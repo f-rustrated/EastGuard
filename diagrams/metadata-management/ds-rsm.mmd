@@ -1,0 +1,80 @@
+graph TB
+    %% Title: Internal Node Architecture: Leaders Left, Followers Right
+
+
+    %% ==========================================
+    %% PHYSICAL SERVER A
+    %% ==========================================
+    subgraph NodeA ["Physical Server A"]
+        direction LR
+        
+        subgraph A_Left ["👑 Leaders (Active)"]
+            direction TB
+            A_L1[("Shard #1")]
+            A_L4[("Shard #4")]
+        end
+
+        subgraph A_Right ["Followers (Passive)"]
+            direction TB
+            A_F2[("Replica #2")]
+            A_F3[("Replica #3")]
+            A_F5[("Replica #5")]
+        end
+    end
+
+    %% ==========================================
+    %% PHYSICAL SERVER B
+    %% ==========================================
+    subgraph NodeB ["Physical Server B"]
+        direction LR
+        
+        subgraph B_Left ["👑 Leaders (Active)"]
+            direction TB
+            B_L2[("Shard #2")]
+            B_L5[("Shard #5")]
+        end
+
+        subgraph B_Right ["Followers (Passive)"]
+            direction TB
+            B_F1[("Replica #1")]
+            B_F3[("Replica #3")]
+            B_F4[("Replica #4")]
+        end
+    end
+
+    %% ==========================================
+    %% PHYSICAL SERVER C
+    %% ==========================================
+    subgraph NodeC ["Physical Server C"]
+        direction LR
+        
+        subgraph C_Left ["👑 Leaders (Active)"]
+            direction TB
+            C_L3[("Shard #3")]
+            C_L6[("Shard #6")]
+        end
+
+        subgraph C_Right ["Followers (Passive)"]
+            direction TB
+            C_F1[("Replica #1")]
+            C_F2[("Replica #2")]
+            C_F4[("Replica #4")]
+        end
+    end
+
+    %% ==========================================
+    %% LOGICAL CONNECTIONS (RAFT GROUPS)
+    %% ==========================================
+    
+    %% Shard 1 Group
+    A_L1 -.-> B_F1 & C_F1
+    linkStyle 0,1 stroke:#ffcc80,stroke-width:2px
+
+    %% Shard 2 Group
+    B_L2 -.-> A_F2 & C_F2
+    linkStyle 2,3 stroke:#80deea,stroke-width:2px
+
+    %% Shard 3 Group
+    C_L3 -.-> A_F3 & B_F3
+    linkStyle 4,5 stroke:#a5d6a7,stroke-width:2px
+
