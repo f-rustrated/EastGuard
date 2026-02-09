@@ -8,7 +8,7 @@ use crate::{
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
-        reqeust::ConnectionRequests,
+        request::ConnectionRequests,
     },
 };
 
