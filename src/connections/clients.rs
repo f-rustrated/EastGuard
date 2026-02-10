@@ -7,7 +7,7 @@ use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 
-use crate::{config::SERDE_CONFIG, connections::reqeust::SessionRequest};
+use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
 
 pub struct ClientStreamWriter(pub(crate) OwnedWriteHalf);
 

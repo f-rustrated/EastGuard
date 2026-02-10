@@ -8,7 +8,7 @@ use crate::{
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
-        reqeust::ConnectionRequests,
+        request::ConnectionRequests,
     },
 };
 
@@ -24,7 +24,9 @@ impl StartUp {
     }
 
     async fn receive_client_streams(self) {
-        let listener = TcpListener::bind(ENV.bind_addr()).await.unwrap();
+        let addr = ENV.bind_addr();
+        let listener = TcpListener::bind(&addr).await.unwrap();
+        println!("EastGuard listening on {addr}");
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {

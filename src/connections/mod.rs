@@ -1,2 +1,2 @@
 pub(crate) mod clients;
-pub(crate) mod reqeust;
+pub(crate) mod request;
