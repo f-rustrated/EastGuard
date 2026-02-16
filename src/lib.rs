@@ -4,10 +4,10 @@ mod connections;
 mod clusters;
 
 use anyhow::Result;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
-    clusters::swim::SwimActor,
+    clusters::{swim::SwimActor, transport::TransportLayer},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -22,9 +22,18 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         // Create a channel for the SwimActor
         let local_peer_addr = ENV.peer_socket_addr();
-        let (_swim_sender, swim_actor) = SwimActor::new(local_peer_addr).await?;
+
+        let (tx_internal, rx_internal) = mpsc::channel(100); // Actor Events
+        let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
+
+        let transport =
+            TransportLayer::new(local_peer_addr, tx_internal.clone(), rx_outbound).await?;
+
+        // 2. Create Actor
+        let swim_actor = SwimActor::new(local_peer_addr, rx_internal, tx_internal, tx_outbound);
 
         // Spawn the SwimActor to run in the background
+        tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 
         // run handlers
