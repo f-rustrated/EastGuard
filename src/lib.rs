@@ -19,7 +19,23 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         // run handlers
 
+        tokio::spawn(Self::start_receiving_peer_connections());
         let _ = self.receive_client_streams().await;
+        Ok(())
+    }
+
+    async fn start_receiving_peer_connections() -> Result<()> {
+        let addr = ENV.peer_bind_addr();
+        let listener = TcpListener::bind(&addr).await?;
+        println!("EastGuard Peer Listener on {addr}");
+
+        while let Ok((stream, peer_addr)) = listener.accept().await {
+            println!("Received peer connection from: {}", peer_addr);
+            // TODO: Implement actual peer connection handling
+            tokio::spawn(async move {
+                let _ = stream;
+            });
+        }
         Ok(())
     }
 
