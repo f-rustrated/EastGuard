@@ -31,7 +31,7 @@ pub struct SwimActor {
     alive_nodes: HashSet<SocketAddr>, // Optimization for random selection
 
     // Probe State
-    seq_counter: u32,
+    seq_counter: u32,                       // "correlation ID" for the message
     pending_acks: HashMap<u32, SocketAddr>, // Seq -> Target
 }
 
