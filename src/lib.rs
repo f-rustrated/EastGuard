@@ -1,10 +1,13 @@
 mod config;
 mod connections;
 
+mod clusters;
+
 use anyhow::Result;
 use tokio::net::TcpListener;
 
 use crate::{
+    clusters::swim::SwimActor,
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -17,25 +20,15 @@ pub struct StartUp;
 
 impl StartUp {
     pub async fn run(self) -> Result<()> {
+        // Create a channel for the SwimActor
+        let local_peer_addr = ENV.peer_socket_addr();
+        let (_swim_sender, swim_actor) = SwimActor::new(local_peer_addr).await?;
+
+        // Spawn the SwimActor to run in the background
+        tokio::spawn(swim_actor.run());
+
         // run handlers
-
-        tokio::spawn(Self::start_receiving_peer_connections());
         let _ = self.receive_client_streams().await;
-        Ok(())
-    }
-
-    async fn start_receiving_peer_connections() -> Result<()> {
-        let addr = ENV.peer_bind_addr();
-        let listener = TcpListener::bind(&addr).await?;
-        println!("EastGuard Peer Listener on {addr}");
-
-        while let Ok((stream, peer_addr)) = listener.accept().await {
-            println!("Received peer connection from: {}", peer_addr);
-            // TODO: Implement actual peer connection handling
-            tokio::spawn(async move {
-                let _ = stream;
-            });
-        }
         Ok(())
     }
 
@@ -55,17 +48,17 @@ impl StartUp {
 
     async fn handle_client_stream(&self, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
         let (read_half, write_half) = stream.into_split();
-        let stream_writer = ClientStreamWriter(write_half);
+        let _stream_writer = ClientStreamWriter(write_half);
         // ! TBD writer needs to be run and read handler should hold sender to the writer
 
         let mut stream_reader = ClientStreamReader::new(read_half);
-        let request = stream_reader.read_request().await?;
+        let _request = stream_reader.read_request().await?;
 
-        match request {
+        match _request {
             ConnectionRequests::Discovery => {
                 // exemplary request
             }
-            ConnectionRequests::Connection(request) => {
+            ConnectionRequests::Connection(_request) => {
                 // validate connection
 
                 tokio::spawn(stream_reader.handle_client_stream());

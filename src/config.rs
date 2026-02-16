@@ -12,8 +12,11 @@ pub struct Environment {
     pub dir: String,
 
     /// --port or -p or PORT=
-    #[arg(short, long, env = "PORT", default_value_t = 8080)]
+    #[arg(short, long, env = "PORT", default_value_t = 2921)]
     pub port: u16,
+
+    #[arg(short, long, env = "CLUSTER_PORT", default_value_t = 2922)]
+    pub cluster_port: u16,
 
     /// --host or -h or HOST=
     #[arg(long, env = "HOST", default_value = "127.0.0.1")]
@@ -48,7 +51,13 @@ impl Environment {
     }
 
     pub(crate) fn peer_bind_addr(&self) -> String {
+        format!("{}:{}", self.host, self.cluster_port)
+    }
+
+    pub(crate) fn peer_socket_addr(&self) -> std::net::SocketAddr {
         format!("{}:{}", self.host, self.port + 10000)
+            .parse()
+            .expect("Invalid peer bind address")
     }
 }
 
@@ -64,10 +73,11 @@ mod tests {
             dir: "./test".into(),
             port: 3000,
             host: "127.0.0.1".into(),
+            cluster_port: 3001,
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
-        assert_eq!(env.peer_bind_addr(), "127.0.0.1:13000");
+        assert_eq!(env.peer_bind_addr(), "127.0.0.1:3001");
     }
 
     #[test]
@@ -76,7 +86,8 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse defaults");
 
-        assert_eq!(env.port, 8080); // The default we set
+        assert_eq!(env.port, 2921); // The default we set
+        assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
         assert_eq!(env.dir, "./data");
     }
