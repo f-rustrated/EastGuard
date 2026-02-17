@@ -223,12 +223,12 @@ impl SwimActor {
             if (member.state == NodeState::Suspect || member.state == NodeState::Dead)
                 && self.incarnation <= member.incarnation
             {
+                let new_incarnation = member.incarnation + 1;
                 println!(
                     "Refuting suspicion! (My Inc: {} -> {})",
-                    self.incarnation,
-                    self.incarnation + 1
+                    self.incarnation, new_incarnation
                 );
-                self.incarnation += 1;
+                self.incarnation = new_incarnation;
                 // I don't need to broadcast immediately; next Ping/Ack will carry it.
             }
             return;
