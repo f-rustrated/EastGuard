@@ -20,8 +20,8 @@ const INDIRECT_PING_COUNT: usize = 3;
 
 pub struct SwimActor {
     // Communication
-    receiver: mpsc::Receiver<ActorEvent>,   // Inbound events
-    sender: mpsc::Sender<ActorEvent>,       // To schedule own timers
+    mailbox: mpsc::Receiver<ActorEvent>,    // Inbound events
+    self_tx: mpsc::Sender<ActorEvent>,      // To schedule own timers
     outbound: mpsc::Sender<OutboundPacket>, // To Network
 
     // State
@@ -38,13 +38,13 @@ pub struct SwimActor {
 impl SwimActor {
     pub fn new(
         local_addr: SocketAddr,
-        receiver: mpsc::Receiver<ActorEvent>,
-        sender: mpsc::Sender<ActorEvent>,
+        mailbox: mpsc::Receiver<ActorEvent>,
+        self_tx: mpsc::Sender<ActorEvent>,
         outbound: mpsc::Sender<OutboundPacket>,
     ) -> Self {
         Self {
-            receiver,
-            sender,
+            mailbox,
+            self_tx,
             outbound,
             local_addr,
             incarnation: 0,
@@ -66,7 +66,7 @@ impl SwimActor {
                 _ = ticker.tick() => {
                     self.perform_protocol_tick(&mut rng).await;
                 }
-                Some(event) = self.receiver.recv() => {
+                Some(event) = self.mailbox.recv() => {
                     self.handle_event(event, &mut rng).await;
                 }
             }
@@ -98,7 +98,7 @@ impl SwimActor {
                         self.update_member(target, NodeState::Suspect, member.incarnation);
 
                         // Schedule Suspect -> Dead transition
-                        let tx = self.sender.clone();
+                        let tx = self.self_tx.clone();
                         tokio::spawn(async move {
                             time::sleep(SUSPECT_TIMEOUT).await;
                             let _ = tx.send(ActorEvent::SuspectTimeout { target }).await;
@@ -276,7 +276,7 @@ impl SwimActor {
             self.send(target, msg).await;
 
             // Schedule Direct Timeout
-            let tx = self.sender.clone();
+            let tx = self.self_tx.clone();
             tokio::spawn(async move {
                 time::sleep(ACK_TIMEOUT).await;
                 let _ = tx
@@ -300,7 +300,7 @@ impl SwimActor {
         if peers.is_empty() {
             // No helpers -> Fail immediately.
             let _ = self
-                .sender
+                .self_tx
                 .send(ActorEvent::IndirectProbeTimeout { target })
                 .await;
             return;
@@ -323,7 +323,7 @@ impl SwimActor {
         }
 
         // Schedule Indirect Timeout (Total time for buddy system)
-        let tx = self.sender.clone();
+        let tx = self.self_tx.clone();
         tokio::spawn(async move {
             time::sleep(ACK_TIMEOUT).await;
             let _ = tx.send(ActorEvent::IndirectProbeTimeout { target }).await;
