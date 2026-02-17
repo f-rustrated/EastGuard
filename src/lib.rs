@@ -61,9 +61,9 @@ impl StartUp {
         // ! TBD writer needs to be run and read handler should hold sender to the writer
 
         let mut stream_reader = ClientStreamReader::new(read_half);
-        let _request = stream_reader.read_request().await?;
+        let request = stream_reader.read_request().await?;
 
-        match _request {
+        match request {
             ConnectionRequests::Discovery => {
                 // exemplary request
             }
