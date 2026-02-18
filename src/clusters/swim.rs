@@ -1,10 +1,7 @@
 use crate::clusters::alive_nodes_tracker::AliveNodes;
 
 use super::*;
-use rand::rngs::StdRng;
-use rand::seq::{IteratorRandom, SliceRandom};
-use rand::{Rng, SeedableRng};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
@@ -58,7 +55,6 @@ impl SwimActor {
     }
 
     pub async fn run(mut self) {
-        let mut rng = StdRng::from_entropy();
         let mut ticker = time::interval(PROTOCOL_PERIOD);
 
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
@@ -69,13 +65,13 @@ impl SwimActor {
                     self.perform_protocol_tick().await;
                 }
                 Some(event) = self.mailbox.recv() => {
-                    self.handle_event(event, &mut rng).await;
+                    self.handle_event(event).await;
                 }
             }
         }
     }
 
-    async fn handle_event(&mut self, event: ActorEvent, rng: &mut StdRng) {
+    async fn handle_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::PacketReceived { src, packet } => {
                 self.handle_packet(src, packet).await;
