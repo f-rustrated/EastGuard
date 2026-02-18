@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, net::SocketAddr, ops::Deref};
-
+use super::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use std::{collections::VecDeque, net::SocketAddr, ops::Deref};
 
 // Used to decide who to ping. You don't want to waste network traffic pinging nodes you already know are dead.
 #[derive(Default)]
@@ -34,6 +34,20 @@ impl LiveNodeTracker {
         let peer = self.nodes.pop_front()?;
         self.nodes.push_back(peer);
         Some(peer)
+    }
+
+    pub(crate) fn update(&mut self, addr: SocketAddr, state: super::NodeState) {
+        match state {
+            NodeState::Alive => {
+                self.add(addr);
+            }
+            NodeState::Suspect => {
+                self.remove(&addr);
+            }
+            NodeState::Dead => {
+                self.remove(&addr);
+            }
+        }
     }
 }
 

@@ -85,7 +85,7 @@ impl Topology {
         }
     }
 
-    pub fn update_topology(&mut self, addr: SocketAddr, state: NodeState) {
+    pub fn update(&mut self, addr: SocketAddr, state: NodeState) {
         let id = PhysicalNodeId::from(addr);
         match state {
             NodeState::Alive => {

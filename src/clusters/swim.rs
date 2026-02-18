@@ -227,18 +227,8 @@ impl SwimActor {
             }
         };
 
-        match new_state {
-            NodeState::Alive => {
-                self.livenode_tracker.add(addr);
-            }
-            NodeState::Suspect => {
-                self.livenode_tracker.remove(&addr);
-            }
-            NodeState::Dead => {
-                self.livenode_tracker.remove(&addr);
-            }
-        }
-        self.topology.write().await.update_topology(addr, new_state);
+        self.livenode_tracker.update(addr, new_state);
+        self.topology.write().await.update(addr, new_state);
     }
 
     async fn apply_membership_update(&mut self, member: Member) {
