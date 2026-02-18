@@ -1,4 +1,4 @@
-use crate::clusters::alive_nodes_tracker::AliveNodes;
+use crate::clusters::livenode_tracker::LiveNodeTracker;
 
 use super::*;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ pub struct SwimActor {
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
-    alive_nodes: AliveNodes, // Optimization for random selection
+    alive_nodes: LiveNodeTracker, // Optimization for random selection
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -48,7 +48,7 @@ impl SwimActor {
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
-            alive_nodes: AliveNodes::default(),
+            alive_nodes: LiveNodeTracker::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }

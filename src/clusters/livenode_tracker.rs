@@ -4,12 +4,12 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 
 // Used to decide who to ping. You don't want to waste network traffic pinging nodes you already know are dead.
 #[derive(Default)]
-pub(super) struct AliveNodes {
+pub(super) struct LiveNodeTracker {
     nodes: Vec<SocketAddr>,
     ptr: usize,
 }
 
-impl Deref for AliveNodes {
+impl Deref for LiveNodeTracker {
     type Target = Vec<SocketAddr>;
 
     fn deref(&self) -> &Self::Target {
@@ -17,7 +17,7 @@ impl Deref for AliveNodes {
     }
 }
 
-impl AliveNodes {
+impl LiveNodeTracker {
     pub(super) fn add(&mut self, peer_addr: SocketAddr) {
         let mut rng = StdRng::from_entropy();
         let selected = rng.gen_range(0..=self.nodes.len());
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_round_robin_basic() {
-        let mut nodes = AliveNodes::default();
+        let mut nodes = LiveNodeTracker::default();
         // Manually push to control order for this specific test
         nodes.nodes.push(addr(1));
         nodes.nodes.push(addr(2));
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn test_remove_before_pointer() {
         // Setup: [1, 2, 3], ptr is at 2 (pointing to 3)
-        let mut nodes = AliveNodes {
+        let mut nodes = LiveNodeTracker {
             nodes: vec![addr(1), addr(2), addr(3)],
             ptr: 2,
         };
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn test_remove_at_pointer() {
         // Setup: [1, 2, 3], ptr is at 1 (pointing to 2)
-        let mut nodes = AliveNodes {
+        let mut nodes = LiveNodeTracker {
             nodes: vec![addr(1), addr(2), addr(3)],
             ptr: 1,
         };
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn test_remove_last_element_wrap() {
         // Setup: [1, 2, 3], ptr is at 2 (pointing to 3)
-        let mut nodes = AliveNodes {
+        let mut nodes = LiveNodeTracker {
             nodes: vec![addr(1), addr(2), addr(3)],
             ptr: 2,
         };
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_remove_after_pointer() {
         // Setup: [1, 2, 3], ptr is at 0 (pointing to 1)
-        let mut nodes = AliveNodes {
+        let mut nodes = LiveNodeTracker {
             nodes: vec![addr(1), addr(2), addr(3)],
             ptr: 0,
         };
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn test_add_updates_pointer() {
         // Setup: [2, 3], ptr is 0 (pointing to 2)
-        let mut nodes = AliveNodes {
+        let mut nodes = LiveNodeTracker {
             nodes: vec![addr(2), addr(3)],
             ptr: 0,
         };
