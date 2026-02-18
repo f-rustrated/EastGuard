@@ -92,6 +92,10 @@ impl Topology {
         self.nodes.insert(id, metadata);
     }
 
+    pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
+        self.nodes.contains_key(id)
+    }
+    
     pub fn remove_node(&mut self, id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
         let metadata = self.nodes.remove(id)?;
         for i in 0..self.config.replicas_per_node {
@@ -148,6 +152,10 @@ impl TopologyActor {
             topology: Arc::new(RwLock::new(topology)),
             mailbox,
         }
+    }
+
+    pub fn topology_handle(&self) -> Arc<RwLock<Topology>> {
+        self.topology.clone()
     }
 
     pub async fn run(mut self) {

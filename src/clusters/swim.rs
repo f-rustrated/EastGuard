@@ -65,6 +65,9 @@ impl SwimActor {
 
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
 
+        // Register ourselves so downstream components (e.g. topology ring) know we exist.
+        self.update_member(self.local_addr, NodeState::Alive,  self.incarnation).await;
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -191,30 +194,34 @@ impl SwimActor {
     // --- CORE SWIM LOGIC (Incarnation & State) ---
 
     async fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
-        let entry = self.members.entry(addr).or_insert(Member {
-            addr,
-            state: NodeState::Dead, // Default until updated
-            incarnation: 0,
-        });
-
-        // RULE: Higher incarnation always wins
-        if incarnation > entry.incarnation {
-            entry.incarnation = incarnation;
-            entry.state = state;
-        }
-        // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
-        else if incarnation == entry.incarnation {
-            match (&entry.state, &state) {
-                (NodeState::Alive, NodeState::Suspect) => entry.state = NodeState::Suspect,
-                (NodeState::Alive, NodeState::Dead) => entry.state = NodeState::Dead,
-                (NodeState::Suspect, NodeState::Dead) => entry.state = NodeState::Dead,
-                _ => {} // No change
+        let new_state = match self.members.entry(addr) {
+            Entry::Vacant(e) => {
+                // New member: set state directly, no SWIM rules apply yet.
+                e.insert(Member { addr, state, incarnation });
+                state
             }
-        }
+            Entry::Occupied(e) => {
+                let entry = e.into_mut();
+                // RULE: Higher incarnation always wins
+                if incarnation > entry.incarnation {
+                    entry.incarnation = incarnation;
+                    entry.state = state;
+                }
+                // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
+                else if incarnation == entry.incarnation {
+                    match (&entry.state, &state) {
+                        (NodeState::Alive, NodeState::Suspect) => entry.state = NodeState::Suspect,
+                        (NodeState::Alive, NodeState::Dead) => entry.state = NodeState::Dead,
+                        (NodeState::Suspect, NodeState::Dead) => entry.state = NodeState::Dead,
+                        _ => {}
+                    }
+                }
+                entry.state
+            }
+        };
 
-        // Maintain optimization set
         let id = PhysicalNodeId::from(addr);
-        match entry.state {
+        match new_state {
             NodeState::Alive => {
                 self.alive_nodes.insert(addr);
                 let _ = self.cluster_events.send(ClusterEvent::NodeAlive { id, addr }).await;
@@ -252,11 +259,9 @@ impl SwimActor {
     async fn handle_incarnation_check(&mut self, src: SocketAddr, remote_inc: u64) {
         // If we receive a direct message from someone, they are obviously Alive.
         // If their incarnation is higher than we thought, update it.
-        if let Some(member) = self.members.get_mut(&src) {
+        if let Some(member) = self.members.get(&src) {
             if remote_inc > member.incarnation {
-                member.incarnation = remote_inc;
-                member.state = NodeState::Alive;
-                self.alive_nodes.insert(src);
+                self.update_member(src, NodeState::Alive, remote_inc).await;
             }
         } else {
             // New member discovered via direct message

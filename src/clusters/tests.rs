@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
 use tokio::{sync::mpsc, time};
 
 use crate::clusters::swim::SwimActor;
@@ -5,14 +9,12 @@ use crate::clusters::topology::{Topology, TopologyActor, TopologyConfig};
 
 use super::*;
 
-use std::collections::HashMap;
-use std::time::Duration;
-
 // Helper to setup the test environment
 async fn setup() -> (
     mpsc::Sender<ActorEvent>,       // To send "Fake Network" events
     mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
     SocketAddr,                     // The actor's local address
+    Arc<RwLock<Topology>>,          // Handle to observe topology state
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
@@ -22,18 +24,19 @@ async fn setup() -> (
 
     let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: 256 });
     let topo_actor = TopologyActor::new(topology, rx_cluster);
+    let topo_handle = topo_actor.topology_handle();
     tokio::spawn(topo_actor.run());
 
     // Spawn the actor in the background
     let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, tx_cluster);
     tokio::spawn(actor.run());
 
-    (tx_in, rx_out, addr)
+    (tx_in, rx_out, addr, topo_handle)
 }
 
 #[tokio::test]
 async fn test_ping_response() {
-    let (tx, mut rx, local_addr) = setup().await;
+    let (tx, mut rx, local_addr, _) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
@@ -65,7 +68,7 @@ async fn test_ping_response() {
 
 #[tokio::test]
 async fn test_refutation_mechanism() {
-    let (tx, mut rx, local_addr) = setup().await;
+    let (tx, mut rx, local_addr, _) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
@@ -108,7 +111,7 @@ async fn test_refutation_mechanism() {
 
 #[tokio::test]
 async fn test_gossip_propagation() {
-    let (tx, mut rx, _) = setup().await;
+    let (tx, mut rx, _, _) = setup().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
@@ -166,7 +169,7 @@ async fn test_gossip_propagation() {
 async fn test_indirect_ping_trigger() {
     // This tests the timer logic: Tick -> Ping -> Timeout -> Indirect Ping
 
-    let (tx, mut rx, _) = setup().await;
+    let (tx, mut rx, _, _) = setup().await;
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -227,4 +230,18 @@ async fn test_indirect_ping_trigger() {
         }
         _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet),
     }
+}
+
+#[tokio::test]
+async fn test_self_registers_in_topology_on_startup() {
+    let (_, _, addr, topo_handle) = setup().await;
+
+    // Allow the NodeAlive event to propagate through the channel to TopologyActor.
+    time::sleep(Duration::from_millis(50)).await;
+
+    let topo = topo_handle.read().unwrap();
+    assert!(
+        topo.contains_node(&PhysicalNodeId::from(addr)),
+        "SwimActor should register itself in the topology ring on startup"
+    );
 }
