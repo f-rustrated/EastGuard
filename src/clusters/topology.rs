@@ -32,12 +32,6 @@ pub struct PhysicalNodeMetadata {
     pub address: SocketAddr,
 }
 
-impl PhysicalNodeMetadata {
-    pub fn new(address: SocketAddr) -> Self {
-        Self { address }
-    }
-}
-
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
     hash: u32,
@@ -169,7 +163,7 @@ fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
     VirtualNodeToken {
         hash: hash_stable(&buf),
         node_id: id.clone(),
-        replica_index: replica_index,
+        replica_index,
     }
 }
 
@@ -315,7 +309,7 @@ mod tests {
             .zip(node_addrs.iter())
             .map(|(name, addr)| (name.as_str(), addr.as_str()))
             .collect();
-        let mut topology = topology_from(
+        let topology = topology_from(
             nodes.as_slice(),
             TopologyConfig {
                 replicas_per_node: 4,

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use std::time::Duration;
 
 use tokio::{sync::mpsc, time};
-
+use tokio::sync::RwLock;
 use crate::clusters::swim::SwimActor;
 use crate::clusters::topology::{PhysicalNodeId, Topology, TopologyConfig};
 
@@ -234,9 +234,9 @@ async fn test_self_registers_in_topology_on_startup() {
     let (_, _, addr, topo_handle) = setup().await;
 
     // Yield to allow the spawned SwimActor task to start and self-register.
-    time::sleep(Duration::from_millis(10)).await;
+    time::sleep(Duration::from_millis(50)).await;
 
-    let topo = topo_handle.read().unwrap();
+    let topo = topo_handle.read().await;
     assert!(
         topo.contains_node(&PhysicalNodeId::from(addr)),
         "SwimActor should register itself in the topology ring on startup"
@@ -269,7 +269,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
     // the Ack guarantees the topology has already been updated.
     let _ = rx.recv().await.unwrap();
 
-    let topo = topo_handle.read().unwrap();
+    let topo = topo_handle.read().await;
     assert!(
         topo.contains_node(&PhysicalNodeId::from(new_node)),
         "Alive gossip should add the node to the topology ring"
@@ -301,7 +301,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
+        topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
         "Node should be present in topology after Alive gossip"
     );
 
@@ -324,7 +324,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        !topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
+        !topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
         "Dead gossip should remove the node from the topology ring"
     );
 }

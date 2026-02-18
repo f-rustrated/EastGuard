@@ -5,9 +5,9 @@ use rand::seq::IteratorRandom;
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{self, Duration};
 
 use crate::clusters::topology::{Topology, PhysicalNodeMetadata, PhysicalNodeId};
@@ -69,7 +69,7 @@ impl SwimActor {
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
 
         // Register ourselves so downstream components (e.g. topology ring) know we exist.
-        self.update_member(self.local_addr, NodeState::Alive, self.incarnation);
+        self.update_member(self.local_addr, NodeState::Alive, self.incarnation).await;
 
         loop {
             tokio::select! {
@@ -105,7 +105,7 @@ impl SwimActor {
                 if let Some(member) = self.members.get(&target) {
                     if member.state == NodeState::Alive {
                         println!("Node {} is SUSPECT (Inc: {})", target, member.incarnation);
-                        self.update_member(target, NodeState::Suspect, member.incarnation);
+                        self.update_member(target, NodeState::Suspect, member.incarnation).await;
 
                         // Schedule Suspect -> Dead transition
                         let tx = self.self_tx.clone();
@@ -122,7 +122,7 @@ impl SwimActor {
                 if let Some(member) = self.members.get(&target) {
                     if member.state == NodeState::Suspect {
                         println!("Node {} is DEAD", target);
-                        self.update_member(target, NodeState::Dead, member.incarnation);
+                        self.update_member(target, NodeState::Dead, member.incarnation).await;
                     }
                 }
             }
@@ -140,7 +140,7 @@ impl SwimActor {
         };
 
         for member in gossip_list {
-            self.apply_membership_update(member.clone());
+            self.apply_membership_update(member.clone()).await;
         }
 
         // 2. Handle Message Types
@@ -150,7 +150,7 @@ impl SwimActor {
                 source_incarnation,
                 ..
             } => {
-                self.handle_incarnation_check(src, source_incarnation);
+                self.handle_incarnation_check(src, source_incarnation).await;
                 // Respond with Ack
                 let ack = SwimPacket::Ack {
                     seq,
@@ -165,7 +165,7 @@ impl SwimActor {
                 source_incarnation,
                 ..
             } => {
-                self.handle_incarnation_check(src, source_incarnation);
+                self.handle_incarnation_check(src, source_incarnation).await;
                 // Success! Remove from pending acks.
                 if self.pending_acks.remove(&seq).is_some() {
                     // We can optionally log latency here
@@ -178,7 +178,7 @@ impl SwimActor {
                 source_incarnation,
                 ..
             } => {
-                self.handle_incarnation_check(src, source_incarnation);
+                self.handle_incarnation_check(src, source_incarnation).await;
                 // Proxy Ping: We ping 'target'. If successful, we Ack 'src'.
                 // Simplified: We send a standard Ping to target.
                 // In a full implementation, we need to track that this Ack belongs to 'src'.
@@ -196,7 +196,7 @@ impl SwimActor {
 
     // --- CORE SWIM LOGIC (Incarnation & State) ---
 
-    fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
+    async fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
         let new_state = match self.members.entry(addr) {
             Entry::Vacant(e) => {
                 // New member: set state directly, no SWIM rules apply yet.
@@ -227,19 +227,19 @@ impl SwimActor {
         match new_state {
             NodeState::Alive => {
                 self.alive_nodes.insert(addr);
-                self.topology.write().unwrap().insert_node(id, PhysicalNodeMetadata { address: addr });
+                self.topology.write().await.insert_node(id, PhysicalNodeMetadata { address: addr });
             }
             NodeState::Suspect => {
                 self.alive_nodes.remove(&addr);
             }
             NodeState::Dead => {
                 self.alive_nodes.remove(&addr);
-                self.topology.write().unwrap().remove_node(&id);
+                self.topology.write().await.remove_node(&id);
             }
         }
     }
 
-    fn apply_membership_update(&mut self, member: Member) {
+    async fn apply_membership_update(&mut self, member: Member) {
         // REFUTATION MECHANISM
         if member.addr == self.local_addr {
             // Someone is gossiping that I am Suspect or Dead?
@@ -256,19 +256,19 @@ impl SwimActor {
             }
             return;
         }
-        self.update_member(member.addr, member.state, member.incarnation);
+        self.update_member(member.addr, member.state, member.incarnation).await;
     }
 
-    fn handle_incarnation_check(&mut self, src: SocketAddr, remote_inc: u64) {
+    async fn handle_incarnation_check(&mut self, src: SocketAddr, remote_inc: u64) {
         // If we receive a direct message from someone, they are obviously Alive.
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&src) {
             if remote_inc > member.incarnation {
-                self.update_member(src, NodeState::Alive, remote_inc);
+                self.update_member(src, NodeState::Alive, remote_inc).await;
             }
         } else {
             // New member discovered via direct message
-            self.update_member(src, NodeState::Alive, remote_inc);
+            self.update_member(src, NodeState::Alive, remote_inc).await;
         }
     }
 

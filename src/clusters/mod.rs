@@ -5,12 +5,11 @@
 use bincode::{Decode, Encode};
 use std::net::SocketAddr;
 pub(crate) mod swim;
-
+pub(crate) mod topology;
 pub(crate) mod transport;
 
 #[cfg(test)]
 pub mod tests;
-pub mod topology;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
