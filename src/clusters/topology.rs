@@ -6,40 +6,6 @@ use std::net::SocketAddr;
 
 use crate::clusters::NodeState;
 
-#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
-pub struct PhysicalNodeId(String);
-
-impl PhysicalNodeId {
-    pub(crate) fn new(id: impl Into<String>) -> PhysicalNodeId {
-        Self(id.into())
-    }
-
-    fn generate_vnode_token(&self, replica_index: u64) -> VirtualNodeToken {
-        let mut buf = Vec::with_capacity(self.0.len() + 8);
-        buf.extend_from_slice(self.0.as_bytes());
-        buf.extend_from_slice(&replica_index.to_be_bytes());
-        VirtualNodeToken {
-            hash: hash_stable(&buf),
-            pnode_id: self.clone(),
-            replica_index,
-        }
-    }
-
-    fn generate_vnode(&self, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
-        VirtualNode {
-            replica_index,
-            pnode_id: self.clone(),
-            pnode_metadata: metadata.clone(),
-        }
-    }
-}
-
-/// Identity is managed separately via `PhysicalNodeId`.
-#[derive(Clone, Debug)]
-pub struct PhysicalNodeMetadata {
-    pub address: SocketAddr,
-}
-
 /// node_id and replica_index for tie breaker
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
@@ -199,9 +165,44 @@ impl Topology {
 /// We shouldn't use DefaultHasher because its algorithm and seed are intentionally unstable across
 /// processes, runs, and Rust versions, making the same input produce different hashes in a
 /// distributed system.
+#[inline]
 fn hash_stable(key: &[u8]) -> u32 {
     let mut cursor = Cursor::new(key);
     murmur3_32(&mut cursor, 0).expect("Murmur3 hashing failed")
+}
+
+#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+pub struct PhysicalNodeId(String);
+
+impl PhysicalNodeId {
+    pub(crate) fn new(id: impl Into<String>) -> PhysicalNodeId {
+        Self(id.into())
+    }
+
+    fn generate_vnode_token(&self, replica_index: u64) -> VirtualNodeToken {
+        let mut buf = Vec::with_capacity(self.0.len() + 8);
+        buf.extend_from_slice(self.0.as_bytes());
+        buf.extend_from_slice(&replica_index.to_be_bytes());
+        VirtualNodeToken {
+            hash: hash_stable(&buf),
+            pnode_id: self.clone(),
+            replica_index,
+        }
+    }
+
+    fn generate_vnode(&self, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
+        VirtualNode {
+            replica_index,
+            pnode_id: self.clone(),
+            pnode_metadata: metadata.clone(),
+        }
+    }
+}
+
+/// Identity is managed separately via `PhysicalNodeId`.
+#[derive(Clone, Debug)]
+pub struct PhysicalNodeMetadata {
+    pub address: SocketAddr,
 }
 
 #[cfg(test)]
