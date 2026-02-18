@@ -1,10 +1,13 @@
 mod config;
 mod connections;
 
+mod clusters;
+
 use anyhow::Result;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
+    clusters::{swim::SwimActor, transport::TransportLayer},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -17,8 +20,23 @@ pub struct StartUp;
 
 impl StartUp {
     pub async fn run(self) -> Result<()> {
-        // run handlers
+        // Create a channel for the SwimActor
+        let local_peer_addr = ENV.peer_socket_addr();
 
+        let (tx_internal, rx_internal) = mpsc::channel(100); // Actor Events
+        let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
+
+        let transport =
+            TransportLayer::new(local_peer_addr, tx_internal.clone(), rx_outbound).await?;
+
+        // 2. Create Actor
+        let swim_actor = SwimActor::new(local_peer_addr, rx_internal, tx_internal, tx_outbound);
+
+        // Spawn the SwimActor to run in the background
+        tokio::spawn(transport.run());
+        tokio::spawn(swim_actor.run());
+
+        // run handlers
         let _ = self.receive_client_streams().await;
         Ok(())
     }
@@ -39,7 +57,7 @@ impl StartUp {
 
     async fn handle_client_stream(&self, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
         let (read_half, write_half) = stream.into_split();
-        let stream_writer = ClientStreamWriter(write_half);
+        let _stream_writer = ClientStreamWriter(write_half);
         // ! TBD writer needs to be run and read handler should hold sender to the writer
 
         let mut stream_reader = ClientStreamReader::new(read_half);
@@ -49,7 +67,7 @@ impl StartUp {
             ConnectionRequests::Discovery => {
                 // exemplary request
             }
-            ConnectionRequests::Connection(request) => {
+            ConnectionRequests::Connection(_request) => {
                 // validate connection
 
                 tokio::spawn(stream_reader.handle_client_stream());
