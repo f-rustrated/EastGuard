@@ -3,7 +3,6 @@ use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::ops::{Deref, DerefMut};
 
 use crate::clusters::NodeState;
 
@@ -74,7 +73,7 @@ impl TokenRing {
         vnode_cnt: u64,
     ) {
         for replica_index in 0..vnode_cnt {
-            self.insert(
+            self.0.insert(
                 pnode_id.generate_vnode_token(replica_index),
                 pnode_id.generate_vnode(&metadata, replica_index),
             );
@@ -83,21 +82,26 @@ impl TokenRing {
 
     fn remove_pnode(&mut self, pnode_id: &PhysicalNodeId, vnode_cnt: u64) {
         for replica_index in 0..vnode_cnt {
-            self.remove(&pnode_id.generate_vnode_token(replica_index));
+            self.0.remove(&pnode_id.generate_vnode_token(replica_index));
         }
     }
-}
-impl Deref for TokenRing {
-    type Target = BTreeMap<VirtualNodeToken, VirtualNode>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
-}
 
-impl DerefMut for TokenRing {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+    fn walk_clockwise(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
+        let hash = hash_stable(key);
+        let start = VirtualNodeToken {
+            hash,
+            pnode_id: PhysicalNodeId::new(""),
+            replica_index: 0,
+        };
+
+        self.0
+            .range(&start..)
+            .chain(self.0.range(..&start))
+            .map(|(_, owner)| owner)
     }
 }
 
@@ -119,12 +123,7 @@ impl Topology {
     ) -> Self {
         let mut token_ring = TokenRing::default();
         for (pnode_id, metadata) in &nodes {
-            for i in 0..config.replicas_per_node {
-                token_ring.insert(
-                    pnode_id.generate_vnode_token(i),
-                    pnode_id.generate_vnode(metadata, i),
-                );
-            }
+            token_ring.add_pnode(pnode_id, metadata, config.replicas_per_node);
         }
 
         Self {
@@ -177,7 +176,7 @@ impl Topology {
             return Vec::new();
         }
         let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
-        for owner in self.ring_walk(key) {
+        for owner in self.token_ring.walk_clockwise(key) {
             if let ReplicaPolicy::DistinctNodes = policy {
                 if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
                     continue;
@@ -189,20 +188,6 @@ impl Topology {
             }
         }
         result
-    }
-
-    fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
-        let hash = hash_stable(key);
-        let start = VirtualNodeToken {
-            hash,
-            pnode_id: PhysicalNodeId::new(""),
-            replica_index: 0,
-        };
-
-        self.token_ring
-            .range(&start..)
-            .chain(self.token_ring.range(..&start))
-            .map(|(_, owner)| owner)
     }
 
     #[cfg(test)]
@@ -251,7 +236,7 @@ mod tests {
         );
 
         assert_eq!(topology.nodes.len(), 3);
-        assert_eq!(topology.token_ring.len(), 12);
+        assert_eq!(topology.token_ring.0.len(), 12);
 
         assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-1")));
         assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-2")));
@@ -279,7 +264,7 @@ mod tests {
         );
 
         assert_eq!(topology.nodes.len(), 4);
-        assert_eq!(topology.token_ring.len(), 16);
+        assert_eq!(topology.token_ring.0.len(), 16);
 
         assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-3")));
     }
@@ -305,7 +290,7 @@ mod tests {
         );
 
         assert_eq!(topology.nodes.len(), 3);
-        assert_eq!(topology.token_ring.len(), 12);
+        assert_eq!(topology.token_ring.0.len(), 12);
     }
 
     #[test]
@@ -324,7 +309,7 @@ mod tests {
         let removed = topology.remove_node(&PhysicalNodeId::new("node-0"));
         assert!(removed.is_some());
         assert_eq!(topology.nodes.len(), 2);
-        assert_eq!(topology.token_ring.len(), 8);
+        assert_eq!(topology.token_ring.0.len(), 8);
 
         assert!(!topology.nodes.contains_key(&PhysicalNodeId::new("node-0")));
     }
