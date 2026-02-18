@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::{sync::mpsc, time};
 
 use crate::clusters::swim::SwimActor;
-use crate::clusters::topology::{Topology, TopologyConfig};
+use crate::clusters::topology::{PhysicalNodeId, Topology, TopologyConfig};
 
 use super::*;
 

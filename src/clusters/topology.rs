@@ -1,8 +1,30 @@
-use super::PhysicalNodeId;
 use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use bincode::{Decode, Encode};
+
+#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+pub struct PhysicalNodeId(pub String);
+
+impl From<&str> for PhysicalNodeId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for PhysicalNodeId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// TODO: Let users define their own NodeId using config
+impl From<SocketAddr> for PhysicalNodeId {
+    fn from(addr: SocketAddr) -> Self {
+        Self(addr.to_string())
+    }
+}
 
 /// Identity is managed separately via `PhysicalNodeId`.
 #[derive(Clone, Debug)]
