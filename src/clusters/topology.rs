@@ -56,7 +56,14 @@ pub struct Topology {
 }
 
 pub struct TopologyConfig {
-    replicas_per_node: u32,
+    pub replicas_per_node: u32,
+}
+
+pub enum ReplicaPolicy {
+    /// Allow multiple vnodes from the same physical node.
+    Any,
+    /// Skip vnodes whose physical node is already in the result.
+    DistinctNodes,
 }
 
 impl Topology {
@@ -99,19 +106,21 @@ impl Topology {
         }
     }
 
-    /// Returns up to `n` distinct nodes by walking the ring from the key's position.
     pub fn token_owners_for(
         &self,
         key: &[u8],
         n: usize,
+        policy: ReplicaPolicy,
     ) -> Vec<&TokenOwner> {
         if self.token_ring.is_empty() || n == 0 {
             return Vec::new();
         }
         let mut result: Vec<&TokenOwner> = Vec::with_capacity(n);
         for owner in self.ring_walk(key) {
-            if result.iter().any(|o| o.physical_node_id == owner.physical_node_id) {
-                continue;
+            if let ReplicaPolicy::DistinctNodes = policy {
+                if result.iter().any(|o| o.physical_node_id == owner.physical_node_id) {
+                    continue;
+                }
             }
             result.push(owner);
             if result.len() == n {
@@ -119,11 +128,6 @@ impl Topology {
             }
         }
         result
-    }
-
-    /// Locates the node responsible for the given key.
-    pub fn token_owner_for(&self, key: &[u8]) -> Option<&TokenOwner> {
-        self.ring_walk(key).next()
     }
 
     fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &TokenOwner> {
