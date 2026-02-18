@@ -13,14 +13,23 @@ impl PhysicalNodeId {
     pub(crate) fn new(id: impl Into<String>) -> PhysicalNodeId {
         Self(id.into())
     }
-    fn ring_key(&self, replica_index: u64) -> VirtualNodeToken {
+
+    fn generate_vnode_token(&self, replica_index: u64) -> VirtualNodeToken {
         let mut buf = Vec::with_capacity(self.0.len() + 8);
         buf.extend_from_slice(self.0.as_bytes());
         buf.extend_from_slice(&replica_index.to_be_bytes());
         VirtualNodeToken {
             hash: hash_stable(&buf),
-            node_id: self.clone(),
+            pnode_id: self.clone(),
             replica_index,
+        }
+    }
+
+    fn generate_vnode(&self, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
+        VirtualNode {
+            replica_index,
+            pnode_id: self.clone(),
+            pnode_metadata: metadata.clone(),
         }
     }
 }
@@ -35,15 +44,15 @@ pub struct PhysicalNodeMetadata {
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
     hash: u32,
-    node_id: PhysicalNodeId,
+    pnode_id: PhysicalNodeId,
     replica_index: u64,
 }
 
 #[derive(Debug)]
 pub struct VirtualNode {
     replica_index: u64,
-    physical_node_id: PhysicalNodeId,
-    physical_node_metadata: PhysicalNodeMetadata,
+    pnode_id: PhysicalNodeId,
+    pnode_metadata: PhysicalNodeMetadata,
 }
 
 pub struct Topology {
@@ -72,7 +81,10 @@ impl Topology {
         let mut token_ring = BTreeMap::new();
         for (pnode_id, metadata) in &nodes {
             for i in 0..config.replicas_per_node {
-                token_ring.insert(pnode_id.ring_key(i), token_owner(pnode_id, metadata, i));
+                token_ring.insert(
+                    pnode_id.generate_vnode_token(i),
+                    pnode_id.generate_vnode(metadata, i),
+                );
             }
         }
 
@@ -102,11 +114,10 @@ impl Topology {
         if self.nodes.contains_key(&pnode_id) {
             return;
         }
-        for i in 0..self.config.replicas_per_node {
-            let replica_index = i as u64;
+        for replica_index in 0..self.config.replicas_per_node {
             self.token_ring.insert(
-                pnode_id.ring_key(replica_index),
-                token_owner(&pnode_id, &metadata, replica_index),
+                pnode_id.generate_vnode_token(replica_index),
+                pnode_id.generate_vnode(&metadata, replica_index),
             );
         }
         self.nodes.insert(pnode_id, metadata);
@@ -115,7 +126,7 @@ impl Topology {
     fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
         let metadata = self.nodes.remove(pnode_id)?;
         for i in 0..self.config.replicas_per_node {
-            self.token_ring.remove(&pnode_id.ring_key(i));
+            self.token_ring.remove(&pnode_id.generate_vnode_token(i));
         }
         Some(metadata)
     }
@@ -132,10 +143,7 @@ impl Topology {
         let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
         for owner in self.ring_walk(key) {
             if let ReplicaPolicy::DistinctNodes = policy {
-                if result
-                    .iter()
-                    .any(|o| o.physical_node_id == owner.physical_node_id)
-                {
+                if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
                     continue;
                 }
             }
@@ -151,7 +159,7 @@ impl Topology {
         let hash = hash_stable(key);
         let start = VirtualNodeToken {
             hash,
-            node_id: PhysicalNodeId::new(""),
+            pnode_id: PhysicalNodeId::new(""),
             replica_index: 0,
         };
 
@@ -164,18 +172,6 @@ impl Topology {
     #[cfg(test)]
     pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
         self.nodes.contains_key(id)
-    }
-}
-
-fn token_owner(
-    id: &PhysicalNodeId,
-    metadata: &PhysicalNodeMetadata,
-    replica_index: u64,
-) -> VirtualNode {
-    VirtualNode {
-        replica_index,
-        physical_node_id: id.clone(),
-        physical_node_metadata: metadata.clone(),
     }
 }
 
@@ -322,7 +318,7 @@ mod tests {
         assert_eq!(multiple_owner.len(), 3);
         let physical_node_ids: HashSet<PhysicalNodeId> = multiple_owner
             .iter()
-            .map(|node| node.physical_node_id.clone())
+            .map(|node| node.pnode_id.clone())
             .collect();
         assert_eq!(physical_node_ids.len(), 3);
     }
@@ -360,14 +356,14 @@ mod tests {
         let key = b"test-key";
         let owners = topology.token_owners_for(key, 2, ReplicaPolicy::DistinctNodes);
         assert_eq!(owners.len(), 2);
-        let primary_id = owners[0].physical_node_id.clone();
-        let successor_id = owners[1].physical_node_id.clone();
+        let primary_id = owners[0].pnode_id.clone();
+        let successor_id = owners[1].pnode_id.clone();
 
         let mut topology = topology;
         topology.remove_node(&primary_id);
 
         let new_owners = topology.token_owners_for(key, 1, ReplicaPolicy::DistinctNodes);
         assert_eq!(new_owners.len(), 1);
-        assert_eq!(new_owners[0].physical_node_id, successor_id);
+        assert_eq!(new_owners[0].pnode_id, successor_id);
     }
 }
