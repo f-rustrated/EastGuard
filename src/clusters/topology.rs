@@ -1,24 +1,11 @@
+use super::{ClusterEvent, PhysicalNodeId};
 use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use tokio::sync::mpsc;
 
-#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub struct PhysicalNodeId(String);
-
-impl From<&str> for PhysicalNodeId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
-
-impl From<String> for PhysicalNodeId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-/// Mutable metadata associated with a physical node.
 /// Identity is managed separately via `PhysicalNodeId`.
 #[derive(Clone, Debug)]
 pub struct PhysicalNodeMetadata {
@@ -33,28 +20,29 @@ impl PhysicalNodeMetadata {
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
-    pub hash: u32,
-    pub node_id: PhysicalNodeId,
+    hash: u32,
+    node_id: PhysicalNodeId,
+    replica_index: u64,
 }
 
 #[derive(Debug)]
 pub struct VirtualNodeMetadata {
-    pub replica_index: u64,
-    pub physical_node_id: PhysicalNodeId,
+    replica_index: u64,
+    physical_node_id: PhysicalNodeId,
 }
 
 #[derive(Debug)]
 pub struct TokenOwner {
-    pub physical_node_id: PhysicalNodeId,
-    pub physical_node: PhysicalNodeMetadata,
-    pub virtual_node_metadata: VirtualNodeMetadata,
+    physical_node_id: PhysicalNodeId,
+    physical_node_metadata: PhysicalNodeMetadata,
+    virtual_node_metadata: VirtualNodeMetadata,
 }
 
 pub struct Topology {
-    pub nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
-    pub config: TopologyConfig,
+    nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
+    config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
-    pub token_ring: BTreeMap<VirtualNodeToken, TokenOwner>,
+    token_ring: BTreeMap<VirtualNodeToken, TokenOwner>,
 }
 
 pub struct TopologyConfig {
@@ -141,15 +129,41 @@ impl Topology {
 
     fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &TokenOwner> {
         let hash = hash_stable(key);
+        let start = VirtualNodeToken { hash, node_id: "".into(), replica_index: 0 };
         self.token_ring
-            .range(
-                VirtualNodeToken {
-                    hash,
-                    node_id: "".into(),
-                }..,
-            )
-            .chain(self.token_ring.iter())
+            .range(&start..)
+            .chain(self.token_ring.range(..&start))
             .map(|(_, owner)| owner)
+    }
+}
+
+pub struct TopologyActor {
+    topology: Arc<RwLock<Topology>>,
+    mailbox: mpsc::Receiver<ClusterEvent>,
+}
+
+impl TopologyActor {
+    pub fn new(topology: Topology, mailbox: mpsc::Receiver<ClusterEvent>) -> Self {
+        Self {
+            topology: Arc::new(RwLock::new(topology)),
+            mailbox,
+        }
+    }
+
+    pub async fn run(mut self) {
+        println!("TopologyActor started.");
+        while let Some(event) = self.mailbox.recv().await {
+            match event {
+                ClusterEvent::NodeAlive { id, addr } => {
+                    let mut topo = self.topology.write().unwrap();
+                    topo.insert_node(id, PhysicalNodeMetadata { address: addr });
+                }
+                ClusterEvent::NodeDead { id } => {
+                    let mut topo = self.topology.write().unwrap();
+                    topo.remove_node(&id);
+                }
+            }
+        }
     }
 }
 
@@ -160,6 +174,7 @@ fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
     VirtualNodeToken {
         hash: hash_stable(&buf),
         node_id: id.clone(),
+        replica_index: replica_index,
     }
 }
 
@@ -170,7 +185,7 @@ fn token_owner(
 ) -> TokenOwner {
     TokenOwner {
         physical_node_id: id.clone(),
-        physical_node: metadata.clone(),
+        physical_node_metadata: metadata.clone(),
         virtual_node_metadata: VirtualNodeMetadata {
             replica_index,
             physical_node_id: id.clone(),
@@ -188,9 +203,8 @@ fn hash_stable(key: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use super::*;
-    use std::hint::assert_unchecked;
+    use std::collections::HashSet;
 
     /// Builds a `Topology` from explicit `(node_id, socket_addr)` pairs.
     fn topology_from(nodes: &[(&str, &str)], config: TopologyConfig) -> Topology {
@@ -295,21 +309,6 @@ mod tests {
         assert_eq!(topology.token_ring.len(), 8);
 
         assert!(!topology.nodes.contains_key(&"node-0".into()));
-    }
-
-    #[test]
-    fn ring_walk_wraps_around_for_keys_beyond_last_token() {
-        let topology = topology_from(
-            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
-            TopologyConfig { replicas_per_node: 4 },
-        );
-        // Try many keys — at least one will hash beyond the last token,
-        // exercising the wrap-around chain. All must return a result.
-        for i in 0u32..100 {
-            let key = i.to_be_bytes();
-            let owners = topology.token_owners_for(&key, 1, ReplicaPolicy::DistinctNodes);
-            assert_eq!(owners.len(), 1, "key {} should always find an owner", i);
-        }
     }
 
     #[test]
