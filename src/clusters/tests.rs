@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::{sync::mpsc, time};
-use tokio::sync::RwLock;
 use crate::clusters::swim::SwimActor;
 use crate::clusters::topology::{PhysicalNodeId, Topology, TopologyConfig};
+use tokio::sync::RwLock;
+use tokio::{sync::mpsc, time};
 
 use super::*;
 
@@ -21,7 +21,12 @@ async fn setup() -> (
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-    let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: 256 });
+    let topology = Topology::new(
+        HashMap::new(),
+        TopologyConfig {
+            replicas_per_node: 256,
+        },
+    );
     let topo_handle = Arc::new(RwLock::new(topology));
 
     // Spawn the actor in the background
@@ -301,7 +306,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
+        topo_handle
+            .read()
+            .await
+            .contains_node(&PhysicalNodeId::from(node)),
         "Node should be present in topology after Alive gossip"
     );
 
@@ -324,7 +332,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        !topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
+        !topo_handle
+            .read()
+            .await
+            .contains_node(&PhysicalNodeId::from(node)),
         "Dead gossip should remove the node from the topology ring"
     );
 }

@@ -3,11 +3,6 @@ mod connections;
 
 mod clusters;
 
-use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::{Arc};
-use tokio::{net::TcpListener, sync::mpsc};
-use tokio::sync::RwLock;
 use crate::{
     clusters::{
         swim::SwimActor,
@@ -20,6 +15,11 @@ use crate::{
         request::ConnectionRequests,
     },
 };
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Debug)]
 pub struct StartUp;
@@ -29,20 +29,25 @@ impl StartUp {
         // Create a channel for the SwimActor
         let local_peer_addr = ENV.peer_socket_addr();
 
-        let (tx_internal, rx_internal) = mpsc::channel(100); // Actor Events
+        let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            TransportLayer::new(local_peer_addr, tx_internal.clone(), rx_outbound).await?;
+            TransportLayer::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
 
-        let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: ENV.replicas_per_node });
+        let topology = Topology::new(
+            HashMap::new(),
+            TopologyConfig {
+                replicas_per_node: ENV.replicas_per_node,
+            },
+        );
         let topo_handle = Arc::new(RwLock::new(topology));
 
         // 3. Create Actor
         let swim_actor = SwimActor::new(
             local_peer_addr,
-            rx_internal,
-            tx_internal,
+            swim_mailbox,
+            swim_sender,
             tx_outbound,
             topo_handle,
         );

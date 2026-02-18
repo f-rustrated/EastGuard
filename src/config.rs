@@ -30,7 +30,7 @@ pub struct Environment {
     /// Higher values improve key distribution but increase memory usage.
     /// --replicas-per-node or REPLICAS_PER_NODE=
     #[arg(long, env = "REPLICAS_PER_NODE", default_value_t = 256)]
-    pub replicas_per_node: u32,
+    pub replicas_per_node: u64,
 }
 
 impl Environment {
@@ -109,10 +109,14 @@ mod tests {
         // Simulate: my-server --port 9999 --host 0.0.0.0 --dir /tmp/test
         let args = vec![
             "my-server",
-            "--port", "9999",
-            "--host", "0.0.0.0",
-            "--dir", "/tmp/test",
-            "--replicas-per-node", "8",
+            "--port",
+            "9999",
+            "--host",
+            "0.0.0.0",
+            "--dir",
+            "/tmp/test",
+            "--replicas-per-node",
+            "8",
         ];
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
@@ -127,9 +131,12 @@ mod tests {
     fn test_flags_override2() {
         let args = vec![
             "my-server",
-            "-p", "9999",
-            "--host", "0.0.0.0", // -h is preserved for --help.
-            "-d", "/tmp/test",
+            "-p",
+            "9999",
+            "--host",
+            "0.0.0.0", // -h is preserved for --help.
+            "-d",
+            "/tmp/test",
         ];
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");

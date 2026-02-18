@@ -196,7 +196,6 @@ impl SwimActor {
     }
 
     // --- CORE SWIM LOGIC (Incarnation & State) ---
-
     async fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
         let new_state = match self.members.entry(addr) {
             Entry::Vacant(e) => {
@@ -228,23 +227,18 @@ impl SwimActor {
             }
         };
 
-        let id = PhysicalNodeId::from(addr);
         match new_state {
             NodeState::Alive => {
                 self.livenode_tracker.add(addr);
-                self.topology
-                    .write()
-                    .await
-                    .insert_node(id, PhysicalNodeMetadata { address: addr });
             }
             NodeState::Suspect => {
                 self.livenode_tracker.remove(&addr);
             }
             NodeState::Dead => {
                 self.livenode_tracker.remove(&addr);
-                self.topology.write().await.remove_node(&id);
             }
         }
+        self.topology.write().await.update_topology(addr, new_state);
     }
 
     async fn apply_membership_update(&mut self, member: Member) {

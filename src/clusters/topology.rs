@@ -1,8 +1,10 @@
+use bincode::{Decode, Encode};
 use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use bincode::{Decode, Encode};
+
+use crate::clusters::NodeState;
 
 #[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
 pub struct PhysicalNodeId(pub String);
@@ -32,7 +34,7 @@ pub struct PhysicalNodeMetadata {
     pub address: SocketAddr,
 }
 
-/// node_id and replica_index for tie breaker 
+/// node_id and replica_index for tie breaker
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
     hash: u32,
@@ -55,7 +57,7 @@ pub struct Topology {
 }
 
 pub struct TopologyConfig {
-    pub replicas_per_node: u32,
+    pub replicas_per_node: u64,
 }
 
 pub enum ReplicaPolicy {
@@ -73,11 +75,7 @@ impl Topology {
         let mut token_ring = BTreeMap::new();
         for (id, metadata) in &nodes {
             for i in 0..config.replicas_per_node {
-                let replica_index = i as u64;
-                token_ring.insert(
-                    ring_key(id, replica_index),
-                    token_owner(id, metadata, replica_index),
-                );
+                token_ring.insert(ring_key(id, i), token_owner(id, metadata, i));
             }
         }
         Self {
@@ -87,7 +85,22 @@ impl Topology {
         }
     }
 
-    pub fn insert_node(&mut self, id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
+    pub fn update_topology(&mut self, addr: SocketAddr, state: NodeState) {
+        let id = PhysicalNodeId::from(addr);
+        match state {
+            NodeState::Alive => {
+                self.insert_node(id, PhysicalNodeMetadata { address: addr });
+            }
+
+            NodeState::Dead => {
+                self.remove_node(&id);
+            }
+            NodeState::Suspect => {}
+        }
+    }
+
+    fn insert_node(&mut self, id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
+        // ? what if metadata needs to be changed ?
         if self.nodes.contains_key(&id) {
             return;
         }
@@ -101,11 +114,7 @@ impl Topology {
         self.nodes.insert(id, metadata);
     }
 
-    pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
-        self.nodes.contains_key(id)
-    }
-    
-    pub fn remove_node(&mut self, id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
+    fn remove_node(&mut self, id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
         let metadata = self.nodes.remove(id)?;
         for i in 0..self.config.replicas_per_node {
             self.token_ring.remove(&ring_key(id, i as u64));
@@ -142,14 +151,22 @@ impl Topology {
 
     fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
         let hash = hash_stable(key);
-        let start = VirtualNodeToken { hash, node_id: "".into(), replica_index: 0 };
+        let start = VirtualNodeToken {
+            hash,
+            node_id: "".into(),
+            replica_index: 0,
+        };
         self.token_ring
             .range(&start..)
             .chain(self.token_ring.range(..&start))
             .map(|(_, owner)| owner)
     }
-}
 
+    #[cfg(test)]
+    pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
+        self.nodes.contains_key(id)
+    }
+}
 
 fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
     let mut buf = Vec::with_capacity(id.0.len() + 8);
@@ -308,7 +325,7 @@ mod tests {
             },
         );
 
-        let single_owner =
+        let single_owner: Vec<&VirtualNode> =
             topology.token_owners_for("hello".as_bytes(), 1, ReplicaPolicy::DistinctNodes);
         assert_eq!(single_owner.len(), 1);
 
@@ -325,8 +342,14 @@ mod tests {
     #[test]
     fn token_owners_for_limited_to_available_node_count_with_distinct_policy() {
         let topology = topology_from(
-            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081"), ("node-2", "127.0.0.1:8082")],
-            TopologyConfig { replicas_per_node: 4 },
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                replicas_per_node: 4,
+            },
         );
         // Asking for more replicas than physical nodes exist should return at most 3.
         let owners = topology.token_owners_for(b"any-key", 5, ReplicaPolicy::DistinctNodes);
@@ -341,7 +364,9 @@ mod tests {
                 ("node-1", "127.0.0.1:8081"),
                 ("node-2", "127.0.0.1:8082"),
             ],
-            TopologyConfig { replicas_per_node: 150 },
+            TopologyConfig {
+                replicas_per_node: 150,
+            },
         );
 
         let key = b"test-key";
