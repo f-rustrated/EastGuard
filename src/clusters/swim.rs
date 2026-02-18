@@ -27,7 +27,7 @@ pub struct SwimActor {
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
-    alive_nodes: LiveNodeTracker, // Optimization for random selection
+    livenode_tracker: LiveNodeTracker,
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -48,7 +48,7 @@ impl SwimActor {
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
-            alive_nodes: LiveNodeTracker::default(),
+            livenode_tracker: LiveNodeTracker::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }
@@ -208,9 +208,9 @@ impl SwimActor {
 
         // Maintain optimization set
         if entry.state == NodeState::Alive {
-            self.alive_nodes.add(addr);
+            self.livenode_tracker.add(addr);
         } else {
-            self.alive_nodes.remove(&addr);
+            self.livenode_tracker.remove(&addr);
         }
     }
 
@@ -241,7 +241,7 @@ impl SwimActor {
             if remote_inc > member.incarnation {
                 member.incarnation = remote_inc;
                 member.state = NodeState::Alive;
-                self.alive_nodes.add(src);
+                self.livenode_tracker.add(src);
             }
         } else {
             // New member discovered via direct message
@@ -254,11 +254,11 @@ impl SwimActor {
     async fn perform_protocol_tick(&mut self) {
         // 1. Pick random Alive member
 
-        if self.alive_nodes.is_empty() {
+        if self.livenode_tracker.is_empty() {
             return;
         }
 
-        if let Some(target) = self.alive_nodes.next() {
+        if let Some(target) = self.livenode_tracker.next() {
             if target == self.local_addr {
                 return;
             }
@@ -287,14 +287,14 @@ impl SwimActor {
     async fn start_indirect_probe(&mut self, target: SocketAddr) {
         let mut peers = Vec::new();
 
-        for _ in 0..self.alive_nodes.len() {
+        for _ in 0..self.livenode_tracker.len() {
             // Stop once we have enough helpers
             if peers.len() >= INDIRECT_PING_COUNT {
                 break;
             }
 
             // Round-robin
-            if let Some(peer) = self.alive_nodes.next() {
+            if let Some(peer) = self.livenode_tracker.next() {
                 // Filter: Don't ask the target or ourselves
                 if peer != target && peer != self.local_addr {
                     peers.push(peer);

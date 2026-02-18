@@ -4,9 +4,8 @@
 
 use bincode::{Decode, Encode};
 use std::net::SocketAddr;
-pub(crate) mod swim;
-
 mod livenode_tracker;
+pub(crate) mod swim;
 pub(crate) mod transport;
 
 #[cfg(test)]
