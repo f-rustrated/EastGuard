@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{self, Duration};
 
-use crate::clusters::topology::{PhysicalNodeId, PhysicalNodeMetadata, Topology};
+use crate::clusters::topology::Topology;
 
 // --- CONFIGURATION ---
 const PROTOCOL_PERIOD: Duration = Duration::from_secs(1);

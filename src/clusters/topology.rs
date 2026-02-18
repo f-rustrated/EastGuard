@@ -7,17 +7,21 @@ use std::net::SocketAddr;
 use crate::clusters::NodeState;
 
 #[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
-pub struct PhysicalNodeId(pub String);
+pub struct PhysicalNodeId(String);
 
-impl From<&str> for PhysicalNodeId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
+impl PhysicalNodeId {
+    fn new(id: impl Into<String>) -> PhysicalNodeId {
+        Self(id.into())
     }
-}
-
-impl From<String> for PhysicalNodeId {
-    fn from(s: String) -> Self {
-        Self(s)
+    fn ring_key(&self, replica_index: u64) -> VirtualNodeToken {
+        let mut buf = Vec::with_capacity(self.0.len() + 8);
+        buf.extend_from_slice(self.0.as_bytes());
+        buf.extend_from_slice(&replica_index.to_be_bytes());
+        VirtualNodeToken {
+            hash: hash_stable(&buf),
+            node_id: self.clone(),
+            replica_index,
+        }
     }
 }
 
@@ -73,11 +77,12 @@ impl Topology {
         config: TopologyConfig,
     ) -> Self {
         let mut token_ring = BTreeMap::new();
-        for (id, metadata) in &nodes {
+        for (pnode_id, metadata) in &nodes {
             for i in 0..config.replicas_per_node {
-                token_ring.insert(ring_key(id, i), token_owner(id, metadata, i));
+                token_ring.insert(pnode_id.ring_key(i), token_owner(pnode_id, metadata, i));
             }
         }
+
         Self {
             nodes,
             config,
@@ -99,25 +104,25 @@ impl Topology {
         }
     }
 
-    fn insert_node(&mut self, id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
+    fn insert_node(&mut self, pnode_id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
         // ? what if metadata needs to be changed ?
-        if self.nodes.contains_key(&id) {
+        if self.nodes.contains_key(&pnode_id) {
             return;
         }
         for i in 0..self.config.replicas_per_node {
             let replica_index = i as u64;
             self.token_ring.insert(
-                ring_key(&id, replica_index),
-                token_owner(&id, &metadata, replica_index),
+                pnode_id.ring_key(replica_index),
+                token_owner(&pnode_id, &metadata, replica_index),
             );
         }
-        self.nodes.insert(id, metadata);
+        self.nodes.insert(pnode_id, metadata);
     }
 
-    fn remove_node(&mut self, id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
-        let metadata = self.nodes.remove(id)?;
+    fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
+        let metadata = self.nodes.remove(pnode_id)?;
         for i in 0..self.config.replicas_per_node {
-            self.token_ring.remove(&ring_key(id, i as u64));
+            self.token_ring.remove(&pnode_id.ring_key(i));
         }
         Some(metadata)
     }
@@ -153,9 +158,10 @@ impl Topology {
         let hash = hash_stable(key);
         let start = VirtualNodeToken {
             hash,
-            node_id: "".into(),
+            node_id: PhysicalNodeId::new(""),
             replica_index: 0,
         };
+
         self.token_ring
             .range(&start..)
             .chain(self.token_ring.range(..&start))
@@ -165,17 +171,6 @@ impl Topology {
     #[cfg(test)]
     pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
         self.nodes.contains_key(id)
-    }
-}
-
-fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
-    let mut buf = Vec::with_capacity(id.0.len() + 8);
-    buf.extend_from_slice(id.0.as_bytes());
-    buf.extend_from_slice(&replica_index.to_be_bytes());
-    VirtualNodeToken {
-        hash: hash_stable(&buf),
-        node_id: id.clone(),
-        replica_index,
     }
 }
 
@@ -209,7 +204,7 @@ mod tests {
         let map = nodes
             .iter()
             .map(|(id, addr)| {
-                let id: PhysicalNodeId = (*id).into();
+                let id: PhysicalNodeId = PhysicalNodeId::new(*id);
                 let address: SocketAddr = addr.parse().expect("invalid socket address");
                 (id, PhysicalNodeMetadata { address })
             })
@@ -233,9 +228,9 @@ mod tests {
         assert_eq!(topology.nodes.len(), 3);
         assert_eq!(topology.token_ring.len(), 12);
 
-        assert!(topology.nodes.contains_key(&"node-1".into()));
-        assert!(topology.nodes.contains_key(&"node-2".into()));
-        assert!(!topology.nodes.contains_key(&"node-3".into()));
+        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-1")));
+        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-2")));
+        assert!(!topology.nodes.contains_key(&PhysicalNodeId::new("node-3")));
     }
 
     #[test]
@@ -252,7 +247,7 @@ mod tests {
         );
 
         topology.insert_node(
-            "node-3".into(),
+            PhysicalNodeId::new("node-3"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8083".parse().unwrap(),
             },
@@ -261,7 +256,7 @@ mod tests {
         assert_eq!(topology.nodes.len(), 4);
         assert_eq!(topology.token_ring.len(), 16);
 
-        assert!(topology.nodes.contains_key(&"node-3".into()));
+        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-3")));
     }
 
     #[test]
@@ -278,7 +273,7 @@ mod tests {
         );
 
         topology.insert_node(
-            "node-2".into(),
+            PhysicalNodeId::new("node-2"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8082".parse().unwrap(),
             },
@@ -301,12 +296,12 @@ mod tests {
             },
         );
 
-        let removed = topology.remove_node(&"node-0".into());
+        let removed = topology.remove_node(&PhysicalNodeId::new("node-0"));
         assert!(removed.is_some());
         assert_eq!(topology.nodes.len(), 2);
         assert_eq!(topology.token_ring.len(), 8);
 
-        assert!(!topology.nodes.contains_key(&"node-0".into()));
+        assert!(!topology.nodes.contains_key(&PhysicalNodeId::new("node-0")));
     }
 
     #[test]
