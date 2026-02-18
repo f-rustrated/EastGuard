@@ -3,8 +3,8 @@ use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 
 /// Identity is managed separately via `PhysicalNodeId`.
 #[derive(Clone, Debug)]
@@ -163,11 +163,11 @@ impl TopologyActor {
         while let Some(event) = self.mailbox.recv().await {
             match event {
                 ClusterEvent::NodeAlive { id, addr } => {
-                    let mut topo = self.topology.write().unwrap();
+                    let mut topo = self.topology.write().await;
                     topo.insert_node(id, PhysicalNodeMetadata { address: addr });
                 }
                 ClusterEvent::NodeDead { id } => {
-                    let mut topo = self.topology.write().unwrap();
+                    let mut topo = self.topology.write().await;
                     topo.remove_node(&id);
                 }
             }
