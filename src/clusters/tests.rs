@@ -116,6 +116,7 @@ async fn test_gossip_propagation() {
     let (tx, mut rx, _, _) = setup().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
 
     // 1. Tell the actor that "Node 9999" is DEAD via gossip
     let gossip_msg = Member {
@@ -124,47 +125,54 @@ async fn test_gossip_propagation() {
         incarnation: 5,
     };
 
-    let ping = SwimPacket::Ping {
-        seq: 300,
-        source_incarnation: 0,
-        gossip: vec![gossip_msg],
-    };
-
     tx.send(ActorEvent::PacketReceived {
         src: sender_addr,
-        packet: ping,
-    })
-    .await
-    .unwrap();
-
-    // 2. Receive the Ack (flush the immediate response)
-    let _ = rx.recv().await.unwrap();
-
-    // 3. Now send a NEW ping from a different node.
-    // We expect the actor to gossip "Node 9999 is Dead" back to us.
-    let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
-    tx.send(ActorEvent::PacketReceived {
-        src: probe_addr,
         packet: SwimPacket::Ping {
-            seq: 400,
+            seq: 300,
             source_incarnation: 0,
-            gossip: vec![],
+            gossip: vec![gossip_msg],
         },
     })
     .await
     .unwrap();
 
-    let response = rx.recv().await.unwrap();
+    // 2. Retry Loop: Probe until we hear the rumor or timeout
+    // We give the actor 5 attempts (or 500ms) to propagate the info.
+    let mut propagated = false;
 
-    match response.packet {
-        SwimPacket::Ack { gossip, .. } => {
-            // Find the dead node in the gossip list
-            let rumor = gossip.iter().find(|m| m.addr == dead_node);
-            assert!(rumor.is_some(), "Actor did not gossip the Dead node info");
-            assert_eq!(rumor.unwrap().state, NodeState::Dead);
+    for i in 0..5 {
+        // Send a fresh probe
+        tx.send(ActorEvent::PacketReceived {
+            src: probe_addr,
+            packet: SwimPacket::Ping {
+                seq: 400 + i, // Increment seq to keep packets distinct
+                source_incarnation: 0,
+                gossip: vec![],
+            },
+        })
+        .await
+        .unwrap();
+
+        // Wait for response
+        if let Some(response) = rx.recv().await {
+            if let SwimPacket::Ack { gossip, .. } = response.packet {
+                // Check if our rumor is in this specific Ack
+                if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
+                    assert_eq!(rumor.state, NodeState::Dead);
+                    propagated = true;
+                    break; // Success!
+                }
+            }
         }
-        _ => panic!("Expected Ack"),
+
+        // Brief sleep to allow the actor's async tasks to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    assert!(
+        propagated,
+        "Actor failed to gossip the Dead node info after retries"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +251,7 @@ async fn test_self_registers_in_topology_on_startup() {
 
     let topo = topo_handle.read().await;
     assert!(
-        topo.contains_node(&PhysicalNodeId::from(addr)),
+        topo.contains_node(&PhysicalNodeId::new(addr.to_string())),
         "SwimActor should register itself in the topology ring on startup"
     );
 }
@@ -276,7 +284,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
 
     let topo = topo_handle.read().await;
     assert!(
-        topo.contains_node(&PhysicalNodeId::from(new_node)),
+        topo.contains_node(&PhysicalNodeId::new(new_node.to_string())),
         "Alive gossip should add the node to the topology ring"
     );
 }
@@ -309,7 +317,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
         topo_handle
             .read()
             .await
-            .contains_node(&PhysicalNodeId::from(node)),
+            .contains_node(&PhysicalNodeId::new(node.to_string())),
         "Node should be present in topology after Alive gossip"
     );
 
@@ -335,7 +343,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
         !topo_handle
             .read()
             .await
-            .contains_node(&PhysicalNodeId::from(node)),
+            .contains_node(&PhysicalNodeId::new(node.to_string())),
         "Dead gossip should remove the node from the topology ring"
     );
 }

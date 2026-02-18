@@ -10,7 +10,7 @@ use crate::clusters::NodeState;
 pub struct PhysicalNodeId(String);
 
 impl PhysicalNodeId {
-    fn new(id: impl Into<String>) -> PhysicalNodeId {
+    pub(crate) fn new(id: impl Into<String>) -> PhysicalNodeId {
         Self(id.into())
     }
     fn ring_key(&self, replica_index: u64) -> VirtualNodeToken {
@@ -22,13 +22,6 @@ impl PhysicalNodeId {
             node_id: self.clone(),
             replica_index,
         }
-    }
-}
-
-/// TODO: Let users define their own NodeId using config
-impl From<SocketAddr> for PhysicalNodeId {
-    fn from(addr: SocketAddr) -> Self {
-        Self(addr.to_string())
     }
 }
 
@@ -91,7 +84,7 @@ impl Topology {
     }
 
     pub fn update(&mut self, addr: SocketAddr, state: NodeState) {
-        let id = PhysicalNodeId::from(addr);
+        let id = PhysicalNodeId::new(addr.to_string());
         match state {
             NodeState::Alive => {
                 self.insert_node(id, PhysicalNodeMetadata { address: addr });
