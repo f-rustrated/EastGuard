@@ -32,6 +32,7 @@ pub struct PhysicalNodeMetadata {
     pub address: SocketAddr,
 }
 
+/// node_id and replica_index for tie breaker 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
     hash: u32,
