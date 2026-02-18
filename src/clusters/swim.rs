@@ -1,7 +1,9 @@
+use crate::clusters::alive_nodes_tracker::AliveNodes;
+
 use super::*;
-use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::IteratorRandom;
+use rand::seq::{IteratorRandom, SliceRandom};
+use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
@@ -28,7 +30,7 @@ pub struct SwimActor {
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
-    alive_nodes: HashSet<SocketAddr>, // Optimization for random selection
+    alive_nodes: AliveNodes, // Optimization for random selection
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -49,7 +51,7 @@ impl SwimActor {
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
-            alive_nodes: HashSet::new(),
+            alive_nodes: AliveNodes::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }
@@ -210,7 +212,7 @@ impl SwimActor {
 
         // Maintain optimization set
         if entry.state == NodeState::Alive {
-            self.alive_nodes.insert(addr);
+            self.alive_nodes.add(addr);
         } else {
             self.alive_nodes.remove(&addr);
         }
@@ -243,7 +245,7 @@ impl SwimActor {
             if remote_inc > member.incarnation {
                 member.incarnation = remote_inc;
                 member.state = NodeState::Alive;
-                self.alive_nodes.insert(src);
+                self.alive_nodes.add(src);
             }
         } else {
             // New member discovered via direct message
