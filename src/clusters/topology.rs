@@ -153,7 +153,11 @@ impl Topology {
     }
 
     pub fn print(&self) {
-        println!("Topology ({} nodes, {} vnodes):", self.nodes.len(), self.token_ring.len());
+        println!(
+            "Topology ({} nodes, {} vnodes):",
+            self.nodes.len(),
+            self.token_ring.len()
+        );
         for (token, owner) in &self.token_ring {
             println!(
                 "  [{:#010x}] {} (replica {}) -> {}",
@@ -201,7 +205,9 @@ fn hash_stable(key: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use super::*;
+    use std::hint::assert_unchecked;
 
     /// Builds a `Topology` from explicit `(node_id, socket_addr)` pairs.
     fn topology_from(nodes: &[(&str, &str)], config: TopologyConfig) -> Topology {
@@ -289,16 +295,12 @@ mod tests {
 
     #[test]
     fn remove_node() {
-        let node_names: Vec<String> = (0..3).map(|idx| format!("node-{}", idx)).collect();
-        let node_addrs: Vec<String> = (0..3).map(|idx| format!("127.0.{}.1:8080", idx)).collect();
-        let nodes: Vec<(&str, &str)> = node_names
-            .iter()
-            .zip(node_addrs.iter())
-            .map(|(name, addr)| (name.as_str(), addr.as_str()))
-            .collect();
-
         let mut topology = topology_from(
-            nodes.as_slice(),
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
             TopologyConfig {
                 replicas_per_node: 4,
             },
@@ -310,5 +312,35 @@ mod tests {
         assert_eq!(topology.token_ring.len(), 8);
 
         assert!(!topology.nodes.contains_key(&"node-0".into()));
+    }
+
+    #[test]
+    fn token_owners() {
+        let node_names: Vec<String> = (0..3).map(|idx| format!("node-{}", idx)).collect();
+        let node_addrs: Vec<String> = (0..3).map(|idx| format!("127.0.{}.1:8080", idx)).collect();
+        let nodes: Vec<(&str, &str)> = node_names
+            .iter()
+            .zip(node_addrs.iter())
+            .map(|(name, addr)| (name.as_str(), addr.as_str()))
+            .collect();
+        let mut topology = topology_from(
+            nodes.as_slice(),
+            TopologyConfig {
+                replicas_per_node: 4,
+            },
+        );
+
+        let single_owner =
+            topology.token_owners_for("hello".as_bytes(), 1, ReplicaPolicy::DistinctNodes);
+        assert_eq!(single_owner.len(), 1);
+
+        let multiple_owner =
+            topology.token_owners_for("hello".as_bytes(), 3, ReplicaPolicy::DistinctNodes);
+        assert_eq!(multiple_owner.len(), 3);
+        let physical_node_ids: HashSet<PhysicalNodeId> = multiple_owner
+            .iter()
+            .map(|node| node.physical_node_id.clone())
+            .collect();
+        assert_eq!(physical_node_ids.len(), 3);
     }
 }
