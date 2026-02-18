@@ -40,23 +40,17 @@ pub struct VirtualNodeToken {
 }
 
 #[derive(Debug)]
-pub struct VirtualNodeMetadata {
+pub struct VirtualNode {
     replica_index: u64,
     physical_node_id: PhysicalNodeId,
-}
-
-#[derive(Debug)]
-pub struct TokenOwner {
-    physical_node_id: PhysicalNodeId,
     physical_node_metadata: PhysicalNodeMetadata,
-    virtual_node_metadata: VirtualNodeMetadata,
 }
 
 pub struct Topology {
     nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
-    token_ring: BTreeMap<VirtualNodeToken, TokenOwner>,
+    token_ring: BTreeMap<VirtualNodeToken, VirtualNode>,
 }
 
 pub struct TopologyConfig {
@@ -123,11 +117,11 @@ impl Topology {
         key: &[u8],
         n: usize,
         policy: ReplicaPolicy,
-    ) -> Vec<&TokenOwner> {
+    ) -> Vec<&VirtualNode> {
         if self.token_ring.is_empty() || n == 0 {
             return Vec::new();
         }
-        let mut result: Vec<&TokenOwner> = Vec::with_capacity(n);
+        let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
         for owner in self.ring_walk(key) {
             if let ReplicaPolicy::DistinctNodes = policy {
                 if result
@@ -145,7 +139,7 @@ impl Topology {
         result
     }
 
-    fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &TokenOwner> {
+    fn ring_walk(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
         let hash = hash_stable(key);
         let start = VirtualNodeToken { hash, node_id: "".into(), replica_index: 0 };
         self.token_ring
@@ -171,14 +165,11 @@ fn token_owner(
     id: &PhysicalNodeId,
     metadata: &PhysicalNodeMetadata,
     replica_index: u64,
-) -> TokenOwner {
-    TokenOwner {
+) -> VirtualNode {
+    VirtualNode {
+        replica_index,
         physical_node_id: id.clone(),
         physical_node_metadata: metadata.clone(),
-        virtual_node_metadata: VirtualNodeMetadata {
-            replica_index,
-            physical_node_id: id.clone(),
-        },
     }
 }
 
