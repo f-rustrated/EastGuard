@@ -237,11 +237,105 @@ async fn test_self_registers_in_topology_on_startup() {
     let (_, _, addr, topo_handle) = setup().await;
 
     // Allow the NodeAlive event to propagate through the channel to TopologyActor.
+    // TODO: make non-flaky tests
     time::sleep(Duration::from_millis(50)).await;
 
     let topo = topo_handle.read().unwrap();
     assert!(
         topo.contains_node(&PhysicalNodeId::from(addr)),
         "SwimActor should register itself in the topology ring on startup"
+    );
+}
+
+#[tokio::test]
+async fn test_alive_gossip_adds_node_to_topology() {
+    let (tx, mut rx, _, topo_handle) = setup().await;
+    let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+    // Gossip that new_node is Alive
+    tx.send(ActorEvent::PacketReceived {
+        src: sender_addr,
+        packet: SwimPacket::Ping {
+            seq: 1,
+            source_incarnation: 1,
+            gossip: vec![Member {
+                addr: new_node,
+                state: NodeState::Alive,
+                incarnation: 1,
+            }],
+        },
+    })
+    .await
+    .unwrap();
+
+    let _ = rx.recv().await.unwrap(); // flush Ack
+
+    // Allow NodeAlive event to propagate to TopologyActor
+    // TODO: make non-flaky tests
+    time::sleep(Duration::from_millis(50)).await;
+
+    let topo = topo_handle.read().unwrap();
+    assert!(
+        topo.contains_node(&PhysicalNodeId::from(new_node)),
+        "Alive gossip should add the node to the topology ring"
+    );
+}
+
+#[tokio::test]
+async fn test_dead_gossip_removes_node_from_topology() {
+    let (tx, mut rx, _, topo_handle) = setup().await;
+    let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+    // Step 1: add the node via Alive gossip
+    tx.send(ActorEvent::PacketReceived {
+        src: sender_addr,
+        packet: SwimPacket::Ping {
+            seq: 1,
+            source_incarnation: 1,
+            gossip: vec![Member {
+                addr: node,
+                state: NodeState::Alive,
+                incarnation: 1,
+            }],
+        },
+    })
+    .await
+    .unwrap();
+
+    let _ = rx.recv().await.unwrap(); // flush Ack
+
+    time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
+        "Node should be present in topology after Alive gossip"
+    );
+
+    // Step 2: mark the node as Dead via gossip
+    tx.send(ActorEvent::PacketReceived {
+        src: sender_addr,
+        packet: SwimPacket::Ping {
+            seq: 2,
+            source_incarnation: 1,
+            gossip: vec![Member {
+                addr: node,
+                state: NodeState::Dead,
+                incarnation: 2,
+            }],
+        },
+    })
+    .await
+    .unwrap();
+
+    let _ = rx.recv().await.unwrap(); // flush Ack
+
+    // Allow NodeDead event to propagate to TopologyActor
+    time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        !topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
+        "Dead gossip should remove the node from the topology ring"
     );
 }
