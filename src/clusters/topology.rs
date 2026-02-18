@@ -99,7 +99,7 @@ impl TokenRing {
 }
 
 pub struct TopologyConfig {
-    pub replicas_per_node: u64,
+    pub vnodes_per_pnode: u64,
 }
 
 impl Topology {
@@ -109,7 +109,7 @@ impl Topology {
     ) -> Self {
         let mut token_ring = TokenRing::default();
         for (pnode_id, metadata) in nodes {
-            token_ring.add_pnode(pnode_id, metadata, config.replicas_per_node);
+            token_ring.add_pnode(pnode_id, metadata, config.vnodes_per_pnode);
         }
 
         Self {
@@ -135,12 +135,12 @@ impl Topology {
     fn insert_node(&mut self, pnode_id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
         // ? what if metadata needs to be changed ?
         self.ring
-            .add_pnode(pnode_id, metadata, self.config.replicas_per_node);
+            .add_pnode(pnode_id, metadata, self.config.vnodes_per_pnode);
     }
 
     fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
         self.ring
-            .remove_pnode(&pnode_id, self.config.replicas_per_node)
+            .remove_pnode(&pnode_id, self.config.vnodes_per_pnode)
     }
 
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
@@ -223,7 +223,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
 
@@ -259,7 +259,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
 
@@ -290,7 +290,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
 
@@ -314,7 +314,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
 
@@ -343,7 +343,7 @@ mod tests {
         let topology = topology_from(
             nodes.as_slice(),
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
 
@@ -368,7 +368,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 4,
+                vnodes_per_pnode: 4,
             },
         );
         // Asking for more replicas than physical nodes exist should return at most 3.
@@ -385,7 +385,7 @@ mod tests {
                 ("node-2", "127.0.0.1:8082"),
             ],
             TopologyConfig {
-                replicas_per_node: 150,
+                vnodes_per_pnode: 150,
             },
         );
 

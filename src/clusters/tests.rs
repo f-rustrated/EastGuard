@@ -24,7 +24,7 @@ async fn setup() -> (
     let topology = Topology::new(
         HashMap::new(),
         TopologyConfig {
-            replicas_per_node: 256,
+            vnodes_per_pnode: 256,
         },
     );
     let topo_handle = Arc::new(RwLock::new(topology));
