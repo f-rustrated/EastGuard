@@ -3,6 +3,7 @@ use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 
 use crate::clusters::NodeState;
 
@@ -59,7 +60,45 @@ pub struct Topology {
     nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
-    token_ring: BTreeMap<VirtualNodeToken, VirtualNode>,
+    token_ring: TokenRing,
+}
+
+#[derive(Default)]
+struct TokenRing(BTreeMap<VirtualNodeToken, VirtualNode>);
+
+impl TokenRing {
+    fn add_pnode(
+        &mut self,
+        pnode_id: &PhysicalNodeId,
+        metadata: &PhysicalNodeMetadata,
+        vnode_cnt: u64,
+    ) {
+        for replica_index in 0..vnode_cnt {
+            self.insert(
+                pnode_id.generate_vnode_token(replica_index),
+                pnode_id.generate_vnode(&metadata, replica_index),
+            );
+        }
+    }
+
+    fn remove_pnode(&mut self, pnode_id: &PhysicalNodeId, vnode_cnt: u64) {
+        for replica_index in 0..vnode_cnt {
+            self.remove(&pnode_id.generate_vnode_token(replica_index));
+        }
+    }
+}
+impl Deref for TokenRing {
+    type Target = BTreeMap<VirtualNodeToken, VirtualNode>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for TokenRing {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 pub struct TopologyConfig {
@@ -78,7 +117,7 @@ impl Topology {
         nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
         config: TopologyConfig,
     ) -> Self {
-        let mut token_ring = BTreeMap::new();
+        let mut token_ring = TokenRing::default();
         for (pnode_id, metadata) in &nodes {
             for i in 0..config.replicas_per_node {
                 token_ring.insert(
@@ -95,7 +134,7 @@ impl Topology {
         }
     }
 
-    pub fn update(&mut self, addr: SocketAddr, state: NodeState) {
+    pub(crate) fn update(&mut self, addr: SocketAddr, state: NodeState) {
         let id = PhysicalNodeId::new(addr.to_string());
         match state {
             NodeState::Alive => {
@@ -114,20 +153,17 @@ impl Topology {
         if self.nodes.contains_key(&pnode_id) {
             return;
         }
-        for replica_index in 0..self.config.replicas_per_node {
-            self.token_ring.insert(
-                pnode_id.generate_vnode_token(replica_index),
-                pnode_id.generate_vnode(&metadata, replica_index),
-            );
-        }
+
+        self.token_ring
+            .add_pnode(&pnode_id, &metadata, self.config.replicas_per_node);
+
         self.nodes.insert(pnode_id, metadata);
     }
 
     fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
         let metadata = self.nodes.remove(pnode_id)?;
-        for i in 0..self.config.replicas_per_node {
-            self.token_ring.remove(&pnode_id.generate_vnode_token(i));
-        }
+        self.token_ring
+            .remove_pnode(&pnode_id, self.config.replicas_per_node);
         Some(metadata)
     }
 
