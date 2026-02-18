@@ -22,38 +22,47 @@ pub struct VirtualNode {
 }
 
 pub struct Topology {
-    nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
-    token_ring: TokenRing,
+    ring: TokenRing,
 }
 
 #[derive(Default)]
-struct TokenRing(BTreeMap<VirtualNodeToken, VirtualNode>);
+struct TokenRing {
+    vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
+    pnodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
+}
 
 impl TokenRing {
     fn add_pnode(
         &mut self,
-        pnode_id: &PhysicalNodeId,
-        metadata: &PhysicalNodeMetadata,
+        pnode_id: PhysicalNodeId,
+        metadata: PhysicalNodeMetadata,
         vnode_cnt: u64,
     ) {
+        if self.pnodes.contains_key(&pnode_id) {
+            return;
+        }
         for replica_index in 0..vnode_cnt {
-            self.0.insert(
+            self.vnodes.insert(
                 pnode_id.generate_vnode_token(replica_index),
                 pnode_id.generate_vnode(&metadata, replica_index),
             );
         }
+        self.pnodes.insert(pnode_id, metadata);
     }
 
-    fn remove_pnode(&mut self, pnode_id: &PhysicalNodeId, vnode_cnt: u64) {
+    fn remove_pnode(
+        &mut self,
+        pnode_id: &PhysicalNodeId,
+        vnode_cnt: u64,
+    ) -> Option<PhysicalNodeMetadata> {
+        let metadata = self.pnodes.remove(pnode_id)?;
         for replica_index in 0..vnode_cnt {
-            self.0.remove(&pnode_id.generate_vnode_token(replica_index));
+            self.vnodes
+                .remove(&pnode_id.generate_vnode_token(replica_index));
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        Some(metadata)
     }
 
     fn walk_clockwise(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
@@ -64,9 +73,9 @@ impl TokenRing {
             replica_index: 0,
         };
 
-        self.0
+        self.vnodes
             .range(&start..)
-            .chain(self.0.range(..&start))
+            .chain(self.vnodes.range(..&start))
             .map(|(_, owner)| owner)
     }
 }
@@ -75,27 +84,19 @@ pub struct TopologyConfig {
     pub replicas_per_node: u64,
 }
 
-pub enum ReplicaPolicy {
-    /// Allow multiple vnodes from the same physical node.
-    Any,
-    /// Skip vnodes whose physical node is already in the result.
-    DistinctNodes,
-}
-
 impl Topology {
     pub fn new(
         nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
         config: TopologyConfig,
     ) -> Self {
         let mut token_ring = TokenRing::default();
-        for (pnode_id, metadata) in &nodes {
+        for (pnode_id, metadata) in nodes {
             token_ring.add_pnode(pnode_id, metadata, config.replicas_per_node);
         }
 
         Self {
-            nodes,
             config,
-            token_ring,
+            ring: token_ring,
         }
     }
 
@@ -115,39 +116,26 @@ impl Topology {
 
     fn insert_node(&mut self, pnode_id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
         // ? what if metadata needs to be changed ?
-        if self.nodes.contains_key(&pnode_id) {
-            return;
-        }
 
-        self.token_ring
-            .add_pnode(&pnode_id, &metadata, self.config.replicas_per_node);
-
-        self.nodes.insert(pnode_id, metadata);
+        self.ring
+            .add_pnode(pnode_id, metadata, self.config.replicas_per_node);
     }
 
     fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
-        let metadata = self.nodes.remove(pnode_id)?;
-        self.token_ring
-            .remove_pnode(&pnode_id, self.config.replicas_per_node);
-        Some(metadata)
+        self.ring
+            .remove_pnode(&pnode_id, self.config.replicas_per_node)
     }
 
-    pub fn token_owners_for(
-        &self,
-        key: &[u8],
-        n: usize,
-        policy: ReplicaPolicy,
-    ) -> Vec<&VirtualNode> {
-        if self.token_ring.is_empty() || n == 0 {
+    pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
+        if self.ring.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
         let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
-        for owner in self.token_ring.walk_clockwise(key) {
-            if let ReplicaPolicy::DistinctNodes = policy {
-                if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
-                    continue;
-                }
+        for owner in self.ring.walk_clockwise(key) {
+            if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
+                continue;
             }
+
             result.push(owner);
             if result.len() == n {
                 break;
@@ -158,7 +146,7 @@ impl Topology {
 
     #[cfg(test)]
     pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
-        self.nodes.contains_key(id)
+        self.ring.pnodes.contains_key(id)
     }
 }
 
@@ -236,12 +224,27 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.nodes.len(), 3);
-        assert_eq!(topology.token_ring.0.len(), 12);
+        assert_eq!(topology.ring.pnodes.len(), 3);
+        assert_eq!(topology.ring.vnodes.len(), 12);
 
-        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-1")));
-        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-2")));
-        assert!(!topology.nodes.contains_key(&PhysicalNodeId::new("node-3")));
+        assert!(
+            topology
+                .ring
+                .pnodes
+                .contains_key(&PhysicalNodeId::new("node-1"))
+        );
+        assert!(
+            topology
+                .ring
+                .pnodes
+                .contains_key(&PhysicalNodeId::new("node-2"))
+        );
+        assert!(
+            !topology
+                .ring
+                .pnodes
+                .contains_key(&PhysicalNodeId::new("node-3"))
+        );
     }
 
     #[test]
@@ -264,10 +267,15 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.nodes.len(), 4);
-        assert_eq!(topology.token_ring.0.len(), 16);
+        assert_eq!(topology.ring.pnodes.len(), 4);
+        assert_eq!(topology.ring.vnodes.len(), 16);
 
-        assert!(topology.nodes.contains_key(&PhysicalNodeId::new("node-3")));
+        assert!(
+            topology
+                .ring
+                .pnodes
+                .contains_key(&PhysicalNodeId::new("node-3"))
+        );
     }
 
     #[test]
@@ -290,8 +298,8 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.nodes.len(), 3);
-        assert_eq!(topology.token_ring.0.len(), 12);
+        assert_eq!(topology.ring.pnodes.len(), 3);
+        assert_eq!(topology.ring.vnodes.len(), 12);
     }
 
     #[test]
@@ -309,10 +317,15 @@ mod tests {
 
         let removed = topology.remove_node(&PhysicalNodeId::new("node-0"));
         assert!(removed.is_some());
-        assert_eq!(topology.nodes.len(), 2);
-        assert_eq!(topology.token_ring.0.len(), 8);
+        assert_eq!(topology.ring.pnodes.len(), 2);
+        assert_eq!(topology.ring.vnodes.len(), 8);
 
-        assert!(!topology.nodes.contains_key(&PhysicalNodeId::new("node-0")));
+        assert!(
+            !topology
+                .ring
+                .pnodes
+                .contains_key(&PhysicalNodeId::new("node-0"))
+        );
     }
 
     #[test]
@@ -331,12 +344,10 @@ mod tests {
             },
         );
 
-        let single_owner: Vec<&VirtualNode> =
-            topology.token_owners_for("hello".as_bytes(), 1, ReplicaPolicy::DistinctNodes);
+        let single_owner: Vec<&VirtualNode> = topology.token_owners_for("hello".as_bytes(), 1);
         assert_eq!(single_owner.len(), 1);
 
-        let multiple_owner =
-            topology.token_owners_for("hello".as_bytes(), 3, ReplicaPolicy::DistinctNodes);
+        let multiple_owner = topology.token_owners_for("hello".as_bytes(), 3);
         assert_eq!(multiple_owner.len(), 3);
         let physical_node_ids: HashSet<PhysicalNodeId> = multiple_owner
             .iter()
@@ -358,7 +369,7 @@ mod tests {
             },
         );
         // Asking for more replicas than physical nodes exist should return at most 3.
-        let owners = topology.token_owners_for(b"any-key", 5, ReplicaPolicy::DistinctNodes);
+        let owners = topology.token_owners_for(b"any-key", 5);
         assert_eq!(owners.len(), 3);
     }
 
@@ -376,7 +387,7 @@ mod tests {
         );
 
         let key = b"test-key";
-        let owners = topology.token_owners_for(key, 2, ReplicaPolicy::DistinctNodes);
+        let owners = topology.token_owners_for(key, 2);
         assert_eq!(owners.len(), 2);
         let primary_id = owners[0].pnode_id.clone();
         let successor_id = owners[1].pnode_id.clone();
@@ -384,7 +395,7 @@ mod tests {
         let mut topology = topology;
         topology.remove_node(&primary_id);
 
-        let new_owners = topology.token_owners_for(key, 1, ReplicaPolicy::DistinctNodes);
+        let new_owners = topology.token_owners_for(key, 1);
         assert_eq!(new_owners.len(), 1);
         assert_eq!(new_owners[0].pnode_id, successor_id);
     }
