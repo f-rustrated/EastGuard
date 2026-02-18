@@ -4,10 +4,15 @@ mod connections;
 mod clusters;
 
 use anyhow::Result;
+use std::collections::HashMap;
 use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
-    clusters::{swim::SwimActor, transport::TransportLayer},
+    clusters::{
+        swim::SwimActor,
+        topology::{Topology, TopologyActor, TopologyConfig},
+        transport::TransportLayer,
+    },
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -29,11 +34,22 @@ impl StartUp {
         let transport =
             TransportLayer::new(local_peer_addr, tx_internal.clone(), rx_outbound).await?;
 
-        // 2. Create Actor
-        let swim_actor = SwimActor::new(local_peer_addr, rx_internal, tx_internal, tx_outbound);
+        let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: ENV.replicas_per_node });
+        let (tx_cluster, rx_cluster) = mpsc::channel(100);
+        let topo_actor = TopologyActor::new(topology, rx_cluster);
 
-        // Spawn the SwimActor to run in the background
+        // 3. Create Actor
+        let swim_actor = SwimActor::new(
+            local_peer_addr,
+            rx_internal,
+            tx_internal,
+            tx_outbound,
+            tx_cluster,
+        );
+
+        // Spawn Actors
         tokio::spawn(transport.run());
+        tokio::spawn(topo_actor.run());
         tokio::spawn(swim_actor.run());
 
         // run handlers

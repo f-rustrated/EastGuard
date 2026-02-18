@@ -1,9 +1,11 @@
 use tokio::{sync::mpsc, time};
 
 use crate::clusters::swim::SwimActor;
+use crate::clusters::topology::{Topology, TopologyActor, TopologyConfig};
 
 use super::*;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 // Helper to setup the test environment
@@ -14,11 +16,16 @@ async fn setup() -> (
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
+    let (tx_cluster, rx_cluster) = mpsc::channel(100);
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
+    let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: 256 });
+    let topo_actor = TopologyActor::new(topology, rx_cluster);
+    tokio::spawn(topo_actor.run());
+
     // Spawn the actor in the background
-    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out);
+    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, tx_cluster);
     tokio::spawn(actor.run());
 
     (tx_in, rx_out, addr)

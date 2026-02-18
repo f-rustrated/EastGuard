@@ -14,6 +14,40 @@ pub mod topology;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
+#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
+pub struct PhysicalNodeId(pub String);
+
+impl From<&str> for PhysicalNodeId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for PhysicalNodeId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// TODO: Let users define their own NodeId using config
+impl From<SocketAddr> for PhysicalNodeId {
+    fn from(addr: SocketAddr) -> Self {
+        Self(addr.to_string())
+    }
+}
+
+/// Membership events from SWIM; may fire repeatedly for the same node — listeners must be idempotent.
+#[derive(Debug, Clone)]
+pub enum ClusterEvent {
+    NodeAlive {
+        id: PhysicalNodeId,
+        addr: SocketAddr,
+    },
+    NodeDead {
+        id: PhysicalNodeId,
+    },
+}
+
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
