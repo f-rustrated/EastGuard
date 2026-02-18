@@ -1,8 +1,7 @@
+use crate::clusters::livenode_tracker::LiveNodeTracker;
+
 use super::*;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::IteratorRandom;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
@@ -28,7 +27,7 @@ pub struct SwimActor {
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
-    alive_nodes: HashSet<SocketAddr>, // Optimization for random selection
+    livenode_tracker: LiveNodeTracker,
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -49,14 +48,13 @@ impl SwimActor {
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
-            alive_nodes: HashSet::new(),
+            livenode_tracker: LiveNodeTracker::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }
     }
 
     pub async fn run(mut self) {
-        let mut rng = StdRng::from_entropy();
         let mut ticker = time::interval(PROTOCOL_PERIOD);
 
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
@@ -64,16 +62,16 @@ impl SwimActor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.perform_protocol_tick(&mut rng).await;
+                    self.perform_protocol_tick().await;
                 }
                 Some(event) = self.mailbox.recv() => {
-                    self.handle_event(event, &mut rng).await;
+                    self.handle_event(event).await;
                 }
             }
         }
     }
 
-    async fn handle_event(&mut self, event: ActorEvent, rng: &mut StdRng) {
+    async fn handle_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::PacketReceived { src, packet } => {
                 self.handle_packet(src, packet).await;
@@ -86,7 +84,7 @@ impl SwimActor {
                 // If the ACK for this sequence hasn't arrived yet
                 if self.pending_acks.contains_key(&seq) {
                     // Direct ping failed. Try Indirect.
-                    self.start_indirect_probe(target, rng).await;
+                    self.start_indirect_probe(target).await;
                 }
             }
 
@@ -210,9 +208,9 @@ impl SwimActor {
 
         // Maintain optimization set
         if entry.state == NodeState::Alive {
-            self.alive_nodes.insert(addr);
+            self.livenode_tracker.add(addr);
         } else {
-            self.alive_nodes.remove(&addr);
+            self.livenode_tracker.remove(&addr);
         }
     }
 
@@ -243,7 +241,7 @@ impl SwimActor {
             if remote_inc > member.incarnation {
                 member.incarnation = remote_inc;
                 member.state = NodeState::Alive;
-                self.alive_nodes.insert(src);
+                self.livenode_tracker.add(src);
             }
         } else {
             // New member discovered via direct message
@@ -253,14 +251,14 @@ impl SwimActor {
 
     // --- PROBE MECHANICS ---
 
-    async fn perform_protocol_tick(&mut self, rng: &mut StdRng) {
+    async fn perform_protocol_tick(&mut self) {
         // 1. Pick random Alive member
 
-        if self.alive_nodes.is_empty() {
+        if self.livenode_tracker.is_empty() {
             return;
         }
 
-        if let Some(&target) = self.alive_nodes.iter().choose(rng) {
+        if let Some(target) = self.livenode_tracker.next() {
             if target == self.local_addr {
                 return;
             }
@@ -286,16 +284,23 @@ impl SwimActor {
         }
     }
 
-    async fn start_indirect_probe(&mut self, target: SocketAddr, rng: &mut StdRng) {
-        // Select K random peers
-        let peers: Vec<SocketAddr> = self
-            .alive_nodes
-            .iter()
-            .filter(|&&a| a != target && a != self.local_addr)
-            .choose_multiple(rng, INDIRECT_PING_COUNT)
-            .into_iter()
-            .cloned()
-            .collect();
+    async fn start_indirect_probe(&mut self, target: SocketAddr) {
+        let mut peers = Vec::new();
+
+        for _ in 0..self.livenode_tracker.len() {
+            // Stop once we have enough helpers
+            if peers.len() >= INDIRECT_PING_COUNT {
+                break;
+            }
+
+            // Round-robin
+            if let Some(peer) = self.livenode_tracker.next() {
+                // Filter: Don't ask the target or ourselves
+                if peer != target && peer != self.local_addr {
+                    peers.push(peer);
+                }
+            }
+        }
 
         if peers.is_empty() {
             // No helpers -> Fail immediately.
@@ -336,6 +341,9 @@ impl SwimActor {
         let _ = self.outbound.send(OutboundPacket { target, packet }).await;
     }
 
+    // TODO need to keep track of recent events by
+    // 1. Queuing : this will add some structural complexity with but more deterministic, fast propagation for the recent events if deduplication is done correctly.
+    // 2. Random Selection : simple, not require heavy changes
     fn get_gossip(&self) -> Vec<Member> {
         // Send 3 random members (Optimized: prefer recent changes in real impl)
         self.members.values().take(3).cloned().collect()

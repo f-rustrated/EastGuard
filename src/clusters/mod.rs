@@ -4,8 +4,8 @@
 
 use bincode::{Decode, Encode};
 use std::net::SocketAddr;
+mod livenode_tracker;
 pub(crate) mod swim;
-
 pub(crate) mod transport;
 
 #[cfg(test)]
@@ -61,6 +61,7 @@ pub enum NodeState {
     Dead,
 }
 
+// Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Member {
     pub addr: SocketAddr,
