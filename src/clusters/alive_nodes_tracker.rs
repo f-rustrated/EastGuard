@@ -52,7 +52,7 @@ impl AliveNodes {
         }
     }
 
-    fn next(&mut self) -> Option<SocketAddr> {
+    pub(super) fn next(&mut self) -> Option<SocketAddr> {
         if self.nodes.is_empty() {
             return None;
         }

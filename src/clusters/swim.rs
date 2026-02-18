@@ -66,7 +66,7 @@ impl SwimActor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.perform_protocol_tick(&mut rng).await;
+                    self.perform_protocol_tick().await;
                 }
                 Some(event) = self.mailbox.recv() => {
                     self.handle_event(event, &mut rng).await;
@@ -88,7 +88,7 @@ impl SwimActor {
                 // If the ACK for this sequence hasn't arrived yet
                 if self.pending_acks.contains_key(&seq) {
                     // Direct ping failed. Try Indirect.
-                    self.start_indirect_probe(target, rng).await;
+                    self.start_indirect_probe(target).await;
                 }
             }
 
@@ -255,14 +255,14 @@ impl SwimActor {
 
     // --- PROBE MECHANICS ---
 
-    async fn perform_protocol_tick(&mut self, rng: &mut StdRng) {
+    async fn perform_protocol_tick(&mut self) {
         // 1. Pick random Alive member
 
         if self.alive_nodes.is_empty() {
             return;
         }
 
-        if let Some(&target) = self.alive_nodes.iter().choose(rng) {
+        if let Some(target) = self.alive_nodes.next() {
             if target == self.local_addr {
                 return;
             }
@@ -288,16 +288,23 @@ impl SwimActor {
         }
     }
 
-    async fn start_indirect_probe(&mut self, target: SocketAddr, rng: &mut StdRng) {
-        // Select K random peers
-        let peers: Vec<SocketAddr> = self
-            .alive_nodes
-            .iter()
-            .filter(|&&a| a != target && a != self.local_addr)
-            .choose_multiple(rng, INDIRECT_PING_COUNT)
-            .into_iter()
-            .cloned()
-            .collect();
+    async fn start_indirect_probe(&mut self, target: SocketAddr) {
+        let mut peers = Vec::new();
+
+        for _ in 0..self.alive_nodes.len() {
+            // Stop once we have enough helpers
+            if peers.len() >= INDIRECT_PING_COUNT {
+                break;
+            }
+
+            // Round-robin
+            if let Some(peer) = self.alive_nodes.next() {
+                // Filter: Don't ask the target or ourselves
+                if peer != target && peer != self.local_addr {
+                    peers.push(peer);
+                }
+            }
+        }
 
         if peers.is_empty() {
             // No helpers -> Fail immediately.

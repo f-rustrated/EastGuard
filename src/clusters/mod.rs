@@ -9,6 +9,7 @@ pub(crate) mod swim;
 pub(crate) mod transport;
 
 mod alive_nodes_tracker;
+mod recent_event_queue;
 #[cfg(test)]
 pub mod tests;
 
