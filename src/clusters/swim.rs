@@ -1,16 +1,15 @@
+use crate::clusters::livenode_tracker::LiveNodeTracker;
+
 use super::*;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::IteratorRandom;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::{Arc};
+use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::{self, Duration};
 
-use crate::clusters::topology::{Topology, PhysicalNodeMetadata, PhysicalNodeId};
+use crate::clusters::topology::{PhysicalNodeId, PhysicalNodeMetadata, Topology};
 
 // --- CONFIGURATION ---
 const PROTOCOL_PERIOD: Duration = Duration::from_secs(1);
@@ -33,7 +32,7 @@ pub struct SwimActor {
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
-    alive_nodes: HashSet<SocketAddr>, // Optimization for random selection
+    livenode_tracker: LiveNodeTracker,
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -56,34 +55,34 @@ impl SwimActor {
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
-            alive_nodes: HashSet::new(),
+            livenode_tracker: LiveNodeTracker::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }
     }
 
     pub async fn run(mut self) {
-        let mut rng = StdRng::from_entropy();
         let mut ticker = time::interval(PROTOCOL_PERIOD);
 
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
 
         // Register ourselves so downstream components (e.g. topology ring) know we exist.
-        self.update_member(self.local_addr, NodeState::Alive, self.incarnation).await;
+        self.update_member(self.local_addr, NodeState::Alive, self.incarnation)
+            .await;
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.perform_protocol_tick(&mut rng).await;
+                    self.perform_protocol_tick().await;
                 }
                 Some(event) = self.mailbox.recv() => {
-                    self.handle_event(event, &mut rng).await;
+                    self.handle_event(event).await;
                 }
             }
         }
     }
 
-    async fn handle_event(&mut self, event: ActorEvent, rng: &mut StdRng) {
+    async fn handle_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::PacketReceived { src, packet } => {
                 self.handle_packet(src, packet).await;
@@ -96,7 +95,7 @@ impl SwimActor {
                 // If the ACK for this sequence hasn't arrived yet
                 if self.pending_acks.contains_key(&seq) {
                     // Direct ping failed. Try Indirect.
-                    self.start_indirect_probe(target, rng).await;
+                    self.start_indirect_probe(target).await;
                 }
             }
 
@@ -105,7 +104,8 @@ impl SwimActor {
                 if let Some(member) = self.members.get(&target) {
                     if member.state == NodeState::Alive {
                         println!("Node {} is SUSPECT (Inc: {})", target, member.incarnation);
-                        self.update_member(target, NodeState::Suspect, member.incarnation).await;
+                        self.update_member(target, NodeState::Suspect, member.incarnation)
+                            .await;
 
                         // Schedule Suspect -> Dead transition
                         let tx = self.self_tx.clone();
@@ -122,7 +122,8 @@ impl SwimActor {
                 if let Some(member) = self.members.get(&target) {
                     if member.state == NodeState::Suspect {
                         println!("Node {} is DEAD", target);
-                        self.update_member(target, NodeState::Dead, member.incarnation).await;
+                        self.update_member(target, NodeState::Dead, member.incarnation)
+                            .await;
                     }
                 }
             }
@@ -200,7 +201,11 @@ impl SwimActor {
         let new_state = match self.members.entry(addr) {
             Entry::Vacant(e) => {
                 // New member: set state directly, no SWIM rules apply yet.
-                e.insert(Member { addr, state, incarnation });
+                e.insert(Member {
+                    addr,
+                    state,
+                    incarnation,
+                });
                 state
             }
             Entry::Occupied(e) => {
@@ -226,14 +231,17 @@ impl SwimActor {
         let id = PhysicalNodeId::from(addr);
         match new_state {
             NodeState::Alive => {
-                self.alive_nodes.insert(addr);
-                self.topology.write().await.insert_node(id, PhysicalNodeMetadata { address: addr });
+                self.livenode_tracker.add(addr);
+                self.topology
+                    .write()
+                    .await
+                    .insert_node(id, PhysicalNodeMetadata { address: addr });
             }
             NodeState::Suspect => {
-                self.alive_nodes.remove(&addr);
+                self.livenode_tracker.remove(&addr);
             }
             NodeState::Dead => {
-                self.alive_nodes.remove(&addr);
+                self.livenode_tracker.remove(&addr);
                 self.topology.write().await.remove_node(&id);
             }
         }
@@ -256,13 +264,14 @@ impl SwimActor {
             }
             return;
         }
-        self.update_member(member.addr, member.state, member.incarnation).await;
+        self.update_member(member.addr, member.state, member.incarnation)
+            .await;
     }
 
     async fn handle_incarnation_check(&mut self, src: SocketAddr, remote_inc: u64) {
         // If we receive a direct message from someone, they are obviously Alive.
         // If their incarnation is higher than we thought, update it.
-        if let Some(member) = self.members.get(&src) {
+        if let Some(member) = self.members.get_mut(&src) {
             if remote_inc > member.incarnation {
                 self.update_member(src, NodeState::Alive, remote_inc).await;
             }
@@ -274,14 +283,14 @@ impl SwimActor {
 
     // --- PROBE MECHANICS ---
 
-    async fn perform_protocol_tick(&mut self, rng: &mut StdRng) {
+    async fn perform_protocol_tick(&mut self) {
         // 1. Pick random Alive member
 
-        if self.alive_nodes.is_empty() {
+        if self.livenode_tracker.is_empty() {
             return;
         }
 
-        if let Some(&target) = self.alive_nodes.iter().choose(rng) {
+        if let Some(target) = self.livenode_tracker.next() {
             if target == self.local_addr {
                 return;
             }
@@ -307,16 +316,23 @@ impl SwimActor {
         }
     }
 
-    async fn start_indirect_probe(&mut self, target: SocketAddr, rng: &mut StdRng) {
-        // Select K random peers
-        let peers: Vec<SocketAddr> = self
-            .alive_nodes
-            .iter()
-            .filter(|&&a| a != target && a != self.local_addr)
-            .choose_multiple(rng, INDIRECT_PING_COUNT)
-            .into_iter()
-            .cloned()
-            .collect();
+    async fn start_indirect_probe(&mut self, target: SocketAddr) {
+        let mut peers = Vec::new();
+
+        for _ in 0..self.livenode_tracker.len() {
+            // Stop once we have enough helpers
+            if peers.len() >= INDIRECT_PING_COUNT {
+                break;
+            }
+
+            // Round-robin
+            if let Some(peer) = self.livenode_tracker.next() {
+                // Filter: Don't ask the target or ourselves
+                if peer != target && peer != self.local_addr {
+                    peers.push(peer);
+                }
+            }
+        }
 
         if peers.is_empty() {
             // No helpers -> Fail immediately.
@@ -357,6 +373,9 @@ impl SwimActor {
         let _ = self.outbound.send(OutboundPacket { target, packet }).await;
     }
 
+    // TODO need to keep track of recent events by
+    // 1. Queuing : this will add some structural complexity with but more deterministic, fast propagation for the recent events if deduplication is done correctly.
+    // 2. Random Selection : simple, not require heavy changes
     fn get_gossip(&self) -> Vec<Member> {
         // Send 3 random members (Optimized: prefer recent changes in real impl)
         self.members.values().take(3).cloned().collect()
