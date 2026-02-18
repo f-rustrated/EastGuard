@@ -341,6 +341,9 @@ impl SwimActor {
         let _ = self.outbound.send(OutboundPacket { target, packet }).await;
     }
 
+    // TODO need to keep track of recent events by
+    // 1. Queuing : this will add some structural complexity with but more deterministic, fast propagation for the recent events if deduplication is done correctly.
+    // 2. Random Selection : simple, not require heavy changes
     fn get_gossip(&self) -> Vec<Member> {
         // Send 3 random members (Optimized: prefer recent changes in real impl)
         self.members.values().take(3).cloned().collect()
