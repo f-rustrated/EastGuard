@@ -151,23 +151,6 @@ impl Topology {
             .chain(self.token_ring.iter())
             .map(|(_, owner)| owner)
     }
-
-    pub fn print(&self) {
-        println!(
-            "Topology ({} nodes, {} vnodes):",
-            self.nodes.len(),
-            self.token_ring.len()
-        );
-        for (token, owner) in &self.token_ring {
-            println!(
-                "  [{:#010x}] {} (replica {}) -> {}",
-                token.hash,
-                owner.physical_node_id.0,
-                owner.virtual_node_metadata.replica_index,
-                owner.physical_node.address,
-            );
-        }
-    }
 }
 
 fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
@@ -223,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn topology_construction() {
+    fn new_builds_correct_node_and_vnode_counts() {
         let topology = topology_from(
             &[
                 ("node-0", "127.0.0.1:8080"),
@@ -244,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_node() {
+    fn insert_node_adds_node_and_vnodes_to_ring() {
         let mut topology = topology_from(
             &[
                 ("node-0", "127.0.0.1:8080"),
@@ -270,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_duplicate_node() {
+    fn insert_node_is_idempotent_for_duplicate_id() {
         let mut topology = topology_from(
             &[
                 ("node-0", "127.0.0.1:8080"),
@@ -294,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_node() {
+    fn remove_node_cleans_up_node_and_its_vnodes() {
         let mut topology = topology_from(
             &[
                 ("node-0", "127.0.0.1:8080"),
@@ -315,7 +298,22 @@ mod tests {
     }
 
     #[test]
-    fn token_owners() {
+    fn ring_walk_wraps_around_for_keys_beyond_last_token() {
+        let topology = topology_from(
+            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
+            TopologyConfig { replicas_per_node: 4 },
+        );
+        // Try many keys — at least one will hash beyond the last token,
+        // exercising the wrap-around chain. All must return a result.
+        for i in 0u32..100 {
+            let key = i.to_be_bytes();
+            let owners = topology.token_owners_for(&key, 1, ReplicaPolicy::DistinctNodes);
+            assert_eq!(owners.len(), 1, "key {} should always find an owner", i);
+        }
+    }
+
+    #[test]
+    fn token_owners_for_returns_distinct_physical_nodes_with_distinct_policy() {
         let node_names: Vec<String> = (0..3).map(|idx| format!("node-{}", idx)).collect();
         let node_addrs: Vec<String> = (0..3).map(|idx| format!("127.0.{}.1:8080", idx)).collect();
         let nodes: Vec<(&str, &str)> = node_names
@@ -342,5 +340,41 @@ mod tests {
             .map(|node| node.physical_node_id.clone())
             .collect();
         assert_eq!(physical_node_ids.len(), 3);
+    }
+
+    #[test]
+    fn token_owners_for_limited_to_available_node_count_with_distinct_policy() {
+        let topology = topology_from(
+            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081"), ("node-2", "127.0.0.1:8082")],
+            TopologyConfig { replicas_per_node: 4 },
+        );
+        // Asking for more replicas than physical nodes exist should return at most 3.
+        let owners = topology.token_owners_for(b"any-key", 5, ReplicaPolicy::DistinctNodes);
+        assert_eq!(owners.len(), 3);
+    }
+
+    #[test]
+    fn removing_primary_owner_promotes_next_node() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig { replicas_per_node: 150 },
+        );
+
+        let key = b"test-key";
+        let owners = topology.token_owners_for(key, 2, ReplicaPolicy::DistinctNodes);
+        assert_eq!(owners.len(), 2);
+        let primary_id = owners[0].physical_node_id.clone();
+        let successor_id = owners[1].physical_node_id.clone();
+
+        let mut topology = topology;
+        topology.remove_node(&primary_id);
+
+        let new_owners = topology.token_owners_for(key, 1, ReplicaPolicy::DistinctNodes);
+        assert_eq!(new_owners.len(), 1);
+        assert_eq!(new_owners[0].physical_node_id, successor_id);
     }
 }
