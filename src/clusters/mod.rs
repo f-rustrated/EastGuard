@@ -10,6 +10,7 @@ pub(crate) mod transport;
 
 #[cfg(test)]
 pub mod tests;
+pub mod topology;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
