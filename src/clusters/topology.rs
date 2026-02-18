@@ -78,6 +78,24 @@ impl TokenRing {
             .chain(self.vnodes.range(..&start))
             .map(|(_, owner)| owner)
     }
+
+    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
+        if self.vnodes.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
+        for owner in self.walk_clockwise(key) {
+            if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
+                continue;
+            }
+
+            result.push(owner);
+            if result.len() == n {
+                break;
+            }
+        }
+        result
+    }
 }
 
 pub struct TopologyConfig {
@@ -116,7 +134,6 @@ impl Topology {
 
     fn insert_node(&mut self, pnode_id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
         // ? what if metadata needs to be changed ?
-
         self.ring
             .add_pnode(pnode_id, metadata, self.config.replicas_per_node);
     }
@@ -127,21 +144,7 @@ impl Topology {
     }
 
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
-        if self.ring.vnodes.is_empty() || n == 0 {
-            return Vec::new();
-        }
-        let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
-        for owner in self.ring.walk_clockwise(key) {
-            if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
-                continue;
-            }
-
-            result.push(owner);
-            if result.len() == n {
-                break;
-            }
-        }
-        result
+        self.ring.token_owners_for(key, n)
     }
 
     #[cfg(test)]
