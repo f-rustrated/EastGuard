@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::{sync::mpsc, time};
-use tokio::sync::RwLock;
+
 use crate::clusters::swim::SwimActor;
-use crate::clusters::topology::{Topology, TopologyActor, TopologyConfig};
+use crate::clusters::topology::{Topology, TopologyConfig};
 
 use super::*;
 
@@ -18,17 +18,14 @@ async fn setup() -> (
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
-    let (tx_cluster, rx_cluster) = mpsc::channel(100);
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
     let topology = Topology::new(HashMap::new(), TopologyConfig { replicas_per_node: 256 });
-    let topo_actor = TopologyActor::new(topology, rx_cluster);
-    let topo_handle = topo_actor.topology_handle();
-    tokio::spawn(topo_actor.run());
+    let topo_handle = Arc::new(RwLock::new(topology));
 
     // Spawn the actor in the background
-    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, tx_cluster);
+    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, topo_handle.clone());
     tokio::spawn(actor.run());
 
     (tx_in, rx_out, addr, topo_handle)
@@ -236,11 +233,10 @@ async fn test_indirect_ping_trigger() {
 async fn test_self_registers_in_topology_on_startup() {
     let (_, _, addr, topo_handle) = setup().await;
 
-    // Allow the NodeAlive event to propagate through the channel to TopologyActor.
-    // TODO: make non-flaky tests
-    time::sleep(Duration::from_millis(50)).await;
+    // Yield to allow the spawned SwimActor task to start and self-register.
+    time::sleep(Duration::from_millis(10)).await;
 
-    let topo = topo_handle.read().await;
+    let topo = topo_handle.read().unwrap();
     assert!(
         topo.contains_node(&PhysicalNodeId::from(addr)),
         "SwimActor should register itself in the topology ring on startup"
@@ -269,13 +265,11 @@ async fn test_alive_gossip_adds_node_to_topology() {
     .await
     .unwrap();
 
-    let _ = rx.recv().await.unwrap(); // flush Ack
+    // Topology is updated synchronously before the Ack is sent, so receiving
+    // the Ack guarantees the topology has already been updated.
+    let _ = rx.recv().await.unwrap();
 
-    // Allow NodeAlive event to propagate to TopologyActor
-    // TODO: make non-flaky tests
-    time::sleep(Duration::from_millis(50)).await;
-
-    let topo = topo_handle.read().await;
+    let topo = topo_handle.read().unwrap();
     assert!(
         topo.contains_node(&PhysicalNodeId::from(new_node)),
         "Alive gossip should add the node to the topology ring"
@@ -304,12 +298,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
     .await
     .unwrap();
 
-    let _ = rx.recv().await.unwrap(); // flush Ack
-
-    time::sleep(Duration::from_millis(50)).await;
+    let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
+        topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
         "Node should be present in topology after Alive gossip"
     );
 
@@ -329,13 +321,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
     .await
     .unwrap();
 
-    let _ = rx.recv().await.unwrap(); // flush Ack
-
-    // Allow NodeDead event to propagate to TopologyActor
-    time::sleep(Duration::from_millis(50)).await;
+    let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
 
     assert!(
-        !topo_handle.read().await.contains_node(&PhysicalNodeId::from(node)),
+        !topo_handle.read().unwrap().contains_node(&PhysicalNodeId::from(node)),
         "Dead gossip should remove the node from the topology ring"
     );
 }

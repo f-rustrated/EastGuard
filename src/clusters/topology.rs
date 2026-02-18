@@ -1,10 +1,8 @@
-use super::{ClusterEvent, PhysicalNodeId};
+use super::PhysicalNodeId;
 use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
 
 /// Identity is managed separately via `PhysicalNodeId`.
 #[derive(Clone, Debug)]
@@ -141,39 +139,6 @@ impl Topology {
     }
 }
 
-pub struct TopologyActor {
-    topology: Arc<RwLock<Topology>>,
-    mailbox: mpsc::Receiver<ClusterEvent>,
-}
-
-impl TopologyActor {
-    pub fn new(topology: Topology, mailbox: mpsc::Receiver<ClusterEvent>) -> Self {
-        Self {
-            topology: Arc::new(RwLock::new(topology)),
-            mailbox,
-        }
-    }
-
-    pub fn topology_handle(&self) -> Arc<RwLock<Topology>> {
-        self.topology.clone()
-    }
-
-    pub async fn run(mut self) {
-        println!("TopologyActor started.");
-        while let Some(event) = self.mailbox.recv().await {
-            match event {
-                ClusterEvent::NodeAlive { id, addr } => {
-                    let mut topo = self.topology.write().await;
-                    topo.insert_node(id, PhysicalNodeMetadata { address: addr });
-                }
-                ClusterEvent::NodeDead { id } => {
-                    let mut topo = self.topology.write().await;
-                    topo.remove_node(&id);
-                }
-            }
-        }
-    }
-}
 
 fn ring_key(id: &PhysicalNodeId, replica_index: u64) -> VirtualNodeToken {
     let mut buf = Vec::with_capacity(id.0.len() + 8);
