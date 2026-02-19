@@ -14,22 +14,27 @@ pub mod tests;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
+type NodeId = String;
+
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
     Ping {
         seq: u32,
+        source_node_id: NodeId, 
         source_incarnation: u64,
         gossip: Vec<Member>,
     },
     Ack {
         seq: u32,
+        source_node_id: NodeId, 
         source_incarnation: u64,
         gossip: Vec<Member>,
     },
     PingReq {
         seq: u32,
         target: SocketAddr,
+        source_node_id: NodeId, 
         source_incarnation: u64,
         gossip: Vec<Member>,
     },
@@ -43,9 +48,9 @@ pub enum ActorEvent {
 
     // Internal Timers
     ProtocolTick,
-    DirectProbeTimeout { target: SocketAddr, seq: u32 },
-    IndirectProbeTimeout { target: SocketAddr },
-    SuspectTimeout { target: SocketAddr },
+    DirectProbeTimeout { target_node_id: NodeId, seq: u32 },
+    IndirectProbeTimeout { target_node_id: NodeId },
+    SuspectTimeout { target_node_id: NodeId },
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -65,6 +70,7 @@ pub enum NodeState {
 // Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Member {
+    pub node_id: NodeId,
     pub addr: SocketAddr,
     pub state: NodeState,
     pub incarnation: u64,
