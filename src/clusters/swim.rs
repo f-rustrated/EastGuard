@@ -1,3 +1,4 @@
+use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::livenode_tracker::LiveNodeTracker;
 
 use super::*;
@@ -31,6 +32,7 @@ pub struct SwimActor {
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
     livenode_tracker: LiveNodeTracker,
+    gossip_buffer: GossipBuffer,
 
     // Probe State
     seq_counter: u32,                       // "correlation ID" for the message
@@ -54,6 +56,7 @@ impl SwimActor {
             incarnation: 0,
             members: HashMap::new(),
             livenode_tracker: LiveNodeTracker::default(),
+            gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
             pending_acks: HashMap::new(),
         }
@@ -151,7 +154,7 @@ impl SwimActor {
                 let ack = SwimPacket::Ack {
                     seq,
                     source_incarnation: self.incarnation,
-                    gossip: self.get_gossip(),
+                    gossip: self.gossip_buffer.collect(),
                 };
                 self.send(src, ack).await;
             }
@@ -183,7 +186,7 @@ impl SwimActor {
                 let ping = SwimPacket::Ping {
                     seq: my_seq,
                     source_incarnation: self.incarnation,
-                    gossip: self.get_gossip(),
+                    gossip: self.gossip_buffer.collect(),
                 };
                 self.send(target, ping).await;
             }
@@ -192,7 +195,7 @@ impl SwimActor {
 
     // --- CORE SWIM LOGIC (Incarnation & State) ---
     fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
-        let new_state = match self.members.entry(addr) {
+        let (new_state, changed) = match self.members.entry(addr) {
             Entry::Vacant(e) => {
                 // New member: set state directly, no SWIM rules apply yet.
                 e.insert(Member {
@@ -200,10 +203,13 @@ impl SwimActor {
                     state,
                     incarnation,
                 });
-                state
+                (state, true)
             }
             Entry::Occupied(e) => {
                 let entry = e.into_mut();
+                let old_state = entry.state;
+                let old_inc = entry.incarnation;
+
                 // RULE: Higher incarnation always wins
                 if incarnation > entry.incarnation {
                     entry.incarnation = incarnation;
@@ -218,12 +224,21 @@ impl SwimActor {
                         _ => {}
                     }
                 }
-                entry.state
+
+                (
+                    entry.state,
+                    entry.state != old_state || entry.incarnation != old_inc,
+                )
             }
         };
 
         self.livenode_tracker.update(addr, new_state);
         self.topology.update(addr, new_state);
+
+        if changed {
+            let member = self.members[&addr].clone();
+            self.gossip_buffer.enqueue(member, self.members.len());
+        }
     }
 
     fn apply_membership_update(&mut self, member: Member) {
@@ -239,7 +254,15 @@ impl SwimActor {
                     self.incarnation, new_incarnation
                 );
                 self.incarnation = new_incarnation;
-                // I don't need to broadcast immediately; next Ping/Ack will carry it.
+                // Enqueue refutation so the cluster learns quickly.
+                self.gossip_buffer.enqueue(
+                    Member {
+                        addr: self.local_addr,
+                        state: NodeState::Alive,
+                        incarnation: new_incarnation,
+                    },
+                    self.members.len(),
+                );
             }
             return;
         }
@@ -279,7 +302,7 @@ impl SwimActor {
             let msg = SwimPacket::Ping {
                 seq,
                 source_incarnation: self.incarnation,
-                gossip: self.get_gossip(),
+                gossip: self.gossip_buffer.collect(),
             };
             self.send(target, msg).await;
 
@@ -330,7 +353,7 @@ impl SwimActor {
             seq,
             target,
             source_incarnation: self.incarnation,
-            gossip: self.get_gossip(),
+            gossip: self.gossip_buffer.collect(),
         };
 
         for peer in peers {
@@ -349,14 +372,6 @@ impl SwimActor {
 
     async fn send(&self, target: SocketAddr, packet: SwimPacket) {
         let _ = self.outbound.send(OutboundPacket { target, packet }).await;
-    }
-
-    // TODO need to keep track of recent events by
-    // 1. Queuing : this will add some structural complexity with but more deterministic, fast propagation for the recent events if deduplication is done correctly.
-    // 2. Random Selection : simple, not require heavy changes
-    fn get_gossip(&self) -> Vec<Member> {
-        // Send 3 random members (Optimized: prefer recent changes in real impl)
-        self.members.values().take(3).cloned().collect()
     }
 
     fn next_seq(&mut self) -> u32 {
