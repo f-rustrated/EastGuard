@@ -36,7 +36,7 @@ impl StartUp {
         let topology = Topology::new(
             HashMap::new(),
             TopologyConfig {
-                vnodes_per_pnode: ENV.replicas_per_node,
+                vnodes_per_pnode: ENV.vnodes_per_pnode,
             },
         );
 
