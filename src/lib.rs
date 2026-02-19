@@ -41,7 +41,7 @@ impl StartUp {
         );
 
         // 3. Create Actor
-        let node_id = ENV.resolve_node_id().clone();
+        let node_id = ENV.resolve_node_id();
         let swim_actor = SwimActor::new(
             local_peer_addr,
             node_id,
