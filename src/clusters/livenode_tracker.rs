@@ -56,7 +56,7 @@ mod tests {
     use super::*;
 
     fn node(n: u16) -> NodeId {
-        format!("node-{}", n)
+        NodeId::new(format!("node-{}", n))
     }
 
     #[test]

@@ -14,7 +14,45 @@ pub mod tests;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
-type NodeId = String;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
+pub struct NodeId(String);
+
+impl NodeId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl From<&str> for NodeId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for NodeId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::ops::Deref for NodeId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for NodeId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]

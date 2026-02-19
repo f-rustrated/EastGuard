@@ -68,7 +68,7 @@ impl TokenRing {
         let hash = hash_stable(key);
         let start = VirtualNodeToken {
             hash,
-            pnode_id: String::new(),
+            pnode_id: NodeId::new(""),
             replica_index: 0,
         };
 
@@ -194,7 +194,7 @@ mod tests {
         let map = nodes
             .iter()
             .map(|(id, addr)| {
-                let id: NodeId = id.to_string();
+                let id = NodeId::new(*id);
                 let address: SocketAddr = addr.parse().expect("invalid socket address");
                 (id, PhysicalNodeMetadata { address })
             })
@@ -237,7 +237,7 @@ mod tests {
         );
 
         topology.insert_node(
-            "node-3".to_string(),
+            NodeId::new("node-3"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8083".parse().unwrap(),
             },
@@ -262,7 +262,7 @@ mod tests {
         );
 
         topology.insert_node(
-            "node-2".to_string(),
+            NodeId::new("node-2"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8082".parse().unwrap(),
             },
@@ -285,7 +285,7 @@ mod tests {
             },
         );
 
-        let removed = topology.remove_node(&"node-0".to_string());
+        let removed = topology.remove_node(&NodeId::new("node-0"));
         assert!(removed.is_some());
         assert_eq!(topology.ring.pnodes.len(), 2);
         assert_eq!(topology.ring.vnodes.len(), 8);

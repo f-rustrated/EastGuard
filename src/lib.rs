@@ -8,6 +8,7 @@ use crate::{
         swim::SwimActor,
         topology::{Topology, TopologyConfig},
         transport::TransportLayer,
+        NodeId,
     },
     config::ENV,
     connections::{
@@ -41,7 +42,7 @@ impl StartUp {
         );
 
         // 3. Create Actor
-        let node_id = ENV.resolve_node_id();
+        let node_id = NodeId::new(ENV.resolve_node_id());
         let swim_actor = SwimActor::new(
             local_peer_addr,
             node_id,
