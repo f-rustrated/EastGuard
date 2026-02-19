@@ -8,9 +8,8 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
-    /// TODO: Need to decide whether to provide a NodeId
-    /// #[arg(long, env = "NODE_ID", default_value = "eastguard")]
-    /// pub node_id: String,
+    #[arg(long, env = "NODE_ID")]
+    pub node_id: Option<String>,
 
     #[arg(short, long, env = "SERVER_DIR", default_value = "./data")]
     pub dir: String,
@@ -80,6 +79,7 @@ mod tests {
     #[test]
     fn test_address_formatting() {
         let env = Environment {
+            node_id: Some("node-1".into()),
             dir: "./test".into(),
             port: 3000,
             host: "127.0.0.1".into(),
@@ -97,6 +97,7 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse defaults");
 
+        assert_eq!(env.node_id, None);
         assert_eq!(env.port, 2921); // The default we set
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
@@ -109,6 +110,8 @@ mod tests {
         // Simulate: my-server --port 9999 --host 0.0.0.0 --dir /tmp/test
         let args = vec![
             "my-server",
+            "--node-id",
+            "node-1",
             "--port",
             "9999",
             "--host",
@@ -121,6 +124,7 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
 
+        assert_eq!(env.node_id, Some("node-1".into()));
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.dir, "/tmp/test");
