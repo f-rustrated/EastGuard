@@ -3,17 +3,21 @@ mod connections;
 
 mod clusters;
 
-use anyhow::Result;
-use tokio::{net::TcpListener, sync::mpsc};
-
 use crate::{
-    clusters::{swim::SwimActor, transport::TransportLayer},
+    clusters::{
+        swim::SwimActor,
+        topology::{Topology, TopologyConfig},
+        transport::TransportLayer,
+    },
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
         request::ConnectionRequests,
     },
 };
+use anyhow::Result;
+use std::collections::HashMap;
+use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Debug)]
 pub struct StartUp;
@@ -23,16 +27,29 @@ impl StartUp {
         // Create a channel for the SwimActor
         let local_peer_addr = ENV.peer_socket_addr();
 
-        let (tx_internal, rx_internal) = mpsc::channel(100); // Actor Events
+        let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            TransportLayer::new(local_peer_addr, tx_internal.clone(), rx_outbound).await?;
+            TransportLayer::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
 
-        // 2. Create Actor
-        let swim_actor = SwimActor::new(local_peer_addr, rx_internal, tx_internal, tx_outbound);
+        let topology = Topology::new(
+            HashMap::new(),
+            TopologyConfig {
+                vnodes_per_pnode: ENV.replicas_per_node,
+            },
+        );
 
-        // Spawn the SwimActor to run in the background
+        // 3. Create Actor
+        let swim_actor = SwimActor::new(
+            local_peer_addr,
+            swim_mailbox,
+            swim_sender,
+            tx_outbound,
+            topology,
+        );
+
+        // Spawn Actors
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 

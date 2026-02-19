@@ -6,6 +6,7 @@ use bincode::{Decode, Encode};
 use std::net::SocketAddr;
 mod livenode_tracker;
 pub(crate) mod swim;
+pub(crate) mod topology;
 pub(crate) mod transport;
 
 #[cfg(test)]

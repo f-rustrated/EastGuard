@@ -2,10 +2,12 @@ use crate::clusters::livenode_tracker::LiveNodeTracker;
 
 use super::*;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
+
+use crate::clusters::topology::Topology;
 
 // --- CONFIGURATION ---
 const PROTOCOL_PERIOD: Duration = Duration::from_secs(1);
@@ -24,6 +26,7 @@ pub struct SwimActor {
     outbound: mpsc::Sender<OutboundPacket>, // To Network
 
     // State
+    topology: Topology,
     local_addr: SocketAddr,
     incarnation: u64,
     members: HashMap<SocketAddr, Member>,
@@ -40,11 +43,13 @@ impl SwimActor {
         mailbox: mpsc::Receiver<ActorEvent>,
         self_tx: mpsc::Sender<ActorEvent>,
         outbound: mpsc::Sender<OutboundPacket>,
+        topology: Topology,
     ) -> Self {
         Self {
             mailbox,
             self_tx,
             outbound,
+            topology,
             local_addr,
             incarnation: 0,
             members: HashMap::new(),
@@ -58,6 +63,9 @@ impl SwimActor {
         let mut ticker = time::interval(PROTOCOL_PERIOD);
 
         println!("SwimActor started. Local Incarnation: {}", self.incarnation);
+
+        // Register ourselves so downstream components (e.g. topology ring) know we exist.
+        self.update_member(self.local_addr, NodeState::Alive, self.incarnation);
 
         loop {
             tokio::select! {
@@ -183,35 +191,39 @@ impl SwimActor {
     }
 
     // --- CORE SWIM LOGIC (Incarnation & State) ---
-
     fn update_member(&mut self, addr: SocketAddr, state: NodeState, incarnation: u64) {
-        let entry = self.members.entry(addr).or_insert(Member {
-            addr,
-            state: NodeState::Dead, // Default until updated
-            incarnation: 0,
-        });
-
-        // RULE: Higher incarnation always wins
-        if incarnation > entry.incarnation {
-            entry.incarnation = incarnation;
-            entry.state = state;
-        }
-        // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
-        else if incarnation == entry.incarnation {
-            match (&entry.state, &state) {
-                (NodeState::Alive, NodeState::Suspect) => entry.state = NodeState::Suspect,
-                (NodeState::Alive, NodeState::Dead) => entry.state = NodeState::Dead,
-                (NodeState::Suspect, NodeState::Dead) => entry.state = NodeState::Dead,
-                _ => {} // No change
+        let new_state = match self.members.entry(addr) {
+            Entry::Vacant(e) => {
+                // New member: set state directly, no SWIM rules apply yet.
+                e.insert(Member {
+                    addr,
+                    state,
+                    incarnation,
+                });
+                state
             }
-        }
+            Entry::Occupied(e) => {
+                let entry = e.into_mut();
+                // RULE: Higher incarnation always wins
+                if incarnation > entry.incarnation {
+                    entry.incarnation = incarnation;
+                    entry.state = state;
+                }
+                // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
+                else if incarnation == entry.incarnation {
+                    match (&entry.state, &state) {
+                        (NodeState::Alive, NodeState::Suspect) => entry.state = NodeState::Suspect,
+                        (NodeState::Alive, NodeState::Dead) => entry.state = NodeState::Dead,
+                        (NodeState::Suspect, NodeState::Dead) => entry.state = NodeState::Dead,
+                        _ => {}
+                    }
+                }
+                entry.state
+            }
+        };
 
-        // Maintain optimization set
-        if entry.state == NodeState::Alive {
-            self.livenode_tracker.add(addr);
-        } else {
-            self.livenode_tracker.remove(&addr);
-        }
+        self.livenode_tracker.update(addr, new_state);
+        self.topology.update(addr, new_state);
     }
 
     fn apply_membership_update(&mut self, member: Member) {
@@ -239,9 +251,7 @@ impl SwimActor {
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get_mut(&src) {
             if remote_inc > member.incarnation {
-                member.incarnation = remote_inc;
-                member.state = NodeState::Alive;
-                self.livenode_tracker.add(src);
+                self.update_member(src, NodeState::Alive, remote_inc);
             }
         } else {
             // New member discovered via direct message
@@ -352,5 +362,20 @@ impl SwimActor {
     fn next_seq(&mut self) -> u32 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
+    }
+
+    #[cfg(test)]
+    pub fn topology(&self) -> &Topology {
+        &self.topology
+    }
+
+    #[cfg(test)]
+    pub fn init_self_for_test(&mut self) {
+        self.update_member(self.local_addr, NodeState::Alive, self.incarnation);
+    }
+
+    #[cfg(test)]
+    pub async fn process_event_for_test(&mut self, event: ActorEvent) {
+        self.handle_event(event).await;
     }
 }

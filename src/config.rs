@@ -8,6 +8,10 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
+    /// TODO: Need to decide whether to provide a NodeId
+    /// #[arg(long, env = "NODE_ID", default_value = "eastguard")]
+    /// pub node_id: String,
+
     #[arg(short, long, env = "SERVER_DIR", default_value = "./data")]
     pub dir: String,
 
@@ -21,6 +25,12 @@ pub struct Environment {
     /// --host or -h or HOST=
     #[arg(long, env = "HOST", default_value = "127.0.0.1")]
     pub host: String,
+
+    /// Number of virtual nodes (vnodes) placed on the ring per physical node.
+    /// Higher values improve key distribution but increase memory usage.
+    /// --replicas-per-node or REPLICAS_PER_NODE=
+    #[arg(long, env = "REPLICAS_PER_NODE", default_value_t = 256)]
+    pub replicas_per_node: u64,
 }
 
 impl Environment {
@@ -74,6 +84,7 @@ mod tests {
             port: 3000,
             host: "127.0.0.1".into(),
             cluster_port: 3001,
+            replicas_per_node: 256,
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
@@ -90,6 +101,7 @@ mod tests {
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
         assert_eq!(env.dir, "./data");
+        assert_eq!(env.replicas_per_node, 256);
     }
 
     #[test]
@@ -103,6 +115,8 @@ mod tests {
             "0.0.0.0",
             "--dir",
             "/tmp/test",
+            "--replicas-per-node",
+            "8",
         ];
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
@@ -110,6 +124,7 @@ mod tests {
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.dir, "/tmp/test");
+        assert_eq!(env.replicas_per_node, 8);
     }
 
     #[test]
@@ -118,8 +133,8 @@ mod tests {
             "my-server",
             "-p",
             "9999",
-            "--host", // -h is preserved for --help.
-            "0.0.0.0",
+            "--host",
+            "0.0.0.0", // -h is preserved for --help.
             "-d",
             "/tmp/test",
         ];
