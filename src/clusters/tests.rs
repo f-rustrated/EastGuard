@@ -1,44 +1,39 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 use crate::clusters::topology::{PhysicalNodeId, Topology, TopologyConfig};
-use tokio::sync::RwLock;
 use tokio::{sync::mpsc, time};
 
 use super::*;
+
+fn make_topology() -> Topology {
+    Topology::new(
+        HashMap::new(),
+        TopologyConfig { vnodes_per_pnode: 256 },
+    )
+}
 
 // Helper to setup the test environment
 async fn setup() -> (
     mpsc::Sender<ActorEvent>,       // To send "Fake Network" events
     mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
     SocketAddr,                     // The actor's local address
-    Arc<RwLock<Topology>>,          // Handle to observe topology state
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-    let topology = Topology::new(
-        HashMap::new(),
-        TopologyConfig {
-            vnodes_per_pnode: 256,
-        },
-    );
-    let topo_handle = Arc::new(RwLock::new(topology));
-
-    // Spawn the actor in the background
-    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, topo_handle.clone());
+    let actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, make_topology());
     tokio::spawn(actor.run());
 
-    (tx_in, rx_out, addr, topo_handle)
+    (tx_in, rx_out, addr)
 }
 
 #[tokio::test]
 async fn test_ping_response() {
-    let (tx, mut rx, local_addr, _) = setup().await;
+    let (tx, mut rx, local_addr) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
@@ -70,7 +65,7 @@ async fn test_ping_response() {
 
 #[tokio::test]
 async fn test_refutation_mechanism() {
-    let (tx, mut rx, local_addr, _) = setup().await;
+    let (tx, mut rx, local_addr) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
@@ -113,7 +108,7 @@ async fn test_refutation_mechanism() {
 
 #[tokio::test]
 async fn test_gossip_propagation() {
-    let (tx, mut rx, _, _) = setup().await;
+    let (tx, mut rx, _) = setup().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
@@ -179,7 +174,7 @@ async fn test_gossip_propagation() {
 async fn test_indirect_ping_trigger() {
     // This tests the timer logic: Tick -> Ping -> Timeout -> Indirect Ping
 
-    let (tx, mut rx, _, _) = setup().await;
+    let (tx, mut rx, _) = setup().await;
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -244,106 +239,99 @@ async fn test_indirect_ping_trigger() {
 
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
-    let (_, _, addr, topo_handle) = setup().await;
+    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let (tx_in, rx_in) = mpsc::channel(100);
+    let (tx_out, _rx_out) = mpsc::channel(100);
 
-    // Yield to allow the spawned SwimActor task to start and self-register.
-    time::sleep(Duration::from_millis(50)).await;
+    let mut actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, make_topology());
+    actor.init_self_for_test();
 
-    let topo = topo_handle.read().await;
     assert!(
-        topo.contains_node(&PhysicalNodeId::new(addr.to_string())),
+        actor.topology().contains_node(&PhysicalNodeId::new(addr.to_string())),
         "SwimActor should register itself in the topology ring on startup"
     );
 }
 
 #[tokio::test]
 async fn test_alive_gossip_adds_node_to_topology() {
-    let (tx, mut rx, _, topo_handle) = setup().await;
+    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let (tx_in, rx_in) = mpsc::channel(100);
+    let (tx_out, _rx_out) = mpsc::channel(100);
 
-    // Gossip that new_node is Alive
-    tx.send(ActorEvent::PacketReceived {
-        src: sender_addr,
-        packet: SwimPacket::Ping {
-            seq: 1,
-            source_incarnation: 1,
-            gossip: vec![Member {
-                addr: new_node,
-                state: NodeState::Alive,
-                incarnation: 1,
-            }],
-        },
-    })
-    .await
-    .unwrap();
+    let mut actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, make_topology());
 
-    // Topology is updated synchronously before the Ack is sent, so receiving
-    // the Ack guarantees the topology has already been updated.
-    let _ = rx.recv().await.unwrap();
+    actor
+        .process_event_for_test(ActorEvent::PacketReceived {
+            src: sender_addr,
+            packet: SwimPacket::Ping {
+                seq: 1,
+                source_incarnation: 1,
+                gossip: vec![Member {
+                    addr: new_node,
+                    state: NodeState::Alive,
+                    incarnation: 1,
+                }],
+            },
+        })
+        .await;
 
-    let topo = topo_handle.read().await;
     assert!(
-        topo.contains_node(&PhysicalNodeId::new(new_node.to_string())),
+        actor.topology().contains_node(&PhysicalNodeId::new(new_node.to_string())),
         "Alive gossip should add the node to the topology ring"
     );
 }
 
 #[tokio::test]
 async fn test_dead_gossip_removes_node_from_topology() {
-    let (tx, mut rx, _, topo_handle) = setup().await;
+    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let (tx_in, rx_in) = mpsc::channel(100);
+    let (tx_out, _rx_out) = mpsc::channel(100);
+
+    let mut actor = SwimActor::new(addr, rx_in, tx_in.clone(), tx_out, make_topology());
 
     // Step 1: add the node via Alive gossip
-    tx.send(ActorEvent::PacketReceived {
-        src: sender_addr,
-        packet: SwimPacket::Ping {
-            seq: 1,
-            source_incarnation: 1,
-            gossip: vec![Member {
-                addr: node,
-                state: NodeState::Alive,
-                incarnation: 1,
-            }],
-        },
-    })
-    .await
-    .unwrap();
-
-    let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
+    actor
+        .process_event_for_test(ActorEvent::PacketReceived {
+            src: sender_addr,
+            packet: SwimPacket::Ping {
+                seq: 1,
+                source_incarnation: 1,
+                gossip: vec![Member {
+                    addr: node,
+                    state: NodeState::Alive,
+                    incarnation: 1,
+                }],
+            },
+        })
+        .await;
 
     assert!(
-        topo_handle
-            .read()
-            .await
-            .contains_node(&PhysicalNodeId::new(node.to_string())),
+        actor.topology().contains_node(&PhysicalNodeId::new(node.to_string())),
         "Node should be present in topology after Alive gossip"
     );
 
     // Step 2: mark the node as Dead via gossip
-    tx.send(ActorEvent::PacketReceived {
-        src: sender_addr,
-        packet: SwimPacket::Ping {
-            seq: 2,
-            source_incarnation: 1,
-            gossip: vec![Member {
-                addr: node,
-                state: NodeState::Dead,
-                incarnation: 2,
-            }],
-        },
-    })
-    .await
-    .unwrap();
-
-    let _ = rx.recv().await.unwrap(); // Ack received → topology already updated
+    actor
+        .process_event_for_test(ActorEvent::PacketReceived {
+            src: sender_addr,
+            packet: SwimPacket::Ping {
+                seq: 2,
+                source_incarnation: 1,
+                gossip: vec![Member {
+                    addr: node,
+                    state: NodeState::Dead,
+                    incarnation: 2,
+                }],
+            },
+        })
+        .await;
 
     assert!(
-        !topo_handle
-            .read()
-            .await
-            .contains_node(&PhysicalNodeId::new(node.to_string())),
+        !actor.topology().contains_node(&PhysicalNodeId::new(node.to_string())),
         "Dead gossip should remove the node from the topology ring"
     );
 }

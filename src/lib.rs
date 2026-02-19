@@ -17,8 +17,6 @@ use crate::{
 };
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Debug)]
@@ -41,7 +39,6 @@ impl StartUp {
                 vnodes_per_pnode: ENV.replicas_per_node,
             },
         );
-        let topo_handle = Arc::new(RwLock::new(topology));
 
         // 3. Create Actor
         let swim_actor = SwimActor::new(
@@ -49,7 +46,7 @@ impl StartUp {
             swim_mailbox,
             swim_sender,
             tx_outbound,
-            topo_handle,
+            topology,
         );
 
         // Spawn Actors
