@@ -8,28 +8,29 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
+    #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
+    pub config_dir: String,
+
+    #[arg(long, env = "DATA_DIR", default_value = "./eastguard/data")]
+    pub data_dir: String,
+
     #[arg(long, env = "NODE_ID")]
     pub node_id: Option<String>,
 
-    #[arg(short, long, env = "SERVER_DIR", default_value = "./data")]
-    pub dir: String,
+    #[arg(long, env = "NODE_ID_FILE_NAME", default_value = "node_id")]
+    pub node_id_file_name: String,
 
-    /// --port or -p or PORT=
     #[arg(short, long, env = "PORT", default_value_t = 2921)]
     pub port: u16,
 
-    #[arg(short, long, env = "CLUSTER_PORT", default_value_t = 2922)]
+    #[arg(long, env = "CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
-    /// --host or -h or HOST=
     #[arg(long, env = "HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Number of virtual nodes (vnodes) placed on the ring per physical node.
-    /// Higher values improve key distribution but increase memory usage.
-    /// --replicas-per-node or REPLICAS_PER_NODE=
-    #[arg(long, env = "REPLICAS_PER_NODE", default_value_t = 256)]
-    pub replicas_per_node: u64,
+    #[arg(long, env = "VNODES_PER_NODE", default_value_t = 256)]
+    pub vnodes_per_pnode: u64,
 }
 
 impl Environment {
@@ -38,18 +39,18 @@ impl Environment {
         let env = Environment::parse();
 
         // 2. Perform side effects (creation/validation) just like before
-        if let Err(e) = fs::create_dir_all(&env.dir) {
-            eprintln!("Warning: Could not create directory '{}': {}", env.dir, e);
+        if let Err(e) = fs::create_dir_all(&env.data_dir) {
+            eprintln!("Warning: Could not create directory '{}': {}", env.data_dir, e);
         }
 
         // Validate write permissions
-        let test_file = format!("{}/.write_test", env.dir);
+        let test_file = format!("{}/.write_test", env.data_dir);
         if let Ok(_) = OpenOptions::new().write(true).create(true).open(&test_file) {
             let _ = fs::remove_file(test_file);
         } else {
             eprintln!(
                 "Warning: Server directory '{}' may not be writable.",
-                env.dir
+                env.data_dir
             );
         }
 
@@ -79,12 +80,14 @@ mod tests {
     #[test]
     fn test_address_formatting() {
         let env = Environment {
+            config_dir: "./eastguard/config".into(),
+            data_dir: "./test".into(),
             node_id: Some("node-1".into()),
-            dir: "./test".into(),
+            node_id_file_name: "node_id".into(),
             port: 3000,
-            host: "127.0.0.1".into(),
             cluster_port: 3001,
-            replicas_per_node: 256,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
@@ -97,17 +100,19 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse defaults");
 
+        assert_eq!(env.config_dir, "./eastguard/config");
+        assert_eq!(env.data_dir, "./eastguard/data");
         assert_eq!(env.node_id, None);
-        assert_eq!(env.port, 2921); // The default we set
+        assert_eq!(env.node_id_file_name, "node_id");
+        assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
-        assert_eq!(env.dir, "./data");
-        assert_eq!(env.replicas_per_node, 256);
+        assert_eq!(env.vnodes_per_pnode, 256);
     }
 
     #[test]
     fn test_flags_override() {
-        // Simulate: my-server --port 9999 --host 0.0.0.0 --dir /tmp/test
+        // Simulate: my-server --node-id node-1 --port 9999 --host 0.0.0.0 --data-dir /tmp/test
         let args = vec![
             "my-server",
             "--node-id",
@@ -116,9 +121,9 @@ mod tests {
             "9999",
             "--host",
             "0.0.0.0",
-            "--dir",
+            "--data-dir",
             "/tmp/test",
-            "--replicas-per-node",
+            "--vnodes-per-pnode",
             "8",
         ];
 
@@ -127,8 +132,8 @@ mod tests {
         assert_eq!(env.node_id, Some("node-1".into()));
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
-        assert_eq!(env.dir, "/tmp/test");
-        assert_eq!(env.replicas_per_node, 8);
+        assert_eq!(env.data_dir, "/tmp/test");
+        assert_eq!(env.vnodes_per_pnode, 8);
     }
 
     #[test]
@@ -139,7 +144,7 @@ mod tests {
             "9999",
             "--host",
             "0.0.0.0", // -h is preserved for --help.
-            "-d",
+            "--data-dir",
             "/tmp/test",
         ];
 
@@ -147,7 +152,7 @@ mod tests {
 
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
-        assert_eq!(env.dir, "/tmp/test");
+        assert_eq!(env.data_dir, "/tmp/test");
     }
 
     #[test]
