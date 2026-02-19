@@ -1,14 +1,20 @@
 use std::sync::LazyLock;
 
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 
 use clap::Parser;
+use uuid::Uuid;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
-    #[arg(long, env = "EASTGUARD_CONFIG_DIR", default_value = "./eastguard/config")]
+    #[arg(
+        long,
+        env = "EASTGUARD_CONFIG_DIR",
+        default_value = "./eastguard/config"
+    )]
     pub config_dir: String,
 
     #[arg(long, env = "EASTGUARD_DATA_DIR", default_value = "./eastguard/data")]
@@ -40,7 +46,10 @@ impl Environment {
 
         // 2. Perform side effects (creation/validation) just like before
         if let Err(e) = fs::create_dir_all(&env.data_dir) {
-            eprintln!("Warning: Could not create directory '{}': {}", env.data_dir, e);
+            eprintln!(
+                "Warning: Could not create directory '{}': {}",
+                env.data_dir, e
+            );
         }
 
         // Validate write permissions
@@ -69,6 +78,55 @@ impl Environment {
             .parse()
             .expect("Invalid peer bind address")
     }
+
+    /// Returns the node ID, resolving it from (in priority order):
+    /// 1. The `--node-id` flag / `EASTGUARD_NODE_ID` env var (if set)
+    /// 2. The file at `{config_dir}/{node_id_file_name}` (if it exists and is non-empty)
+    /// 3. A freshly generated UUID v4, which is then persisted to that file
+    pub fn resolve_node_id(&self) -> String {
+        if let Some(id) = &self.node_id {
+            return id.clone();
+        }
+
+        let path = format!("{}/{}", self.config_dir, self.node_id_file_name);
+
+        if let Ok(contents) = fs::read_to_string(&path) {
+            let id = contents.trim();
+            if !id.is_empty() {
+                return id.to_owned();
+            }
+        }
+
+        self.generate_and_persist_node_id(&path)
+    }
+
+    fn generate_and_persist_node_id(&self, path: &str) -> String {
+        let new_id = Uuid::new_v4().to_string();
+
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                if let Err(e) = file
+                    .write_all(new_id.as_bytes())
+                    .and_then(|_| file.sync_all())
+                {
+                    eprintln!("Warning: failed to persist node_id '{}': {}", path, e);
+                }
+                new_id
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process won — read the canonical ID
+                fs::read_to_string(path)
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(new_id)
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to create node_id file '{}': {}", path, e);
+                new_id
+            }
+        }
+    }
 }
 
 pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -76,6 +134,7 @@ pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standa
 mod tests {
     use super::*;
     use clap::Parser;
+    use serial_test::serial;
 
     #[test]
     fn test_address_formatting() {
@@ -95,6 +154,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_defaults() {
         let args = vec!["my-server"];
 
@@ -156,8 +216,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_env_vars_override() {
-        // SAFETY: test binary is single-threaded for env var mutation
         unsafe {
             std::env::set_var("EASTGUARD_NODE_ID", "env-node-1");
             std::env::set_var("EASTGUARD_PORT", "8888");
@@ -184,5 +244,105 @@ mod tests {
         // This should fail because clap validates u16 automatically
         let result = Environment::try_parse_from(args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_node_id_from_flag() {
+        let env = Environment {
+            config_dir: "./eastguard/config".into(),
+            data_dir: "/tmp".into(),
+            node_id: Some("explicit-node".into()),
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
+        };
+
+        assert_eq!(env.resolve_node_id(), "explicit-node");
+    }
+
+    #[test]
+    fn test_resolve_node_id_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("node_id");
+        fs::write(&file_path, "file-node-42").unwrap();
+
+        let env = Environment {
+            config_dir: dir.path().to_str().unwrap().into(),
+            data_dir: "./eastguard/data".into(),
+            node_id: None,
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
+        };
+
+        assert_eq!(env.resolve_node_id(), "file-node-42");
+    }
+
+    #[test]
+    fn test_resolve_node_id_generates_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let env = Environment {
+            config_dir: dir.path().to_str().unwrap().into(),
+            data_dir: "./eastguard/data".into(),
+            node_id: None,
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
+        };
+
+        let id1 = env.resolve_node_id();
+        // UUID v4 format: 8-4-4-4-12 hex chars
+        assert!(Uuid::parse_str(&id1).is_ok());
+
+        // Second call must return the same persisted value
+        let id2 = env.resolve_node_id();
+        assert_eq!(id1, id2);
+
+        // File must contain the ID
+        let on_disk = fs::read_to_string(dir.path().join("node_id")).unwrap();
+        assert_eq!(on_disk.trim(), id1);
+    }
+
+    #[test]
+    fn test_resolve_node_id_persisted_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate first startup: no node_id passed, UUID is generated and persisted.
+        let id_first_run = Environment {
+            config_dir: dir.path().to_str().unwrap().into(),
+            data_dir: "./eastguard/data".into(),
+            node_id: None,
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
+        }
+        .resolve_node_id();
+
+        assert!(Uuid::parse_str(&id_first_run).is_ok());
+
+        // Simulate restart: a fresh Environment pointing to the same config_dir,
+        // still without an explicit node_id. It must recover the persisted UUID.
+        let id_after_restart = Environment {
+            config_dir: dir.path().to_str().unwrap().into(),
+            data_dir: "./eastguard/data".into(),
+            node_id: None,
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_pnode: 256,
+        }
+        .resolve_node_id();
+
+        assert_eq!(id_first_run, id_after_restart);
     }
 }
