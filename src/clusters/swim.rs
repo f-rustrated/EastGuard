@@ -276,10 +276,10 @@ impl SwimActor {
         if let Some(member) = self.members.get_mut(&source_node_id) {
             if remote_inc > member.incarnation {
                 self.update_member(source_node_id.clone(), addr, NodeState::Alive, remote_inc);
-            } else {
-                // New member discovered via direct message
-                self.update_member(source_node_id.clone(), addr, NodeState::Alive, remote_inc);
             }
+        } else {
+            // New member discovered via direct message
+            self.update_member(source_node_id.clone(), addr, NodeState::Alive, remote_inc);
         }
     }
 

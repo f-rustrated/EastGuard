@@ -15,5 +15,4 @@ murmur3 = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
-murmur3 = { version = "0.5" }
 serial_test = "3.3.1"

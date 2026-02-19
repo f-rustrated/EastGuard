@@ -1,6 +1,7 @@
 use super::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::VecDeque;
+use std::ops::Deref;
 
 // Used to decide who to ping. You don't want to waste network traffic pinging nodes you already know are dead.
 #[derive(Default)]
@@ -49,8 +50,6 @@ impl LiveNodeTracker {
         }
     }
 }
-
-use std::ops::Deref;
 
 #[cfg(test)]
 mod tests {

@@ -21,20 +21,20 @@ type NodeId = String;
 pub enum SwimPacket {
     Ping {
         seq: u32,
-        source_node_id: NodeId, 
+        source_node_id: NodeId,
         source_incarnation: u64,
         gossip: Vec<Member>,
     },
     Ack {
         seq: u32,
-        source_node_id: NodeId, 
+        source_node_id: NodeId,
         source_incarnation: u64,
         gossip: Vec<Member>,
     },
     PingReq {
         seq: u32,
         target: SocketAddr,
-        source_node_id: NodeId, 
+        source_node_id: NodeId,
         source_incarnation: u64,
         gossip: Vec<Member>,
     },

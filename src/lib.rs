@@ -36,12 +36,12 @@ impl StartUp {
         let topology = Topology::new(
             HashMap::new(),
             TopologyConfig {
-                vnodes_per_pnode: ENV.vnodes_per_pnode,
+                vnodes_per_pnode: ENV.vnodes_per_node,
             },
         );
 
         // 3. Create Actor
-        let node_id = ENV.node_id.clone().unwrap_or_else(|| local_peer_addr.to_string());
+        let node_id = ENV.resolve_node_id().clone();
         let swim_actor = SwimActor::new(
             local_peer_addr,
             node_id,

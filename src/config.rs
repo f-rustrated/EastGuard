@@ -36,7 +36,7 @@ pub struct Environment {
     pub host: String,
 
     #[arg(long, env = "EASTGUARD_VNODES_PER_NODE", default_value_t = 256)]
-    pub vnodes_per_pnode: u64,
+    pub vnodes_per_node: u64,
 }
 
 impl Environment {
@@ -45,11 +45,10 @@ impl Environment {
         let env = Environment::parse();
 
         // 2. Perform side effects (creation/validation) just like before
-        if let Err(e) = fs::create_dir_all(&env.data_dir) {
-            eprintln!(
-                "Warning: Could not create directory '{}': {}",
-                env.data_dir, e
-            );
+        for dir in [&env.data_dir, &env.config_dir] {
+            if let Err(e) = fs::create_dir_all(dir) {
+                eprintln!("Warning: Could not create directory '{}': {}", dir, e);
+            }
         }
 
         // Validate write permissions
@@ -146,7 +145,7 @@ mod tests {
             port: 3000,
             cluster_port: 3001,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
@@ -167,7 +166,7 @@ mod tests {
         assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
-        assert_eq!(env.vnodes_per_pnode, 256);
+        assert_eq!(env.vnodes_per_node, 256);
     }
 
     #[test]
@@ -183,7 +182,7 @@ mod tests {
             "0.0.0.0",
             "--data-dir",
             "/tmp/test",
-            "--vnodes-per-pnode",
+            "--vnodes-per-node",
             "8",
         ];
 
@@ -193,7 +192,7 @@ mod tests {
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
-        assert_eq!(env.vnodes_per_pnode, 8);
+        assert_eq!(env.vnodes_per_node, 8);
     }
 
     #[test]
@@ -256,7 +255,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         };
 
         assert_eq!(env.resolve_node_id(), "explicit-node");
@@ -276,7 +275,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         };
 
         assert_eq!(env.resolve_node_id(), "file-node-42");
@@ -294,7 +293,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         };
 
         let id1 = env.resolve_node_id();
@@ -323,7 +322,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         }
         .resolve_node_id();
 
@@ -339,7 +338,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
-            vnodes_per_pnode: 256,
+            vnodes_per_node: 256,
         }
         .resolve_node_id();
 
