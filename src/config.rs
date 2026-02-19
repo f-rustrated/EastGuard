@@ -8,28 +8,28 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
-    #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
+    #[arg(long, env = "EASTGUARD_CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
-    #[arg(long, env = "DATA_DIR", default_value = "./eastguard/data")]
+    #[arg(long, env = "EASTGUARD_DATA_DIR", default_value = "./eastguard/data")]
     pub data_dir: String,
 
-    #[arg(long, env = "NODE_ID")]
+    #[arg(long, env = "EASTGUARD_NODE_ID")]
     pub node_id: Option<String>,
 
-    #[arg(long, env = "NODE_ID_FILE_NAME", default_value = "node_id")]
+    #[arg(long, env = "EASTGUARD_NODE_ID_FILE_NAME", default_value = "node_id")]
     pub node_id_file_name: String,
 
-    #[arg(short, long, env = "PORT", default_value_t = 2921)]
+    #[arg(short, long, env = "EASTGUARD_PORT", default_value_t = 2921)]
     pub port: u16,
 
-    #[arg(long, env = "CLUSTER_PORT", default_value_t = 2922)]
+    #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
-    #[arg(long, env = "HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "EASTGUARD_HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    #[arg(long, env = "VNODES_PER_NODE", default_value_t = 256)]
+    #[arg(long, env = "EASTGUARD_VNODES_PER_NODE", default_value_t = 256)]
     pub vnodes_per_pnode: u64,
 }
 
@@ -153,6 +153,28 @@ mod tests {
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
+    }
+
+    #[test]
+    fn test_env_vars_override() {
+        // SAFETY: test binary is single-threaded for env var mutation
+        unsafe {
+            std::env::set_var("EASTGUARD_NODE_ID", "env-node-1");
+            std::env::set_var("EASTGUARD_PORT", "8888");
+            std::env::set_var("EASTGUARD_HOST", "0.0.0.0");
+        }
+
+        let env = Environment::try_parse_from(vec!["my-server"]).expect("Failed to parse env vars");
+
+        assert_eq!(env.node_id, Some("env-node-1".into()));
+        assert_eq!(env.port, 8888);
+        assert_eq!(env.host, "0.0.0.0");
+
+        unsafe {
+            std::env::remove_var("EASTGUARD_NODE_ID");
+            std::env::remove_var("EASTGUARD_PORT");
+            std::env::remove_var("EASTGUARD_HOST");
+        }
     }
 
     #[test]
