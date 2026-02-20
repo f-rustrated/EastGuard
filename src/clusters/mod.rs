@@ -8,6 +8,7 @@ mod livenode_tracker;
 pub(crate) mod swim;
 pub(crate) mod topology;
 pub(crate) mod transport;
+pub(crate) mod gossip_buffer;
 
 #[cfg(test)]
 pub mod tests;

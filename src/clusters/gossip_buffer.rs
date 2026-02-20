@@ -45,7 +45,7 @@ impl GossipBuffer {
         if let Some(pos) = self
             .entries
             .iter()
-            .position(|e| e.member.addr == member.addr)
+            .position(|e| e.member.node_id == member.node_id)
         {
             self.entries.remove(pos);
         }
@@ -110,7 +110,7 @@ pub(super) fn dissemination_count(cluster_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::NodeState;
+    use crate::clusters::{NodeId, NodeState};
     use std::net::SocketAddr;
 
     fn addr(port: u16) -> SocketAddr {
@@ -119,6 +119,7 @@ mod tests {
 
     fn member(port: u16, state: NodeState, incarnation: u64) -> Member {
         Member {
+            node_id: NodeId::new(port.to_string()),
             addr: addr(port),
             state,
             incarnation,

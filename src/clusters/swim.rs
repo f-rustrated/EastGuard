@@ -6,7 +6,7 @@ use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-
+use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::topology::Topology;
 
 // --- CONFIGURATION ---
@@ -256,10 +256,10 @@ impl SwimActor {
         };
 
         self.livenode_tracker.update(node_id.clone(), new_state);
-        self.topology.update(node_id, addr, new_state);
+        self.topology.update(node_id.clone(), addr, new_state);
 
         if changed {
-            let member = self.members[&addr].clone();
+            let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
         }
     }
@@ -280,6 +280,7 @@ impl SwimActor {
                 // Enqueue refutation so the cluster learns quickly.
                 self.gossip_buffer.enqueue(
                     Member {
+                        node_id: self.node_id.clone(),
                         addr: self.local_addr,
                         state: NodeState::Alive,
                         incarnation: new_incarnation,
