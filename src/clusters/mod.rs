@@ -5,10 +5,11 @@
 use bincode::{Decode, Encode};
 use std::net::SocketAddr;
 mod livenode_tracker;
+mod gossip_buffer;
+
 pub(crate) mod swim;
 pub(crate) mod topology;
 pub(crate) mod transport;
-pub(crate) mod gossip_buffer;
 
 #[cfg(test)]
 pub mod tests;

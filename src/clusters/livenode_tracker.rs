@@ -18,6 +18,7 @@ impl Deref for LiveNodeTracker {
 }
 
 impl LiveNodeTracker {
+    // TODO: should we allow adding duplicate node_ids?
     pub(super) fn add(&mut self, node_id: NodeId) {
         let mut rng = StdRng::from_entropy();
         let selected = rng.gen_range(0..=self.nodes.len());
