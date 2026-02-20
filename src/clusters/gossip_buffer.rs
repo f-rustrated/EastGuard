@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use super::Member;
 
 // UDP does not handle splitting large messages up.
