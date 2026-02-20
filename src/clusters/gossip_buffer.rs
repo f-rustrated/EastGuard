@@ -90,7 +90,7 @@ impl GossipBuffer {
         }
 
         self.entries.retain(|e| e.remaining > 0);
-        self.entries.sort();
+        self.entries.sort_by(|a, b| b.remaining.cmp(&a.remaining));
 
         result
     }
@@ -185,6 +185,33 @@ mod tests {
 
         let r4 = buf.collect();
         assert_eq!(r4.len(), 0);
+    }
+
+    // Regression test for the sort direction bug in collect().
+    // After collect() drains some remaining counts and calls sort(), entries must still
+    // be ordered descending (highest remaining first) so that the *next* collect()
+    // continues to prefer newer/hotter entries.
+    #[test]
+    fn priority_order_preserved_across_multiple_collects() {
+        let mut buf = GossipBuffer::default();
+
+        // cluster_size=4 → remaining = 3 * ceil(log2(4)) = 6
+        buf.enqueue(member(1, NodeState::Alive, 0), 4);
+
+        // Collect twice: member(1).remaining drops to 4
+        buf.collect();
+        buf.collect();
+
+        // Enqueue member(2) fresh: remaining = 6
+        buf.enqueue(member(2, NodeState::Dead, 1), 4);
+
+        // after collect member(2)→5, member(1)→3
+        let first = buf.collect();
+        assert_eq!(first[0].addr, addr(2), "member(2) should lead (higher remaining)");
+
+        // collect should prefer member(2)->5 than member(1)->3.
+        let second = buf.collect();
+        assert_eq!(second[0].addr, addr(2), "member(2) should still lead after sort() in previous collect()");
     }
 
     #[test]
