@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::Member;
 
 // UDP does not handle splitting large messages up.
@@ -26,7 +28,7 @@ impl PartialOrd for GossipEntry {
 }
 impl Ord for GossipEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.remaining.cmp(&other.remaining)
+        self.remaining.cmp(&other.remaining)
     }
 }
 
