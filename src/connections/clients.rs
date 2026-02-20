@@ -9,7 +9,12 @@ use tokio::{
 
 use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
 
-pub struct ClientStreamWriter(pub(crate) OwnedWriteHalf);
+pub struct ClientStreamWriter(OwnedWriteHalf);
+impl ClientStreamWriter {
+    pub(crate) fn new(write_half: OwnedWriteHalf) -> Self {
+        Self(write_half)
+    }
+}
 
 #[derive(Debug)]
 pub struct ClientStreamReader {
