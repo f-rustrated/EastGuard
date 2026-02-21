@@ -1,4 +1,4 @@
-use super::Member;
+use super::SwimNode;
 
 // UDP does not handle splitting large messages up.
 // Preventing IP fragmentation is therefore necessary unless we have dedicated frangmentation handling logics.
@@ -15,12 +15,12 @@ pub(super) struct GossipBuffer {
 
 #[derive(PartialEq, Eq)]
 struct GossipEntry {
-    member: Member,
+    member: SwimNode,
     remaining: u32,
 }
 
 impl GossipBuffer {
-    pub(super) fn enqueue(&mut self, member: Member, cluster_size: usize) {
+    pub(super) fn enqueue(&mut self, member: SwimNode, cluster_size: usize) {
         if member.encoded_size() > MAX_GOSSIP_BYTES {
             // TODO Log an error or return a Result::Err here.
             eprintln!("Single member should never exceed the packet size limit");
@@ -55,7 +55,7 @@ impl GossipBuffer {
             .insert(insert_pos, GossipEntry { member, remaining });
     }
 
-    pub(super) fn collect(&mut self) -> Vec<Member> {
+    pub(super) fn collect(&mut self) -> Vec<SwimNode> {
         let mut result = Vec::new();
         let mut total_bytes = 0usize;
         let mut included_count = 0;
@@ -99,15 +99,15 @@ pub(super) fn dissemination_count(cluster_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::{NodeId, NodeState};
+    use crate::clusters::{NodeId, SwimNodeState};
     use std::net::SocketAddr;
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
-    fn member(port: u16, state: NodeState, incarnation: u64) -> Member {
-        Member {
+    fn member(port: u16, state: SwimNodeState, incarnation: u64) -> SwimNode {
+        SwimNode {
             node_id: NodeId::new(port.to_string()),
             addr: addr(port),
             state,
@@ -118,8 +118,8 @@ mod tests {
     #[test]
     fn enqueue_and_collect_returns_members() {
         let mut buf = GossipBuffer::default();
-        buf.enqueue(member(1, NodeState::Alive, 0), 10);
-        buf.enqueue(member(2, NodeState::Dead, 5), 10);
+        buf.enqueue(member(1, SwimNodeState::Alive, 0), 10);
+        buf.enqueue(member(2, SwimNodeState::Dead, 5), 10);
 
         let result = buf.collect();
         assert_eq!(result.len(), 2);
@@ -133,7 +133,7 @@ mod tests {
     fn collect_decrements_remaining_and_eventually_drains() {
         let mut buf = GossipBuffer::default();
         // cluster_size=2 → dissemination_count = 3 * ceil(log2(2)) = 3
-        buf.enqueue(member(1, NodeState::Alive, 0), 2);
+        buf.enqueue(member(1, SwimNodeState::Alive, 0), 2);
 
         let r1 = buf.collect();
         assert_eq!(r1.len(), 1);
@@ -152,19 +152,19 @@ mod tests {
     #[test]
     fn duplicate_addr_resets_remaining() {
         let mut buf = GossipBuffer::default();
-        buf.enqueue(member(1, NodeState::Alive, 0), 2);
+        buf.enqueue(member(1, SwimNodeState::Alive, 0), 2);
 
         // Collect twice to decrement remaining to 1
         buf.collect();
         buf.collect();
 
         // Re-enqueue same addr with new state
-        buf.enqueue(member(1, NodeState::Dead, 1), 2);
+        buf.enqueue(member(1, SwimNodeState::Dead, 1), 2);
 
         // Should have fresh remaining (3), so 3 more collects before drain
         let r1 = buf.collect();
         assert_eq!(r1.len(), 1);
-        assert_eq!(r1[0].state, NodeState::Dead);
+        assert_eq!(r1[0].state, SwimNodeState::Dead);
 
         let r2 = buf.collect();
         assert_eq!(r2.len(), 1);
@@ -185,22 +185,30 @@ mod tests {
         let mut buf = GossipBuffer::default();
 
         // cluster_size=4 → remaining = 3 * ceil(log2(4)) = 6
-        buf.enqueue(member(1, NodeState::Alive, 0), 4);
+        buf.enqueue(member(1, SwimNodeState::Alive, 0), 4);
 
         // Collect twice: member(1).remaining drops to 4
         buf.collect();
         buf.collect();
 
         // Enqueue member(2) fresh: remaining = 6
-        buf.enqueue(member(2, NodeState::Dead, 1), 4);
+        buf.enqueue(member(2, SwimNodeState::Dead, 1), 4);
 
         // after collect member(2)→5, member(1)→3
         let first = buf.collect();
-        assert_eq!(first[0].addr, addr(2), "member(2) should lead (higher remaining)");
+        assert_eq!(
+            first[0].addr,
+            addr(2),
+            "member(2) should lead (higher remaining)"
+        );
 
         // collect should prefer member(2)->5 than member(1)->3.
         let second = buf.collect();
-        assert_eq!(second[0].addr, addr(2), "member(2) should still lead after sort() in previous collect()");
+        assert_eq!(
+            second[0].addr,
+            addr(2),
+            "member(2) should still lead after sort() in previous collect()"
+        );
     }
 
     #[test]
@@ -208,13 +216,13 @@ mod tests {
         let mut buf = GossipBuffer::default();
 
         // Enqueue first entry
-        buf.enqueue(member(1, NodeState::Alive, 0), 4);
+        buf.enqueue(member(1, SwimNodeState::Alive, 0), 4);
 
         // Collect once to decrement first entry's remaining
         buf.collect();
 
         // Enqueue second entry (has higher remaining because it's fresh)
-        buf.enqueue(member(2, NodeState::Dead, 1), 4);
+        buf.enqueue(member(2, SwimNodeState::Dead, 1), 4);
 
         let result = buf.collect();
         assert_eq!(result.len(), 2);
@@ -227,7 +235,7 @@ mod tests {
     fn collect_respects_byte_budget() {
         let mut gossip_buf = GossipBuffer::default();
 
-        let sample_member = member(1, NodeState::Alive, u64::MAX);
+        let sample_member = member(1, SwimNodeState::Alive, u64::MAX);
         let size = sample_member.encoded_size();
 
         // division by size to find out exactly how many whole Member structs can fit into the budget.
@@ -246,7 +254,7 @@ mod tests {
         );
 
         for i in 0..total {
-            gossip_buf.enqueue(member(i as u16 + 1, NodeState::Alive, u64::MAX), 100);
+            gossip_buf.enqueue(member(i as u16 + 1, SwimNodeState::Alive, u64::MAX), 100);
         }
 
         let result = gossip_buf.collect();
@@ -265,14 +273,14 @@ mod tests {
 
         // Fill to MAX_ENTRIES
         for i in 0..MAX_ENTRIES {
-            buf.enqueue(member(i as u16 + 1, NodeState::Alive, 0), 10);
+            buf.enqueue(member(i as u16 + 1, SwimNodeState::Alive, 0), 10);
         }
 
         // Collect once to decrement all entries' remaining
         buf.collect();
 
         // Add a new entry — should evict one with lowest remaining
-        let new = member(999, NodeState::Dead, 5);
+        let new = member(999, SwimNodeState::Dead, 5);
         buf.enqueue(new, 10);
 
         let result = buf.collect();

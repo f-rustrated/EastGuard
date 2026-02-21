@@ -1,13 +1,13 @@
 use crate::clusters::livenode_tracker::LiveNodeTracker;
 
 use super::*;
+use crate::clusters::gossip_buffer::GossipBuffer;
+use crate::clusters::topology::Topology;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use crate::clusters::gossip_buffer::GossipBuffer;
-use crate::clusters::topology::Topology;
 
 // --- CONFIGURATION ---
 const PROTOCOL_PERIOD: Duration = Duration::from_secs(1);
@@ -30,7 +30,7 @@ pub struct SwimActor {
     node_id: NodeId,
     local_addr: SocketAddr,
     incarnation: u64,
-    members: HashMap<NodeId, Member>,
+    members: HashMap<NodeId, SwimNode>,
     livenode_tracker: LiveNodeTracker,
     gossip_buffer: GossipBuffer,
 
@@ -73,7 +73,7 @@ impl SwimActor {
         self.update_member(
             self.node_id.clone(),
             self.local_addr,
-            NodeState::Alive,
+            SwimNodeState::Alive,
             self.incarnation,
         );
 
@@ -98,7 +98,10 @@ impl SwimActor {
             ActorEvent::ProtocolTick => { /* Handled by loop ticker */ }
 
             // --- FAILURE DETECTION TIMEOUTS ---
-            ActorEvent::DirectProbeTimeout { target_node_id, seq, } => {
+            ActorEvent::DirectProbeTimeout {
+                target_node_id,
+                seq,
+            } => {
                 // If the ACK for this sequence hasn't arrived yet
                 if self.pending_acks.contains_key(&seq) {
                     // Direct ping failed. Try Indirect.
@@ -111,10 +114,18 @@ impl SwimActor {
             ActorEvent::IndirectProbeTimeout { target_node_id } => {
                 // Indirect pings failed. Mark Suspect.
                 if let Some(member) = self.members.get(&target_node_id) {
-                    if member.state == NodeState::Alive {
-                        println!("Node {} is SUSPECT (Inc: {})", target_node_id, member.incarnation);
+                    if member.state == SwimNodeState::Alive {
+                        println!(
+                            "Node {} is SUSPECT (Inc: {})",
+                            target_node_id, member.incarnation
+                        );
                         let (addr, incarnation) = (member.addr, member.incarnation);
-                        self.update_member(target_node_id.clone(), addr, NodeState::Suspect, incarnation, );
+                        self.update_member(
+                            target_node_id.clone(),
+                            addr,
+                            SwimNodeState::Suspect,
+                            incarnation,
+                        );
 
                         // Schedule Suspect -> Dead transition
                         let tx = self.self_tx.clone();
@@ -129,10 +140,10 @@ impl SwimActor {
             ActorEvent::SuspectTimeout { target_node_id } => {
                 // If still Suspect after timeout, mark Dead.
                 if let Some(member) = self.members.get(&target_node_id) {
-                    if member.state == NodeState::Suspect {
+                    if member.state == SwimNodeState::Suspect {
                         println!("Node {} is DEAD", target_node_id);
                         let (addr, incarnation) = (member.addr, member.incarnation);
-                        self.update_member(target_node_id, addr, NodeState::Dead, incarnation);
+                        self.update_member(target_node_id, addr, SwimNodeState::Dead, incarnation);
                     }
                 }
             }
@@ -214,13 +225,13 @@ impl SwimActor {
         &mut self,
         node_id: NodeId,
         addr: SocketAddr,
-        state: NodeState,
+        state: SwimNodeState,
         incarnation: u64,
     ) {
         let (new_state, changed) = match self.members.entry(node_id.clone()) {
             Entry::Vacant(e) => {
                 // New member: set state directly, no SWIM rules apply yet.
-                e.insert(Member {
+                e.insert(SwimNode {
                     node_id: node_id.clone(),
                     addr,
                     state,
@@ -241,9 +252,9 @@ impl SwimActor {
                 // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
                 else if incarnation == entry.incarnation {
                     match (&entry.state, &state) {
-                        (NodeState::Alive, NodeState::Suspect) => entry.state = NodeState::Suspect,
-                        (NodeState::Alive, NodeState::Dead) => entry.state = NodeState::Dead,
-                        (NodeState::Suspect, NodeState::Dead) => entry.state = NodeState::Dead,
+                        (SwimNodeState::Alive, SwimNodeState::Suspect) => entry.state = SwimNodeState::Suspect,
+                        (SwimNodeState::Alive, SwimNodeState::Dead) => entry.state = SwimNodeState::Dead,
+                        (SwimNodeState::Suspect, SwimNodeState::Dead) => entry.state = SwimNodeState::Dead,
                         _ => {}
                     }
                 }
@@ -264,11 +275,11 @@ impl SwimActor {
         }
     }
 
-    fn apply_membership_update(&mut self, member: Member) {
+    fn apply_membership_update(&mut self, member: SwimNode) {
         // REFUTATION MECHANISM
         if member.node_id == self.node_id {
             // Someone is gossiping that I am Suspect or Dead?
-            if (member.state == NodeState::Suspect || member.state == NodeState::Dead)
+            if (member.state == SwimNodeState::Suspect || member.state == SwimNodeState::Dead)
                 && self.incarnation <= member.incarnation
             {
                 let new_incarnation = member.incarnation + 1;
@@ -279,10 +290,10 @@ impl SwimActor {
                 self.incarnation = new_incarnation;
                 // Enqueue refutation so the cluster learns quickly.
                 self.gossip_buffer.enqueue(
-                    Member {
+                    SwimNode {
                         node_id: self.node_id.clone(),
                         addr: self.local_addr,
-                        state: NodeState::Alive,
+                        state: SwimNodeState::Alive,
                         incarnation: new_incarnation,
                     },
                     self.members.len(),
@@ -290,19 +301,29 @@ impl SwimActor {
             }
             return;
         }
-        self.update_member(member.node_id, member.addr, member.state, member.incarnation);
+        self.update_member(
+            member.node_id,
+            member.addr,
+            member.state,
+            member.incarnation,
+        );
     }
 
-    fn handle_incarnation_check(&mut self, source_node_id: NodeId, addr: SocketAddr, remote_inc: u64) {
+    fn handle_incarnation_check(
+        &mut self,
+        source_node_id: NodeId,
+        addr: SocketAddr,
+        remote_inc: u64,
+    ) {
         // If we receive a direct message from someone, they are obviously Alive.
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get_mut(&source_node_id) {
             if remote_inc > member.incarnation {
-                self.update_member(source_node_id.clone(), addr, NodeState::Alive, remote_inc);
+                self.update_member(source_node_id.clone(), addr, SwimNodeState::Alive, remote_inc);
             }
         } else {
             // New member discovered via direct message
-            self.update_member(source_node_id.clone(), addr, NodeState::Alive, remote_inc);
+            self.update_member(source_node_id.clone(), addr, SwimNodeState::Alive, remote_inc);
         }
     }
 
@@ -341,13 +362,16 @@ impl SwimActor {
             tokio::spawn(async move {
                 time::sleep(ACK_TIMEOUT).await;
                 let _ = tx
-                    .send(ActorEvent::DirectProbeTimeout { target_node_id, seq })
+                    .send(ActorEvent::DirectProbeTimeout {
+                        target_node_id,
+                        seq,
+                    })
                     .await;
             });
         }
     }
 
-    async fn start_indirect_probe(&mut self, target: Member) {
+    async fn start_indirect_probe(&mut self, target: SwimNode) {
         let mut peer_addrs = Vec::new();
 
         for _ in 0..self.livenode_tracker.len() {
@@ -400,7 +424,9 @@ impl SwimActor {
         tokio::spawn(async move {
             time::sleep(ACK_TIMEOUT).await;
             let _ = tx
-                .send(ActorEvent::IndirectProbeTimeout { target_node_id: target.node_id })
+                .send(ActorEvent::IndirectProbeTimeout {
+                    target_node_id: target.node_id,
+                })
                 .await;
         });
     }
@@ -426,7 +452,7 @@ impl SwimActor {
         self.update_member(
             self.node_id.clone(),
             self.local_addr,
-            NodeState::Alive,
+            SwimNodeState::Alive,
             self.incarnation,
         );
     }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
 
-use crate::clusters::{NodeId, NodeState};
+use crate::clusters::{NodeId, SwimNodeState};
 
 /// node_id and replica_index for tie breaker
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
@@ -117,15 +117,15 @@ impl Topology {
         }
     }
 
-    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: NodeState) {
+    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: SwimNodeState) {
         match state {
-            NodeState::Alive => {
+            SwimNodeState::Alive => {
                 self.insert_node(node_id, PhysicalNodeMetadata { address: addr });
             }
-            NodeState::Dead => {
+            SwimNodeState::Dead => {
                 self.remove_node(&node_id);
             }
-            NodeState::Suspect => {}
+            SwimNodeState::Suspect => {}
         }
     }
 

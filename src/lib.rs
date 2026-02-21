@@ -5,10 +5,10 @@ mod clusters;
 
 use crate::{
     clusters::{
+        NodeId,
         swim::SwimActor,
         topology::{Topology, TopologyConfig},
         transport::TransportLayer,
-        NodeId,
     },
     config::ENV,
     connections::{

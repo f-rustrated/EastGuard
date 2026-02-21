@@ -37,15 +37,15 @@ impl LiveNodeTracker {
         Some(node_id)
     }
 
-    pub(crate) fn update(&mut self, node_id: NodeId, state: NodeState) {
+    pub(crate) fn update(&mut self, node_id: NodeId, state: SwimNodeState) {
         match state {
-            NodeState::Alive => {
+            SwimNodeState::Alive => {
                 self.add(node_id);
             }
-            NodeState::Suspect => {
+            SwimNodeState::Suspect => {
                 self.remove(&node_id);
             }
-            NodeState::Dead => {
+            SwimNodeState::Dead => {
                 self.remove(&node_id);
             }
         }
