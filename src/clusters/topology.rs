@@ -1,23 +1,22 @@
-use bincode::{Decode, Encode};
 use murmur3::murmur3_32;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
 
-use crate::clusters::NodeState;
+use crate::clusters::{NodeId, NodeState};
 
 /// node_id and replica_index for tie breaker
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct VirtualNodeToken {
     hash: u32,
-    pnode_id: PhysicalNodeId,
+    pnode_id: NodeId,
     replica_index: u64,
 }
 
 #[derive(Debug)]
 pub struct VirtualNode {
     replica_index: u64,
-    pnode_id: PhysicalNodeId,
+    pub pnode_id: NodeId,
     pnode_metadata: PhysicalNodeMetadata,
 }
 
@@ -30,13 +29,13 @@ pub struct Topology {
 #[derive(Default)]
 struct TokenRing {
     vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
-    pnodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
+    pnodes: HashMap<NodeId, PhysicalNodeMetadata>,
 }
 
 impl TokenRing {
     fn add_pnode(
         &mut self,
-        pnode_id: PhysicalNodeId,
+        pnode_id: NodeId,
         metadata: PhysicalNodeMetadata,
         vnode_cnt: u64,
     ) {
@@ -45,8 +44,8 @@ impl TokenRing {
         }
         for replica_index in 0..vnode_cnt {
             self.vnodes.insert(
-                pnode_id.generate_vnode_token(replica_index),
-                pnode_id.generate_vnode(&metadata, replica_index),
+                generate_vnode_token(&pnode_id, replica_index),
+                generate_vnode(&pnode_id, &metadata, replica_index),
             );
         }
         self.pnodes.insert(pnode_id, metadata);
@@ -54,13 +53,13 @@ impl TokenRing {
 
     fn remove_pnode(
         &mut self,
-        pnode_id: &PhysicalNodeId,
+        pnode_id: &NodeId,
         vnode_cnt: u64,
     ) -> Option<PhysicalNodeMetadata> {
         let metadata = self.pnodes.remove(pnode_id)?;
         for replica_index in 0..vnode_cnt {
             self.vnodes
-                .remove(&pnode_id.generate_vnode_token(replica_index));
+                .remove(&generate_vnode_token(pnode_id, replica_index));
         }
         Some(metadata)
     }
@@ -69,7 +68,7 @@ impl TokenRing {
         let hash = hash_stable(key);
         let start = VirtualNodeToken {
             hash,
-            pnode_id: PhysicalNodeId::new(""),
+            pnode_id: NodeId::new(""),
             replica_index: 0,
         };
 
@@ -104,7 +103,7 @@ pub struct TopologyConfig {
 
 impl Topology {
     pub fn new(
-        nodes: HashMap<PhysicalNodeId, PhysicalNodeMetadata>,
+        nodes: HashMap<NodeId, PhysicalNodeMetadata>,
         config: TopologyConfig,
     ) -> Self {
         let mut token_ring = TokenRing::default();
@@ -118,29 +117,27 @@ impl Topology {
         }
     }
 
-    pub(crate) fn update(&mut self, addr: SocketAddr, state: NodeState) {
-        let id = PhysicalNodeId::new(addr.to_string());
+    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: NodeState) {
         match state {
             NodeState::Alive => {
-                self.insert_node(id, PhysicalNodeMetadata { address: addr });
+                self.insert_node(node_id, PhysicalNodeMetadata { address: addr });
             }
-
             NodeState::Dead => {
-                self.remove_node(&id);
+                self.remove_node(&node_id);
             }
             NodeState::Suspect => {}
         }
     }
 
-    fn insert_node(&mut self, pnode_id: PhysicalNodeId, metadata: PhysicalNodeMetadata) {
+    fn insert_node(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata) {
         // ? what if metadata needs to be changed ?
         self.ring
             .add_pnode(pnode_id, metadata, self.config.vnodes_per_pnode);
     }
 
-    fn remove_node(&mut self, pnode_id: &PhysicalNodeId) -> Option<PhysicalNodeMetadata> {
+    fn remove_node(&mut self, pnode_id: &NodeId) -> Option<PhysicalNodeMetadata> {
         self.ring
-            .remove_pnode(&pnode_id, self.config.vnodes_per_pnode)
+            .remove_pnode(pnode_id, self.config.vnodes_per_pnode)
     }
 
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
@@ -148,8 +145,27 @@ impl Topology {
     }
 
     #[cfg(test)]
-    pub fn contains_node(&self, id: &PhysicalNodeId) -> bool {
+    pub fn contains_node(&self, id: &NodeId) -> bool {
         self.ring.pnodes.contains_key(id)
+    }
+}
+
+fn generate_vnode_token(node_id: &NodeId, replica_index: u64) -> VirtualNodeToken {
+    let mut buf = Vec::with_capacity(node_id.len() + 8);
+    buf.extend_from_slice(node_id.as_bytes());
+    buf.extend_from_slice(&replica_index.to_be_bytes());
+    VirtualNodeToken {
+        hash: hash_stable(&buf),
+        pnode_id: node_id.clone(),
+        replica_index,
+    }
+}
+
+fn generate_vnode(node_id: &NodeId, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
+    VirtualNode {
+        replica_index,
+        pnode_id: node_id.clone(),
+        pnode_metadata: metadata.clone(),
     }
 }
 
@@ -162,35 +178,7 @@ fn hash_stable(key: &[u8]) -> u32 {
     murmur3_32(&mut cursor, 0).expect("Murmur3 hashing failed")
 }
 
-#[derive(Hash, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Encode, Decode)]
-pub struct PhysicalNodeId(String);
-
-impl PhysicalNodeId {
-    pub(crate) fn new(id: impl Into<String>) -> PhysicalNodeId {
-        Self(id.into())
-    }
-
-    fn generate_vnode_token(&self, replica_index: u64) -> VirtualNodeToken {
-        let mut buf = Vec::with_capacity(self.0.len() + 8);
-        buf.extend_from_slice(self.0.as_bytes());
-        buf.extend_from_slice(&replica_index.to_be_bytes());
-        VirtualNodeToken {
-            hash: hash_stable(&buf),
-            pnode_id: self.clone(),
-            replica_index,
-        }
-    }
-
-    fn generate_vnode(&self, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
-        VirtualNode {
-            replica_index,
-            pnode_id: self.clone(),
-            pnode_metadata: metadata.clone(),
-        }
-    }
-}
-
-/// Identity is managed separately via `PhysicalNodeId`.
+/// Identity is managed separately via `NodeId`.
 #[derive(Clone, Debug)]
 pub struct PhysicalNodeMetadata {
     pub address: SocketAddr,
@@ -206,7 +194,7 @@ mod tests {
         let map = nodes
             .iter()
             .map(|(id, addr)| {
-                let id: PhysicalNodeId = PhysicalNodeId::new(*id);
+                let id = NodeId::new(*id);
                 let address: SocketAddr = addr.parse().expect("invalid socket address");
                 (id, PhysicalNodeMetadata { address })
             })
@@ -230,24 +218,9 @@ mod tests {
         assert_eq!(topology.ring.pnodes.len(), 3);
         assert_eq!(topology.ring.vnodes.len(), 12);
 
-        assert!(
-            topology
-                .ring
-                .pnodes
-                .contains_key(&PhysicalNodeId::new("node-1"))
-        );
-        assert!(
-            topology
-                .ring
-                .pnodes
-                .contains_key(&PhysicalNodeId::new("node-2"))
-        );
-        assert!(
-            !topology
-                .ring
-                .pnodes
-                .contains_key(&PhysicalNodeId::new("node-3"))
-        );
+        assert!(topology.ring.pnodes.contains_key("node-1"));
+        assert!(topology.ring.pnodes.contains_key("node-2"));
+        assert!(!topology.ring.pnodes.contains_key("node-3"));
     }
 
     #[test]
@@ -264,7 +237,7 @@ mod tests {
         );
 
         topology.insert_node(
-            PhysicalNodeId::new("node-3"),
+            NodeId::new("node-3"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8083".parse().unwrap(),
             },
@@ -272,13 +245,7 @@ mod tests {
 
         assert_eq!(topology.ring.pnodes.len(), 4);
         assert_eq!(topology.ring.vnodes.len(), 16);
-
-        assert!(
-            topology
-                .ring
-                .pnodes
-                .contains_key(&PhysicalNodeId::new("node-3"))
-        );
+        assert!(topology.ring.pnodes.contains_key("node-3"));
     }
 
     #[test]
@@ -295,7 +262,7 @@ mod tests {
         );
 
         topology.insert_node(
-            PhysicalNodeId::new("node-2"),
+            NodeId::new("node-2"),
             PhysicalNodeMetadata {
                 address: "127.0.0.1:8082".parse().unwrap(),
             },
@@ -318,17 +285,11 @@ mod tests {
             },
         );
 
-        let removed = topology.remove_node(&PhysicalNodeId::new("node-0"));
+        let removed = topology.remove_node(&NodeId::new("node-0"));
         assert!(removed.is_some());
         assert_eq!(topology.ring.pnodes.len(), 2);
         assert_eq!(topology.ring.vnodes.len(), 8);
-
-        assert!(
-            !topology
-                .ring
-                .pnodes
-                .contains_key(&PhysicalNodeId::new("node-0"))
-        );
+        assert!(!topology.ring.pnodes.contains_key("node-0"));
     }
 
     #[test]
@@ -352,7 +313,7 @@ mod tests {
 
         let multiple_owner = topology.token_owners_for("hello".as_bytes(), 3);
         assert_eq!(multiple_owner.len(), 3);
-        let physical_node_ids: HashSet<PhysicalNodeId> = multiple_owner
+        let physical_node_ids: HashSet<NodeId> = multiple_owner
             .iter()
             .map(|node| node.pnode_id.clone())
             .collect();

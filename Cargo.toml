@@ -10,4 +10,9 @@ clap = { version = "4.5", features = ["derive", "env"] }
 bytes = "1.10.1"
 bincode = { version = "2.0.1" }
 rand = "0.8"
-murmur3 = { version = "0.5" }
+uuid = { version = "1", features = ["v4"] }
+murmur3 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3.3.1"

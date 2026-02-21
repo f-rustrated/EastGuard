@@ -19,17 +19,6 @@ struct GossipEntry {
     remaining: u32,
 }
 
-impl PartialOrd for GossipEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.remaining.partial_cmp(&other.remaining)
-    }
-}
-impl Ord for GossipEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.remaining.cmp(&other.remaining)
-    }
-}
-
 impl GossipBuffer {
     pub(super) fn enqueue(&mut self, member: Member, cluster_size: usize) {
         if member.encoded_size() > MAX_GOSSIP_BYTES {
@@ -45,7 +34,7 @@ impl GossipBuffer {
         if let Some(pos) = self
             .entries
             .iter()
-            .position(|e| e.member.addr == member.addr)
+            .position(|e| e.member.node_id == member.node_id)
         {
             self.entries.remove(pos);
         }
@@ -90,7 +79,7 @@ impl GossipBuffer {
         }
 
         self.entries.retain(|e| e.remaining > 0);
-        self.entries.sort();
+        self.entries.sort_by(|a, b| b.remaining.cmp(&a.remaining));
 
         result
     }
@@ -110,7 +99,7 @@ pub(super) fn dissemination_count(cluster_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::NodeState;
+    use crate::clusters::{NodeId, NodeState};
     use std::net::SocketAddr;
 
     fn addr(port: u16) -> SocketAddr {
@@ -119,6 +108,7 @@ mod tests {
 
     fn member(port: u16, state: NodeState, incarnation: u64) -> Member {
         Member {
+            node_id: NodeId::new(port.to_string()),
             addr: addr(port),
             state,
             incarnation,
@@ -184,6 +174,33 @@ mod tests {
 
         let r4 = buf.collect();
         assert_eq!(r4.len(), 0);
+    }
+
+    // Regression test for the sort direction bug in collect().
+    // After collect() drains some remaining counts and calls sort(), entries must still
+    // be ordered descending (highest remaining first) so that the *next* collect()
+    // continues to prefer newer/hotter entries.
+    #[test]
+    fn priority_order_preserved_across_multiple_collects() {
+        let mut buf = GossipBuffer::default();
+
+        // cluster_size=4 → remaining = 3 * ceil(log2(4)) = 6
+        buf.enqueue(member(1, NodeState::Alive, 0), 4);
+
+        // Collect twice: member(1).remaining drops to 4
+        buf.collect();
+        buf.collect();
+
+        // Enqueue member(2) fresh: remaining = 6
+        buf.enqueue(member(2, NodeState::Dead, 1), 4);
+
+        // after collect member(2)→5, member(1)→3
+        let first = buf.collect();
+        assert_eq!(first[0].addr, addr(2), "member(2) should lead (higher remaining)");
+
+        // collect should prefer member(2)->5 than member(1)->3.
+        let second = buf.collect();
+        assert_eq!(second[0].addr, addr(2), "member(2) should still lead after sort() in previous collect()");
     }
 
     #[test]
