@@ -19,17 +19,6 @@ struct GossipEntry {
     remaining: u32,
 }
 
-impl PartialOrd for GossipEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.remaining.partial_cmp(&other.remaining)
-    }
-}
-impl Ord for GossipEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.remaining.cmp(&other.remaining)
-    }
-}
-
 impl GossipBuffer {
     pub(super) fn enqueue(&mut self, member: Member, cluster_size: usize) {
         if member.encoded_size() > MAX_GOSSIP_BYTES {
