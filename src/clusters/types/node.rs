@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use bincode::{Decode, Encode};
 
 use crate::clusters::BINCODE_CONFIG;
+use crate::clusters::SwimNodeState::Alive;
 
 // Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -18,6 +19,12 @@ pub enum SwimNodeState {
     Alive,
     Suspect,
     Dead,
+}
+
+impl SwimNodeState {
+    pub fn not_alive(self) -> bool {
+        self != Alive
+    }
 }
 
 impl SwimNode {
