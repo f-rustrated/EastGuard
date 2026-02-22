@@ -502,7 +502,6 @@ mod tests {
     use crate::clusters::topology::{Topology, TopologyConfig};
     use std::collections::HashMap;
     use std::net::SocketAddr;
-    use std::os::unix::raw::time_t;
 
     fn make_machine(local_id: &str, local_port: u16) -> SwimStateMachine {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
@@ -567,252 +566,251 @@ mod tests {
     // Ping tests
     // -----------------------------------------------------------------------
 
-    // Ping from an unknown node
-    //    → node added to `members` as Alive; Ack sent back to sender
-    #[test]
-    fn ping_from_unknown_node() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    mod ping {
+        use std::net::SocketAddr;
+        use crate::clusters::swim_state_machine::tests::{make_machine, node, ping};
+        use crate::clusters::{NodeId, SwimNodeState, SwimPacket};
 
-        m.step(sender, ping(1, "node-b", 0, vec![]));
+        #[test]
+        fn ping_from_unknown_node() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        let member = m
-            .members
-            .get("node-b")
-            .expect("unknown node should be added");
-        assert_eq!(member.state, SwimNodeState::Alive);
-        assert_eq!(member.addr, sender);
+            m.step(sender, ping(1, "node-b", 0, vec![]));
 
-        let out = m.take_outbound();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].target, sender);
-        assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
-    }
+            let member = m
+                .members
+                .get("node-b")
+                .expect("unknown node should be added");
+            assert_eq!(member.state, SwimNodeState::Alive);
+            assert_eq!(member.addr, sender);
 
-    // Ping from a known Alive node
-    //    → Ack sent; member state unchanged
-    #[test]
-    fn ping_from_known_alive_node() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].target, sender);
+            assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
+        }
 
-        // First ping: introduces node-b into members
-        m.step(sender, ping(1, "node-b", 2, vec![]));
-        let _ = m.take_outbound();
+        #[test]
+        fn ping_from_known_alive_node() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        let state_before = m.members.get("node-b").unwrap().state;
-        let inc_before = m.members.get("node-b").unwrap().incarnation;
+            // First ping: introduces node-b into members
+            m.step(sender, ping(1, "node-b", 2, vec![]));
+            let _ = m.take_outbound();
 
-        // Second ping: same node, same incarnation
-        m.step(sender, ping(2, "node-b", 2, vec![]));
+            let state_before = m.members.get("node-b").unwrap().state;
+            let inc_before = m.members.get("node-b").unwrap().incarnation;
 
-        let member = m.members.get("node-b").unwrap();
-        assert_eq!(member.state, state_before);
-        assert_eq!(member.incarnation, inc_before);
+            // Second ping: same node, same incarnation
+            m.step(sender, ping(2, "node-b", 2, vec![]));
 
-        let out = m.take_outbound();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].target, sender);
-        assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
-    }
+            let member = m.members.get("node-b").unwrap();
+            assert_eq!(member.state, state_before);
+            assert_eq!(member.incarnation, inc_before);
 
-    // Ping with non-empty gossip list
-    //    → gossip applied to `members` before Ack is built; Ack's gossip reflects the update
-    #[test]
-    fn ping_with_gossip_applied_before_ack() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].target, sender);
+            assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
+        }
 
-        let gossip_entry = node("node-c", 9001, SwimNodeState::Alive, 1);
-        m.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
+        #[test]
+        fn ping_with_gossip_applied_before_ack() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        // Gossip applied: node-c is in members
-        assert!(
-            m.members.contains_key("node-c"),
-            "gossiped node should be in members"
-        );
+            let gossip_entry = node("node-c", 9001, SwimNodeState::Alive, 1);
+            m.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
 
-        // Ack's gossip reflects the update applied during this step
-        let out = m.take_outbound();
-        assert_eq!(out.len(), 1);
-        match &out[0].packet {
-            SwimPacket::Ack { gossip, .. } => {
-                assert!(
-                    gossip.iter().any(|n| n.node_id == NodeId::new("node-c")),
-                    "Ack gossip should contain node-c (applied before Ack was built)"
-                );
+            // Gossip applied: node-c is in members
+            assert!(
+                m.members.contains_key("node-c"),
+                "gossiped node should be in members"
+            );
+
+            // Ack's gossip reflects the update applied during this step
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            match &out[0].packet {
+                SwimPacket::Ack { gossip, .. } => {
+                    assert!(
+                        gossip.iter().any(|n| n.node_id == NodeId::new("node-c")),
+                        "Ack gossip should contain node-c (applied before Ack was built)"
+                    );
+                }
+                _ => panic!("expected Ack"),
             }
-            _ => panic!("expected Ack"),
+        }
+
+        #[test]
+        fn ping_sender_higher_incarnation_updates_member() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+            // Introduce node-b at incarnation 1
+            m.step(sender, ping(1, "node-b", 1, vec![]));
+            let _ = m.take_outbound();
+            assert_eq!(m.members.get("node-b").unwrap().incarnation, 1);
+
+            // Ping from node-b with higher incarnation 5
+            m.step(sender, ping(2, "node-b", 5, vec![]));
+            let _ = m.take_outbound();
+
+            let member = m.members.get("node-b").unwrap();
+            assert_eq!(member.state, SwimNodeState::Alive);
+            assert_eq!(member.incarnation, 5);
+        }
+
+        #[test]
+        fn ping_sender_lower_incarnation_does_not_downgrade() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+            // Introduce node-b at incarnation 5
+            m.step(sender, ping(1, "node-b", 5, vec![]));
+            let _ = m.take_outbound();
+            assert_eq!(m.members.get("node-b").unwrap().incarnation, 5);
+
+            // Ping from node-b with lower incarnation 1
+            m.step(sender, ping(2, "node-b", 1, vec![]));
+            let _ = m.take_outbound();
+
+            let member = m.members.get("node-b").unwrap();
+            assert_eq!(member.state, SwimNodeState::Alive);
+            assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
         }
     }
 
-    // Ping sender has a higher incarnation than we know
-    //    → member updated to Alive at the new (higher) incarnation
-    #[test]
-    fn ping_sender_higher_incarnation_updates_member() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    mod ack {
+        use std::net::SocketAddr;
+        use crate::clusters::swim_state_machine::{ProbePhase, DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+        use crate::clusters::swim_state_machine::tests::{ack, add_node, make_machine, tick_until};
+        use crate::clusters::SwimNodeState;
 
-        // Introduce node-b at incarnation 1
-        m.step(sender, ping(1, "node-b", 1, vec![]));
-        let _ = m.take_outbound();
-        assert_eq!(m.members.get("node-b").unwrap().incarnation, 1);
+        #[test]
+        fn ack_matching_direct_probe_removes_probe() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            let node_b_id = "node-b";
+            add_node(&mut m, node_b_id, sender, 1);
 
-        // Ping from node-b with higher incarnation 5
-        m.step(sender, ping(2, "node-b", 5, vec![]));
-        let _ = m.take_outbound();
+            // wait until direct ping is sent
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+                m.probe_seq_for(node_b_id)
+            });
 
-        let member = m.members.get("node-b").unwrap();
-        assert_eq!(member.state, SwimNodeState::Alive);
-        assert_eq!(member.incarnation, 5);
-    }
+            // let's Ack before direct ping times out
+            m.step(sender, ack(seq, node_b_id, 1, vec![]));
+            let _ = m.take_outbound();
 
-    // Ping sender has a lower incarnation than we know
-    //    → member incarnation is NOT downgraded; no state change
-    #[test]
-    fn ping_sender_lower_incarnation_does_not_downgrade() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-
-        // Introduce node-b at incarnation 5
-        m.step(sender, ping(1, "node-b", 5, vec![]));
-        let _ = m.take_outbound();
-        assert_eq!(m.members.get("node-b").unwrap().incarnation, 5);
-
-        // Ping from node-b with lower incarnation 1
-        m.step(sender, ping(2, "node-b", 1, vec![]));
-        let _ = m.take_outbound();
-
-        let member = m.members.get("node-b").unwrap();
-        assert_eq!(member.state, SwimNodeState::Alive);
-        assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
-    }
-
-    // -----------------------------------------------------------------------
-    // Ack tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn ack_matching_direct_probe_removes_probe() {
-        let mut m = make_machine("node-local", 8000);
-        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let node_b_id = "node-b";
-        add_node(&mut m, node_b_id, sender, 1);
-
-        // wait until direct ping is sent
-        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
-            m.probe_seq_for(node_b_id)
-        });
-
-        // let's Ack before direct ping times out
-        m.step(sender, ack(seq, node_b_id, 1, vec![]));
-        let _ = m.take_outbound();
-
-        assert!(!m.pending_probes.contains_key(&seq));
-    }
-
-    #[test]
-    fn ack_matching_indirect_probe_removes_probe() {
-        let mut m = make_machine("node-local", 8000);
-        let node_b = "node-b";
-        let node_c = "node-c";
-        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-
-        add_node(&mut m, node_b, b_addr, 1);
-
-        // Wait until node-b's direct probe starts
-        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
-            m.probe_seq_for(node_b)
-        });
-        let _ = m.take_outbound(); // discard the ping
-
-        add_node(&mut m, node_c, c_addr, 1);
-
-        // Let direct probe timeout for node-b
-        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-            m.tick();
+            assert!(!m.pending_probes.contains_key(&seq));
         }
-        let _ = m.take_outbound(); // discard the PingReqs
 
-        assert!(
-            matches!(
+        #[test]
+        fn ack_matching_indirect_probe_removes_probe() {
+            let mut m = make_machine("node-local", 8000);
+            let node_b = "node-b";
+            let node_c = "node-c";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            add_node(&mut m, node_b, b_addr, 1);
+
+            // Wait until node-b's direct probe starts
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+                m.probe_seq_for(node_b)
+            });
+            let _ = m.take_outbound(); // discard the ping
+
+            add_node(&mut m, node_c, c_addr, 1);
+
+            // Let direct probe timeout for node-b
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                m.tick();
+            }
+            let _ = m.take_outbound(); // discard the PingReqs
+
+            assert!(
+                matches!(
                 m.pending_probes.get(&seq).unwrap().phase,
                 ProbePhase::Indirect
             ),
-            "probe should be in Indirect phase after direct timeout"
-        );
+                "probe should be in Indirect phase after direct timeout"
+            );
 
-        // Send Ack with the (reused) seq — clears the indirect probe
-        m.step(b_addr, ack(seq, node_b, 1, vec![]));
+            // Send Ack with the (reused) seq — clears the indirect probe
+            m.step(b_addr, ack(seq, node_b, 1, vec![]));
 
-        assert!(
-            m.pending_probes.get(&seq).is_none(),
-            "indirect probe should be removed after matching Ack"
-        );
-    }
+            assert!(
+                m.pending_probes.get(&seq).is_none(),
+                "indirect probe should be removed after matching Ack"
+            );
+        }
 
-    #[test]
-    fn late_ack_same_incarnation_does_not_refute_suspect() {
-        let mut m = make_machine("node-local", 8000);
-        let node_b = "node-b";
-        let node_c = "node-c";
-        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        #[test]
+        fn late_ack_same_incarnation_does_not_refute_suspect() {
+            let mut m = make_machine("node-local", 8000);
+            let node_b = "node-b";
+            let node_c = "node-c";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-        add_node(&mut m, node_b, b_addr, 1);
-        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
-        let _ = m.take_outbound();
+            add_node(&mut m, node_b, b_addr, 1);
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+            let _ = m.take_outbound();
 
-        // we don't care about node c. It's for indirect request
-        add_node(&mut m, node_c, c_addr, 1);
+            // we don't care about node c. It's for indirect request
+            add_node(&mut m, node_c, c_addr, 1);
 
-        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
-        let _ = m.take_outbound();
-        for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+            let _ = m.take_outbound();
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
 
-        assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+            assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
-        // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
-        m.step(b_addr, ack(seq, node_b, 1, vec![]));
+            // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
+            m.step(b_addr, ack(seq, node_b, 1, vec![]));
 
-        assert_eq!(
-            m.members.get(node_b).unwrap().state,
-            SwimNodeState::Suspect,
-            "same incarnation Ack should not refute suspicion"
-        );
-    }
+            assert_eq!(
+                m.members.get(node_b).unwrap().state,
+                SwimNodeState::Suspect,
+                "same incarnation Ack should not refute suspicion"
+            );
+        }
 
-    #[test]
-    fn late_ack_with_higher_incarnation_refutes_suspect() {
-        let mut m = make_machine("node-local", 8000);
-        let node_b = "node-b";
-        let node_c = "node-c";
-        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        #[test]
+        fn late_ack_with_higher_incarnation_refutes_suspect() {
+            let mut m = make_machine("node-local", 8000);
+            let node_b = "node-b";
+            let node_c = "node-c";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-        add_node(&mut m, node_b, b_addr, 1);
-        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
-        let _ = m.take_outbound();
+            add_node(&mut m, node_b, b_addr, 1);
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+            let _ = m.take_outbound();
 
-        // we don't care about node c. It's for indirect request
-        add_node(&mut m, node_c, c_addr, 1);
+            // we don't care about node c. It's for indirect request
+            add_node(&mut m, node_c, c_addr, 1);
 
-        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
-        let _ = m.take_outbound();
-        for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+            let _ = m.take_outbound();
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
 
-        assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+            assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
-        // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
-        m.step(b_addr, ack(seq, node_b, 2, vec![]));
+            // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
+            m.step(b_addr, ack(seq, node_b, 2, vec![]));
 
-        assert_eq!(
-            m.members.get(node_b).unwrap().state,
-            SwimNodeState::Alive,
-            "higher incarnation Ack should refute suspicion"
-        );
-        // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-        assert!(m.suspect_timers.contains_key(node_b));
+            assert_eq!(
+                m.members.get(node_b).unwrap().state,
+                SwimNodeState::Alive,
+                "higher incarnation Ack should refute suspicion"
+            );
+            // Suspect timer still running — try_mark_dead guard will see Alive and no-op
+            assert!(m.suspect_timers.contains_key(node_b));
+        }
     }
 }
