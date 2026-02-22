@@ -972,11 +972,67 @@ mod tests {
         let mut m = make_machine("node-local", 8000);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        m.step(sender, ping(1, "node-b", 0, vec![
-            node("node-local", 8000, SwimNodeState::Dead, 0),
-        ]));
+        m.step(
+            sender,
+            ping(
+                1,
+                "node-b",
+                0,
+                vec![node("node-local", 8000, SwimNodeState::Dead, 0)],
+            ),
+        );
 
         // TODO: Fix current (incorrect) behavior: Dead gossip triggers refutation
-        assert_eq!(m.incarnation, 1, "current impl refutes Dead — this should change when TODO is fixed");
+        assert_eq!(
+            m.incarnation, 1,
+            "current impl refutes Dead — this should change when TODO is fixed"
+        );
+    }
+
+    mod tick_protocol_period {
+        use crate::clusters::SwimPacket;
+        use crate::clusters::swim_state_machine::tests::{add_node, make_machine, tick_until};
+        use crate::clusters::swim_state_machine::{PROBE_INTERVAL_TICKS, ProbePhase};
+        use std::net::SocketAddr;
+
+        #[test]
+        fn no_probe_before_protocol_period_elapses() {
+            let mut m = make_machine("127.0.0.1", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            add_node(&mut m, "node-b", b_addr, 1);
+            let _ = m.take_outbound();
+
+            for _ in 0..PROBE_INTERVAL_TICKS - 1 {
+                m.tick();
+            }
+
+            assert!(m.pending_probes.is_empty());
+            assert!(m.take_outbound().is_empty());
+        }
+
+        #[test]
+        fn probe_starts_on_protocol_period() {
+            let mut m = make_machine("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node(&mut m, "node-b", b_addr, 1);
+            let _ = m.take_outbound();
+
+            tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+                if !m.pending_probes.is_empty() {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+
+            assert_eq!(m.pending_probes.len(), 1);
+            assert!(matches!(
+                m.pending_probes.values().next().unwrap().phase,
+                ProbePhase::Direct
+            ));
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].packet, SwimPacket::Ping { .. }));
+        }
     }
 }
