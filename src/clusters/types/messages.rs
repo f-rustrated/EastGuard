@@ -34,11 +34,10 @@ pub enum ActorEvent {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
 
-    // Internal Timers
+    // Test hook: advance one logical tick in the state machine without waiting
+    // for the real-time interval. Useful for deterministic tests via SwimActor.
+    // For fully deterministic testing, prefer driving SwimStateMachine directly.
     ProtocolTick,
-    DirectProbeTimeout { target_node_id: NodeId, seq: u32 },
-    IndirectProbeTimeout { target_node_id: NodeId },
-    SuspectTimeout { target_node_id: NodeId },
 }
 
 /// Outbound Commands (Logic -> Transport)

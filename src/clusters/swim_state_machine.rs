@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 
-const PROTOCOL_PERIOD_TICKS: u32 = 10; // 10 × 100ms = 1s
-const ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-const INDIRECT_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
+pub(crate) const PROTOCOL_PERIOD_TICKS: u32 = 10; // 10 × 100ms = 1s
+pub(crate) const ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
+pub(crate) const INDIRECT_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
+pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 const INDIRECT_PING_COUNT: usize = 3;
 
 /// SWIM protocol state machine. No async, no channels, no real timers.

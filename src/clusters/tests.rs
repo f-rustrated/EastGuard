@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
+
+use crate::clusters::swim_state_machine::{ACK_TIMEOUT_TICKS, PROTOCOL_PERIOD_TICKS};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -31,7 +33,6 @@ async fn setup() -> (
         addr,
         "node-local".into(),
         rx_in,
-        tx_in.clone(),
         tx_out,
         make_topology(),
     );
@@ -222,35 +223,32 @@ async fn test_indirect_ping_trigger() {
 
     let _ack = rx.recv().await.unwrap(); // Clear the Ack
 
-    // 2. Trigger the Protocol Tick manually
-    tx.send(ActorEvent::ProtocolTick).await.unwrap();
+    // 2. Advance PROTOCOL_PERIOD_TICKS ticks so the state machine starts a probe.
+    for _ in 0..PROTOCOL_PERIOD_TICKS {
+        tx.send(ActorEvent::ProtocolTick).await.unwrap();
+    }
 
-    // 3. Expect a Direct Ping to one of them (e.g., Peer 1)
-    let direct_ping = rx.recv().await.unwrap();
+    // 3. Expect the Direct Ping that was sent at the end of the protocol period.
+    let direct_ping = time::timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .expect("Actor should send a Ping after PROTOCOL_PERIOD_TICKS ticks")
+        .unwrap();
     let target_addr = direct_ping.target;
-    let target_node_id = if target_addr == peer_1 {
-        "node-peer-1"
-    } else {
-        "node-peer-2"
-    };
-    let seq = match direct_ping.packet {
-        SwimPacket::Ping { seq, .. } => seq,
+    match direct_ping.packet {
+        SwimPacket::Ping { .. } => {}
         _ => panic!("Expected Ping"),
     };
 
-    // 4. DON'T send an Ack. Simulate a timeout.
-    // We manually trigger the timeout event the actor would have scheduled.
-    tx.send(ActorEvent::DirectProbeTimeout {
-        target_node_id: target_node_id.into(),
-        seq,
-    })
-    .await
-    .unwrap();
+    // 4. DON'T send an Ack. Advance ACK_TIMEOUT_TICKS more ticks so the direct
+    //    probe times out and the state machine transitions to indirect probing.
+    for _ in 0..ACK_TIMEOUT_TICKS {
+        tx.send(ActorEvent::ProtocolTick).await.unwrap();
+    }
 
-    // 5. Expect Indirect Pings (PingReq) sent to the *other* peer
-    let indirect_ping = time::timeout(Duration::from_millis(100), rx.recv())
+    // 5. Expect a PingReq aimed at the same target.
+    let indirect_ping = time::timeout(Duration::from_millis(200), rx.recv())
         .await
-        .expect("Should send indirect ping")
+        .expect("Actor should send a PingReq after ACK_TIMEOUT_TICKS ticks")
         .unwrap();
 
     match indirect_ping.packet {
@@ -269,18 +267,17 @@ async fn test_indirect_ping_trigger() {
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-    let (tx_in, rx_in) = mpsc::channel(100);
+    let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(
+    let actor = SwimActor::new(
         addr,
         "node-local".into(),
         rx_in,
-        tx_in.clone(),
         tx_out,
         make_topology(),
     );
-    actor.init_self_for_test();
+    // init_self() is called inside SwimActor::new(); no explicit call needed.
 
     assert!(
         actor.topology().contains_node(&"node-local".into()),
@@ -293,14 +290,13 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (tx_in, rx_in) = mpsc::channel(100);
+    let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
     let mut actor = SwimActor::new(
         addr,
         "node-local".into(),
         rx_in,
-        tx_in.clone(),
         tx_out,
         make_topology(),
     );
@@ -333,14 +329,13 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (tx_in, rx_in) = mpsc::channel(100);
+    let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
     let mut actor = SwimActor::new(
         addr,
         "node-local".into(),
         rx_in,
-        tx_in.clone(),
         tx_out,
         make_topology(),
     );

@@ -47,7 +47,6 @@ impl StartUp {
             local_peer_addr,
             node_id,
             swim_mailbox,
-            swim_sender,
             tx_outbound,
             topology,
         );
