@@ -321,6 +321,11 @@ impl SwimStateMachine {
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_probes.remove(&seq);
+
+                // Do NOT cancel the suspect timer here. A same-or-lower incarnation Ack
+                // could be a delayed packet from before the node knew it was suspected.
+                // Only `handle_incarnation_check` above can clear suspicion, and only
+                // when the sender proves awareness by sending a strictly higher incarnation.
             }
 
             SwimPacket::PingReq {
@@ -481,6 +486,14 @@ impl SwimStateMachine {
     pub fn take_outbound(&mut self) -> Vec<OutboundPacket> {
         std::mem::take(&mut self.pending_outbound)
     }
+
+    #[cfg(test)]
+    pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
+        self.pending_probes
+            .iter()
+            .find(|(_, probe)| &*probe.target_node_id == node_id)
+            .map(|(&seq, _)| seq)
+    }
 }
 
 #[cfg(test)]
@@ -493,7 +506,12 @@ mod tests {
 
     fn make_machine(local_id: &str, local_port: u16) -> SwimStateMachine {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-        let topology = Topology::new(HashMap::new(), TopologyConfig { vnodes_per_pnode: 256 });
+        let topology = Topology::new(
+            HashMap::new(),
+            TopologyConfig {
+                vnodes_per_pnode: 256,
+            },
+        );
         let mut m = SwimStateMachine::new(NodeId::new(local_id), addr, topology);
         m.init_self();
         m
@@ -531,11 +549,16 @@ mod tests {
         let _ = m.take_outbound();
     }
 
-    fn tick_until<T>(m: &mut SwimStateMachine, max_ticks: u32, mut f: impl FnMut(&SwimStateMachine) -> Option<T>) -> T
-    {
+    fn tick_until<T>(
+        m: &mut SwimStateMachine,
+        max_ticks: u32,
+        mut f: impl FnMut(&SwimStateMachine) -> Option<T>,
+    ) -> T {
         for _ in 0..max_ticks {
             m.tick();
-            if let Some(v) = f(m) { return v; }
+            if let Some(v) = f(m) {
+                return v;
+            }
         }
         panic!("condition not met after {max_ticks} ticks");
     }
@@ -553,7 +576,10 @@ mod tests {
 
         m.step(sender, ping(1, "node-b", 0, vec![]));
 
-        let member = m.members.get("node-b").expect("unknown node should be added");
+        let member = m
+            .members
+            .get("node-b")
+            .expect("unknown node should be added");
         assert_eq!(member.state, SwimNodeState::Alive);
         assert_eq!(member.addr, sender);
 
@@ -601,7 +627,10 @@ mod tests {
         m.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
 
         // Gossip applied: node-c is in members
-        assert!(m.members.contains_key("node-c"), "gossiped node should be in members");
+        assert!(
+            m.members.contains_key("node-c"),
+            "gossiped node should be in members"
+        );
 
         // Ack's gossip reflects the update applied during this step
         let out = m.take_outbound();
@@ -659,5 +688,131 @@ mod tests {
         assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
     }
 
+    // -----------------------------------------------------------------------
+    // Ack tests
+    // -----------------------------------------------------------------------
 
+    #[test]
+    fn ack_matching_direct_probe_removes_probe() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let node_b_id = "node-b";
+        add_node(&mut m, node_b_id, sender, 1);
+
+        // wait until direct ping is sent
+        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            m.probe_seq_for(node_b_id)
+        });
+
+        // let's Ack before direct ping times out
+        m.step(sender, ack(seq, node_b_id, 1, vec![]));
+        let _ = m.take_outbound();
+
+        assert!(!m.pending_probes.contains_key(&seq));
+    }
+
+    #[test]
+    fn ack_matching_indirect_probe_removes_probe() {
+        let mut m = make_machine("node-local", 8000);
+        let node_b = "node-b";
+        let node_c = "node-c";
+        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        add_node(&mut m, node_b, b_addr, 1);
+
+        // Wait until node-b's direct probe starts
+        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            m.probe_seq_for(node_b)
+        });
+        let _ = m.take_outbound(); // discard the ping
+
+        add_node(&mut m, node_c, c_addr, 1);
+
+        // Let direct probe timeout for node-b
+        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+            m.tick();
+        }
+        let _ = m.take_outbound(); // discard the PingReqs
+
+        assert!(
+            matches!(
+                m.pending_probes.get(&seq).unwrap().phase,
+                ProbePhase::Indirect
+            ),
+            "probe should be in Indirect phase after direct timeout"
+        );
+
+        // Send Ack with the (reused) seq — clears the indirect probe
+        m.step(b_addr, ack(seq, node_b, 1, vec![]));
+
+        assert!(
+            m.pending_probes.get(&seq).is_none(),
+            "indirect probe should be removed after matching Ack"
+        );
+    }
+
+    #[test]
+    fn late_ack_same_incarnation_does_not_refute_suspect() {
+        let mut m = make_machine("node-local", 8000);
+        let node_b = "node-b";
+        let node_c = "node-c";
+        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        add_node(&mut m, node_b, b_addr, 1);
+        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+        let _ = m.take_outbound();
+
+        // we don't care about node c. It's for indirect request
+        add_node(&mut m, node_c, c_addr, 1);
+
+        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+        let _ = m.take_outbound();
+        for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+
+        assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+
+        // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
+        m.step(b_addr, ack(seq, node_b, 1, vec![]));
+
+        assert_eq!(
+            m.members.get(node_b).unwrap().state,
+            SwimNodeState::Suspect,
+            "same incarnation Ack should not refute suspicion"
+        );
+    }
+
+    #[test]
+    fn late_ack_with_higher_incarnation_refutes_suspect() {
+        let mut m = make_machine("node-local", 8000);
+        let node_b = "node-b";
+        let node_c = "node-c";
+        let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        add_node(&mut m, node_b, b_addr, 1);
+        let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+        let _ = m.take_outbound();
+
+        // we don't care about node c. It's for indirect request
+        add_node(&mut m, node_c, c_addr, 1);
+
+        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+        let _ = m.take_outbound();
+        for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+
+        assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+
+        // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
+        m.step(b_addr, ack(seq, node_b, 2, vec![]));
+
+        assert_eq!(
+            m.members.get(node_b).unwrap().state,
+            SwimNodeState::Alive,
+            "higher incarnation Ack should refute suspicion"
+        );
+        // Suspect timer still running — try_mark_dead guard will see Alive and no-op
+        assert!(m.suspect_timers.contains_key(node_b));
+    }
 }
