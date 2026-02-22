@@ -224,31 +224,33 @@ async fn test_indirect_ping_trigger() {
     let _ack = rx.recv().await.unwrap(); // Clear the Ack
 
     // 2. Advance PROTOCOL_PERIOD_TICKS ticks so the state machine starts a probe.
-    for _ in 0..PROTOCOL_PERIOD_TICKS {
-        tx.send(ActorEvent::ProtocolTick).await.unwrap();
+    //    LiveNodeTracker inserts at a random position, so start_probe() may land
+    //    on self and skip. Retry up to 3 periods to guarantee hitting a peer.
+    let mut target_addr = None;
+    for _ in 0..3 {
+        for _ in 0..PROTOCOL_PERIOD_TICKS {
+            tx.send(ActorEvent::ProtocolTick).await.unwrap();
+        }
+        match time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Some(pkt)) if matches!(pkt.packet, SwimPacket::Ping { .. }) => {
+                target_addr = Some(pkt.target);
+                break;
+            }
+            _ => {}
+        }
     }
+    let target_addr = target_addr.expect("Actor should send a Ping within 3 protocol periods");
 
-    // 3. Expect the Direct Ping that was sent at the end of the protocol period.
-    let direct_ping = time::timeout(Duration::from_millis(200), rx.recv())
-        .await
-        .expect("Actor should send a Ping after PROTOCOL_PERIOD_TICKS ticks")
-        .unwrap();
-    let target_addr = direct_ping.target;
-    match direct_ping.packet {
-        SwimPacket::Ping { .. } => {}
-        _ => panic!("Expected Ping"),
-    };
-
-    // 4. DON'T send an Ack. Advance ACK_TIMEOUT_TICKS more ticks so the direct
+    // 4. DON'T send an Ack. Advance ACK_TIMEOUT_TICKS ticks so the direct
     //    probe times out and the state machine transitions to indirect probing.
     for _ in 0..ACK_TIMEOUT_TICKS {
         tx.send(ActorEvent::ProtocolTick).await.unwrap();
     }
 
-    // 5. Expect a PingReq aimed at the same target.
-    let indirect_ping = time::timeout(Duration::from_millis(200), rx.recv())
+    // 5. Expect Indirect Pings (PingReq) sent to the *other* peer
+    let indirect_ping = time::timeout(Duration::from_millis(100), rx.recv())
         .await
-        .expect("Actor should send a PingReq after ACK_TIMEOUT_TICKS ticks")
+        .expect("Should send indirect ping")
         .unwrap();
 
     match indirect_ping.packet {
