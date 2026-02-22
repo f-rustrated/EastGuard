@@ -255,7 +255,7 @@ impl SwimStateMachine {
             }
 
             let (addr, incarnation) = (member.addr, member.incarnation);
-            println!("Node {} is SUSPECT(Inc: {})", target_node_id, incarnation);
+            tracing::info!("Node {} is SUSPECT(Inc: {})", target_node_id, incarnation);
             self.update_member(
                 target_node_id.clone(),
                 addr,
@@ -352,7 +352,7 @@ impl SwimStateMachine {
         if member.node_id == self.node_id {
             if member.state.not_alive() && self.incarnation <= member.incarnation {
                 let new_incarnation = member.incarnation + 1;
-                println!(
+                tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
                     self.incarnation, new_incarnation
                 );
@@ -847,7 +847,6 @@ mod tests {
     mod step_pingreq {
         use crate::clusters::swim_state_machine::tests::{make_machine, node, pingreq};
         use crate::clusters::{SwimNode, SwimNodeState, SwimPacket};
-        use std::hint::assert_unchecked;
         use std::net::SocketAddr;
 
         #[test]
