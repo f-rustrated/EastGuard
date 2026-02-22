@@ -543,6 +543,22 @@ mod tests {
         }
     }
 
+    fn pingreq(
+        seq: u32,
+        from_id: &str,
+        from_inc: u64,
+        target: SocketAddr,
+        gossip: Vec<SwimNode>,
+    ) -> SwimPacket {
+        SwimPacket::PingReq {
+            seq,
+            target,
+            source_node_id: NodeId::new(from_id),
+            source_incarnation: from_inc,
+            gossip,
+        }
+    }
+
     fn add_node(m: &mut SwimStateMachine, id: &str, addr: SocketAddr, inc: u64) {
         m.step(addr, ping(1, id, inc, vec![]));
         let _ = m.take_outbound();
@@ -567,9 +583,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod ping {
-        use std::net::SocketAddr;
         use crate::clusters::swim_state_machine::tests::{make_machine, node, ping};
         use crate::clusters::{NodeId, SwimNodeState, SwimPacket};
+        use std::net::SocketAddr;
 
         #[test]
         fn ping_from_unknown_node() {
@@ -684,10 +700,12 @@ mod tests {
     }
 
     mod ack {
-        use std::net::SocketAddr;
-        use crate::clusters::swim_state_machine::{ProbePhase, DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
-        use crate::clusters::swim_state_machine::tests::{ack, add_node, make_machine, tick_until};
         use crate::clusters::SwimNodeState;
+        use crate::clusters::swim_state_machine::tests::{ack, add_node, make_machine, tick_until};
+        use crate::clusters::swim_state_machine::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, ProbePhase,
+        };
+        use std::net::SocketAddr;
 
         #[test]
         fn ack_matching_direct_probe_removes_probe() {
@@ -734,9 +752,9 @@ mod tests {
 
             assert!(
                 matches!(
-                m.pending_probes.get(&seq).unwrap().phase,
-                ProbePhase::Indirect
-            ),
+                    m.pending_probes.get(&seq).unwrap().phase,
+                    ProbePhase::Indirect
+                ),
                 "probe should be in Indirect phase after direct timeout"
             );
 
@@ -758,15 +776,21 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node(&mut m, node_b, b_addr, 1);
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+                m.probe_seq_for(node_b)
+            });
             let _ = m.take_outbound();
 
             // we don't care about node c. It's for indirect request
             add_node(&mut m, node_c, c_addr, 1);
 
-            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                m.tick()
+            } // we now send indirect ping for node-b
             let _ = m.take_outbound();
-            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
+                m.tick()
+            } // node-b is not suspect
 
             assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
@@ -789,15 +813,21 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node(&mut m, node_b, b_addr, 1);
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| m.probe_seq_for(node_b));
+            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+                m.probe_seq_for(node_b)
+            });
             let _ = m.take_outbound();
 
             // we don't care about node c. It's for indirect request
             add_node(&mut m, node_c, c_addr, 1);
 
-            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS { m.tick() } // we now send indirect ping for node-b
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                m.tick()
+            } // we now send indirect ping for node-b
             let _ = m.take_outbound();
-            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS { m.tick() } // node-b is not suspect
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
+                m.tick()
+            } // node-b is now suspect
 
             assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
@@ -811,6 +841,66 @@ mod tests {
             );
             // Suspect timer still running — try_mark_dead guard will see Alive and no-op
             assert!(m.suspect_timers.contains_key(node_b));
+        }
+    }
+
+    mod step_pingreq {
+        use crate::clusters::swim_state_machine::tests::{make_machine, node, pingreq};
+        use crate::clusters::{SwimNode, SwimNodeState, SwimPacket};
+        use std::hint::assert_unchecked;
+        use std::net::SocketAddr;
+
+        #[test]
+        fn pingreq_sends_ping_to_target() {
+            let mut m = make_machine("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            m.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
+
+            // A Ping must be sent to the target (node-c)
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            assert!(
+                out.iter()
+                    .any(|p| p.target == c_addr && matches!(p.packet, SwimPacket::Ping { .. }))
+            );
+
+            // handle_incarnation_check ran: sender node-b should be in members
+            let member = m
+                .members
+                .get("node-b")
+                .expect("node-b should be added to members");
+            assert_eq!(member.state, SwimNodeState::Alive);
+        }
+
+        #[test]
+        fn pingreq_gossip_applied_before_proxy_ping() {
+            let mut m = make_machine("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            let gossip_entry = node("node-d", 9003, SwimNodeState::Alive, 1);
+            m.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![gossip_entry]));
+
+            // Gossip applied: node-d should be in members
+            assert!(
+                m.members.contains_key("node-d"),
+                "gossiped node-d should be in members"
+            );
+
+            // Proxy Ping's gossip should reflect the update (gossip applied in Phase 1, before Ping built)
+            let out = m.take_outbound();
+            assert_eq!(out.len(), 1);
+            match &out[0].packet {
+                SwimPacket::Ping { gossip, .. } => {
+                    assert!(
+                        gossip.iter().any(|n| n.node_id == "node-d".into()),
+                        "proxy Ping gossip should contain node-d"
+                    );
+                }
+                _ => panic!("expected Ping"),
+            }
         }
     }
 }
