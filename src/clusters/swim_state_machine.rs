@@ -132,7 +132,8 @@ impl SwimStateMachine {
             let probe = self.pending_probes.remove(&seq).unwrap();
             match probe.phase {
                 ProbePhase::Direct => {
-                    self.start_indirect_probe(probe.target_node_id);
+                    // We preserve the previous direct probe's seq so that we can cancel indirect probe timeout when we receive long running Ack message from the previous direct probe
+                    self.start_indirect_probe(probe.target_node_id, seq);
                 }
                 ProbePhase::Indirect => {
                     self.try_mark_suspect(probe.target_node_id);
@@ -198,7 +199,7 @@ impl SwimStateMachine {
         }
     }
 
-    fn start_indirect_probe(&mut self, target_node_id: NodeId) {
+    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
         let target_addr = match self.members.get(&target_node_id).map(|m| m.addr) {
             Some(addr) => addr,
             None => return,
@@ -226,7 +227,6 @@ impl SwimStateMachine {
             return;
         }
 
-        let seq = self.next_seq();
         let msg = SwimPacket::PingReq {
             seq,
             target: target_addr,
@@ -318,6 +318,7 @@ impl SwimStateMachine {
                 source_incarnation,
                 ..
             } => {
+                // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_probes.remove(&seq);
             }
@@ -515,7 +516,57 @@ mod tests {
         }
     }
 
-    // 1. Ping from an unknown node
+    fn ack(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+        SwimPacket::Ack {
+            seq,
+            source_node_id: NodeId::new(from_id),
+            source_incarnation: from_inc,
+            gossip,
+        }
+    }
+
+    fn add_node(m: &mut SwimStateMachine, id: &str, addr: SocketAddr, inc: u64) {
+        m.step(addr, ping(1, id, inc, vec![]));
+        let _ = m.take_outbound();
+    }
+
+    /// Tick until a direct Ping targeting `node_id` appears in the outbound buffer.
+    /// The buffer is NOT drained — the caller owns it.
+    fn wait_for_direct_probe(m: &mut SwimStateMachine, node_id: &str) -> u32 {
+        let addr = m.members.get(node_id).unwrap().addr;
+        loop {
+            m.tick();
+            for p in &m.pending_outbound {
+                if let SwimPacket::Ping { seq, .. } = &p.packet {
+                    if p.target == addr {
+                        return *seq;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tick until a PingReq targeting `node_id` appears in the outbound buffer.
+    /// The buffer is NOT drained — the caller owns it.
+    fn wait_for_indirect_probe(m: &mut SwimStateMachine, node_id: &str) -> u32 {
+        let addr = m.members.get(node_id).unwrap().addr;
+        loop {
+            m.tick();
+            for p in &m.pending_outbound {
+                if let SwimPacket::PingReq { seq, target, .. } = &p.packet {
+                    if *target == addr {
+                        return *seq;
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ping tests
+    // -----------------------------------------------------------------------
+
+    // Ping from an unknown node
     //    → node added to `members` as Alive; Ack sent back to sender
     #[test]
     fn ping_from_unknown_node() {
@@ -534,7 +585,7 @@ mod tests {
         assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
     }
 
-    // 2. Ping from a known Alive node
+    // Ping from a known Alive node
     //    → Ack sent; member state unchanged
     #[test]
     fn ping_from_known_alive_node() {
@@ -561,7 +612,7 @@ mod tests {
         assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
     }
 
-    // 3. Ping with non-empty gossip list
+    // Ping with non-empty gossip list
     //    → gossip applied to `members` before Ack is built; Ack's gossip reflects the update
     #[test]
     fn ping_with_gossip_applied_before_ack() {
@@ -588,7 +639,7 @@ mod tests {
         }
     }
 
-    // 4. Ping sender has a higher incarnation than we know
+    // Ping sender has a higher incarnation than we know
     //    → member updated to Alive at the new (higher) incarnation
     #[test]
     fn ping_sender_higher_incarnation_updates_member() {
@@ -609,7 +660,7 @@ mod tests {
         assert_eq!(member.incarnation, 5);
     }
 
-    // 5. Ping sender has a lower incarnation than we know
+    // Ping sender has a lower incarnation than we know
     //    → member incarnation is NOT downgraded; no state change
     #[test]
     fn ping_sender_lower_incarnation_does_not_downgrade() {
