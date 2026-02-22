@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 
-pub(crate) const PROTOCOL_PERIOD_TICKS: u32 = 10; // 10 × 100ms = 1s
-pub(crate) const ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-pub(crate) const INDIRECT_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
+pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
+pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
+pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 const INDIRECT_PING_COUNT: usize = 3;
 
@@ -158,7 +158,7 @@ impl SwimStateMachine {
 
         // 3. Advance the protocol clock - start a new probe when the period elapses
         self.protocol_elapsed += 1;
-        if self.protocol_elapsed >= PROTOCOL_PERIOD_TICKS {
+        if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
             self.protocol_elapsed = 0;
             self.start_probe();
         }
@@ -193,7 +193,7 @@ impl SwimStateMachine {
                 ActiveProbe {
                     target_node_id,
                     phase: ProbePhase::Direct,
-                    ticks_remaining: ACK_TIMEOUT_TICKS,
+                    ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
                 },
             );
         }
@@ -243,7 +243,7 @@ impl SwimStateMachine {
             ActiveProbe {
                 target_node_id,
                 phase: ProbePhase::Indirect,
-                ticks_remaining: INDIRECT_TIMEOUT_TICKS,
+                ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
             },
         );
     }
@@ -489,6 +489,7 @@ mod tests {
     use crate::clusters::topology::{Topology, TopologyConfig};
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::os::unix::raw::time_t;
 
     fn make_machine(local_id: &str, local_port: u16) -> SwimStateMachine {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
@@ -530,36 +531,13 @@ mod tests {
         let _ = m.take_outbound();
     }
 
-    /// Tick until a direct Ping targeting `node_id` appears in the outbound buffer.
-    /// The buffer is NOT drained — the caller owns it.
-    fn wait_for_direct_probe(m: &mut SwimStateMachine, node_id: &str) -> u32 {
-        let addr = m.members.get(node_id).unwrap().addr;
-        loop {
+    fn tick_until<T>(m: &mut SwimStateMachine, max_ticks: u32, mut f: impl FnMut(&SwimStateMachine) -> Option<T>) -> T
+    {
+        for _ in 0..max_ticks {
             m.tick();
-            for p in &m.pending_outbound {
-                if let SwimPacket::Ping { seq, .. } = &p.packet {
-                    if p.target == addr {
-                        return *seq;
-                    }
-                }
-            }
+            if let Some(v) = f(m) { return v; }
         }
-    }
-
-    /// Tick until a PingReq targeting `node_id` appears in the outbound buffer.
-    /// The buffer is NOT drained — the caller owns it.
-    fn wait_for_indirect_probe(m: &mut SwimStateMachine, node_id: &str) -> u32 {
-        let addr = m.members.get(node_id).unwrap().addr;
-        loop {
-            m.tick();
-            for p in &m.pending_outbound {
-                if let SwimPacket::PingReq { seq, target, .. } = &p.packet {
-                    if *target == addr {
-                        return *seq;
-                    }
-                }
-            }
-        }
+        panic!("condition not met after {max_ticks} ticks");
     }
 
     // -----------------------------------------------------------------------
@@ -680,4 +658,6 @@ mod tests {
         assert_eq!(member.state, SwimNodeState::Alive);
         assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
     }
+
+
 }

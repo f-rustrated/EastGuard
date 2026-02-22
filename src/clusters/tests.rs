@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_state_machine::{ACK_TIMEOUT_TICKS, PROTOCOL_PERIOD_TICKS};
+use crate::clusters::swim_state_machine::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -228,7 +228,7 @@ async fn test_indirect_ping_trigger() {
     //    on self and skip. Retry up to 3 periods to guarantee hitting a peer.
     let mut target_addr = None;
     for _ in 0..3 {
-        for _ in 0..PROTOCOL_PERIOD_TICKS {
+        for _ in 0..PROBE_INTERVAL_TICKS {
             tx.send(ActorEvent::ProtocolTick).await.unwrap();
         }
         match time::timeout(Duration::from_millis(50), rx.recv()).await {
@@ -243,7 +243,7 @@ async fn test_indirect_ping_trigger() {
 
     // 4. DON'T send an Ack. Advance ACK_TIMEOUT_TICKS ticks so the direct
     //    probe times out and the state machine transitions to indirect probing.
-    for _ in 0..ACK_TIMEOUT_TICKS {
+    for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
         tx.send(ActorEvent::ProtocolTick).await.unwrap();
     }
 
