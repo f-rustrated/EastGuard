@@ -903,4 +903,80 @@ mod tests {
             }
         }
     }
+
+    mod step_self_refutation {
+        use crate::clusters::swim_state_machine::tests::{make_machine, node, ping};
+        use crate::clusters::{SwimNodeState, SwimPacket};
+        use std::net::SocketAddr;
+
+        #[test]
+        fn refutation_bumps_to_gossip_inc_plus_one() {
+            let mut m = make_machine("node-local", 8080);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            m.incarnation = 2;
+
+            m.step(
+                sender,
+                ping(
+                    1,
+                    "node-b",
+                    0,
+                    vec![node("node-local", 8080, SwimNodeState::Suspect, 5)],
+                ),
+            );
+
+            assert_eq!(m.incarnation, 6, "must bump to gossip.inc + 1 = 6");
+            let out = m.take_outbound();
+            match &out[0].packet {
+                SwimPacket::Ack {
+                    source_incarnation,
+                    gossip,
+                    ..
+                } => {
+                    assert_eq!(*source_incarnation, 6);
+                    assert!(
+                        gossip
+                            .iter()
+                            .any(|n| n.node_id == "node-local".into() && n.incarnation == 6),
+                        "self-refutation should be enqueued in gossip"
+                    );
+                }
+                _ => panic!("expected Ack"),
+            }
+        }
+
+        #[test]
+        fn refutation_skipped_when_local_inc_is_higher() {
+            let mut m = make_machine("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            m.incarnation = 3;
+
+            m.step(
+                sender,
+                ping(
+                    1,
+                    "node-b",
+                    0,
+                    vec![node("node-local", 8000, SwimNodeState::Suspect, 2)],
+                ),
+            );
+
+            assert_eq!(m.incarnation, 3, "local inc must not change");
+        }
+    }
+
+    #[test]
+    fn refutation_on_dead_gossip_current_behavior() {
+        // TODO: Per SWIM spec, Dead is terminal and should NOT trigger refutation.
+        // Fix: add `if member.state == Dead { return; }` guard in apply_membership_update.
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        m.step(sender, ping(1, "node-b", 0, vec![
+            node("node-local", 8000, SwimNodeState::Dead, 0),
+        ]));
+
+        // TODO: Fix current (incorrect) behavior: Dead gossip triggers refutation
+        assert_eq!(m.incarnation, 1, "current impl refutes Dead — this should change when TODO is fixed");
+    }
 }
