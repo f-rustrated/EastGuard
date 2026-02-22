@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_state_machine::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+use crate::clusters::swim_protocol::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 

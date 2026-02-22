@@ -1,4 +1,4 @@
-use super::swim_state_machine::SwimStateMachine;
+use super::swim_protocol::SwimProtocol;
 use super::*;
 use crate::clusters::topology::Topology;
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ const TICK_PERIOD: Duration = Duration::from_millis(100);
 pub struct SwimActor {
     mailbox: mpsc::Receiver<ActorEvent>,
     outbound: mpsc::Sender<OutboundPacket>,
-    state: SwimStateMachine,
+    state: SwimProtocol,
 }
 
 impl SwimActor {
@@ -27,7 +27,7 @@ impl SwimActor {
         outbound: mpsc::Sender<OutboundPacket>,
         topology: Topology,
     ) -> Self {
-        let mut state = SwimStateMachine::new(node_id, local_addr, topology);
+        let mut state = SwimProtocol::new(node_id, local_addr, topology);
         state.init_self();
         Self { mailbox, outbound, state }
     }

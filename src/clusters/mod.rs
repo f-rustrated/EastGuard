@@ -14,7 +14,7 @@ pub(crate) mod transport;
 #[cfg(test)]
 pub mod tests;
 mod types;
-mod swim_state_machine;
+mod swim_protocol;
 
 pub(crate) use types::messages::*;
 pub(crate) use types::node::*;

@@ -12,15 +12,13 @@ pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 const INDIRECT_PING_COUNT: usize = 3;
 
-/// SWIM protocol state machine. No async, no channels, no real timers.
+/// SWIM protocol. No async, no channels, no real timers.
 ///
 /// Driven by two inputs:
 ///   - `step(src, packet)` — a packet arrived from the network
 ///   - `tick()`            — one unit of logical time has passed (100ms in production)
 ///
 /// All outbound packets are buffered in `pending_outbound`; drain with `take_outbound()`.
-///
-/// # Member State Machine
 ///
 /// ```text
 ///                    tick: every PROTOCOL_PERIOD_TICKS
@@ -54,7 +52,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 ///                                    paper, Dead is a terminal state and should NOT
 ///                                    be overridden by any incarnation number)
 /// ```
-pub struct SwimStateMachine {
+pub struct SwimProtocol {
     // Identity
     pub(crate) node_id: NodeId,
     pub(crate) local_addr: SocketAddr,
@@ -89,7 +87,7 @@ pub(crate) enum ProbePhase {
     Indirect,
 }
 
-impl SwimStateMachine {
+impl SwimProtocol {
     pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
         Self {
             node_id,
@@ -503,7 +501,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
-    fn make_machine(local_id: &str, local_port: u16) -> SwimStateMachine {
+    fn make_protocol(local_id: &str, local_port: u16) -> SwimProtocol {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
             HashMap::new(),
@@ -511,9 +509,9 @@ mod tests {
                 vnodes_per_pnode: 256,
             },
         );
-        let mut m = SwimStateMachine::new(NodeId::new(local_id), addr, topology);
-        m.init_self();
-        m
+        let mut p = SwimProtocol::new(NodeId::new(local_id), addr, topology);
+        p.init_self();
+        p
     }
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
@@ -559,15 +557,15 @@ mod tests {
         }
     }
 
-    fn add_node(m: &mut SwimStateMachine, id: &str, addr: SocketAddr, inc: u64) {
+    fn add_node(m: &mut SwimProtocol, id: &str, addr: SocketAddr, inc: u64) {
         m.step(addr, ping(1, id, inc, vec![]));
         let _ = m.take_outbound();
     }
 
     fn tick_until<T>(
-        m: &mut SwimStateMachine,
+        m: &mut SwimProtocol,
         max_ticks: u32,
-        mut f: impl FnMut(&SwimStateMachine) -> Option<T>,
+        mut f: impl FnMut(&SwimProtocol) -> Option<T>,
     ) -> T {
         for _ in 0..max_ticks {
             m.tick();
@@ -583,25 +581,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod ping {
-        use crate::clusters::swim_state_machine::tests::{make_machine, node, ping};
+        use crate::clusters::swim_protocol::tests::{make_protocol, node, ping};
         use crate::clusters::{NodeId, SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]
         fn ping_from_unknown_node() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-            m.step(sender, ping(1, "node-b", 0, vec![]));
+            p.step(sender, ping(1, "node-b", 0, vec![]));
 
-            let member = m
+            let member = p
                 .members
                 .get("node-b")
                 .expect("unknown node should be added");
             assert_eq!(member.state, SwimNodeState::Alive);
             assert_eq!(member.addr, sender);
 
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
             assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
@@ -609,24 +607,24 @@ mod tests {
 
         #[test]
         fn ping_from_known_alive_node() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // First ping: introduces node-b into members
-            m.step(sender, ping(1, "node-b", 2, vec![]));
-            let _ = m.take_outbound();
+            p.step(sender, ping(1, "node-b", 2, vec![]));
+            let _ = p.take_outbound();
 
-            let state_before = m.members.get("node-b").unwrap().state;
-            let inc_before = m.members.get("node-b").unwrap().incarnation;
+            let state_before = p.members.get("node-b").unwrap().state;
+            let inc_before = p.members.get("node-b").unwrap().incarnation;
 
             // Second ping: same node, same incarnation
-            m.step(sender, ping(2, "node-b", 2, vec![]));
+            p.step(sender, ping(2, "node-b", 2, vec![]));
 
-            let member = m.members.get("node-b").unwrap();
+            let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, state_before);
             assert_eq!(member.incarnation, inc_before);
 
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
             assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
@@ -634,20 +632,20 @@ mod tests {
 
         #[test]
         fn ping_with_gossip_applied_before_ack() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             let gossip_entry = node("node-c", 9001, SwimNodeState::Alive, 1);
-            m.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
+            p.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
 
             // Gossip applied: node-c is in members
             assert!(
-                m.members.contains_key("node-c"),
+                p.members.contains_key("node-c"),
                 "gossiped node should be in members"
             );
 
             // Ack's gossip reflects the update applied during this step
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             match &out[0].packet {
                 SwimPacket::Ack { gossip, .. } => {
@@ -662,38 +660,38 @@ mod tests {
 
         #[test]
         fn ping_sender_higher_incarnation_updates_member() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // Introduce node-b at incarnation 1
-            m.step(sender, ping(1, "node-b", 1, vec![]));
-            let _ = m.take_outbound();
-            assert_eq!(m.members.get("node-b").unwrap().incarnation, 1);
+            p.step(sender, ping(1, "node-b", 1, vec![]));
+            let _ = p.take_outbound();
+            assert_eq!(p.members.get("node-b").unwrap().incarnation, 1);
 
             // Ping from node-b with higher incarnation 5
-            m.step(sender, ping(2, "node-b", 5, vec![]));
-            let _ = m.take_outbound();
+            p.step(sender, ping(2, "node-b", 5, vec![]));
+            let _ = p.take_outbound();
 
-            let member = m.members.get("node-b").unwrap();
+            let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, SwimNodeState::Alive);
             assert_eq!(member.incarnation, 5);
         }
 
         #[test]
         fn ping_sender_lower_incarnation_does_not_downgrade() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // Introduce node-b at incarnation 5
-            m.step(sender, ping(1, "node-b", 5, vec![]));
-            let _ = m.take_outbound();
-            assert_eq!(m.members.get("node-b").unwrap().incarnation, 5);
+            p.step(sender, ping(1, "node-b", 5, vec![]));
+            let _ = p.take_outbound();
+            assert_eq!(p.members.get("node-b").unwrap().incarnation, 5);
 
             // Ping from node-b with lower incarnation 1
-            m.step(sender, ping(2, "node-b", 1, vec![]));
-            let _ = m.take_outbound();
+            p.step(sender, ping(2, "node-b", 1, vec![]));
+            let _ = p.take_outbound();
 
-            let member = m.members.get("node-b").unwrap();
+            let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, SwimNodeState::Alive);
             assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
         }
@@ -701,104 +699,104 @@ mod tests {
 
     mod ack {
         use crate::clusters::SwimNodeState;
-        use crate::clusters::swim_state_machine::tests::{ack, add_node, make_machine, tick_until};
-        use crate::clusters::swim_state_machine::{
+        use crate::clusters::swim_protocol::tests::{ack, add_node, make_protocol, tick_until};
+        use crate::clusters::swim_protocol::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, ProbePhase,
         };
         use std::net::SocketAddr;
 
         #[test]
         fn ack_matching_direct_probe_removes_probe() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
             let node_b_id = "node-b";
-            add_node(&mut m, node_b_id, sender, 1);
+            add_node(&mut p, node_b_id, sender, 1);
 
             // wait until direct ping is sent
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
                 m.probe_seq_for(node_b_id)
             });
 
             // let's Ack before direct ping times out
-            m.step(sender, ack(seq, node_b_id, 1, vec![]));
-            let _ = m.take_outbound();
+            p.step(sender, ack(seq, node_b_id, 1, vec![]));
+            let _ = p.take_outbound();
 
-            assert!(!m.pending_probes.contains_key(&seq));
+            assert!(!p.pending_probes.contains_key(&seq));
         }
 
         #[test]
         fn ack_matching_indirect_probe_removes_probe() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut m, node_b, b_addr, 1);
+            add_node(&mut p, node_b, b_addr, 1);
 
             // Wait until node-b's direct probe starts
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
                 m.probe_seq_for(node_b)
             });
-            let _ = m.take_outbound(); // discard the ping
+            let _ = p.take_outbound(); // discard the ping
 
-            add_node(&mut m, node_c, c_addr, 1);
+            add_node(&mut p, node_c, c_addr, 1);
 
             // Let direct probe timeout for node-b
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                m.tick();
+                p.tick();
             }
-            let _ = m.take_outbound(); // discard the PingReqs
+            let _ = p.take_outbound(); // discard the PingReqs
 
             assert!(
                 matches!(
-                    m.pending_probes.get(&seq).unwrap().phase,
+                    p.pending_probes.get(&seq).unwrap().phase,
                     ProbePhase::Indirect
                 ),
                 "probe should be in Indirect phase after direct timeout"
             );
 
             // Send Ack with the (reused) seq — clears the indirect probe
-            m.step(b_addr, ack(seq, node_b, 1, vec![]));
+            p.step(b_addr, ack(seq, node_b, 1, vec![]));
 
             assert!(
-                m.pending_probes.get(&seq).is_none(),
+                p.pending_probes.get(&seq).is_none(),
                 "indirect probe should be removed after matching Ack"
             );
         }
 
         #[test]
         fn late_ack_same_incarnation_does_not_refute_suspect() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut m, node_b, b_addr, 1);
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            add_node(&mut p, node_b, b_addr, 1);
+            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
                 m.probe_seq_for(node_b)
             });
-            let _ = m.take_outbound();
+            let _ = p.take_outbound();
 
             // we don't care about node c. It's for indirect request
-            add_node(&mut m, node_c, c_addr, 1);
+            add_node(&mut p, node_c, c_addr, 1);
 
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                m.tick()
+                p.tick()
             } // we now send indirect ping for node-b
-            let _ = m.take_outbound();
+            let _ = p.take_outbound();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
-                m.tick()
+                p.tick()
             } // node-b is not suspect
 
-            assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+            assert_eq!(p.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
             // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
-            m.step(b_addr, ack(seq, node_b, 1, vec![]));
+            p.step(b_addr, ack(seq, node_b, 1, vec![]));
 
             assert_eq!(
-                m.members.get(node_b).unwrap().state,
+                p.members.get(node_b).unwrap().state,
                 SwimNodeState::Suspect,
                 "same incarnation Ack should not refute suspicion"
             );
@@ -806,59 +804,59 @@ mod tests {
 
         #[test]
         fn late_ack_with_higher_incarnation_refutes_suspect() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut m, node_b, b_addr, 1);
-            let seq = tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            add_node(&mut p, node_b, b_addr, 1);
+            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
                 m.probe_seq_for(node_b)
             });
-            let _ = m.take_outbound();
+            let _ = p.take_outbound();
 
             // we don't care about node c. It's for indirect request
-            add_node(&mut m, node_c, c_addr, 1);
+            add_node(&mut p, node_c, c_addr, 1);
 
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                m.tick()
+                p.tick()
             } // we now send indirect ping for node-b
-            let _ = m.take_outbound();
+            let _ = p.take_outbound();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
-                m.tick()
+                p.tick()
             } // node-b is now suspect
 
-            assert_eq!(m.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+            assert_eq!(p.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
 
             // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
-            m.step(b_addr, ack(seq, node_b, 2, vec![]));
+            p.step(b_addr, ack(seq, node_b, 2, vec![]));
 
             assert_eq!(
-                m.members.get(node_b).unwrap().state,
+                p.members.get(node_b).unwrap().state,
                 SwimNodeState::Alive,
                 "higher incarnation Ack should refute suspicion"
             );
             // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-            assert!(m.suspect_timers.contains_key(node_b));
+            assert!(p.suspect_timers.contains_key(node_b));
         }
     }
 
     mod step_pingreq {
-        use crate::clusters::swim_state_machine::tests::{make_machine, node, pingreq};
+        use crate::clusters::swim_protocol::tests::{make_protocol, node, pingreq};
         use crate::clusters::{SwimNode, SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]
         fn pingreq_sends_ping_to_target() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            m.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
+            p.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
 
             // A Ping must be sent to the target (node-c)
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert!(
                 out.iter()
@@ -866,7 +864,7 @@ mod tests {
             );
 
             // handle_incarnation_check ran: sender node-b should be in members
-            let member = m
+            let member = p
                 .members
                 .get("node-b")
                 .expect("node-b should be added to members");
@@ -875,21 +873,21 @@ mod tests {
 
         #[test]
         fn pingreq_gossip_applied_before_proxy_ping() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             let gossip_entry = node("node-d", 9003, SwimNodeState::Alive, 1);
-            m.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![gossip_entry]));
+            p.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![gossip_entry]));
 
             // Gossip applied: node-d should be in members
             assert!(
-                m.members.contains_key("node-d"),
+                p.members.contains_key("node-d"),
                 "gossiped node-d should be in members"
             );
 
             // Proxy Ping's gossip should reflect the update (gossip applied in Phase 1, before Ping built)
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             match &out[0].packet {
                 SwimPacket::Ping { gossip, .. } => {
@@ -904,17 +902,17 @@ mod tests {
     }
 
     mod step_self_refutation {
-        use crate::clusters::swim_state_machine::tests::{make_machine, node, ping};
+        use crate::clusters::swim_protocol::tests::{make_protocol, node, ping};
         use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]
         fn refutation_bumps_to_gossip_inc_plus_one() {
-            let mut m = make_machine("node-local", 8080);
+            let mut p = make_protocol("node-local", 8080);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            m.incarnation = 2;
+            p.incarnation = 2;
 
-            m.step(
+            p.step(
                 sender,
                 ping(
                     1,
@@ -924,8 +922,8 @@ mod tests {
                 ),
             );
 
-            assert_eq!(m.incarnation, 6, "must bump to gossip.inc + 1 = 6");
-            let out = m.take_outbound();
+            assert_eq!(p.incarnation, 6, "must bump to gossip.inc + 1 = 6");
+            let out = p.take_outbound();
             match &out[0].packet {
                 SwimPacket::Ack {
                     source_incarnation,
@@ -946,11 +944,11 @@ mod tests {
 
         #[test]
         fn refutation_skipped_when_local_inc_is_higher() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            m.incarnation = 3;
+            p.incarnation = 3;
 
-            m.step(
+            p.step(
                 sender,
                 ping(
                     1,
@@ -960,7 +958,7 @@ mod tests {
                 ),
             );
 
-            assert_eq!(m.incarnation, 3, "local inc must not change");
+            assert_eq!(p.incarnation, 3, "local inc must not change");
         }
     }
 
@@ -968,10 +966,10 @@ mod tests {
     fn refutation_on_dead_gossip_current_behavior() {
         // TODO: Per SWIM spec, Dead is terminal and should NOT trigger refutation.
         // Fix: add `if member.state == Dead { return; }` guard in apply_membership_update.
-        let mut m = make_machine("node-local", 8000);
+        let mut p = make_protocol("node-local", 8000);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        m.step(
+        p.step(
             sender,
             ping(
                 1,
@@ -983,40 +981,40 @@ mod tests {
 
         // TODO: Fix current (incorrect) behavior: Dead gossip triggers refutation
         assert_eq!(
-            m.incarnation, 1,
+            p.incarnation, 1,
             "current impl refutes Dead — this should change when TODO is fixed"
         );
     }
 
     mod tick_protocol_period {
         use crate::clusters::SwimPacket;
-        use crate::clusters::swim_state_machine::tests::{add_node, make_machine, tick_until};
-        use crate::clusters::swim_state_machine::{PROBE_INTERVAL_TICKS, ProbePhase};
+        use crate::clusters::swim_protocol::tests::{add_node, make_protocol, tick_until};
+        use crate::clusters::swim_protocol::{PROBE_INTERVAL_TICKS, ProbePhase};
         use std::net::SocketAddr;
 
         #[test]
         fn no_probe_before_protocol_period_elapses() {
-            let mut m = make_machine("127.0.0.1", 8000);
+            let mut p = make_protocol("127.0.0.1", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            add_node(&mut m, "node-b", b_addr, 1);
-            let _ = m.take_outbound();
+            add_node(&mut p, "node-b", b_addr, 1);
+            let _ = p.take_outbound();
 
             for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-                m.tick();
+                p.tick();
             }
 
-            assert!(m.pending_probes.is_empty());
-            assert!(m.take_outbound().is_empty());
+            assert!(p.pending_probes.is_empty());
+            assert!(p.take_outbound().is_empty());
         }
 
         #[test]
         fn probe_starts_on_protocol_period() {
-            let mut m = make_machine("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-            add_node(&mut m, "node-b", b_addr, 1);
-            let _ = m.take_outbound();
+            add_node(&mut p, "node-b", b_addr, 1);
+            let _ = p.take_outbound();
 
-            tick_until(&mut m, 2 * PROBE_INTERVAL_TICKS, |m| {
+            tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
                 if !m.pending_probes.is_empty() {
                     Some(())
                 } else {
@@ -1024,12 +1022,12 @@ mod tests {
                 }
             });
 
-            assert_eq!(m.pending_probes.len(), 1);
+            assert_eq!(p.pending_probes.len(), 1);
             assert!(matches!(
-                m.pending_probes.values().next().unwrap().phase,
+                p.pending_probes.values().next().unwrap().phase,
                 ProbePhase::Direct
             ));
-            let out = m.take_outbound();
+            let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0].packet, SwimPacket::Ping { .. }));
         }
