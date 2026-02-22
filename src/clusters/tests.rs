@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_state_machine::{ACK_TIMEOUT_TICKS, PROTOCOL_PERIOD_TICKS};
+use crate::clusters::swim_state_machine::{ACK_TIMEOUT_TICKS, PROTOCOL_PERIOD_TICKS, SwimStateMachine};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -264,125 +264,96 @@ async fn test_indirect_ping_trigger() {
     }
 }
 
-#[tokio::test]
-async fn test_self_registers_in_topology_on_startup() {
+#[test]
+fn test_self_registers_in_topology_on_startup() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
-
-    let actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
-    // init_self() is called inside SwimActor::new(); no explicit call needed.
+    let mut state = SwimStateMachine::new("node-local".into(), addr, make_topology());
+    state.init_self();
 
     assert!(
-        actor.topology().contains_node(&"node-local".into()),
-        "SwimActor should register itself in the topology ring on startup"
+        state.topology.contains_node(&"node-local".into()),
+        "SwimStateMachine should register itself in the topology ring after init_self()"
     );
 }
 
-#[tokio::test]
-async fn test_alive_gossip_adds_node_to_topology() {
+#[test]
+fn test_alive_gossip_adds_node_to_topology() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
+    let mut state = SwimStateMachine::new("node-local".into(), addr, make_topology());
+    state.init_self();
+
+    state.step(
+        sender_addr,
+        SwimPacket::Ping {
+            seq: 1,
+            source_node_id: "node-sender".into(),
+            source_incarnation: 1,
+            gossip: vec![SwimNode {
+                node_id: "node-new".into(),
+                addr: new_node,
+                state: SwimNodeState::Alive,
+                incarnation: 1,
+            }],
+        },
     );
 
-    actor
-        .process_event_for_test(ActorEvent::PacketReceived {
-            src: sender_addr,
-            packet: SwimPacket::Ping {
-                seq: 1,
-                source_node_id: "node-sender".into(),
-                source_incarnation: 1,
-                gossip: vec![SwimNode {
-                    node_id: "node-new".into(),
-                    addr: new_node,
-                    state: SwimNodeState::Alive,
-                    incarnation: 1,
-                }],
-            },
-        })
-        .await;
-
     assert!(
-        actor.topology().contains_node(&"node-new".into()),
+        state.topology.contains_node(&"node-new".into()),
         "Alive gossip should add the node to the topology ring"
     );
 }
 
-#[tokio::test]
-async fn test_dead_gossip_removes_node_from_topology() {
+#[test]
+fn test_dead_gossip_removes_node_from_topology() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
+    let mut state = SwimStateMachine::new("node-local".into(), addr, make_topology());
+    state.init_self();
 
     // Step 1: add the node via Alive gossip
-    actor
-        .process_event_for_test(ActorEvent::PacketReceived {
-            src: sender_addr,
-            packet: SwimPacket::Ping {
-                seq: 1,
-                source_node_id: "node-sender".into(),
-                source_incarnation: 1,
-                gossip: vec![SwimNode {
-                    node_id: "node-target".into(),
-                    addr: node,
-                    state: SwimNodeState::Alive,
-                    incarnation: 1,
-                }],
-            },
-        })
-        .await;
+    state.step(
+        sender_addr,
+        SwimPacket::Ping {
+            seq: 1,
+            source_node_id: "node-sender".into(),
+            source_incarnation: 1,
+            gossip: vec![SwimNode {
+                node_id: "node-target".into(),
+                addr: node,
+                state: SwimNodeState::Alive,
+                incarnation: 1,
+            }],
+        },
+    );
 
     assert!(
-        actor.topology().contains_node(&"node-target".into()),
+        state.topology.contains_node(&"node-target".into()),
         "Node should be present in topology after Alive gossip"
     );
 
     // Step 2: mark the node as Dead via gossip
-    actor
-        .process_event_for_test(ActorEvent::PacketReceived {
-            src: sender_addr,
-            packet: SwimPacket::Ping {
-                seq: 2,
-                source_node_id: "node-sender".into(),
-                source_incarnation: 1,
-                gossip: vec![SwimNode {
-                    node_id: "node-target".into(),
-                    addr: node,
-                    state: SwimNodeState::Dead,
-                    incarnation: 2,
-                }],
-            },
-        })
-        .await;
+    state.step(
+        sender_addr,
+        SwimPacket::Ping {
+            seq: 2,
+            source_node_id: "node-sender".into(),
+            source_incarnation: 1,
+            gossip: vec![SwimNode {
+                node_id: "node-target".into(),
+                addr: node,
+                state: SwimNodeState::Dead,
+                incarnation: 2,
+            }],
+        },
+    );
 
     assert!(
-        !actor.topology().contains_node(&"node-target".into()),
+        !state.topology.contains_node(&"node-target".into()),
         "Dead gossip should remove the node from the topology ring"
     );
 }

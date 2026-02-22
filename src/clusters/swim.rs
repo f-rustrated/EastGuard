@@ -72,14 +72,4 @@ impl SwimActor {
             let _ = self.outbound.send(pkt).await;
         }
     }
-
-    #[cfg(test)]
-    pub fn topology(&self) -> &Topology {
-        &self.state.topology
-    }
-
-    #[cfg(test)]
-    pub async fn process_event_for_test(&mut self, event: ActorEvent) {
-        self.handle_event(event).await;
-    }
 }
