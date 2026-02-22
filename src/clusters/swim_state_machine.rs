@@ -481,3 +481,152 @@ impl SwimStateMachine {
         std::mem::take(&mut self.pending_outbound)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clusters::topology::{Topology, TopologyConfig};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    fn make_machine(local_id: &str, local_port: u16) -> SwimStateMachine {
+        let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
+        let topology = Topology::new(HashMap::new(), TopologyConfig { vnodes_per_pnode: 256 });
+        let mut m = SwimStateMachine::new(NodeId::new(local_id), addr, topology);
+        m.init_self();
+        m
+    }
+
+    fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+        SwimPacket::Ping {
+            seq,
+            source_node_id: NodeId::new(from_id),
+            source_incarnation: from_inc,
+            gossip,
+        }
+    }
+
+    fn node(id: &str, port: u16, state: SwimNodeState, inc: u64) -> SwimNode {
+        SwimNode {
+            node_id: NodeId::new(id),
+            addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            state,
+            incarnation: inc,
+        }
+    }
+
+    // 1. Ping from an unknown node
+    //    → node added to `members` as Alive; Ack sent back to sender
+    #[test]
+    fn ping_from_unknown_node() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        m.step(sender, ping(1, "node-b", 0, vec![]));
+
+        let member = m.members.get("node-b").expect("unknown node should be added");
+        assert_eq!(member.state, SwimNodeState::Alive);
+        assert_eq!(member.addr, sender);
+
+        let out = m.take_outbound();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target, sender);
+        assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
+    }
+
+    // 2. Ping from a known Alive node
+    //    → Ack sent; member state unchanged
+    #[test]
+    fn ping_from_known_alive_node() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // First ping: introduces node-b into members
+        m.step(sender, ping(1, "node-b", 2, vec![]));
+        let _ = m.take_outbound();
+
+        let state_before = m.members.get("node-b").unwrap().state;
+        let inc_before = m.members.get("node-b").unwrap().incarnation;
+
+        // Second ping: same node, same incarnation
+        m.step(sender, ping(2, "node-b", 2, vec![]));
+
+        let member = m.members.get("node-b").unwrap();
+        assert_eq!(member.state, state_before);
+        assert_eq!(member.incarnation, inc_before);
+
+        let out = m.take_outbound();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target, sender);
+        assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
+    }
+
+    // 3. Ping with non-empty gossip list
+    //    → gossip applied to `members` before Ack is built; Ack's gossip reflects the update
+    #[test]
+    fn ping_with_gossip_applied_before_ack() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let gossip_entry = node("node-c", 9001, SwimNodeState::Alive, 1);
+        m.step(sender, ping(1, "node-b", 0, vec![gossip_entry]));
+
+        // Gossip applied: node-c is in members
+        assert!(m.members.contains_key("node-c"), "gossiped node should be in members");
+
+        // Ack's gossip reflects the update applied during this step
+        let out = m.take_outbound();
+        assert_eq!(out.len(), 1);
+        match &out[0].packet {
+            SwimPacket::Ack { gossip, .. } => {
+                assert!(
+                    gossip.iter().any(|n| n.node_id == NodeId::new("node-c")),
+                    "Ack gossip should contain node-c (applied before Ack was built)"
+                );
+            }
+            _ => panic!("expected Ack"),
+        }
+    }
+
+    // 4. Ping sender has a higher incarnation than we know
+    //    → member updated to Alive at the new (higher) incarnation
+    #[test]
+    fn ping_sender_higher_incarnation_updates_member() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Introduce node-b at incarnation 1
+        m.step(sender, ping(1, "node-b", 1, vec![]));
+        let _ = m.take_outbound();
+        assert_eq!(m.members.get("node-b").unwrap().incarnation, 1);
+
+        // Ping from node-b with higher incarnation 5
+        m.step(sender, ping(2, "node-b", 5, vec![]));
+        let _ = m.take_outbound();
+
+        let member = m.members.get("node-b").unwrap();
+        assert_eq!(member.state, SwimNodeState::Alive);
+        assert_eq!(member.incarnation, 5);
+    }
+
+    // 5. Ping sender has a lower incarnation than we know
+    //    → member incarnation is NOT downgraded; no state change
+    #[test]
+    fn ping_sender_lower_incarnation_does_not_downgrade() {
+        let mut m = make_machine("node-local", 8000);
+        let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // Introduce node-b at incarnation 5
+        m.step(sender, ping(1, "node-b", 5, vec![]));
+        let _ = m.take_outbound();
+        assert_eq!(m.members.get("node-b").unwrap().incarnation, 5);
+
+        // Ping from node-b with lower incarnation 1
+        m.step(sender, ping(2, "node-b", 1, vec![]));
+        let _ = m.take_outbound();
+
+        let member = m.members.get("node-b").unwrap();
+        assert_eq!(member.state, SwimNodeState::Alive);
+        assert_eq!(member.incarnation, 5, "incarnation must not be downgraded");
+    }
+}
