@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::btree_map::Keys;
 use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
@@ -264,6 +265,65 @@ async fn test_indirect_ping_trigger() {
         }
         _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet),
     }
+}
+
+#[tokio::test]
+async fn test_suspect_timeout_mark_node_dead() {
+    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let target_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let (tx_in, rx_in) = mpsc::channel(100);
+    let (tx_out, rx_out) = mpsc::channel(100);
+
+    let mut actor = SwimActor::new(
+        addr,
+        "node-local".into(),
+        rx_in,
+        tx_in.clone(),
+        tx_out,
+        make_topology(),
+    );
+
+    actor.process_event_for_test(ActorEvent::PacketReceived {
+        src: (sender_addr), packet: (SwimPacket::Ping {
+            seq: (1),
+            source_node_id: ("node-sender".into()),
+            source_incarnation: (1),
+            gossip: (vec![SwimNode {
+                node_id: "node-target".into(),
+                addr: target_addr,
+                state: SwimNodeState::Alive,
+                incarnation: 1,
+            }])
+        })
+    })
+    .await;
+
+    assert!(
+        actor.topology().contains_node(&"node-target".into()),
+        "Node should be in topology after Alive gossip"
+    );
+
+    actor.process_event_for_test(ActorEvent::IndirectProbeTimeout {
+        target_node_id: ("node-target".into())
+    })
+    .await;
+
+    assert!(
+        actor.topology().contains_node(&"node-target".into()),
+        "Suspect node should be in topology"
+    );
+
+    actor.process_event_for_test(ActorEvent::SuspectTimeout {
+        target_node_id: ("node-target".into())
+    })
+    .await;
+
+    assert!(
+        !actor.topology().contains_node(&"node-target".into()),
+        "Dead node should be removed from the topology after the SuspectTimeout"
+    )
+
 }
 
 #[tokio::test]
