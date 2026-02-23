@@ -70,16 +70,15 @@ impl SwimActor {
             }
         }
 
-        self.apply_timer_commands().await;
+        self.flush_ticker_commands().await;
         self.flush_outbound().await;
     }
 
-    async fn apply_timer_commands(&mut self) {
+    async fn flush_ticker_commands(&mut self) {
         for cmd in self.state.take_timer_commands() {
             let _ = self.scheduler_sender.send(cmd.into()).await;
         }
     }
-
     async fn flush_outbound(&mut self) {
         for pkt in self.state.take_outbound() {
             let _ = self.outbound.send(pkt).await;
