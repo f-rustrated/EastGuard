@@ -290,7 +290,6 @@ async fn test_self_registers_in_topology_on_startup() {
         make_topology(),
         ticker_send,
     );
-    // init_self() is called inside SwimActor::new(); no explicit call needed.
 
     assert!(
         actor.topology().contains_node(&"node-local".into()),

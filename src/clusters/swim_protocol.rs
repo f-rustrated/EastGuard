@@ -75,7 +75,7 @@ pub struct SwimProtocol {
 
 impl SwimProtocol {
     pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
-        Self {
+        let mut swim = Self {
             node_id,
             local_addr,
             incarnation: 0,
@@ -86,18 +86,14 @@ impl SwimProtocol {
             seq_counter: 0,
             pending_outbound: vec![],
             pending_timer_commands: vec![],
-        }
-    }
-
-    /// Register this node as Alive in its own member map and topology.
-    /// Must be called once before the first `step()`.
-    pub fn init_self(&mut self) {
-        self.update_member(
-            self.node_id.clone(),
-            self.local_addr,
+        };
+        swim.update_member(
+            swim.node_id.clone(),
+            local_addr,
             SwimNodeState::Alive,
-            self.incarnation,
+            swim.incarnation,
         );
+        swim
     }
 
     // -----------------------------------------------------------------------
@@ -119,7 +115,7 @@ impl SwimProtocol {
                 None => return,
             };
 
-            let seq = self.next_seq();
+            let seq: u32 = self.next_seq();
             let packet = SwimPacket::Ping {
                 seq,
                 source_node_id: self.node_id.clone(),
@@ -449,7 +445,7 @@ mod tests {
             },
         );
         let mut p = SwimProtocol::new(NodeId::new(local_id), addr, topology);
-        p.init_self();
+
         p
     }
 

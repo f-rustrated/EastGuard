@@ -25,8 +25,8 @@ impl SwimActor {
         topology: Topology,
         ticker_tx: mpsc::Sender<TickerCommand>,
     ) -> Self {
-        let mut state = SwimProtocol::new(node_id, local_addr, topology);
-        state.init_self();
+        let state = SwimProtocol::new(node_id, local_addr, topology);
+
         Self {
             mailbox,
             transport_tx,
