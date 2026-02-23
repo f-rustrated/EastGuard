@@ -2,7 +2,7 @@ use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
 use crate::clusters::types::ticker_message::TickerCommand;
-use crate::clusters::{ActorEvent, NodeId, OutboundPacket, TickEvent};
+use crate::clusters::{SwimCommand, NodeId, OutboundPacket, TickEvent};
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 // ==========================================
 
 pub struct SwimActor {
-    mailbox: mpsc::Receiver<ActorEvent>,
+    mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
     ticker_tx: mpsc::Sender<TickerCommand>,
     state: Swim,
@@ -22,7 +22,7 @@ impl SwimActor {
     pub fn new(
         local_addr: SocketAddr,
         node_id: NodeId,
-        mailbox: mpsc::Receiver<ActorEvent>,
+        mailbox: mpsc::Receiver<SwimCommand>,
         transport_tx: mpsc::Sender<OutboundPacket>,
         ticker_tx: mpsc::Sender<TickerCommand>,
         vnodes_per_node: u64,
@@ -67,13 +67,13 @@ impl SwimActor {
         }
     }
 
-    async fn handle_actor_event(&mut self, event: ActorEvent) {
+    async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
-            ActorEvent::PacketReceived { src, packet } => {
+            SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
             }
 
-            ActorEvent::Tick(tick_event) => {
+            SwimCommand::Tick(tick_event) => {
                 self.handle_tick_event(tick_event).await;
             }
         }
@@ -99,15 +99,15 @@ impl SwimActor {
     }
 
     #[cfg(test)]
-    pub async fn process_event_for_test(&mut self, event: ActorEvent) {
+    pub async fn process_event_for_test(&mut self, event: SwimCommand) {
         match event {
-            ActorEvent::PacketReceived { src, packet } => {
+            SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
                 // Discard timer commands — topology tests don't need timing.
                 self.state.take_timer_commands();
                 self.flush_outbound().await;
             }
-            ActorEvent::Tick(tick_event) => {}
+            SwimCommand::Tick(tick_event) => {}
         }
     }
 }

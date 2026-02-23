@@ -7,14 +7,14 @@ use tokio::{net::UdpSocket, sync::mpsc};
 
 pub struct SwimTransportActor {
     socket: Arc<UdpSocket>,
-    to_actor: mpsc::Sender<ActorEvent>,
+    to_actor: mpsc::Sender<SwimCommand>,
     from_actor: mpsc::Receiver<OutboundPacket>,
 }
 
 impl SwimTransportActor {
     pub async fn new(
         bind_addr: SocketAddr,
-        to_actor: mpsc::Sender<ActorEvent>,
+        to_actor: mpsc::Sender<SwimCommand>,
         from_actor: mpsc::Receiver<OutboundPacket>,
     ) -> anyhow::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
@@ -38,7 +38,7 @@ impl SwimTransportActor {
                 Ok((len, src)) = self.socket.recv_from(&mut buf) => {
                     match bincode::decode_from_slice(&buf[..len], BINCODE_CONFIG) {
                         Ok((packet, _)) => {
-                             let _ = self.to_actor.send(ActorEvent::PacketReceived { src, packet }).await;
+                             let _ = self.to_actor.send(SwimCommand::PacketReceived { src, packet }).await;
                         }
                         Err(e) => eprintln!("Failed to decode packet from {}: {}", src, e),
                     }

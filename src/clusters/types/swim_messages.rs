@@ -30,16 +30,16 @@ pub enum SwimPacket {
 
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
-pub enum ActorEvent {
+pub enum SwimCommand {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
 
     Tick(TickEvent),
 }
 
-impl From<TickEvent> for ActorEvent {
+impl From<TickEvent> for SwimCommand {
     fn from(value: TickEvent) -> Self {
-        ActorEvent::Tick(value)
+        SwimCommand::Tick(value)
     }
 }
 

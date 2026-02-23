@@ -12,7 +12,7 @@ use super::*;
 
 // Helper to setup the test environment
 async fn setup() -> (
-    mpsc::Sender<ActorEvent>,       // To send "Fake Network" events
+    mpsc::Sender<SwimCommand>,      // To send "Fake Network" events
     mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
     mpsc::Sender<TickerCommand>,    // To drive the ticker directly
     SocketAddr,                     // The actor's local address
@@ -52,7 +52,7 @@ async fn test_ping_response() {
         gossip: vec![],
     };
 
-    tx.send(ActorEvent::PacketReceived {
+    tx.send(SwimCommand::PacketReceived {
         src: remote_addr,
         packet: ping,
     })
@@ -93,7 +93,7 @@ async fn test_refutation_mechanism() {
         gossip: vec![lie],
     };
 
-    tx.send(ActorEvent::PacketReceived {
+    tx.send(SwimCommand::PacketReceived {
         src: remote_addr,
         packet: ping,
     })
@@ -132,7 +132,7 @@ async fn test_gossip_propagation() {
         incarnation: 5,
     };
 
-    tx.send(ActorEvent::PacketReceived {
+    tx.send(SwimCommand::PacketReceived {
         src: sender_addr,
         packet: SwimPacket::Ping {
             seq: 300,
@@ -150,7 +150,7 @@ async fn test_gossip_propagation() {
 
     for i in 0..5 {
         // Send a fresh probe
-        tx.send(ActorEvent::PacketReceived {
+        tx.send(SwimCommand::PacketReceived {
             src: probe_addr,
             packet: SwimPacket::Ping {
                 seq: 400 + i, // Increment seq to keep packets distinct
@@ -208,7 +208,7 @@ async fn test_indirect_ping_trigger() {
         incarnation: 1,
     };
 
-    tx.send(ActorEvent::PacketReceived {
+    tx.send(SwimCommand::PacketReceived {
         src: peer_1,
         packet: SwimPacket::Ping {
             seq: 1,
@@ -293,7 +293,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256);
 
     actor
-        .process_event_for_test(ActorEvent::PacketReceived {
+        .process_event_for_test(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 1,
@@ -328,7 +328,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
 
     // Step 1: add the node via Alive gossip
     actor
-        .process_event_for_test(ActorEvent::PacketReceived {
+        .process_event_for_test(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 1,
@@ -351,7 +351,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
 
     // Step 2: mark the node as Dead via gossip
     actor
-        .process_event_for_test(ActorEvent::PacketReceived {
+        .process_event_for_test(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 2,
