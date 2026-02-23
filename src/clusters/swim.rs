@@ -1,6 +1,6 @@
 use super::swim_protocol::SwimProtocol;
 use super::*;
-use crate::clusters::swim_ticker::{TickEvent, TickerActor, TickerCommand};
+use crate::clusters::swim_ticker::{TickEvent, TickerCommand};
 use crate::clusters::topology::Topology;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -66,11 +66,9 @@ impl SwimActor {
                 self.apply_timer_commands().await;
                 self.flush_outbound().await;
             }
-            ActorEvent::ProtocolTick => {
-                let _ = self.scheduler_sender.send(TickerCommand::ForceTick).await;
-            }
+
             ActorEvent::Tick(tick_event) => {
-                self.handle_tick_event(tick_event);
+                self.handle_tick_event(tick_event).await;
             }
         }
     }
@@ -100,9 +98,6 @@ impl SwimActor {
                 // Discard timer commands — topology tests don't need timing.
                 self.state.take_timer_commands();
                 self.flush_outbound().await;
-            }
-            ActorEvent::ProtocolTick => {
-                // No ticker available in test mode — ignored.
             }
             ActorEvent::Tick(tick_event) => {}
         }

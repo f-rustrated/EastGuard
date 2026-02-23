@@ -34,10 +34,6 @@ pub enum ActorEvent {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
 
-    // Test hook: advance one logical tick in the state machine without waiting
-    // for the real-time interval. Useful for deterministic tests via SwimActor.
-    // For fully deterministic testing, prefer driving SwimStateMachine directly.
-    ProtocolTick,
     Tick(TickEvent),
 }
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+use crate::clusters::swim_ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, TickerActor};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -26,9 +26,12 @@ async fn setup() -> (
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
-    let (ticker_send, _ticker_recv) = mpsc::channel(100);
+    let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(100);
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+
+    // TickerActor sends tick events back into the SwimActor's mailbox.
+    tokio::spawn(TickerActor::new(ticker_cmd_rx, tx_in.clone()).run());
 
     let actor = SwimActor::new(
         addr,
@@ -36,7 +39,7 @@ async fn setup() -> (
         rx_in,
         tx_out,
         make_topology(),
-        ticker_send,
+        ticker_cmd_tx,
     );
     tokio::spawn(actor.run());
 
