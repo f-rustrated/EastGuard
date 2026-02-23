@@ -1,4 +1,4 @@
-use crate::clusters::{ActorEvent, NodeId};
+use crate::clusters::{ActorEvent, NodeId, TickEvent};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,25 +32,22 @@ pub(crate) enum ProbePhase {
 }
 
 #[derive(Debug)]
-pub(crate) enum TickEvent {
-    ProtocolPeriodElapsed,
-    DirectProbeTimedOut { seq: u32, target_node_id: NodeId },
-    IndirectProbeTimedOut { seq: u32, target_node_id: NodeId },
-    SuspectTimedOut { node_id: NodeId },
-}
-
-impl From<TickEvent> for ActorEvent {
-    fn from(value: TickEvent) -> Self {
-        ActorEvent::Tick(value)
-    }
+pub(crate) enum TickerCommand {
+    Probe(ProbeCommand),
+    ForceTick,
 }
 
 #[derive(Debug)]
-pub(crate) enum TimerCommand {
+pub(crate) enum ProbeCommand {
     SetDirectProbe { seq: u32, target_node_id: NodeId },
     SetIndirectProbe { seq: u32, target_node_id: NodeId },
     SetSuspectTimer { node_id: NodeId },
     CancelProbe { seq: u32 },
+}
+impl From<ProbeCommand> for TickerCommand {
+    fn from(value: ProbeCommand) -> Self {
+        TickerCommand::Probe(value)
+    }
 }
 
 impl SwimTicker {
@@ -59,6 +56,42 @@ impl SwimTicker {
             protocol_elapsed: 0,
             probe_timers: HashMap::new(),
             suspect_timers: HashMap::new(),
+        }
+    }
+    pub(crate) fn apply(&mut self, cmd: ProbeCommand) {
+        match cmd {
+            ProbeCommand::SetDirectProbe {
+                seq,
+                target_node_id,
+            } => {
+                self.probe_timers.insert(
+                    seq,
+                    ProbeTimer {
+                        target_node_id,
+                        phase: ProbePhase::Direct,
+                        ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
+                    },
+                );
+            }
+            ProbeCommand::SetIndirectProbe {
+                seq,
+                target_node_id,
+            } => {
+                self.probe_timers.insert(
+                    seq,
+                    ProbeTimer {
+                        target_node_id,
+                        phase: ProbePhase::Indirect,
+                        ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
+                    },
+                );
+            }
+            ProbeCommand::SetSuspectTimer { node_id } => {
+                self.suspect_timers.insert(node_id, SUSPECT_TIMEOUT_TICKS);
+            }
+            ProbeCommand::CancelProbe { seq } => {
+                self.probe_timers.remove(&seq);
+            }
         }
     }
 
@@ -117,43 +150,6 @@ impl SwimTicker {
         events
     }
 
-    pub fn apply(&mut self, cmd: TimerCommand) {
-        match cmd {
-            TimerCommand::SetDirectProbe {
-                seq,
-                target_node_id,
-            } => {
-                self.probe_timers.insert(
-                    seq,
-                    ProbeTimer {
-                        target_node_id,
-                        phase: ProbePhase::Direct,
-                        ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
-                    },
-                );
-            }
-            TimerCommand::SetIndirectProbe {
-                seq,
-                target_node_id,
-            } => {
-                self.probe_timers.insert(
-                    seq,
-                    ProbeTimer {
-                        target_node_id,
-                        phase: ProbePhase::Indirect,
-                        ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
-                    },
-                );
-            }
-            TimerCommand::SetSuspectTimer { node_id } => {
-                self.suspect_timers.insert(node_id, SUSPECT_TIMEOUT_TICKS);
-            }
-            TimerCommand::CancelProbe { seq } => {
-                self.probe_timers.remove(&seq);
-            }
-        }
-    }
-
     #[cfg(test)]
     pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
         self.probe_timers
@@ -176,16 +172,6 @@ impl SwimTicker {
     pub fn probe_phase(&self, seq: u32) -> Option<ProbePhase> {
         self.probe_timers.get(&seq).map(|p| p.phase)
     }
-}
-
-// ==========================================
-// TickerActor — async wrapper around SwimTicker
-// ==========================================
-
-#[derive(Debug)]
-pub(crate) enum TickerCommand {
-    Apply(TimerCommand),
-    ForceTick,
 }
 
 pub(crate) struct TickerActor {
@@ -215,14 +201,15 @@ impl TickerActor {
                 }
                 Some(cmd) = self.commands.recv() => {
                     match cmd {
-                        TickerCommand::Apply(timer_cmd) => {
-                            self.ticker.apply(timer_cmd);
-                        }
                         TickerCommand::ForceTick => {
                             self.do_tick().await;
                         }
+                        TickerCommand::Probe(probe_cmd)=>{
+                            self.ticker.apply(probe_cmd);
+                        }
                     }
                 }
+
             }
         }
     }

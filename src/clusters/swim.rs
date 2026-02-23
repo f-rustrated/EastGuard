@@ -1,6 +1,6 @@
 use super::swim_protocol::SwimProtocol;
 use super::*;
-use crate::clusters::swim_ticker::{TickEvent, TickerCommand};
+use crate::clusters::swim_ticker::TickerCommand;
 use crate::clusters::topology::Topology;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -75,7 +75,7 @@ impl SwimActor {
 
     async fn apply_timer_commands(&mut self) {
         for cmd in self.state.take_timer_commands() {
-            let _ = self.scheduler_sender.send(TickerCommand::Apply(cmd)).await;
+            let _ = self.scheduler_sender.send(cmd.into()).await;
         }
     }
 

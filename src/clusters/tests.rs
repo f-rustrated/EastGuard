@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, TickerActor};
+use crate::clusters::swim_ticker::{
+    DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, TickerActor, TickerCommand,
+};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -22,6 +24,7 @@ fn make_topology() -> Topology {
 async fn setup() -> (
     mpsc::Sender<ActorEvent>,       // To send "Fake Network" events
     mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
+    mpsc::Sender<TickerCommand>,    // To drive the ticker directly
     SocketAddr,                     // The actor's local address
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
@@ -39,16 +42,16 @@ async fn setup() -> (
         rx_in,
         tx_out,
         make_topology(),
-        ticker_cmd_tx,
+        ticker_cmd_tx.clone(),
     );
     tokio::spawn(actor.run());
 
-    (tx_in, rx_out, addr)
+    (tx_in, rx_out, ticker_cmd_tx, addr)
 }
 
 #[tokio::test]
 async fn test_ping_response() {
-    let (tx, mut rx, _local_addr) = setup().await;
+    let (tx, mut rx, _, _local_addr) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
@@ -81,7 +84,7 @@ async fn test_ping_response() {
 
 #[tokio::test]
 async fn test_refutation_mechanism() {
-    let (tx, mut rx, local_addr) = setup().await;
+    let (tx, mut rx, _, local_addr) = setup().await;
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
@@ -126,7 +129,7 @@ async fn test_refutation_mechanism() {
 
 #[tokio::test]
 async fn test_gossip_propagation() {
-    let (tx, mut rx, _) = setup().await;
+    let (tx, mut rx, _, _) = setup().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
@@ -194,8 +197,9 @@ async fn test_gossip_propagation() {
 #[tokio::test]
 async fn test_indirect_ping_trigger() {
     // This tests the timer logic: Tick -> Ping -> Timeout -> Indirect Ping
+    // Drives the TickerActor directly via TickerCommand::ForceTick.
 
-    let (tx, mut rx, _) = setup().await;
+    let (tx, mut rx, ticker_tx, _) = setup().await;
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -228,15 +232,16 @@ async fn test_indirect_ping_trigger() {
 
     let _ack = rx.recv().await.unwrap(); // Clear the Ack
 
-    // 2. Advance PROTOCOL_PERIOD_TICKS ticks so the state machine starts a probe.
+    // 2. Force-tick PROBE_INTERVAL_TICKS times so the ticker fires a
+    //    ProtocolPeriodElapsed, which makes SwimProtocol start a probe.
     //    LiveNodeTracker inserts at a random position, so start_probe() may land
     //    on self and skip. Retry up to 3 periods to guarantee hitting a peer.
     let mut target_addr = None;
     for _ in 0..3 {
         for _ in 0..PROBE_INTERVAL_TICKS {
-            tx.send(ActorEvent::ProtocolTick).await.unwrap();
+            ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
         }
-        match time::timeout(Duration::from_millis(50), rx.recv()).await {
+        match time::timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping { .. }) => {
                 target_addr = Some(pkt.target);
                 break;
@@ -246,13 +251,13 @@ async fn test_indirect_ping_trigger() {
     }
     let target_addr = target_addr.expect("Actor should send a Ping within 3 protocol periods");
 
-    // 4. DON'T send an Ack. Advance ACK_TIMEOUT_TICKS ticks so the direct
-    //    probe times out and the state machine transitions to indirect probing.
+    // 3. DON'T send an Ack. Force-tick DIRECT_ACK_TIMEOUT_TICKS times so the
+    //    direct probe times out and the state machine transitions to indirect probing.
     for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-        tx.send(ActorEvent::ProtocolTick).await.unwrap();
+        ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
     }
 
-    // 5. Expect Indirect Pings (PingReq) sent to the *other* peer
+    // 4. Expect Indirect Pings (PingReq) sent to the *other* peer
     let indirect_ping = time::timeout(Duration::from_millis(100), rx.recv())
         .await
         .expect("Should send indirect ping")

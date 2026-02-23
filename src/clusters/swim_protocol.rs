@@ -1,6 +1,7 @@
 use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::livenode_tracker::LiveNodeTracker;
-use crate::clusters::swim_ticker::TimerCommand;
+
+use crate::clusters::swim_ticker::ProbeCommand;
 use crate::clusters::topology::Topology;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ pub struct SwimProtocol {
 
     // Output buffers
     pub(crate) pending_outbound: Vec<OutboundPacket>,
-    pub(crate) pending_timer_commands: Vec<TimerCommand>,
+    pub(crate) pending_timer_commands: Vec<ProbeCommand>,
 }
 
 impl SwimProtocol {
@@ -152,7 +153,7 @@ impl SwimProtocol {
                 .push(OutboundPacket::new(target, packet));
 
             self.pending_timer_commands
-                .push(TimerCommand::SetDirectProbe {
+                .push(ProbeCommand::SetDirectProbe {
                     seq,
                     target_node_id,
                 });
@@ -200,7 +201,7 @@ impl SwimProtocol {
         }
 
         self.pending_timer_commands
-            .push(TimerCommand::SetIndirectProbe {
+            .push(ProbeCommand::SetIndirectProbe {
                 seq,
                 target_node_id,
             });
@@ -221,7 +222,7 @@ impl SwimProtocol {
                 incarnation,
             );
             self.pending_timer_commands
-                .push(TimerCommand::SetSuspectTimer {
+                .push(ProbeCommand::SetSuspectTimer {
                     node_id: target_node_id,
                 });
         }
@@ -282,7 +283,7 @@ impl SwimProtocol {
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
-                    .push(TimerCommand::CancelProbe { seq });
+                    .push(ProbeCommand::CancelProbe { seq });
 
                 // Do NOT cancel the suspect timer here. A same-or-lower incarnation Ack
                 // could be a delayed packet from before the node knew it was suspected.
@@ -446,7 +447,7 @@ impl SwimProtocol {
     }
 
     /// Drain all timer commands buffered since the last call.
-    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand> {
+    pub fn take_timer_commands(&mut self) -> Vec<ProbeCommand> {
         std::mem::take(&mut self.pending_timer_commands)
     }
 }
@@ -454,7 +455,8 @@ impl SwimProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::swim_ticker::{SwimTicker, TickEvent};
+    use crate::clusters::TickEvent;
+    use crate::clusters::swim_ticker::SwimTicker;
     use crate::clusters::topology::{Topology, TopologyConfig};
     use std::collections::HashMap;
     use std::net::SocketAddr;

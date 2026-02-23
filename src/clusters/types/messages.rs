@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
-use crate::clusters::{NodeId, SwimNode, swim_ticker::TickEvent};
+use crate::clusters::{NodeId, SwimNode};
 
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
@@ -35,6 +35,20 @@ pub enum ActorEvent {
     PacketReceived { src: SocketAddr, packet: SwimPacket },
 
     Tick(TickEvent),
+}
+
+impl From<TickEvent> for ActorEvent {
+    fn from(value: TickEvent) -> Self {
+        ActorEvent::Tick(value)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TickEvent {
+    ProtocolPeriodElapsed,
+    DirectProbeTimedOut { seq: u32, target_node_id: NodeId },
+    IndirectProbeTimedOut { seq: u32, target_node_id: NodeId },
+    SuspectTimedOut { node_id: NodeId },
 }
 
 /// Outbound Commands (Logic -> Transport)
