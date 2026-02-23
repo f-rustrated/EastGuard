@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
-use crate::clusters::{NodeId, SwimNode};
+use crate::clusters::{NodeId, SwimNode, swim_ticker::TickEvent};
 
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
@@ -38,6 +38,7 @@ pub enum ActorEvent {
     // for the real-time interval. Useful for deterministic tests via SwimActor.
     // For fully deterministic testing, prefer driving SwimStateMachine directly.
     ProtocolTick,
+    Tick(TickEvent),
 }
 
 /// Outbound Commands (Logic -> Transport)

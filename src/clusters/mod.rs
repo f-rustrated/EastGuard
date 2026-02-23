@@ -1,8 +1,3 @@
-// ==========================================
-// MESSAGES & DATA STRUCTURES
-// ==========================================
-
-use bincode::{Decode, Encode};
 use std::net::SocketAddr;
 mod gossip_buffer;
 mod livenode_tracker;
@@ -11,10 +6,11 @@ pub(crate) mod swim;
 pub(crate) mod topology;
 pub(crate) mod transport;
 
+mod swim_protocol;
+pub(crate) mod swim_ticker;
 #[cfg(test)]
 pub mod tests;
 mod types;
-mod swim_protocol;
 
 pub(crate) use types::messages::*;
 pub(crate) use types::node::*;

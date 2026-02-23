@@ -1,13 +1,9 @@
 use super::swim_protocol::SwimProtocol;
 use super::*;
+use crate::clusters::swim_ticker::{TickEvent, TickerActor, TickerCommand};
 use crate::clusters::topology::Topology;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
-
-/// One real-time tick drives one logical tick in SwimStateMachine.
-/// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
-const TICK_PERIOD: Duration = Duration::from_millis(100);
 
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
@@ -16,6 +12,7 @@ const TICK_PERIOD: Duration = Duration::from_millis(100);
 pub struct SwimActor {
     mailbox: mpsc::Receiver<ActorEvent>,
     outbound: mpsc::Sender<OutboundPacket>,
+    scheduler_sender: mpsc::Sender<TickerCommand>,
     state: SwimProtocol,
 }
 
@@ -26,6 +23,7 @@ impl SwimActor {
         mailbox: mpsc::Receiver<ActorEvent>,
         outbound: mpsc::Sender<OutboundPacket>,
         topology: Topology,
+        scheduler_sender: mpsc::Sender<TickerCommand>,
     ) -> Self {
         let mut state = SwimProtocol::new(node_id, local_addr, topology);
         state.init_self();
@@ -33,42 +31,54 @@ impl SwimActor {
             mailbox,
             outbound,
             state,
+            scheduler_sender,
         }
     }
 
     pub async fn run(mut self) {
-        let mut ticker = time::interval(TICK_PERIOD);
         println!("SwimActor started.");
 
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    self.handle_tick().await;
-                }
-                Some(event) = self.mailbox.recv() => {
-                    self.handle_event(event).await;
-                }
-            }
+        while let Some(event) = self.mailbox.recv().await {
+            self.handle_actor_event(event).await;
         }
     }
 
-    async fn handle_event(&mut self, event: ActorEvent) {
+    async fn handle_tick_event(&mut self, event: TickEvent) {
+        match event {
+            TickEvent::ProtocolPeriodElapsed => self.state.on_protocol_period(),
+            TickEvent::DirectProbeTimedOut {
+                seq,
+                target_node_id,
+            } => self.state.on_direct_probe_timeout(seq, target_node_id),
+            TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+                self.state.on_indirect_probe_timeout(target_node_id)
+            }
+            TickEvent::SuspectTimedOut { node_id } => self.state.on_suspect_timeout(node_id),
+        }
+        self.apply_timer_commands().await;
+        self.flush_outbound().await;
+    }
+
+    async fn handle_actor_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
+                self.apply_timer_commands().await;
                 self.flush_outbound().await;
             }
-
             ActorEvent::ProtocolTick => {
-                // Test hook: advance one logical tick without waiting for the real interval.
-                self.handle_tick().await;
+                let _ = self.scheduler_sender.send(TickerCommand::ForceTick).await;
+            }
+            ActorEvent::Tick(tick_event) => {
+                self.handle_tick_event(tick_event);
             }
         }
     }
 
-    async fn handle_tick(&mut self) {
-        self.state.tick();
-        self.flush_outbound().await;
+    async fn apply_timer_commands(&mut self) {
+        for cmd in self.state.take_timer_commands() {
+            let _ = self.scheduler_sender.send(TickerCommand::Apply(cmd)).await;
+        }
     }
 
     async fn flush_outbound(&mut self) {
@@ -84,6 +94,17 @@ impl SwimActor {
 
     #[cfg(test)]
     pub async fn process_event_for_test(&mut self, event: ActorEvent) {
-        self.handle_event(event).await;
+        match event {
+            ActorEvent::PacketReceived { src, packet } => {
+                self.state.step(src, packet);
+                // Discard timer commands — topology tests don't need timing.
+                self.state.take_timer_commands();
+                self.flush_outbound().await;
+            }
+            ActorEvent::ProtocolTick => {
+                // No ticker available in test mode — ignored.
+            }
+            ActorEvent::Tick(tick_event) => {}
+        }
     }
 }

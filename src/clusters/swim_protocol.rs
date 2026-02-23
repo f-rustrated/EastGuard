@@ -1,48 +1,47 @@
 use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::livenode_tracker::LiveNodeTracker;
+use crate::clusters::swim_ticker::TimerCommand;
 use crate::clusters::topology::Topology;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
 
-pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
-pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 const INDIRECT_PING_COUNT: usize = 3;
 
-/// SWIM protocol. No async, no channels, no real timers.
+/// SWIM protocol state machine. No async, no channels, no timers.
 ///
-/// Driven by two inputs:
+/// Driven by two kinds of inputs:
 ///   - `step(src, packet)` — a packet arrived from the network
-///   - `tick()`            — one unit of logical time has passed (100ms in production)
+///   - Event handlers       — timer events dispatched by `SwimTicker` via the actor
 ///
 /// All outbound packets are buffered in `pending_outbound`; drain with `take_outbound()`.
+/// All timer commands are buffered in `pending_timer_commands`; drain with `take_timer_commands()`.
 ///
 /// ```text
-///                    tick: every PROTOCOL_PERIOD_TICKS
-///                    └─ start_probe() sends Ping
+///                    TickEvent::ProtocolPeriodElapsed
+///                    └─ on_protocol_period() → start_probe() sends Ping
 ///                              │
 ///                              ▼
 ///   (new node) ──────────► Alive
 ///        ▲                    │  step: Ack with matching seq
-///        │                    │  └─ pending_probes.remove() — probe cancelled, stays Alive
+///        │                    │  └─ emits CancelProbe — probe cancelled, stays Alive
 ///        │                    │
-///        │                    │  tick: ACK_TIMEOUT_TICKS elapse, no Ack
-///        │                    │  └─ start_indirect_probe() sends PingReq to K helpers
+///        │                    │  TickEvent::DirectProbeTimedOut
+///        │                    │  └─ on_direct_probe_timeout() → start_indirect_probe()
+///        │                    │     sends PingReq to K helpers
 ///        │                    │
-///        │                    │  tick: INDIRECT_TIMEOUT_TICKS elapse, still no Ack
+///        │                    │  TickEvent::IndirectProbeTimedOut
 ///        │                    │  (or no helpers available → skip indirect immediately)
-///        │                    │  └─ try_mark_suspect()
+///        │                    │  └─ on_indirect_probe_timeout() → try_mark_suspect()
 ///        │                    │
 ///        │                    ▼
 ///        │                 Suspect
 ///        │                    │  step: higher-incarnation Alive gossip (refutation)
 ///        │◄───────────────────┘  └─ apply_membership_update() → Suspect → Alive
 ///        │
-///        │                    │  tick: SUSPECT_TIMEOUT_TICKS elapse, no refutation
-///        │                    │  └─ try_mark_dead()
+///        │                    │  TickEvent::SuspectTimedOut
+///        │                    │  └─ on_suspect_timeout() → try_mark_dead()
 ///        │                    │
 ///        │                    ▼
 ///        │                  Dead
@@ -64,27 +63,12 @@ pub struct SwimProtocol {
     pub(crate) gossip_buffer: GossipBuffer,
     pub(crate) topology: Topology,
 
-    // Tick-based timers
-    pub(crate) protocol_elapsed: u32,
-    pub(crate) pending_probes: HashMap<u32, ActiveProbe>,
-    pub(crate) suspect_timers: HashMap<NodeId, u32>,
-
     // Sequence
     pub(crate) seq_counter: u32,
 
-    // Output buffer
+    // Output buffers
     pub(crate) pending_outbound: Vec<OutboundPacket>,
-}
-
-pub(crate) struct ActiveProbe {
-    target_node_id: NodeId,
-    phase: ProbePhase,
-    ticks_remaining: u32,
-}
-
-pub(crate) enum ProbePhase {
-    Direct,
-    Indirect,
+    pub(crate) pending_timer_commands: Vec<TimerCommand>,
 }
 
 impl SwimProtocol {
@@ -97,16 +81,14 @@ impl SwimProtocol {
             members: HashMap::new(),
             live_node_tracker: LiveNodeTracker::default(),
             gossip_buffer: GossipBuffer::default(),
-            protocol_elapsed: 0,
-            pending_probes: HashMap::new(),
-            suspect_timers: HashMap::new(),
             seq_counter: 0,
             pending_outbound: vec![],
+            pending_timer_commands: vec![],
         }
     }
 
     /// Register this node as Alive in its own member map and topology.
-    /// Must be called once before the first `tick()` or `step()`.
+    /// Must be called once before the first `step()`.
     pub fn init_self(&mut self) {
         self.update_member(
             self.node_id.clone(),
@@ -116,51 +98,32 @@ impl SwimProtocol {
         );
     }
 
-    pub fn tick(&mut self) {
-        // Age every in-flight probes
-        let mut timeout_seqs: Vec<u32> = vec![];
-        for (seq, probe) in self.pending_probes.iter_mut() {
-            probe.ticks_remaining -= 1;
-            if probe.ticks_remaining == 0 {
-                timeout_seqs.push(*seq);
-            }
-        }
+    // -----------------------------------------------------------------------
+    // Event handlers (called by the actor in response to SwimTicker events)
+    // -----------------------------------------------------------------------
 
-        for seq in timeout_seqs {
-            let probe = self.pending_probes.remove(&seq).unwrap();
-            match probe.phase {
-                ProbePhase::Direct => {
-                    // We preserve the previous direct probe's seq so that we can cancel indirect probe timeout when we receive long running Ack message from the previous direct probe
-                    self.start_indirect_probe(probe.target_node_id, seq);
-                }
-                ProbePhase::Indirect => {
-                    self.try_mark_suspect(probe.target_node_id);
-                }
-            }
-        }
-
-        // 2. Age suspect timers, collect the ones that expired
-        let expired: Vec<NodeId> = self
-            .suspect_timers
-            .iter_mut()
-            .filter_map(|(id, ticks)| {
-                *ticks -= 1;
-                (*ticks == 0).then(|| id.clone())
-            })
-            .collect();
-
-        for node_id in expired {
-            self.suspect_timers.remove(&node_id);
-            self.try_mark_dead(node_id);
-        }
-
-        // 3. Advance the protocol clock - start a new probe when the period elapses
-        self.protocol_elapsed += 1;
-        if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
-            self.protocol_elapsed = 0;
-            self.start_probe();
-        }
+    pub fn on_protocol_period(&mut self) {
+        self.start_probe();
     }
+
+    pub fn on_direct_probe_timeout(&mut self, seq: u32, target_node_id: NodeId) {
+        // We preserve the previous direct probe's seq so that we can cancel
+        // indirect probe timeout when we receive a long-running Ack message
+        // from the previous direct probe
+        self.start_indirect_probe(target_node_id, seq);
+    }
+
+    pub fn on_indirect_probe_timeout(&mut self, target_node_id: NodeId) {
+        self.try_mark_suspect(target_node_id);
+    }
+
+    pub fn on_suspect_timeout(&mut self, node_id: NodeId) {
+        self.try_mark_dead(node_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Core protocol logic
+    // -----------------------------------------------------------------------
 
     fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
@@ -188,14 +151,11 @@ impl SwimProtocol {
             self.pending_outbound
                 .push(OutboundPacket::new(target, packet));
 
-            self.pending_probes.insert(
-                seq,
-                ActiveProbe {
+            self.pending_timer_commands
+                .push(TimerCommand::SetDirectProbe {
+                    seq,
                     target_node_id,
-                    phase: ProbePhase::Direct,
-                    ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
-                },
-            );
+                });
         }
     }
 
@@ -239,14 +199,11 @@ impl SwimProtocol {
                 .push(OutboundPacket::new(target, packet.clone()));
         }
 
-        self.pending_probes.insert(
-            seq,
-            ActiveProbe {
+        self.pending_timer_commands
+            .push(TimerCommand::SetIndirectProbe {
+                seq,
                 target_node_id,
-                phase: ProbePhase::Indirect,
-                ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
-            },
-        );
+            });
     }
 
     fn try_mark_suspect(&mut self, target_node_id: NodeId) {
@@ -263,8 +220,10 @@ impl SwimProtocol {
                 SwimNodeState::Suspect,
                 incarnation,
             );
-            self.suspect_timers
-                .insert(target_node_id, SUSPECT_TIMEOUT_TICKS);
+            self.pending_timer_commands
+                .push(TimerCommand::SetSuspectTimer {
+                    node_id: target_node_id,
+                });
         }
     }
 
@@ -322,7 +281,8 @@ impl SwimProtocol {
             } => {
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
-                self.pending_probes.remove(&seq);
+                self.pending_timer_commands
+                    .push(TimerCommand::CancelProbe { seq });
 
                 // Do NOT cancel the suspect timer here. A same-or-lower incarnation Ack
                 // could be a delayed packet from before the node knew it was suspected.
@@ -480,29 +440,21 @@ impl SwimProtocol {
         self.seq_counter
     }
 
-    fn push_outbound(&mut self, target: SocketAddr, packet: SwimPacket) {
-        self.pending_outbound
-            .push(OutboundPacket::new(target, packet))
-    }
-
     /// Drain all outbound packets buffered since the last call.
-    /// Call this after every `step()` or `tick()` to retrieve packets to send.
     pub fn take_outbound(&mut self) -> Vec<OutboundPacket> {
         std::mem::take(&mut self.pending_outbound)
     }
 
-    #[cfg(test)]
-    pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
-        self.pending_probes
-            .iter()
-            .find(|(_, probe)| &*probe.target_node_id == node_id)
-            .map(|(&seq, _)| seq)
+    /// Drain all timer commands buffered since the last call.
+    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand> {
+        std::mem::take(&mut self.pending_timer_commands)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clusters::swim_ticker::{SwimTicker, TickEvent};
     use crate::clusters::topology::{Topology, TopologyConfig};
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -518,6 +470,53 @@ mod tests {
         let mut p = SwimProtocol::new(NodeId::new(local_id), addr, topology);
         p.init_self();
         p
+    }
+
+    /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
+    /// what SwimActor does in production.
+    struct TestHarness {
+        protocol: SwimProtocol,
+        ticker: SwimTicker,
+    }
+
+    impl TestHarness {
+        fn new(local_id: &str, local_port: u16) -> Self {
+            Self {
+                protocol: make_protocol(local_id, local_port),
+                ticker: SwimTicker::new(),
+            }
+        }
+
+        fn tick(&mut self) {
+            let events = self.ticker.tick();
+            for event in events {
+                match event {
+                    TickEvent::ProtocolPeriodElapsed => self.protocol.on_protocol_period(),
+                    TickEvent::DirectProbeTimedOut {
+                        seq,
+                        target_node_id,
+                    } => self.protocol.on_direct_probe_timeout(seq, target_node_id),
+                    TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+                        self.protocol.on_indirect_probe_timeout(target_node_id)
+                    }
+                    TickEvent::SuspectTimedOut { node_id } => {
+                        self.protocol.on_suspect_timeout(node_id)
+                    }
+                }
+                self.apply_timer_commands();
+            }
+        }
+
+        fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
+            self.protocol.step(src, packet);
+            self.apply_timer_commands();
+        }
+
+        fn apply_timer_commands(&mut self) {
+            for cmd in self.protocol.take_timer_commands() {
+                self.ticker.apply(cmd);
+            }
+        }
     }
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
@@ -566,16 +565,22 @@ mod tests {
     fn add_node(m: &mut SwimProtocol, id: &str, addr: SocketAddr, inc: u64) {
         m.step(addr, ping(1, id, inc, vec![]));
         let _ = m.take_outbound();
+        let _ = m.take_timer_commands();
+    }
+
+    fn add_node_harness(h: &mut TestHarness, id: &str, addr: SocketAddr, inc: u64) {
+        h.step(addr, ping(1, id, inc, vec![]));
+        let _ = h.protocol.take_outbound();
     }
 
     fn tick_until<T>(
-        m: &mut SwimProtocol,
+        h: &mut TestHarness,
         max_ticks: u32,
-        mut f: impl FnMut(&SwimProtocol) -> Option<T>,
+        mut f: impl FnMut(&TestHarness) -> Option<T>,
     ) -> T {
         for _ in 0..max_ticks {
-            m.tick();
-            if let Some(v) = f(m) {
+            h.tick();
+            if let Some(v) = f(h) {
                 return v;
             }
         }
@@ -705,104 +710,107 @@ mod tests {
 
     mod ack {
         use crate::clusters::SwimNodeState;
-        use crate::clusters::swim_protocol::tests::{ack, add_node, make_protocol, tick_until};
-        use crate::clusters::swim_protocol::{
+        use crate::clusters::swim_protocol::tests::{
+            TestHarness, ack, add_node_harness, tick_until,
+        };
+        use crate::clusters::swim_ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, ProbePhase,
         };
         use std::net::SocketAddr;
 
         #[test]
         fn ack_matching_direct_probe_removes_probe() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut h = TestHarness::new("node-local", 8000);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
             let node_b_id = "node-b";
-            add_node(&mut p, node_b_id, sender, 1);
+            add_node_harness(&mut h, node_b_id, sender, 1);
 
             // wait until direct ping is sent
-            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
-                m.probe_seq_for(node_b_id)
+            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b_id)
             });
 
             // let's Ack before direct ping times out
-            p.step(sender, ack(seq, node_b_id, 1, vec![]));
-            let _ = p.take_outbound();
+            h.step(sender, ack(seq, node_b_id, 1, vec![]));
+            let _ = h.protocol.take_outbound();
 
-            assert!(!p.pending_probes.contains_key(&seq));
+            assert!(!h.ticker.has_probe(seq));
         }
 
         #[test]
         fn ack_matching_indirect_probe_removes_probe() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut h = TestHarness::new("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut p, node_b, b_addr, 1);
+            add_node_harness(&mut h, node_b, b_addr, 1);
 
             // Wait until node-b's direct probe starts
-            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
-                m.probe_seq_for(node_b)
+            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b)
             });
-            let _ = p.take_outbound(); // discard the ping
+            let _ = h.protocol.take_outbound(); // discard the ping
 
-            add_node(&mut p, node_c, c_addr, 1);
+            add_node_harness(&mut h, node_c, c_addr, 1);
 
             // Let direct probe timeout for node-b
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                p.tick();
+                h.tick();
             }
-            let _ = p.take_outbound(); // discard the PingReqs
+            let _ = h.protocol.take_outbound(); // discard the PingReqs
 
-            assert!(
-                matches!(
-                    p.pending_probes.get(&seq).unwrap().phase,
-                    ProbePhase::Indirect
-                ),
+            assert_eq!(
+                h.ticker.probe_phase(seq),
+                Some(ProbePhase::Indirect),
                 "probe should be in Indirect phase after direct timeout"
             );
 
             // Send Ack with the (reused) seq — clears the indirect probe
-            p.step(b_addr, ack(seq, node_b, 1, vec![]));
+            h.step(b_addr, ack(seq, node_b, 1, vec![]));
 
             assert!(
-                p.pending_probes.get(&seq).is_none(),
+                !h.ticker.has_probe(seq),
                 "indirect probe should be removed after matching Ack"
             );
         }
 
         #[test]
         fn late_ack_same_incarnation_does_not_refute_suspect() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut h = TestHarness::new("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut p, node_b, b_addr, 1);
-            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
-                m.probe_seq_for(node_b)
+            add_node_harness(&mut h, node_b, b_addr, 1);
+            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b)
             });
-            let _ = p.take_outbound();
+            let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
-            add_node(&mut p, node_c, c_addr, 1);
+            add_node_harness(&mut h, node_c, c_addr, 1);
 
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                p.tick()
+                h.tick()
             } // we now send indirect ping for node-b
-            let _ = p.take_outbound();
+            let _ = h.protocol.take_outbound();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
-                p.tick()
-            } // node-b is not suspect
-
-            assert_eq!(p.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
-
-            // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
-            p.step(b_addr, ack(seq, node_b, 1, vec![]));
+                h.tick()
+            } // node-b is now suspect
 
             assert_eq!(
-                p.members.get(node_b).unwrap().state,
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Suspect
+            );
+
+            // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
+            h.step(b_addr, ack(seq, node_b, 1, vec![]));
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
                 SwimNodeState::Suspect,
                 "same incarnation Ack should not refute suspicion"
             );
@@ -810,41 +818,44 @@ mod tests {
 
         #[test]
         fn late_ack_with_higher_incarnation_refutes_suspect() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut h = TestHarness::new("node-local", 8000);
             let node_b = "node-b";
             let node_c = "node-c";
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-            add_node(&mut p, node_b, b_addr, 1);
-            let seq = tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
-                m.probe_seq_for(node_b)
+            add_node_harness(&mut h, node_b, b_addr, 1);
+            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b)
             });
-            let _ = p.take_outbound();
+            let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
-            add_node(&mut p, node_c, c_addr, 1);
+            add_node_harness(&mut h, node_c, c_addr, 1);
 
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-                p.tick()
+                h.tick()
             } // we now send indirect ping for node-b
-            let _ = p.take_outbound();
+            let _ = h.protocol.take_outbound();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
-                p.tick()
+                h.tick()
             } // node-b is now suspect
 
-            assert_eq!(p.members.get(node_b).unwrap().state, SwimNodeState::Suspect);
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Suspect
+            );
 
             // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
-            p.step(b_addr, ack(seq, node_b, 2, vec![]));
+            h.step(b_addr, ack(seq, node_b, 2, vec![]));
 
             assert_eq!(
-                p.members.get(node_b).unwrap().state,
+                h.protocol.members.get(node_b).unwrap().state,
                 SwimNodeState::Alive,
                 "higher incarnation Ack should refute suspicion"
             );
             // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-            assert!(p.suspect_timers.contains_key(node_b));
+            assert!(h.ticker.has_suspect_timer(node_b));
         }
     }
 
@@ -994,46 +1005,38 @@ mod tests {
 
     mod tick_protocol_period {
         use crate::clusters::SwimPacket;
-        use crate::clusters::swim_protocol::tests::{add_node, make_protocol, tick_until};
-        use crate::clusters::swim_protocol::{PROBE_INTERVAL_TICKS, ProbePhase};
+        use crate::clusters::swim_protocol::tests::{TestHarness, add_node_harness, tick_until};
+        use crate::clusters::swim_ticker::{PROBE_INTERVAL_TICKS, ProbePhase};
         use std::net::SocketAddr;
 
         #[test]
         fn no_probe_before_protocol_period_elapses() {
-            let mut p = make_protocol("127.0.0.1", 8000);
+            let mut h = TestHarness::new("127.0.0.1", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            add_node(&mut p, "node-b", b_addr, 1);
-            let _ = p.take_outbound();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+            let _ = h.protocol.take_outbound();
 
             for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-                p.tick();
+                h.tick();
             }
 
-            assert!(p.pending_probes.is_empty());
-            assert!(p.take_outbound().is_empty());
+            assert!(h.ticker.probe_seq_for("node-b").is_none());
+            assert!(h.protocol.take_outbound().is_empty());
         }
 
         #[test]
         fn probe_starts_on_protocol_period() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut h = TestHarness::new("node-local", 8000);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-            add_node(&mut p, "node-b", b_addr, 1);
-            let _ = p.take_outbound();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+            let _ = h.protocol.take_outbound();
 
-            tick_until(&mut p, 2 * PROBE_INTERVAL_TICKS, |m| {
-                if !m.pending_probes.is_empty() {
-                    Some(())
-                } else {
-                    None
-                }
+            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for("node-b")
             });
 
-            assert_eq!(p.pending_probes.len(), 1);
-            assert!(matches!(
-                p.pending_probes.values().next().unwrap().phase,
-                ProbePhase::Direct
-            ));
-            let out = p.take_outbound();
+            assert_eq!(h.ticker.probe_phase(seq), Some(ProbePhase::Direct));
+            let out = h.protocol.take_outbound();
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0].packet(), SwimPacket::Ping { .. }));
         }

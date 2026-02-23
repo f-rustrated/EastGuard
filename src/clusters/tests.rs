@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::clusters::swim::SwimActor;
 
-use crate::clusters::swim_protocol::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+use crate::clusters::swim_ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 
@@ -26,10 +26,18 @@ async fn setup() -> (
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
+    let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
+    let actor = SwimActor::new(
+        addr,
+        "node-local".into(),
+        rx_in,
+        tx_out,
+        make_topology(),
+        ticker_send,
+    );
     tokio::spawn(actor.run());
 
     (tx_in, rx_out, addr)
@@ -265,8 +273,16 @@ async fn test_self_registers_in_topology_on_startup() {
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
+    let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
+    let actor = SwimActor::new(
+        addr,
+        "node-local".into(),
+        rx_in,
+        tx_out,
+        make_topology(),
+        ticker_send,
+    );
     // init_self() is called inside SwimActor::new(); no explicit call needed.
 
     assert!(
@@ -282,8 +298,16 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
+    let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
+    let mut actor = SwimActor::new(
+        addr,
+        "node-local".into(),
+        rx_in,
+        tx_out,
+        make_topology(),
+        ticker_send,
+    );
 
     actor
         .process_event_for_test(ActorEvent::PacketReceived {
@@ -315,8 +339,16 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
+    let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
+    let mut actor = SwimActor::new(
+        addr,
+        "node-local".into(),
+        rx_in,
+        tx_out,
+        make_topology(),
+        ticker_send,
+    );
 
     // Step 1: add the node via Alive gossip
     actor

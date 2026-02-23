@@ -7,6 +7,7 @@ use crate::{
     clusters::{
         NodeId,
         swim::SwimActor,
+        swim_ticker::TickerActor,
         topology::{Topology, TopologyConfig},
         transport::TransportLayer,
     },
@@ -40,8 +41,7 @@ impl StartUp {
                 vnodes_per_pnode: ENV.vnodes_per_node,
             },
         );
-
-        // 3. Create Actor
+        let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let node_id = NodeId::new(ENV.resolve_node_id());
         let swim_actor = SwimActor::new(
             local_peer_addr,
@@ -49,7 +49,12 @@ impl StartUp {
             swim_mailbox,
             tx_outbound,
             topology,
+            ticker_cmd_tx.clone(),
         );
+
+        tokio::spawn(TickerActor::new(ticker_cmd_rx, swim_sender).run());
+
+        // 3. Create Actor
 
         // Spawn Actors
         tokio::spawn(transport.run());
