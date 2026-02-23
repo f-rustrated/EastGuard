@@ -99,25 +99,6 @@ impl SwimProtocol {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Event handlers (called by the actor in response to SwimTicker events)
-    // -----------------------------------------------------------------------
-
-    pub fn on_protocol_period(&mut self) {
-        self.start_probe();
-    }
-
-    pub fn on_direct_probe_timeout(&mut self, seq: u32, target_node_id: NodeId) {
-        // We preserve the previous direct probe's seq so that we can cancel
-        // indirect probe timeout when we receive a long-running Ack message
-        // from the previous direct probe
-        self.start_indirect_probe(target_node_id, seq);
-    }
-
-    pub fn on_indirect_probe_timeout(&mut self, target_node_id: NodeId) {
-        self.try_mark_suspect(target_node_id);
-    }
-
     pub fn on_suspect_timeout(&mut self, node_id: NodeId) {
         self.try_mark_dead(node_id);
     }
@@ -126,7 +107,7 @@ impl SwimProtocol {
     // Core protocol logic
     // -----------------------------------------------------------------------
 
-    fn start_probe(&mut self) {
+    pub(crate) fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
             return;
         }
@@ -160,7 +141,10 @@ impl SwimProtocol {
         }
     }
 
-    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
+    // We preserve the previous direct probe's seq so that we can cancel
+    // indirect probe timeout when we receive a long-running Ack message
+    // from the previous direct probe
+    pub(crate) fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
         let target_addr = match self.members.get(&target_node_id).map(|m| m.addr) {
             Some(addr) => addr,
             None => return,
@@ -207,7 +191,7 @@ impl SwimProtocol {
             });
     }
 
-    fn try_mark_suspect(&mut self, target_node_id: NodeId) {
+    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Alive {
                 return;
@@ -228,7 +212,7 @@ impl SwimProtocol {
         }
     }
 
-    fn try_mark_dead(&mut self, target_node_id: NodeId) {
+    pub(crate) fn try_mark_dead(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Suspect {
                 return;
@@ -493,13 +477,14 @@ mod tests {
             let events = self.ticker.tick();
             for event in events {
                 match event {
-                    TickEvent::ProtocolPeriodElapsed => self.protocol.on_protocol_period(),
+                    TickEvent::ProtocolPeriodElapsed => self.protocol.start_probe(),
                     TickEvent::DirectProbeTimedOut {
                         seq,
                         target_node_id,
-                    } => self.protocol.on_direct_probe_timeout(seq, target_node_id),
+                    } => self.protocol.start_indirect_probe(target_node_id, seq),
+
                     TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                        self.protocol.on_indirect_probe_timeout(target_node_id)
+                        self.protocol.try_mark_suspect(target_node_id)
                     }
                     TickEvent::SuspectTimedOut { node_id } => {
                         self.protocol.on_suspect_timeout(node_id)
@@ -863,7 +848,7 @@ mod tests {
 
     mod step_pingreq {
         use crate::clusters::swim_protocol::tests::{make_protocol, node, pingreq};
-        use crate::clusters::{SwimNode, SwimNodeState, SwimPacket};
+        use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]

@@ -73,7 +73,7 @@ impl StartUp {
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
             if let Err(err) = self.handle_client_stream(stream).await {
-                eprintln!("{}", err.to_string());
+                eprintln!("{}", err);
                 continue;
             }
         }

@@ -45,32 +45,33 @@ impl SwimActor {
 
     async fn handle_tick_event(&mut self, event: TickEvent) {
         match event {
-            TickEvent::ProtocolPeriodElapsed => self.state.on_protocol_period(),
+            TickEvent::ProtocolPeriodElapsed => self.state.start_probe(),
             TickEvent::DirectProbeTimedOut {
                 seq,
                 target_node_id,
-            } => self.state.on_direct_probe_timeout(seq, target_node_id),
+            } => self.state.start_indirect_probe(target_node_id, seq),
             TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                self.state.on_indirect_probe_timeout(target_node_id)
+                self.state.try_mark_suspect(target_node_id);
             }
-            TickEvent::SuspectTimedOut { node_id } => self.state.on_suspect_timeout(node_id),
+            TickEvent::SuspectTimedOut { node_id } => {
+                self.state.try_mark_dead(node_id);
+            }
         }
-        self.apply_timer_commands().await;
-        self.flush_outbound().await;
     }
 
     async fn handle_actor_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
-                self.apply_timer_commands().await;
-                self.flush_outbound().await;
             }
 
             ActorEvent::Tick(tick_event) => {
                 self.handle_tick_event(tick_event).await;
             }
         }
+
+        self.apply_timer_commands().await;
+        self.flush_outbound().await;
     }
 
     async fn apply_timer_commands(&mut self) {
