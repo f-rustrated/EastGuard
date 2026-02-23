@@ -2,7 +2,7 @@ use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
 use crate::clusters::types::ticker_message::TickerCommand;
-use crate::clusters::{SwimCommand, NodeId, OutboundPacket, TickEvent};
+use crate::clusters::{NodeId, OutboundPacket, SwimCommand, TickEvent};
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;

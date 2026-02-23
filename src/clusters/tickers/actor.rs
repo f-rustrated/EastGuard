@@ -13,7 +13,7 @@ const TICK_PERIOD: Duration = Duration::from_millis(100);
 
 pub(crate) struct TickerActor {
     ticker: Ticker,
-    commands: mpsc::Receiver<TickerCommand>,
+    mailbox: mpsc::Receiver<TickerCommand>,
     swim_sender: mpsc::Sender<SwimCommand>,
 }
 
@@ -24,7 +24,7 @@ impl TickerActor {
     ) -> Self {
         Self {
             ticker: Ticker::default(),
-            commands: mailbox,
+            mailbox,
             swim_sender,
         }
     }
@@ -36,7 +36,7 @@ impl TickerActor {
                 _ = interval.tick() => {
                     self.run_tick().await;
                 }
-                Some(cmd) = self.commands.recv() => {
+                Some(cmd) = self.mailbox.recv() => {
                     match cmd {
                         #[cfg(test)]
                         TickerCommand::ForceTick => {
