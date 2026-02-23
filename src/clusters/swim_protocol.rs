@@ -99,10 +99,6 @@ impl SwimProtocol {
         );
     }
 
-    pub fn on_suspect_timeout(&mut self, node_id: NodeId) {
-        self.try_mark_dead(node_id);
-    }
-
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
@@ -487,7 +483,7 @@ mod tests {
                         self.protocol.try_mark_suspect(target_node_id)
                     }
                     TickEvent::SuspectTimedOut { node_id } => {
-                        self.protocol.on_suspect_timeout(node_id)
+                        self.protocol.try_mark_dead(node_id);
                     }
                 }
                 self.apply_timer_commands();
