@@ -2,11 +2,10 @@
 // TRANSPORT LAYER (Presentation)
 // ==========================================
 use super::*;
-use std::sync::Arc;
 use tokio::{net::UdpSocket, sync::mpsc};
 
 pub struct SwimTransportActor {
-    socket: Arc<UdpSocket>,
+    socket: UdpSocket,
     to_actor: mpsc::Sender<SwimCommand>,
     from_actor: mpsc::Receiver<OutboundPacket>,
 }
@@ -17,7 +16,7 @@ impl SwimTransportActor {
         to_actor: mpsc::Sender<SwimCommand>,
         from_actor: mpsc::Receiver<OutboundPacket>,
     ) -> anyhow::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let socket = UdpSocket::bind(bind_addr).await?;
         Ok(Self {
             socket,
             to_actor,
