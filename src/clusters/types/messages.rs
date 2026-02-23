@@ -44,5 +44,15 @@ pub enum ActorEvent {
 #[derive(Debug)]
 pub struct OutboundPacket {
     pub target: SocketAddr,
-    pub packet: SwimPacket,
+    packet: SwimPacket,
+}
+
+impl OutboundPacket {
+    pub(crate) fn new(target: SocketAddr, packet: SwimPacket) -> Self {
+        OutboundPacket { target, packet }
+    }
+
+    pub fn packet(&self) -> &SwimPacket {
+        &self.packet
+    }
 }

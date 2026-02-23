@@ -46,7 +46,7 @@ impl TransportLayer {
 
                 // OUTGOING: Actor -> Encode -> Socket
                 Some(msg) = self.from_actor.recv() => {
-                    match bincode::encode_to_vec(&msg.packet, BINCODE_CONFIG) {
+                    match bincode::encode_to_vec(msg.packet(), BINCODE_CONFIG) {
                         Ok(bytes) => {
                             let _ = self.socket.send_to(&bytes, msg.target).await;
                         }

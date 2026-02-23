@@ -29,7 +29,11 @@ impl SwimActor {
     ) -> Self {
         let mut state = SwimProtocol::new(node_id, local_addr, topology);
         state.init_self();
-        Self { mailbox, outbound, state }
+        Self {
+            mailbox,
+            outbound,
+            state,
+        }
     }
 
     pub async fn run(mut self) {
@@ -72,7 +76,7 @@ impl SwimActor {
             let _ = self.outbound.send(pkt).await;
         }
     }
-    
+
     #[cfg(test)]
     pub(crate) fn topology(&self) -> &Topology {
         &self.state.topology

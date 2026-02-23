@@ -29,13 +29,7 @@ async fn setup() -> (
 
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
-    let actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
+    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
     tokio::spawn(actor.run());
 
     (tx_in, rx_out, addr)
@@ -58,8 +52,8 @@ async fn test_ping_response() {
         src: remote_addr,
         packet: ping,
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // 2. Assert the Actor sends an Ack back
     let response = time::timeout(Duration::from_millis(100), rx.recv())
@@ -68,8 +62,8 @@ async fn test_ping_response() {
         .expect("Channel closed");
 
     assert_eq!(response.target, remote_addr);
-    match response.packet {
-        SwimPacket::Ack { seq, .. } => assert_eq!(seq, 100),
+    match response.packet() {
+        SwimPacket::Ack { seq, .. } => assert_eq!(*seq, 100),
         _ => panic!("Expected Ack packet"),
     }
 }
@@ -99,19 +93,19 @@ async fn test_refutation_mechanism() {
         src: remote_addr,
         packet: ping,
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // 2. The Actor should respond with an Ack.
     // CHECK: Did the actor increment its incarnation to 1 to refute the lie?
     let response = rx.recv().await.unwrap();
 
-    match response.packet {
+    match response.packet() {
         SwimPacket::Ack {
             source_incarnation, ..
         } => {
             assert_eq!(
-                source_incarnation, 1,
+                *source_incarnation, 1,
                 "Actor did not increment incarnation to refute suspicion!"
             );
         }
@@ -143,8 +137,8 @@ async fn test_gossip_propagation() {
             gossip: vec![gossip_msg],
         },
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // 2. Retry Loop: Probe until we hear the rumor or timeout
     // We give the actor 5 attempts (or 500ms) to propagate the info.
@@ -161,12 +155,12 @@ async fn test_gossip_propagation() {
                 gossip: vec![],
             },
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Wait for response
         if let Some(response) = rx.recv().await {
-            if let SwimPacket::Ack { gossip, .. } = response.packet {
+            if let SwimPacket::Ack { gossip, .. } = response.packet() {
                 // Check if our rumor is in this specific Ack
                 if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
                     assert_eq!(rumor.state, SwimNodeState::Dead);
@@ -218,8 +212,8 @@ async fn test_indirect_ping_trigger() {
             gossip: vec![p1, p2],
         },
     })
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     let _ack = rx.recv().await.unwrap(); // Clear the Ack
 
@@ -232,7 +226,7 @@ async fn test_indirect_ping_trigger() {
             tx.send(ActorEvent::ProtocolTick).await.unwrap();
         }
         match time::timeout(Duration::from_millis(50), rx.recv()).await {
-            Ok(Some(pkt)) if matches!(pkt.packet, SwimPacket::Ping { .. }) => {
+            Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping { .. }) => {
                 target_addr = Some(pkt.target);
                 break;
             }
@@ -253,16 +247,16 @@ async fn test_indirect_ping_trigger() {
         .expect("Should send indirect ping")
         .unwrap();
 
-    match indirect_ping.packet {
+    match indirect_ping.packet() {
         SwimPacket::PingReq {
             target: req_target, ..
         } => {
             assert_eq!(
-                req_target, target_addr,
+                *req_target, target_addr,
                 "PingReq should target the failed node"
             );
         }
-        _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet),
+        _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet()),
     }
 }
 
@@ -272,13 +266,7 @@ async fn test_self_registers_in_topology_on_startup() {
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
+    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
     // init_self() is called inside SwimActor::new(); no explicit call needed.
 
     assert!(
@@ -295,13 +283,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
+    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
 
     actor
         .process_event_for_test(ActorEvent::PacketReceived {
@@ -334,13 +316,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let (_tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, _rx_out) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(
-        addr,
-        "node-local".into(),
-        rx_in,
-        tx_out,
-        make_topology(),
-    );
+    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, make_topology());
 
     // Step 1: add the node via Alive gossip
     actor

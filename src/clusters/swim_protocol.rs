@@ -93,10 +93,10 @@ impl SwimProtocol {
             node_id,
             local_addr,
             incarnation: 0,
+            topology,
             members: HashMap::new(),
             live_node_tracker: LiveNodeTracker::default(),
             gossip_buffer: GossipBuffer::default(),
-            topology,
             protocol_elapsed: 0,
             pending_probes: HashMap::new(),
             suspect_timers: HashMap::new(),
@@ -172,19 +172,21 @@ impl SwimProtocol {
                 return;
             }
 
-            let target_addr = match self.members.get(&target_node_id).map(|m| m.addr) {
+            let target = match self.members.get(&target_node_id).map(|m| m.addr) {
                 Some(addr) => addr,
                 None => return,
             };
 
             let seq = self.next_seq();
-            let msg = SwimPacket::Ping {
+            let packet = SwimPacket::Ping {
                 seq,
                 source_node_id: self.node_id.clone(),
                 source_incarnation: self.incarnation,
                 gossip: self.gossip_buffer.collect(),
             };
-            self.push_outbound(target_addr, msg);
+
+            self.pending_outbound
+                .push(OutboundPacket::new(target, packet));
 
             self.pending_probes.insert(
                 seq,
@@ -225,15 +227,16 @@ impl SwimProtocol {
             return;
         }
 
-        let msg = SwimPacket::PingReq {
+        let packet = SwimPacket::PingReq {
             seq,
             target: target_addr,
             source_node_id: self.node_id.clone(),
             source_incarnation: self.incarnation,
             gossip: self.gossip_buffer.collect(),
         };
-        for peer_addr in peer_addrs {
-            self.push_outbound(peer_addr, msg.clone());
+        for target in peer_addrs {
+            self.pending_outbound
+                .push(OutboundPacket::new(target, packet.clone()));
         }
 
         self.pending_probes.insert(
@@ -307,7 +310,8 @@ impl SwimProtocol {
                     source_incarnation: self.incarnation,
                     gossip: self.gossip_buffer.collect(),
                 };
-                self.push_outbound(src, ack);
+
+                self.pending_outbound.push(OutboundPacket::new(src, ack))
             }
 
             SwimPacket::Ack {
@@ -340,7 +344,8 @@ impl SwimProtocol {
                     source_incarnation: self.incarnation,
                     gossip: self.gossip_buffer.collect(),
                 };
-                self.push_outbound(target, ping);
+                self.pending_outbound
+                    .push(OutboundPacket::new(target, ping));
             }
         }
     }
@@ -352,7 +357,8 @@ impl SwimProtocol {
                 let new_incarnation = member.incarnation + 1;
                 tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
-                    self.incarnation, new_incarnation
+                    self.incarnation,
+                    new_incarnation
                 );
                 self.incarnation = new_incarnation;
                 // Enqueue refutation so that the cluster learns quickly
@@ -476,7 +482,7 @@ impl SwimProtocol {
 
     fn push_outbound(&mut self, target: SocketAddr, packet: SwimPacket) {
         self.pending_outbound
-            .push(OutboundPacket { target, packet })
+            .push(OutboundPacket::new(target, packet))
     }
 
     /// Drain all outbound packets buffered since the last call.
@@ -602,7 +608,7 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
-            assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 1, .. }));
+            assert!(matches!(&out[0].packet(), SwimPacket::Ack { seq: 1, .. }));
         }
 
         #[test]
@@ -627,7 +633,7 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
-            assert!(matches!(&out[0].packet, SwimPacket::Ack { seq: 2, .. }));
+            assert!(matches!(&out[0].packet(), SwimPacket::Ack { seq: 2, .. }));
         }
 
         #[test]
@@ -647,7 +653,7 @@ mod tests {
             // Ack's gossip reflects the update applied during this step
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
-            match &out[0].packet {
+            match &out[0].packet() {
                 SwimPacket::Ack { gossip, .. } => {
                     assert!(
                         gossip.iter().any(|n| n.node_id == NodeId::new("node-c")),
@@ -860,7 +866,7 @@ mod tests {
             assert_eq!(out.len(), 1);
             assert!(
                 out.iter()
-                    .any(|p| p.target == c_addr && matches!(p.packet, SwimPacket::Ping { .. }))
+                    .any(|p| p.target == c_addr && matches!(p.packet(), SwimPacket::Ping { .. }))
             );
 
             // handle_incarnation_check ran: sender node-b should be in members
@@ -889,7 +895,7 @@ mod tests {
             // Proxy Ping's gossip should reflect the update (gossip applied in Phase 1, before Ping built)
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
-            match &out[0].packet {
+            match &out[0].packet() {
                 SwimPacket::Ping { gossip, .. } => {
                     assert!(
                         gossip.iter().any(|n| n.node_id == "node-d".into()),
@@ -924,7 +930,7 @@ mod tests {
 
             assert_eq!(p.incarnation, 6, "must bump to gossip.inc + 1 = 6");
             let out = p.take_outbound();
-            match &out[0].packet {
+            match &out[0].packet() {
                 SwimPacket::Ack {
                     source_incarnation,
                     gossip,
@@ -1029,7 +1035,7 @@ mod tests {
             ));
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
-            assert!(matches!(out[0].packet, SwimPacket::Ping { .. }));
+            assert!(matches!(out[0].packet(), SwimPacket::Ping { .. }));
         }
     }
 }
