@@ -13,6 +13,7 @@ pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 
+#[derive(Default)]
 pub(crate) struct SwimTicker {
     protocol_elapsed: u32,
     probe_timers: HashMap<u32, ProbeTimer>,
@@ -63,40 +64,33 @@ pub(crate) enum ProbePhase {
 
 #[derive(Debug)]
 pub(crate) enum TickerCommand {
-    Probe(ProbeCommand),
+    Probe(TimerCommand),
+    #[cfg(test)]
     ForceTick,
 }
 
 #[derive(Debug)]
-pub(crate) enum ProbeCommand {
+pub(crate) enum TimerCommand {
     SetProbe { seq: u32, timer: ProbeTimer },
-
-    SetSuspectTimer { node_id: NodeId },
     CancelProbe { seq: u32 },
+    SetSuspectTimer { node_id: NodeId },
 }
-impl From<ProbeCommand> for TickerCommand {
-    fn from(value: ProbeCommand) -> Self {
+impl From<TimerCommand> for TickerCommand {
+    fn from(value: TimerCommand) -> Self {
         TickerCommand::Probe(value)
     }
 }
 
 impl SwimTicker {
-    pub fn new() -> Self {
-        Self {
-            protocol_elapsed: 0,
-            probe_timers: HashMap::new(),
-            suspect_timers: HashMap::new(),
-        }
-    }
-    pub(crate) fn apply(&mut self, cmd: ProbeCommand) {
+    pub(crate) fn apply(&mut self, cmd: TimerCommand) {
         match cmd {
-            ProbeCommand::SetProbe { seq, timer } => {
+            TimerCommand::SetProbe { seq, timer } => {
                 self.probe_timers.insert(seq, timer);
             }
-            ProbeCommand::SetSuspectTimer { node_id } => {
+            TimerCommand::SetSuspectTimer { node_id } => {
                 self.suspect_timers.insert(node_id, SUSPECT_TIMEOUT_TICKS);
             }
-            ProbeCommand::CancelProbe { seq } => {
+            TimerCommand::CancelProbe { seq } => {
                 self.probe_timers.remove(&seq);
             }
         }
@@ -180,7 +174,7 @@ impl TickerActor {
         swim_sender: mpsc::Sender<ActorEvent>,
     ) -> Self {
         Self {
-            ticker: SwimTicker::new(),
+            ticker: SwimTicker::default(),
             commands: mailbox,
             swim_sender,
         }
@@ -195,6 +189,7 @@ impl TickerActor {
                 }
                 Some(cmd) = self.commands.recv() => {
                     match cmd {
+                        #[cfg(test)]
                         TickerCommand::ForceTick => {
                             self.do_tick().await;
                         }
