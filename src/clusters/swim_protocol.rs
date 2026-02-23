@@ -1,7 +1,7 @@
 use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::livenode_tracker::LiveNodeTracker;
 
-use crate::clusters::swim_ticker::ProbeCommand;
+use crate::clusters::swim_ticker::{ProbeCommand, ProbeTimer};
 use crate::clusters::topology::Topology;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
@@ -129,11 +129,10 @@ impl SwimProtocol {
             self.pending_outbound
                 .push(OutboundPacket::new(target, packet));
 
-            self.pending_timer_commands
-                .push(ProbeCommand::SetDirectProbe {
-                    seq,
-                    target_node_id,
-                });
+            self.pending_timer_commands.push(ProbeCommand::SetProbe {
+                seq,
+                timer: ProbeTimer::direct_probe(target_node_id),
+            });
         }
     }
 
@@ -180,11 +179,10 @@ impl SwimProtocol {
                 .push(OutboundPacket::new(target, packet.clone()));
         }
 
-        self.pending_timer_commands
-            .push(ProbeCommand::SetIndirectProbe {
-                seq,
-                target_node_id,
-            });
+        self.pending_timer_commands.push(ProbeCommand::SetProbe {
+            seq,
+            timer: ProbeTimer::indirect_probe(target_node_id),
+        });
     }
 
     pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId) {

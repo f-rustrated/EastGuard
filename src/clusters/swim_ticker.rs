@@ -19,10 +19,40 @@ pub(crate) struct SwimTicker {
     suspect_timers: HashMap<NodeId, u32>,
 }
 
-struct ProbeTimer {
+#[derive(Debug)]
+pub(crate) struct ProbeTimer {
     target_node_id: NodeId,
     phase: ProbePhase,
     ticks_remaining: u32,
+}
+impl ProbeTimer {
+    pub(crate) fn direct_probe(target: NodeId) -> Self {
+        Self {
+            target_node_id: target,
+            phase: ProbePhase::Direct,
+            ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
+        }
+    }
+
+    pub(crate) fn indirect_probe(target: NodeId) -> Self {
+        Self {
+            target_node_id: target,
+            phase: ProbePhase::Indirect,
+            ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
+        }
+    }
+    pub(crate) fn to_timeout_event(self, seq: u32) -> TickEvent {
+        match self.phase {
+            ProbePhase::Direct => TickEvent::DirectProbeTimedOut {
+                seq: seq,
+                target_node_id: self.target_node_id,
+            },
+            ProbePhase::Indirect => TickEvent::IndirectProbeTimedOut {
+                seq: seq,
+                target_node_id: self.target_node_id,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +69,8 @@ pub(crate) enum TickerCommand {
 
 #[derive(Debug)]
 pub(crate) enum ProbeCommand {
-    SetDirectProbe { seq: u32, target_node_id: NodeId },
-    SetIndirectProbe { seq: u32, target_node_id: NodeId },
+    SetProbe { seq: u32, timer: ProbeTimer },
+
     SetSuspectTimer { node_id: NodeId },
     CancelProbe { seq: u32 },
 }
@@ -60,31 +90,8 @@ impl SwimTicker {
     }
     pub(crate) fn apply(&mut self, cmd: ProbeCommand) {
         match cmd {
-            ProbeCommand::SetDirectProbe {
-                seq,
-                target_node_id,
-            } => {
-                self.probe_timers.insert(
-                    seq,
-                    ProbeTimer {
-                        target_node_id,
-                        phase: ProbePhase::Direct,
-                        ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
-                    },
-                );
-            }
-            ProbeCommand::SetIndirectProbe {
-                seq,
-                target_node_id,
-            } => {
-                self.probe_timers.insert(
-                    seq,
-                    ProbeTimer {
-                        target_node_id,
-                        phase: ProbePhase::Indirect,
-                        ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
-                    },
-                );
+            ProbeCommand::SetProbe { seq, timer } => {
+                self.probe_timers.insert(seq, timer);
             }
             ProbeCommand::SetSuspectTimer { node_id } => {
                 self.suspect_timers.insert(node_id, SUSPECT_TIMEOUT_TICKS);
@@ -109,20 +116,7 @@ impl SwimTicker {
 
         for seq in timeout_seqs {
             let probe = self.probe_timers.remove(&seq).unwrap();
-            match probe.phase {
-                ProbePhase::Direct => {
-                    events.push(TickEvent::DirectProbeTimedOut {
-                        seq,
-                        target_node_id: probe.target_node_id,
-                    });
-                }
-                ProbePhase::Indirect => {
-                    events.push(TickEvent::IndirectProbeTimedOut {
-                        seq,
-                        target_node_id: probe.target_node_id,
-                    });
-                }
-            }
+            events.push(probe.to_timeout_event(seq));
         }
 
         // 2. Age suspect timers, collect the ones that expired
