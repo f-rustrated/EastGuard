@@ -1,7 +1,7 @@
 use super::*;
-use crate::clusters::ticker::TimerCommand;
 
-use crate::clusters::types::timer::ProbeTimer;
+use crate::clusters::tickers::timer::ProbeTimer;
+use crate::clusters::types::ticker_message::TimerCommand;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -429,7 +429,7 @@ impl Swim {
 mod tests {
     use super::*;
     use crate::clusters::TickEvent;
-    use crate::clusters::ticker::Ticker;
+    use crate::clusters::tickers::ticker::Ticker;
 
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -442,9 +442,7 @@ mod tests {
                 vnodes_per_pnode: 256,
             },
         );
-        let mut p = Swim::new(NodeId::new(local_id), addr, topology);
-
-        p
+        Swim::new(NodeId::new(local_id), addr, topology)
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
@@ -690,10 +688,11 @@ mod tests {
     mod ack {
         use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
-        use crate::clusters::ticker::{
+        use crate::clusters::tickers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
         };
-        use crate::clusters::types::timer::ProbePhase;
+        use crate::clusters::tickers::timer::ProbePhase;
+
         use std::net::SocketAddr;
 
         #[test]

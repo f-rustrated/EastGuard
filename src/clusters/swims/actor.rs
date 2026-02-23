@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::clusters::swims::swim::Swim;
-use crate::clusters::ticker::TickerCommand;
+
+use crate::clusters::types::ticker_message::TickerCommand;
 use crate::clusters::{ActorEvent, NodeId, OutboundPacket, TickEvent};
 
 use std::net::SocketAddr;

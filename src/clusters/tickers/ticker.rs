@@ -1,6 +1,9 @@
 #[cfg(test)]
-use crate::clusters::types::timer::ProbePhase;
-use crate::clusters::{NodeId, TickEvent, types::timer::ProbeTimer};
+use crate::clusters::tickers::timer::ProbePhase;
+use crate::clusters::tickers::timer::ProbeTimer;
+
+use crate::clusters::types::ticker_message::TimerCommand;
+use crate::clusters::{NodeId, TickEvent};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
@@ -13,25 +16,6 @@ pub(crate) struct Ticker {
     protocol_elapsed: u32,
     probe_timers: HashMap<u32, ProbeTimer>,
     suspect_timers: HashMap<NodeId, u32>,
-}
-
-#[derive(Debug)]
-pub(crate) enum TickerCommand {
-    Probe(TimerCommand),
-    #[cfg(test)]
-    ForceTick,
-}
-
-#[derive(Debug)]
-pub(crate) enum TimerCommand {
-    SetProbe { seq: u32, timer: ProbeTimer },
-    CancelProbe { seq: u32 },
-    SetSuspectTimer { node_id: NodeId },
-}
-impl From<TimerCommand> for TickerCommand {
-    fn from(value: TimerCommand) -> Self {
-        TickerCommand::Probe(value)
-    }
 }
 
 impl Ticker {

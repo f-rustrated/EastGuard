@@ -1,7 +1,5 @@
-use crate::clusters::{
-    NodeId, TickEvent,
-    ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS},
-};
+use crate::clusters::tickers::ticker::INDIRECT_ACK_TIMEOUT_TICKS;
+use crate::clusters::{NodeId, TickEvent, tickers::ticker::DIRECT_ACK_TIMEOUT_TICKS};
 
 #[derive(Debug)]
 pub(crate) struct ProbeTimer {

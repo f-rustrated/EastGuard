@@ -5,9 +5,7 @@ mod clusters;
 
 use crate::{
     clusters::{
-        NodeId,
-        actors::{ticker::TickerActor, transport::SwimTransportActor},
-        swims::swim_actor::SwimActor,
+        NodeId, swims::actor::SwimActor, tickers::actor::TickerActor, transport::SwimTransportActor,
     },
     config::ENV,
     connections::{
@@ -16,7 +14,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::HashMap;
+
 use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Debug)]

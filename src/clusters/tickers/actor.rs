@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use crate::clusters::ticker::{Ticker, TickerCommand};
 use tokio::sync::mpsc;
 use tokio::time;
 
-use super::*;
+use crate::clusters::ActorEvent;
+use crate::clusters::tickers::ticker::Ticker;
+use crate::clusters::types::ticker_message::TickerCommand;
 
 /// One real-time tick drives one logical tick in SwimTicker.
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
