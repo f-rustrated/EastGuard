@@ -209,3 +209,125 @@ impl TickerActor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_protocol_period_before_interval_elapses() {
+        let mut ticker = SwimTicker::default();
+        for _ in 0..PROBE_INTERVAL_TICKS - 1 {
+            let events = ticker.tick();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, TickEvent::ProtocolPeriodElapsed)),
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_period_fires_at_interval() {
+        let mut ticker = SwimTicker::default();
+        for _ in 0..PROBE_INTERVAL_TICKS - 1 {
+            ticker.tick();
+        }
+        let events = ticker.tick();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TickEvent::ProtocolPeriodElapsed))
+        );
+    }
+
+    #[test]
+    fn direct_probe_timeout() {
+        let mut ticker = SwimTicker::default();
+        ticker.apply(TimerCommand::SetProbe {
+            seq: 1,
+            timer: ProbeTimer::direct_probe("node-b".into()),
+        });
+
+        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
+            let events = ticker.tick();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { .. }))
+            );
+        }
+
+        let events = ticker.tick();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { seq: 1, .. }))
+        );
+        assert!(!ticker.has_probe(1));
+    }
+
+    #[test]
+    fn indirect_probe_timeout() {
+        let mut ticker = SwimTicker::default();
+        ticker.apply(TimerCommand::SetProbe {
+            seq: 2,
+            timer: ProbeTimer::indirect_probe("node-c".into()),
+        });
+
+        for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
+            ticker.tick();
+        }
+
+        let events = ticker.tick();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TickEvent::IndirectProbeTimedOut { seq: 2, .. }))
+        );
+    }
+
+    #[test]
+    fn cancel_probe_prevents_timeout() {
+        let mut ticker = SwimTicker::default();
+        ticker.apply(TimerCommand::SetProbe {
+            seq: 1,
+            timer: ProbeTimer::direct_probe("node-b".into()),
+        });
+        ticker.apply(TimerCommand::CancelProbe { seq: 1 });
+
+        for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
+            let events = ticker.tick();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn suspect_timer_fires_after_timeout() {
+        let mut ticker = SwimTicker::default();
+        ticker.apply(TimerCommand::SetSuspectTimer {
+            node_id: "node-b".into(),
+        });
+
+        for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
+            let events = ticker.tick();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, TickEvent::SuspectTimedOut { .. }))
+            );
+        }
+
+        let events = ticker.tick();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TickEvent::SuspectTimedOut { .. }))
+        );
+        assert!(!ticker.has_suspect_timer("node-b"));
+    }
+}

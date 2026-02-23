@@ -983,43 +983,4 @@ mod tests {
             "current impl refutes Dead — this should change when TODO is fixed"
         );
     }
-
-    mod tick_protocol_period {
-        use crate::clusters::SwimPacket;
-        use crate::clusters::swim_protocol::tests::{TestHarness, add_node_harness, tick_until};
-        use crate::clusters::swim_ticker::{PROBE_INTERVAL_TICKS, ProbePhase};
-        use std::net::SocketAddr;
-
-        #[test]
-        fn no_probe_before_protocol_period_elapses() {
-            let mut h = TestHarness::new("127.0.0.1", 8000);
-            let b_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-            add_node_harness(&mut h, "node-b", b_addr, 1);
-            let _ = h.protocol.take_outbound();
-
-            for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-                h.tick();
-            }
-
-            assert!(h.ticker.probe_seq_for("node-b").is_none());
-            assert!(h.protocol.take_outbound().is_empty());
-        }
-
-        #[test]
-        fn probe_starts_on_protocol_period() {
-            let mut h = TestHarness::new("node-local", 8000);
-            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-            add_node_harness(&mut h, "node-b", b_addr, 1);
-            let _ = h.protocol.take_outbound();
-
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for("node-b")
-            });
-
-            assert_eq!(h.ticker.probe_phase(seq), Some(ProbePhase::Direct));
-            let out = h.protocol.take_outbound();
-            assert_eq!(out.len(), 1);
-            assert!(matches!(out[0].packet(), SwimPacket::Ping { .. }));
-        }
-    }
 }
