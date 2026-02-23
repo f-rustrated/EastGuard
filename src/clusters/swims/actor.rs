@@ -1,7 +1,6 @@
-use super::*;
-
 use crate::clusters::swims::swim::Swim;
-
+use crate::clusters::swims::topology::Topology;
+use crate::clusters::swims::topology::TopologyConfig;
 use crate::clusters::types::ticker_message::TickerCommand;
 use crate::clusters::{ActorEvent, NodeId, OutboundPacket, TickEvent};
 

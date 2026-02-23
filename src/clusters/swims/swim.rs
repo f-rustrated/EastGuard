@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::clusters::swims::topology::Topology;
 use crate::clusters::tickers::timer::ProbeTimer;
 use crate::clusters::types::ticker_message::TimerCommand;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
@@ -54,21 +55,21 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    pub(crate) local_addr: SocketAddr,
-    pub(crate) incarnation: u64,
+    local_addr: SocketAddr,
+    incarnation: u64,
 
     // Protocol state
-    pub(crate) members: HashMap<NodeId, SwimNode>,
-    pub(crate) live_node_tracker: LiveNodeTracker,
-    pub(crate) gossip_buffer: GossipBuffer,
+    members: HashMap<NodeId, SwimNode>,
+    live_node_tracker: LiveNodeTracker,
+    gossip_buffer: GossipBuffer,
     pub(crate) topology: Topology,
 
     // Sequence
-    pub(crate) seq_counter: u32,
+    seq_counter: u32,
 
     // Output buffers
-    pub(crate) pending_outbound: Vec<OutboundPacket>,
-    pub(crate) pending_timer_commands: Vec<TimerCommand>,
+    pending_outbound: Vec<OutboundPacket>,
+    pending_timer_commands: Vec<TimerCommand>,
 }
 
 impl Swim {

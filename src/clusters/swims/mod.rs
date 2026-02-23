@@ -6,7 +6,6 @@ mod topology;
 
 use gossip_buffer::*;
 use livenode_tracker::*;
-use topology::*;
 
 #[cfg(test)]
 pub use topology::*;

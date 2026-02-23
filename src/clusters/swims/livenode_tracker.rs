@@ -1,6 +1,5 @@
 use crate::clusters::{NodeId, SwimNodeState};
 
-use super::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::VecDeque;
 use std::ops::Deref;
