@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::clusters::swim::SwimActor;
+use crate::clusters::actors::swim::SwimActor;
 
-use crate::clusters::swim_ticker::{
-    DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, TickerActor, TickerCommand,
-};
+use crate::clusters::actors::ticker::TickerActor;
+use crate::clusters::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, TickerCommand};
 use crate::clusters::topology::{Topology, TopologyConfig};
 use tokio::{sync::mpsc, time};
 

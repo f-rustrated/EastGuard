@@ -1,8 +1,9 @@
 use crate::clusters::gossip_buffer::GossipBuffer;
 use crate::clusters::livenode_tracker::LiveNodeTracker;
 
-use crate::clusters::swim_ticker::{ProbeTimer, TimerCommand};
+use crate::clusters::ticker::TimerCommand;
 use crate::clusters::topology::Topology;
+use crate::clusters::types::timer::ProbeTimer;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -434,7 +435,7 @@ impl SwimProtocol {
 mod tests {
     use super::*;
     use crate::clusters::TickEvent;
-    use crate::clusters::swim_ticker::SwimTicker;
+    use crate::clusters::ticker::SwimTicker;
     use crate::clusters::topology::{Topology, TopologyConfig};
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -694,9 +695,10 @@ mod tests {
         use crate::clusters::swim_protocol::tests::{
             TestHarness, ack, add_node_harness, tick_until,
         };
-        use crate::clusters::swim_ticker::{
-            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS, ProbePhase,
+        use crate::clusters::ticker::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
         };
+        use crate::clusters::types::timer::ProbePhase;
         use std::net::SocketAddr;
 
         #[test]

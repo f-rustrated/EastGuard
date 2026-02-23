@@ -2,14 +2,13 @@ use std::net::SocketAddr;
 mod gossip_buffer;
 mod livenode_tracker;
 
-pub(crate) mod swim;
 pub(crate) mod topology;
 pub(crate) mod transport;
 
+pub(crate) mod actors;
 mod swim_protocol;
-pub(crate) mod swim_ticker;
-#[cfg(test)]
-pub mod tests;
+pub(crate) mod ticker;
+
 mod types;
 
 pub(crate) use types::messages::*;

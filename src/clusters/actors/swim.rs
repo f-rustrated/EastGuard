@@ -1,6 +1,6 @@
 use super::swim_protocol::SwimProtocol;
 use super::*;
-use crate::clusters::swim_ticker::TickerCommand;
+use crate::clusters::ticker::TickerCommand;
 use crate::clusters::topology::Topology;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 
 pub struct SwimActor {
     mailbox: mpsc::Receiver<ActorEvent>,
-    outbound: mpsc::Sender<OutboundPacket>,
-    scheduler_sender: mpsc::Sender<TickerCommand>,
+    transport_tx: mpsc::Sender<OutboundPacket>,
+    ticker_tx: mpsc::Sender<TickerCommand>,
     state: SwimProtocol,
 }
 
@@ -21,17 +21,17 @@ impl SwimActor {
         local_addr: SocketAddr,
         node_id: NodeId,
         mailbox: mpsc::Receiver<ActorEvent>,
-        outbound: mpsc::Sender<OutboundPacket>,
+        transport_tx: mpsc::Sender<OutboundPacket>,
         topology: Topology,
-        scheduler_sender: mpsc::Sender<TickerCommand>,
+        ticker_tx: mpsc::Sender<TickerCommand>,
     ) -> Self {
         let mut state = SwimProtocol::new(node_id, local_addr, topology);
         state.init_self();
         Self {
             mailbox,
-            outbound,
+            transport_tx,
             state,
-            scheduler_sender,
+            ticker_tx,
         }
     }
 
@@ -76,12 +76,12 @@ impl SwimActor {
 
     async fn flush_ticker_commands(&mut self) {
         for cmd in self.state.take_timer_commands() {
-            let _ = self.scheduler_sender.send(cmd.into()).await;
+            let _ = self.ticker_tx.send(cmd.into()).await;
         }
     }
     async fn flush_outbound(&mut self) {
         for pkt in self.state.take_outbound() {
-            let _ = self.outbound.send(pkt).await;
+            let _ = self.transport_tx.send(pkt).await;
         }
     }
 

@@ -1,12 +1,7 @@
-use crate::clusters::{ActorEvent, NodeId, TickEvent};
+#[cfg(test)]
+use crate::clusters::types::timer::ProbePhase;
+use crate::clusters::{NodeId, TickEvent, types::timer::ProbeTimer};
 use std::collections::HashMap;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time;
-
-/// One real-time tick drives one logical tick in SwimTicker.
-/// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
-const TICK_PERIOD: Duration = Duration::from_millis(100);
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
 pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
@@ -18,48 +13,6 @@ pub(crate) struct SwimTicker {
     protocol_elapsed: u32,
     probe_timers: HashMap<u32, ProbeTimer>,
     suspect_timers: HashMap<NodeId, u32>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ProbeTimer {
-    target_node_id: NodeId,
-    phase: ProbePhase,
-    ticks_remaining: u32,
-}
-impl ProbeTimer {
-    pub(crate) fn direct_probe(target: NodeId) -> Self {
-        Self {
-            target_node_id: target,
-            phase: ProbePhase::Direct,
-            ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
-        }
-    }
-
-    pub(crate) fn indirect_probe(target: NodeId) -> Self {
-        Self {
-            target_node_id: target,
-            phase: ProbePhase::Indirect,
-            ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
-        }
-    }
-    pub(crate) fn to_timeout_event(self, seq: u32) -> TickEvent {
-        match self.phase {
-            ProbePhase::Direct => TickEvent::DirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-            ProbePhase::Indirect => TickEvent::IndirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbePhase {
-    Direct,
-    Indirect,
 }
 
 #[derive(Debug)]
@@ -159,54 +112,6 @@ impl SwimTicker {
     #[cfg(test)]
     pub fn probe_phase(&self, seq: u32) -> Option<ProbePhase> {
         self.probe_timers.get(&seq).map(|p| p.phase)
-    }
-}
-
-pub(crate) struct TickerActor {
-    ticker: SwimTicker,
-    commands: mpsc::Receiver<TickerCommand>,
-    swim_sender: mpsc::Sender<ActorEvent>,
-}
-
-impl TickerActor {
-    pub fn new(
-        mailbox: mpsc::Receiver<TickerCommand>,
-        swim_sender: mpsc::Sender<ActorEvent>,
-    ) -> Self {
-        Self {
-            ticker: SwimTicker::default(),
-            commands: mailbox,
-            swim_sender,
-        }
-    }
-
-    pub async fn run(mut self) {
-        let mut interval = time::interval(TICK_PERIOD);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    self.do_tick().await;
-                }
-                Some(cmd) = self.commands.recv() => {
-                    match cmd {
-                        #[cfg(test)]
-                        TickerCommand::ForceTick => {
-                            self.do_tick().await;
-                        }
-                        TickerCommand::Probe(probe_cmd)=>{
-                            self.ticker.apply(probe_cmd);
-                        }
-                    }
-                }
-
-            }
-        }
-    }
-
-    async fn do_tick(&mut self) {
-        for event in self.ticker.tick() {
-            let _ = self.swim_sender.send(event.into()).await;
-        }
     }
 }
 
