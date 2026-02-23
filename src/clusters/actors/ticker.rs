@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::clusters::ticker::{SwimTicker, TickerCommand};
+use crate::clusters::ticker::{Ticker, TickerCommand};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -11,7 +11,7 @@ use super::*;
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
 pub(crate) struct TickerActor {
-    ticker: SwimTicker,
+    ticker: Ticker,
     commands: mpsc::Receiver<TickerCommand>,
     swim_sender: mpsc::Sender<ActorEvent>,
 }
@@ -22,7 +22,7 @@ impl TickerActor {
         swim_sender: mpsc::Sender<ActorEvent>,
     ) -> Self {
         Self {
-            ticker: SwimTicker::default(),
+            ticker: Ticker::default(),
             commands: mailbox,
             swim_sender,
         }

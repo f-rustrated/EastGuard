@@ -1,7 +1,9 @@
-use super::swim_protocol::SwimProtocol;
 use super::*;
+
+use crate::clusters::swims::swim::Swim;
 use crate::clusters::ticker::TickerCommand;
-use crate::clusters::topology::Topology;
+use crate::clusters::{ActorEvent, NodeId, OutboundPacket, TickEvent};
+
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
@@ -13,7 +15,7 @@ pub struct SwimActor {
     mailbox: mpsc::Receiver<ActorEvent>,
     transport_tx: mpsc::Sender<OutboundPacket>,
     ticker_tx: mpsc::Sender<TickerCommand>,
-    state: SwimProtocol,
+    state: Swim,
 }
 
 impl SwimActor {
@@ -22,10 +24,16 @@ impl SwimActor {
         node_id: NodeId,
         mailbox: mpsc::Receiver<ActorEvent>,
         transport_tx: mpsc::Sender<OutboundPacket>,
-        topology: Topology,
         ticker_tx: mpsc::Sender<TickerCommand>,
+        vnodes_per_node: u64,
     ) -> Self {
-        let state = SwimProtocol::new(node_id, local_addr, topology);
+        let topology = Topology::new(
+            Default::default(),
+            TopologyConfig {
+                vnodes_per_pnode: vnodes_per_node,
+            },
+        );
+        let state = Swim::new(node_id, local_addr, topology);
 
         Self {
             mailbox,

@@ -9,7 +9,7 @@ pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 
 #[derive(Default)]
-pub(crate) struct SwimTicker {
+pub(crate) struct Ticker {
     protocol_elapsed: u32,
     probe_timers: HashMap<u32, ProbeTimer>,
     suspect_timers: HashMap<NodeId, u32>,
@@ -34,7 +34,7 @@ impl From<TimerCommand> for TickerCommand {
     }
 }
 
-impl SwimTicker {
+impl Ticker {
     pub(crate) fn apply(&mut self, cmd: TimerCommand) {
         match cmd {
             TimerCommand::SetProbe { seq, timer } => {
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn no_protocol_period_before_interval_elapses() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             let events = ticker.tick();
             assert!(
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn protocol_period_fires_at_interval() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             ticker.tick();
         }
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn direct_probe_timeout() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 1,
             timer: ProbeTimer::direct_probe("node-b".into()),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn indirect_probe_timeout() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 2,
             timer: ProbeTimer::indirect_probe("node-c".into()),
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn cancel_probe_prevents_timeout() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 1,
             timer: ProbeTimer::direct_probe("node-b".into()),
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn suspect_timer_fires_after_timeout() {
-        let mut ticker = SwimTicker::default();
+        let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetSuspectTimer {
             node_id: "node-b".into(),
         });

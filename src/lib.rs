@@ -6,9 +6,8 @@ mod clusters;
 use crate::{
     clusters::{
         NodeId,
-        actors::{swim::SwimActor, ticker::TickerActor},
-        topology::{Topology, TopologyConfig},
-        transport::TransportLayer,
+        actors::{ticker::TickerActor, transport::SwimTransportActor},
+        swims::swim_actor::SwimActor,
     },
     config::ENV,
     connections::{
@@ -32,22 +31,16 @@ impl StartUp {
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            TransportLayer::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
 
-        let topology = Topology::new(
-            HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: ENV.vnodes_per_node,
-            },
-        );
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(
             local_peer_addr,
             NodeId::new(ENV.resolve_node_id()),
             swim_mailbox,
             tx_outbound,
-            topology,
             ticker_cmd_tx.clone(),
+            ENV.vnodes_per_node,
         );
 
         // Spawn Actors

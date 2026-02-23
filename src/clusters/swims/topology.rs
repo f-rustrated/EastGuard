@@ -33,12 +33,7 @@ struct TokenRing {
 }
 
 impl TokenRing {
-    fn add_pnode(
-        &mut self,
-        pnode_id: NodeId,
-        metadata: PhysicalNodeMetadata,
-        vnode_cnt: u64,
-    ) {
+    fn add_pnode(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata, vnode_cnt: u64) {
         if self.pnodes.contains_key(&pnode_id) {
             return;
         }
@@ -51,11 +46,7 @@ impl TokenRing {
         self.pnodes.insert(pnode_id, metadata);
     }
 
-    fn remove_pnode(
-        &mut self,
-        pnode_id: &NodeId,
-        vnode_cnt: u64,
-    ) -> Option<PhysicalNodeMetadata> {
+    fn remove_pnode(&mut self, pnode_id: &NodeId, vnode_cnt: u64) -> Option<PhysicalNodeMetadata> {
         let metadata = self.pnodes.remove(pnode_id)?;
         for replica_index in 0..vnode_cnt {
             self.vnodes
@@ -102,10 +93,7 @@ pub struct TopologyConfig {
 }
 
 impl Topology {
-    pub fn new(
-        nodes: HashMap<NodeId, PhysicalNodeMetadata>,
-        config: TopologyConfig,
-    ) -> Self {
+    pub fn new(nodes: HashMap<NodeId, PhysicalNodeMetadata>, config: TopologyConfig) -> Self {
         let mut token_ring = TokenRing::default();
         for (pnode_id, metadata) in nodes {
             token_ring.add_pnode(pnode_id, metadata, config.vnodes_per_pnode);
@@ -161,7 +149,11 @@ fn generate_vnode_token(node_id: &NodeId, replica_index: u64) -> VirtualNodeToke
     }
 }
 
-fn generate_vnode(node_id: &NodeId, metadata: &PhysicalNodeMetadata, replica_index: u64) -> VirtualNode {
+fn generate_vnode(
+    node_id: &NodeId,
+    metadata: &PhysicalNodeMetadata,
+    replica_index: u64,
+) -> VirtualNode {
     VirtualNode {
         replica_index,
         pnode_id: node_id.clone(),

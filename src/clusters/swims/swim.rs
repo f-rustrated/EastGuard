@@ -1,8 +1,6 @@
-use crate::clusters::gossip_buffer::GossipBuffer;
-use crate::clusters::livenode_tracker::LiveNodeTracker;
-
+use super::*;
 use crate::clusters::ticker::TimerCommand;
-use crate::clusters::topology::Topology;
+
 use crate::clusters::types::timer::ProbeTimer;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
 use std::collections::HashMap;
@@ -53,7 +51,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 ///                                    paper, Dead is a terminal state and should NOT
 ///                                    be overridden by any incarnation number)
 /// ```
-pub struct SwimProtocol {
+pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
     pub(crate) local_addr: SocketAddr,
@@ -73,7 +71,7 @@ pub struct SwimProtocol {
     pub(crate) pending_timer_commands: Vec<TimerCommand>,
 }
 
-impl SwimProtocol {
+impl Swim {
     pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
         let mut swim = Self {
             node_id,
@@ -431,12 +429,12 @@ impl SwimProtocol {
 mod tests {
     use super::*;
     use crate::clusters::TickEvent;
-    use crate::clusters::ticker::SwimTicker;
-    use crate::clusters::topology::{Topology, TopologyConfig};
+    use crate::clusters::ticker::Ticker;
+
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
-    fn make_protocol(local_id: &str, local_port: u16) -> SwimProtocol {
+    fn make_protocol(local_id: &str, local_port: u16) -> Swim {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
             HashMap::new(),
@@ -444,7 +442,7 @@ mod tests {
                 vnodes_per_pnode: 256,
             },
         );
-        let mut p = SwimProtocol::new(NodeId::new(local_id), addr, topology);
+        let mut p = Swim::new(NodeId::new(local_id), addr, topology);
 
         p
     }
@@ -452,15 +450,15 @@ mod tests {
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
     /// what SwimActor does in production.
     struct TestHarness {
-        protocol: SwimProtocol,
-        ticker: SwimTicker,
+        protocol: Swim,
+        ticker: Ticker,
     }
 
     impl TestHarness {
         fn new(local_id: &str, local_port: u16) -> Self {
             Self {
                 protocol: make_protocol(local_id, local_port),
-                ticker: SwimTicker::default(),
+                ticker: Ticker::default(),
             }
         }
 
@@ -540,7 +538,7 @@ mod tests {
         }
     }
 
-    fn add_node(m: &mut SwimProtocol, id: &str, addr: SocketAddr, inc: u64) {
+    fn add_node(m: &mut Swim, id: &str, addr: SocketAddr, inc: u64) {
         m.step(addr, ping(1, id, inc, vec![]));
         let _ = m.take_outbound();
         let _ = m.take_timer_commands();
@@ -570,8 +568,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod ping {
-        use crate::clusters::swim_protocol::tests::{make_protocol, node, ping};
-        use crate::clusters::{NodeId, SwimNodeState, SwimPacket};
+
+        use crate::clusters::{
+            NodeId, SwimNodeState, SwimPacket,
+            swims::swim::tests::{make_protocol, node, ping},
+        };
         use std::net::SocketAddr;
 
         #[test]
@@ -688,9 +689,7 @@ mod tests {
 
     mod ack {
         use crate::clusters::SwimNodeState;
-        use crate::clusters::swim_protocol::tests::{
-            TestHarness, ack, add_node_harness, tick_until,
-        };
+        use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
         use crate::clusters::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
         };
@@ -839,7 +838,7 @@ mod tests {
     }
 
     mod step_pingreq {
-        use crate::clusters::swim_protocol::tests::{make_protocol, node, pingreq};
+        use crate::clusters::swims::swim::tests::{make_protocol, node, pingreq};
         use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
@@ -898,7 +897,7 @@ mod tests {
     }
 
     mod step_self_refutation {
-        use crate::clusters::swim_protocol::tests::{make_protocol, node, ping};
+        use crate::clusters::swims::swim::tests::{make_protocol, node, ping};
         use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 

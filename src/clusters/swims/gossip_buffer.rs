@@ -1,4 +1,4 @@
-use super::SwimNode;
+use crate::clusters::SwimNode;
 
 // UDP does not handle splitting large messages up.
 // Preventing IP fragmentation is therefore necessary unless we have dedicated frangmentation handling logics.

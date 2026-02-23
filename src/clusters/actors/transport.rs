@@ -5,13 +5,13 @@ use super::*;
 use std::sync::Arc;
 use tokio::{net::UdpSocket, sync::mpsc};
 
-pub struct TransportLayer {
+pub struct SwimTransportActor {
     socket: Arc<UdpSocket>,
     to_actor: mpsc::Sender<ActorEvent>,
     from_actor: mpsc::Receiver<OutboundPacket>,
 }
 
-impl TransportLayer {
+impl SwimTransportActor {
     pub async fn new(
         bind_addr: SocketAddr,
         to_actor: mpsc::Sender<ActorEvent>,
