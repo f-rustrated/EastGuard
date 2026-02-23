@@ -1,5 +1,5 @@
 use crate::clusters::tickers::ticker::INDIRECT_ACK_TIMEOUT_TICKS;
-use crate::clusters::{NodeId, TickEvent, tickers::ticker::DIRECT_ACK_TIMEOUT_TICKS};
+use crate::clusters::{NodeId, TimeoutEvent, tickers::ticker::DIRECT_ACK_TIMEOUT_TICKS};
 
 #[derive(Debug)]
 pub(crate) struct ProbeTimer {
@@ -23,13 +23,13 @@ impl ProbeTimer {
             ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
         }
     }
-    pub(crate) fn to_timeout_event(self, seq: u32) -> TickEvent {
+    pub(crate) fn to_timeout_event(self, seq: u32) -> TimeoutEvent {
         match self.phase {
-            ProbePhase::Direct => TickEvent::DirectProbeTimedOut {
+            ProbePhase::Direct => TimeoutEvent::DirectProbeTimedOut {
                 seq: seq,
                 target_node_id: self.target_node_id,
             },
-            ProbePhase::Indirect => TickEvent::IndirectProbeTimedOut {
+            ProbePhase::Indirect => TimeoutEvent::IndirectProbeTimedOut {
                 seq: seq,
                 target_node_id: self.target_node_id,
             },

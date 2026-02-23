@@ -33,18 +33,18 @@ pub enum SwimPacket {
 pub enum SwimCommand {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
-
-    Tick(TickEvent),
+    // From Ticker
+    Timeout(TimeoutEvent),
 }
 
-impl From<TickEvent> for SwimCommand {
-    fn from(value: TickEvent) -> Self {
-        SwimCommand::Tick(value)
+impl From<TimeoutEvent> for SwimCommand {
+    fn from(value: TimeoutEvent) -> Self {
+        SwimCommand::Timeout(value)
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum TickEvent {
+pub(crate) enum TimeoutEvent {
     ProtocolPeriodElapsed,
     DirectProbeTimedOut { seq: u32, target_node_id: NodeId },
     IndirectProbeTimedOut { seq: u32, target_node_id: NodeId },

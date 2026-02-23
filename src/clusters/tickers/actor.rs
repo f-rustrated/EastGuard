@@ -53,7 +53,7 @@ impl TickerActor {
     }
 
     async fn run_tick(&mut self) {
-        for event in self.ticker.tick() {
+        for event in self.ticker.advance_clock() {
             let _ = self.swim_sender.send(event.into()).await;
         }
     }

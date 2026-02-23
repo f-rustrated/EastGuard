@@ -429,7 +429,7 @@ impl Swim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::TickEvent;
+    use crate::clusters::TimeoutEvent;
     use crate::clusters::tickers::ticker::Ticker;
 
     use std::collections::HashMap;
@@ -462,19 +462,19 @@ mod tests {
         }
 
         fn tick(&mut self) {
-            let events = self.ticker.tick();
+            let events = self.ticker.advance_clock();
             for event in events {
                 match event {
-                    TickEvent::ProtocolPeriodElapsed => self.protocol.start_probe(),
-                    TickEvent::DirectProbeTimedOut {
+                    TimeoutEvent::ProtocolPeriodElapsed => self.protocol.start_probe(),
+                    TimeoutEvent::DirectProbeTimedOut {
                         seq,
                         target_node_id,
                     } => self.protocol.start_indirect_probe(target_node_id, seq),
 
-                    TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+                    TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
                         self.protocol.try_mark_suspect(target_node_id)
                     }
-                    TickEvent::SuspectTimedOut { node_id } => {
+                    TimeoutEvent::SuspectTimedOut { node_id } => {
                         self.protocol.try_mark_dead(node_id);
                     }
                 }

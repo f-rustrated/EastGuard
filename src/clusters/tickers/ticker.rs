@@ -3,7 +3,7 @@ use crate::clusters::tickers::timer::ProbePhase;
 use crate::clusters::tickers::timer::ProbeTimer;
 
 use crate::clusters::types::ticker_message::TimerCommand;
-use crate::clusters::{NodeId, TickEvent};
+use crate::clusters::{NodeId, TimeoutEvent};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
@@ -33,7 +33,7 @@ impl Ticker {
         }
     }
 
-    pub fn tick(&mut self) -> Vec<TickEvent> {
+    pub fn advance_clock(&mut self) -> Vec<TimeoutEvent> {
         let mut events = Vec::new();
 
         // 1. Age every in-flight probe
@@ -62,14 +62,14 @@ impl Ticker {
 
         for node_id in expired {
             self.suspect_timers.remove(&node_id);
-            events.push(TickEvent::SuspectTimedOut { node_id });
+            events.push(TimeoutEvent::SuspectTimedOut { node_id });
         }
 
         // 3. Advance the protocol clock
         self.protocol_elapsed += 1;
         if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
             self.protocol_elapsed = 0;
-            events.push(TickEvent::ProtocolPeriodElapsed);
+            events.push(TimeoutEvent::ProtocolPeriodElapsed);
         }
 
         events
@@ -107,11 +107,11 @@ mod tests {
     fn no_protocol_period_before_interval_elapses() {
         let mut ticker = Ticker::default();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-            let events = ticker.tick();
+            let events = ticker.advance_clock();
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TickEvent::ProtocolPeriodElapsed)),
+                    .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed)),
             );
         }
     }
@@ -120,13 +120,13 @@ mod tests {
     fn protocol_period_fires_at_interval() {
         let mut ticker = Ticker::default();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-            ticker.tick();
+            ticker.advance_clock();
         }
-        let events = ticker.tick();
+        let events = ticker.advance_clock();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TickEvent::ProtocolPeriodElapsed))
+                .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed))
         );
     }
 
@@ -139,19 +139,19 @@ mod tests {
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
-            let events = ticker.tick();
+            let events = ticker.advance_clock();
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { .. }))
+                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
             );
         }
 
-        let events = ticker.tick();
+        let events = ticker.advance_clock();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { seq: 1, .. }))
+                .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { seq: 1, .. }))
         );
         assert!(!ticker.has_probe(1));
     }
@@ -165,14 +165,14 @@ mod tests {
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
-            ticker.tick();
+            ticker.advance_clock();
         }
 
-        let events = ticker.tick();
+        let events = ticker.advance_clock();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TickEvent::IndirectProbeTimedOut { seq: 2, .. }))
+                .any(|e| matches!(e, TimeoutEvent::IndirectProbeTimedOut { seq: 2, .. }))
         );
     }
 
@@ -186,11 +186,11 @@ mod tests {
         ticker.apply(TimerCommand::CancelProbe { seq: 1 });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
-            let events = ticker.tick();
+            let events = ticker.advance_clock();
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TickEvent::DirectProbeTimedOut { .. }))
+                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
             );
         }
     }
@@ -203,19 +203,19 @@ mod tests {
         });
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
-            let events = ticker.tick();
+            let events = ticker.advance_clock();
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TickEvent::SuspectTimedOut { .. }))
+                    .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
             );
         }
 
-        let events = ticker.tick();
+        let events = ticker.advance_clock();
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TickEvent::SuspectTimedOut { .. }))
+                .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
         );
         assert!(!ticker.has_suspect_timer("node-b"));
     }

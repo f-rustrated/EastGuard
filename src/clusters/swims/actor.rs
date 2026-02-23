@@ -2,7 +2,7 @@ use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
 use crate::clusters::types::ticker_message::TickerCommand;
-use crate::clusters::{NodeId, OutboundPacket, SwimCommand, TickEvent};
+use crate::clusters::{NodeId, OutboundPacket, SwimCommand, TimeoutEvent};
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -51,17 +51,17 @@ impl SwimActor {
         }
     }
 
-    async fn handle_tick_event(&mut self, event: TickEvent) {
+    async fn handle_tick_event(&mut self, event: TimeoutEvent) {
         match event {
-            TickEvent::ProtocolPeriodElapsed => self.state.start_probe(),
-            TickEvent::DirectProbeTimedOut {
+            TimeoutEvent::ProtocolPeriodElapsed => self.state.start_probe(),
+            TimeoutEvent::DirectProbeTimedOut {
                 seq,
                 target_node_id,
             } => self.state.start_indirect_probe(target_node_id, seq),
-            TickEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+            TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
                 self.state.try_mark_suspect(target_node_id);
             }
-            TickEvent::SuspectTimedOut { node_id } => {
+            TimeoutEvent::SuspectTimedOut { node_id } => {
                 self.state.try_mark_dead(node_id);
             }
         }
@@ -73,7 +73,7 @@ impl SwimActor {
                 self.state.step(src, packet);
             }
 
-            SwimCommand::Tick(tick_event) => {
+            SwimCommand::Timeout(tick_event) => {
                 self.handle_tick_event(tick_event).await;
             }
         }
@@ -107,7 +107,7 @@ impl SwimActor {
                 self.state.take_timer_commands();
                 self.flush_outbound().await;
             }
-            SwimCommand::Tick(tick_event) => {}
+            SwimCommand::Timeout(tick_event) => {}
         }
     }
 }
