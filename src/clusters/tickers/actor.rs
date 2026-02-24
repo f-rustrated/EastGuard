@@ -11,13 +11,13 @@ use crate::clusters::types::ticker_message::TickerCommand;
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-pub(crate) struct TickerActor {
+pub(crate) struct SwimSchedullingActor {
     ticker: Ticker,
     mailbox: mpsc::Receiver<TickerCommand>,
     swim_sender: mpsc::Sender<SwimCommand>,
 }
 
-impl TickerActor {
+impl SwimSchedullingActor {
     pub fn new(
         mailbox: mpsc::Receiver<TickerCommand>,
         swim_sender: mpsc::Sender<SwimCommand>,
