@@ -1,4 +1,4 @@
-use crate::clusters::{NodeId, tickers::timer::ProbeTimer};
+use crate::clusters::tickers::timer::ProbeTimer;
 
 #[derive(Debug)]
 pub(crate) enum TickerCommand {

@@ -17,7 +17,7 @@ pub struct SwimNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub enum SwimNodeState {
     Alive,
-    Suspect,
+    Suspect(u32), // local view on when it was suspected
     Dead,
 }
 

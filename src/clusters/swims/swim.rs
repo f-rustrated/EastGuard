@@ -190,13 +190,14 @@ impl Swim {
 
             let (addr, incarnation) = (member.addr, member.incarnation);
             tracing::info!("Node {} is SUSPECT(Inc: {})", target_node_id, incarnation);
+            let seq = self.next_seq();
+
             self.update_member(
                 target_node_id.clone(),
                 addr,
-                SwimNodeState::Suspect,
+                SwimNodeState::Suspect(seq),
                 incarnation,
             );
-            let seq = self.next_seq();
             self.pending_timer_commands
                 .push(TimerCommand::SetSuspectTimer {
                     timer: ProbeTimer::suspect_timer(target_node_id),
@@ -207,7 +208,7 @@ impl Swim {
 
     pub(crate) fn try_mark_dead(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
-            if member.state != SwimNodeState::Suspect {
+            if !matches!(member.state, SwimNodeState::Suspect(_)) {
                 return;
             }
 
@@ -327,6 +328,10 @@ impl Swim {
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
+                if let SwimNodeState::Suspect(suspect_seq) = member.state {
+                    self.pending_timer_commands
+                        .push(TimerCommand::CancelProbe { seq: suspect_seq });
+                }
                 self.update_member(
                     source_node_id.clone(),
                     addr,
@@ -381,13 +386,11 @@ impl Swim {
                 // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
                 else if incarnation == entry.incarnation {
                     match (&entry.state, &state) {
-                        (SwimNodeState::Alive, SwimNodeState::Suspect) => {
-                            entry.state = SwimNodeState::Suspect
-                        }
+                        (SwimNodeState::Alive, SwimNodeState::Suspect(_)) => entry.state = state,
                         (SwimNodeState::Alive, SwimNodeState::Dead) => {
                             entry.state = SwimNodeState::Dead
                         }
-                        (SwimNodeState::Suspect, SwimNodeState::Dead) => {
+                        (SwimNodeState::Suspect(_), SwimNodeState::Dead) => {
                             entry.state = SwimNodeState::Dead
                         }
                         _ => {}
@@ -777,17 +780,19 @@ mod tests {
                 h.tick()
             } // node-b is now suspect
 
-            assert_eq!(
+            assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect
-            );
+                SwimNodeState::Suspect(_)
+            ));
 
             // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
 
-            assert_eq!(
-                h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect,
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect(_)
+                ),
                 "same incarnation Ack should not refute suspicion"
             );
         }
@@ -817,10 +822,10 @@ mod tests {
                 h.tick()
             } // node-b is now suspect
 
-            assert_eq!(
+            assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect
-            );
+                SwimNodeState::Suspect(_)
+            ));
 
             // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
             h.step(b_addr, ack(seq, node_b, 2, vec![]));
@@ -831,12 +836,12 @@ mod tests {
                 "higher incarnation Ack should refute suspicion"
             );
 
-            // Probe timer cancelled by CancelProbe, but suspect timer lives on
-            // with its own seq — try_mark_dead guard will see Alive and nso-op
-            assert!(!h.ticker.has_timer(seq), "probe timer should be cancelled");
+            // Probe timer already consumed by timeouts; suspect timer cancelled
+            // by handle_incarnation_check on refutation
+            assert!(!h.ticker.has_timer(seq), "probe timer should be gone");
             assert!(
-                h.ticker.probe_seq_for(node_b).is_some(),
-                "suspect timer should still be running (separate seq)"
+                h.ticker.probe_seq_for(node_b).is_none(),
+                "suspect timer should be cancelled after refutation"
             );
         }
     }
@@ -917,7 +922,7 @@ mod tests {
                     1,
                     "node-b",
                     0,
-                    vec![node("node-local", 8080, SwimNodeState::Suspect, 5)],
+                    vec![node("node-local", 8080, SwimNodeState::Suspect(0), 5)],
                 ),
             );
 
@@ -953,7 +958,7 @@ mod tests {
                     1,
                     "node-b",
                     0,
-                    vec![node("node-local", 8000, SwimNodeState::Suspect, 2)],
+                    vec![node("node-local", 8000, SwimNodeState::Suspect(0), 2)],
                 ),
             );
 

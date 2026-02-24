@@ -82,7 +82,7 @@ async fn test_refutation_mechanism() {
     let lie = SwimNode {
         node_id: "node-local".into(),
         addr: local_addr,
-        state: SwimNodeState::Suspect,
+        state: SwimNodeState::Suspect(0),
         incarnation: 0,
     };
 

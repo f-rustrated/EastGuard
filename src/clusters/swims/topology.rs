@@ -113,7 +113,7 @@ impl Topology {
             SwimNodeState::Dead => {
                 self.remove_node(&node_id);
             }
-            SwimNodeState::Suspect => {}
+            SwimNodeState::Suspect(_) => {}
         }
     }
 
