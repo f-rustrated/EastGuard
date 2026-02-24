@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::clusters::swims::topology::Topology;
+
 use crate::clusters::tickers::timer::ProbeTimer;
 use crate::clusters::types::ticker_message::TimerCommand;
 use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
@@ -114,7 +115,7 @@ impl Swim {
                 None => return,
             };
 
-            let seq: u32 = self.next_seq();
+            let seq = self.next_seq();
             let packet = SwimPacket::Ping {
                 seq,
                 source_node_id: self.node_id.clone(),
@@ -197,7 +198,7 @@ impl Swim {
             );
             self.pending_timer_commands
                 .push(TimerCommand::SetSuspectTimer {
-                    node_id: target_node_id,
+                    timer: ProbeTimer::suspect_timer(target_node_id),
                 });
         }
     }

@@ -1,4 +1,4 @@
-use crate::clusters::tickers::ticker::INDIRECT_ACK_TIMEOUT_TICKS;
+use crate::clusters::tickers::ticker::{INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS};
 use crate::clusters::{NodeId, TimeoutEvent, tickers::ticker::DIRECT_ACK_TIMEOUT_TICKS};
 
 #[derive(Debug)]
@@ -23,6 +23,15 @@ impl ProbeTimer {
             ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
         }
     }
+
+    pub(crate) fn suspect_timer(target: NodeId) -> Self {
+        Self {
+            target_node_id: target,
+            phase: ProbePhase::Suspect,
+            ticks_remaining: SUSPECT_TIMEOUT_TICKS,
+        }
+    }
+
     pub(crate) fn to_timeout_event(self, seq: u32) -> TimeoutEvent {
         match self.phase {
             ProbePhase::Direct => TimeoutEvent::DirectProbeTimedOut {
@@ -33,6 +42,9 @@ impl ProbeTimer {
                 seq: seq,
                 target_node_id: self.target_node_id,
             },
+            ProbePhase::Suspect => TimeoutEvent::SuspectTimedOut {
+                node_id: self.target_node_id,
+            },
         }
     }
 }
@@ -41,4 +53,5 @@ impl ProbeTimer {
 pub(crate) enum ProbePhase {
     Direct,
     Indirect,
+    Suspect,
 }

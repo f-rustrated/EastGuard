@@ -24,8 +24,9 @@ impl Ticker {
             TimerCommand::SetProbe { seq, timer } => {
                 self.probe_timers.insert(seq, timer);
             }
-            TimerCommand::SetSuspectTimer { node_id } => {
-                self.suspect_timers.insert(node_id, SUSPECT_TIMEOUT_TICKS);
+            TimerCommand::SetSuspectTimer { timer } => {
+                self.suspect_timers
+                    .insert(timer.target_node_id, timer.ticks_remaining);
             }
             TimerCommand::CancelProbe { seq } => {
                 self.probe_timers.remove(&seq);
@@ -199,7 +200,7 @@ mod tests {
     fn suspect_timer_fires_after_timeout() {
         let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetSuspectTimer {
-            node_id: "node-b".into(),
+            timer: ProbeTimer::suspect_timer("node-b".into()),
         });
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
