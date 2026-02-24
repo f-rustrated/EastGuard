@@ -11,11 +11,10 @@ pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct Ticker {
     protocol_elapsed: u32,
     probe_timers: HashMap<u32, ProbeTimer>,
-    suspect_timers: HashMap<NodeId, u32>,
 }
 
 impl Ticker {
@@ -24,9 +23,8 @@ impl Ticker {
             TimerCommand::SetProbe { seq, timer } => {
                 self.probe_timers.insert(seq, timer);
             }
-            TimerCommand::SetSuspectTimer { timer } => {
-                self.suspect_timers
-                    .insert(timer.target_node_id, timer.ticks_remaining);
+            TimerCommand::SetSuspectTimer { timer, seq } => {
+                self.probe_timers.insert(seq, timer);
             }
             TimerCommand::CancelProbe { seq } => {
                 self.probe_timers.remove(&seq);
@@ -51,22 +49,7 @@ impl Ticker {
             events.push(probe.to_timeout_event(seq));
         }
 
-        // 2. Age suspect timers, collect the ones that expired
-        let expired: Vec<NodeId> = self
-            .suspect_timers
-            .iter_mut()
-            .filter_map(|(id, ticks)| {
-                *ticks -= 1;
-                (*ticks == 0).then(|| id.clone())
-            })
-            .collect();
-
-        for node_id in expired {
-            self.suspect_timers.remove(&node_id);
-            events.push(TimeoutEvent::SuspectTimedOut { node_id });
-        }
-
-        // 3. Advance the protocol clock
+        // 2. Advance the protocol clock
         self.protocol_elapsed += 1;
         if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
             self.protocol_elapsed = 0;
@@ -85,13 +68,8 @@ impl Ticker {
     }
 
     #[cfg(test)]
-    pub fn has_probe(&self, seq: u32) -> bool {
+    pub fn has_timer(&self, seq: u32) -> bool {
         self.probe_timers.contains_key(&seq)
-    }
-
-    #[cfg(test)]
-    pub fn has_suspect_timer(&self, node_id: &str) -> bool {
-        self.suspect_timers.contains_key(node_id)
     }
 
     #[cfg(test)]
@@ -154,7 +132,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { seq: 1, .. }))
         );
-        assert!(!ticker.has_probe(1));
+        assert!(!ticker.has_timer(1));
     }
 
     #[test]
@@ -199,8 +177,11 @@ mod tests {
     #[test]
     fn suspect_timer_fires_after_timeout() {
         let mut ticker = Ticker::default();
+        let node_id = "node-b";
+        let seq = 1;
         ticker.apply(TimerCommand::SetSuspectTimer {
-            timer: ProbeTimer::suspect_timer("node-b".into()),
+            timer: ProbeTimer::suspect_timer(node_id.into()),
+            seq,
         });
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
@@ -213,11 +194,15 @@ mod tests {
         }
 
         let events = ticker.advance_clock();
+
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
         );
-        assert!(!ticker.has_suspect_timer("node-b"));
+        assert!(
+            !ticker.has_timer(seq),
+            "There shouldn't be any existing suspect"
+        );
     }
 }

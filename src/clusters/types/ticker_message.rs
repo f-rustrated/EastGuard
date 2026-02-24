@@ -11,7 +11,7 @@ pub(crate) enum TickerCommand {
 pub(crate) enum TimerCommand {
     SetProbe { seq: u32, timer: ProbeTimer },
     CancelProbe { seq: u32 },
-    SetSuspectTimer { timer: ProbeTimer },
+    SetSuspectTimer { seq: u32, timer: ProbeTimer },
 }
 impl From<TimerCommand> for TickerCommand {
     fn from(value: TimerCommand) -> Self {

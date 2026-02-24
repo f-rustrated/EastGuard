@@ -160,7 +160,7 @@ impl Swim {
         }
 
         if peer_addrs.is_empty() {
-            self.try_mark_suspect(target_node_id);
+            self.try_mark_suspect(target_node_id, seq);
             return;
         }
 
@@ -182,7 +182,7 @@ impl Swim {
         });
     }
 
-    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId) {
+    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId, seq: u32) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Alive {
                 return;
@@ -199,6 +199,7 @@ impl Swim {
             self.pending_timer_commands
                 .push(TimerCommand::SetSuspectTimer {
                     timer: ProbeTimer::suspect_timer(target_node_id),
+                    seq,
                 });
         }
     }
@@ -472,9 +473,10 @@ mod tests {
                         target_node_id,
                     } => self.protocol.start_indirect_probe(target_node_id, seq),
 
-                    TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                        self.protocol.try_mark_suspect(target_node_id)
-                    }
+                    TimeoutEvent::IndirectProbeTimedOut {
+                        target_node_id,
+                        seq,
+                    } => self.protocol.try_mark_suspect(target_node_id, seq),
                     TimeoutEvent::SuspectTimedOut { node_id } => {
                         self.protocol.try_mark_dead(node_id);
                     }
@@ -713,7 +715,7 @@ mod tests {
             h.step(sender, ack(seq, node_b_id, 1, vec![]));
             let _ = h.protocol.take_outbound();
 
-            assert!(!h.ticker.has_probe(seq));
+            assert!(!h.ticker.has_timer(seq));
         }
 
         #[test]
@@ -750,7 +752,7 @@ mod tests {
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
 
             assert!(
-                !h.ticker.has_probe(seq),
+                !h.ticker.has_timer(seq),
                 "indirect probe should be removed after matching Ack"
             );
         }
@@ -833,8 +835,10 @@ mod tests {
                 SwimNodeState::Alive,
                 "higher incarnation Ack should refute suspicion"
             );
+
             // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-            assert!(h.ticker.has_suspect_timer(node_b));
+            dbg!("{}", &h.ticker);
+            assert!(h.ticker.has_timer(seq));
         }
     }
 
