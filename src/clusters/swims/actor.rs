@@ -58,11 +58,8 @@ impl SwimActor {
                 seq,
                 target_node_id,
             } => self.state.start_indirect_probe(target_node_id, seq),
-            TimeoutEvent::IndirectProbeTimedOut {
-                target_node_id,
-                seq,
-            } => {
-                self.state.try_mark_suspect(target_node_id, seq);
+            TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+                self.state.try_mark_suspect(target_node_id);
             }
             TimeoutEvent::SuspectTimedOut { node_id } => {
                 self.state.try_mark_dead(node_id);

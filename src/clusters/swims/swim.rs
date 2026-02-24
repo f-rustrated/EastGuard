@@ -160,7 +160,7 @@ impl Swim {
         }
 
         if peer_addrs.is_empty() {
-            self.try_mark_suspect(target_node_id, seq);
+            self.try_mark_suspect(target_node_id);
             return;
         }
 
@@ -182,7 +182,7 @@ impl Swim {
         });
     }
 
-    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId, seq: u32) {
+    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Alive {
                 return;
@@ -196,6 +196,7 @@ impl Swim {
                 SwimNodeState::Suspect,
                 incarnation,
             );
+            let seq = self.next_seq();
             self.pending_timer_commands
                 .push(TimerCommand::SetSuspectTimer {
                     timer: ProbeTimer::suspect_timer(target_node_id),
@@ -260,11 +261,6 @@ impl Swim {
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
                     .push(TimerCommand::CancelProbe { seq });
-
-                // Do NOT cancel the suspect timer here. A same-or-lower incarnation Ack
-                // could be a delayed packet from before the node knew it was suspected.
-                // Only `handle_incarnation_check` above can clear suspicion, and only
-                // when the sender proves awareness by sending a strictly higher incarnation.
             }
 
             SwimPacket::PingReq {
@@ -473,10 +469,9 @@ mod tests {
                         target_node_id,
                     } => self.protocol.start_indirect_probe(target_node_id, seq),
 
-                    TimeoutEvent::IndirectProbeTimedOut {
-                        target_node_id,
-                        seq,
-                    } => self.protocol.try_mark_suspect(target_node_id, seq),
+                    TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
+                        self.protocol.try_mark_suspect(target_node_id)
+                    }
                     TimeoutEvent::SuspectTimedOut { node_id } => {
                         self.protocol.try_mark_dead(node_id);
                     }
@@ -836,9 +831,13 @@ mod tests {
                 "higher incarnation Ack should refute suspicion"
             );
 
-            // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-            dbg!("{}", &h.ticker);
-            assert!(h.ticker.has_timer(seq));
+            // Probe timer cancelled by CancelProbe, but suspect timer lives on
+            // with its own seq — try_mark_dead guard will see Alive and nso-op
+            assert!(!h.ticker.has_timer(seq), "probe timer should be cancelled");
+            assert!(
+                h.ticker.probe_seq_for(node_b).is_some(),
+                "suspect timer should still be running (separate seq)"
+            );
         }
     }
 
