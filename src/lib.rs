@@ -5,10 +5,8 @@ mod clusters;
 
 use crate::{
     clusters::{
-        NodeId,
-        swim::SwimActor,
-        topology::{Topology, TopologyConfig},
-        transport::TransportLayer,
+        NodeId, swims::actor::SwimActor, tickers::actor::SwimSchedullingActor,
+        transport::SwimTransportActor,
     },
     config::ENV,
     connections::{
@@ -17,7 +15,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::HashMap;
+
 use tokio::{net::TcpListener, sync::mpsc};
 
 #[derive(Debug)]
@@ -32,27 +30,20 @@ impl StartUp {
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            TransportLayer::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
 
-        let topology = Topology::new(
-            HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: ENV.vnodes_per_node,
-            },
-        );
-
-        // 3. Create Actor
-        let node_id = NodeId::new(ENV.resolve_node_id());
+        let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(
             local_peer_addr,
-            node_id,
+            NodeId::new(ENV.resolve_node_id()),
             swim_mailbox,
-            swim_sender,
             tx_outbound,
-            topology,
+            ticker_cmd_tx.clone(),
+            ENV.vnodes_per_node,
         );
 
         // Spawn Actors
+        tokio::spawn(SwimSchedullingActor::new(ticker_cmd_rx, swim_sender).run());
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 
@@ -69,7 +60,7 @@ impl StartUp {
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
             if let Err(err) = self.handle_client_stream(stream).await {
-                eprintln!("{}", err.to_string());
+                eprintln!("{}", err);
                 continue;
             }
         }

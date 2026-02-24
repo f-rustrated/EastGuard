@@ -30,20 +30,40 @@ pub enum SwimPacket {
 
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
-pub enum ActorEvent {
+pub enum SwimCommand {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
+    // From Ticker
+    Timeout(TimeoutEvent),
+}
 
-    // Internal Timers
-    ProtocolTick,
-    DirectProbeTimeout { target_node_id: NodeId, seq: u32 },
-    IndirectProbeTimeout { target_node_id: NodeId },
-    SuspectTimeout { target_node_id: NodeId },
+impl From<TimeoutEvent> for SwimCommand {
+    fn from(value: TimeoutEvent) -> Self {
+        SwimCommand::Timeout(value)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TimeoutEvent {
+    ProtocolPeriodElapsed,
+    DirectProbeTimedOut { seq: u32, target_node_id: NodeId },
+    IndirectProbeTimedOut { seq: u32, target_node_id: NodeId },
+    SuspectTimedOut { node_id: NodeId },
 }
 
 /// Outbound Commands (Logic -> Transport)
 #[derive(Debug)]
 pub struct OutboundPacket {
     pub target: SocketAddr,
-    pub packet: SwimPacket,
+    packet: SwimPacket,
+}
+
+impl OutboundPacket {
+    pub(crate) fn new(target: SocketAddr, packet: SwimPacket) -> Self {
+        OutboundPacket { target, packet }
+    }
+
+    pub fn packet(&self) -> &SwimPacket {
+        &self.packet
+    }
 }
