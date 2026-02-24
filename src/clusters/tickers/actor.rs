@@ -36,6 +36,8 @@ impl SwimSchedullingActor {
                 _ = interval.tick() => {
                     self.run_tick().await;
                 }
+
+                // What if schedulling actor consistantly gets mailbox and ticker never gets picked in select?
                 Some(cmd) = self.mailbox.recv() => {
                     match cmd {
                         #[cfg(test)]

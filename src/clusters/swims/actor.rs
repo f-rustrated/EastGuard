@@ -78,19 +78,24 @@ impl SwimActor {
             }
         }
 
-        self.flush_ticker_commands().await;
-        self.flush_outbound().await;
+        self.flush_outbound_commands().await;
     }
 
-    async fn flush_ticker_commands(&mut self) {
-        for cmd in self.state.take_timer_commands() {
-            let _ = self.ticker_tx.send(cmd.into()).await;
-        }
-    }
-    async fn flush_outbound(&mut self) {
-        for pkt in self.state.take_outbound() {
-            let _ = self.transport_tx.send(pkt).await;
-        }
+    async fn flush_outbound_commands(&mut self) {
+        let timer_commands = self.state.take_timer_commands();
+        let outbound_packets = self.state.take_outbound();
+        tokio::join!(
+            async {
+                for cmd in timer_commands {
+                    let _ = self.ticker_tx.send(cmd.into()).await;
+                }
+            },
+            async {
+                for pkt in outbound_packets {
+                    let _ = self.transport_tx.send(pkt).await;
+                }
+            }
+        );
     }
 
     #[cfg(test)]
@@ -104,8 +109,7 @@ impl SwimActor {
             SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
                 // Discard timer commands — topology tests don't need timing.
-                self.state.take_timer_commands();
-                self.flush_outbound().await;
+                self.flush_outbound_commands().await;
             }
             SwimCommand::Timeout(tick_event) => {}
         }
