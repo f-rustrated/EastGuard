@@ -3,7 +3,8 @@ use super::*;
 use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{
-    NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutSchedule,
+    NodeId, OutboundPacket, ProbePhase, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutCallback,
+    SwimTimeOutSchedule,
 };
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::HashMap;
@@ -102,8 +103,22 @@ impl Swim {
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
+    pub(crate) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
+        match event {
+            SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
+            SwimTimeOutCallback::TimedOut {
+                seq,
+                target_node_id,
+                phase,
+            } => match phase {
+                ProbePhase::Direct => self.start_indirect_probe(target_node_id, seq),
+                ProbePhase::Indirect => self.try_mark_suspect(target_node_id),
+                ProbePhase::Suspect => self.try_mark_dead(target_node_id),
+            },
+        }
+    }
 
-    pub(crate) fn start_probe(&mut self) {
+    fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
             return;
         }
@@ -139,7 +154,7 @@ impl Swim {
     // We preserve the previous direct probe's seq so that we can cancel
     // indirect probe timeout when we receive a long-running Ack message
     // from the previous direct probe
-    pub(crate) fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
+    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
         let target_addr = match self.members.get(&target_node_id).map(|m| m.addr) {
             Some(addr) => addr,
             None => return,
@@ -185,7 +200,7 @@ impl Swim {
         });
     }
 
-    pub(crate) fn try_mark_suspect(&mut self, target_node_id: NodeId) {
+    fn try_mark_suspect(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Alive {
                 return;
@@ -197,7 +212,7 @@ impl Swim {
         }
     }
 
-    pub(crate) fn try_mark_dead(&mut self, target_node_id: NodeId) {
+    fn try_mark_dead(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Suspect {
                 return;
@@ -418,12 +433,12 @@ impl Swim {
     }
 
     /// Drain all outbound packets buffered since the last call.
-    pub fn take_outbound(&mut self) -> Vec<OutboundPacket> {
+    pub(crate) fn take_outbound(&mut self) -> Vec<OutboundPacket> {
         std::mem::take(&mut self.pending_outbound)
     }
 
     /// Drain all timer commands buffered since the last call.
-    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimeOutSchedule>> {
+    pub(crate) fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimeOutSchedule>> {
         std::mem::take(&mut self.pending_timer_commands)
     }
 }
@@ -466,20 +481,7 @@ mod tests {
         fn tick(&mut self) {
             let events = self.ticker.advance_clock();
             for event in events {
-                match event {
-                    SwimTimeOutCallback::ProtocolPeriodElapsed => self.protocol.start_probe(),
-                    SwimTimeOutCallback::TimedOut {
-                        seq,
-                        target_node_id,
-                        phase,
-                    } => match phase {
-                        ProbePhase::Direct => {
-                            self.protocol.start_indirect_probe(target_node_id, seq)
-                        }
-                        ProbePhase::Indirect => self.protocol.try_mark_suspect(target_node_id),
-                        ProbePhase::Suspect => self.protocol.try_mark_dead(target_node_id),
-                    },
-                }
+                self.protocol.handle_timeout(event);
                 self.apply_timer_commands();
             }
         }

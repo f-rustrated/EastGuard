@@ -54,21 +54,6 @@ impl SwimActor {
         }
     }
 
-    async fn handle_tick_event(&mut self, event: SwimTimeOutCallback) {
-        match event {
-            SwimTimeOutCallback::ProtocolPeriodElapsed => self.state.start_probe(),
-            SwimTimeOutCallback::TimedOut {
-                seq,
-                target_node_id,
-                phase,
-            } => match phase {
-                ProbePhase::Direct => self.state.start_indirect_probe(target_node_id, seq),
-                ProbePhase::Indirect => self.state.try_mark_suspect(target_node_id),
-                ProbePhase::Suspect => self.state.try_mark_dead(target_node_id),
-            },
-        }
-    }
-
     async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
             SwimCommand::PacketReceived { src, packet } => {
@@ -76,7 +61,7 @@ impl SwimActor {
             }
 
             SwimCommand::Timeout(tick_event) => {
-                self.handle_tick_event(tick_event).await;
+                self.state.handle_timeout(tick_event);
             }
         }
 
