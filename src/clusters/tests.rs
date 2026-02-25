@@ -14,7 +14,7 @@ use super::*;
 async fn setup() -> (
     mpsc::Sender<SwimCommand>,      // To send "Fake Network" events
     mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
-    mpsc::Sender<TickerCommand>,    // To drive the ticker directly
+    mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>, // To drive the ticker directly
     SocketAddr,                     // The actor's local address
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);

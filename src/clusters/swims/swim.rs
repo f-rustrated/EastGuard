@@ -71,7 +71,7 @@ pub struct Swim {
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
-    pending_timer_commands: Vec<TimerCommand>,
+    pending_timer_commands: Vec<TimerCommand<SwimTimeOutSchedule>>,
 }
 
 impl Swim {
@@ -130,7 +130,7 @@ impl Swim {
 
             self.pending_timer_commands.push(TimerCommand::SetSchedule {
                 seq,
-                timer: Box::new(SwimTimeOutSchedule::direct_probe(target_node_id)),
+                timer: SwimTimeOutSchedule::direct_probe(target_node_id),
             });
         }
     }
@@ -180,7 +180,7 @@ impl Swim {
 
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq,
-            timer: Box::new(SwimTimeOutSchedule::indirect_probe(target_node_id)),
+            timer: SwimTimeOutSchedule::indirect_probe(target_node_id),
         });
     }
 
@@ -405,7 +405,7 @@ impl Swim {
                 self.last_suspected_seqs.insert(node_id.clone(), seq);
                 self.pending_timer_commands.push(TimerCommand::SetSchedule {
                     seq,
-                    timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id)),
+                    timer: SwimTimeOutSchedule::suspect_timer(node_id),
                 });
             }
         }
@@ -422,7 +422,7 @@ impl Swim {
     }
 
     /// Drain all timer commands buffered since the last call.
-    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand> {
+    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimeOutSchedule>> {
         std::mem::take(&mut self.pending_timer_commands)
     }
 }
@@ -449,16 +449,16 @@ mod tests {
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
     /// what SwimActor does in production.
-    struct TestHarness {
+    struct TestHarness<T> {
         protocol: Swim,
-        ticker: Ticker,
+        ticker: Ticker<T>,
     }
 
-    impl TestHarness {
+    impl TestHarness<SwimTimeOutSchedule> {
         fn new(local_id: &str, local_port: u16) -> Self {
             Self {
                 protocol: make_protocol(local_id, local_port),
-                ticker: Ticker::default(),
+                ticker: Ticker::new(),
             }
         }
 
@@ -544,15 +544,20 @@ mod tests {
         let _ = m.take_timer_commands();
     }
 
-    fn add_node_harness(h: &mut TestHarness, id: &str, addr: SocketAddr, inc: u64) {
+    fn add_node_harness(
+        h: &mut TestHarness<SwimTimeOutSchedule>,
+        id: &str,
+        addr: SocketAddr,
+        inc: u64,
+    ) {
         h.step(addr, ping(1, id, inc, vec![]));
         let _ = h.protocol.take_outbound();
     }
 
     fn tick_until<T>(
-        h: &mut TestHarness,
+        h: &mut TestHarness<SwimTimeOutSchedule>,
         max_ticks: u32,
-        mut f: impl FnMut(&TestHarness) -> Option<T>,
+        mut f: impl FnMut(&TestHarness<SwimTimeOutSchedule>) -> Option<T>,
     ) -> T {
         for _ in 0..max_ticks {
             h.tick();

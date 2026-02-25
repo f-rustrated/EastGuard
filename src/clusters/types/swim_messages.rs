@@ -87,7 +87,7 @@ impl TTimer for SwimTimeOutSchedule {
         self.ticks_remaining
     }
 
-    fn to_timeout_event(self: Box<Self>, seq: u32) -> TimeoutEvent {
+    fn to_timeout_event(self, seq: u32) -> TimeoutEvent {
         match self.phase {
             ProbePhase::Direct => TimeoutEvent::DirectProbeTimedOut {
                 seq: seq,

@@ -1,19 +1,19 @@
 use crate::clusters::tickers::timer::TTimer;
 
 #[derive(Debug)]
-pub(crate) enum TickerCommand {
-    Schedule(TimerCommand),
+pub(crate) enum TickerCommand<T> {
+    Schedule(TimerCommand<T>),
     #[cfg(test)]
     ForceTick,
 }
 
 #[derive(Debug)]
-pub(crate) enum TimerCommand {
-    SetSchedule { seq: u32, timer: Box<dyn TTimer> },
+pub(crate) enum TimerCommand<T> {
+    SetSchedule { seq: u32, timer: T },
     CancelSchedule { seq: u32 },
 }
-impl From<TimerCommand> for TickerCommand {
-    fn from(value: TimerCommand) -> Self {
+impl<T> From<TimerCommand<T>> for TickerCommand<T> {
+    fn from(value: TimerCommand<T>) -> Self {
         TickerCommand::Schedule(value)
     }
 }

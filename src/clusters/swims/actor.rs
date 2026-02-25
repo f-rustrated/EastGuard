@@ -1,3 +1,4 @@
+use crate::clusters::SwimTimeOutSchedule;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 pub struct SwimActor {
     mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
-    ticker_tx: mpsc::Sender<TickerCommand>,
+    ticker_tx: mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>,
     state: Swim,
 }
 
@@ -24,7 +25,7 @@ impl SwimActor {
         node_id: NodeId,
         mailbox: mpsc::Receiver<SwimCommand>,
         transport_tx: mpsc::Sender<OutboundPacket>,
-        ticker_tx: mpsc::Sender<TickerCommand>,
+        ticker_tx: mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>,
         vnodes_per_node: u64,
     ) -> Self {
         let topology = Topology::new(
