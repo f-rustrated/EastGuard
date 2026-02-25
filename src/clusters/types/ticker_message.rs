@@ -1,5 +1,3 @@
-use crate::clusters::tickers::timer::TTimer;
-
 #[derive(Debug)]
 pub(crate) enum TickerCommand<T> {
     Schedule(TimerCommand<T>),

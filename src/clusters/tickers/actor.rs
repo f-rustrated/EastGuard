@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -12,53 +13,37 @@ use crate::clusters::types::ticker_message::TickerCommand;
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-pub(crate) struct SchedulingActor<T, U> {
-    ticker: Ticker<U>,
-    mailbox: mpsc::Receiver<TickerCommand<U>>,
-    sender: mpsc::Sender<T>,
-}
+pub async fn run_scheduling_actor(
+    sender: mpsc::Sender<impl From<TimeoutEvent>>,
+    mut mailbox: mpsc::Receiver<TickerCommand<impl TTimer>>,
+) {
+    let mut interval = time::interval(TICK_PERIOD);
+    let mut ticker = Ticker::new();
 
-impl<T, U> SchedulingActor<T, U>
-where
-    T: From<TimeoutEvent>,
-    U: TTimer,
-{
-    pub fn new(mailbox: mpsc::Receiver<TickerCommand<U>>, swim_sender: mpsc::Sender<T>) -> Self {
-        Self {
-            ticker: Ticker::<U>::new(),
-            mailbox,
-            sender: swim_sender,
-        }
-    }
-
-    pub async fn run(mut self) {
-        let mut interval = time::interval(TICK_PERIOD);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    self.run_tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = interval.tick() => {
+                for event in ticker.advance_clock() {
+                    let _ = sender.send(event.into()).await;
                 }
+            }
 
-                // What if scheduling actor consistantly gets mailbox and ticker never gets picked in select?
-                Some(cmd) = self.mailbox.recv() => {
-                    match cmd {
-                        #[cfg(test)]
-                        TickerCommand::ForceTick => {
-                            self.run_tick().await;
-                        }
-                        TickerCommand::Schedule(probe_cmd)=>{
-                            self.ticker.apply(probe_cmd);
+            // What if scheduling actor consistantly gets mailbox and ticker never gets picked in select?
+            Some(cmd) = mailbox.recv() => {
+                match cmd {
+                    #[cfg(test)]
+                    TickerCommand::ForceTick => {
+                        for event in ticker.advance_clock() {
+                            let _ = sender.send(event.into()).await;
                         }
                     }
+                    TickerCommand::Schedule(probe_cmd)=>{
+                        ticker.apply(probe_cmd);
+                    }
                 }
-
             }
-        }
-    }
 
-    async fn run_tick(&mut self) {
-        for event in self.ticker.advance_clock() {
-            let _ = self.sender.send(event.into()).await;
         }
     }
 }

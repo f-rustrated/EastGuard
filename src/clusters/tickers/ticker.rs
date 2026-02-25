@@ -3,7 +3,6 @@ use crate::clusters::tickers::timer::TTimer;
 use crate::clusters::TimeoutEvent;
 use crate::clusters::types::ticker_message::TimerCommand;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
 pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
