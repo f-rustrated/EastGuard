@@ -1,9 +1,11 @@
+use crate::clusters::ProbePhase;
 use crate::clusters::SwimTimeOutSchedule;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
-use crate::clusters::types::ticker_message::TickerCommand;
-use crate::clusters::{NodeId, OutboundPacket, SwimCommand, TimeoutEvent};
+
+use crate::clusters::{NodeId, OutboundPacket, SwimCommand, SwimTimeOutCallback};
+use crate::schedulers::ticker_message::TickerCommand;
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -52,19 +54,18 @@ impl SwimActor {
         }
     }
 
-    async fn handle_tick_event(&mut self, event: TimeoutEvent) {
+    async fn handle_tick_event(&mut self, event: SwimTimeOutCallback) {
         match event {
-            TimeoutEvent::ProtocolPeriodElapsed => self.state.start_probe(),
-            TimeoutEvent::DirectProbeTimedOut {
+            SwimTimeOutCallback::ProtocolPeriodElapsed => self.state.start_probe(),
+            SwimTimeOutCallback::TimedOut {
                 seq,
                 target_node_id,
-            } => self.state.start_indirect_probe(target_node_id, seq),
-            TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                self.state.try_mark_suspect(target_node_id);
-            }
-            TimeoutEvent::SuspectTimedOut { node_id } => {
-                self.state.try_mark_dead(node_id);
-            }
+                phase,
+            } => match phase {
+                ProbePhase::Direct => self.state.start_indirect_probe(target_node_id, seq),
+                ProbePhase::Indirect => self.state.try_mark_suspect(target_node_id),
+                ProbePhase::Suspect => self.state.try_mark_dead(target_node_id),
+            },
         }
     }
 

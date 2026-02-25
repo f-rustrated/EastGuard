@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
 
-use crate::clusters::tickers::actor::run_scheduling_actor;
-use crate::clusters::tickers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
-use crate::clusters::types::ticker_message::TickerCommand;
+use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::{sync::mpsc, time};
 

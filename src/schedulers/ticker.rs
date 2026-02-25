@@ -1,7 +1,4 @@
-use crate::clusters::tickers::timer::TTimer;
-
-use crate::clusters::TimeoutEvent;
-use crate::clusters::types::ticker_message::TimerCommand;
+use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
@@ -37,7 +34,7 @@ where
         }
     }
 
-    pub fn advance_clock(&mut self) -> Vec<TimeoutEvent> {
+    pub fn advance_clock(&mut self) -> Vec<T::Callback> {
         let mut events = Vec::new();
 
         // 1. Age every in-flight probe
@@ -50,14 +47,14 @@ where
 
         for seq in timeout_seqs {
             let probe = self.timers.remove(&seq).unwrap();
-            events.push(probe.to_timeout_event(seq));
+            events.push(probe.to_timeout_callback(seq));
         }
 
         // 2. Advance the protocol clock
         self.protocol_elapsed += 1;
         if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
             self.protocol_elapsed = 0;
-            events.push(TimeoutEvent::ProtocolPeriodElapsed);
+            events.push(Default::default());
         }
 
         events
@@ -80,7 +77,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::SwimTimeOutSchedule;
+    use crate::clusters::{ProbePhase, SwimTimeOutCallback, SwimTimeOutSchedule};
 
     use super::*;
 
@@ -92,7 +89,7 @@ mod tests {
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed)),
+                    .any(|e| matches!(e, SwimTimeOutCallback::ProtocolPeriodElapsed)),
             );
         }
     }
@@ -107,7 +104,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed))
+                .any(|e| matches!(e, SwimTimeOutCallback::ProtocolPeriodElapsed))
         );
     }
 
@@ -121,19 +118,24 @@ mod tests {
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Direct,
+                    ..
+                }
+            )));
         }
 
         let events = ticker.advance_clock();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { seq: 1, .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Direct,
+                seq: 1,
+                ..
+            }
+        )));
         assert!(!ticker.has_timer(1));
     }
 
@@ -150,11 +152,14 @@ mod tests {
         }
 
         let events = ticker.advance_clock();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::IndirectProbeTimedOut { seq: 2, .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Indirect,
+                seq: 2,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -168,11 +173,13 @@ mod tests {
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Direct,
+                    ..
+                }
+            )));
         }
     }
 
@@ -188,20 +195,24 @@ mod tests {
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Suspect,
+                    ..
+                }
+            )));
         }
 
         let events = ticker.advance_clock();
 
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Suspect,
+                ..
+            }
+        )));
         assert!(
             !ticker.has_timer(seq),
             "There shouldn't be any existing suspect"

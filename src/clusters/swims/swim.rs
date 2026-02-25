@@ -1,10 +1,11 @@
 use super::*;
 
 use crate::clusters::swims::topology::Topology;
-use crate::clusters::types::ticker_message::TimerCommand;
+
 use crate::clusters::{
     NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutSchedule,
 };
+use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
@@ -430,8 +431,8 @@ impl Swim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::TimeoutEvent;
-    use crate::clusters::tickers::ticker::Ticker;
+    use crate::clusters::{ProbePhase, SwimTimeOutCallback};
+    use crate::schedulers::ticker::Ticker;
 
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -466,18 +467,18 @@ mod tests {
             let events = self.ticker.advance_clock();
             for event in events {
                 match event {
-                    TimeoutEvent::ProtocolPeriodElapsed => self.protocol.start_probe(),
-                    TimeoutEvent::DirectProbeTimedOut {
+                    SwimTimeOutCallback::ProtocolPeriodElapsed => self.protocol.start_probe(),
+                    SwimTimeOutCallback::TimedOut {
                         seq,
                         target_node_id,
-                    } => self.protocol.start_indirect_probe(target_node_id, seq),
-
-                    TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                        self.protocol.try_mark_suspect(target_node_id)
-                    }
-                    TimeoutEvent::SuspectTimedOut { node_id } => {
-                        self.protocol.try_mark_dead(node_id);
-                    }
+                        phase,
+                    } => match phase {
+                        ProbePhase::Direct => {
+                            self.protocol.start_indirect_probe(target_node_id, seq)
+                        }
+                        ProbePhase::Indirect => self.protocol.try_mark_suspect(target_node_id),
+                        ProbePhase::Suspect => self.protocol.try_mark_dead(target_node_id),
+                    },
                 }
                 self.apply_timer_commands();
             }
@@ -695,7 +696,7 @@ mod tests {
     mod ack {
         use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
-        use crate::clusters::tickers::ticker::{
+        use crate::schedulers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
             SUSPECT_TIMEOUT_TICKS,
         };

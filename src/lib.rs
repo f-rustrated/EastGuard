@@ -2,12 +2,11 @@ mod config;
 mod connections;
 
 mod clusters;
+pub(crate) mod schedulers;
 
+use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
-    clusters::{
-        NodeId, swims::actor::SwimActor, tickers::actor::run_scheduling_actor,
-        transport::SwimTransportActor,
-    },
+    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},

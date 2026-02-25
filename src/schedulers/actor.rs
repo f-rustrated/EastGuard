@@ -1,24 +1,22 @@
-use std::marker::PhantomData;
+use crate::schedulers::ticker::Ticker;
+use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::timer::TTimer;
 use std::time::Duration;
-
 use tokio::sync::mpsc;
 use tokio::time;
-
-use crate::clusters::TimeoutEvent;
-use crate::clusters::tickers::ticker::Ticker;
-use crate::clusters::tickers::timer::TTimer;
-use crate::clusters::types::ticker_message::TickerCommand;
 
 /// One real-time tick drives one logical tick in SwimTicker.
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-pub async fn run_scheduling_actor(
-    sender: mpsc::Sender<impl From<TimeoutEvent>>,
-    mut mailbox: mpsc::Receiver<TickerCommand<impl TTimer>>,
-) {
+pub async fn run_scheduling_actor<T>(
+    sender: mpsc::Sender<impl From<T::Callback>>,
+    mut mailbox: mpsc::Receiver<TickerCommand<T>>,
+) where
+    T: TTimer,
+{
     let mut interval = time::interval(TICK_PERIOD);
-    let mut ticker = Ticker::new();
+    let mut ticker = Ticker::<T>::new();
 
     loop {
         tokio::select! {

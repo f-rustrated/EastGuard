@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 pub(crate) mod swims;
-pub(crate) mod tickers;
 pub(crate) mod transport;
 mod types;
 
