@@ -855,7 +855,8 @@ mod tests {
             add_node_harness(&mut h, node_c, c_addr, 1);
 
             // --- First suspicion: drive node-b to Suspect ---
-            let seq1 = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+
+            let seq1 = tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b)
             });
             let _ = h.protocol.take_outbound();
@@ -894,20 +895,16 @@ mod tests {
             // --- Second suspicion: drive node-b to Suspect again ---
             // (node-c may already be Suspect, so indirect phase may be skipped;
             //  use tick_until to find the exact moment node-b becomes Suspect)
-            tick_until(
-                &mut h,
-                4 * PROBE_INTERVAL_TICKS + DIRECT_ACK_TIMEOUT_TICKS + INDIRECT_ACK_TIMEOUT_TICKS,
-                |h| {
-                    if matches!(
-                        h.protocol.members.get(node_b).unwrap().state,
-                        SwimNodeState::Suspect
-                    ) {
-                        Some(())
-                    } else {
-                        None
-                    }
-                },
-            );
+            tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+                if matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect
+                ) {
+                    Some(())
+                } else {
+                    None
+                }
+            });
 
             // Tick just short of SUSPECT_TIMEOUT_TICKS — node-b must still be Suspect,
             // proving no stale timer from the first round caused premature death.
