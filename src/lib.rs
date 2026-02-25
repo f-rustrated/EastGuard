@@ -5,7 +5,7 @@ mod clusters;
 
 use crate::{
     clusters::{
-        NodeId, swims::actor::SwimActor, tickers::actor::SwimSchedullingActor,
+        NodeId, swims::actor::SwimActor, tickers::actor::SchedullingActor,
         transport::SwimTransportActor,
     },
     config::ENV,
@@ -43,7 +43,7 @@ impl StartUp {
         );
 
         // Spawn Actors
-        tokio::spawn(SwimSchedullingActor::new(ticker_cmd_rx, swim_sender).run());
+        tokio::spawn(SchedullingActor::new(ticker_cmd_rx, swim_sender).run());
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 
