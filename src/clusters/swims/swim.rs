@@ -692,6 +692,7 @@ mod tests {
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
         use crate::clusters::tickers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
+            SUSPECT_TIMEOUT_TICKS,
         };
         use crate::clusters::tickers::timer::ProbePhase;
 
@@ -842,6 +843,99 @@ mod tests {
             assert!(
                 h.ticker.probe_seq_for(node_b).is_none(),
                 "suspect timer should be cancelled after refutation"
+            );
+        }
+
+        /// ABA scenario: Suspect → refuted to Alive → Suspect again.
+        /// A stale suspect timer from the first suspicion period must NOT
+        /// prematurely mark the node Dead during the second suspicion period.
+        #[test]
+        fn aba_stale_suspect_timer_does_not_cause_premature_death() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let node_b = "node-b";
+            let node_c = "node-c";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            add_node_harness(&mut h, node_b, b_addr, 1);
+            add_node_harness(&mut h, node_c, c_addr, 1);
+
+            // --- First suspicion: drive node-b to Suspect ---
+            let seq1 = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b)
+            });
+            let _ = h.protocol.take_outbound();
+
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                h.tick();
+            }
+            let _ = h.protocol.take_outbound();
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
+                h.tick();
+            }
+            let _ = h.protocol.take_outbound();
+
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect(_)
+                ),
+                "node-b should be Suspect after first probe failure"
+            );
+
+            // --- Refutation: node-b sends Ack with higher incarnation ---
+            h.step(b_addr, ack(seq1, node_b, 2, vec![]));
+            let _ = h.protocol.take_outbound();
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Alive,
+                "node-b should be Alive after refutation"
+            );
+            assert!(
+                h.ticker.probe_seq_for(node_b).is_none(),
+                "first suspect timer should be cancelled after refutation"
+            );
+
+            // --- Second suspicion: drive node-b to Suspect again ---
+            // (node-c may already be Suspect, so indirect phase may be skipped;
+            //  use tick_until to find the exact moment node-b becomes Suspect)
+            tick_until(
+                &mut h,
+                4 * PROBE_INTERVAL_TICKS + DIRECT_ACK_TIMEOUT_TICKS + INDIRECT_ACK_TIMEOUT_TICKS,
+                |h| {
+                    if matches!(
+                        h.protocol.members.get(node_b).unwrap().state,
+                        SwimNodeState::Suspect(_)
+                    ) {
+                        Some(())
+                    } else {
+                        None
+                    }
+                },
+            );
+
+            // Tick just short of SUSPECT_TIMEOUT_TICKS — node-b must still be Suspect,
+            // proving no stale timer from the first round caused premature death.
+            for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
+                h.tick();
+            }
+
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect(_)
+                ),
+                "node-b must remain Suspect — stale timer must not cause premature death"
+            );
+
+            // One more tick: the second suspect timer fires, NOW it's Dead
+            h.tick();
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Dead,
+                "node-b should be Dead only after the second suspect timer expires"
             );
         }
     }

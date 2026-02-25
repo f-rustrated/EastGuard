@@ -2,8 +2,8 @@
 use crate::clusters::tickers::timer::ProbePhase;
 use crate::clusters::tickers::timer::ProbeTimer;
 
+use crate::clusters::TimeoutEvent;
 use crate::clusters::types::ticker_message::TimerCommand;
-use crate::clusters::{NodeId, TimeoutEvent};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
@@ -14,20 +14,20 @@ pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 #[derive(Default, Debug)]
 pub(crate) struct Ticker {
     protocol_elapsed: u32,
-    probe_timers: HashMap<u32, ProbeTimer>,
+    timers: HashMap<u32, ProbeTimer>,
 }
 
 impl Ticker {
     pub(crate) fn apply(&mut self, cmd: TimerCommand) {
         match cmd {
             TimerCommand::SetProbe { seq, timer } => {
-                self.probe_timers.insert(seq, timer);
+                self.timers.insert(seq, timer);
             }
             TimerCommand::SetSuspectTimer { timer, seq } => {
-                self.probe_timers.insert(seq, timer);
+                self.timers.insert(seq, timer);
             }
             TimerCommand::CancelProbe { seq } => {
-                self.probe_timers.remove(&seq);
+                self.timers.remove(&seq);
             }
         }
     }
@@ -37,7 +37,7 @@ impl Ticker {
 
         // 1. Age every in-flight probe
         let mut timeout_seqs: Vec<u32> = vec![];
-        for (seq, probe) in self.probe_timers.iter_mut() {
+        for (seq, probe) in self.timers.iter_mut() {
             probe.ticks_remaining -= 1;
             if probe.ticks_remaining == 0 {
                 timeout_seqs.push(*seq);
@@ -45,7 +45,7 @@ impl Ticker {
         }
 
         for seq in timeout_seqs {
-            let probe = self.probe_timers.remove(&seq).unwrap();
+            let probe = self.timers.remove(&seq).unwrap();
             events.push(probe.to_timeout_event(seq));
         }
 
@@ -61,7 +61,7 @@ impl Ticker {
 
     #[cfg(test)]
     pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
-        self.probe_timers
+        self.timers
             .iter()
             .find(|(_, probe)| &*probe.target_node_id == node_id)
             .map(|(&seq, _)| seq)
@@ -69,12 +69,12 @@ impl Ticker {
 
     #[cfg(test)]
     pub fn has_timer(&self, seq: u32) -> bool {
-        self.probe_timers.contains_key(&seq)
+        self.timers.contains_key(&seq)
     }
 
     #[cfg(test)]
     pub fn probe_phase(&self, seq: u32) -> Option<ProbePhase> {
-        self.probe_timers.get(&seq).map(|p| p.phase)
+        self.timers.get(&seq).map(|p| p.phase)
     }
 }
 
