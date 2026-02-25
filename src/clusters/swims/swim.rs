@@ -1,9 +1,10 @@
 use super::*;
 
 use crate::clusters::swims::topology::Topology;
-use crate::clusters::tickers::timer::ProbeTimer;
 use crate::clusters::types::ticker_message::TimerCommand;
-use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
+use crate::clusters::{
+    NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutSchedule,
+};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
@@ -66,6 +67,7 @@ pub struct Swim {
 
     // Sequence
     seq_counter: u32,
+    last_suspected_seqs: HashMap<NodeId, u32>,
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
@@ -83,6 +85,7 @@ impl Swim {
             live_node_tracker: LiveNodeTracker::default(),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
+            last_suspected_seqs: HashMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
         };
@@ -114,7 +117,7 @@ impl Swim {
                 None => return,
             };
 
-            let seq: u32 = self.next_seq();
+            let seq = self.next_seq();
             let packet = SwimPacket::Ping {
                 seq,
                 source_node_id: self.node_id.clone(),
@@ -125,9 +128,9 @@ impl Swim {
             self.pending_outbound
                 .push(OutboundPacket::new(target, packet));
 
-            self.pending_timer_commands.push(TimerCommand::SetProbe {
+            self.pending_timer_commands.push(TimerCommand::SetSchedule {
                 seq,
-                timer: ProbeTimer::direct_probe(target_node_id),
+                timer: Box::new(SwimTimeOutSchedule::direct_probe(target_node_id)),
             });
         }
     }
@@ -175,9 +178,9 @@ impl Swim {
                 .push(OutboundPacket::new(target, packet.clone()));
         }
 
-        self.pending_timer_commands.push(TimerCommand::SetProbe {
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq,
-            timer: ProbeTimer::indirect_probe(target_node_id),
+            timer: Box::new(SwimTimeOutSchedule::indirect_probe(target_node_id)),
         });
     }
 
@@ -189,16 +192,7 @@ impl Swim {
 
             let (addr, incarnation) = (member.addr, member.incarnation);
             tracing::info!("Node {} is SUSPECT(Inc: {})", target_node_id, incarnation);
-            self.update_member(
-                target_node_id.clone(),
-                addr,
-                SwimNodeState::Suspect,
-                incarnation,
-            );
-            self.pending_timer_commands
-                .push(TimerCommand::SetSuspectTimer {
-                    node_id: target_node_id,
-                });
+            self.update_member(target_node_id, addr, SwimNodeState::Suspect, incarnation);
         }
     }
 
@@ -208,13 +202,12 @@ impl Swim {
                 return;
             }
 
-            let (addr, incarnation) = (member.addr, member.incarnation);
-            println!("Node {} is DEAD(Inc: {})", target_node_id, incarnation);
+            self.last_suspected_seqs.remove(&target_node_id);
             self.update_member(
-                target_node_id.clone(),
-                addr,
+                target_node_id,
+                member.addr,
                 SwimNodeState::Dead,
-                incarnation,
+                member.incarnation,
             );
         }
     }
@@ -257,12 +250,7 @@ impl Swim {
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
-                    .push(TimerCommand::CancelProbe { seq });
-
-                // Do NOT cancel the suspect timer here. A same-or-lower incarnation Ack
-                // could be a delayed packet from before the node knew it was suspected.
-                // Only `handle_incarnation_check` above can clear suspicion, and only
-                // when the sender proves awareness by sending a strictly higher incarnation.
+                    .push(TimerCommand::CancelSchedule { seq });
             }
 
             SwimPacket::PingReq {
@@ -329,6 +317,10 @@ impl Swim {
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
+                if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
+                    self.pending_timer_commands
+                        .push(TimerCommand::CancelSchedule { seq: suspect_seq });
+                }
                 self.update_member(
                     source_node_id.clone(),
                     addr,
@@ -354,7 +346,7 @@ impl Swim {
         state: SwimNodeState,
         incarnation: u64,
     ) {
-        let (new_state, changed) = match (self.members).entry(node_id.clone()) {
+        let (new_state, changed) = match self.members.entry(node_id.clone()) {
             Entry::Vacant(e) => {
                 e.insert(SwimNode {
                     node_id: node_id.clone(),
@@ -407,6 +399,15 @@ impl Swim {
         if changed {
             let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
+
+            if new_state == SwimNodeState::Suspect {
+                let seq = self.next_seq();
+                self.last_suspected_seqs.insert(node_id.clone(), seq);
+                self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                    seq,
+                    timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id)),
+                });
+            }
         }
     }
 
@@ -691,8 +692,8 @@ mod tests {
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
         use crate::clusters::tickers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
+            SUSPECT_TIMEOUT_TICKS,
         };
-        use crate::clusters::tickers::timer::ProbePhase;
 
         use std::net::SocketAddr;
 
@@ -712,7 +713,7 @@ mod tests {
             h.step(sender, ack(seq, node_b_id, 1, vec![]));
             let _ = h.protocol.take_outbound();
 
-            assert!(!h.ticker.has_probe(seq));
+            assert!(!h.ticker.has_timer(seq));
         }
 
         #[test]
@@ -739,17 +740,11 @@ mod tests {
             }
             let _ = h.protocol.take_outbound(); // discard the PingReqs
 
-            assert_eq!(
-                h.ticker.probe_phase(seq),
-                Some(ProbePhase::Indirect),
-                "probe should be in Indirect phase after direct timeout"
-            );
-
             // Send Ack with the (reused) seq — clears the indirect probe
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
 
             assert!(
-                !h.ticker.has_probe(seq),
+                !h.ticker.has_timer(seq),
                 "indirect probe should be removed after matching Ack"
             );
         }
@@ -779,17 +774,19 @@ mod tests {
                 h.tick()
             } // node-b is now suspect
 
-            assert_eq!(
+            assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
                 SwimNodeState::Suspect
-            );
+            ));
 
             // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
 
-            assert_eq!(
-                h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect,
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect
+                ),
                 "same incarnation Ack should not refute suspicion"
             );
         }
@@ -819,10 +816,10 @@ mod tests {
                 h.tick()
             } // node-b is now suspect
 
-            assert_eq!(
+            assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
                 SwimNodeState::Suspect
-            );
+            ));
 
             // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
             h.step(b_addr, ack(seq, node_b, 2, vec![]));
@@ -832,8 +829,104 @@ mod tests {
                 SwimNodeState::Alive,
                 "higher incarnation Ack should refute suspicion"
             );
-            // Suspect timer still running — try_mark_dead guard will see Alive and no-op
-            assert!(h.ticker.has_suspect_timer(node_b));
+
+            // Probe timer already consumed by timeouts; suspect timer cancelled
+            // by handle_incarnation_check on refutation
+            assert!(!h.ticker.has_timer(seq), "probe timer should be gone");
+            assert!(
+                h.ticker.probe_seq_for(node_b).is_none(),
+                "suspect timer should be cancelled after refutation"
+            );
+        }
+
+        /// ABA scenario: Suspect → refuted to Alive → Suspect again.
+        /// A stale suspect timer from the first suspicion period must NOT
+        /// prematurely mark the node Dead during the second suspicion period.
+        #[test]
+        fn aba_stale_suspect_timer_does_not_cause_premature_death() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let node_b = "node-b";
+            let node_c = "node-c";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            add_node_harness(&mut h, node_b, b_addr, 1);
+            add_node_harness(&mut h, node_c, c_addr, 1);
+
+            // --- First suspicion: drive node-b to Suspect ---
+
+            let seq1 = tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+                h.ticker.probe_seq_for(node_b)
+            });
+            let _ = h.protocol.take_outbound();
+
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                h.tick();
+            }
+            let _ = h.protocol.take_outbound();
+            for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
+                h.tick();
+            }
+            let _ = h.protocol.take_outbound();
+
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect
+                ),
+                "node-b should be Suspect after first probe failure"
+            );
+
+            // --- Refutation: node-b sends Ack with higher incarnation ---
+            h.step(b_addr, ack(seq1, node_b, 2, vec![]));
+            let _ = h.protocol.take_outbound();
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Alive,
+                "node-b should be Alive after refutation"
+            );
+            assert!(
+                h.ticker.probe_seq_for(node_b).is_none(),
+                "first suspect timer should be cancelled after refutation"
+            );
+
+            // --- Second suspicion: drive node-b to Suspect again ---
+            // (node-c may already be Suspect, so indirect phase may be skipped;
+            //  use tick_until to find the exact moment node-b becomes Suspect)
+            tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+                if matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect
+                ) {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+
+            // Tick just short of SUSPECT_TIMEOUT_TICKS — node-b must still be Suspect,
+            // proving no stale timer from the first round caused premature death.
+            for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
+                h.tick();
+            }
+
+            assert!(
+                matches!(
+                    h.protocol.members.get(node_b).unwrap().state,
+                    SwimNodeState::Suspect
+                ),
+                "node-b must remain Suspect — stale timer must not cause premature death"
+            );
+
+            // One more tick: the second suspect timer fires, NOW it's Dead
+            h.tick();
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Dead,
+                "node-b should be Dead only after the second suspect timer expires"
+            );
         }
     }
 

@@ -1,20 +1,19 @@
-use crate::clusters::{NodeId, tickers::timer::ProbeTimer};
+use crate::clusters::tickers::timer::TTimer;
 
 #[derive(Debug)]
 pub(crate) enum TickerCommand {
-    Probe(TimerCommand),
+    Schedule(TimerCommand),
     #[cfg(test)]
     ForceTick,
 }
 
 #[derive(Debug)]
 pub(crate) enum TimerCommand {
-    SetProbe { seq: u32, timer: ProbeTimer },
-    CancelProbe { seq: u32 },
-    SetSuspectTimer { node_id: NodeId },
+    SetSchedule { seq: u32, timer: Box<dyn TTimer> },
+    CancelSchedule { seq: u32 },
 }
 impl From<TimerCommand> for TickerCommand {
     fn from(value: TimerCommand) -> Self {
-        TickerCommand::Probe(value)
+        TickerCommand::Schedule(value)
     }
 }

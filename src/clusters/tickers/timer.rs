@@ -1,44 +1,13 @@
-use crate::clusters::tickers::ticker::INDIRECT_ACK_TIMEOUT_TICKS;
-use crate::clusters::{NodeId, TimeoutEvent, tickers::ticker::DIRECT_ACK_TIMEOUT_TICKS};
+use crate::clusters::TimeoutEvent;
+use std::fmt::Debug;
 
-#[derive(Debug)]
-pub(crate) struct ProbeTimer {
-    pub(crate) target_node_id: NodeId,
-    pub(crate) phase: ProbePhase,
-    pub(crate) ticks_remaining: u32,
-}
-impl ProbeTimer {
-    pub(crate) fn direct_probe(target: NodeId) -> Self {
-        Self {
-            target_node_id: target,
-            phase: ProbePhase::Direct,
-            ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
-        }
-    }
+#[cfg(test)]
+use crate::clusters::NodeId;
 
-    pub(crate) fn indirect_probe(target: NodeId) -> Self {
-        Self {
-            target_node_id: target,
-            phase: ProbePhase::Indirect,
-            ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
-        }
-    }
-    pub(crate) fn to_timeout_event(self, seq: u32) -> TimeoutEvent {
-        match self.phase {
-            ProbePhase::Direct => TimeoutEvent::DirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-            ProbePhase::Indirect => TimeoutEvent::IndirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-        }
-    }
-}
+pub(crate) trait TTimer: Debug + Send + Sync + 'static {
+    fn tick(&mut self) -> u32;
+    fn to_timeout_event(self: Box<Self>, seq: u32) -> TimeoutEvent;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbePhase {
-    Direct,
-    Indirect,
+    #[cfg(test)]
+    fn target_node_id(&self) -> NodeId;
 }
