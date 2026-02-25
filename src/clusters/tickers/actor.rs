@@ -12,13 +12,13 @@ use crate::clusters::types::ticker_message::TickerCommand;
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-pub(crate) struct SchedullingActor<T, U> {
+pub(crate) struct SchedulingActor<T, U> {
     ticker: Ticker<U>,
     mailbox: mpsc::Receiver<TickerCommand<U>>,
     sender: mpsc::Sender<T>,
 }
 
-impl<T, U> SchedullingActor<T, U>
+impl<T, U> SchedulingActor<T, U>
 where
     T: From<TimeoutEvent>,
     U: TTimer,
@@ -39,7 +39,7 @@ where
                     self.run_tick().await;
                 }
 
-                // What if schedulling actor consistantly gets mailbox and ticker never gets picked in select?
+                // What if scheduling actor consistantly gets mailbox and ticker never gets picked in select?
                 Some(cmd) = self.mailbox.recv() => {
                     match cmd {
                         #[cfg(test)]

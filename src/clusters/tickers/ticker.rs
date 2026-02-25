@@ -14,7 +14,6 @@ pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
     timers: HashMap<u32, T>,
-    _t: PhantomData<T>,
 }
 
 impl<T> Ticker<T>
@@ -25,7 +24,6 @@ where
         Self {
             protocol_elapsed: 0,
             timers: Default::default(),
-            _t: PhantomData,
         }
     }
     pub(crate) fn apply(&mut self, cmd: TimerCommand<T>) {
