@@ -57,7 +57,7 @@ pub(crate) enum SwimTimeOutCallback {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ProbePhase {
     Direct,
     Indirect,
