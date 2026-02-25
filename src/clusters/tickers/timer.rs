@@ -1,5 +1,8 @@
-use crate::clusters::{NodeId, TimeoutEvent};
+use crate::clusters::TimeoutEvent;
 use std::fmt::Debug;
+
+#[cfg(test)]
+use crate::clusters::NodeId;
 
 pub(crate) trait TTimer: Debug + Send + Sync + 'static {
     fn tick(&mut self) -> u32;
