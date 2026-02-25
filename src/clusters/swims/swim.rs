@@ -67,6 +67,7 @@ pub struct Swim {
 
     // Sequence
     seq_counter: u32,
+    last_suspected_seqs: HashMap<NodeId, u32>,
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
@@ -84,6 +85,7 @@ impl Swim {
             live_node_tracker: LiveNodeTracker::default(),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
+            last_suspected_seqs: HashMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
         };
@@ -190,35 +192,22 @@ impl Swim {
 
             let (addr, incarnation) = (member.addr, member.incarnation);
             tracing::info!("Node {} is SUSPECT(Inc: {})", target_node_id, incarnation);
-            let seq = self.next_seq();
-
-            self.update_member(
-                target_node_id.clone(),
-                addr,
-                SwimNodeState::Suspect(seq),
-                incarnation,
-            );
-            self.pending_timer_commands
-                .push(TimerCommand::SetSuspectTimer {
-                    timer: ProbeTimer::suspect_timer(target_node_id),
-                    seq,
-                });
+            self.update_member(target_node_id, addr, SwimNodeState::Suspect, incarnation);
         }
     }
 
     pub(crate) fn try_mark_dead(&mut self, target_node_id: NodeId) {
         if let Some(member) = self.members.get(&target_node_id) {
-            if !matches!(member.state, SwimNodeState::Suspect(_)) {
+            if member.state != SwimNodeState::Suspect {
                 return;
             }
 
-            let (addr, incarnation) = (member.addr, member.incarnation);
-            println!("Node {} is DEAD(Inc: {})", target_node_id, incarnation);
+            self.last_suspected_seqs.remove(&target_node_id);
             self.update_member(
-                target_node_id.clone(),
-                addr,
+                target_node_id,
+                member.addr,
                 SwimNodeState::Dead,
-                incarnation,
+                member.incarnation,
             );
         }
     }
@@ -328,7 +317,7 @@ impl Swim {
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
-                if let SwimNodeState::Suspect(suspect_seq) = member.state {
+                if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
                     self.pending_timer_commands
                         .push(TimerCommand::CancelProbe { seq: suspect_seq });
                 }
@@ -357,7 +346,7 @@ impl Swim {
         state: SwimNodeState,
         incarnation: u64,
     ) {
-        let (new_state, changed) = match (self.members).entry(node_id.clone()) {
+        let (new_state, changed) = match self.members.entry(node_id.clone()) {
             Entry::Vacant(e) => {
                 e.insert(SwimNode {
                     node_id: node_id.clone(),
@@ -386,11 +375,13 @@ impl Swim {
                 // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
                 else if incarnation == entry.incarnation {
                     match (&entry.state, &state) {
-                        (SwimNodeState::Alive, SwimNodeState::Suspect(_)) => entry.state = state,
+                        (SwimNodeState::Alive, SwimNodeState::Suspect) => {
+                            entry.state = SwimNodeState::Suspect
+                        }
                         (SwimNodeState::Alive, SwimNodeState::Dead) => {
                             entry.state = SwimNodeState::Dead
                         }
-                        (SwimNodeState::Suspect(_), SwimNodeState::Dead) => {
+                        (SwimNodeState::Suspect, SwimNodeState::Dead) => {
                             entry.state = SwimNodeState::Dead
                         }
                         _ => {}
@@ -408,6 +399,16 @@ impl Swim {
         if changed {
             let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
+
+            if new_state == SwimNodeState::Suspect {
+                let seq = self.next_seq();
+                self.last_suspected_seqs.insert(node_id.clone(), seq);
+                self.pending_timer_commands
+                    .push(TimerCommand::SetSuspectTimer {
+                        seq,
+                        timer: ProbeTimer::suspect_timer(node_id),
+                    });
+            }
         }
     }
 
@@ -783,7 +784,7 @@ mod tests {
 
             assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect(_)
+                SwimNodeState::Suspect
             ));
 
             // Ack with same incarnation: remote_inc(1) > member.incarnation(1) → false → no-op
@@ -792,7 +793,7 @@ mod tests {
             assert!(
                 matches!(
                     h.protocol.members.get(node_b).unwrap().state,
-                    SwimNodeState::Suspect(_)
+                    SwimNodeState::Suspect
                 ),
                 "same incarnation Ack should not refute suspicion"
             );
@@ -825,7 +826,7 @@ mod tests {
 
             assert!(matches!(
                 h.protocol.members.get(node_b).unwrap().state,
-                SwimNodeState::Suspect(_)
+                SwimNodeState::Suspect
             ));
 
             // Ack with higher incarnation: remote_inc(2) > member.incarnation(1) → update to Alive
@@ -878,7 +879,7 @@ mod tests {
             assert!(
                 matches!(
                     h.protocol.members.get(node_b).unwrap().state,
-                    SwimNodeState::Suspect(_)
+                    SwimNodeState::Suspect
                 ),
                 "node-b should be Suspect after first probe failure"
             );
@@ -906,7 +907,7 @@ mod tests {
                 |h| {
                     if matches!(
                         h.protocol.members.get(node_b).unwrap().state,
-                        SwimNodeState::Suspect(_)
+                        SwimNodeState::Suspect
                     ) {
                         Some(())
                     } else {
@@ -924,7 +925,7 @@ mod tests {
             assert!(
                 matches!(
                     h.protocol.members.get(node_b).unwrap().state,
-                    SwimNodeState::Suspect(_)
+                    SwimNodeState::Suspect
                 ),
                 "node-b must remain Suspect — stale timer must not cause premature death"
             );
@@ -1016,7 +1017,7 @@ mod tests {
                     1,
                     "node-b",
                     0,
-                    vec![node("node-local", 8080, SwimNodeState::Suspect(0), 5)],
+                    vec![node("node-local", 8080, SwimNodeState::Suspect, 5)],
                 ),
             );
 
@@ -1052,7 +1053,7 @@ mod tests {
                     1,
                     "node-b",
                     0,
-                    vec![node("node-local", 8000, SwimNodeState::Suspect(0), 2)],
+                    vec![node("node-local", 8000, SwimNodeState::Suspect, 2)],
                 ),
             );
 

@@ -43,7 +43,7 @@ impl LiveNodeTracker {
             SwimNodeState::Alive => {
                 self.add(node_id);
             }
-            SwimNodeState::Suspect(_) => {
+            SwimNodeState::Suspect => {
                 self.remove(&node_id);
             }
             SwimNodeState::Dead => {
