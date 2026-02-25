@@ -77,13 +77,13 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::{ProbePhase, SwimTimeOutCallback, SwimTimeOutSchedule};
+    use crate::clusters::swims::{ProbePhase, SwimTimeOutCallback, SwimTimer};
 
     use super::*;
 
     #[test]
     fn no_protocol_period_before_interval_elapses() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             let events = ticker.advance_clock();
             assert!(
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn protocol_period_fires_at_interval() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             ticker.advance_clock();
         }
@@ -110,10 +110,10 @@ mod tests {
 
     #[test]
     fn direct_probe_timeout() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: SwimTimeOutSchedule::direct_probe("node-b".into()),
+            timer: SwimTimer::direct_probe("node-b".into()),
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -141,10 +141,10 @@ mod tests {
 
     #[test]
     fn indirect_probe_timeout() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 2,
-            timer: SwimTimeOutSchedule::indirect_probe("node-c".into()),
+            timer: SwimTimer::indirect_probe("node-c".into()),
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -164,10 +164,10 @@ mod tests {
 
     #[test]
     fn cancel_probe_prevents_timeout() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: SwimTimeOutSchedule::direct_probe("node-b".into()),
+            timer: SwimTimer::direct_probe("node-b".into()),
         });
         ticker.apply(TimerCommand::CancelSchedule { seq: 1 });
 
@@ -185,11 +185,11 @@ mod tests {
 
     #[test]
     fn suspect_timer_fires_after_timeout() {
-        let mut ticker = Ticker::<SwimTimeOutSchedule>::new();
+        let mut ticker = Ticker::<SwimTimer>::new();
         let node_id = "node-b";
         let seq = 1;
         ticker.apply(TimerCommand::SetSchedule {
-            timer: SwimTimeOutSchedule::suspect_timer(node_id.into()),
+            timer: SwimTimer::suspect_timer(node_id.into()),
             seq,
         });
 

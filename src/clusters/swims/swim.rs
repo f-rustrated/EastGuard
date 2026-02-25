@@ -2,10 +2,7 @@ use super::*;
 
 use crate::clusters::swims::topology::Topology;
 
-use crate::clusters::{
-    NodeId, OutboundPacket, ProbePhase, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutCallback,
-    SwimTimeOutSchedule,
-};
+use crate::clusters::{NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -73,7 +70,7 @@ pub struct Swim {
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
-    pending_timer_commands: Vec<TimerCommand<SwimTimeOutSchedule>>,
+    pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
 }
 
 impl Swim {
@@ -146,7 +143,7 @@ impl Swim {
 
             self.pending_timer_commands.push(TimerCommand::SetSchedule {
                 seq,
-                timer: SwimTimeOutSchedule::direct_probe(target_node_id),
+                timer: SwimTimer::direct_probe(target_node_id),
             });
         }
     }
@@ -196,7 +193,7 @@ impl Swim {
 
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq,
-            timer: SwimTimeOutSchedule::indirect_probe(target_node_id),
+            timer: SwimTimer::indirect_probe(target_node_id),
         });
     }
 
@@ -421,7 +418,7 @@ impl Swim {
                 self.last_suspected_seqs.insert(node_id.clone(), seq);
                 self.pending_timer_commands.push(TimerCommand::SetSchedule {
                     seq,
-                    timer: SwimTimeOutSchedule::suspect_timer(node_id),
+                    timer: SwimTimer::suspect_timer(node_id),
                 });
             }
         }
@@ -438,7 +435,7 @@ impl Swim {
     }
 
     /// Drain all timer commands buffered since the last call.
-    pub(crate) fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimeOutSchedule>> {
+    pub(crate) fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimer>> {
         std::mem::take(&mut self.pending_timer_commands)
     }
 }
@@ -446,7 +443,7 @@ impl Swim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::{ProbePhase, SwimTimeOutCallback};
+
     use crate::schedulers::ticker::Ticker;
 
     use std::collections::HashMap;
@@ -470,7 +467,7 @@ mod tests {
         ticker: Ticker<T>,
     }
 
-    impl TestHarness<SwimTimeOutSchedule> {
+    impl TestHarness<SwimTimer> {
         fn new(local_id: &str, local_port: u16) -> Self {
             Self {
                 protocol: make_protocol(local_id, local_port),
@@ -547,20 +544,15 @@ mod tests {
         let _ = m.take_timer_commands();
     }
 
-    fn add_node_harness(
-        h: &mut TestHarness<SwimTimeOutSchedule>,
-        id: &str,
-        addr: SocketAddr,
-        inc: u64,
-    ) {
+    fn add_node_harness(h: &mut TestHarness<SwimTimer>, id: &str, addr: SocketAddr, inc: u64) {
         h.step(addr, ping(1, id, inc, vec![]));
         let _ = h.protocol.take_outbound();
     }
 
     fn tick_until<T>(
-        h: &mut TestHarness<SwimTimeOutSchedule>,
+        h: &mut TestHarness<SwimTimer>,
         max_ticks: u32,
-        mut f: impl FnMut(&TestHarness<SwimTimeOutSchedule>) -> Option<T>,
+        mut f: impl FnMut(&TestHarness<SwimTimer>) -> Option<T>,
     ) -> T {
         for _ in 0..max_ticks {
             h.tick();
@@ -576,9 +568,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod ping {
-
+        use super::*;
         use crate::clusters::{
-            NodeId, SwimNodeState, SwimPacket,
+            NodeId, SwimNodeState,
             swims::swim::tests::{make_protocol, node, ping},
         };
         use std::net::SocketAddr;
@@ -939,8 +931,9 @@ mod tests {
     }
 
     mod step_pingreq {
+        use super::*;
+        use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{make_protocol, node, pingreq};
-        use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]
@@ -998,8 +991,9 @@ mod tests {
     }
 
     mod step_self_refutation {
+        use super::*;
+        use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{make_protocol, node, ping};
-        use crate::clusters::{SwimNodeState, SwimPacket};
         use std::net::SocketAddr;
 
         #[test]

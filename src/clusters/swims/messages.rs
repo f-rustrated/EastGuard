@@ -57,6 +57,13 @@ pub(crate) enum SwimTimeOutCallback {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbePhase {
+    Direct,
+    Indirect,
+    Suspect,
+}
+
 /// Outbound Commands (Logic -> Transport)
 #[derive(Debug)]
 pub struct OutboundPacket {
@@ -75,13 +82,13 @@ impl OutboundPacket {
 }
 
 #[derive(Debug)]
-pub(crate) struct SwimTimeOutSchedule {
+pub(crate) struct SwimTimer {
     target_node_id: NodeId,
     phase: ProbePhase,
     ticks_remaining: u32,
 }
 
-impl TTimer for SwimTimeOutSchedule {
+impl TTimer for SwimTimer {
     type Callback = SwimTimeOutCallback;
 
     fn tick(&mut self) -> u32 {
@@ -102,7 +109,7 @@ impl TTimer for SwimTimeOutSchedule {
         self.target_node_id.clone()
     }
 }
-impl SwimTimeOutSchedule {
+impl SwimTimer {
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {
             target_node_id: target,
@@ -126,11 +133,4 @@ impl SwimTimeOutSchedule {
             ticks_remaining: SUSPECT_TIMEOUT_TICKS,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbePhase {
-    Direct,
-    Indirect,
-    Suspect,
 }

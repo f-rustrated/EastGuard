@@ -5,7 +5,6 @@ pub(crate) mod transport;
 mod types;
 
 pub(crate) use types::node::*;
-pub(crate) use types::swim_messages::*;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 

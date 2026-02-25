@@ -1,10 +1,9 @@
-use crate::clusters::ProbePhase;
-use crate::clusters::SwimTimeOutSchedule;
+use super::*;
+
+use crate::clusters::NodeId;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
-
-use crate::clusters::{NodeId, OutboundPacket, SwimCommand, SwimTimeOutCallback};
 use crate::schedulers::ticker_message::TickerCommand;
 
 use std::net::SocketAddr;
@@ -17,7 +16,7 @@ use tokio::sync::mpsc;
 pub struct SwimActor {
     mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
-    ticker_tx: mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>,
+    scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
     state: Swim,
 }
 
@@ -27,7 +26,7 @@ impl SwimActor {
         node_id: NodeId,
         mailbox: mpsc::Receiver<SwimCommand>,
         transport_tx: mpsc::Sender<OutboundPacket>,
-        ticker_tx: mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>,
+        ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         vnodes_per_node: u64,
     ) -> Self {
         let topology = Topology::new(
@@ -42,7 +41,7 @@ impl SwimActor {
             mailbox,
             transport_tx,
             state,
-            ticker_tx,
+            scheduler_tx: ticker_tx,
         }
     }
 
@@ -74,7 +73,7 @@ impl SwimActor {
         tokio::join!(
             async {
                 for cmd in timer_commands {
-                    let _ = self.ticker_tx.send(cmd.into()).await;
+                    let _ = self.scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {

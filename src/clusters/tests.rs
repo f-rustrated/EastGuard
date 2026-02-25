@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
+use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTimer};
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
@@ -12,10 +13,10 @@ use super::*;
 
 // Helper to setup the test environment
 async fn setup() -> (
-    mpsc::Sender<SwimCommand>,      // To send "Fake Network" events
-    mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
-    mpsc::Sender<TickerCommand<SwimTimeOutSchedule>>, // To drive the ticker directly
-    SocketAddr,                     // The actor's local address
+    mpsc::Sender<SwimCommand>,              // To send "Fake Network" events
+    mpsc::Receiver<OutboundPacket>,         // To catch "Outbound" commands
+    mpsc::Sender<TickerCommand<SwimTimer>>, // To drive the ticker directly
+    SocketAddr,                             // The actor's local address
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
