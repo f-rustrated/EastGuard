@@ -1,6 +1,4 @@
-#[cfg(test)]
-use crate::clusters::tickers::timer::ProbePhase;
-use crate::clusters::tickers::timer::ProbeTimer;
+use crate::clusters::tickers::timer::TTimer;
 
 use crate::clusters::TimeoutEvent;
 use crate::clusters::types::ticker_message::TimerCommand;
@@ -14,7 +12,7 @@ pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 #[derive(Default, Debug)]
 pub(crate) struct Ticker {
     protocol_elapsed: u32,
-    timers: HashMap<u32, ProbeTimer>,
+    timers: HashMap<u32, Box<dyn TTimer>>,
 }
 
 impl Ticker {
@@ -38,8 +36,7 @@ impl Ticker {
         // 1. Age every in-flight probe
         let mut timeout_seqs: Vec<u32> = vec![];
         for (seq, probe) in self.timers.iter_mut() {
-            probe.ticks_remaining -= 1;
-            if probe.ticks_remaining == 0 {
+            if probe.tick() == 0 {
                 timeout_seqs.push(*seq);
             }
         }
@@ -63,7 +60,7 @@ impl Ticker {
     pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
         self.timers
             .iter()
-            .find(|(_, probe)| &*probe.target_node_id == node_id)
+            .find(|(_, probe)| &*probe.target_node_id() == node_id)
             .map(|(&seq, _)| seq)
     }
 
@@ -71,15 +68,13 @@ impl Ticker {
     pub fn has_timer(&self, seq: u32) -> bool {
         self.timers.contains_key(&seq)
     }
-
-    #[cfg(test)]
-    pub fn probe_phase(&self, seq: u32) -> Option<ProbePhase> {
-        self.timers.get(&seq).map(|p| p.phase)
-    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    use crate::clusters::SwimTimeOutSchedule;
+
     use super::*;
 
     #[test]
@@ -114,7 +109,7 @@ mod tests {
         let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 1,
-            timer: ProbeTimer::direct_probe("node-b".into()),
+            timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -140,7 +135,7 @@ mod tests {
         let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 2,
-            timer: ProbeTimer::indirect_probe("node-c".into()),
+            timer: Box::new(SwimTimeOutSchedule::indirect_probe("node-c".into())),
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -160,7 +155,7 @@ mod tests {
         let mut ticker = Ticker::default();
         ticker.apply(TimerCommand::SetProbe {
             seq: 1,
-            timer: ProbeTimer::direct_probe("node-b".into()),
+            timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
         });
         ticker.apply(TimerCommand::CancelProbe { seq: 1 });
 
@@ -180,7 +175,7 @@ mod tests {
         let node_id = "node-b";
         let seq = 1;
         ticker.apply(TimerCommand::SetSuspectTimer {
-            timer: ProbeTimer::suspect_timer(node_id.into()),
+            timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id.into())),
             seq,
         });
 

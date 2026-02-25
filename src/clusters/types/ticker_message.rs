@@ -1,4 +1,10 @@
-use crate::clusters::tickers::timer::ProbeTimer;
+use crate::clusters::{
+    NodeId, TimeoutEvent,
+    tickers::{
+        ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
+        timer::TTimer,
+    },
+};
 
 #[derive(Debug)]
 pub(crate) enum TickerCommand {
@@ -9,9 +15,9 @@ pub(crate) enum TickerCommand {
 
 #[derive(Debug)]
 pub(crate) enum TimerCommand {
-    SetProbe { seq: u32, timer: ProbeTimer },
+    SetProbe { seq: u32, timer: Box<dyn TTimer> },
     CancelProbe { seq: u32 },
-    SetSuspectTimer { seq: u32, timer: ProbeTimer },
+    SetSuspectTimer { seq: u32, timer: Box<dyn TTimer> },
 }
 impl From<TimerCommand> for TickerCommand {
     fn from(value: TimerCommand) -> Self {

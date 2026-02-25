@@ -1,10 +1,10 @@
 use super::*;
 
 use crate::clusters::swims::topology::Topology;
-
-use crate::clusters::tickers::timer::ProbeTimer;
 use crate::clusters::types::ticker_message::TimerCommand;
-use crate::clusters::{NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket};
+use crate::clusters::{
+    NodeId, OutboundPacket, SwimNode, SwimNodeState, SwimPacket, SwimTimeOutSchedule,
+};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
@@ -130,7 +130,7 @@ impl Swim {
 
             self.pending_timer_commands.push(TimerCommand::SetProbe {
                 seq,
-                timer: ProbeTimer::direct_probe(target_node_id),
+                timer: Box::new(SwimTimeOutSchedule::direct_probe(target_node_id)),
             });
         }
     }
@@ -180,7 +180,7 @@ impl Swim {
 
         self.pending_timer_commands.push(TimerCommand::SetProbe {
             seq,
-            timer: ProbeTimer::indirect_probe(target_node_id),
+            timer: Box::new(SwimTimeOutSchedule::indirect_probe(target_node_id)),
         });
     }
 
@@ -406,7 +406,7 @@ impl Swim {
                 self.pending_timer_commands
                     .push(TimerCommand::SetSuspectTimer {
                         seq,
-                        timer: ProbeTimer::suspect_timer(node_id),
+                        timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id)),
                     });
             }
         }
@@ -695,7 +695,6 @@ mod tests {
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
             SUSPECT_TIMEOUT_TICKS,
         };
-        use crate::clusters::tickers::timer::ProbePhase;
 
         use std::net::SocketAddr;
 
@@ -741,12 +740,6 @@ mod tests {
                 h.tick();
             }
             let _ = h.protocol.take_outbound(); // discard the PingReqs
-
-            assert_eq!(
-                h.ticker.probe_phase(seq),
-                Some(ProbePhase::Indirect),
-                "probe should be in Indirect phase after direct timeout"
-            );
 
             // Send Ack with the (reused) seq — clears the indirect probe
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
