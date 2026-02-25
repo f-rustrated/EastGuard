@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::clusters::SwimCommand;
+use crate::clusters::TimeoutEvent;
 use crate::clusters::tickers::ticker::Ticker;
 use crate::clusters::types::ticker_message::TickerCommand;
 
@@ -11,21 +11,21 @@ use crate::clusters::types::ticker_message::TickerCommand;
 /// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
 const TICK_PERIOD: Duration = Duration::from_millis(100);
 
-pub(crate) struct SwimSchedullingActor {
+pub(crate) struct SwimSchedullingActor<T> {
     ticker: Ticker,
     mailbox: mpsc::Receiver<TickerCommand>,
-    swim_sender: mpsc::Sender<SwimCommand>,
+    sender: mpsc::Sender<T>,
 }
 
-impl SwimSchedullingActor {
-    pub fn new(
-        mailbox: mpsc::Receiver<TickerCommand>,
-        swim_sender: mpsc::Sender<SwimCommand>,
-    ) -> Self {
+impl<T> SwimSchedullingActor<T>
+where
+    T: From<TimeoutEvent>,
+{
+    pub fn new(mailbox: mpsc::Receiver<TickerCommand>, swim_sender: mpsc::Sender<T>) -> Self {
         Self {
             ticker: Ticker::default(),
             mailbox,
-            swim_sender,
+            sender: swim_sender,
         }
     }
 
@@ -44,7 +44,7 @@ impl SwimSchedullingActor {
                         TickerCommand::ForceTick => {
                             self.run_tick().await;
                         }
-                        TickerCommand::Probe(probe_cmd)=>{
+                        TickerCommand::Schedule(probe_cmd)=>{
                             self.ticker.apply(probe_cmd);
                         }
                     }
@@ -56,7 +56,7 @@ impl SwimSchedullingActor {
 
     async fn run_tick(&mut self) {
         for event in self.ticker.advance_clock() {
-            let _ = self.swim_sender.send(event.into()).await;
+            let _ = self.sender.send(event.into()).await;
         }
     }
 }

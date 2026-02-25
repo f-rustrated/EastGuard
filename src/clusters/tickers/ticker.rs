@@ -18,13 +18,11 @@ pub(crate) struct Ticker {
 impl Ticker {
     pub(crate) fn apply(&mut self, cmd: TimerCommand) {
         match cmd {
-            TimerCommand::SetProbe { seq, timer } => {
+            TimerCommand::SetSchedule { seq, timer } => {
                 self.timers.insert(seq, timer);
             }
-            TimerCommand::SetSuspectTimer { timer, seq } => {
-                self.timers.insert(seq, timer);
-            }
-            TimerCommand::CancelProbe { seq } => {
+
+            TimerCommand::CancelSchedule { seq } => {
                 self.timers.remove(&seq);
             }
         }
@@ -107,7 +105,7 @@ mod tests {
     #[test]
     fn direct_probe_timeout() {
         let mut ticker = Ticker::default();
-        ticker.apply(TimerCommand::SetProbe {
+        ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
             timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
         });
@@ -133,7 +131,7 @@ mod tests {
     #[test]
     fn indirect_probe_timeout() {
         let mut ticker = Ticker::default();
-        ticker.apply(TimerCommand::SetProbe {
+        ticker.apply(TimerCommand::SetSchedule {
             seq: 2,
             timer: Box::new(SwimTimeOutSchedule::indirect_probe("node-c".into())),
         });
@@ -153,11 +151,11 @@ mod tests {
     #[test]
     fn cancel_probe_prevents_timeout() {
         let mut ticker = Ticker::default();
-        ticker.apply(TimerCommand::SetProbe {
+        ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
             timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
         });
-        ticker.apply(TimerCommand::CancelProbe { seq: 1 });
+        ticker.apply(TimerCommand::CancelSchedule { seq: 1 });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
             let events = ticker.advance_clock();
@@ -174,7 +172,7 @@ mod tests {
         let mut ticker = Ticker::default();
         let node_id = "node-b";
         let seq = 1;
-        ticker.apply(TimerCommand::SetSuspectTimer {
+        ticker.apply(TimerCommand::SetSchedule {
             timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id.into())),
             seq,
         });

@@ -128,7 +128,7 @@ impl Swim {
             self.pending_outbound
                 .push(OutboundPacket::new(target, packet));
 
-            self.pending_timer_commands.push(TimerCommand::SetProbe {
+            self.pending_timer_commands.push(TimerCommand::SetSchedule {
                 seq,
                 timer: Box::new(SwimTimeOutSchedule::direct_probe(target_node_id)),
             });
@@ -178,7 +178,7 @@ impl Swim {
                 .push(OutboundPacket::new(target, packet.clone()));
         }
 
-        self.pending_timer_commands.push(TimerCommand::SetProbe {
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq,
             timer: Box::new(SwimTimeOutSchedule::indirect_probe(target_node_id)),
         });
@@ -250,7 +250,7 @@ impl Swim {
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
-                    .push(TimerCommand::CancelProbe { seq });
+                    .push(TimerCommand::CancelSchedule { seq });
             }
 
             SwimPacket::PingReq {
@@ -319,7 +319,7 @@ impl Swim {
             if remote_inc > member.incarnation {
                 if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
                     self.pending_timer_commands
-                        .push(TimerCommand::CancelProbe { seq: suspect_seq });
+                        .push(TimerCommand::CancelSchedule { seq: suspect_seq });
                 }
                 self.update_member(
                     source_node_id.clone(),
@@ -403,11 +403,10 @@ impl Swim {
             if new_state == SwimNodeState::Suspect {
                 let seq = self.next_seq();
                 self.last_suspected_seqs.insert(node_id.clone(), seq);
-                self.pending_timer_commands
-                    .push(TimerCommand::SetSuspectTimer {
-                        seq,
-                        timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id)),
-                    });
+                self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                    seq,
+                    timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id)),
+                });
             }
         }
     }
