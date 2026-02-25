@@ -2,14 +2,11 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
-use crate::clusters::{
-    NodeId, SwimNode,
-    tickers::{
-        ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
-        timer::TTimer,
-    },
+use crate::clusters::{NodeId, SwimNode};
+use crate::schedulers::{
+    ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
+    timer::TTimer,
 };
-
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
@@ -40,21 +37,31 @@ pub enum SwimCommand {
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker
-    Timeout(TimeoutEvent),
+    Timeout(SwimTimeOutCallback),
 }
 
-impl From<TimeoutEvent> for SwimCommand {
-    fn from(value: TimeoutEvent) -> Self {
+impl From<SwimTimeOutCallback> for SwimCommand {
+    fn from(value: SwimTimeOutCallback) -> Self {
         SwimCommand::Timeout(value)
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum TimeoutEvent {
+#[derive(Debug, Default)]
+pub(crate) enum SwimTimeOutCallback {
+    #[default]
     ProtocolPeriodElapsed,
-    DirectProbeTimedOut { seq: u32, target_node_id: NodeId },
-    IndirectProbeTimedOut { seq: u32, target_node_id: NodeId },
-    SuspectTimedOut { node_id: NodeId },
+    TimedOut {
+        seq: u32,
+        target_node_id: NodeId,
+        phase: ProbePhase,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum ProbePhase {
+    Direct,
+    Indirect,
+    Suspect,
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -75,31 +82,25 @@ impl OutboundPacket {
 }
 
 #[derive(Debug)]
-pub(crate) struct SwimTimeOutSchedule {
+pub(crate) struct SwimTimer {
     target_node_id: NodeId,
     phase: ProbePhase,
     ticks_remaining: u32,
 }
 
-impl TTimer for SwimTimeOutSchedule {
+impl TTimer for SwimTimer {
+    type Callback = SwimTimeOutCallback;
+
     fn tick(&mut self) -> u32 {
         self.ticks_remaining -= 1;
         self.ticks_remaining
     }
 
-    fn to_timeout_event(self: Box<Self>, seq: u32) -> TimeoutEvent {
-        match self.phase {
-            ProbePhase::Direct => TimeoutEvent::DirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-            ProbePhase::Indirect => TimeoutEvent::IndirectProbeTimedOut {
-                seq: seq,
-                target_node_id: self.target_node_id,
-            },
-            ProbePhase::Suspect => TimeoutEvent::SuspectTimedOut {
-                node_id: self.target_node_id,
-            },
+    fn to_timeout_callback(self, seq: u32) -> SwimTimeOutCallback {
+        SwimTimeOutCallback::TimedOut {
+            seq: seq,
+            target_node_id: self.target_node_id,
+            phase: self.phase,
         }
     }
 
@@ -108,7 +109,7 @@ impl TTimer for SwimTimeOutSchedule {
         self.target_node_id.clone()
     }
 }
-impl SwimTimeOutSchedule {
+impl SwimTimer {
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {
             target_node_id: target,
@@ -132,11 +133,4 @@ impl SwimTimeOutSchedule {
             ticks_remaining: SUSPECT_TIMEOUT_TICKS,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbePhase {
-    Direct,
-    Indirect,
-    Suspect,
 }

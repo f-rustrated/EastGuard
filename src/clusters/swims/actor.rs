@@ -1,8 +1,10 @@
+use super::*;
+
+use crate::clusters::NodeId;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
-use crate::clusters::types::ticker_message::TickerCommand;
-use crate::clusters::{NodeId, OutboundPacket, SwimCommand, TimeoutEvent};
+use crate::schedulers::ticker_message::TickerCommand;
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -14,7 +16,7 @@ use tokio::sync::mpsc;
 pub struct SwimActor {
     mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
-    ticker_tx: mpsc::Sender<TickerCommand>,
+    scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
     state: Swim,
 }
 
@@ -24,7 +26,7 @@ impl SwimActor {
         node_id: NodeId,
         mailbox: mpsc::Receiver<SwimCommand>,
         transport_tx: mpsc::Sender<OutboundPacket>,
-        ticker_tx: mpsc::Sender<TickerCommand>,
+        ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         vnodes_per_node: u64,
     ) -> Self {
         let topology = Topology::new(
@@ -39,7 +41,7 @@ impl SwimActor {
             mailbox,
             transport_tx,
             state,
-            ticker_tx,
+            scheduler_tx: ticker_tx,
         }
     }
 
@@ -51,22 +53,6 @@ impl SwimActor {
         }
     }
 
-    async fn handle_tick_event(&mut self, event: TimeoutEvent) {
-        match event {
-            TimeoutEvent::ProtocolPeriodElapsed => self.state.start_probe(),
-            TimeoutEvent::DirectProbeTimedOut {
-                seq,
-                target_node_id,
-            } => self.state.start_indirect_probe(target_node_id, seq),
-            TimeoutEvent::IndirectProbeTimedOut { target_node_id, .. } => {
-                self.state.try_mark_suspect(target_node_id);
-            }
-            TimeoutEvent::SuspectTimedOut { node_id } => {
-                self.state.try_mark_dead(node_id);
-            }
-        }
-    }
-
     async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
             SwimCommand::PacketReceived { src, packet } => {
@@ -74,7 +60,7 @@ impl SwimActor {
             }
 
             SwimCommand::Timeout(tick_event) => {
-                self.handle_tick_event(tick_event).await;
+                self.state.handle_timeout(tick_event);
             }
         }
 
@@ -87,7 +73,7 @@ impl SwimActor {
         tokio::join!(
             async {
                 for cmd in timer_commands {
-                    let _ = self.ticker_tx.send(cmd.into()).await;
+                    let _ = self.scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {

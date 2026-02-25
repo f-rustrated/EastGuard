@@ -1,7 +1,4 @@
-use crate::clusters::tickers::timer::TTimer;
-
-use crate::clusters::TimeoutEvent;
-use crate::clusters::types::ticker_message::TimerCommand;
+use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
@@ -9,14 +6,23 @@ pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
 pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 
-#[derive(Default, Debug)]
-pub(crate) struct Ticker {
+#[derive(Debug)]
+pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
-    timers: HashMap<u32, Box<dyn TTimer>>,
+    timers: HashMap<u32, T>,
 }
 
-impl Ticker {
-    pub(crate) fn apply(&mut self, cmd: TimerCommand) {
+impl<T> Ticker<T>
+where
+    T: TTimer,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            protocol_elapsed: 0,
+            timers: Default::default(),
+        }
+    }
+    pub(crate) fn apply(&mut self, cmd: TimerCommand<T>) {
         match cmd {
             TimerCommand::SetSchedule { seq, timer } => {
                 self.timers.insert(seq, timer);
@@ -28,7 +34,7 @@ impl Ticker {
         }
     }
 
-    pub fn advance_clock(&mut self) -> Vec<TimeoutEvent> {
+    pub fn advance_clock(&mut self) -> Vec<T::Callback> {
         let mut events = Vec::new();
 
         // 1. Age every in-flight probe
@@ -41,14 +47,14 @@ impl Ticker {
 
         for seq in timeout_seqs {
             let probe = self.timers.remove(&seq).unwrap();
-            events.push(probe.to_timeout_event(seq));
+            events.push(probe.to_timeout_callback(seq));
         }
 
         // 2. Advance the protocol clock
         self.protocol_elapsed += 1;
         if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
             self.protocol_elapsed = 0;
-            events.push(TimeoutEvent::ProtocolPeriodElapsed);
+            events.push(Default::default());
         }
 
         events
@@ -71,26 +77,26 @@ impl Ticker {
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::SwimTimeOutSchedule;
+    use crate::clusters::swims::{ProbePhase, SwimTimeOutCallback, SwimTimer};
 
     use super::*;
 
     #[test]
     fn no_protocol_period_before_interval_elapses() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             let events = ticker.advance_clock();
             assert!(
                 !events
                     .iter()
-                    .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed)),
+                    .any(|e| matches!(e, SwimTimeOutCallback::ProtocolPeriodElapsed)),
             );
         }
     }
 
     #[test]
     fn protocol_period_fires_at_interval() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             ticker.advance_clock();
         }
@@ -98,42 +104,47 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, TimeoutEvent::ProtocolPeriodElapsed))
+                .any(|e| matches!(e, SwimTimeOutCallback::ProtocolPeriodElapsed))
         );
     }
 
     #[test]
     fn direct_probe_timeout() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
+            timer: SwimTimer::direct_probe("node-b".into()),
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Direct,
+                    ..
+                }
+            )));
         }
 
         let events = ticker.advance_clock();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { seq: 1, .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Direct,
+                seq: 1,
+                ..
+            }
+        )));
         assert!(!ticker.has_timer(1));
     }
 
     #[test]
     fn indirect_probe_timeout() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 2,
-            timer: Box::new(SwimTimeOutSchedule::indirect_probe("node-c".into())),
+            timer: SwimTimer::indirect_probe("node-c".into()),
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -141,58 +152,67 @@ mod tests {
         }
 
         let events = ticker.advance_clock();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::IndirectProbeTimedOut { seq: 2, .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Indirect,
+                seq: 2,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn cancel_probe_prevents_timeout() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: Box::new(SwimTimeOutSchedule::direct_probe("node-b".into())),
+            timer: SwimTimer::direct_probe("node-b".into()),
         });
         ticker.apply(TimerCommand::CancelSchedule { seq: 1 });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::DirectProbeTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Direct,
+                    ..
+                }
+            )));
         }
     }
 
     #[test]
     fn suspect_timer_fires_after_timeout() {
-        let mut ticker = Ticker::default();
+        let mut ticker = Ticker::<SwimTimer>::new();
         let node_id = "node-b";
         let seq = 1;
         ticker.apply(TimerCommand::SetSchedule {
-            timer: Box::new(SwimTimeOutSchedule::suspect_timer(node_id.into())),
+            timer: SwimTimer::suspect_timer(node_id.into()),
             seq,
         });
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
             let events = ticker.advance_clock();
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
-            );
+            assert!(!events.iter().any(|e| matches!(
+                e,
+                SwimTimeOutCallback::TimedOut {
+                    phase: ProbePhase::Suspect,
+                    ..
+                }
+            )));
         }
 
         let events = ticker.advance_clock();
 
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TimeoutEvent::SuspectTimedOut { .. }))
-        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SwimTimeOutCallback::TimedOut {
+                phase: ProbePhase::Suspect,
+                ..
+            }
+        )));
         assert!(
             !ticker.has_timer(seq),
             "There shouldn't be any existing suspect"

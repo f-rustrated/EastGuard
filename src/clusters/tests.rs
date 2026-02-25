@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
+use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTimer};
 
-use crate::clusters::tickers::actor::SchedullingActor;
-use crate::clusters::tickers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
-use crate::clusters::types::ticker_message::TickerCommand;
+use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::{sync::mpsc, time};
 
@@ -12,10 +13,10 @@ use super::*;
 
 // Helper to setup the test environment
 async fn setup() -> (
-    mpsc::Sender<SwimCommand>,      // To send "Fake Network" events
-    mpsc::Receiver<OutboundPacket>, // To catch "Outbound" commands
-    mpsc::Sender<TickerCommand>,    // To drive the ticker directly
-    SocketAddr,                     // The actor's local address
+    mpsc::Sender<SwimCommand>,              // To send "Fake Network" events
+    mpsc::Receiver<OutboundPacket>,         // To catch "Outbound" commands
+    mpsc::Sender<TickerCommand<SwimTimer>>, // To drive the ticker directly
+    SocketAddr,                             // The actor's local address
 ) {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
@@ -24,7 +25,7 @@ async fn setup() -> (
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
     // TickerActor sends tick events back into the SwimActor's mailbox.
-    tokio::spawn(SchedullingActor::new(ticker_cmd_rx, tx_in.clone()).run());
+    tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_cmd_rx));
 
     let actor = SwimActor::new(
         addr,

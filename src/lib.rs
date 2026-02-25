@@ -2,12 +2,11 @@ mod config;
 mod connections;
 
 mod clusters;
+pub(crate) mod schedulers;
 
+use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
-    clusters::{
-        NodeId, swims::actor::SwimActor, tickers::actor::SchedullingActor,
-        transport::SwimTransportActor,
-    },
+    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -43,7 +42,7 @@ impl StartUp {
         );
 
         // Spawn Actors
-        tokio::spawn(SchedullingActor::new(ticker_cmd_rx, swim_sender).run());
+        tokio::spawn(run_scheduling_actor(swim_sender, ticker_cmd_rx));
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 
