@@ -2,7 +2,7 @@ use super::*;
 
 use crate::clusters::swims::topology::Topology;
 
-use crate::clusters::{NodeId, SwimNode, SwimNodeState};
+use crate::clusters::{JoinConfig, NodeId, PendingJoin, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -71,10 +71,19 @@ pub struct Swim {
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
+
+    // Join
+    join_config: JoinConfig,
+    pending_join_seqs: HashMap<u32, PendingJoin>,
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        local_addr: SocketAddr,
+        join_config: JoinConfig,
+        topology: Topology,
+    ) -> Self {
         let mut swim = Self {
             node_id,
             local_addr,
@@ -87,6 +96,8 @@ impl Swim {
             last_suspected_seqs: HashMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
+            join_config,
+            pending_join_seqs: HashMap::new()
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -97,24 +108,53 @@ impl Swim {
         swim
     }
 
+    pub(crate) fn initiate_join(&mut self) {
+        let seeds: Vec<SocketAddr> = self.join_config.seed_addrs
+            .iter()
+            .filter(|&&addr| addr != self.local_addr)
+            .copied()
+            .collect();
+
+        for addr in seeds {
+            let seq = self.next_seq();
+            // Maybe we can send Ping immediately when initial_delay_ticks = 0, but let's skip it for now    
+            self.pending_join_seqs.insert(
+                seq,
+                PendingJoin {
+                    addr,
+                    left_attempts: self.join_config.max_attempts
+                }
+            );
+            self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                seq,
+                timer: SwimTimer::join_retry(self.join_config.initial_delay_ticks)
+            })
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
     pub(crate) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
             SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
-            SwimTimeOutCallback::JoinRetry { .. } => todo!("join retry"),
             SwimTimeOutCallback::TimedOut {
                 seq,
                 target_node_id,
                 phase,
             } => {
-                let Some(target) = target_node_id else { return };
-                match phase {
-                    ProbePhase::Direct => self.start_indirect_probe(target, seq),
-                    ProbePhase::Indirect => self.try_mark_suspect(target),
-                    ProbePhase::Suspect => self.try_mark_dead(target),
-                    ProbePhase::JoinRetry => todo!("join retry probe phase"),
+                if let Some(target) = target_node_id {
+                    match phase {
+                        ProbePhase::Direct => self.start_indirect_probe(target, seq),
+                        ProbePhase::Indirect => self.try_mark_suspect(target),
+                        ProbePhase::Suspect => self.try_mark_dead(target),
+                        _ => {}
+                    }
+                } else {
+                    match phase {
+                        ProbePhase::JoinRetry => self.handle_join_retry(seq),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -228,6 +268,33 @@ impl Swim {
                 member.incarnation,
             );
         }
+    }
+
+    fn handle_join_retry(&mut self, seq: u32) {
+        let Some(pending_join) = self.pending_join_seqs.remove(&seq) else {
+            return
+        };
+
+        if pending_join.left_attempts == 0 {
+            return;
+        }
+
+        let attempt = self.join_config.max_attempts - pending_join.left_attempts;
+        let next_ticks = self.join_config.interval_ticks * self.join_config.multiplier.pow(attempt);
+
+        let new_seq = self.next_seq();
+        let ping = SwimPacket::Ping {
+            seq: new_seq,
+            source_node_id: self.node_id.clone(),
+            source_incarnation: self.incarnation,
+            gossip: self.gossip_buffer.collect()
+        };
+        self.pending_outbound.push(OutboundPacket::new(pending_join.addr, ping));
+        self.pending_join_seqs.insert(new_seq, PendingJoin { addr: pending_join.addr, left_attempts: pending_join.left_attempts - 1 });
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
+            seq: new_seq,
+            timer: SwimTimer::join_retry(next_ticks),
+        });
     }
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
@@ -454,15 +521,17 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
+    fn no_join_config() -> JoinConfig {
+        JoinConfig { seed_addrs: vec![], initial_delay_ticks: 0, interval_ticks: 10, multiplier: 1, max_attempts: 0 }
+    }
+
     fn make_protocol(local_id: &str, local_port: u16) -> Swim {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
             HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: 256,
-            },
+            TopologyConfig { vnodes_per_pnode: 256 },
         );
-        Swim::new(NodeId::new(local_id), addr, topology)
+        Swim::new(NodeId::new(local_id), addr, no_join_config(), topology)
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring

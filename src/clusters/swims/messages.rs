@@ -34,6 +34,7 @@ pub enum SwimPacket {
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
 pub enum SwimCommand {
+    InitiateJoin,
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker
@@ -50,9 +51,6 @@ impl From<SwimTimeOutCallback> for SwimCommand {
 pub(crate) enum SwimTimeOutCallback {
     #[default]
     ProtocolPeriodElapsed,
-    JoinRetry {
-        left_attempts: u32,
-    },
     TimedOut {
         seq: u32,
         target_node_id: Option<NodeId>,
@@ -114,11 +112,13 @@ impl TTimer for SwimTimer {
     }
 }
 impl SwimTimer {
-    // pub(crate) fn join_retry(left_attempts: u32, ticks_remaining: u32) -> Self {
-    //     Self {
-    //         target_node_id: NodeId::
-    //     }
-    // }
+    pub(crate) fn join_retry(ticks_remaining: u32) -> Self {
+        Self {
+            target_node_id: None,
+            phase: ProbePhase::JoinRetry,
+            ticks_remaining
+        }
+    }
 
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {

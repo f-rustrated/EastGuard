@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::clusters::swims::actor::SwimActor;
+use crate::clusters::{JoinConfig, swims::actor::SwimActor};
 use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTimer};
 
 use crate::schedulers::actor::run_scheduling_actor;
@@ -10,6 +10,10 @@ use crate::schedulers::ticker_message::TickerCommand;
 use tokio::{sync::mpsc, time};
 
 use super::*;
+
+fn no_join_config() -> JoinConfig {
+    JoinConfig { seed_addrs: vec![], initial_delay_ticks: 0, interval_ticks: 10, multiplier: 1, max_attempts: 0 }
+}
 
 // Helper to setup the test environment
 async fn setup() -> (
@@ -34,6 +38,7 @@ async fn setup() -> (
         tx_out,
         ticker_cmd_tx.clone(),
         256,
+        no_join_config(),
     );
     tokio::spawn(actor.run());
 
@@ -274,7 +279,7 @@ async fn test_self_registers_in_topology_on_startup() {
     let (tx_out, _rx_out) = mpsc::channel(100);
     let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256);
+    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
 
     assert!(
         actor.topology().contains_node(&"node-local".into()),
@@ -291,7 +296,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let (tx_out, _rx_out) = mpsc::channel(100);
     let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256);
+    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
 
     actor
         .process_event_for_test(SwimCommand::PacketReceived {
@@ -325,7 +330,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
     let (tx_out, _rx_out) = mpsc::channel(100);
     let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256);
+    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
 
     // Step 1: add the node via Alive gossip
     actor

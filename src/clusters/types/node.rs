@@ -69,3 +69,16 @@ impl std::borrow::Borrow<str> for NodeId {
         &self.0
     }
 }
+
+pub(crate) struct JoinConfig {
+    pub(crate) seed_addrs: Vec<SocketAddr>,
+    pub(crate) initial_delay_ticks: u32,
+    pub(crate) interval_ticks: u32,
+    pub(crate) multiplier: u32,
+    pub(crate) max_attempts: u32
+}
+
+pub(crate) struct PendingJoin {
+    pub(crate) addr: SocketAddr,
+    pub(crate) left_attempts: u32
+}

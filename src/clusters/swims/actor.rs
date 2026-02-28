@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::clusters::NodeId;
+use crate::clusters::{JoinConfig, NodeId};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
@@ -28,6 +28,7 @@ impl SwimActor {
         transport_tx: mpsc::Sender<OutboundPacket>,
         ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         vnodes_per_node: u64,
+        join_config: JoinConfig,
     ) -> Self {
         let topology = Topology::new(
             Default::default(),
@@ -35,7 +36,7 @@ impl SwimActor {
                 vnodes_per_pnode: vnodes_per_node,
             },
         );
-        let state = Swim::new(node_id, local_addr, topology);
+        let state = Swim::new(node_id, local_addr, join_config, topology);
 
         Self {
             mailbox,
@@ -55,6 +56,10 @@ impl SwimActor {
 
     async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
+            SwimCommand::InitiateJoin => {
+                todo!("TODO")
+            }
+
             SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
             }
@@ -92,6 +97,9 @@ impl SwimActor {
     #[cfg(test)]
     pub async fn process_event_for_test(&mut self, event: SwimCommand) {
         match event {
+            SwimCommand::InitiateJoin => {
+                todo!("TODO")
+            }
             SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
                 // Discard timer commands — topology tests don't need timing.
