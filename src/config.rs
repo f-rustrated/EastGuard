@@ -44,6 +44,9 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_JOIN_INITIAL_DELAY_MS", default_value_t = 1000)]
     pub join_initial_delay_ms: u64,
 
+    #[arg(long, env = "EASTGUARD_JOIN_INTERVAL_DELAY_MS", default_value_t = 1000)]
+    pub join_interval_delay_ms: u64,
+
     #[arg(long, env = "EASTGUARD_JOIN_MULTIPLIER", default_value_t = 2)]
     pub join_multiplier: u32,
 
@@ -159,6 +162,7 @@ mod tests {
             vnodes_per_node: 256,
             join_seed_nodes: vec![],
             join_initial_delay_ms: 1000,
+            join_interval_delay_ms: 1000,
             join_multiplier: 2,
             join_max_attempts: 5,
         }
@@ -204,6 +208,7 @@ mod tests {
         assert_eq!(env.vnodes_per_node, 256);
         assert_eq!(env.join_seed_nodes, Vec::<String>::new());
         assert_eq!(env.join_initial_delay_ms, 1000);
+        assert_eq!(env.join_interval_delay_ms, 1000);
         assert_eq!(env.join_multiplier, 2);
         assert_eq!(env.join_max_attempts, 5);
     }
@@ -262,6 +267,8 @@ mod tests {
             "10.0.0.2:2921",
             "--join-initial-delay-ms",
             "500",
+            "--join-interval-delay-ms",
+            "750",
             "--join-multiplier",
             "3",
             "--join-max-attempts",
@@ -275,6 +282,7 @@ mod tests {
             vec!["10.0.0.1:2921".to_string(), "10.0.0.2:2921".to_string()]
         );
         assert_eq!(env.join_initial_delay_ms, 500);
+        assert_eq!(env.join_interval_delay_ms, 750);
         assert_eq!(env.join_multiplier, 3);
         assert_eq!(env.join_max_attempts, 10);
     }
