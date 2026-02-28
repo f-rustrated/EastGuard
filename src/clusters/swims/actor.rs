@@ -47,7 +47,7 @@ impl SwimActor {
     }
 
     pub async fn run(mut self) {
-        println!("SwimActor started.");
+        println!("SwimActor {} started.", self.state.node_id);
 
         while let Some(event) = self.mailbox.recv().await {
             self.handle_actor_event(event).await;
