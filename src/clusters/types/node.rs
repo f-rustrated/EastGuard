@@ -70,6 +70,7 @@ impl std::borrow::Borrow<str> for NodeId {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct JoinConfig {
     pub(crate) seed_addrs: Vec<SocketAddr>,
     pub(crate) initial_delay_ticks: u32,
