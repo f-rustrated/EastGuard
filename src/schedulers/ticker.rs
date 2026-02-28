@@ -64,7 +64,7 @@ where
     pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
         self.timers
             .iter()
-            .find(|(_, probe)| &*probe.target_node_id() == node_id)
+            .find(|(_, probe)| probe.target_node_id().as_deref() == Some(node_id))
             .map(|(&seq, _)| seq)
     }
 

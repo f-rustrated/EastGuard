@@ -103,15 +103,20 @@ impl Swim {
     pub(crate) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
             SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
+            SwimTimeOutCallback::JoinRetry { .. } => todo!("join retry"),
             SwimTimeOutCallback::TimedOut {
                 seq,
                 target_node_id,
                 phase,
-            } => match phase {
-                ProbePhase::Direct => self.start_indirect_probe(target_node_id, seq),
-                ProbePhase::Indirect => self.try_mark_suspect(target_node_id),
-                ProbePhase::Suspect => self.try_mark_dead(target_node_id),
-            },
+            } => {
+                let Some(target) = target_node_id else { return };
+                match phase {
+                    ProbePhase::Direct => self.start_indirect_probe(target, seq),
+                    ProbePhase::Indirect => self.try_mark_suspect(target),
+                    ProbePhase::Suspect => self.try_mark_dead(target),
+                    ProbePhase::JoinRetry => todo!("join retry probe phase"),
+                }
+            }
         }
     }
 

@@ -50,9 +50,12 @@ impl From<SwimTimeOutCallback> for SwimCommand {
 pub(crate) enum SwimTimeOutCallback {
     #[default]
     ProtocolPeriodElapsed,
+    JoinRetry {
+        left_attempts: u32,
+    },
     TimedOut {
         seq: u32,
-        target_node_id: NodeId,
+        target_node_id: Option<NodeId>,
         phase: ProbePhase,
     },
 }
@@ -62,6 +65,7 @@ pub(crate) enum ProbePhase {
     Direct,
     Indirect,
     Suspect,
+    JoinRetry
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -83,7 +87,7 @@ impl OutboundPacket {
 
 #[derive(Debug)]
 pub(crate) struct SwimTimer {
-    target_node_id: NodeId,
+    target_node_id: Option<NodeId>,
     phase: ProbePhase,
     ticks_remaining: u32,
 }
@@ -105,14 +109,20 @@ impl TTimer for SwimTimer {
     }
 
     #[cfg(test)]
-    fn target_node_id(&self) -> NodeId {
+    fn target_node_id(&self) -> Option<NodeId> {
         self.target_node_id.clone()
     }
 }
 impl SwimTimer {
+    // pub(crate) fn join_retry(left_attempts: u32, ticks_remaining: u32) -> Self {
+    //     Self {
+    //         target_node_id: NodeId::
+    //     }
+    // }
+
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
+            target_node_id: Some(target),
             phase: ProbePhase::Direct,
             ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
         }
@@ -120,7 +130,7 @@ impl SwimTimer {
 
     pub(crate) fn indirect_probe(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
+            target_node_id: Some(target),
             phase: ProbePhase::Indirect,
             ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
         }
@@ -128,7 +138,7 @@ impl SwimTimer {
 
     pub(crate) fn suspect_timer(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
+            target_node_id: Some(target),
             phase: ProbePhase::Suspect,
             ticks_remaining: SUSPECT_TIMEOUT_TICKS,
         }
