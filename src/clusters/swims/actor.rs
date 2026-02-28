@@ -57,7 +57,7 @@ impl SwimActor {
     async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
             SwimCommand::InitiateJoin => {
-                todo!("TODO")
+                self.state.initiate_join();
             }
 
             SwimCommand::PacketReceived { src, packet } => {
@@ -98,14 +98,14 @@ impl SwimActor {
     pub async fn process_event_for_test(&mut self, event: SwimCommand) {
         match event {
             SwimCommand::InitiateJoin => {
-                todo!("TODO")
+                self.state.initiate_join();
             }
             SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
                 // Discard timer commands — topology tests don't need timing.
                 self.flush_outbound_commands().await;
             }
-            SwimCommand::Timeout(tick_event) => {}
+            SwimCommand::Timeout(_tick_event) => {}
         }
     }
 }
