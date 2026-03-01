@@ -1,5 +1,5 @@
 use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
 pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
@@ -9,7 +9,7 @@ pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 #[derive(Debug)]
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
-    timers: HashMap<u32, T>,
+    timers: BTreeMap<u32, T>,
 }
 
 impl<T> Ticker<T>
@@ -19,7 +19,7 @@ where
     pub(crate) fn new() -> Self {
         Self {
             protocol_elapsed: 0,
-            timers: Default::default(),
+            timers: BTreeMap::new(),
         }
     }
     pub(crate) fn apply(&mut self, cmd: TimerCommand<T>) {

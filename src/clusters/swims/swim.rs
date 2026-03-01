@@ -4,8 +4,8 @@ use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{JoinConfig, NodeId, PendingJoin, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap};
+use std::collections::btree_map::Entry;
 use std::net::SocketAddr;
 
 const INDIRECT_PING_COUNT: usize = 3;
@@ -59,14 +59,14 @@ pub struct Swim {
     incarnation: u64,
 
     // Protocol state
-    members: HashMap<NodeId, SwimNode>,
+    members: BTreeMap<NodeId, SwimNode>,
     live_node_tracker: LiveNodeTracker,
     gossip_buffer: GossipBuffer,
     pub(crate) topology: Topology,
 
     // Sequence
     seq_counter: u32,
-    last_suspected_seqs: HashMap<NodeId, u32>,
+    last_suspected_seqs: BTreeMap<NodeId, u32>,
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
@@ -74,7 +74,7 @@ pub struct Swim {
 
     // Join
     join_config: JoinConfig,
-    pending_join_seqs: HashMap<u32, PendingJoin>,
+    pending_join_seqs: BTreeMap<u32, PendingJoin>,
 }
 
 impl Swim {
@@ -90,15 +90,15 @@ impl Swim {
             local_addr,
             incarnation: 0,
             topology,
-            members: HashMap::new(),
+            members: BTreeMap::new(),
             live_node_tracker: LiveNodeTracker::new(seed),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
-            last_suspected_seqs: HashMap::new(),
+            last_suspected_seqs: BTreeMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
             join_config,
-            pending_join_seqs: HashMap::new()
+            pending_join_seqs: BTreeMap::new()
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -555,7 +555,7 @@ mod tests {
             HashMap::new(),
             TopologyConfig { vnodes_per_pnode: 256 },
         );
-        Swim::new(NodeId::new(local_id), addr, no_join_config(), topology)
+        Swim::new(0, NodeId::new(local_id), addr, no_join_config(), topology)
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
@@ -1187,7 +1187,7 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
             let topology = Topology::new(HashMap::new(), TopologyConfig { vnodes_per_pnode: 256 });
             TestHarness {
-                protocol: Swim::new(NodeId::new(local_id), addr, join_config, topology),
+                protocol: Swim::new(0, NodeId::new(local_id), addr, join_config, topology),
                 ticker: Ticker::new(),
             }
         }
