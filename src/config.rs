@@ -10,8 +10,8 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
-    #[arg(long, env = "EASTGUARD_SEED")]
-    pub seed: Option<u64>,
+    #[arg(long, env = "EASTGUARD_RANDOM_SEED")]
+    pub random_seed: Option<u64>,
 
     #[arg(
         long,
@@ -152,7 +152,7 @@ mod tests {
 
     fn make_env() -> Environment {
         Environment {
-            seed: None,
+            random_seed: None,
             config_dir: "./eastguard/config".into(),
             data_dir: "./eastguard/data".into(),
             node_id: None,
