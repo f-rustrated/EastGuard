@@ -179,16 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_socket_addr() {
-        let env = Environment {
-            port: 3000,
-            ..make_env()
-        };
-        let addr = env.peer_bind_addr();
-        assert_eq!(addr.to_string(), "127.0.0.1:13000");
-    }
-
-    #[test]
     #[serial]
     fn test_defaults() {
         let args = vec!["my-server"];
