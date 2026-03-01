@@ -3,6 +3,8 @@ mod connections;
 
 mod clusters;
 pub(crate) mod schedulers;
+#[cfg(test)]
+mod tests;
 
 use crate::schedulers::actor::{run_scheduling_actor, TICK_PERIOD_MS};
 use crate::{
@@ -73,12 +75,12 @@ impl StartUp {
     async fn receive_client_streams(self) {
         let addr = ENV.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
-        println!("[{}] EastGuard listening on {}", ENV.resolve_node_id(), addr);
+        tracing::info!("[{}] EastGuard listening on {}", ENV.resolve_node_id(), addr);
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
             if let Err(err) = self.handle_client_stream(stream).await {
-                eprintln!("{}", err);
+                tracing::error!("{}", err);
                 continue;
             }
         }

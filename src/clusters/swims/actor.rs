@@ -48,7 +48,7 @@ impl SwimActor {
     }
 
     pub async fn run(mut self) {
-        println!("[{}] SwimActor started.", self.state.node_id);
+        tracing::info!("[{}] SwimActor started.", self.state.node_id);
         self.state.initiate_join(); 
         self.flush_outbound_commands().await;
 

@@ -23,7 +23,7 @@ impl GossipBuffer {
     pub(super) fn enqueue(&mut self, member: SwimNode, cluster_size: usize) {
         if member.encoded_size() > MAX_GOSSIP_BYTES {
             // TODO Log an error or return a Result::Err here.
-            eprintln!("Single member should never exceed the packet size limit");
+            tracing::error!("Single member should never exceed the packet size limit");
 
             return;
         }
