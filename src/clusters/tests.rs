@@ -1,9 +1,8 @@
 use std::collections::HashMap;
-use std::panic::panic_any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::clusters::{JoinConfig, swims::actor::SwimActor, swims::Topology};
+use crate::clusters::{JoinConfig, swims::actor::SwimActor};
 use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer};
 
 use crate::schedulers::actor::run_scheduling_actor;
@@ -71,7 +70,6 @@ impl NetworkBridge {
             tokio::spawn(async move {
                 while let Some(pkt) = rx.recv().await {
                     if let Some(tx) = routes.get(&pkt.target) {
-                        println!("src: {}", sender_addr);
                         let _ = tx.send(SwimCommand::PacketReceived {
                             src: sender_addr,
                             packet: pkt.packet().clone(),
@@ -473,7 +471,7 @@ async fn cluster_formation_using_join() {
     bridge.add(&mut h2);
     bridge.add(&mut h3);
     bridge.spawn();
-    
+
     // Let all three actors process InitiateJoin and register their timers
     tokio::time::sleep(Duration::from_millis(10)).await;
 
