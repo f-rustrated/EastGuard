@@ -249,9 +249,9 @@ mod tests {
         let args = vec![
             "my-server",
             "--join-seed-nodes",
-            "10.0.0.1:2921",
+            "10.0.0.1:2922",
             "--join-seed-nodes",
-            "10.0.0.2:2921",
+            "10.0.0.2:2922",
             "--join-initial-delay-ms",
             "500",
             "--join-interval-ms",
@@ -266,7 +266,7 @@ mod tests {
 
         assert_eq!(
             env.join_seed_nodes,
-            vec!["10.0.0.1:2921".to_string(), "10.0.0.2:2921".to_string()]
+            vec!["10.0.0.1:2922".to_string(), "10.0.0.2:2922".to_string()]
         );
         assert_eq!(env.join_initial_delay_ms, 500);
         assert_eq!(env.join_interval_ms, 750);

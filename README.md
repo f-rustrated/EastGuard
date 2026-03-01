@@ -36,6 +36,7 @@ $ cargo run --bin server
 cargo run --bin server -- \
 --node-id node-1 \
 --port 3001 \
+--cluster-port 13001 \
 --data-dir /tmp/eg-node1 \
 --config-dir /tmp/eg-node1-config \
 --join-seed-nodes 127.0.0.1:13002 \
@@ -47,6 +48,7 @@ cargo run --bin server -- \
 cargo run --bin server -- \
 --node-id node-2 \
 --port 3002 \
+--cluster-port 13002 \
 --data-dir /tmp/eg-node2 \
 --config-dir /tmp/eg-node2-config \
 --join-seed-nodes 127.0.0.1:13001 \
@@ -58,6 +60,7 @@ cargo run --bin server -- \
 cargo run --bin server -- \
 --node-id node-3 \
 --port 3003 \
+--cluster-port 13003 \
 --data-dir /tmp/eg-node3 \
 --config-dir /tmp/eg-node3-config \
 --join-seed-nodes 127.0.0.1:13001 \
