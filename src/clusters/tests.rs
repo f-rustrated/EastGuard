@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::panic::panic_any;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::clusters::{JoinConfig, swims::actor::SwimActor};
-use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTimer};
+use crate::clusters::{JoinConfig, swims::actor::SwimActor, swims::Topology};
+use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer};
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
@@ -13,33 +16,33 @@ use super::*;
 
 struct TestHarness {
     pub tx_in: mpsc::Sender<SwimCommand>,
-    pub rx_in: Option<mpsc::Receiver<SwimCommand>>,
     pub tx_out: mpsc::Sender<OutboundPacket>,
-    pub rx_out: mpsc::Receiver<OutboundPacket>,
+    pub rx_out: Option<mpsc::Receiver<OutboundPacket>>,
     pub ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
-    pub ticker_rx: Option<mpsc::Receiver<TickerCommand<SwimTimer>>>,
     pub local_addr: SocketAddr,
     pub config: JoinConfig,
 }
 
 impl TestHarness {
-    pub fn spawn(&mut self) {
-        let rx_in = self.rx_in.take().expect("rx_in already taken");
-        let ticker_rx = self.ticker_rx.take().expect("ticker_rx already taken");
+    pub async fn query_topology_count(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx_in
+            .send(SwimCommand::Test(SwimTestCommand::TopologyValidationCount { reply: tx }))
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
 
-        // TickerActor sends tick events back into the SwimActor's mailbox.
-        tokio::spawn(run_scheduling_actor(self.tx_in.clone(), ticker_rx));
-
-        let actor = SwimActor::new(
-            self.local_addr,
-            format!("node-local-{}", self.local_addr.port()).as_str().into(),
-            rx_in,
-            self.tx_out.clone(),
-            self.ticker_tx.clone(),
-            256,
-            self.config.clone(),
-        );
-        tokio::spawn(actor.run());
+    pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx_in
+            .send(SwimCommand::Test(SwimTestCommand::TopologyIncludesNode {
+                node_id,
+                reply: tx
+            }))
+            .await
+            .unwrap();
+        rx.await.unwrap()
     }
 }
 
@@ -62,13 +65,24 @@ async fn setup_with_config(
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
+    let actor = SwimActor::new(
+        addr,
+        format!("node-local-{}", port).as_str().into(),
+        rx_in,
+        tx_out.clone(),
+        ticker_tx.clone(),
+        256,
+        join_config.clone(),
+    );
+
+    tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
+    tokio::spawn(actor.run());
+
     TestHarness {
         tx_in,
-        rx_in: Some(rx_in),
         tx_out,
-        rx_out,
+        rx_out: Some(rx_out),
         ticker_tx,
-        ticker_rx: Some(ticker_rx),
         local_addr: addr,
         config: join_config,
     }
@@ -78,7 +92,7 @@ async fn setup_with_config(
 #[tokio::test]
 async fn test_ping_response() {
     let mut harness = setup_single().await;
-    harness.spawn();
+    let mut rx_out = harness.rx_out.take().unwrap();
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
@@ -97,7 +111,7 @@ async fn test_ping_response() {
         .unwrap();
 
     // 2. Assert the Actor sends an Ack back
-    let response = time::timeout(Duration::from_millis(100), harness.rx_out.recv())
+    let response = time::timeout(Duration::from_millis(100), rx_out.recv())
         .await
         .expect("Actor should respond immediately")
         .expect("Channel closed");
@@ -112,13 +126,13 @@ async fn test_ping_response() {
 #[tokio::test]
 async fn test_refutation_mechanism() {
     let mut harness = setup_single().await;
-    harness.spawn();
+    let mut rx_out = harness.rx_out.take().unwrap();
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
     // The actor starts at Incarnation 0. We send Suspect with Incarnation 0.
     let lie = SwimNode {
-        node_id: "node-local".into(),
+        node_id: "node-local-8000".into(),
         addr: harness.local_addr,
         state: SwimNodeState::Suspect,
         incarnation: 0,
@@ -140,7 +154,7 @@ async fn test_refutation_mechanism() {
 
     // 2. The Actor should respond with an Ack.
     // CHECK: Did the actor increment its incarnation to 1 to refute the lie?
-    let response = harness.rx_out.recv().await.unwrap();
+    let response = rx_out.recv().await.unwrap();
 
     match response.packet() {
         SwimPacket::Ack {
@@ -158,7 +172,7 @@ async fn test_refutation_mechanism() {
 #[tokio::test]
 async fn test_gossip_propagation() {
     let mut harness = setup_single().await;
-    harness.spawn();
+    let mut rx_out = harness.rx_out.take().unwrap();
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
@@ -202,7 +216,7 @@ async fn test_gossip_propagation() {
             .unwrap();
 
         // Wait for response
-        if let Some(response) = harness.rx_out.recv().await {
+        if let Some(response) = rx_out.recv().await {
             if let SwimPacket::Ack { gossip, .. } = response.packet() {
                 // Check if our rumor is in this specific Ack
                 if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
@@ -229,7 +243,7 @@ async fn test_indirect_ping_trigger() {
     // Drives the TickerActor directly via TickerCommand::ForceTick.
 
     let mut harness = setup_single().await;
-    harness.spawn();
+    let mut rx_out = harness.rx_out.take().unwrap();
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -260,7 +274,7 @@ async fn test_indirect_ping_trigger() {
         .await
         .unwrap();
 
-    let _ack = harness.rx_out.recv().await.unwrap(); // Clear the Ack
+    let _ack = rx_out.recv().await.unwrap(); // Clear the Ack
 
     // 2. Force-tick PROBE_INTERVAL_TICKS times so the ticker fires a
     //    ProtocolPeriodElapsed, which makes SwimProtocol start a probe.
@@ -271,7 +285,7 @@ async fn test_indirect_ping_trigger() {
         for _ in 0..PROBE_INTERVAL_TICKS {
             harness.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
         }
-        match time::timeout(Duration::from_millis(100), harness.rx_out.recv()).await {
+        match time::timeout(Duration::from_millis(100), rx_out.recv()).await {
             Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping { .. }) => {
                 target_addr = Some(pkt.target);
                 break;
@@ -282,13 +296,13 @@ async fn test_indirect_ping_trigger() {
     let target_addr = target_addr.expect("Actor should send a Ping within 3 protocol periods");
 
     // 3. DON'T send an Ack. Force-tick DIRECT_ACK_TIMEOUT_TICKS times so the
-    //    direct probe times out and the state machine transitions to indirect probing.
+    //    direct probe timeout and the state machine transitions to indirect probing.
     for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
         harness.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
     }
 
     // 4. Expect Indirect Pings (PingReq) sent to the *other* peer
-    let indirect_ping = time::timeout(Duration::from_millis(100), harness.rx_out.recv())
+    let indirect_ping = time::timeout(Duration::from_millis(100), rx_out.recv())
         .await
         .expect("Should send indirect ping")
         .unwrap();
@@ -309,32 +323,21 @@ async fn test_indirect_ping_trigger() {
 
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
-    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
-    let (ticker_send, _ticker_recv) = mpsc::channel(100);
-
-    let actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
+    let mut harness = setup_single().await;
 
     assert!(
-        actor.topology().contains_node(&"node-local".into()),
+        harness.query_topology_includes("node-local-8000".into()).await,
         "SwimActor should register itself in the topology ring on startup"
     );
 }
 
 #[tokio::test]
 async fn test_alive_gossip_adds_node_to_topology() {
-    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let mut harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
-    let (ticker_send, _ticker_recv) = mpsc::channel(100);
-
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
-
-    actor
-        .process_event_for_test(SwimCommand::PacketReceived {
+    let _ = harness.tx_in.send(
+        SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 1,
@@ -347,52 +350,49 @@ async fn test_alive_gossip_adds_node_to_topology() {
                     incarnation: 1,
                 }],
             },
-        })
-        .await;
+        }
+    ).await;
 
     assert!(
-        actor.topology().contains_node(&"node-new".into()),
+        harness.query_topology_includes("node-new".into()).await,
         "Alive gossip should add the node to the topology ring"
     );
 }
 
 #[tokio::test]
 async fn test_dead_gossip_removes_node_from_topology() {
-    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let mut harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let (_tx_in, rx_in) = mpsc::channel(100);
-    let (tx_out, _rx_out) = mpsc::channel(100);
-    let (ticker_send, _ticker_recv) = mpsc::channel(100);
 
-    let mut actor = SwimActor::new(addr, "node-local".into(), rx_in, tx_out, ticker_send, 256, no_join_config());
-
-    // Step 1: add the node via Alive gossip
-    actor
-        .process_event_for_test(SwimCommand::PacketReceived {
-            src: sender_addr,
-            packet: SwimPacket::Ping {
-                seq: 1,
-                source_node_id: "node-sender".into(),
-                source_incarnation: 1,
-                gossip: vec![SwimNode {
-                    node_id: "node-target".into(),
-                    addr: node,
-                    state: SwimNodeState::Alive,
-                    incarnation: 1,
-                }],
-            },
-        })
-        .await;
+    {
+        // Step 1: add the node via Alive gossip
+        let _ = harness.tx_in
+            .send(SwimCommand::PacketReceived {
+                src: sender_addr,
+                packet: SwimPacket::Ping {
+                    seq: 1,
+                    source_node_id: "node-sender".into(),
+                    source_incarnation: 1,
+                    gossip: vec![SwimNode {
+                        node_id: "node-target".into(),
+                        addr: node,
+                        state: SwimNodeState::Alive,
+                        incarnation: 1,
+                    }],
+                },
+            })
+            .await;
+    }
 
     assert!(
-        actor.topology().contains_node(&"node-target".into()),
+        harness.query_topology_includes("node-target".into()).await,
         "Node should be present in topology after Alive gossip"
     );
 
     // Step 2: mark the node as Dead via gossip
-    actor
-        .process_event_for_test(SwimCommand::PacketReceived {
+    let _ = harness.tx_in
+        .send(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 2,
@@ -409,7 +409,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
         .await;
 
     assert!(
-        !actor.topology().contains_node(&"node-target".into()),
+        !harness.query_topology_includes("node-target".into()).await,
         "Dead gossip should remove the node from the topology ring"
     );
 }
