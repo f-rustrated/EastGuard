@@ -4,9 +4,9 @@ mod connections;
 mod clusters;
 pub(crate) mod schedulers;
 
-use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::actor::{run_scheduling_actor, TICK_PERIOD_MS};
 use crate::{
-    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
+    clusters::{JoinConfig, NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -39,10 +39,11 @@ impl StartUp {
             tx_outbound,
             ticker_cmd_tx.clone(),
             ENV.vnodes_per_node,
+            self.build_join_config(),
         );
 
         // Spawn Actors
-        tokio::spawn(run_scheduling_actor(swim_sender, ticker_cmd_rx));
+        tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
 
@@ -51,10 +52,22 @@ impl StartUp {
         Ok(())
     }
 
+    fn build_join_config(&self) -> JoinConfig {
+        JoinConfig {
+            seed_addrs: ENV.join_seed_nodes.iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
+            initial_delay_ticks: (ENV.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
+            interval_ticks: (ENV.join_interval_ms / TICK_PERIOD_MS) as u32,
+            multiplier: ENV.join_multiplier,
+            max_attempts: ENV.join_max_attempts,
+        }
+    }
+
     async fn receive_client_streams(self) {
         let addr = ENV.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
-        println!("EastGuard listening on {addr}");
+        println!("[{}] EastGuard listening on {}", ENV.resolve_node_id(), addr);
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {

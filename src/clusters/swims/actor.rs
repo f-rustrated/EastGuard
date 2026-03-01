@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::clusters::NodeId;
+use crate::clusters::{JoinConfig, NodeId};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
@@ -28,6 +28,7 @@ impl SwimActor {
         transport_tx: mpsc::Sender<OutboundPacket>,
         ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         vnodes_per_node: u64,
+        join_config: JoinConfig,
     ) -> Self {
         let topology = Topology::new(
             Default::default(),
@@ -35,7 +36,7 @@ impl SwimActor {
                 vnodes_per_pnode: vnodes_per_node,
             },
         );
-        let state = Swim::new(node_id, local_addr, topology);
+        let state = Swim::new(node_id, local_addr, join_config, topology);
 
         Self {
             mailbox,
@@ -46,7 +47,9 @@ impl SwimActor {
     }
 
     pub async fn run(mut self) {
-        println!("SwimActor started.");
+        println!("[{}] SwimActor started.", self.state.node_id);
+        self.state.initiate_join(); 
+        self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {
             self.handle_actor_event(event).await;
@@ -61,6 +64,10 @@ impl SwimActor {
 
             SwimCommand::Timeout(tick_event) => {
                 self.state.handle_timeout(tick_event);
+            }
+            #[cfg(test)]
+            SwimCommand::Test(test_command) => {
+                self.state.handle_test_command(test_command)
             }
         }
 
@@ -82,22 +89,5 @@ impl SwimActor {
                 }
             }
         );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn topology(&self) -> &Topology {
-        &self.state.topology
-    }
-
-    #[cfg(test)]
-    pub async fn process_event_for_test(&mut self, event: SwimCommand) {
-        match event {
-            SwimCommand::PacketReceived { src, packet } => {
-                self.state.step(src, packet);
-                // Discard timer commands — topology tests don't need timing.
-                self.flush_outbound_commands().await;
-            }
-            SwimCommand::Timeout(tick_event) => {}
-        }
     }
 }

@@ -5,9 +5,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-/// One real-time tick drives one logical tick in SwimTicker.
-/// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD (100 ms) = 1 s per probe round.
-const TICK_PERIOD: Duration = Duration::from_millis(100);
+/// One real-time tick = 100 ms.
+/// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD_MS (100 ms) = 1 s per probe round.
+pub const TICK_PERIOD_MS: u64 = 100;
 
 pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
@@ -15,7 +15,7 @@ pub async fn run_scheduling_actor<T>(
 ) where
     T: TTimer,
 {
-    let mut interval = time::interval(TICK_PERIOD);
+    let mut interval = time::interval(Duration::from_millis(TICK_PERIOD_MS));
     let mut ticker = Ticker::<T>::new();
 
     loop {
