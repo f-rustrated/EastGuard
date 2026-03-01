@@ -84,12 +84,8 @@ impl Environment {
         format!("{}:{}", self.host, self.port)
     }
 
-    pub(crate) fn peer_bind_addr(&self) -> String {
+    pub(crate) fn peer_bind_addr(&self) -> std::net::SocketAddr {
         format!("{}:{}", self.host, self.cluster_port)
-    }
-
-    pub(crate) fn peer_socket_addr(&self) -> std::net::SocketAddr {
-        format!("{}:{}", self.host, self.port + 10000)
             .parse()
             .expect("Invalid peer bind address")
     }
@@ -179,7 +175,7 @@ mod tests {
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
-        assert_eq!(env.peer_bind_addr(), "127.0.0.1:3001");
+        assert_eq!(env.peer_bind_addr(), "127.0.0.1:3001".parse().unwrap());
     }
 
     #[test]
@@ -188,7 +184,7 @@ mod tests {
             port: 3000,
             ..make_env()
         };
-        let addr = env.peer_socket_addr();
+        let addr = env.peer_bind_addr();
         assert_eq!(addr.to_string(), "127.0.0.1:13000");
     }
 
