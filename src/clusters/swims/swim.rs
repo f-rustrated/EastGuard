@@ -115,6 +115,8 @@ impl Swim {
             .copied()
             .collect();
 
+        println!("[{}] InitiateJoin: {} seed(s) → {:?}", self.node_id, seeds.len(), seeds);
+
         for addr in seeds {
             if self.join_config.initial_delay_ticks == 0 {
                 self.send_join_ping_with_retry(
@@ -124,6 +126,7 @@ impl Swim {
                 );
             } else {
                 let seq = self.next_seq();
+                println!("[{}] Scheduling join timer to {} (delay {} ticks)", self.node_id, addr, self.join_config.initial_delay_ticks);
                 self.schedule_join_timer(seq, addr, self.join_config.max_attempts, self.join_config.initial_delay_ticks);
             }
         }
@@ -138,6 +141,7 @@ impl Swim {
     }
 
     fn send_join_ping_with_retry(&mut self, addr: SocketAddr, left_attempts: u32, ticks: u32) {
+        println!("[{}] → Sending join Ping to {} ({} attempt(s) left)", self.node_id, addr, left_attempts);
         let seq = self.next_seq();
         let ping = SwimPacket::Ping {
             seq,
@@ -302,10 +306,12 @@ impl Swim {
 
     fn handle_join_retry(&mut self, seq: u32) {
         let Some(pending_join) = self.pending_join_seqs.remove(&seq) else {
+            println!("[{}] Join retry fired for seq {} but no pending join found (already acked?)", self.node_id, seq);
             return
         };
 
         if pending_join.left_attempts == 0 {
+            println!("[{}] Join to {} exhausted all attempts — giving up", self.node_id, pending_join.addr);
             return;
         }
 
@@ -337,6 +343,7 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
+                println!("[{}] ← Received Ping from {} ({}) seq={}", self.node_id, source_node_id, src, seq);
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 let ack = SwimPacket::Ack {
                     seq,
@@ -354,6 +361,7 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
+                println!("[{}] ← Received Ack  from {} ({}) seq={}", self.node_id, source_node_id, src, seq);
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
@@ -504,6 +512,7 @@ impl Swim {
         self.topology.update(node_id.clone(), addr, new_state);
 
         if changed {
+            println!("[{}] Member update: {} @ {} → {:?} (inc {})", self.node_id, node_id, addr, new_state, incarnation);
             let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
 
