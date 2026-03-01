@@ -118,7 +118,7 @@ impl Swim {
         println!("[{}] InitiateJoin: {} seed(s) → {:?}", self.node_id, seeds.len(), seeds);
 
         for addr in seeds {
-            if self.join_config.initial_delay_ticks == 0 {
+            if self.join_config.initial_delay_ticks == 0 && self.join_config.max_attempts > 0 {
                 self.send_join_ping_with_retry(
                     addr,
                     self.join_config.max_attempts.saturating_sub(1),
@@ -177,10 +177,10 @@ impl Swim {
     pub(crate) fn handle_test_command(&self, test_command: SwimTestCommand) {
         match test_command {
             SwimTestCommand::TopologyValidationCount { reply } => {
-                let _ = reply.send(self.topology.num_nodes()); 
+                let _ = reply.send(self.topology.num_nodes());
             }
             SwimTestCommand::TopologyIncludesNode { node_id, reply } => {
-                let _ = reply.send(self.topology.contains_node(&node_id)); 
+                let _ = reply.send(self.topology.contains_node(&node_id));
             }
         }
     }

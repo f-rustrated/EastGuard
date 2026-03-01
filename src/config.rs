@@ -41,6 +41,7 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_JOIN_SEED_NODES")]
     pub join_seed_nodes: Vec<String>,
 
+    // TODO: We know that when join_initial_delay_ms < tick interval, join process will fire immediately. Let's fix this when we think we need to.
     #[arg(long, env = "EASTGUARD_JOIN_INITIAL_DELAY_MS", default_value_t = 1000)]
     pub join_initial_delay_ms: u64,
 
