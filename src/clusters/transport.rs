@@ -1,6 +1,5 @@
 use std::io;
 use crate::clusters::swims::{OutboundPacket, SwimCommand};
-
 // ==========================================
 // TRANSPORT LAYER (Presentation)
 // ==========================================
@@ -14,6 +13,21 @@ pub trait UdpTransport: Send + 'static {
 }
 
 impl UdpTransport for UdpSocket {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_to(buf, target).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+}
+
+#[cfg(test)]
+impl UdpTransport for turmoil::net::UdpSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.send_to(buf, target).await
     }
