@@ -3,7 +3,9 @@ use crate::clusters::swims::{SwimCommand, SwimTestCommand, SwimTimer};
 use crate::clusters::transport::{SwimTransportActor, UdpTransport};
 use crate::clusters::{JoinConfig, NodeId};
 use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::ticker::Ticker;
 use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::timer::TTimer;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -168,16 +170,16 @@ pub fn set_up_cluster(sim: &mut turmoil::Sim, specs: &[NodeSpec]) -> Vec<DstNode
     dst_nodes
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedulers::actor::TICK_PERIOD_MS;
     use crate::schedulers::ticker::PROBE_INTERVAL_TICKS;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::util::SubscriberInitExt;
-
     // ---------------------------------------------------------------
     // Tracing capture
     // ---------------------------------------------------------------
@@ -190,7 +192,9 @@ mod tests {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl<'a> MakeWriter<'a> for SharedWriter {
@@ -206,9 +210,24 @@ mod tests {
 
     fn three_node_specs() -> Vec<NodeSpec> {
         vec![
-            NodeSpec { node_id: "node-0".into(), host: "127.0.0.1", port: 5000, cluster_port: 15000 },
-            NodeSpec { node_id: "node-1".into(), host: "127.0.0.1", port: 5001, cluster_port: 15001 },
-            NodeSpec { node_id: "node-2".into(), host: "127.0.0.1", port: 5002, cluster_port: 15002 },
+            NodeSpec {
+                node_id: "node-0".into(),
+                host: "127.0.0.1",
+                port: 5000,
+                cluster_port: 15000,
+            },
+            NodeSpec {
+                node_id: "node-1".into(),
+                host: "127.0.0.1",
+                port: 5001,
+                cluster_port: 15001,
+            },
+            NodeSpec {
+                node_id: "node-2".into(),
+                host: "127.0.0.1",
+                port: 5002,
+                cluster_port: 15002,
+            },
         ]
     }
 
@@ -224,15 +243,22 @@ mod tests {
             .with_ansi(false) // remove ANSI color codes
             .set_default();
 
-        let mut sim = turmoil::Builder::new().build();
+        // Default budget is 10 s of virtual time; our sleep is TICK_PERIOD_MS *
+        // PROBE_INTERVAL_TICKS * 100 = 100 s, so we raise the limit with headroom.
+        let sim_duration =
+            Duration::from_millis(TICK_PERIOD_MS * PROBE_INTERVAL_TICKS as u64 * 100)
+                + Duration::from_secs(10);
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(sim_duration)
+            .build();
         let nodes = set_up_cluster(&mut sim, &three_node_specs());
 
         sim.client("observer", async move {
             // Let actors initialize and fire their first join pings.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            for _ in 0..PROBE_INTERVAL_TICKS * 100 {
-                for node in &nodes { node.force_tick().await; }
-            }
+            tokio::time::sleep(Duration::from_millis(
+                TICK_PERIOD_MS * PROBE_INTERVAL_TICKS as u64 * 100,
+            ))
+            .await;
             Ok(())
         });
 
@@ -240,12 +266,12 @@ mod tests {
         drop(_guard); // release the subscriber's Arc clone before unwrapping
 
         let bytes = Arc::try_unwrap(buf).unwrap().into_inner().unwrap();
-        String::from_utf8(bytes).unwrap()
+        String::from_utf8(bytes)
+            .unwrap()
             .lines()
             .map(String::from)
             .collect()
     }
-
 
     #[test]
     fn test_simulation_is_deterministic() {
