@@ -48,6 +48,8 @@ impl SwimActor {
 
     pub async fn run(mut self) {
         println!("SwimActor {} started.", self.state.node_id);
+        self.state.initiate_join(); 
+        self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {
             self.handle_actor_event(event).await;
@@ -56,16 +58,16 @@ impl SwimActor {
 
     async fn handle_actor_event(&mut self, event: SwimCommand) {
         match event {
-            SwimCommand::InitiateJoin => {
-                self.state.initiate_join();
-            }
-
             SwimCommand::PacketReceived { src, packet } => {
                 self.state.step(src, packet);
             }
 
             SwimCommand::Timeout(tick_event) => {
                 self.state.handle_timeout(tick_event);
+            }
+            #[cfg(test)]
+            SwimCommand::Test(test_command) => {
+                self.state.handle_test_command(test_command)
             }
         }
 
@@ -87,25 +89,5 @@ impl SwimActor {
                 }
             }
         );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn topology(&self) -> &Topology {
-        &self.state.topology
-    }
-
-    #[cfg(test)]
-    pub async fn process_event_for_test(&mut self, event: SwimCommand) {
-        match event {
-            SwimCommand::InitiateJoin => {
-                self.state.initiate_join();
-            }
-            SwimCommand::PacketReceived { src, packet } => {
-                self.state.step(src, packet);
-                // Discard timer commands — topology tests don't need timing.
-                self.flush_outbound_commands().await;
-            }
-            SwimCommand::Timeout(_tick_event) => {}
-        }
     }
 }

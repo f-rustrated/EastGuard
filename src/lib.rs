@@ -16,7 +16,6 @@ use crate::{
 use anyhow::Result;
 
 use tokio::{net::TcpListener, sync::mpsc};
-use crate::clusters::swims::SwimCommand;
 
 #[derive(Debug)]
 pub struct StartUp;
@@ -46,9 +45,6 @@ impl StartUp {
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
         tokio::spawn(transport.run());
         tokio::spawn(swim_actor.run());
-        
-        // After initialization 
-        swim_sender.send(SwimCommand::InitiateJoin).await.expect("Initialization Failed");
 
         // run handlers
         let _ = self.receive_client_streams().await;

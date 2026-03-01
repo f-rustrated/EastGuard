@@ -6,27 +6,28 @@ use std::net::SocketAddr;
 use crate::clusters::{NodeId, SwimNodeState};
 
 /// node_id and replica_index for tie breaker
-#[derive(Eq, PartialEq, Ord, PartialOrd, Debug)]
+#[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone)]
 pub struct VirtualNodeToken {
     hash: u32,
     pnode_id: NodeId,
     replica_index: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VirtualNode {
     replica_index: u64,
     pub pnode_id: NodeId,
     pnode_metadata: PhysicalNodeMetadata,
 }
 
+#[derive(Clone, Debug)]
 pub struct Topology {
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
     ring: TokenRing,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 struct TokenRing {
     vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
     pnodes: HashMap<NodeId, PhysicalNodeMetadata>,
@@ -88,6 +89,7 @@ impl TokenRing {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct TopologyConfig {
     pub vnodes_per_pnode: u64,
 }
@@ -135,6 +137,10 @@ impl Topology {
     #[cfg(test)]
     pub fn contains_node(&self, id: &NodeId) -> bool {
         self.ring.pnodes.contains_key(id)
+    }
+
+    pub fn num_nodes(&self) -> usize {
+        self.ring.pnodes.len()
     }
 }
 

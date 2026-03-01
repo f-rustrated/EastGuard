@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
-
+use tokio::sync::oneshot;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
     ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
@@ -34,11 +34,19 @@ pub enum SwimPacket {
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
 pub enum SwimCommand {
-    InitiateJoin,
     // From Transport
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker
     Timeout(SwimTimeOutCallback),
+    #[cfg(test)]
+    Test(SwimTestCommand)
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub enum SwimTestCommand {
+    TopologyValidationCount { reply: oneshot::Sender<usize> },
+    TopologyIncludesNode { node_id: NodeId, reply: oneshot::Sender<bool> }
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {

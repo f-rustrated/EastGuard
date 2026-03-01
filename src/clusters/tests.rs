@@ -46,6 +46,43 @@ impl TestHarness {
     }
 }
 
+/// Routes `OutboundPacket`s between test harnesses, simulating a network.
+/// Call `add()` for every harness, then `spawn()` to start routing.
+struct NetworkBridge {
+    routes: HashMap<SocketAddr, mpsc::Sender<SwimCommand>>,
+    inbounds: Vec<(SocketAddr, mpsc::Receiver<OutboundPacket>)>,
+}
+
+impl NetworkBridge {
+    fn new() -> Self {
+        NetworkBridge { routes: HashMap::new(), inbounds: Vec::new() }
+    }
+
+    fn add(&mut self, harness: &mut TestHarness) {
+        let rx = harness.rx_out.take().expect("rx_out already taken");
+        self.routes.insert(harness.local_addr, harness.tx_in.clone());
+        self.inbounds.push((harness.local_addr, rx));
+    }
+
+    fn spawn(self) {
+        let routes = Arc::new(self.routes);
+        for (sender_addr, mut rx) in self.inbounds {
+            let routes = Arc::clone(&routes);
+            tokio::spawn(async move {
+                while let Some(pkt) = rx.recv().await {
+                    if let Some(tx) = routes.get(&pkt.target) {
+                        println!("src: {}", sender_addr);
+                        let _ = tx.send(SwimCommand::PacketReceived {
+                            src: sender_addr,
+                            packet: pkt.packet().clone(),
+                        }).await;
+                    }
+                }
+            });
+        }
+    }
+}
+
 fn no_join_config() -> JoinConfig {
     JoinConfig { seed_addrs: vec![], initial_delay_ticks: 0, interval_ticks: 10, multiplier: 1, max_attempts: 0 }
 }
@@ -412,4 +449,41 @@ async fn test_dead_gossip_removes_node_from_topology() {
         !harness.query_topology_includes("node-target".into()).await,
         "Dead gossip should remove the node from the topology ring"
     );
+}
+
+
+#[tokio::test]
+async fn cluster_formation_using_join() {
+    let join_config = JoinConfig {
+        seed_addrs: vec!["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
+            .iter()
+            .map(|addr| addr.parse().unwrap())
+            .collect(),
+        initial_delay_ticks: 1,
+        interval_ticks: 1,
+        multiplier: 2,
+        max_attempts: 3,
+    };
+    let mut h1 = setup_with_config(8001, join_config.clone()).await;
+    let mut h2 = setup_with_config(8002, join_config.clone()).await;
+    let mut h3 = setup_with_config(8003, join_config.clone()).await;
+
+    let mut bridge = NetworkBridge::new();
+    bridge.add(&mut h1);
+    bridge.add(&mut h2);
+    bridge.add(&mut h3);
+    bridge.spawn();
+    
+    // Let all three actors process InitiateJoin and register their timers
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    for _ in 0..PROBE_INTERVAL_TICKS * 2 {
+        h1.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        h2.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        h3.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+    }
+
+    assert_eq!(h1.query_topology_count().await, 3);
+    assert_eq!(h2.query_topology_count().await, 3);
+    assert_eq!(h3.query_topology_count().await, 3);
 }

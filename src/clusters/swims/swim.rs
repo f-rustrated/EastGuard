@@ -177,6 +177,19 @@ impl Swim {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn handle_test_command(&self, test_command: SwimTestCommand) {
+        match test_command {
+            SwimTestCommand::TopologyValidationCount { reply } => {
+                let _ = reply.send(self.topology.num_nodes()); 
+            }
+            SwimTestCommand::TopologyIncludesNode { node_id, reply } => {
+                let _ = reply.send(self.topology.contains_node(&node_id)); 
+            }
+        }
+    }
+
+
     fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
             return;
