@@ -23,17 +23,17 @@ pub struct StartUp;
 impl StartUp {
     pub async fn run(self) -> Result<()> {
         // Create a channel for the SwimActor
-        let local_peer_addr = ENV.peer_socket_addr();
+        let peer_bind_addr = ENV.peer_bind_addr();
 
         let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            SwimTransportActor::new(local_peer_addr, swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(peer_bind_addr, swim_sender.clone(), rx_outbound).await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(
-            local_peer_addr,
+            peer_bind_addr,
             NodeId::new(ENV.resolve_node_id()),
             swim_mailbox,
             tx_outbound,
