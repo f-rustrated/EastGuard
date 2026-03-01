@@ -16,6 +16,7 @@ use crate::{
 use anyhow::Result;
 
 use tokio::{net::TcpListener, sync::mpsc};
+use tokio::net::UdpSocket;
 
 #[derive(Debug)]
 pub struct StartUp;
@@ -28,11 +29,12 @@ impl StartUp {
         let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
+        let socket = UdpSocket::bind(peer_bind_addr).await?;
         let transport =
-            SwimTransportActor::new(peer_bind_addr, swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(socket, swim_sender.clone(), rx_outbound).await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
-        let seed = ENV.seed.unwrap_or_else(rand::random);
+        let seed = ENV.random_seed.unwrap_or_else(rand::random);
         tracing::info!(seed, "simulation seed (set EASTGUARD_RANDOM_SEED to reproduce)");
 
         let swim_actor = SwimActor::new(

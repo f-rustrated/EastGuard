@@ -1,3 +1,4 @@
+use std::io;
 use crate::clusters::swims::{OutboundPacket, SwimCommand};
 
 // ==========================================
@@ -6,19 +7,39 @@ use crate::clusters::swims::{OutboundPacket, SwimCommand};
 use super::*;
 use tokio::{net::UdpSocket, sync::mpsc};
 
-pub struct SwimTransportActor {
-    socket: UdpSocket,
+pub trait UdpTransport: Send + 'static {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+impl UdpTransport for UdpSocket {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_to(buf, target).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.local_addr()
+    }
+}
+
+pub struct SwimTransportActor<S: UdpTransport> {
+    socket: S,
     to_actor: mpsc::Sender<SwimCommand>,
     from_actor: mpsc::Receiver<OutboundPacket>,
 }
 
-impl SwimTransportActor {
+impl <S: UdpTransport> SwimTransportActor<S> {
     pub async fn new(
-        bind_addr: SocketAddr,
+        socket: S, 
         to_actor: mpsc::Sender<SwimCommand>,
         from_actor: mpsc::Receiver<OutboundPacket>,
     ) -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await?;
+        // let socket = UdpSocket::bind(bind_addr).await?;
         Ok(Self {
             socket,
             to_actor,
