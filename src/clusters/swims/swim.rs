@@ -132,14 +132,6 @@ impl Swim {
         }
     }
 
-    fn schedule_join_timer(&mut self, seq: u32, addr: SocketAddr, left_attempts: u32, ticks: u32) {
-        self.pending_join_seqs.insert(seq, PendingJoin { addr, left_attempts });
-        self.pending_timer_commands.push(TimerCommand::SetSchedule {
-            seq,
-            timer: SwimTimer::join_retry(ticks),
-        });
-    }
-
     fn send_join_ping_with_retry(&mut self, addr: SocketAddr, left_attempts: u32, ticks: u32) {
         println!("[{}] → Sending join Ping to {} ({} attempt(s) left)", self.node_id, addr, left_attempts);
         let seq = self.next_seq();
@@ -153,6 +145,14 @@ impl Swim {
         self.schedule_join_timer(seq, addr, left_attempts, ticks);
     }
 
+    fn schedule_join_timer(&mut self, seq: u32, addr: SocketAddr, left_attempts: u32, ticks: u32) {
+        self.pending_join_seqs.insert(seq, PendingJoin { addr, left_attempts });
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
+            seq,
+            timer: SwimTimer::join_retry(ticks),
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
@@ -163,21 +163,13 @@ impl Swim {
                 seq,
                 target_node_id,
                 phase,
-            } => {
-                if let Some(target) = target_node_id {
-                    match phase {
-                        ProbePhase::Direct => self.start_indirect_probe(target, seq),
-                        ProbePhase::Indirect => self.try_mark_suspect(target),
-                        ProbePhase::Suspect => self.try_mark_dead(target),
-                        _ => {}
-                    }
-                } else {
-                    match phase {
-                        ProbePhase::JoinRetry => self.handle_join_retry(seq),
-                        _ => {}
-                    }
-                }
-            }
+            } => match (phase, target_node_id) {
+                (ProbePhase::Direct, Some(target))   => self.start_indirect_probe(target, seq),
+                (ProbePhase::Indirect, Some(target)) => self.try_mark_suspect(target),
+                (ProbePhase::Suspect, Some(target))  => self.try_mark_dead(target),
+                (ProbePhase::JoinRetry, None)        => self.handle_join_retry(seq),
+                _ => {}
+            },
         }
     }
 
