@@ -26,21 +26,6 @@ impl UdpTransport for UdpSocket {
     }
 }
 
-#[cfg(test)]
-impl UdpTransport for turmoil::net::UdpSocket {
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.send_to(buf, target).await
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.recv_from(buf).await
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr()
-    }
-}
-
 pub struct SwimTransportActor<S: UdpTransport> {
     socket: S,
     to_actor: mpsc::Sender<SwimCommand>,
@@ -62,7 +47,7 @@ impl <S: UdpTransport> SwimTransportActor<S> {
     }
 
     pub async fn run(mut self) {
-        println!(
+        tracing::info!(
             "Transport Layer listening on {}",
             self.socket.local_addr().unwrap()
         );
@@ -76,7 +61,7 @@ impl <S: UdpTransport> SwimTransportActor<S> {
                         Ok((packet, _)) => {
                              let _ = self.to_actor.send(SwimCommand::PacketReceived { src, packet }).await;
                         }
-                        Err(e) => eprintln!("Failed to decode packet from {}: {}", src, e),
+                        Err(e) => tracing::error!("Failed to decode packet from {}: {}", src, e),
                     }
                 }
 
@@ -86,7 +71,7 @@ impl <S: UdpTransport> SwimTransportActor<S> {
                         Ok(bytes) => {
                             let _ = self.socket.send_to(&bytes, msg.target).await;
                         }
-                        Err(e) => eprintln!("Failed to encode packet: {}", e),
+                        Err(e) => tracing::error!("Failed to encode packet: {}", e),
                     }
                 }
             }
