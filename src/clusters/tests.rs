@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,13 +48,13 @@ impl TestHarness {
 /// Routes `OutboundPacket`s between test harnesses, simulating a network.
 /// Call `add()` for every harness, then `spawn()` to start routing.
 struct NetworkBridge {
-    routes: HashMap<SocketAddr, mpsc::Sender<SwimCommand>>,
+    routes: BTreeMap<SocketAddr, mpsc::Sender<SwimCommand>>,
     inbounds: Vec<(SocketAddr, mpsc::Receiver<OutboundPacket>)>,
 }
 
 impl NetworkBridge {
     fn new() -> Self {
-        NetworkBridge { routes: HashMap::new(), inbounds: Vec::new() }
+        NetworkBridge { routes: BTreeMap::new(), inbounds: Vec::new() }
     }
 
     fn add(&mut self, harness: &mut TestHarness) {
