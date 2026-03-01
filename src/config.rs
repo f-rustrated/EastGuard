@@ -10,6 +10,9 @@ pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
+    #[arg(long, env = "EASTGUARD_SEED")]
+    pub seed: Option<u64>,
+
     #[arg(
         long,
         env = "EASTGUARD_CONFIG_DIR",
@@ -52,7 +55,7 @@ pub struct Environment {
     pub join_multiplier: u32,
 
     #[arg(long, env = "EASTGUARD_JOIN_MAX_ATTEMPTS", default_value_t = 5)]
-    pub join_max_attempts: u32
+    pub join_max_attempts: u32,
 }
 
 impl Environment {
@@ -149,6 +152,7 @@ mod tests {
 
     fn make_env() -> Environment {
         Environment {
+            seed: None,
             config_dir: "./eastguard/config".into(),
             data_dir: "./eastguard/data".into(),
             node_id: None,

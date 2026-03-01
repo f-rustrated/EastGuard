@@ -22,6 +22,7 @@ pub struct SwimActor {
 
 impl SwimActor {
     pub fn new(
+        seed: u64,
         local_addr: SocketAddr,
         node_id: NodeId,
         mailbox: mpsc::Receiver<SwimCommand>,
@@ -36,7 +37,7 @@ impl SwimActor {
                 vnodes_per_pnode: vnodes_per_node,
             },
         );
-        let state = Swim::new(node_id, local_addr, join_config, topology);
+        let state = Swim::new(seed, node_id, local_addr, join_config, topology);
 
         Self {
             mailbox,

@@ -101,6 +101,7 @@ async fn setup_with_config(
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     let actor = SwimActor::new(
+        0,
         addr,
         format!("node-local-{}", port).as_str().into(),
         rx_in,

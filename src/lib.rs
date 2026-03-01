@@ -32,7 +32,11 @@ impl StartUp {
             SwimTransportActor::new(peer_bind_addr, swim_sender.clone(), rx_outbound).await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
+        let seed = ENV.seed.unwrap_or_else(rand::random);
+        tracing::info!(seed, "simulation seed (set EASTGUARD_RANDOM_SEED to reproduce)");
+
         let swim_actor = SwimActor::new(
+            seed,
             peer_bind_addr,
             NodeId::new(ENV.resolve_node_id()),
             swim_mailbox,

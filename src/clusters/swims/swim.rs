@@ -79,6 +79,7 @@ pub struct Swim {
 
 impl Swim {
     pub fn new(
+        seed: u64,
         node_id: NodeId,
         local_addr: SocketAddr,
         join_config: JoinConfig,
@@ -90,7 +91,7 @@ impl Swim {
             incarnation: 0,
             topology,
             members: HashMap::new(),
-            live_node_tracker: LiveNodeTracker::default(),
+            live_node_tracker: LiveNodeTracker::new(seed),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
             last_suspected_seqs: HashMap::new(),
