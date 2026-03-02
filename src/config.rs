@@ -149,7 +149,7 @@ impl Environment {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
-            initial_delay_ticks: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
+            ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
             backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
             multiplier: self.join_multiplier,
             max_attempts: self.join_max_attempts,

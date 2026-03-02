@@ -155,7 +155,7 @@ impl SwimTimer {
     pub(crate) fn join_retry(join_try: JoinTry) -> Self {
         Self {
             target_node_id: None,
-            ticks_remaining: join_try.remaining_ticks,
+            ticks_remaining: join_try.ticks_for_wait,
             phase: ProbePhase::JoinRetry(join_try),
         }
     }

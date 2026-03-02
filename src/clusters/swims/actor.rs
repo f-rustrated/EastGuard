@@ -47,7 +47,7 @@ impl SwimActor {
 
     pub async fn run(mut self, join_config: JoinConfig) {
         println!("[{}] SwimActor started.", self.state.node_id);
-        self.state.initiate_join(&join_config);
+        self.state.initiate_join(join_config);
         self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {

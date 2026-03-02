@@ -73,7 +73,7 @@ impl std::borrow::Borrow<str> for NodeId {
 #[derive(Clone)]
 pub(crate) struct JoinConfig {
     pub(crate) seed_addrs: Vec<SocketAddr>,
-    pub(crate) initial_delay_ticks: u32,
+    pub(crate) ticks_for_wait: u32,
     pub(crate) backoff_ticks: u32,
     pub(crate) multiplier: u32,
     pub(crate) max_attempts: u32,
@@ -84,7 +84,7 @@ impl JoinConfig {
             .iter()
             .map(|addr| JoinTry {
                 seed_addr: *addr,
-                remaining_ticks: self.initial_delay_ticks,
+                ticks_for_wait: self.ticks_for_wait,
                 backoff_ticks: self.backoff_ticks,
                 multiplier: self.multiplier,
                 max_attempts: self.max_attempts,
@@ -97,7 +97,7 @@ impl JoinConfig {
 #[derive(Debug)]
 pub(crate) struct JoinTry {
     pub(crate) seed_addr: SocketAddr,
-    pub(crate) remaining_ticks: u32,
+    pub(crate) ticks_for_wait: u32,
     pub(crate) backoff_ticks: u32,
     pub(crate) multiplier: u32,
     pub(crate) max_attempts: u32,

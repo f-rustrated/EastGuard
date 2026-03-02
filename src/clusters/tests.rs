@@ -92,7 +92,7 @@ impl NetworkBridge {
 fn no_join_config() -> JoinConfig {
     JoinConfig {
         seed_addrs: vec![],
-        initial_delay_ticks: 0,
+        ticks_for_wait: 0,
         backoff_ticks: 10,
         multiplier: 1,
         max_attempts: 0,
@@ -487,7 +487,7 @@ async fn cluster_formation_using_join() {
             .iter()
             .map(|addr| addr.parse().unwrap())
             .collect(),
-        initial_delay_ticks: 1,
+        ticks_for_wait: 1,
         backoff_ticks: 1,
         multiplier: 2,
         max_attempts: 3,
