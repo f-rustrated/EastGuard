@@ -77,7 +77,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::swims::{ProbePhase, SwimTimeOutCallback, SwimTimer};
+    use crate::clusters::swims::{SwimTimeOutCallback, SwimTimer, SwimTimerKind};
 
     use super::*;
 
@@ -121,7 +121,7 @@ mod tests {
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
-                    phase: ProbePhase::Direct,
+                    phase: SwimTimerKind::DirectProbe,
                     ..
                 }
             )));
@@ -131,7 +131,7 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             SwimTimeOutCallback::TimedOut {
-                phase: ProbePhase::Direct,
+                phase: SwimTimerKind::DirectProbe,
                 seq: 1,
                 ..
             }
@@ -155,7 +155,7 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             SwimTimeOutCallback::TimedOut {
-                phase: ProbePhase::Indirect,
+                phase: SwimTimerKind::IndirectProbe,
                 seq: 2,
                 ..
             }
@@ -176,7 +176,7 @@ mod tests {
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
-                    phase: ProbePhase::Direct,
+                    phase: SwimTimerKind::DirectProbe,
                     ..
                 }
             )));
@@ -198,7 +198,7 @@ mod tests {
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
-                    phase: ProbePhase::Suspect,
+                    phase: SwimTimerKind::Suspect,
                     ..
                 }
             )));
@@ -209,7 +209,7 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             SwimTimeOutCallback::TimedOut {
-                phase: ProbePhase::Suspect,
+                phase: SwimTimerKind::Suspect,
                 ..
             }
         )));

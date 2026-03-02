@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::clusters::JoinTry;
+use crate::clusters::JoinAttempt;
 use crate::clusters::NodeId;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
@@ -46,7 +46,7 @@ impl SwimActor {
         }
     }
 
-    pub async fn run(mut self, bootstrap_servers: Vec<JoinTry>) {
+    pub async fn run(mut self, bootstrap_servers: Vec<JoinAttempt>) {
         tracing::info!("[{}] SwimActor started.", self.state.node_id);
         self.state.initiate_join(bootstrap_servers);
         self.flush_outbound_commands().await;

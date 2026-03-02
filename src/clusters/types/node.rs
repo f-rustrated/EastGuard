@@ -4,6 +4,7 @@ use bincode::{Decode, Encode};
 
 use crate::clusters::BINCODE_CONFIG;
 use crate::clusters::SwimNodeState::Alive;
+use crate::clusters::swims::swim::Swim;
 
 // Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -71,7 +72,7 @@ impl std::borrow::Borrow<str> for NodeId {
 }
 
 #[derive(Debug)]
-pub(crate) struct JoinTry {
+pub(crate) struct JoinAttempt {
     pub(crate) seed_addr: SocketAddr,
     pub(crate) ticks_for_wait: u32,
     pub(crate) backoff_ticks: u32,
@@ -79,7 +80,7 @@ pub(crate) struct JoinTry {
     pub(crate) max_attempts: u32,
     pub(crate) remaining_attempts: u32,
 }
-impl JoinTry {
+impl JoinAttempt {
     pub(crate) fn deduct_remaining_attempt(&mut self) {
         self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
     }
@@ -101,10 +102,10 @@ pub(crate) struct JoinConfig {
 }
 #[cfg(test)]
 impl JoinConfig {
-    pub(crate) fn tries(&self) -> Vec<JoinTry> {
+    pub(crate) fn tries(&self) -> Vec<JoinAttempt> {
         self.seed_addrs
             .iter()
-            .map(|addr| JoinTry {
+            .map(|addr| JoinAttempt {
                 seed_addr: *addr,
                 ticks_for_wait: self.ticks_for_wait,
                 backoff_ticks: self.backoff_ticks,

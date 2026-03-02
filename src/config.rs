@@ -6,7 +6,7 @@ use std::io::Write;
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::JoinTry;
+use crate::clusters::JoinAttempt;
 use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
@@ -142,11 +142,11 @@ impl Environment {
         }
     }
 
-    pub(crate) fn bootstrap_servers(&self) -> Vec<JoinTry> {
+    pub(crate) fn bootstrap_servers(&self) -> Vec<JoinAttempt> {
         self.join_seed_nodes
             .iter()
             .filter_map(|s| s.parse().ok())
-            .map(|addr| JoinTry {
+            .map(|addr| JoinAttempt {
                 seed_addr: addr,
                 ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
                 backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
