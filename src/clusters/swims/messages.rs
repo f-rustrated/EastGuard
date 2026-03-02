@@ -92,7 +92,7 @@ impl OutboundPacket {
 }
 
 #[derive(Debug)]
-pub(crate) struct SwimTimer {
+pub struct SwimTimer {
     target_node_id: Option<NodeId>,
     phase: ProbePhase,
     ticks_remaining: u32,

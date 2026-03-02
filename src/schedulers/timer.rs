@@ -3,7 +3,7 @@ use std::fmt::Debug;
 #[cfg(test)]
 use crate::clusters::NodeId;
 
-pub(crate) trait TTimer: Debug + Send + Sync + 'static {
+pub trait TTimer: Debug + Send + Sync + 'static {
     type Callback: Default;
 
     fn tick(&mut self) -> u32;

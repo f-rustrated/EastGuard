@@ -1,4 +1,4 @@
-pub(crate) mod actor;
+pub mod actor;
 mod gossip_buffer;
 mod livenode_tracker;
 mod messages;
@@ -7,7 +7,7 @@ mod topology;
 
 use gossip_buffer::*;
 use livenode_tracker::*;
-pub(crate) use messages::*;
+pub use messages::*;
 
 #[cfg(test)]
 pub use topology::*;

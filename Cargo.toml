@@ -19,3 +19,5 @@ tempfile = "3"
 serial_test = "3.3.1"
 turmoil = { version = "0.7.1" }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+mad-turmoil = "0.2"
+rand_sim = { version = "0.10", package = "rand" }

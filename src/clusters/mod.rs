@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
-pub(crate) mod swims;
-pub(crate) mod transport;
+pub mod swims;
+pub mod transport;
 mod types;
 
-pub(crate) use types::node::*;
+pub use types::node::*;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 

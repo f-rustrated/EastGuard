@@ -1,10 +1,8 @@
 mod config;
 mod connections;
 
-mod clusters;
-pub(crate) mod schedulers;
-#[cfg(test)]
-mod tests;
+pub mod clusters;
+pub mod schedulers;
 
 use crate::schedulers::actor::{run_scheduling_actor, TICK_PERIOD_MS};
 use crate::{
