@@ -5,6 +5,9 @@ use std::io::Write;
 
 use clap::Parser;
 use uuid::Uuid;
+
+use crate::clusters::JoinConfig;
+use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug)]
@@ -52,7 +55,7 @@ pub struct Environment {
     pub join_multiplier: u32,
 
     #[arg(long, env = "EASTGUARD_JOIN_MAX_ATTEMPTS", default_value_t = 5)]
-    pub join_max_attempts: u32
+    pub join_max_attempts: u32,
 }
 
 impl Environment {
@@ -136,6 +139,20 @@ impl Environment {
                 eprintln!("Warning: failed to create node_id file '{}': {}", path, e);
                 new_id
             }
+        }
+    }
+
+    pub(crate) fn build_join_config(&self) -> JoinConfig {
+        JoinConfig {
+            seed_addrs: self
+                .join_seed_nodes
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
+            initial_delay_ticks: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
+            interval_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
+            multiplier: self.join_multiplier,
+            max_attempts: self.join_max_attempts,
         }
     }
 }
