@@ -107,7 +107,7 @@ impl Topology {
         }
     }
 
-    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: SwimNodeState) {
+    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: &SwimNodeState) {
         match state {
             SwimNodeState::Alive => {
                 self.insert_node(node_id, PhysicalNodeMetadata { address: addr });

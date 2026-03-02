@@ -412,7 +412,6 @@ impl Swim {
             );
         }
     }
-
     fn update_member(
         &mut self,
         node_id: NodeId,
@@ -420,55 +419,52 @@ impl Swim {
         state: SwimNodeState,
         incarnation: u64,
     ) {
-        let (new_state, changed) = match self.members.entry(node_id.clone()) {
+        let (changed, member) = match self.members.entry(node_id.clone()) {
             Entry::Vacant(e) => {
-                e.insert(SwimNode {
+                let node = SwimNode {
                     node_id: node_id.clone(),
                     addr,
                     state,
                     incarnation,
-                });
+                };
+                e.insert(node.clone());
 
-                (state, true)
+                (true, node)
             }
 
-            Entry::Occupied(e) => {
-                let entry = e.into_mut();
-                let old_state = entry.state;
-                let old_inc = entry.incarnation;
+            Entry::Occupied(mut e) => {
+                let node = e.get_mut();
+
+                // Dead is a terminal state.
+                // If it's dead, ignore the update and exit the function entirely.
+                // After this "tombstone" period, the node is deleted from the HashMap entirely
+                // To join the cluster again, a node should join it with new node ID.
+                if node.state == SwimNodeState::Dead {
+                    return;
+                }
+
+                let old_state = node.state;
+                let old_inc = node.incarnation;
 
                 // RULE: Higher incarnation always wins.
-                // TODO: Per the original SWIM paper, Dead is a terminal state — a Dead node
-                // should never be resurrected by a higher incarnation number. The current
-                // implementation allows it, which deviates from the spec. Fix by adding a
-                // guard: `if entry.state == Dead { return; }` before this block.
-                if incarnation > entry.incarnation {
-                    entry.incarnation = incarnation;
-                    entry.state = state;
+                if incarnation > node.incarnation {
+                    node.incarnation = incarnation;
+                    node.state = state;
                 }
                 // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
-                else if incarnation == entry.incarnation {
-                    match (&entry.state, &state) {
-                        (SwimNodeState::Alive, SwimNodeState::Suspect) => {
-                            entry.state = SwimNodeState::Suspect
-                        }
-                        (SwimNodeState::Alive, SwimNodeState::Dead) => {
-                            entry.state = SwimNodeState::Dead
-                        }
-                        (SwimNodeState::Suspect, SwimNodeState::Dead) => {
-                            entry.state = SwimNodeState::Dead
-                        }
-                        _ => {}
-                    }
+                else if incarnation == node.incarnation {
+                    // Requires `SwimNodeState` to derive `PartialOrd, Ord`
+                    node.state = node.state.max(state);
                 }
 
-                let changed = entry.state != old_state || entry.incarnation != old_inc;
-                (entry.state, changed)
+                let changed = node.state != old_state || node.incarnation != old_inc;
+                (changed, node.clone())
             }
         };
 
-        self.live_node_tracker.update(node_id.clone(), new_state);
-        self.topology.update(node_id.clone(), addr, new_state);
+        self.live_node_tracker
+            .update(node_id.clone(), &member.state);
+        self.topology.update(node_id.clone(), addr, &member.state);
 
         if changed {
             tracing::info!(
@@ -476,13 +472,11 @@ impl Swim {
                 self.node_id,
                 node_id,
                 addr,
-                new_state,
+                member.state,
                 incarnation
             );
-            let member = self.members[&node_id].clone();
-            self.gossip_buffer.enqueue(member, self.members.len());
 
-            if new_state == SwimNodeState::Suspect {
+            if member.state == SwimNodeState::Suspect {
                 let seq = self.next_seq();
                 self.last_suspected_seqs.insert(node_id.clone(), seq);
                 self.pending_timer_commands.push(TimerCommand::SetSchedule {
@@ -490,6 +484,8 @@ impl Swim {
                     timer: SwimTimer::suspect_timer(node_id),
                 });
             }
+
+            self.gossip_buffer.enqueue(member, self.members.len());
         }
     }
 
