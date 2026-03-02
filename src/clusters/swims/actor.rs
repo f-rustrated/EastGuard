@@ -1,9 +1,9 @@
 use super::*;
 
-use crate::clusters::{JoinConfig, NodeId};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
+use crate::clusters::{JoinConfig, NodeId};
 use crate::schedulers::ticker_message::TickerCommand;
 
 use std::net::SocketAddr;
@@ -28,7 +28,6 @@ impl SwimActor {
         transport_tx: mpsc::Sender<OutboundPacket>,
         ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         vnodes_per_node: u64,
-        join_config: JoinConfig,
     ) -> Self {
         let topology = Topology::new(
             Default::default(),
@@ -36,7 +35,7 @@ impl SwimActor {
                 vnodes_per_pnode: vnodes_per_node,
             },
         );
-        let state = Swim::new(node_id, local_addr, join_config, topology);
+        let state = Swim::new(node_id, local_addr, topology);
 
         Self {
             mailbox,
@@ -46,9 +45,9 @@ impl SwimActor {
         }
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self, join_config: JoinConfig) {
         println!("[{}] SwimActor started.", self.state.node_id);
-        self.state.initiate_join(); 
+        self.state.initiate_join(&join_config);
         self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {
@@ -66,9 +65,7 @@ impl SwimActor {
                 self.state.handle_timeout(tick_event);
             }
             #[cfg(test)]
-            SwimCommand::Test(test_command) => {
-                self.state.handle_test_command(test_command)
-            }
+            SwimCommand::Test(test_command) => self.state.handle_test_command(test_command),
         }
 
         self.flush_outbound_commands().await;

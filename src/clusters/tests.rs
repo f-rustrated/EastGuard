@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::clusters::{JoinConfig, swims::actor::SwimActor};
 use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer};
+use crate::clusters::{JoinConfig, swims::actor::SwimActor};
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
@@ -26,7 +26,9 @@ impl TestHarness {
     pub async fn query_topology_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Test(SwimTestCommand::TopologyValidationCount { reply: tx }))
+            .send(SwimCommand::Test(
+                SwimTestCommand::TopologyValidationCount { reply: tx },
+            ))
             .await
             .unwrap();
         rx.await.unwrap()
@@ -37,7 +39,7 @@ impl TestHarness {
         self.tx_in
             .send(SwimCommand::Test(SwimTestCommand::TopologyIncludesNode {
                 node_id,
-                reply: tx
+                reply: tx,
             }))
             .await
             .unwrap();
@@ -54,12 +56,16 @@ struct NetworkBridge {
 
 impl NetworkBridge {
     fn new() -> Self {
-        NetworkBridge { routes: HashMap::new(), inbounds: Vec::new() }
+        NetworkBridge {
+            routes: HashMap::new(),
+            inbounds: Vec::new(),
+        }
     }
 
     fn add(&mut self, harness: &mut TestHarness) {
         let rx = harness.rx_out.take().expect("rx_out already taken");
-        self.routes.insert(harness.local_addr, harness.tx_in.clone());
+        self.routes
+            .insert(harness.local_addr, harness.tx_in.clone());
         self.inbounds.push((harness.local_addr, rx));
     }
 
@@ -70,10 +76,12 @@ impl NetworkBridge {
             tokio::spawn(async move {
                 while let Some(pkt) = rx.recv().await {
                     if let Some(tx) = routes.get(&pkt.target) {
-                        let _ = tx.send(SwimCommand::PacketReceived {
-                            src: sender_addr,
-                            packet: pkt.packet().clone(),
-                        }).await;
+                        let _ = tx
+                            .send(SwimCommand::PacketReceived {
+                                src: sender_addr,
+                                packet: pkt.packet().clone(),
+                            })
+                            .await;
                     }
                 }
             });
@@ -82,7 +90,13 @@ impl NetworkBridge {
 }
 
 fn no_join_config() -> JoinConfig {
-    JoinConfig { seed_addrs: vec![], initial_delay_ticks: 0, interval_ticks: 10, multiplier: 1, max_attempts: 0 }
+    JoinConfig {
+        seed_addrs: vec![],
+        initial_delay_ticks: 0,
+        backoff_ticks: 10,
+        multiplier: 1,
+        max_attempts: 0,
+    }
 }
 
 // Helper to setup the test environment
@@ -90,10 +104,7 @@ async fn setup_single() -> TestHarness {
     setup_with_config(8000, no_join_config()).await
 }
 
-async fn setup_with_config(
-    port: u32,
-    join_config: JoinConfig,
-) -> TestHarness {
+async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
@@ -107,11 +118,10 @@ async fn setup_with_config(
         tx_out.clone(),
         ticker_tx.clone(),
         256,
-        join_config.clone(),
     );
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
-    tokio::spawn(actor.run());
+    tokio::spawn(actor.run(join_config.clone()));
 
     TestHarness {
         tx_in,
@@ -122,7 +132,6 @@ async fn setup_with_config(
         config: join_config,
     }
 }
-
 
 #[tokio::test]
 async fn test_ping_response() {
@@ -138,10 +147,12 @@ async fn test_ping_response() {
         gossip: vec![],
     };
 
-    harness.tx_in.send(SwimCommand::PacketReceived {
-        src: remote_addr,
-        packet: ping,
-    })
+    harness
+        .tx_in
+        .send(SwimCommand::PacketReceived {
+            src: remote_addr,
+            packet: ping,
+        })
         .await
         .unwrap();
 
@@ -180,10 +191,12 @@ async fn test_refutation_mechanism() {
         gossip: vec![lie],
     };
 
-    harness.tx_in.send(SwimCommand::PacketReceived {
-        src: remote_addr,
-        packet: ping,
-    })
+    harness
+        .tx_in
+        .send(SwimCommand::PacketReceived {
+            src: remote_addr,
+            packet: ping,
+        })
         .await
         .unwrap();
 
@@ -220,15 +233,17 @@ async fn test_gossip_propagation() {
         incarnation: 5,
     };
 
-    harness.tx_in.send(SwimCommand::PacketReceived {
-        src: sender_addr,
-        packet: SwimPacket::Ping {
-            seq: 300,
-            source_node_id: "node-sender".into(),
-            source_incarnation: 0,
-            gossip: vec![gossip_msg],
-        },
-    })
+    harness
+        .tx_in
+        .send(SwimCommand::PacketReceived {
+            src: sender_addr,
+            packet: SwimPacket::Ping {
+                seq: 300,
+                source_node_id: "node-sender".into(),
+                source_incarnation: 0,
+                gossip: vec![gossip_msg],
+            },
+        })
         .await
         .unwrap();
 
@@ -238,15 +253,17 @@ async fn test_gossip_propagation() {
 
     for i in 0..5 {
         // Send a fresh probe
-        harness.tx_in.send(SwimCommand::PacketReceived {
-            src: probe_addr,
-            packet: SwimPacket::Ping {
-                seq: 400 + i, // Increment seq to keep packets distinct
-                source_node_id: "node-probe".into(),
-                source_incarnation: 0,
-                gossip: vec![],
-            },
-        })
+        harness
+            .tx_in
+            .send(SwimCommand::PacketReceived {
+                src: probe_addr,
+                packet: SwimPacket::Ping {
+                    seq: 400 + i, // Increment seq to keep packets distinct
+                    source_node_id: "node-probe".into(),
+                    source_incarnation: 0,
+                    gossip: vec![],
+                },
+            })
             .await
             .unwrap();
 
@@ -297,15 +314,17 @@ async fn test_indirect_ping_trigger() {
         incarnation: 1,
     };
 
-    harness.tx_in.send(SwimCommand::PacketReceived {
-        src: peer_1,
-        packet: SwimPacket::Ping {
-            seq: 1,
-            source_node_id: "node-peer-1".into(),
-            source_incarnation: 1,
-            gossip: vec![p1, p2],
-        },
-    })
+    harness
+        .tx_in
+        .send(SwimCommand::PacketReceived {
+            src: peer_1,
+            packet: SwimPacket::Ping {
+                seq: 1,
+                source_node_id: "node-peer-1".into(),
+                source_incarnation: 1,
+                gossip: vec![p1, p2],
+            },
+        })
         .await
         .unwrap();
 
@@ -318,7 +337,11 @@ async fn test_indirect_ping_trigger() {
     let mut target_addr = None;
     for _ in 0..3 {
         for _ in 0..PROBE_INTERVAL_TICKS {
-            harness.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+            harness
+                .ticker_tx
+                .send(TickerCommand::ForceTick)
+                .await
+                .unwrap();
         }
         match time::timeout(Duration::from_millis(100), rx_out.recv()).await {
             Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping { .. }) => {
@@ -333,7 +356,11 @@ async fn test_indirect_ping_trigger() {
     // 3. DON'T send an Ack. Force-tick DIRECT_ACK_TIMEOUT_TICKS times so the
     //    direct probe timeout and the state machine transitions to indirect probing.
     for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-        harness.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        harness
+            .ticker_tx
+            .send(TickerCommand::ForceTick)
+            .await
+            .unwrap();
     }
 
     // 4. Expect Indirect Pings (PingReq) sent to the *other* peer
@@ -355,13 +382,14 @@ async fn test_indirect_ping_trigger() {
     }
 }
 
-
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
     let mut harness = setup_single().await;
 
     assert!(
-        harness.query_topology_includes("node-local-8000".into()).await,
+        harness
+            .query_topology_includes("node-local-8000".into())
+            .await,
         "SwimActor should register itself in the topology ring on startup"
     );
 }
@@ -371,8 +399,9 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let mut harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let _ = harness.tx_in.send(
-        SwimCommand::PacketReceived {
+    let _ = harness
+        .tx_in
+        .send(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
                 seq: 1,
@@ -385,8 +414,8 @@ async fn test_alive_gossip_adds_node_to_topology() {
                     incarnation: 1,
                 }],
             },
-        }
-    ).await;
+        })
+        .await;
 
     assert!(
         harness.query_topology_includes("node-new".into()).await,
@@ -402,7 +431,8 @@ async fn test_dead_gossip_removes_node_from_topology() {
 
     {
         // Step 1: add the node via Alive gossip
-        let _ = harness.tx_in
+        let _ = harness
+            .tx_in
             .send(SwimCommand::PacketReceived {
                 src: sender_addr,
                 packet: SwimPacket::Ping {
@@ -426,7 +456,8 @@ async fn test_dead_gossip_removes_node_from_topology() {
     );
 
     // Step 2: mark the node as Dead via gossip
-    let _ = harness.tx_in
+    let _ = harness
+        .tx_in
         .send(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping {
@@ -449,7 +480,6 @@ async fn test_dead_gossip_removes_node_from_topology() {
     );
 }
 
-
 #[tokio::test]
 async fn cluster_formation_using_join() {
     let join_config = JoinConfig {
@@ -458,7 +488,7 @@ async fn cluster_formation_using_join() {
             .map(|addr| addr.parse().unwrap())
             .collect(),
         initial_delay_ticks: 1,
-        interval_ticks: 1,
+        backoff_ticks: 1,
         multiplier: 2,
         max_attempts: 3,
     };

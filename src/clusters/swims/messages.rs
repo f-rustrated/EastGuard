@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
-use tokio::sync::oneshot;
-use crate::clusters::{NodeId, SwimNode};
+use crate::clusters::{JoinTry, NodeId, SwimNode};
 use crate::schedulers::{
     ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
     timer::TTimer,
 };
+use bincode::{Decode, Encode};
+use tokio::sync::oneshot;
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
@@ -35,18 +35,26 @@ pub enum SwimPacket {
 #[derive(Debug)]
 pub enum SwimCommand {
     // From Transport
-    PacketReceived { src: SocketAddr, packet: SwimPacket },
+    PacketReceived {
+        src: SocketAddr,
+        packet: SwimPacket,
+    },
     // From Ticker
     Timeout(SwimTimeOutCallback),
     #[cfg(test)]
-    Test(SwimTestCommand)
+    Test(SwimTestCommand),
 }
 
 #[cfg(test)]
 #[derive(Debug)]
 pub enum SwimTestCommand {
-    TopologyValidationCount { reply: oneshot::Sender<usize> },
-    TopologyIncludesNode { node_id: NodeId, reply: oneshot::Sender<bool> }
+    TopologyValidationCount {
+        reply: oneshot::Sender<usize>,
+    },
+    TopologyIncludesNode {
+        node_id: NodeId,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {
@@ -71,7 +79,7 @@ pub(crate) enum ProbePhase {
     Direct,
     Indirect,
     Suspect,
-    JoinRetry
+    JoinRetry(JoinTry),
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -120,14 +128,6 @@ impl TTimer for SwimTimer {
     }
 }
 impl SwimTimer {
-    pub(crate) fn join_retry(ticks_remaining: u32) -> Self {
-        Self {
-            target_node_id: None,
-            phase: ProbePhase::JoinRetry,
-            ticks_remaining
-        }
-    }
-
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {
             target_node_id: Some(target),
@@ -149,6 +149,14 @@ impl SwimTimer {
             target_node_id: Some(target),
             phase: ProbePhase::Suspect,
             ticks_remaining: SUSPECT_TIMEOUT_TICKS,
+        }
+    }
+
+    pub(crate) fn join_retry(join_try: JoinTry) -> Self {
+        Self {
+            target_node_id: None,
+            ticks_remaining: join_try.remaining_ticks,
+            phase: ProbePhase::JoinRetry(join_try),
         }
     }
 }

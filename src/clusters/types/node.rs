@@ -74,12 +74,37 @@ impl std::borrow::Borrow<str> for NodeId {
 pub(crate) struct JoinConfig {
     pub(crate) seed_addrs: Vec<SocketAddr>,
     pub(crate) initial_delay_ticks: u32,
-    pub(crate) interval_ticks: u32,
+    pub(crate) backoff_ticks: u32,
     pub(crate) multiplier: u32,
-    pub(crate) max_attempts: u32
+    pub(crate) max_attempts: u32,
+}
+impl JoinConfig {
+    pub(crate) fn tries(&self) -> Vec<JoinTry> {
+        self.seed_addrs
+            .iter()
+            .map(|addr| JoinTry {
+                seed_addr: *addr,
+                remaining_ticks: self.initial_delay_ticks,
+                backoff_ticks: self.backoff_ticks,
+                multiplier: self.multiplier,
+                max_attempts: self.max_attempts,
+                remaining_attempts: self.max_attempts,
+            })
+            .collect()
+    }
 }
 
-pub(crate) struct PendingJoin {
-    pub(crate) addr: SocketAddr,
-    pub(crate) left_attempts: u32
+#[derive(Debug)]
+pub(crate) struct JoinTry {
+    pub(crate) seed_addr: SocketAddr,
+    pub(crate) remaining_ticks: u32,
+    pub(crate) backoff_ticks: u32,
+    pub(crate) multiplier: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) remaining_attempts: u32,
+}
+impl JoinTry {
+    pub(crate) fn deduct_remaining_attempt(&mut self) {
+        self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
+    }
 }

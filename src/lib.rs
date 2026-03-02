@@ -39,13 +39,12 @@ impl StartUp {
             tx_outbound,
             ticker_cmd_tx.clone(),
             ENV.vnodes_per_node,
-            ENV.build_join_config(),
         );
 
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
         tokio::spawn(transport.run());
-        tokio::spawn(swim_actor.run());
+        tokio::spawn(swim_actor.run(ENV.build_join_config()));
 
         // run handlers
         let _ = self.receive_client_streams().await;
