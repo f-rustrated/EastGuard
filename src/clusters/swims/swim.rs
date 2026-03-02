@@ -103,23 +103,19 @@ impl Swim {
             .filter(|t| t.seed_addr != self.local_addr)
             .collect::<Vec<_>>()
         {
-            self.send_join_ping_with_retry(join_try);
+            tracing::info!(
+                "[{}] → Sending join Ping to {} ({} attempt(s) left)",
+                self.node_id,
+                join_try.seed_addr,
+                join_try.remaining_attempts
+            );
+            let seq = self.next_seq();
+            if join_try.ticks_for_wait == 0 && join_try.max_attempts > 0 {
+                self.handle_join_retry(join_try, Some(seq));
+                return;
+            }
+            self.schedule_join_timer(seq, join_try);
         }
-    }
-
-    pub(crate) fn send_join_ping_with_retry(&mut self, join_try: JoinTry) {
-        tracing::info!(
-            "[{}] → Sending join Ping to {} ({} attempt(s) left)",
-            self.node_id,
-            join_try.seed_addr,
-            join_try.remaining_attempts
-        );
-        let seq = self.next_seq();
-        if join_try.ticks_for_wait == 0 && join_try.max_attempts > 0 {
-            self.handle_join_retry(join_try, Some(seq));
-            return;
-        }
-        self.schedule_join_timer(seq, join_try);
     }
 
     fn handle_join_retry(&mut self, mut join_try: JoinTry, seq: Option<u32>) {
