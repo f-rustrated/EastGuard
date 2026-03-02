@@ -24,7 +24,6 @@ impl SwimActor {
         Self {
             mailbox,
             transport_tx,
-
             scheduler_tx: ticker_tx,
         }
     }
