@@ -11,8 +11,7 @@ use gossip_buffer::*;
 use livenode_tracker::*;
 pub(crate) use messages::*;
 
-#[cfg(test)]
-pub use topology::*;
+pub(crate) use topology::*;
 
 #[cfg(test)]
 pub mod common {

@@ -6,7 +6,10 @@ use std::io::Write;
 use clap::Parser;
 use uuid::Uuid;
 
+use crate::clusters::NodeId;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
+use crate::clusters::swims::swim::Swim;
+use crate::clusters::swims::{Topology, TopologyConfig};
 use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
@@ -155,6 +158,19 @@ impl Environment {
                 remaining_attempts: self.join_max_attempts,
             })
             .collect()
+    }
+
+    pub(crate) fn swim(&self) -> Swim {
+        Swim::new(
+            NodeId::new(self.resolve_node_id()),
+            self.peer_bind_addr(),
+            Topology::new(
+                Default::default(),
+                TopologyConfig {
+                    vnodes_per_pnode: self.vnodes_per_node,
+                },
+            ),
+        )
     }
 }
 

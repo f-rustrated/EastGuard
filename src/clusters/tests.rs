@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
-use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer};
+use crate::clusters::swims::swim::Swim;
+use crate::clusters::swims::{
+    OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer, Topology, TopologyConfig,
+};
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
@@ -112,20 +115,21 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let mut actor = SwimActor::new(
+    let mut swim = Swim::new(
+        NodeId::new(format!("node-local-{}", port).as_str()),
         addr,
-        format!("node-local-{}", port).as_str().into(),
-        rx_in,
-        tx_out.clone(),
-        ticker_tx.clone(),
-        256,
+        Topology::new(
+            Default::default(),
+            TopologyConfig {
+                vnodes_per_pnode: 256,
+            },
+        ),
     );
+    let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone());
+    Bootstrapper::new(join_config.tries(), &mut swim);
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
-    tokio::spawn({
-        Bootstrapper::new(join_config.tries(), &mut actor.state).bootstrap();
-        actor.run()
-    });
+    tokio::spawn(actor.run(swim));
 
     TestHarness {
         tx_in,
@@ -400,7 +404,7 @@ async fn test_self_registers_in_topology_on_startup() {
 
 #[tokio::test]
 async fn test_alive_gossip_adds_node_to_topology() {
-    let mut harness = setup_single().await;
+    let harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let _ = harness
