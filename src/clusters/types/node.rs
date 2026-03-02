@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bincode::{Decode, Encode};
 
@@ -37,17 +38,17 @@ impl SwimNode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
-pub struct NodeId(String);
+pub struct NodeId(Arc<str>);
 
 impl NodeId {
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+        Self(id.into().into())
     }
 }
 
 impl From<&str> for NodeId {
     fn from(s: &str) -> Self {
-        Self(s.to_owned())
+        Self(s.into())
     }
 }
 

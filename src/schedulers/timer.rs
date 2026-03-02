@@ -10,5 +10,5 @@ pub(crate) trait TTimer: Debug + Send + Sync + 'static {
     fn to_timeout_callback(self, id: u32) -> Self::Callback;
 
     #[cfg(test)]
-    fn target_node_id(&self) -> NodeId;
+    fn target_node_id(&self) -> Option<NodeId>;
 }

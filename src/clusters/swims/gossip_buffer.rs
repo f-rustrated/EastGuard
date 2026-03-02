@@ -23,7 +23,12 @@ impl GossipBuffer {
     pub(super) fn enqueue(&mut self, member: SwimNode, cluster_size: usize) {
         if member.encoded_size() > MAX_GOSSIP_BYTES {
             // TODO Log an error or return a Result::Err here.
-            eprintln!("Single member should never exceed the packet size limit");
+            tracing::error!(
+                node_id = ?member.node_id,
+                size = member.encoded_size(),
+                limit = MAX_GOSSIP_BYTES,
+                "Poison pill detected: Single member exceeds the packet size limit. Dropping update."
+            );
 
             return;
         }
@@ -42,6 +47,10 @@ impl GossipBuffer {
         if self.entries.len() >= MAX_ENTRIES {
             // Because the Vec is always sorted descending by `remaining`,
             // the least-used entry is ALWAYS at the very end.
+            tracing::warn!(
+                max_entries = MAX_ENTRIES,
+                "Gossip buffer full! Evicting the oldest entry prematurely."
+            );
             self.entries.pop();
         }
 
@@ -58,23 +67,16 @@ impl GossipBuffer {
     pub(super) fn collect(&mut self) -> Vec<SwimNode> {
         let mut result = Vec::new();
         let mut total_bytes = 0usize;
-        let mut included_count = 0;
 
-        for entry in &self.entries {
+        for entry in self.entries.iter_mut() {
             let size = entry.member.encoded_size();
             if total_bytes + size > MAX_GOSSIP_BYTES {
-                // If a single Member's encoded size is strictly greater than MAX_GOSSIP_BYTES
-                // (e.g., a 1000-byte member with a 900-byte limit),
-                // it acts as a poison pill and will quietly bring the entire gossip protocol to a halt.
-                // that's why we need to deny in enqueue.
+                // Buffer is full. Since we enforce MAX_GOSSIP_BYTES limits
+                // at the enqueue stage, we won't get stuck on a poison pill here.
                 break;
             }
             total_bytes += size;
             result.push(entry.member.clone());
-            included_count += 1;
-        }
-
-        for entry in self.entries.iter_mut().take(included_count) {
             entry.remaining = entry.remaining.saturating_sub(1);
         }
 

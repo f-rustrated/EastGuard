@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeId, SwimNode, SwimNodeState};
@@ -55,7 +56,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    local_addr: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
     incarnation: u64,
 
     // Protocol state
@@ -97,6 +98,26 @@ impl Swim {
         swim
     }
 
+    pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
+        let seq = self.next_seq();
+        let ping = SwimPacket::Ping {
+            seq,
+            source_node_id: self.node_id.clone(),
+            source_incarnation: self.incarnation,
+            gossip: self.gossip_buffer.collect(),
+        };
+        self.pending_outbound
+            .push(OutboundPacket::new(attempt.seed_addr, ping));
+
+        attempt.reset_next_ticks_for_wait();
+        attempt.deduct_remaining_attempt();
+
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
+            seq,
+            timer: SwimTimer::join_try(attempt),
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
@@ -107,11 +128,37 @@ impl Swim {
                 seq,
                 target_node_id,
                 phase,
-            } => match phase {
-                ProbePhase::Direct => self.start_indirect_probe(target_node_id, seq),
-                ProbePhase::Indirect => self.try_mark_suspect(target_node_id),
-                ProbePhase::Suspect => self.try_mark_dead(target_node_id),
+            } => match (phase, target_node_id) {
+                (SwimTimerKind::DirectProbe, Some(target)) => {
+                    self.start_indirect_probe(target, seq)
+                }
+                (SwimTimerKind::IndirectProbe, Some(target)) => self.try_mark_suspect(target),
+                (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target),
+                (SwimTimerKind::JoinTry(join_attempt), None) => {
+                    if join_attempt.remaining_attempts == 0 {
+                        tracing::warn!(
+                            "[{}] Join to {} exhausted all attempts — giving up",
+                            self.node_id,
+                            join_attempt.seed_addr
+                        );
+                        return;
+                    }
+                    self.handle_join(join_attempt);
+                }
+                _ => {}
             },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_test_command(&self, test_command: SwimTestCommand) {
+        match test_command {
+            SwimTestCommand::TopologyValidationCount { reply } => {
+                let _ = reply.send(self.topology.num_nodes());
+            }
+            SwimTestCommand::TopologyIncludesNode { node_id, reply } => {
+                let _ = reply.send(self.topology.contains_node(&node_id));
+            }
         }
     }
 
@@ -157,19 +204,24 @@ impl Swim {
             None => return,
         };
 
-        let mut peer_addrs = Vec::new();
+        // * OPT : pre-allocation
+        let mut peer_addrs = Vec::with_capacity(INDIRECT_PING_COUNT);
+
         for _ in 0..self.live_node_tracker.len() {
-            if peer_addrs.len() >= INDIRECT_PING_COUNT {
+            let Some(peer_node_id) = self.live_node_tracker.next() else {
                 break;
+            };
+
+            if peer_node_id == target_node_id || peer_node_id == self.node_id {
+                continue;
             }
 
-            if let Some(peer_node_id) = self.live_node_tracker.next() {
-                if peer_node_id == target_node_id || peer_node_id == self.node_id {
-                    continue;
-                }
+            if let Some(peer_member) = self.members.get(&peer_node_id) {
+                peer_addrs.push(peer_member.addr);
 
-                if let Some(peer_addr) = self.members.get(&peer_node_id).map(|m| m.addr) {
-                    peer_addrs.push(peer_addr);
+                // * OPT : Check length ONLY after a successful insertion
+                if peer_addrs.len() == INDIRECT_PING_COUNT {
+                    break;
                 }
             }
         }
@@ -243,6 +295,13 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
+                tracing::info!(
+                    "[{}] ← Received Ping from {} ({}) seq={}",
+                    self.node_id,
+                    source_node_id,
+                    src,
+                    seq
+                );
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 let ack = SwimPacket::Ack {
                     seq,
@@ -260,6 +319,13 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
+                tracing::info!(
+                    "[{}] ← Received Ack  from {} ({}) seq={}",
+                    self.node_id,
+                    source_node_id,
+                    src,
+                    seq
+                );
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
@@ -351,7 +417,6 @@ impl Swim {
             );
         }
     }
-
     fn update_member(
         &mut self,
         node_id: NodeId,
@@ -359,61 +424,64 @@ impl Swim {
         state: SwimNodeState,
         incarnation: u64,
     ) {
-        let (new_state, changed) = match self.members.entry(node_id.clone()) {
+        let (changed, member) = match self.members.entry(node_id.clone()) {
             Entry::Vacant(e) => {
-                e.insert(SwimNode {
+                let node = SwimNode {
                     node_id: node_id.clone(),
                     addr,
                     state,
                     incarnation,
-                });
+                };
+                e.insert(node.clone());
 
-                (state, true)
+                (true, node)
             }
 
-            Entry::Occupied(e) => {
-                let entry = e.into_mut();
-                let old_state = entry.state;
-                let old_inc = entry.incarnation;
+            Entry::Occupied(mut e) => {
+                let node = e.get_mut();
+
+                // Dead is a terminal state.
+                // If it's dead, ignore the update and exit the function entirely.
+                // After this "tombstone" period, the node is deleted from the HashMap entirely
+                // To join the cluster again, a node should join it with new node ID.
+                if node.state == SwimNodeState::Dead {
+                    return;
+                }
+
+                let old_state = node.state;
+                let old_inc = node.incarnation;
 
                 // RULE: Higher incarnation always wins.
-                // TODO: Per the original SWIM paper, Dead is a terminal state — a Dead node
-                // should never be resurrected by a higher incarnation number. The current
-                // implementation allows it, which deviates from the spec. Fix by adding a
-                // guard: `if entry.state == Dead { return; }` before this block.
-                if incarnation > entry.incarnation {
-                    entry.incarnation = incarnation;
-                    entry.state = state;
+                if incarnation > node.incarnation {
+                    node.incarnation = incarnation;
+                    node.state = state;
                 }
                 // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
-                else if incarnation == entry.incarnation {
-                    match (&entry.state, &state) {
-                        (SwimNodeState::Alive, SwimNodeState::Suspect) => {
-                            entry.state = SwimNodeState::Suspect
-                        }
-                        (SwimNodeState::Alive, SwimNodeState::Dead) => {
-                            entry.state = SwimNodeState::Dead
-                        }
-                        (SwimNodeState::Suspect, SwimNodeState::Dead) => {
-                            entry.state = SwimNodeState::Dead
-                        }
-                        _ => {}
-                    }
+                else if incarnation == node.incarnation {
+                    // Requires `SwimNodeState` to derive `PartialOrd, Ord`
+                    node.state = node.state.max(state);
                 }
 
-                let changed = entry.state != old_state || entry.incarnation != old_inc;
-                (entry.state, changed)
+                let changed = node.state != old_state || node.incarnation != old_inc;
+                (changed, node.clone())
             }
         };
 
-        self.live_node_tracker.update(node_id.clone(), new_state);
-        self.topology.update(node_id.clone(), addr, new_state);
+        self.live_node_tracker
+            .update(node_id.clone(), &member.state);
+        self.topology.update(node_id.clone(), addr, &member.state);
 
         if changed {
-            let member = self.members[&node_id].clone();
-            self.gossip_buffer.enqueue(member, self.members.len());
+            tracing::info!(
+                "[{}] Member update: {} @ {} → {:?} (inc {})",
+                self.node_id,
+                node_id,
+                addr,
+                member.state,
+                incarnation
+            );
 
-            if new_state == SwimNodeState::Suspect {
+            if member.state == SwimNodeState::Suspect {
                 let seq = self.next_seq();
                 self.last_suspected_seqs.insert(node_id.clone(), seq);
                 self.pending_timer_commands.push(TimerCommand::SetSchedule {
@@ -421,6 +489,8 @@ impl Swim {
                     timer: SwimTimer::suspect_timer(node_id),
                 });
             }
+
+            self.gossip_buffer.enqueue(member, self.members.len());
         }
     }
 
@@ -443,57 +513,8 @@ impl Swim {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::schedulers::ticker::Ticker;
-
-    use std::collections::HashMap;
+    use crate::clusters::swims::common::{TestHarness, make_protocol};
     use std::net::SocketAddr;
-
-    fn make_protocol(local_id: &str, local_port: u16) -> Swim {
-        let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-        let topology = Topology::new(
-            HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: 256,
-            },
-        );
-        Swim::new(NodeId::new(local_id), addr, topology)
-    }
-
-    /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
-    /// what SwimActor does in production.
-    struct TestHarness<T> {
-        protocol: Swim,
-        ticker: Ticker<T>,
-    }
-
-    impl TestHarness<SwimTimer> {
-        fn new(local_id: &str, local_port: u16) -> Self {
-            Self {
-                protocol: make_protocol(local_id, local_port),
-                ticker: Ticker::new(),
-            }
-        }
-
-        fn tick(&mut self) {
-            let events = self.ticker.advance_clock();
-            for event in events {
-                self.protocol.handle_timeout(event);
-                self.apply_timer_commands();
-            }
-        }
-
-        fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
-            self.protocol.step(src, packet);
-            self.apply_timer_commands();
-        }
-
-        fn apply_timer_commands(&mut self) {
-            for cmd in self.protocol.take_timer_commands() {
-                self.ticker.apply(cmd);
-            }
-        }
-    }
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping {
@@ -538,29 +559,9 @@ mod tests {
         }
     }
 
-    fn add_node(m: &mut Swim, id: &str, addr: SocketAddr, inc: u64) {
-        m.step(addr, ping(1, id, inc, vec![]));
-        let _ = m.take_outbound();
-        let _ = m.take_timer_commands();
-    }
-
     fn add_node_harness(h: &mut TestHarness<SwimTimer>, id: &str, addr: SocketAddr, inc: u64) {
         h.step(addr, ping(1, id, inc, vec![]));
         let _ = h.protocol.take_outbound();
-    }
-
-    fn tick_until<T>(
-        h: &mut TestHarness<SwimTimer>,
-        max_ticks: u32,
-        mut f: impl FnMut(&TestHarness<SwimTimer>) -> Option<T>,
-    ) -> T {
-        for _ in 0..max_ticks {
-            h.tick();
-            if let Some(v) = f(h) {
-                return v;
-            }
-        }
-        panic!("condition not met after {max_ticks} ticks");
     }
 
     // -----------------------------------------------------------------------
@@ -689,7 +690,7 @@ mod tests {
 
     mod ack {
         use crate::clusters::SwimNodeState;
-        use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
+        use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness};
         use crate::schedulers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
             SUSPECT_TIMEOUT_TICKS,
@@ -705,7 +706,7 @@ mod tests {
             add_node_harness(&mut h, node_b_id, sender, 1);
 
             // wait until direct ping is sent
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b_id)
             });
 
@@ -727,9 +728,7 @@ mod tests {
             add_node_harness(&mut h, node_b, b_addr, 1);
 
             // Wait until node-b's direct probe starts
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound(); // discard the ping
 
             add_node_harness(&mut h, node_c, c_addr, 1);
@@ -758,9 +757,7 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node_harness(&mut h, node_b, b_addr, 1);
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
@@ -800,9 +797,7 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node_harness(&mut h, node_b, b_addr, 1);
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
@@ -855,7 +850,7 @@ mod tests {
 
             // --- First suspicion: drive node-b to Suspect ---
 
-            let seq1 = tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+            let seq1 = h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b)
             });
             let _ = h.protocol.take_outbound();
@@ -894,7 +889,7 @@ mod tests {
             // --- Second suspicion: drive node-b to Suspect again ---
             // (node-c may already be Suspect, so indirect phase may be skipped;
             //  use tick_until to find the exact moment node-b becomes Suspect)
-            tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+            h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
                 if matches!(
                     h.protocol.members.get(node_b).unwrap().state,
                     SwimNodeState::Suspect

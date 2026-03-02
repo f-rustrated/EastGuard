@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
-
+use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
     ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
     timer::TTimer,
 };
+use bincode::{Decode, Encode};
+
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
@@ -35,9 +36,26 @@ pub enum SwimPacket {
 #[derive(Debug)]
 pub enum SwimCommand {
     // From Transport
-    PacketReceived { src: SocketAddr, packet: SwimPacket },
+    PacketReceived {
+        src: SocketAddr,
+        packet: SwimPacket,
+    },
     // From Ticker
     Timeout(SwimTimeOutCallback),
+    #[cfg(test)]
+    Test(SwimTestCommand),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub enum SwimTestCommand {
+    TopologyValidationCount {
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    TopologyIncludesNode {
+        node_id: NodeId,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {
@@ -52,16 +70,17 @@ pub(crate) enum SwimTimeOutCallback {
     ProtocolPeriodElapsed,
     TimedOut {
         seq: u32,
-        target_node_id: NodeId,
-        phase: ProbePhase,
+        target_node_id: Option<NodeId>,
+        phase: SwimTimerKind,
     },
 }
 
 #[derive(Debug)]
-pub(crate) enum ProbePhase {
-    Direct,
-    Indirect,
+pub(crate) enum SwimTimerKind {
+    DirectProbe,
+    IndirectProbe,
     Suspect,
+    JoinTry(JoinAttempt),
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -83,8 +102,8 @@ impl OutboundPacket {
 
 #[derive(Debug)]
 pub(crate) struct SwimTimer {
-    target_node_id: NodeId,
-    phase: ProbePhase,
+    target_node_id: Option<NodeId>,
+    kind: SwimTimerKind,
     ticks_remaining: u32,
 }
 
@@ -100,37 +119,45 @@ impl TTimer for SwimTimer {
         SwimTimeOutCallback::TimedOut {
             seq: seq,
             target_node_id: self.target_node_id,
-            phase: self.phase,
+            phase: self.kind,
         }
     }
 
     #[cfg(test)]
-    fn target_node_id(&self) -> NodeId {
+    fn target_node_id(&self) -> Option<NodeId> {
         self.target_node_id.clone()
     }
 }
 impl SwimTimer {
     pub(crate) fn direct_probe(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
-            phase: ProbePhase::Direct,
+            target_node_id: Some(target),
+            kind: SwimTimerKind::DirectProbe,
             ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
         }
     }
 
     pub(crate) fn indirect_probe(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
-            phase: ProbePhase::Indirect,
+            target_node_id: Some(target),
+            kind: SwimTimerKind::IndirectProbe,
             ticks_remaining: INDIRECT_ACK_TIMEOUT_TICKS,
         }
     }
 
     pub(crate) fn suspect_timer(target: NodeId) -> Self {
         Self {
-            target_node_id: target,
-            phase: ProbePhase::Suspect,
+            target_node_id: Some(target),
+            kind: SwimTimerKind::Suspect,
             ticks_remaining: SUSPECT_TIMEOUT_TICKS,
+        }
+    }
+
+    pub(crate) fn join_try(join_try: JoinAttempt) -> Self {
+        Self {
+            target_node_id: None,
+            ticks_remaining: join_try.ticks_for_wait,
+            kind: SwimTimerKind::JoinTry(join_try),
         }
     }
 }

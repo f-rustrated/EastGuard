@@ -5,6 +5,12 @@ use std::io::Write;
 
 use clap::Parser;
 use uuid::Uuid;
+
+use crate::clusters::NodeId;
+use crate::clusters::swims::peer_discovery::JoinAttempt;
+use crate::clusters::swims::swim::Swim;
+use crate::clusters::swims::{Topology, TopologyConfig};
+use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug)]
@@ -37,6 +43,22 @@ pub struct Environment {
 
     #[arg(long, env = "EASTGUARD_VNODES_PER_NODE", default_value_t = 256)]
     pub vnodes_per_node: u64,
+
+    #[arg(long, env = "EASTGUARD_JOIN_SEED_NODES")]
+    pub join_seed_nodes: Vec<String>,
+
+    // TODO: We know that when join_initial_delay_ms < tick interval, join process will fire immediately. Let's fix this when we think we need to.
+    #[arg(long, env = "EASTGUARD_JOIN_INITIAL_DELAY_MS", default_value_t = 1000)]
+    pub join_initial_delay_ms: u64,
+
+    #[arg(long, env = "EASTGUARD_JOIN_INTERVAL_MS", default_value_t = 1000)]
+    pub join_interval_ms: u64,
+
+    #[arg(long, env = "EASTGUARD_JOIN_MULTIPLIER", default_value_t = 2)]
+    pub join_multiplier: u32,
+
+    #[arg(long, env = "EASTGUARD_JOIN_MAX_ATTEMPTS", default_value_t = 5)]
+    pub join_max_attempts: u32,
 }
 
 impl Environment {
@@ -122,6 +144,34 @@ impl Environment {
             }
         }
     }
+
+    pub(crate) fn bootstrap_servers(&self) -> Vec<JoinAttempt> {
+        self.join_seed_nodes
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .map(|addr| JoinAttempt {
+                seed_addr: addr,
+                ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
+                backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
+                multiplier: self.join_multiplier,
+                max_attempts: self.join_max_attempts,
+                remaining_attempts: self.join_max_attempts,
+            })
+            .collect()
+    }
+
+    pub(crate) fn swim(&self) -> Swim {
+        Swim::new(
+            NodeId::new(self.resolve_node_id()),
+            self.peer_bind_addr(),
+            Topology::new(
+                Default::default(),
+                TopologyConfig {
+                    vnodes_per_pnode: self.vnodes_per_node,
+                },
+            ),
+        )
+    }
 }
 
 pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -131,17 +181,31 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
 
+    fn make_env() -> Environment {
+        Environment {
+            config_dir: "./eastguard/config".into(),
+            data_dir: "./eastguard/data".into(),
+            node_id: None,
+            node_id_file_name: "node_id".into(),
+            port: 2921,
+            cluster_port: 2922,
+            host: "127.0.0.1".into(),
+            vnodes_per_node: 256,
+            join_seed_nodes: vec![],
+            join_initial_delay_ms: 1000,
+            join_interval_ms: 1000,
+            join_multiplier: 2,
+            join_max_attempts: 5,
+        }
+    }
+
     #[test]
     fn test_address_formatting() {
         let env = Environment {
-            config_dir: "./eastguard/config".into(),
-            data_dir: "./test".into(),
-            node_id: Some("node-1".into()),
-            node_id_file_name: "node_id".into(),
             port: 3000,
             cluster_port: 3001,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            node_id: Some("node-1".into()),
+            ..make_env()
         };
 
         assert_eq!(env.bind_addr(), "127.0.0.1:3000");
@@ -163,11 +227,15 @@ mod tests {
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "127.0.0.1");
         assert_eq!(env.vnodes_per_node, 256);
+        assert_eq!(env.join_seed_nodes, Vec::<String>::new());
+        assert_eq!(env.join_initial_delay_ms, 1000);
+        assert_eq!(env.join_interval_ms, 1000);
+        assert_eq!(env.join_multiplier, 2);
+        assert_eq!(env.join_max_attempts, 5);
     }
 
     #[test]
     fn test_flags_override() {
-        // Simulate: my-server --node-id node-1 --port 9999 --host 0.0.0.0 --data-dir /tmp/test
         let args = vec![
             "my-server",
             "--node-id",
@@ -211,6 +279,36 @@ mod tests {
     }
 
     #[test]
+    fn test_join_flags() {
+        let args = vec![
+            "my-server",
+            "--join-seed-nodes",
+            "10.0.0.1:2922",
+            "--join-seed-nodes",
+            "10.0.0.2:2922",
+            "--join-initial-delay-ms",
+            "500",
+            "--join-interval-ms",
+            "750",
+            "--join-multiplier",
+            "3",
+            "--join-max-attempts",
+            "10",
+        ];
+
+        let env = Environment::try_parse_from(args).expect("Failed to parse join flags");
+
+        assert_eq!(
+            env.join_seed_nodes,
+            vec!["10.0.0.1:2922".to_string(), "10.0.0.2:2922".to_string()]
+        );
+        assert_eq!(env.join_initial_delay_ms, 500);
+        assert_eq!(env.join_interval_ms, 750);
+        assert_eq!(env.join_multiplier, 3);
+        assert_eq!(env.join_max_attempts, 10);
+    }
+
+    #[test]
     #[serial]
     fn test_env_vars_override() {
         unsafe {
@@ -244,14 +342,8 @@ mod tests {
     #[test]
     fn test_resolve_node_id_from_flag() {
         let env = Environment {
-            config_dir: "./eastguard/config".into(),
-            data_dir: "/tmp".into(),
             node_id: Some("explicit-node".into()),
-            node_id_file_name: "node_id".into(),
-            port: 2921,
-            cluster_port: 2922,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            ..make_env()
         };
 
         assert_eq!(env.resolve_node_id(), "explicit-node");
@@ -265,16 +357,25 @@ mod tests {
 
         let env = Environment {
             config_dir: dir.path().to_str().unwrap().into(),
-            data_dir: "./eastguard/data".into(),
-            node_id: None,
-            node_id_file_name: "node_id".into(),
-            port: 2921,
-            cluster_port: 2922,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            ..make_env()
         };
 
         assert_eq!(env.resolve_node_id(), "file-node-42");
+    }
+
+    #[test]
+    fn test_resolve_node_id_empty_file_generates_new() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write an empty file — should be treated as absent.
+        fs::write(dir.path().join("node_id"), "").unwrap();
+
+        let env = Environment {
+            config_dir: dir.path().to_str().unwrap().into(),
+            ..make_env()
+        };
+
+        let id = env.resolve_node_id();
+        assert!(Uuid::parse_str(&id).is_ok());
     }
 
     #[test]
@@ -283,13 +384,7 @@ mod tests {
 
         let env = Environment {
             config_dir: dir.path().to_str().unwrap().into(),
-            data_dir: "./eastguard/data".into(),
-            node_id: None,
-            node_id_file_name: "node_id".into(),
-            port: 2921,
-            cluster_port: 2922,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            ..make_env()
         };
 
         let id1 = env.resolve_node_id();
@@ -312,13 +407,7 @@ mod tests {
         // Simulate first startup: no node_id passed, UUID is generated and persisted.
         let id_first_run = Environment {
             config_dir: dir.path().to_str().unwrap().into(),
-            data_dir: "./eastguard/data".into(),
-            node_id: None,
-            node_id_file_name: "node_id".into(),
-            port: 2921,
-            cluster_port: 2922,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            ..make_env()
         }
         .resolve_node_id();
 
@@ -328,13 +417,7 @@ mod tests {
         // still without an explicit node_id. It must recover the persisted UUID.
         let id_after_restart = Environment {
             config_dir: dir.path().to_str().unwrap().into(),
-            data_dir: "./eastguard/data".into(),
-            node_id: None,
-            node_id_file_name: "node_id".into(),
-            port: 2921,
-            cluster_port: 2922,
-            host: "127.0.0.1".into(),
-            vnodes_per_node: 256,
+            ..make_env()
         }
         .resolve_node_id();
 
