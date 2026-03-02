@@ -83,55 +83,10 @@ impl JoinConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::NodeId;
+    use crate::clusters::swims::common::{TestHarness, make_protocol};
     use crate::clusters::swims::messages::*;
-    use crate::clusters::swims::topology::{Topology, TopologyConfig};
     use crate::schedulers::ticker::Ticker;
-    use std::collections::HashMap;
     use std::net::SocketAddr;
-
-    fn make_protocol(local_id: &str, local_port: u16) -> Swim {
-        let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-        let topology = Topology::new(
-            HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: 256,
-            },
-        );
-        Swim::new(NodeId::new(local_id), addr, topology)
-    }
-
-    struct TestHarness {
-        protocol: Swim,
-        ticker: Ticker<SwimTimer>,
-    }
-
-    impl TestHarness {
-        fn tick(&mut self) {
-            let events = self.ticker.advance_clock();
-            for event in events {
-                self.protocol.handle_timeout(event);
-                self.apply_timer_commands();
-            }
-        }
-
-        fn apply_timer_commands(&mut self) {
-            for cmd in self.protocol.take_timer_commands() {
-                self.ticker.apply(cmd);
-            }
-        }
-    }
-
-    /// Bootstraps the harness's protocol via `Bootstrapper`, then applies timer commands.
-
-    fn tick_n_collect(h: &mut TestHarness, n: u32) -> Vec<OutboundPacket> {
-        let mut all = vec![];
-        for _ in 0..n {
-            h.tick();
-            all.extend(h.protocol.take_outbound());
-        }
-        all
-    }
 
     fn count_join_pings(packets: &[OutboundPacket], target: SocketAddr) -> usize {
         packets
@@ -262,7 +217,7 @@ mod tests {
         );
 
         // backoff = 10 * 2^0 = 10 ticks. No retry before that.
-        let out = tick_n_collect(&mut h, 9);
+        let out = h.tick_n_collect(9);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             0,
@@ -289,7 +244,7 @@ mod tests {
         let _ = h.protocol.take_outbound(); // consume immediate ping
 
         // backoff = 10 * 2^0 = 10 ticks
-        let out = tick_n_collect(&mut h, 10);
+        let out = h.tick_n_collect(10);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -330,7 +285,7 @@ mod tests {
         );
 
         // tick 1: no Ping (backoff = 2 ticks)
-        let out = tick_n_collect(&mut h, 1);
+        let out = h.tick_n_collect(1);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             0,
@@ -338,7 +293,7 @@ mod tests {
         );
 
         // tick 2: second Ping
-        let out = tick_n_collect(&mut h, 1);
+        let out = h.tick_n_collect(1);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -346,7 +301,7 @@ mod tests {
         );
 
         // ticks 3–8: retries exhausted, no more Pings
-        let out = tick_n_collect(&mut h, 6);
+        let out = h.tick_n_collect(6);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             0,
@@ -375,7 +330,7 @@ mod tests {
 
         // 1 immediate ping + (max - 1) retries via ticking
         let immediate = h.protocol.take_outbound();
-        let retries = tick_n_collect(&mut h, max + 1);
+        let retries = h.tick_n_collect(max + 1);
         let total = count_join_pings(&immediate, "127.0.0.1:9000".parse().unwrap())
             + count_join_pings(&retries, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(total, max as usize, "exactly max_attempts Pings sent");

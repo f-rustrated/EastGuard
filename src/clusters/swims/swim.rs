@@ -512,57 +512,8 @@ impl Swim {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::schedulers::ticker::Ticker;
-
-    use std::collections::HashMap;
+    use crate::clusters::swims::common::{TestHarness, make_protocol};
     use std::net::SocketAddr;
-
-    fn make_protocol(local_id: &str, local_port: u16) -> Swim {
-        let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-        let topology = Topology::new(
-            HashMap::new(),
-            TopologyConfig {
-                vnodes_per_pnode: 256,
-            },
-        );
-        Swim::new(NodeId::new(local_id), addr, topology)
-    }
-
-    /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
-    /// what SwimActor does in production.
-    struct TestHarness<T> {
-        protocol: Swim,
-        ticker: Ticker<T>,
-    }
-
-    impl TestHarness<SwimTimer> {
-        fn new(local_id: &str, local_port: u16) -> Self {
-            Self {
-                protocol: make_protocol(local_id, local_port),
-                ticker: Ticker::new(),
-            }
-        }
-
-        fn tick(&mut self) {
-            let events = self.ticker.advance_clock();
-            for event in events {
-                self.protocol.handle_timeout(event);
-                self.apply_timer_commands();
-            }
-        }
-
-        fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
-            self.protocol.step(src, packet);
-            self.apply_timer_commands();
-        }
-
-        fn apply_timer_commands(&mut self) {
-            for cmd in self.protocol.take_timer_commands() {
-                self.ticker.apply(cmd);
-            }
-        }
-    }
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping {
@@ -607,29 +558,9 @@ mod tests {
         }
     }
 
-    fn add_node(m: &mut Swim, id: &str, addr: SocketAddr, inc: u64) {
-        m.step(addr, ping(1, id, inc, vec![]));
-        let _ = m.take_outbound();
-        let _ = m.take_timer_commands();
-    }
-
     fn add_node_harness(h: &mut TestHarness<SwimTimer>, id: &str, addr: SocketAddr, inc: u64) {
         h.step(addr, ping(1, id, inc, vec![]));
         let _ = h.protocol.take_outbound();
-    }
-
-    fn tick_until<T>(
-        h: &mut TestHarness<SwimTimer>,
-        max_ticks: u32,
-        mut f: impl FnMut(&TestHarness<SwimTimer>) -> Option<T>,
-    ) -> T {
-        for _ in 0..max_ticks {
-            h.tick();
-            if let Some(v) = f(h) {
-                return v;
-            }
-        }
-        panic!("condition not met after {max_ticks} ticks");
     }
 
     // -----------------------------------------------------------------------
@@ -758,7 +689,7 @@ mod tests {
 
     mod ack {
         use crate::clusters::SwimNodeState;
-        use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness, tick_until};
+        use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness};
         use crate::schedulers::ticker::{
             DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
             SUSPECT_TIMEOUT_TICKS,
@@ -774,7 +705,7 @@ mod tests {
             add_node_harness(&mut h, node_b_id, sender, 1);
 
             // wait until direct ping is sent
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b_id)
             });
 
@@ -796,9 +727,7 @@ mod tests {
             add_node_harness(&mut h, node_b, b_addr, 1);
 
             // Wait until node-b's direct probe starts
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound(); // discard the ping
 
             add_node_harness(&mut h, node_c, c_addr, 1);
@@ -827,9 +756,7 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node_harness(&mut h, node_b, b_addr, 1);
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
@@ -869,9 +796,7 @@ mod tests {
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
             add_node_harness(&mut h, node_b, b_addr, 1);
-            let seq = tick_until(&mut h, 2 * PROBE_INTERVAL_TICKS, |h| {
-                h.ticker.probe_seq_for(node_b)
-            });
+            let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
             let _ = h.protocol.take_outbound();
 
             // we don't care about node c. It's for indirect request
@@ -924,7 +849,7 @@ mod tests {
 
             // --- First suspicion: drive node-b to Suspect ---
 
-            let seq1 = tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+            let seq1 = h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b)
             });
             let _ = h.protocol.take_outbound();
@@ -963,7 +888,7 @@ mod tests {
             // --- Second suspicion: drive node-b to Suspect again ---
             // (node-c may already be Suspect, so indirect phase may be skipped;
             //  use tick_until to find the exact moment node-b becomes Suspect)
-            tick_until(&mut h, 20 * PROBE_INTERVAL_TICKS, |h| {
+            h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
                 if matches!(
                     h.protocol.members.get(node_b).unwrap().state,
                     SwimNodeState::Suspect
