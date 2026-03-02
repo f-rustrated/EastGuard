@@ -44,7 +44,7 @@ impl StartUp {
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
         tokio::spawn(transport.run());
-        tokio::spawn(swim_actor.run(ENV.build_join_config()));
+        tokio::spawn(swim_actor.run(ENV.bootstrap_servers()));
 
         // run handlers
         let _ = self.receive_client_streams().await;

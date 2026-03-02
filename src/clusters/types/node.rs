@@ -70,6 +70,22 @@ impl std::borrow::Borrow<str> for NodeId {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct JoinTry {
+    pub(crate) seed_addr: SocketAddr,
+    pub(crate) ticks_for_wait: u32,
+    pub(crate) backoff_ticks: u32,
+    pub(crate) multiplier: u32,
+    pub(crate) max_attempts: u32,
+    pub(crate) remaining_attempts: u32,
+}
+impl JoinTry {
+    pub(crate) fn deduct_remaining_attempt(&mut self) {
+        self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct JoinConfig {
     pub(crate) seed_addrs: Vec<SocketAddr>,
@@ -78,6 +94,7 @@ pub(crate) struct JoinConfig {
     pub(crate) multiplier: u32,
     pub(crate) max_attempts: u32,
 }
+#[cfg(test)]
 impl JoinConfig {
     pub(crate) fn tries(&self) -> Vec<JoinTry> {
         self.seed_addrs
@@ -91,20 +108,5 @@ impl JoinConfig {
                 remaining_attempts: self.max_attempts,
             })
             .collect()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct JoinTry {
-    pub(crate) seed_addr: SocketAddr,
-    pub(crate) ticks_for_wait: u32,
-    pub(crate) backoff_ticks: u32,
-    pub(crate) multiplier: u32,
-    pub(crate) max_attempts: u32,
-    pub(crate) remaining_attempts: u32,
-}
-impl JoinTry {
-    pub(crate) fn deduct_remaining_attempt(&mut self) {
-        self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
     }
 }

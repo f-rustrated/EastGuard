@@ -1,9 +1,10 @@
 use super::*;
 
+use crate::clusters::JoinTry;
+use crate::clusters::NodeId;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
-use crate::clusters::{JoinConfig, NodeId};
 use crate::schedulers::ticker_message::TickerCommand;
 
 use std::net::SocketAddr;
@@ -45,9 +46,9 @@ impl SwimActor {
         }
     }
 
-    pub async fn run(mut self, join_config: JoinConfig) {
-        println!("[{}] SwimActor started.", self.state.node_id);
-        self.state.initiate_join(join_config);
+    pub async fn run(mut self, bootstrap_servers: Vec<JoinTry>) {
+        tracing::info!("[{}] SwimActor started.", self.state.node_id);
+        self.state.initiate_join(bootstrap_servers);
         self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {

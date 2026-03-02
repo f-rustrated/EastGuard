@@ -2,7 +2,7 @@ use super::*;
 
 use crate::clusters::swims::topology::Topology;
 
-use crate::clusters::{JoinConfig, JoinTry, NodeId, SwimNode, SwimNodeState};
+use crate::clusters::{JoinTry, NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -97,15 +97,14 @@ impl Swim {
         swim
     }
 
-    pub(crate) fn initiate_join(&mut self, join_config: JoinConfig) {
+    pub(crate) fn initiate_join(&mut self, join_config: Vec<JoinTry>) {
         let tries: Vec<JoinTry> = join_config
-            .tries()
             .into_iter()
             .filter(|t| t.seed_addr != self.local_addr)
             .collect();
 
         for join_try in tries {
-            if join_config.ticks_for_wait == 0 && join_config.max_attempts > 0 {
+            if join_try.ticks_for_wait == 0 && join_try.max_attempts > 0 {
                 self.send_join_ping_with_retry(join_try);
             } else {
                 let seq = self.next_seq();
@@ -1174,7 +1173,7 @@ mod tests {
 
         /// Calls initiate_join and applies resulting timer commands to the ticker.
         fn start_join(h: &mut TestHarness<SwimTimer>, join_config: JoinConfig) {
-            h.protocol.initiate_join(join_config);
+            h.protocol.initiate_join(join_config.tries());
             h.apply_timer_commands();
         }
 
@@ -1209,7 +1208,7 @@ mod tests {
                 max_attempts: 3,
             };
             let mut h = TestHarness::new("node-local", 8000);
-            h.protocol.initiate_join(config);
+            h.protocol.initiate_join(config.tries());
 
             assert!(h.protocol.take_outbound().is_empty());
             assert!(h.protocol.take_timer_commands().is_empty());
@@ -1226,7 +1225,7 @@ mod tests {
                 max_attempts: 3,
             };
             let mut h = TestHarness::new("node-local", 8000);
-            h.protocol.initiate_join(config);
+            h.protocol.initiate_join(config.tries());
 
             assert!(h.protocol.take_outbound().is_empty());
             assert!(h.protocol.take_timer_commands().is_empty());
@@ -1246,7 +1245,7 @@ mod tests {
                 max_attempts: 3,
             };
             let mut h = TestHarness::new("node-local", 8000);
-            h.protocol.initiate_join(config);
+            h.protocol.initiate_join(config.tries());
 
             let out = h.protocol.take_outbound();
             assert_eq!(
@@ -1266,7 +1265,7 @@ mod tests {
                 max_attempts: 3,
             };
             let mut h = TestHarness::new("node-local", 8000);
-            h.protocol.initiate_join(config);
+            h.protocol.initiate_join(config.tries());
             let _ = h.protocol.take_outbound();
 
             let cmds = h.protocol.take_timer_commands();

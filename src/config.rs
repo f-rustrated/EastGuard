@@ -6,7 +6,7 @@ use std::io::Write;
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::JoinConfig;
+use crate::clusters::JoinTry;
 use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
@@ -142,18 +142,19 @@ impl Environment {
         }
     }
 
-    pub(crate) fn build_join_config(&self) -> JoinConfig {
-        JoinConfig {
-            seed_addrs: self
-                .join_seed_nodes
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect(),
-            ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
-            backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
-            multiplier: self.join_multiplier,
-            max_attempts: self.join_max_attempts,
-        }
+    pub(crate) fn bootstrap_servers(&self) -> Vec<JoinTry> {
+        self.join_seed_nodes
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .map(|addr| JoinTry {
+                seed_addr: addr,
+                ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
+                backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
+                multiplier: self.join_multiplier,
+                max_attempts: self.join_max_attempts,
+                remaining_attempts: self.join_max_attempts,
+            })
+            .collect()
     }
 }
 

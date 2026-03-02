@@ -121,7 +121,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     );
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
-    tokio::spawn(actor.run(join_config.clone()));
+    tokio::spawn(actor.run(join_config.clone().tries()));
 
     TestHarness {
         tx_in,
