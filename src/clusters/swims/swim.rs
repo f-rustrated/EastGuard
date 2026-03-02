@@ -204,19 +204,24 @@ impl Swim {
             None => return,
         };
 
-        let mut peer_addrs = Vec::new();
+        // * OPT : pre-allocation
+        let mut peer_addrs = Vec::with_capacity(INDIRECT_PING_COUNT);
+
         for _ in 0..self.live_node_tracker.len() {
-            if peer_addrs.len() >= INDIRECT_PING_COUNT {
+            let Some(peer_node_id) = self.live_node_tracker.next() else {
                 break;
+            };
+
+            if peer_node_id == target_node_id || peer_node_id == self.node_id {
+                continue;
             }
 
-            if let Some(peer_node_id) = self.live_node_tracker.next() {
-                if peer_node_id == target_node_id || peer_node_id == self.node_id {
-                    continue;
-                }
+            if let Some(peer_member) = self.members.get(&peer_node_id) {
+                peer_addrs.push(peer_member.addr);
 
-                if let Some(peer_addr) = self.members.get(&peer_node_id).map(|m| m.addr) {
-                    peer_addrs.push(peer_addr);
+                // * OPT : Check length ONLY after a successful insertion
+                if peer_addrs.len() == INDIRECT_PING_COUNT {
+                    break;
                 }
             }
         }
