@@ -2,20 +2,20 @@ use crate::clusters::swims::swim::Swim;
 
 use std::net::SocketAddr;
 
-pub(crate) struct Bootstrapper {
+pub(crate) struct Bootstrapper<'a> {
     bootstrap_servers: Vec<JoinAttempt>,
-    swim: Swim,
+    swim: &'a mut Swim,
 }
 
-impl Bootstrapper {
-    pub fn new(bootstrap_servers: Vec<JoinAttempt>, swim: Swim) -> Self {
+impl<'a> Bootstrapper<'a> {
+    pub fn new(bootstrap_servers: Vec<JoinAttempt>, swim: &'a mut Swim) -> Self {
         Self {
             bootstrap_servers,
             swim,
         }
     }
 
-    pub(crate) fn bootstrap(mut self) -> Swim {
+    pub(crate) fn bootstrap(self) {
         for attempt in self
             .bootstrap_servers
             .into_iter()
@@ -30,7 +30,6 @@ impl Bootstrapper {
             );
             self.swim.handle_join(attempt);
         }
-        self.swim
     }
 }
 
@@ -108,11 +107,10 @@ mod tests {
             multiplier: 2,
             max_attempts: 3,
         };
-        let mut swim = {
-            let swim = make_protocol("node-local", 8000);
-            let join_config: &JoinConfig = &config;
-            Bootstrapper::new(join_config.tries(), swim).bootstrap()
-        };
+
+        let mut swim = make_protocol("node-local", 8000);
+        let join_config: &JoinConfig = &config;
+        Bootstrapper::new(join_config.tries(), &mut swim).bootstrap();
 
         assert!(swim.take_outbound().is_empty());
         assert!(swim.take_timer_commands().is_empty());
@@ -128,11 +126,10 @@ mod tests {
             multiplier: 2,
             max_attempts: 3,
         };
-        let mut swim = {
-            let swim = make_protocol("node-local", 8000);
-            let join_config: &JoinConfig = &config;
-            Bootstrapper::new(join_config.tries(), swim).bootstrap()
-        };
+
+        let mut swim = make_protocol("node-local", 8000);
+        let join_config: &JoinConfig = &config;
+        Bootstrapper::new(join_config.tries(), &mut swim).bootstrap();
 
         assert!(swim.take_outbound().is_empty());
         assert!(swim.take_timer_commands().is_empty());
@@ -151,11 +148,10 @@ mod tests {
             multiplier: 2,
             max_attempts: 3,
         };
-        let mut swim = {
-            let swim = make_protocol("node-local", 8000);
-            let join_config: &JoinConfig = &config;
-            Bootstrapper::new(join_config.tries(), swim).bootstrap()
-        };
+
+        let mut swim = make_protocol("node-local", 8000);
+        let join_config: &JoinConfig = &config;
+        Bootstrapper::new(join_config.tries(), &mut swim).bootstrap();
 
         let out = swim.take_outbound();
         assert_eq!(
@@ -167,9 +163,9 @@ mod tests {
 
     #[test]
     fn delay_zero_schedules_retry_timer_and_decrements_attempts() {
-        let swim = make_protocol("node-local", 8000);
+        let mut swim = make_protocol("node-local", 8000);
 
-        let mut swim = Bootstrapper::new(
+        Bootstrapper::new(
             (&JoinConfig {
                 seed_addrs: vec!["127.0.0.1:9000".parse().unwrap()],
                 ticks_for_wait: 0,
@@ -178,7 +174,7 @@ mod tests {
                 max_attempts: 3,
             })
                 .tries(),
-            swim,
+            &mut swim,
         )
         .bootstrap();
 
@@ -205,7 +201,7 @@ mod tests {
             protocol: make_protocol("node-local", 8000),
             ticker: Ticker::new(),
         };
-        h.protocol = Bootstrapper::new(config.tries(), h.protocol).bootstrap();
+        Bootstrapper::new(config.tries(), &mut h.protocol).bootstrap();
         h.apply_timer_commands();
 
         // First ping sent immediately during start_join
@@ -238,7 +234,7 @@ mod tests {
             protocol: make_protocol("node-local", 8000),
             ticker: Ticker::new(),
         };
-        h.protocol = Bootstrapper::new(config.tries(), h.protocol).bootstrap();
+        Bootstrapper::new(config.tries(), &mut h.protocol).bootstrap();
         h.apply_timer_commands();
 
         let _ = h.protocol.take_outbound(); // consume immediate ping
@@ -273,7 +269,8 @@ mod tests {
             protocol: make_protocol("node-local", 8000),
             ticker: Ticker::new(),
         };
-        h.protocol = Bootstrapper::new(config.tries(), h.protocol).bootstrap();
+
+        Bootstrapper::new(config.tries(), &mut h.protocol).bootstrap();
         h.apply_timer_commands();
 
         // immediate: first Ping
@@ -325,7 +322,7 @@ mod tests {
             ticker: Ticker::new(),
         };
 
-        h.protocol = Bootstrapper::new(config.tries(), h.protocol).bootstrap();
+        Bootstrapper::new(config.tries(), &mut h.protocol).bootstrap();
         h.apply_timer_commands();
 
         // 1 immediate ping + (max - 1) retries via ticking

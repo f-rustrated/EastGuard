@@ -4,6 +4,7 @@ mod connections;
 mod clusters;
 pub(crate) mod schedulers;
 
+use crate::clusters::swims::peer_discovery::Bootstrapper;
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
     clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
@@ -32,7 +33,7 @@ impl StartUp {
             SwimTransportActor::new(peer_bind_addr, swim_sender.clone(), rx_outbound).await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
-        let swim_actor = SwimActor::new(
+        let mut swim_actor = SwimActor::new(
             peer_bind_addr,
             NodeId::new(ENV.resolve_node_id()),
             swim_mailbox,
@@ -44,7 +45,10 @@ impl StartUp {
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
         tokio::spawn(transport.run());
-        tokio::spawn(swim_actor.run(ENV.bootstrap_servers()));
+        tokio::spawn({
+            Bootstrapper::new(ENV.bootstrap_servers(), &mut swim_actor.state).bootstrap();
+            swim_actor.run()
+        });
 
         // run handlers
         let _ = self.receive_client_streams().await;

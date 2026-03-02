@@ -20,7 +20,7 @@ pub struct SwimActor {
     mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
     scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
-    state: Swim,
+    pub(crate) state: Swim,
 }
 
 impl SwimActor {
@@ -48,9 +48,9 @@ impl SwimActor {
         }
     }
 
-    pub async fn run(mut self, bootstrap_servers: Vec<JoinAttempt>) {
+    pub async fn run(mut self) {
         tracing::info!("[{}] SwimActor started.", self.state.node_id);
-        self.state = Bootstrapper::new(bootstrap_servers, self.state).bootstrap();
+
         self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {
