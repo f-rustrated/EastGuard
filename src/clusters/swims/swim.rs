@@ -97,7 +97,7 @@ impl Swim {
             pending_outbound: vec![],
             pending_timer_commands: vec![],
             join_config,
-            pending_join_seqs: HashMap::new()
+            pending_join_seqs: HashMap::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -109,13 +109,20 @@ impl Swim {
     }
 
     pub(crate) fn initiate_join(&mut self) {
-        let seeds: Vec<SocketAddr> = self.join_config.seed_addrs
+        let seeds: Vec<SocketAddr> = self
+            .join_config
+            .seed_addrs
             .iter()
             .filter(|&&addr| addr != self.local_addr)
             .copied()
             .collect();
 
-        println!("[{}] InitiateJoin: {} seed(s) → {:?}", self.node_id, seeds.len(), seeds);
+        println!(
+            "[{}] InitiateJoin: {} seed(s) → {:?}",
+            self.node_id,
+            seeds.len(),
+            seeds
+        );
 
         for addr in seeds {
             if self.join_config.initial_delay_ticks == 0 && self.join_config.max_attempts > 0 {
@@ -126,14 +133,25 @@ impl Swim {
                 );
             } else {
                 let seq = self.next_seq();
-                println!("[{}] Scheduling join timer to {} (delay {} ticks)", self.node_id, addr, self.join_config.initial_delay_ticks);
-                self.schedule_join_timer(seq, addr, self.join_config.max_attempts, self.join_config.initial_delay_ticks);
+                println!(
+                    "[{}] Scheduling join timer to {} (delay {} ticks)",
+                    self.node_id, addr, self.join_config.initial_delay_ticks
+                );
+                self.schedule_join_timer(
+                    seq,
+                    addr,
+                    self.join_config.max_attempts,
+                    self.join_config.initial_delay_ticks,
+                );
             }
         }
     }
 
     fn send_join_ping_with_retry(&mut self, addr: SocketAddr, left_attempts: u32, ticks: u32) {
-        println!("[{}] → Sending join Ping to {} ({} attempt(s) left)", self.node_id, addr, left_attempts);
+        println!(
+            "[{}] → Sending join Ping to {} ({} attempt(s) left)",
+            self.node_id, addr, left_attempts
+        );
         let seq = self.next_seq();
         let ping = SwimPacket::Ping {
             seq,
@@ -146,7 +164,13 @@ impl Swim {
     }
 
     fn schedule_join_timer(&mut self, seq: u32, addr: SocketAddr, left_attempts: u32, ticks: u32) {
-        self.pending_join_seqs.insert(seq, PendingJoin { addr, left_attempts });
+        self.pending_join_seqs.insert(
+            seq,
+            PendingJoin {
+                addr,
+                left_attempts,
+            },
+        );
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq,
             timer: SwimTimer::join_retry(ticks),
@@ -164,10 +188,10 @@ impl Swim {
                 target_node_id,
                 phase,
             } => match (phase, target_node_id) {
-                (ProbePhase::Direct, Some(target))   => self.start_indirect_probe(target, seq),
+                (ProbePhase::Direct, Some(target)) => self.start_indirect_probe(target, seq),
                 (ProbePhase::Indirect, Some(target)) => self.try_mark_suspect(target),
-                (ProbePhase::Suspect, Some(target))  => self.try_mark_dead(target),
-                (ProbePhase::JoinRetry, None)        => self.handle_join_retry(seq),
+                (ProbePhase::Suspect, Some(target)) => self.try_mark_dead(target),
+                (ProbePhase::JoinRetry, None) => self.handle_join_retry(seq),
                 _ => {}
             },
         }
@@ -184,7 +208,6 @@ impl Swim {
             }
         }
     }
-
 
     fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
@@ -298,12 +321,18 @@ impl Swim {
 
     fn handle_join_retry(&mut self, seq: u32) {
         let Some(pending_join) = self.pending_join_seqs.remove(&seq) else {
-            println!("[{}] Join retry fired for seq {} but no pending join found (already acked?)", self.node_id, seq);
-            return
+            println!(
+                "[{}] Join retry fired for seq {} but no pending join found (already acked?)",
+                self.node_id, seq
+            );
+            return;
         };
 
         if pending_join.left_attempts == 0 {
-            println!("[{}] Join to {} exhausted all attempts — giving up", self.node_id, pending_join.addr);
+            println!(
+                "[{}] Join to {} exhausted all attempts — giving up",
+                self.node_id, pending_join.addr
+            );
             return;
         }
 
@@ -335,7 +364,10 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
-                println!("[{}] ← Received Ping from {} ({}) seq={}", self.node_id, source_node_id, src, seq);
+                println!(
+                    "[{}] ← Received Ping from {} ({}) seq={}",
+                    self.node_id, source_node_id, src, seq
+                );
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 let ack = SwimPacket::Ack {
                     seq,
@@ -353,7 +385,10 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
-                println!("[{}] ← Received Ack  from {} ({}) seq={}", self.node_id, source_node_id, src, seq);
+                println!(
+                    "[{}] ← Received Ack  from {} ({}) seq={}",
+                    self.node_id, source_node_id, src, seq
+                );
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 self.pending_timer_commands
@@ -504,7 +539,10 @@ impl Swim {
         self.topology.update(node_id.clone(), addr, new_state);
 
         if changed {
-            println!("[{}] Member update: {} @ {} → {:?} (inc {})", self.node_id, node_id, addr, new_state, incarnation);
+            println!(
+                "[{}] Member update: {} @ {} → {:?} (inc {})",
+                self.node_id, node_id, addr, new_state, incarnation
+            );
             let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
 
@@ -545,14 +583,22 @@ mod tests {
     use std::net::SocketAddr;
 
     fn no_join_config() -> JoinConfig {
-        JoinConfig { seed_addrs: vec![], initial_delay_ticks: 0, interval_ticks: 10, multiplier: 1, max_attempts: 0 }
+        JoinConfig {
+            seed_addrs: vec![],
+            initial_delay_ticks: 0,
+            interval_ticks: 10,
+            multiplier: 1,
+            max_attempts: 0,
+        }
     }
 
     fn make_protocol(local_id: &str, local_port: u16) -> Swim {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
             HashMap::new(),
-            TopologyConfig { vnodes_per_pnode: 256 },
+            TopologyConfig {
+                vnodes_per_pnode: 256,
+            },
         );
         Swim::new(NodeId::new(local_id), addr, no_join_config(), topology)
     }
@@ -1182,9 +1228,18 @@ mod tests {
             "127.0.0.1:9000".parse().unwrap()
         }
 
-        fn make_join_harness(local_id: &str, local_port: u16, join_config: JoinConfig) -> TestHarness<SwimTimer> {
+        fn make_join_harness(
+            local_id: &str,
+            local_port: u16,
+            join_config: JoinConfig,
+        ) -> TestHarness<SwimTimer> {
             let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-            let topology = Topology::new(HashMap::new(), TopologyConfig { vnodes_per_pnode: 256 });
+            let topology = Topology::new(
+                HashMap::new(),
+                TopologyConfig {
+                    vnodes_per_pnode: 256,
+                },
+            );
             TestHarness {
                 protocol: Swim::new(NodeId::new(local_id), addr, join_config, topology),
                 ticker: Ticker::new(),
@@ -1269,7 +1324,11 @@ mod tests {
             h.protocol.initiate_join();
 
             let out = h.protocol.take_outbound();
-            assert_eq!(count_join_pings(&out, seed_addr()), 1, "Ping sent immediately");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                1,
+                "Ping sent immediately"
+            );
         }
 
         #[test]
@@ -1287,7 +1346,10 @@ mod tests {
 
             assert_eq!(h.protocol.pending_join_seqs.len(), 1);
             let pending = h.protocol.pending_join_seqs.values().next().unwrap();
-            assert_eq!(pending.left_attempts, 2, "immediate send counts as attempt 0");
+            assert_eq!(
+                pending.left_attempts, 2,
+                "immediate send counts as attempt 0"
+            );
 
             let cmds = h.protocol.take_timer_commands();
             assert_eq!(cmds.len(), 1, "one retry timer scheduled");
@@ -1312,7 +1374,11 @@ mod tests {
 
             // delay - 1 ticks: timer not yet fired, no Ping
             let out = tick_n_collect(&mut h, delay - 1);
-            assert_eq!(count_join_pings(&out, seed_addr()), 0, "no Ping before delay elapses");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                0,
+                "no Ping before delay elapses"
+            );
         }
 
         #[test]
@@ -1331,7 +1397,11 @@ mod tests {
             // Advance past delay
             let _ = tick_n_collect(&mut h, delay - 1);
             let out = tick_n_collect(&mut h, 1);
-            assert_eq!(count_join_pings(&out, seed_addr()), 1, "Ping sent when delay elapses");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                1,
+                "Ping sent when delay elapses"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -1356,7 +1426,11 @@ mod tests {
 
             // tick 1: first Ping
             let out = tick_n_collect(&mut h, 1);
-            assert_eq!(count_join_pings(&out, seed_addr()), 1, "first Ping at tick 1");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                1,
+                "first Ping at tick 1"
+            );
 
             // tick 2: no Ping (next interval = 2 ticks)
             let out = tick_n_collect(&mut h, 1);
@@ -1364,11 +1438,19 @@ mod tests {
 
             // tick 3: second Ping
             let out = tick_n_collect(&mut h, 1);
-            assert_eq!(count_join_pings(&out, seed_addr()), 1, "second Ping at tick 3");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                1,
+                "second Ping at tick 3"
+            );
 
             // ticks 4–9: retries exhausted, no more Pings
             let out = tick_n_collect(&mut h, 6);
-            assert_eq!(count_join_pings(&out, seed_addr()), 0, "no Pings after exhaustion");
+            assert_eq!(
+                count_join_pings(&out, seed_addr()),
+                0,
+                "no Pings after exhaustion"
+            );
         }
 
         #[test]

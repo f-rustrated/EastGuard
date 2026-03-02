@@ -4,9 +4,9 @@ mod connections;
 mod clusters;
 pub(crate) mod schedulers;
 
-use crate::schedulers::actor::{TICK_PERIOD_MS, run_scheduling_actor};
+use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
-    clusters::{JoinConfig, NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
+    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
