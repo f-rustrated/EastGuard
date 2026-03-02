@@ -306,9 +306,12 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
-                println!(
+                tracing::info!(
                     "[{}] ← Received Ping from {} ({}) seq={}",
-                    self.node_id, source_node_id, src, seq
+                    self.node_id,
+                    source_node_id,
+                    src,
+                    seq
                 );
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
                 let ack = SwimPacket::Ack {
@@ -327,9 +330,12 @@ impl Swim {
                 source_incarnation,
                 ..
             } => {
-                println!(
+                tracing::info!(
                     "[{}] ← Received Ack  from {} ({}) seq={}",
-                    self.node_id, source_node_id, src, seq
+                    self.node_id,
+                    source_node_id,
+                    src,
+                    seq
                 );
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
                 self.handle_incarnation_check(source_node_id, src, source_incarnation);
@@ -481,9 +487,13 @@ impl Swim {
         self.topology.update(node_id.clone(), addr, new_state);
 
         if changed {
-            println!(
+            tracing::info!(
                 "[{}] Member update: {} @ {} → {:?} (inc {})",
-                self.node_id, node_id, addr, new_state, incarnation
+                self.node_id,
+                node_id,
+                addr,
+                new_state,
+                incarnation
             );
             let member = self.members[&node_id].clone();
             self.gossip_buffer.enqueue(member, self.members.len());
