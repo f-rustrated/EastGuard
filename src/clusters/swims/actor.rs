@@ -1,7 +1,9 @@
 use super::*;
 
-use crate::clusters::JoinAttempt;
+use super::peer_discovery::Bootstrapper;
+
 use crate::clusters::NodeId;
+use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::topology::Topology;
 use crate::clusters::swims::topology::TopologyConfig;
@@ -48,7 +50,7 @@ impl SwimActor {
 
     pub async fn run(mut self, bootstrap_servers: Vec<JoinAttempt>) {
         tracing::info!("[{}] SwimActor started.", self.state.node_id);
-        self.state.initiate_join(bootstrap_servers);
+        self.state = Bootstrapper::new(bootstrap_servers, self.state).bootstrap();
         self.flush_outbound_commands().await;
 
         while let Some(event) = self.mailbox.recv().await {

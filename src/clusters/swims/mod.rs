@@ -1,4 +1,5 @@
 pub(crate) mod actor;
+pub(crate) mod peer_discovery;
 
 mod gossip_buffer;
 mod livenode_tracker;

@@ -4,7 +4,6 @@ use bincode::{Decode, Encode};
 
 use crate::clusters::BINCODE_CONFIG;
 use crate::clusters::SwimNodeState::Alive;
-use crate::clusters::swims::swim::Swim;
 
 // Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -68,51 +67,5 @@ impl std::ops::Deref for NodeId {
 impl std::borrow::Borrow<str> for NodeId {
     fn borrow(&self) -> &str {
         &self.0
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct JoinAttempt {
-    pub(crate) seed_addr: SocketAddr,
-    pub(crate) ticks_for_wait: u32,
-    pub(crate) backoff_ticks: u32,
-    pub(crate) multiplier: u32,
-    pub(crate) max_attempts: u32,
-    pub(crate) remaining_attempts: u32,
-}
-impl JoinAttempt {
-    pub(crate) fn deduct_remaining_attempt(&mut self) {
-        self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
-    }
-
-    pub(crate) fn reset_next_ticks_for_wait(&mut self) {
-        let attempt = self.max_attempts - self.remaining_attempts;
-        self.ticks_for_wait = self.backoff_ticks * self.multiplier.pow(attempt);
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct JoinConfig {
-    pub(crate) seed_addrs: Vec<SocketAddr>,
-    pub(crate) ticks_for_wait: u32,
-    pub(crate) backoff_ticks: u32,
-    pub(crate) multiplier: u32,
-    pub(crate) max_attempts: u32,
-}
-#[cfg(test)]
-impl JoinConfig {
-    pub(crate) fn tries(&self) -> Vec<JoinAttempt> {
-        self.seed_addrs
-            .iter()
-            .map(|addr| JoinAttempt {
-                seed_addr: *addr,
-                ticks_for_wait: self.ticks_for_wait,
-                backoff_ticks: self.backoff_ticks,
-                multiplier: self.multiplier,
-                max_attempts: self.max_attempts,
-                remaining_attempts: self.max_attempts,
-            })
-            .collect()
     }
 }

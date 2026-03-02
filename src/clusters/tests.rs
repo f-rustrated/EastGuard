@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::clusters::swims::actor::SwimActor;
+use crate::clusters::swims::peer_discovery::JoinConfig;
 use crate::clusters::swims::{OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer};
-use crate::clusters::{JoinConfig, swims::actor::SwimActor};
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};

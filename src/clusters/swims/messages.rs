@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
-use crate::clusters::{JoinAttempt, NodeId, SwimNode};
+use crate::clusters::swims::peer_discovery::JoinAttempt;
+use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
     ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
     timer::TTimer,

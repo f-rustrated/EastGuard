@@ -6,7 +6,7 @@ use std::io::Write;
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::JoinAttempt;
+use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
