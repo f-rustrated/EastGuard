@@ -55,7 +55,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    local_addr: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
     incarnation: u64,
 
     // Protocol state
@@ -98,31 +98,32 @@ impl Swim {
     }
 
     pub(crate) fn initiate_join(&mut self, join_config: Vec<JoinTry>) {
-        let tries: Vec<JoinTry> = join_config
+        for join_try in join_config
             .into_iter()
             .filter(|t| t.seed_addr != self.local_addr)
-            .collect();
-
-        for join_try in tries {
-            if join_try.ticks_for_wait == 0 && join_try.max_attempts > 0 {
-                self.send_join_ping_with_retry(join_try);
-            } else {
-                let seq = self.next_seq();
-                println!(
-                    "[{}] Scheduling join timer to {} (delay {} ticks)",
-                    self.node_id, join_try.seed_addr, join_try.ticks_for_wait
-                );
-                self.schedule_join_timer(seq, join_try);
-            }
+            .collect::<Vec<_>>()
+        {
+            self.send_join_ping_with_retry(join_try);
         }
     }
 
-    fn send_join_ping_with_retry(&mut self, mut join_try: JoinTry) {
-        println!(
+    pub(crate) fn send_join_ping_with_retry(&mut self, join_try: JoinTry) {
+        tracing::info!(
             "[{}] → Sending join Ping to {} ({} attempt(s) left)",
-            self.node_id, join_try.seed_addr, join_try.remaining_attempts
+            self.node_id,
+            join_try.seed_addr,
+            join_try.remaining_attempts
         );
         let seq = self.next_seq();
+        if join_try.ticks_for_wait == 0 && join_try.max_attempts > 0 {
+            self.handle_join_retry(join_try, Some(seq));
+            return;
+        }
+        self.schedule_join_timer(seq, join_try);
+    }
+
+    fn handle_join_retry(&mut self, mut join_try: JoinTry, seq: Option<u32>) {
+        let seq = seq.unwrap_or(self.next_seq());
         let ping = SwimPacket::Ping {
             seq,
             source_node_id: self.node_id.clone(),
@@ -132,6 +133,7 @@ impl Swim {
         self.pending_outbound
             .push(OutboundPacket::new(join_try.seed_addr, ping));
 
+        join_try.reset_next_ticks_for_wait();
         join_try.deduct_remaining_attempt();
         self.schedule_join_timer(seq, join_try);
     }
@@ -157,7 +159,17 @@ impl Swim {
                 (ProbePhase::Direct, Some(target)) => self.start_indirect_probe(target, seq),
                 (ProbePhase::Indirect, Some(target)) => self.try_mark_suspect(target),
                 (ProbePhase::Suspect, Some(target)) => self.try_mark_dead(target),
-                (ProbePhase::JoinRetry(join_try), None) => self.handle_join_retry(join_try),
+                (ProbePhase::JoinRetry(join_try), None) => {
+                    if join_try.remaining_attempts == 0 {
+                        println!(
+                            "[{}] Join to {} exhausted all attempts — giving up",
+                            self.node_id, join_try.seed_addr
+                        );
+                        return;
+                    }
+
+                    self.handle_join_retry(join_try, None)
+                }
                 _ => {}
             },
         }
@@ -283,20 +295,6 @@ impl Swim {
                 member.incarnation,
             );
         }
-    }
-
-    fn handle_join_retry(&mut self, mut join_try: JoinTry) {
-        if join_try.remaining_attempts == 0 {
-            println!(
-                "[{}] Join to {} exhausted all attempts — giving up",
-                self.node_id, join_try.seed_addr
-            );
-            return;
-        }
-
-        let attempt = join_try.max_attempts - join_try.remaining_attempts;
-        join_try.ticks_for_wait = join_try.backoff_ticks * join_try.multiplier.pow(attempt);
-        self.send_join_ping_with_retry(join_try);
     }
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
