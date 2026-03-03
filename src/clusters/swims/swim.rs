@@ -56,7 +56,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    pub(crate) local_addr: SocketAddr,
+    pub(crate) advertise_addr: SocketAddr,
     incarnation: u64,
 
     // Protocol state
@@ -76,10 +76,10 @@ pub struct Swim {
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
+    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology) -> Self {
         let mut swim = Self {
             node_id,
-            local_addr,
+            advertise_addr,
             incarnation: 0,
             topology,
             members: HashMap::new(),
@@ -93,7 +93,7 @@ impl Swim {
         };
         swim.update_member(
             swim.node_id.clone(),
-            local_addr,
+            advertise_addr,
             SwimNodeState::Alive,
             swim.incarnation,
         );
@@ -400,7 +400,7 @@ impl Swim {
                 self.gossip_buffer.enqueue(
                     SwimNode {
                         node_id: self.node_id.clone(),
-                        addr: self.local_addr,
+                        addr: self.advertise_addr,
                         state: SwimNodeState::Alive,
                         incarnation: new_incarnation,
                     },

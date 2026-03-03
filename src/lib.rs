@@ -26,16 +26,16 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
-pub struct StartUp<'a> {
-    env: &'a Environment,
+pub struct StartUp {
+    env: Environment,
 }
 
-impl<'a> StartUp<'a> {
+impl StartUp {
     pub fn new() -> Self {
-        Self { env: &ENV }
+        Self { env: ENV.clone() }
     }
 
-    pub fn with_env(env: &'a Environment) -> Self {
+    pub fn with_env(env: Environment) -> Self {
         Self { env }
     }
 
