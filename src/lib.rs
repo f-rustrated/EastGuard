@@ -4,13 +4,13 @@ mod connections;
 mod clusters;
 pub(crate) mod schedulers;
 mod net;
+mod it;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
-use crate::clusters::swims::swim::Swim;
 
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
-    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
+    clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -21,24 +21,40 @@ use anyhow::Result;
 
 use crate::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use crate::config::Environment;
 
 #[derive(Debug)]
-pub struct StartUp;
+pub struct StartUp<'a> {
+    env: &'a Environment,
+}
 
-impl StartUp {
+impl <'a> StartUp<'a> {
+
+    pub fn new() -> Self {
+        Self {
+            env: &ENV
+        }
+    }
+
+    pub fn with_env(env: &'a Environment) -> Self {
+        Self {
+            env
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
         // Create a channel for the SwimActor
         let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            SwimTransportActor::new(ENV.peer_bind_addr(), swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(self.env.peer_bind_addr(), swim_sender.clone(), rx_outbound).await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
 
-        let mut state = ENV.swim();
-        Bootstrapper::new(ENV.bootstrap_servers(), &mut state);
+        let mut state = self.env.swim();
+        Bootstrapper::new(self.env.bootstrap_servers(), &mut state);
 
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
@@ -51,11 +67,11 @@ impl StartUp {
     }
 
     async fn receive_client_streams(self) {
-        let addr = ENV.bind_addr();
+        let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
             "[{}] EastGuard listening on {}",
-            ENV.resolve_node_id(),
+            self.env.resolve_node_id(),
             addr
         );
 
