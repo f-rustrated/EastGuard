@@ -6,7 +6,7 @@ use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
-    OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer, Topology, TopologyConfig,
+    OutboundPacket, SwimCommand, SwimPacket, SwimQueryCommand, SwimTimer, Topology, TopologyConfig,
 };
 
 use crate::schedulers::actor::run_scheduling_actor;
@@ -30,24 +30,23 @@ impl TestHarness {
     pub async fn query_topology_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Test(
-                SwimTestCommand::TopologyValidationCount { reply: tx },
+            .send(SwimCommand::Query(
+                SwimQueryCommand::GetMembers { reply: tx },
             ))
             .await
             .unwrap();
-        rx.await.unwrap()
+        rx.await.unwrap().iter().count()
     }
 
     pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Test(SwimTestCommand::TopologyIncludesNode {
-                node_id,
-                reply: tx,
-            }))
+            .send(SwimCommand::Query(
+                SwimQueryCommand::GetTopology { reply: tx },
+            ))
             .await
             .unwrap();
-        rx.await.unwrap()
+        rx.await.unwrap().contains_node(&node_id) 
     }
 }
 
@@ -433,7 +432,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
 
 #[tokio::test]
 async fn test_dead_gossip_removes_node_from_topology() {
-    let mut harness = setup_single().await;
+    let harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 

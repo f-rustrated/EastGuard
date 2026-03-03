@@ -41,8 +41,7 @@ impl SwimActor {
                 SwimCommand::Timeout(tick_event) => {
                     state.handle_timeout(tick_event);
                 }
-                #[cfg(test)]
-                SwimCommand::Test(test_command) => state.handle_test_command(test_command),
+                SwimCommand::Query(command) => state.handle_query(command),
             }
 
             self.flush_outbound_commands(&mut state).await;

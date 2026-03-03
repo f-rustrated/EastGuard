@@ -155,14 +155,13 @@ impl Swim {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn handle_test_command(&self, test_command: SwimTestCommand) {
-        match test_command {
-            SwimTestCommand::TopologyValidationCount { reply } => {
-                let _ = reply.send(self.topology.num_nodes());
+    pub(crate) fn handle_query(&self, command: SwimQueryCommand) {
+        match command {
+            SwimQueryCommand::GetMembers { reply } => {
+                let _ = reply.send(self.members.values().map(|s| s.clone()).collect());
             }
-            SwimTestCommand::TopologyIncludesNode { node_id, reply } => {
-                let _ = reply.send(self.topology.contains_node(&node_id));
+            SwimQueryCommand::GetTopology { reply } => {
+                let _ = reply.send(self.topology.clone());
             }
         }
     }

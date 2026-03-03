@@ -1,3 +1,4 @@
+use std::iter::RepeatN;
 use std::net::SocketAddr;
 
 use crate::clusters::swims::peer_discovery::JoinAttempt;
@@ -7,6 +8,7 @@ use crate::schedulers::{
     timer::TTimer,
 };
 use bincode::{Decode, Encode};
+use crate::clusters::swims::Topology;
 
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
@@ -42,20 +44,17 @@ pub enum SwimCommand {
     },
     // From Ticker
     Timeout(SwimTimeOutCallback),
-    #[cfg(test)]
-    Test(SwimTestCommand),
+    Query(SwimQueryCommand),
 }
 
-#[cfg(test)]
 #[derive(Debug)]
-pub enum SwimTestCommand {
-    TopologyValidationCount {
-        reply: tokio::sync::oneshot::Sender<usize>,
+pub enum SwimQueryCommand {
+    GetMembers {
+        reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
-    TopologyIncludesNode {
-        node_id: NodeId,
-        reply: tokio::sync::oneshot::Sender<bool>,
-    },
+    GetTopology {
+        reply: tokio::sync::oneshot::Sender<Topology>
+    }
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {
