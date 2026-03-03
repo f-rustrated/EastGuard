@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use std::iter::RepeatN;
 use std::net::SocketAddr;
 
@@ -32,6 +33,62 @@ pub enum SwimPacket {
         source_incarnation: u64,
         gossip: Vec<SwimNode>,
     },
+}
+
+impl Display for SwimPacket {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwimPacket::Ping {
+                seq,
+                source_node_id,
+                source_incarnation,
+                gossip,
+            } => {
+                write!(
+                    f,
+                    "[PING] seq: {}, source: {} (inc:{}), gossip: {}",
+                    seq,
+                    source_node_id,
+                    source_incarnation,
+                    gossip.len()
+                )
+            }
+
+            SwimPacket::Ack {
+                seq,
+                source_node_id,
+                source_incarnation,
+                gossip,
+            } => {
+                write!(
+                    f,
+                    "[ACK] seq: {}, source: {} (inc:{}), gossip: {}",
+                    seq,
+                    source_node_id,
+                    source_incarnation,
+                    gossip.len()
+                )
+            }
+
+            SwimPacket::PingReq {
+                seq,
+                target,
+                source_node_id,
+                source_incarnation,
+                gossip,
+            } => {
+                write!(
+                    f,
+                    "[PINGREQ] seq: {}, target: {}, source: {} (inc:{}), gossip: {}",
+                    seq,
+                    target,
+                    source_node_id,
+                    source_incarnation,
+                    gossip.len()
+                )
+            }
+        }
+    }
 }
 
 /// Internal Events (Actor Logic)
@@ -97,6 +154,12 @@ impl OutboundPacket {
 
     pub fn packet(&self) -> &SwimPacket {
         &self.packet
+    }
+}
+
+impl Display for OutboundPacket {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Target: {}, Packet: {}", self.target, self.packet)
     }
 }
 

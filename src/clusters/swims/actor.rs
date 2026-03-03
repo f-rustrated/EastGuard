@@ -54,11 +54,13 @@ impl SwimActor {
         tokio::join!(
             async {
                 for cmd in timer_commands {
+                    tracing::debug!("[TIMER] {}", cmd);
                     let _ = self.scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {
                 for pkt in outbound_packets {
+                    tracing::debug!("[PACKET] {}", pkt);
                     let _ = self.transport_tx.send(pkt).await;
                 }
             }
