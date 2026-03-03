@@ -2,12 +2,16 @@ mod config;
 mod connections;
 
 mod clusters;
-pub(crate) mod schedulers;
-mod net;
 mod it;
+mod net;
+pub(crate) mod schedulers;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
 
+use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
+use crate::config::Environment;
+use crate::connections::request::QueryCommand;
+use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
@@ -18,28 +22,21 @@ use crate::{
     },
 };
 use anyhow::Result;
-
-use crate::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use crate::config::Environment;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct StartUp<'a> {
     env: &'a Environment,
 }
 
-impl <'a> StartUp<'a> {
-
+impl<'a> StartUp<'a> {
     pub fn new() -> Self {
-        Self {
-            env: &ENV
-        }
+        Self { env: &ENV }
     }
 
     pub fn with_env(env: &'a Environment) -> Self {
-        Self {
-            env
-        }
+        Self { env }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -48,7 +45,8 @@ impl <'a> StartUp<'a> {
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            SwimTransportActor::new(self.env.peer_bind_addr(), swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(self.env.peer_bind_addr(), swim_sender.clone(), rx_outbound)
+                .await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
@@ -62,11 +60,11 @@ impl <'a> StartUp<'a> {
         tokio::spawn(swim_actor.run(state));
 
         // run handlers
-        let _ = self.receive_client_streams().await;
+        let _ = self.receive_client_streams(swim_sender.clone()).await;
         Ok(())
     }
 
-    async fn receive_client_streams(self) {
+    async fn receive_client_streams(self, swim_sender: Sender<SwimCommand>) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -84,12 +82,15 @@ impl <'a> StartUp<'a> {
         }
     }
 
-    async fn handle_client_stream(&self, stream: TcpStream) -> anyhow::Result<()> {
+    async fn handle_client_stream(
+        &self,
+        stream: TcpStream,
+        swim_sender: Sender<SwimCommand>,
+    ) -> Result<()> {
         let (read_half, write_half) = stream.into_split();
-        let _stream_writer = ClientStreamWriter::new(write_half);
         // ! TBD writer needs to be run and read handler should hold sender to the writer
-
         let mut stream_reader = ClientStreamReader::new(read_half);
+        let mut stream_writer = ClientStreamWriter::new(write_half);
         let request = stream_reader.read_request().await?;
 
         match request {
@@ -98,10 +99,38 @@ impl <'a> StartUp<'a> {
             }
             ConnectionRequests::Connection(_request) => {
                 // validate connection
-
                 tokio::spawn(stream_reader.handle_client_stream());
+            }
+            ConnectionRequests::Query(query_type) => {
+                self.handle_query(stream_writer, swim_sender, query_type)
+                    .await?;
             }
         }
         Ok(())
+    }
+
+    async fn handle_query(
+        &self,
+        mut writer: ClientStreamWriter,
+        swim_sender: Sender<SwimCommand>,
+        query_type: QueryCommand,
+    ) -> Result<()> {
+        match query_type {
+            QueryCommand::GetMembers => {
+                let (send, recv) = tokio::sync::oneshot::channel();
+                swim_sender
+                    .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
+                        reply: send,
+                    }))
+                    .await?;
+
+                let result = recv.await?;
+                writer
+                    .write(&result)
+                    .await
+                    .expect("Failed to write message");
+                Ok(())
+            }
+        }
     }
 }
