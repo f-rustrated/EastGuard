@@ -72,6 +72,7 @@ pub struct Swim {
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
+    pending_indirect_pings: HashMap<u32, ProxyPing>,
 }
 
 impl Swim {
@@ -88,6 +89,7 @@ impl Swim {
             last_suspected_seqs: HashMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
+            pending_indirect_pings: HashMap::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -134,6 +136,9 @@ impl Swim {
                 }
                 (SwimTimerKind::IndirectProbe, Some(target)) => self.try_mark_suspect(target),
                 (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target),
+                (SwimTimerKind::ProxyPing, None) => {
+                    self.pending_indirect_pings.remove(&seq);
+                }
                 (SwimTimerKind::JoinTry(join_attempt), None) => {
                     if join_attempt.remaining_attempts == 0 {
                         tracing::warn!(
@@ -327,19 +332,44 @@ impl Swim {
                     seq
                 );
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
-                self.handle_incarnation_check(source_node_id, src, source_incarnation);
+                self.handle_incarnation_check(source_node_id.clone(), src, source_incarnation);
                 self.pending_timer_commands
                     .push(TimerCommand::CancelSchedule { seq });
+
+                if let Some(ProxyPing {
+                    requester_addr,
+                    request_seq,
+                }) = self.pending_indirect_pings.remove(&seq)
+                {
+                    let forwarded_ack = SwimPacket::Ack {
+                        seq: request_seq,
+                        source_node_id,
+                        source_incarnation,
+                        gossip: self.gossip_buffer.collect(),
+                    };
+
+                    self.pending_outbound
+                        .push(OutboundPacket::new(requester_addr, forwarded_ack));
+                }
             }
 
             SwimPacket::PingReq {
                 source_node_id,
                 target,
                 source_incarnation,
+                seq: req_seq,
                 ..
             } => {
-                self.handle_incarnation_check(source_node_id, src, source_incarnation);
+                self.handle_incarnation_check(source_node_id.clone(), src, source_incarnation);
                 let seq = self.next_seq();
+
+                self.pending_indirect_pings.insert(
+                    seq,
+                    ProxyPing {
+                        request_seq: req_seq,
+                        requester_addr: src,
+                    },
+                );
                 let ping = SwimPacket::Ping {
                     seq,
                     source_node_id: self.node_id.clone(),
@@ -348,6 +378,10 @@ impl Swim {
                 };
                 self.pending_outbound
                     .push(OutboundPacket::new(target, ping));
+                self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                    seq,
+                    timer: SwimTimer::proxy_ping(),
+                });
             }
         }
     }
@@ -982,6 +1016,77 @@ mod tests {
                 }
                 _ => panic!("expected Ping"),
             }
+        }
+    }
+
+    mod proxy_ping {
+        use super::*;
+        use crate::clusters::swims::swim::tests::{ack, pingreq};
+        use crate::schedulers::ticker::DIRECT_ACK_TIMEOUT_TICKS;
+        use std::net::SocketAddr;
+
+        #[test]
+        fn proxy_ping_entry_cleaned_up_on_timeout() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            // node-b asks us to ping node-c
+            h.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
+            let _ = h.protocol.take_outbound();
+
+            assert_eq!(h.protocol.pending_indirect_pings.len(), 1);
+
+            // node-c never responds — tick until ProxyPing timer fires
+            for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
+                h.tick();
+            }
+
+            assert!(
+                h.protocol.pending_indirect_pings.is_empty(),
+                "stale proxy ping entry should be cleaned up after timeout"
+            );
+        }
+
+        #[test]
+        fn proxy_ping_ack_cancels_timer_and_forwards_ack() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+            // node-b asks us to ping node-c (original seq=42)
+            h.step(b_addr, pingreq(42, "node-b", 1, c_addr, vec![]));
+
+            // grab the proxy Ping's seq
+            let out = h.protocol.take_outbound();
+            let proxy_seq = match out[0].packet() {
+                SwimPacket::Ping { seq, .. } => *seq,
+                _ => panic!("expected proxy Ping"),
+            };
+
+            assert_eq!(h.protocol.pending_indirect_pings.len(), 1);
+
+            // node-c responds with Ack
+            h.step(c_addr, ack(proxy_seq, "node-c", 1, vec![]));
+
+            // entry removed, timer cancelled
+            assert!(
+                h.protocol.pending_indirect_pings.is_empty(),
+                "entry should be removed after Ack"
+            );
+            assert!(
+                !h.ticker.has_timer(proxy_seq),
+                "proxy ping timer should be cancelled after Ack"
+            );
+
+            // forwarded Ack sent back to node-b with original seq=42
+            let out = h.protocol.take_outbound();
+            assert!(
+                out.iter()
+                    .any(|p| p.target == b_addr
+                        && matches!(p.packet(), SwimPacket::Ack { seq: 42, .. })),
+                "should forward Ack to original requester with original seq"
+            );
         }
     }
 
