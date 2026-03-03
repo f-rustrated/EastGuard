@@ -75,7 +75,7 @@ impl<'a> StartUp<'a> {
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
-            if let Err(err) = self.handle_client_stream(stream).await {
+            if let Err(err) = self.handle_client_stream(stream, swim_sender.clone()).await {
                 tracing::error!("{}", err);
                 continue;
             }

@@ -416,7 +416,7 @@ impl Swim {
             member.addr,
             member.state,
             member.incarnation,
-        )
+        );
     }
 
     fn handle_incarnation_check(
@@ -450,6 +450,7 @@ impl Swim {
             );
         }
     }
+
     fn update_member(
         &mut self,
         node_id: NodeId,
@@ -514,13 +515,21 @@ impl Swim {
                 incarnation
             );
 
-            if member.state == SwimNodeState::Suspect {
-                let seq = self.next_seq();
-                self.last_suspected_seqs.insert(node_id.clone(), seq);
-                self.pending_timer_commands.push(TimerCommand::SetSchedule {
-                    seq,
-                    timer: SwimTimer::suspect_timer(node_id),
-                });
+            match member.state {
+                SwimNodeState::Alive => {
+                    if let Some(suspect_seq) = self.last_suspected_seqs.remove(&node_id) {
+                        self.pending_timer_commands.push(TimerCommand::CancelSchedule { seq: suspect_seq });
+                    }
+                }
+                SwimNodeState::Suspect => {
+                    let seq = self.next_seq();
+                    self.last_suspected_seqs.insert(node_id.clone(), seq);
+                    self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                        seq,
+                        timer: SwimTimer::suspect_timer(node_id),
+                    });
+                }
+                _ => {}
             }
 
             self.gossip_buffer.enqueue(member, self.members.len());
