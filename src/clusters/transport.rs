@@ -27,7 +27,7 @@ impl SwimTransportActor {
     }
 
     pub async fn run(mut self) {
-        println!(
+        tracing::info!(
             "Transport Layer listening on {}",
             self.socket.local_addr().unwrap()
         );
@@ -41,7 +41,7 @@ impl SwimTransportActor {
                         Ok((packet, _)) => {
                              let _ = self.to_actor.send(SwimCommand::PacketReceived { src, packet }).await;
                         }
-                        Err(e) => eprintln!("Failed to decode packet from {}: {}", src, e),
+                        Err(e) => tracing::error!("Failed to decode packet from {}: {}", src, e),
                     }
                 }
 
@@ -51,7 +51,7 @@ impl SwimTransportActor {
                         Ok(bytes) => {
                             let _ = self.socket.send_to(&bytes, msg.target).await;
                         }
-                        Err(e) => eprintln!("Failed to encode packet: {}", e),
+                        Err(e) => tracing::error!("Failed to encode packet: {}", e),
                     }
                 }
             }
