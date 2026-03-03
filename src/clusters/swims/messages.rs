@@ -81,6 +81,7 @@ pub(crate) enum SwimTimerKind {
     IndirectProbe,
     Suspect,
     JoinTry(JoinAttempt),
+    ProxyPing,
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -153,6 +154,14 @@ impl SwimTimer {
         }
     }
 
+    pub(crate) fn proxy_ping() -> Self {
+        Self {
+            target_node_id: None,
+            kind: SwimTimerKind::ProxyPing,
+            ticks_remaining: DIRECT_ACK_TIMEOUT_TICKS,
+        }
+    }
+
     pub(crate) fn join_try(join_try: JoinAttempt) -> Self {
         Self {
             target_node_id: None,
@@ -160,4 +169,10 @@ impl SwimTimer {
             kind: SwimTimerKind::JoinTry(join_try),
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProxyPing {
+    pub(crate) requester_addr: SocketAddr,
+    pub(crate) request_seq: u32,
 }
