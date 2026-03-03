@@ -1,4 +1,4 @@
-/// Make sure to run the test using RUST_LOG=debug cargo test --features turmoil cluster_setup -- --nocapture
+/// Make sure to run the test using RUST_LOG=debug cargo test --features turmoil -- --nocapture
 #[cfg(test)]
 #[cfg(feature = "turmoil")]
 mod tests {
@@ -7,10 +7,10 @@ mod tests {
     use crate::config::Environment;
     use crate::connections::clients::{ClientStreamReader, ClientStreamWriter};
     use crate::connections::request::ConnectionRequests;
+    use crate::connections::request::QueryCommand::GetMembers;
     use crate::net::TcpStream;
     use std::time::Duration;
     use turmoil::Builder;
-    use crate::connections::request::QueryCommand::GetMembers;
 
     fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
         Environment {
@@ -20,7 +20,8 @@ mod tests {
             node_id_file_name: "node_id".into(),
             port,
             cluster_port,
-            host: "0.0.0.0".into(), //
+            host: "0.0.0.0".into(),
+            advertise_host: None,
             vnodes_per_node: 256,
             join_seed_nodes: vec![],
             join_initial_delay_ms: 1000,
@@ -30,7 +31,7 @@ mod tests {
         }
     }
 
-    async fn check_node(host: &str, port: u16) -> turmoil::Result {
+    async fn check_node_is_all_alive(host: &str, port: u16) -> turmoil::Result {
         let stream = TcpStream::connect((host, port)).await?;
         let (read_half, write_half) = stream.into_split();
         let mut writer = ClientStreamWriter::new(write_half);
@@ -44,8 +45,15 @@ mod tests {
             // tracing::info!("MEMBER: {}", m);
         }
 
-        let alive_count = members.iter().filter(|m| m.state == SwimNodeState::Alive).count();
-        assert_eq!(alive_count, 3, "{host} should have 3 alive nodes, got {:?}", members);
+        let alive_count = members
+            .iter()
+            .filter(|m| m.state == SwimNodeState::Alive)
+            .count();
+        assert_eq!(
+            alive_count, 3,
+            "{host} should have 3 alive nodes, got {:?}",
+            members
+        );
         Ok(())
     }
 
@@ -60,31 +68,40 @@ mod tests {
             .try_init();
 
         sim.host("node-1", || async {
+            let me = turmoil::lookup("node-1");
             let n2 = turmoil::lookup("node-2");
             let n3 = turmoil::lookup("node-3");
+
             let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             tracing::info!("NODE-1 is running");
             Ok(())
         });
 
         sim.host("node-2", || async {
+            let me = turmoil::lookup("node-2");
             let n1 = turmoil::lookup("node-1");
             let n3 = turmoil::lookup("node-3");
+
             let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             tracing::info!("NODE-2 is running");
             Ok(())
         });
 
         sim.host("node-3", || async {
+            let me = turmoil::lookup("node-3");
             let n1 = turmoil::lookup("node-1");
             let n2 = turmoil::lookup("node-2");
+
             let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             tracing::info!("NODE-3 is running");
             Ok(())
         });
@@ -93,9 +110,9 @@ mod tests {
             // wait for cluster to form
             tokio::time::sleep(Duration::from_secs(10)).await;
 
-            check_node("node-1", 8081).await?;
-            check_node("node-2", 8082).await?;
-            check_node("node-3", 8083).await?;
+            check_node_is_all_alive("node-1", 8081).await?;
+            check_node_is_all_alive("node-2", 8082).await?;
+            check_node_is_all_alive("node-3", 8083).await?;
 
             Ok(())
         });
@@ -116,29 +133,35 @@ mod tests {
             .try_init();
 
         sim.host("node-1", || async {
+            let me = turmoil::lookup("node-1");
             let n2 = turmoil::lookup("node-2");
             let n3 = turmoil::lookup("node-3");
             let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             Ok(())
         });
 
         sim.host("node-2", || async {
+            let me = turmoil::lookup("node-2");
             let n1 = turmoil::lookup("node-1");
             let n3 = turmoil::lookup("node-3");
             let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             Ok(())
         });
 
         sim.host("node-3", || async {
+            let me = turmoil::lookup("node-3");
             let n1 = turmoil::lookup("node-1");
             let n2 = turmoil::lookup("node-2");
             let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
+            env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
-            StartUp::with_env(&env).run().await?;
+            StartUp::with_env(env).run().await?;
             Ok(())
         });
 
@@ -155,9 +178,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
             tracing::info!("[TEST] WAKEUP!!");
 
-            check_node("node-1", 8081).await?;
-            check_node("node-2", 8082).await?;
-            check_node("node-3", 8083).await?;
+            check_node_is_all_alive("node-1", 8081).await?;
+            check_node_is_all_alive("node-2", 8082).await?;
+            check_node_is_all_alive("node-3", 8083).await?;
 
             Ok(())
         });

@@ -522,6 +522,15 @@ impl Swim {
                     }
                 }
                 SwimNodeState::Suspect => {
+                    // Cancel any existing suspect timer before setting a new one.
+                    // Without this, if gossip brings a Suspect(inc=M) for a node already
+                    // at Suspect(inc=N) with M > N, the old timer S_N is orphaned: it
+                    // still counts down against inc=N even though the node has since
+                    // moved to inc=M and may be actively refuting.
+                    if let Some(old_seq) = self.last_suspected_seqs.get(&node_id) {
+                        self.pending_timer_commands
+                            .push(TimerCommand::CancelSchedule { seq: *old_seq });
+                    }
                     let seq = self.next_seq();
                     self.last_suspected_seqs.insert(node_id.clone(), seq);
                     self.pending_timer_commands.push(TimerCommand::SetSchedule {
