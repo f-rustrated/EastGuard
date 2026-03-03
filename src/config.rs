@@ -69,7 +69,7 @@ impl Environment {
         // 2. Perform side effects (creation/validation) just like before
         for dir in [&env.data_dir, &env.config_dir] {
             if let Err(e) = fs::create_dir_all(dir) {
-                eprintln!("Warning: Could not create directory '{}': {}", dir, e);
+                tracing::error!("Warning: Could not create directory '{}': {}", dir, e);
             }
         }
 
@@ -78,7 +78,7 @@ impl Environment {
         if let Ok(_) = OpenOptions::new().write(true).create(true).open(&test_file) {
             let _ = fs::remove_file(test_file);
         } else {
-            eprintln!(
+            tracing::error!(
                 "Warning: Server directory '{}' may not be writable.",
                 env.data_dir
             );
@@ -126,7 +126,7 @@ impl Environment {
                     .write_all(new_id.as_bytes())
                     .and_then(|_| file.sync_all())
                 {
-                    eprintln!("Warning: failed to persist node_id '{}': {}", path, e);
+                    tracing::error!("Warning: failed to persist node_id '{}': {}", path, e);
                 }
                 new_id
             }
@@ -139,7 +139,7 @@ impl Environment {
                     .unwrap_or(new_id)
             }
             Err(e) => {
-                eprintln!("Warning: failed to create node_id file '{}': {}", path, e);
+                tracing::error!("Warning: failed to create node_id file '{}': {}", path, e);
                 new_id
             }
         }

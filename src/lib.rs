@@ -51,7 +51,7 @@ impl StartUp {
     async fn receive_client_streams(self) {
         let addr = ENV.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
-        println!(
+        tracing::info!(
             "[{}] EastGuard listening on {}",
             ENV.resolve_node_id(),
             addr
@@ -60,7 +60,7 @@ impl StartUp {
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
             if let Err(err) = self.handle_client_stream(stream).await {
-                eprintln!("{}", err);
+                tracing::error!("{}", err);
                 continue;
             }
         }
