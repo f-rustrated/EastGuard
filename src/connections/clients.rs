@@ -2,10 +2,8 @@ use std::io::ErrorKind;
 
 use anyhow::bail;
 use bytes::{Buf, BytesMut};
-use tokio::{
-    io::AsyncReadExt,
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use crate::net::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::AsyncReadExt;
 
 use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
 

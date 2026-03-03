@@ -4,7 +4,8 @@ use crate::clusters::swims::{OutboundPacket, SwimCommand};
 // TRANSPORT LAYER (Presentation)
 // ==========================================
 use super::*;
-use tokio::{net::UdpSocket, sync::mpsc};
+use crate::net::UdpSocket;
+use tokio::sync::mpsc;
 
 pub struct SwimTransportActor {
     socket: UdpSocket,

@@ -3,6 +3,7 @@ mod connections;
 
 mod clusters;
 pub(crate) mod schedulers;
+mod net;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
 use crate::clusters::swims::swim::Swim;
@@ -18,7 +19,8 @@ use crate::{
 };
 use anyhow::Result;
 
-use tokio::{net::TcpListener, sync::mpsc};
+use crate::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub struct StartUp;
@@ -66,7 +68,7 @@ impl StartUp {
         }
     }
 
-    async fn handle_client_stream(&self, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+    async fn handle_client_stream(&self, stream: TcpStream) -> anyhow::Result<()> {
         let (read_half, write_half) = stream.into_split();
         let _stream_writer = ClientStreamWriter::new(write_half);
         // ! TBD writer needs to be run and read handler should hold sender to the writer
