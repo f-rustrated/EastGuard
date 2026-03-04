@@ -1,0 +1,7 @@
+disallowed-types = [
+    { path = "tokio::net::TcpListener", reason = "Use our custom networking module instead for turmoil deterministic testing support." },
+    { path = "tokio::net::TcpStream", reason = "Use our custom networking module instead for turmoil deterministic testing support." },
+    { path = "tokio::net::UdpSocket", reason = "Use our custom networking module instead for turmoil deterministic testing support." },
+    { path = "tokio::net::tcp::OwnedReadHalf", reason = "Use our custom networking module instead for turmoil deterministic testing support." },
+    { path = "tokio::net::tcp::OwnedWriteHalf", reason = "Use our custom networking module instead for turmoil deterministic testing support." },
+]
