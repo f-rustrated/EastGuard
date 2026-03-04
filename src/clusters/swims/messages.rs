@@ -1,7 +1,7 @@
 use std::fmt::{Display, Formatter};
-use std::iter::RepeatN;
 use std::net::SocketAddr;
 
+use crate::clusters::swims::Topology;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
@@ -9,85 +9,57 @@ use crate::schedulers::{
     timer::TTimer,
 };
 use bincode::{Decode, Encode};
-use crate::clusters::swims::Topology;
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct SwimHeader {
+    pub seq: u32,
+    pub source_node_id: NodeId,
+    pub source_incarnation: u64,
+    pub gossip: Vec<SwimNode>,
+}
 
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
-    Ping {
-        seq: u32,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
-    },
-    Ack {
-        seq: u32,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
-    },
+    Ping(SwimHeader),
+    Ack(SwimHeader),
     PingReq {
-        seq: u32,
         target: SocketAddr,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
+        header: SwimHeader,
     },
+}
+
+impl SwimPacket {
+    pub(crate) fn gossip(&self) -> &[SwimNode] {
+        match self {
+            SwimPacket::Ping(swim_header) => &swim_header.gossip,
+            SwimPacket::Ack(swim_header) => &swim_header.gossip,
+            SwimPacket::PingReq { header, .. } => &header.gossip,
+        }
+    }
 }
 
 impl Display for SwimPacket {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SwimPacket::Ping {
-                seq,
-                source_node_id,
-                source_incarnation,
-                gossip,
-            } => {
-                write!(
-                    f,
-                    "[PING] seq: {}, source: {} (inc:{}), gossip: {}",
-                    seq,
-                    source_node_id,
-                    source_incarnation,
-                    gossip.len()
-                )
-            }
+        let (kind, header, target) = match self {
+            Self::Ping(h) => ("PING", h, None),
+            Self::Ack(h) => ("ACK", h, None),
+            Self::PingReq { target, header } => ("PINGREQ", header, Some(target)),
+        };
 
-            SwimPacket::Ack {
-                seq,
-                source_node_id,
-                source_incarnation,
-                gossip,
-            } => {
-                write!(
-                    f,
-                    "[ACK] seq: {}, source: {} (inc:{}), gossip: {}",
-                    seq,
-                    source_node_id,
-                    source_incarnation,
-                    gossip.len()
-                )
-            }
+        write!(f, "[{}] seq: {}, ", kind, header.seq)?;
 
-            SwimPacket::PingReq {
-                seq,
-                target,
-                source_node_id,
-                source_incarnation,
-                gossip,
-            } => {
-                write!(
-                    f,
-                    "[PINGREQ] seq: {}, target: {}, source: {} (inc:{}), gossip: {}",
-                    seq,
-                    target,
-                    source_node_id,
-                    source_incarnation,
-                    gossip.len()
-                )
-            }
+        if let Some(t) = target {
+            write!(f, "target: {}, ", t)?;
         }
+
+        write!(
+            f,
+            "source: {} (inc:{}), gossip: {}",
+            header.source_node_id,
+            header.source_incarnation,
+            header.gossip.len()
+        )
     }
 }
 
@@ -95,10 +67,7 @@ impl Display for SwimPacket {
 #[derive(Debug)]
 pub enum SwimCommand {
     // From Transport
-    PacketReceived {
-        src: SocketAddr,
-        packet: SwimPacket,
-    },
+    PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker
     Timeout(SwimTimeOutCallback),
     Query(SwimQueryCommand),
@@ -110,8 +79,8 @@ pub enum SwimQueryCommand {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
     GetTopology {
-        reply: tokio::sync::oneshot::Sender<Topology>
-    }
+        reply: tokio::sync::oneshot::Sender<Topology>,
+    },
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {
