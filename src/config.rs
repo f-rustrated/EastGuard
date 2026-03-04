@@ -13,7 +13,7 @@ use crate::clusters::swims::{Topology, TopologyConfig};
 use crate::schedulers::actor::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
     #[arg(
@@ -38,8 +38,31 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
-    #[arg(long, env = "EASTGUARD_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "EASTGUARD_HOST", default_value = "0.0.0.0")]
     pub host: String,
+
+    /// The IP address gossiped to cluster peers so they can reach this node.
+    ///
+    /// # Why this exists
+    ///
+    /// A node typically binds its sockets to `0.0.0.0` (all interfaces) so it accepts
+    /// traffic regardless of which NIC a packet arrives on. That is correct for *listening*,
+    /// but it is wrong for *advertising*: `0.0.0.0` is not routable. If a node gossips
+    /// `0.0.0.0` as its address, peers will store it and send probes there — probes that
+    /// can never be delivered, causing false suspicion and eventual eviction from the cluster.
+    ///
+    /// `host` controls where the sockets bind; `advertise_host` controls what address is
+    /// published to the rest of the cluster. The two concerns are independent:
+    ///
+    /// - In a single-NIC VM you may set both to the same value.
+    /// - Behind a NAT or load balancer you bind to a private IP but advertise the public one.
+    /// - In a container you bind to `0.0.0.0` but advertise the pod/container IP.
+    ///
+    /// When `advertise_host` is `None`, it falls back to `host`. This is fine in development
+    /// when `host` is already a routable address, but in any multi-node environment you should
+    /// set it explicitly.
+    #[arg(long, env = "EASTGUARD_ADVERTISE_HOST")]
+    pub advertise_host: Option<String>,
 
     #[arg(long, env = "EASTGUARD_VNODES_PER_NODE", default_value_t = 256)]
     pub vnodes_per_node: u64,
@@ -94,6 +117,15 @@ impl Environment {
         format!("{}:{}", self.host, self.cluster_port)
             .parse()
             .expect("Invalid peer bind address")
+    }
+
+    /// The address gossiped to cluster peers — must be routable by other nodes.
+    /// Defaults to `host:cluster_port` when `advertise_host` is not set.
+    pub(crate) fn advertise_peer_addr(&self) -> std::net::SocketAddr {
+        let host = self.advertise_host.as_deref().unwrap_or(&self.host);
+        format!("{}:{}", host, self.cluster_port)
+            .parse()
+            .expect("Invalid advertise peer address")
     }
 
     /// Returns the node ID, resolving it from (in priority order):
@@ -163,7 +195,7 @@ impl Environment {
     pub(crate) fn swim(&self) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
-            self.peer_bind_addr(),
+            self.advertise_peer_addr(),
             Topology::new(
                 Default::default(),
                 TopologyConfig {
@@ -190,6 +222,7 @@ mod tests {
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
+            advertise_host: None,
             vnodes_per_node: 256,
             join_seed_nodes: vec![],
             join_initial_delay_ms: 1000,
@@ -225,7 +258,7 @@ mod tests {
         assert_eq!(env.node_id_file_name, "node_id");
         assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
-        assert_eq!(env.host, "127.0.0.1");
+        assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.vnodes_per_node, 256);
         assert_eq!(env.join_seed_nodes, Vec::<String>::new());
         assert_eq!(env.join_initial_delay_ms, 1000);

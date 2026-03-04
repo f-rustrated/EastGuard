@@ -41,8 +41,7 @@ impl SwimActor {
                 SwimCommand::Timeout(tick_event) => {
                     state.handle_timeout(tick_event);
                 }
-                #[cfg(test)]
-                SwimCommand::Test(test_command) => state.handle_test_command(test_command),
+                SwimCommand::Query(command) => state.handle_query(command),
             }
 
             self.flush_outbound_commands(&mut state).await;
@@ -55,11 +54,13 @@ impl SwimActor {
         tokio::join!(
             async {
                 for cmd in timer_commands {
+                    tracing::debug!("[TIMER] {}", cmd);
                     let _ = self.scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {
                 for pkt in outbound_packets {
+                    tracing::debug!("[PACKET] {}", pkt);
                     let _ = self.transport_tx.send(pkt).await;
                 }
             }

@@ -1,5 +1,7 @@
+use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 
+use crate::clusters::swims::Topology;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
@@ -8,53 +10,76 @@ use crate::schedulers::{
 };
 use bincode::{Decode, Encode};
 
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct SwimHeader {
+    pub seq: u32,
+    pub source_node_id: NodeId,
+    pub source_incarnation: u64,
+    pub gossip: Vec<SwimNode>,
+}
+
 /// The Wire Format (What goes over UDP)
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum SwimPacket {
-    Ping {
-        seq: u32,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
-    },
-    Ack {
-        seq: u32,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
-    },
+    Ping(SwimHeader),
+    Ack(SwimHeader),
     PingReq {
-        seq: u32,
         target: SocketAddr,
-        source_node_id: NodeId,
-        source_incarnation: u64,
-        gossip: Vec<SwimNode>,
+        header: SwimHeader,
     },
+}
+
+impl SwimPacket {
+    pub(crate) fn gossip(&self) -> &[SwimNode] {
+        match self {
+            SwimPacket::Ping(swim_header) => &swim_header.gossip,
+            SwimPacket::Ack(swim_header) => &swim_header.gossip,
+            SwimPacket::PingReq { header, .. } => &header.gossip,
+        }
+    }
+}
+
+impl Display for SwimPacket {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let (kind, header, target) = match self {
+            Self::Ping(h) => ("PING", h, None),
+            Self::Ack(h) => ("ACK", h, None),
+            Self::PingReq { target, header } => ("PINGREQ", header, Some(target)),
+        };
+
+        write!(f, "[{}] seq: {}, ", kind, header.seq)?;
+
+        if let Some(t) = target {
+            write!(f, "target: {}, ", t)?;
+        }
+
+        write!(
+            f,
+            "source: {} (inc:{}), gossip: {}",
+            header.source_node_id,
+            header.source_incarnation,
+            header.gossip.len()
+        )
+    }
 }
 
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
 pub enum SwimCommand {
     // From Transport
-    PacketReceived {
-        src: SocketAddr,
-        packet: SwimPacket,
-    },
+    PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker
     Timeout(SwimTimeOutCallback),
-    #[cfg(test)]
-    Test(SwimTestCommand),
+    Query(SwimQueryCommand),
 }
 
-#[cfg(test)]
 #[derive(Debug)]
-pub enum SwimTestCommand {
-    TopologyValidationCount {
-        reply: tokio::sync::oneshot::Sender<usize>,
+pub enum SwimQueryCommand {
+    GetMembers {
+        reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
-    TopologyIncludesNode {
-        node_id: NodeId,
-        reply: tokio::sync::oneshot::Sender<bool>,
+    GetTopology {
+        reply: tokio::sync::oneshot::Sender<Topology>,
     },
 }
 
@@ -98,6 +123,12 @@ impl OutboundPacket {
 
     pub fn packet(&self) -> &SwimPacket {
         &self.packet
+    }
+}
+
+impl Display for OutboundPacket {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Target: {}, Packet: {}", self.target, self.packet)
     }
 }
 

@@ -56,7 +56,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    pub(crate) local_addr: SocketAddr,
+    pub(crate) advertise_addr: SocketAddr,
     incarnation: u64,
 
     // Protocol state
@@ -76,10 +76,10 @@ pub struct Swim {
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, local_addr: SocketAddr, topology: Topology) -> Self {
+    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology) -> Self {
         let mut swim = Self {
             node_id,
-            local_addr,
+            advertise_addr,
             incarnation: 0,
             topology,
             members: HashMap::new(),
@@ -93,21 +93,24 @@ impl Swim {
         };
         swim.update_member(
             swim.node_id.clone(),
-            local_addr,
+            advertise_addr,
             SwimNodeState::Alive,
             swim.incarnation,
         );
         swim
     }
 
-    pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
-        let seq = self.next_seq();
-        let ping = SwimPacket::Ping {
+    fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
+        SwimHeader {
             seq,
             source_node_id: self.node_id.clone(),
             source_incarnation: self.incarnation,
             gossip: self.gossip_buffer.collect(),
-        };
+        }
+    }
+    pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
+        let seq = self.next_seq();
+        let ping = SwimPacket::Ping(self.generate_swim_header(seq));
         self.pending_outbound
             .push(OutboundPacket::new(attempt.seed_addr, ping));
 
@@ -135,7 +138,7 @@ impl Swim {
                     self.start_indirect_probe(target, seq)
                 }
                 (SwimTimerKind::IndirectProbe, Some(target)) => self.try_mark_suspect(target),
-                (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target),
+                (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target, seq),
                 (SwimTimerKind::ProxyPing, None) => {
                     self.pending_indirect_pings.remove(&seq);
                 }
@@ -155,14 +158,13 @@ impl Swim {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn handle_test_command(&self, test_command: SwimTestCommand) {
-        match test_command {
-            SwimTestCommand::TopologyValidationCount { reply } => {
-                let _ = reply.send(self.topology.num_nodes());
+    pub(crate) fn handle_query(&self, command: SwimQueryCommand) {
+        match command {
+            SwimQueryCommand::GetMembers { reply } => {
+                let _ = reply.send(self.members.values().map(|s| s.clone()).collect());
             }
-            SwimTestCommand::TopologyIncludesNode { node_id, reply } => {
-                let _ = reply.send(self.topology.contains_node(&node_id));
+            SwimQueryCommand::GetTopology { reply } => {
+                let _ = reply.send(self.topology.clone());
             }
         }
     }
@@ -183,12 +185,7 @@ impl Swim {
             };
 
             let seq = self.next_seq();
-            let packet = SwimPacket::Ping {
-                seq,
-                source_node_id: self.node_id.clone(),
-                source_incarnation: self.incarnation,
-                gossip: self.gossip_buffer.collect(),
-            };
+            let packet = SwimPacket::Ping(self.generate_swim_header(seq));
 
             self.pending_outbound
                 .push(OutboundPacket::new(target, packet));
@@ -237,11 +234,8 @@ impl Swim {
         }
 
         let packet = SwimPacket::PingReq {
-            seq,
+            header: self.generate_swim_header(seq),
             target: target_addr,
-            source_node_id: self.node_id.clone(),
-            source_incarnation: self.incarnation,
-            gossip: self.gossip_buffer.collect(),
         };
         for target in peer_addrs {
             self.pending_outbound
@@ -266,10 +260,16 @@ impl Swim {
         }
     }
 
-    fn try_mark_dead(&mut self, target_node_id: NodeId) {
+    fn try_mark_dead(&mut self, target_node_id: NodeId, registered_seq: u32) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Suspect {
                 return;
+            }
+
+            if let Some(seq) = self.last_suspected_seqs.get(&target_node_id) {
+                if registered_seq != *seq {
+                    return;
+                }
             }
 
             self.last_suspected_seqs.remove(&target_node_id);
@@ -284,98 +284,79 @@ impl Swim {
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         // 1. Process Gossip (Piggybacked updates)
-        let gossip_list = match &packet {
-            SwimPacket::Ping { gossip, .. }
-            | SwimPacket::Ack { gossip, .. }
-            | SwimPacket::PingReq { gossip, .. } => gossip,
-        };
-        for member in gossip_list {
+        for member in packet.gossip() {
             self.apply_membership_update(member.clone());
         }
 
         match packet {
-            SwimPacket::Ping {
-                seq,
-                source_node_id,
-                source_incarnation,
-                ..
-            } => {
+            SwimPacket::Ping(header) => {
                 tracing::info!(
                     "[{}] ← Received Ping from {} ({}) seq={}",
                     self.node_id,
-                    source_node_id,
+                    header.source_node_id,
                     src,
-                    seq
+                    header.seq
                 );
-                self.handle_incarnation_check(source_node_id, src, source_incarnation);
-                let ack = SwimPacket::Ack {
-                    seq,
-                    source_node_id: self.node_id.clone(),
-                    source_incarnation: self.incarnation,
-                    gossip: self.gossip_buffer.collect(),
-                };
+                self.handle_incarnation_check(
+                    header.source_node_id,
+                    src,
+                    header.source_incarnation,
+                );
+                let ack = SwimPacket::Ack(self.generate_swim_header(header.seq));
 
                 self.pending_outbound.push(OutboundPacket::new(src, ack))
             }
 
-            SwimPacket::Ack {
-                seq,
-                source_node_id,
-                source_incarnation,
-                ..
-            } => {
+            SwimPacket::Ack(header) => {
                 tracing::info!(
                     "[{}] ← Received Ack  from {} ({}) seq={}",
                     self.node_id,
-                    source_node_id,
+                    header.source_node_id,
                     src,
-                    seq
+                    header.seq
                 );
                 // TODO: should we ONLY handle Ack message with seq that we can identify?
-                self.handle_incarnation_check(source_node_id.clone(), src, source_incarnation);
+                self.handle_incarnation_check(
+                    header.source_node_id.clone(),
+                    src,
+                    header.source_incarnation,
+                );
                 self.pending_timer_commands
-                    .push(TimerCommand::CancelSchedule { seq });
+                    .push(TimerCommand::CancelSchedule { seq: header.seq });
 
                 if let Some(ProxyPing {
                     requester_addr,
                     request_seq,
-                }) = self.pending_indirect_pings.remove(&seq)
+                }) = self.pending_indirect_pings.remove(&header.seq)
                 {
-                    let forwarded_ack = SwimPacket::Ack {
+                    let forwarded_ack = SwimPacket::Ack(SwimHeader {
                         seq: request_seq,
-                        source_node_id,
-                        source_incarnation,
+                        source_node_id: header.source_node_id,
+                        source_incarnation: header.source_incarnation,
                         gossip: self.gossip_buffer.collect(),
-                    };
+                    });
 
                     self.pending_outbound
                         .push(OutboundPacket::new(requester_addr, forwarded_ack));
                 }
             }
 
-            SwimPacket::PingReq {
-                source_node_id,
-                target,
-                source_incarnation,
-                seq: req_seq,
-                ..
-            } => {
-                self.handle_incarnation_check(source_node_id.clone(), src, source_incarnation);
+            SwimPacket::PingReq { header, target, .. } => {
+                self.handle_incarnation_check(
+                    header.source_node_id.clone(),
+                    src,
+                    header.source_incarnation,
+                );
                 let seq = self.next_seq();
 
                 self.pending_indirect_pings.insert(
                     seq,
                     ProxyPing {
-                        request_seq: req_seq,
+                        request_seq: header.seq,
                         requester_addr: src,
                     },
                 );
-                let ping = SwimPacket::Ping {
-                    seq,
-                    source_node_id: self.node_id.clone(),
-                    source_incarnation: self.incarnation,
-                    gossip: self.gossip_buffer.collect(),
-                };
+                let ping = SwimPacket::Ping(self.generate_swim_header(seq));
                 self.pending_outbound
                     .push(OutboundPacket::new(target, ping));
                 self.pending_timer_commands.push(TimerCommand::SetSchedule {
@@ -401,7 +382,7 @@ impl Swim {
                 self.gossip_buffer.enqueue(
                     SwimNode {
                         node_id: self.node_id.clone(),
-                        addr: self.local_addr,
+                        addr: self.advertise_addr,
                         state: SwimNodeState::Alive,
                         incarnation: new_incarnation,
                     },
@@ -417,7 +398,7 @@ impl Swim {
             member.addr,
             member.state,
             member.incarnation,
-        )
+        );
     }
 
     fn handle_incarnation_check(
@@ -451,6 +432,7 @@ impl Swim {
             );
         }
     }
+
     fn update_member(
         &mut self,
         node_id: NodeId,
@@ -515,13 +497,22 @@ impl Swim {
                 incarnation
             );
 
-            if member.state == SwimNodeState::Suspect {
-                let seq = self.next_seq();
-                self.last_suspected_seqs.insert(node_id.clone(), seq);
-                self.pending_timer_commands.push(TimerCommand::SetSchedule {
-                    seq,
-                    timer: SwimTimer::suspect_timer(node_id),
-                });
+            match member.state {
+                SwimNodeState::Alive => {
+                    if let Some(suspect_seq) = self.last_suspected_seqs.remove(&node_id) {
+                        self.pending_timer_commands
+                            .push(TimerCommand::CancelSchedule { seq: suspect_seq });
+                    }
+                }
+                SwimNodeState::Suspect => {
+                    let seq = self.next_seq();
+                    self.last_suspected_seqs.insert(node_id.clone(), seq);
+                    self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                        seq,
+                        timer: SwimTimer::suspect_timer(node_id),
+                    });
+                }
+                _ => {}
             }
 
             self.gossip_buffer.enqueue(member, self.members.len());
@@ -551,12 +542,12 @@ mod tests {
     use std::net::SocketAddr;
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
-        SwimPacket::Ping {
+        SwimPacket::Ping(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
             source_incarnation: from_inc,
             gossip,
-        }
+        })
     }
 
     fn node(id: &str, port: u16, state: SwimNodeState, inc: u64) -> SwimNode {
@@ -569,12 +560,12 @@ mod tests {
     }
 
     fn ack(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
-        SwimPacket::Ack {
+        SwimPacket::Ack(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
             source_incarnation: from_inc,
             gossip,
-        }
+        })
     }
 
     fn pingreq(
@@ -585,11 +576,13 @@ mod tests {
         gossip: Vec<SwimNode>,
     ) -> SwimPacket {
         SwimPacket::PingReq {
-            seq,
             target,
-            source_node_id: NodeId::new(from_id),
-            source_incarnation: from_inc,
-            gossip,
+            header: SwimHeader {
+                seq,
+                source_node_id: NodeId::new(from_id),
+                source_incarnation: from_inc,
+                gossip,
+            },
         }
     }
 
@@ -627,7 +620,10 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
-            assert!(matches!(&out[0].packet(), SwimPacket::Ack { seq: 1, .. }));
+            assert!(matches!(
+                &out[0].packet(),
+                SwimPacket::Ack(SwimHeader { seq: 1, .. })
+            ));
         }
 
         #[test]
@@ -652,7 +648,10 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
-            assert!(matches!(&out[0].packet(), SwimPacket::Ack { seq: 2, .. }));
+            assert!(matches!(
+                &out[0].packet(),
+                SwimPacket::Ack(SwimHeader { seq: 2, .. })
+            ));
         }
 
         #[test]
@@ -673,9 +672,12 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             match &out[0].packet() {
-                SwimPacket::Ack { gossip, .. } => {
+                SwimPacket::Ack(header) => {
                     assert!(
-                        gossip.iter().any(|n| n.node_id == NodeId::new("node-c")),
+                        header
+                            .gossip
+                            .iter()
+                            .any(|n| n.node_id == NodeId::new("node-c")),
                         "Ack gossip should contain node-c (applied before Ack was built)"
                     );
                 }
@@ -1008,9 +1010,9 @@ mod tests {
             let out = p.take_outbound();
             assert_eq!(out.len(), 1);
             match &out[0].packet() {
-                SwimPacket::Ping { gossip, .. } => {
+                SwimPacket::Ping(header) => {
                     assert!(
-                        gossip.iter().any(|n| n.node_id == "node-d".into()),
+                        header.gossip.iter().any(|n| n.node_id == "node-d".into()),
                         "proxy Ping gossip should contain node-d"
                     );
                 }
@@ -1060,7 +1062,7 @@ mod tests {
             // grab the proxy Ping's seq
             let out = h.protocol.take_outbound();
             let proxy_seq = match out[0].packet() {
-                SwimPacket::Ping { seq, .. } => *seq,
+                SwimPacket::Ping(header) => header.seq,
                 _ => panic!("expected proxy Ping"),
             };
 
@@ -1082,9 +1084,8 @@ mod tests {
             // forwarded Ack sent back to node-b with original seq=42
             let out = h.protocol.take_outbound();
             assert!(
-                out.iter()
-                    .any(|p| p.target == b_addr
-                        && matches!(p.packet(), SwimPacket::Ack { seq: 42, .. })),
+                out.iter().any(|p| p.target == b_addr
+                    && matches!(p.packet(), SwimPacket::Ack(SwimHeader { seq: 42, .. }))),
                 "should forward Ack to original requester with original seq"
             );
         }
@@ -1115,14 +1116,11 @@ mod tests {
             assert_eq!(p.incarnation, 6, "must bump to gossip.inc + 1 = 6");
             let out = p.take_outbound();
             match &out[0].packet() {
-                SwimPacket::Ack {
-                    source_incarnation,
-                    gossip,
-                    ..
-                } => {
-                    assert_eq!(*source_incarnation, 6);
+                SwimPacket::Ack(header) => {
+                    assert_eq!(header.source_incarnation, 6);
                     assert!(
-                        gossip
+                        header
+                            .gossip
                             .iter()
                             .any(|n| n.node_id == "node-local".into() && n.incarnation == 6),
                         "self-refutation should be enqueued in gossip"

@@ -2,14 +2,19 @@ mod config;
 mod connections;
 
 mod clusters;
+mod it;
+mod net;
 pub(crate) mod schedulers;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
-use crate::clusters::swims::swim::Swim;
 
+use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
+use crate::config::Environment;
+use crate::connections::request::QueryCommand;
+use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
-    clusters::{NodeId, swims::actor::SwimActor, transport::SwimTransportActor},
+    clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::{
         clients::{ClientStreamReader, ClientStreamWriter},
@@ -17,26 +22,37 @@ use crate::{
     },
 };
 use anyhow::Result;
-
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
-pub struct StartUp;
+pub struct StartUp {
+    env: Environment,
+}
 
 impl StartUp {
+    pub fn new() -> Self {
+        Self { env: ENV.clone() }
+    }
+
+    pub fn with_env(env: Environment) -> Self {
+        Self { env }
+    }
+
     pub async fn run(self) -> Result<()> {
         // Create a channel for the SwimActor
         let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
         let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
 
         let transport =
-            SwimTransportActor::new(ENV.peer_bind_addr(), swim_sender.clone(), rx_outbound).await?;
+            SwimTransportActor::new(self.env.peer_bind_addr(), swim_sender.clone(), rx_outbound)
+                .await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
 
-        let mut state = ENV.swim();
-        Bootstrapper::new(ENV.bootstrap_servers(), &mut state);
+        let mut state = self.env.swim();
+        Bootstrapper::new(self.env.bootstrap_servers(), &mut state);
 
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
@@ -44,34 +60,37 @@ impl StartUp {
         tokio::spawn(swim_actor.run(state));
 
         // run handlers
-        let _ = self.receive_client_streams().await;
+        let _ = self.receive_client_streams(swim_sender.clone()).await;
         Ok(())
     }
 
-    async fn receive_client_streams(self) {
-        let addr = ENV.bind_addr();
+    async fn receive_client_streams(self, swim_sender: Sender<SwimCommand>) {
+        let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
             "[{}] EastGuard listening on {}",
-            ENV.resolve_node_id(),
+            self.env.resolve_node_id(),
             addr
         );
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
-            if let Err(err) = self.handle_client_stream(stream).await {
+            if let Err(err) = self.handle_client_stream(stream, swim_sender.clone()).await {
                 tracing::error!("{}", err);
                 continue;
             }
         }
     }
 
-    async fn handle_client_stream(&self, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+    async fn handle_client_stream(
+        &self,
+        stream: TcpStream,
+        swim_sender: Sender<SwimCommand>,
+    ) -> Result<()> {
         let (read_half, write_half) = stream.into_split();
-        let _stream_writer = ClientStreamWriter::new(write_half);
         // ! TBD writer needs to be run and read handler should hold sender to the writer
-
         let mut stream_reader = ClientStreamReader::new(read_half);
+        let mut stream_writer = ClientStreamWriter::new(write_half);
         let request = stream_reader.read_request().await?;
 
         match request {
@@ -80,10 +99,38 @@ impl StartUp {
             }
             ConnectionRequests::Connection(_request) => {
                 // validate connection
-
                 tokio::spawn(stream_reader.handle_client_stream());
+            }
+            ConnectionRequests::Query(query_type) => {
+                self.handle_query(stream_writer, swim_sender, query_type)
+                    .await?;
             }
         }
         Ok(())
+    }
+
+    async fn handle_query(
+        &self,
+        mut writer: ClientStreamWriter,
+        swim_sender: Sender<SwimCommand>,
+        query_type: QueryCommand,
+    ) -> Result<()> {
+        match query_type {
+            QueryCommand::GetMembers => {
+                let (send, recv) = tokio::sync::oneshot::channel();
+                swim_sender
+                    .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
+                        reply: send,
+                    }))
+                    .await?;
+
+                let result = recv.await?;
+                writer
+                    .write(&result)
+                    .await
+                    .expect("Failed to write message");
+                Ok(())
+            }
+        }
     }
 }

@@ -6,7 +6,8 @@ use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
-    OutboundPacket, SwimCommand, SwimPacket, SwimTestCommand, SwimTimer, Topology, TopologyConfig,
+    OutboundPacket, SwimCommand, SwimHeader, SwimPacket, SwimQueryCommand, SwimTimer, Topology,
+    TopologyConfig,
 };
 
 use crate::schedulers::actor::run_scheduling_actor;
@@ -30,24 +31,23 @@ impl TestHarness {
     pub async fn query_topology_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Test(
-                SwimTestCommand::TopologyValidationCount { reply: tx },
-            ))
+            .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
+                reply: tx,
+            }))
             .await
             .unwrap();
-        rx.await.unwrap()
+        rx.await.unwrap().iter().count()
     }
 
     pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Test(SwimTestCommand::TopologyIncludesNode {
-                node_id,
+            .send(SwimCommand::Query(SwimQueryCommand::GetTopology {
                 reply: tx,
             }))
             .await
             .unwrap();
-        rx.await.unwrap()
+        rx.await.unwrap().contains_node(&node_id)
     }
 }
 
@@ -148,12 +148,12 @@ async fn test_ping_response() {
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
-    let ping = SwimPacket::Ping {
+    let ping = SwimPacket::Ping(SwimHeader {
         seq: 100,
         source_node_id: "node-remote".into(),
         source_incarnation: 0,
         gossip: vec![],
-    };
+    });
 
     harness
         .tx_in
@@ -172,7 +172,7 @@ async fn test_ping_response() {
 
     assert_eq!(response.target, remote_addr);
     match response.packet() {
-        SwimPacket::Ack { seq, .. } => assert_eq!(*seq, 100),
+        SwimPacket::Ack(SwimHeader { seq, .. }) => assert_eq!(*seq, 100),
         _ => panic!("Expected Ack packet"),
     }
 }
@@ -192,12 +192,12 @@ async fn test_refutation_mechanism() {
         incarnation: 0,
     };
 
-    let ping = SwimPacket::Ping {
+    let ping = SwimPacket::Ping(SwimHeader {
         seq: 200,
         source_node_id: "node-remote".into(),
         source_incarnation: 0,
         gossip: vec![lie],
-    };
+    });
 
     harness
         .tx_in
@@ -213,9 +213,9 @@ async fn test_refutation_mechanism() {
     let response = rx_out.recv().await.unwrap();
 
     match response.packet() {
-        SwimPacket::Ack {
+        SwimPacket::Ack(SwimHeader {
             source_incarnation, ..
-        } => {
+        }) => {
             assert_eq!(
                 *source_incarnation, 1,
                 "Actor did not increment incarnation to refute suspicion!"
@@ -245,12 +245,12 @@ async fn test_gossip_propagation() {
         .tx_in
         .send(SwimCommand::PacketReceived {
             src: sender_addr,
-            packet: SwimPacket::Ping {
+            packet: SwimPacket::Ping(SwimHeader {
                 seq: 300,
                 source_node_id: "node-sender".into(),
                 source_incarnation: 0,
                 gossip: vec![gossip_msg],
-            },
+            }),
         })
         .await
         .unwrap();
@@ -265,19 +265,19 @@ async fn test_gossip_propagation() {
             .tx_in
             .send(SwimCommand::PacketReceived {
                 src: probe_addr,
-                packet: SwimPacket::Ping {
+                packet: SwimPacket::Ping(SwimHeader {
                     seq: 400 + i, // Increment seq to keep packets distinct
                     source_node_id: "node-probe".into(),
                     source_incarnation: 0,
                     gossip: vec![],
-                },
+                }),
             })
             .await
             .unwrap();
 
         // Wait for response
         if let Some(response) = rx_out.recv().await {
-            if let SwimPacket::Ack { gossip, .. } = response.packet() {
+            if let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet() {
                 // Check if our rumor is in this specific Ack
                 if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
                     assert_eq!(rumor.state, SwimNodeState::Dead);
@@ -326,12 +326,12 @@ async fn test_indirect_ping_trigger() {
         .tx_in
         .send(SwimCommand::PacketReceived {
             src: peer_1,
-            packet: SwimPacket::Ping {
+            packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
                 source_node_id: "node-peer-1".into(),
                 source_incarnation: 1,
                 gossip: vec![p1, p2],
-            },
+            }),
         })
         .await
         .unwrap();
@@ -352,7 +352,7 @@ async fn test_indirect_ping_trigger() {
                 .unwrap();
         }
         match time::timeout(Duration::from_millis(100), rx_out.recv()).await {
-            Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping { .. }) => {
+            Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping(_)) => {
                 target_addr = Some(pkt.target);
                 break;
             }
@@ -411,7 +411,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
         .tx_in
         .send(SwimCommand::PacketReceived {
             src: sender_addr,
-            packet: SwimPacket::Ping {
+            packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
                 source_node_id: "node-sender".into(),
                 source_incarnation: 1,
@@ -421,7 +421,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
                     state: SwimNodeState::Alive,
                     incarnation: 1,
                 }],
-            },
+            }),
         })
         .await;
 
@@ -433,7 +433,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
 
 #[tokio::test]
 async fn test_dead_gossip_removes_node_from_topology() {
-    let mut harness = setup_single().await;
+    let harness = setup_single().await;
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
 
@@ -443,7 +443,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
             .tx_in
             .send(SwimCommand::PacketReceived {
                 src: sender_addr,
-                packet: SwimPacket::Ping {
+                packet: SwimPacket::Ping(SwimHeader {
                     seq: 1,
                     source_node_id: "node-sender".into(),
                     source_incarnation: 1,
@@ -453,7 +453,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                         state: SwimNodeState::Alive,
                         incarnation: 1,
                     }],
-                },
+                }),
             })
             .await;
     }
@@ -468,7 +468,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
         .tx_in
         .send(SwimCommand::PacketReceived {
             src: sender_addr,
-            packet: SwimPacket::Ping {
+            packet: SwimPacket::Ping(SwimHeader {
                 seq: 2,
                 source_node_id: "node-sender".into(),
                 source_incarnation: 1,
@@ -478,7 +478,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                     state: SwimNodeState::Dead,
                     incarnation: 2,
                 }],
-            },
+            }),
         })
         .await;
 

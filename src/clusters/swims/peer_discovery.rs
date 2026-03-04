@@ -20,7 +20,7 @@ impl<'a> Bootstrapper<'a> {
         for attempt in self
             .bootstrap_servers
             .into_iter()
-            .filter(|t| t.seed_addr != self.swim.local_addr)
+            .filter(|t| t.seed_addr != self.swim.advertise_addr)
             .collect::<Vec<_>>()
         {
             self.swim.handle_join(attempt);

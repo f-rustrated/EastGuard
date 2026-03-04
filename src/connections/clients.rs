@@ -2,17 +2,27 @@ use std::io::ErrorKind;
 
 use anyhow::bail;
 use bytes::{Buf, BytesMut};
-use tokio::{
-    io::AsyncReadExt,
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use crate::net::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
 
-pub struct ClientStreamWriter(OwnedWriteHalf);
+pub struct ClientStreamWriter {
+    pub(crate) stream: OwnedWriteHalf,
+}
+
 impl ClientStreamWriter {
     pub(crate) fn new(write_half: OwnedWriteHalf) -> Self {
-        Self(write_half)
+        Self { stream: write_half }
+    }
+
+    // TODO: refactor
+    pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+        let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
+        let len = (encoded.len() as u32).to_be_bytes();
+        self.stream.write_all(&len).await.expect("write len failed");
+        self.stream.write_all(&encoded).await.expect("write encoded failed");
+        Ok(())
     }
 }
 
