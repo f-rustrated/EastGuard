@@ -38,7 +38,7 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
-    #[arg(long, env = "EASTGUARD_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "EASTGUARD_HOST", default_value = "0.0.0.0")]
     pub host: String,
 
     /// The IP address gossiped to cluster peers so they can reach this node.
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(env.node_id_file_name, "node_id");
         assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
-        assert_eq!(env.host, "127.0.0.1");
+        assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.vnodes_per_node, 256);
         assert_eq!(env.join_seed_nodes, Vec::<String>::new());
         assert_eq!(env.join_initial_delay_ms, 1000);

@@ -16,6 +16,7 @@ impl ClientStreamWriter {
         Self { stream: write_half }
     }
 
+    // TODO: refactor
     pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
         let len = (encoded.len() as u32).to_be_bytes();

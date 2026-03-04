@@ -17,10 +17,10 @@ impl<T> Display for TimerCommand<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             TimerCommand::SetSchedule { seq, timer: _timer } => {
-                write!(f, "seq: {}", seq)
+                write!(f, "[SetSchedule] seq: {}", seq)
             }
             TimerCommand::CancelSchedule { seq } => {
-                write!(f, "seq: {}", seq)
+                write!(f, "[CancelSchedule] seq: {}", seq)
             }
         }
     }
