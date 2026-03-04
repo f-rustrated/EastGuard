@@ -1,0 +1,34 @@
+# clippy.toml
+
+disallowed-types = [
+    # --- Tokio TCP & UDP ---
+    { path = "tokio::net::TcpListener", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::TcpStream", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::UdpSocket", reason = "Direct dependency on replaceable dependency is prohibited" },
+
+    # --- Tokio TCP Halves ---
+    { path = "tokio::net::tcp::OwnedReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::tcp::OwnedWriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::tcp::ReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::tcp::WriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+
+    # --- Tokio Unix Sockets (if applicable) ---
+    { path = "tokio::net::UnixDatagram", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::UnixListener", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::UnixStream", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::unix::OwnedReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::unix::OwnedWriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::unix::ReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "tokio::net::unix::WriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+
+    # --- Turmoil TCP & UDP ---
+    { path = "turmoil::net::TcpListener", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::TcpStream", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::UdpSocket", reason = "Direct dependency on replaceable dependency is prohibited" },
+
+    # --- Turmoil TCP Halves ---
+    { path = "turmoil::net::tcp::OwnedReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::tcp::OwnedWriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::tcp::ReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::tcp::WriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+]

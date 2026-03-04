@@ -12,3 +12,5 @@ pub(crate) trait TTimer: Debug + Send + Sync + 'static {
     #[cfg(test)]
     fn target_node_id(&self) -> Option<NodeId>;
 }
+
+struct CustomType(tokio::net::TcpListener);

@@ -1,10 +1,15 @@
+#![deny(clippy::disallowed_types)]
+
 mod config;
 mod connections;
 
 mod clusters;
-mod it;
+
 mod net;
 pub(crate) mod schedulers;
+
+#[cfg(test)]
+mod it;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
 
@@ -90,7 +95,7 @@ impl StartUp {
         let (read_half, write_half) = stream.into_split();
         // ! TBD writer needs to be run and read handler should hold sender to the writer
         let mut stream_reader = ClientStreamReader::new(read_half);
-        let mut stream_writer = ClientStreamWriter::new(write_half);
+        let stream_writer = ClientStreamWriter::new(write_half);
         let request = stream_reader.read_request().await?;
 
         match request {

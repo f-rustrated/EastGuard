@@ -14,11 +14,8 @@ uuid = { version = "1", features = ["v4"] }
 murmur3 = "0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-turmoil = { version = "0.7.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3.3.1"
-
-[features]
-turmoil = ["dep:turmoil"]
+turmoil = "0.7.1"

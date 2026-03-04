@@ -1,8 +1,8 @@
 use std::io::ErrorKind;
 
+use crate::net::{OwnedReadHalf, OwnedWriteHalf};
 use anyhow::bail;
 use bytes::{Buf, BytesMut};
-use crate::net::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
@@ -21,12 +21,14 @@ impl ClientStreamWriter {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
         let len = (encoded.len() as u32).to_be_bytes();
         self.stream.write_all(&len).await.expect("write len failed");
-        self.stream.write_all(&encoded).await.expect("write encoded failed");
+        self.stream
+            .write_all(&encoded)
+            .await
+            .expect("write encoded failed");
         Ok(())
     }
 }
 
-#[derive(Debug)]
 pub struct ClientStreamReader {
     pub(crate) stream: OwnedReadHalf,
     // Persistent Buffer - instead of creating a new buffer for every message,
