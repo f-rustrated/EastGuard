@@ -12,12 +12,12 @@ pub struct ClientStreamWriter {
 }
 
 impl ClientStreamWriter {
-    pub fn new(write_half: OwnedWriteHalf) -> Self {
+    pub(crate) fn new(write_half: OwnedWriteHalf) -> Self {
         Self { stream: write_half }
     }
 
     // TODO: refactor
-    pub async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+    pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
         let len = (encoded.len() as u32).to_be_bytes();
         self.stream.write_all(&len).await.expect("write len failed");
