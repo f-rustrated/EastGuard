@@ -190,6 +190,7 @@ File System Layout  ($DATA_DIR = /var/eastguard)
 Design Rationale
 ────────────────────────────────────────────────────────
 
+```
 raft/ vs coordinator/
 ├─ raft/         = the *log* of mutations (how we got here) — needed for Raft consensus
 └─ coordinator/  = the *applied state* (what exists now)    — derived from replaying raft/
@@ -210,4 +211,4 @@ Crash Recovery Sequence (on startup)
 2. For each active segment: check wal.log — if wal.log exists but data.seg is incomplete,
    re-apply WAL records to data.seg and rebuild index entries
 3. Truncate/remove any wal.log whose records are fully reflected in data.seg
-
+``` 
