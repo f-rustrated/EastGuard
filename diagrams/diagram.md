@@ -49,6 +49,17 @@
 │            │  hash(range_id)   → vnode       │                              │
 │            ▼                                 ▼                              │
 │   ┌──────────────────────────────────────────────────────────────────────┐  │
+│   │                    RAFT-TOPOLOGY BRIDGE                              │  │
+│   │   ├─ Initialization              (bootstrap or join Raft groups)     │  │
+│   │   ├─ Membership changes          (node join / leave → ConfChange)    │  │
+│   │   ├─ Quorum-loss recovery        (reconfigure Raft group)            │  │
+│   │   └─ Range transfer coordination (ring reshard → data migration)     │  │
+│   │   Owns the ring ranges of its node. Authority transfers to clockwise │  │
+│   │   successor on failure.                                              │  │
+│   └────────────────────────┬─────────────────────────────────────────────┘  │
+│                            │  ConfChange / metadata routing                 │
+│                            ▼                                                │
+│   ┌──────────────────────────────────────────────────────────────────────┐  │
 │   │                        COORDINATOR                                   │  │
 │   │               (Raft-backed RSM, one per VNode leader)                │  │
 │   │                                                                      │  │
@@ -141,6 +152,17 @@
                            └── scan segments with dead node in replica_set
                                  └── pick new broker (satisfies StoragePolicy constraints from Topology)
                                        └── Replication session ──► Storage Engine (new replica)
+
+  [6] Quorum-Loss Recovery  (Bridge)
+      Raft group ──► Bridge: QuorumLoss(group_id)      
+      Bridge     ──► Topology: reachable_nodes()        (find live replacements)
+      Bridge     ──► Raft group: ConfChange             (form new group)
+      New Raft group stable → Coordinator unfreezes
+
+  [7] Ring Reshard  (Bridge)
+      SWIM: NodeAlive(X) ──► Topology: insert vnode for X
+      Bridge (successor of X) detects new vnode in its range
+      Bridge coordinates range transfer: migrate segments → update replica sets
 ```
 
 ────────────────────────────────────────────────────────
