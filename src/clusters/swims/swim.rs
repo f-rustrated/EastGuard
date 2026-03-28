@@ -76,7 +76,12 @@ pub struct Swim {
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology, rng_seed: u64) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        advertise_addr: SocketAddr,
+        topology: Topology,
+        rng_seed: u64,
+    ) -> Self {
         let mut swim = Self {
             node_id,
             advertise_addr,
@@ -1186,5 +1191,111 @@ mod tests {
             p.incarnation, 1,
             "current impl refutes Dead — this should change when TODO is fixed"
         );
+    }
+
+    mod tombstone {
+        use super::*;
+        use crate::schedulers::ticker::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
+            SUSPECT_TIMEOUT_TICKS, TOMBSTONE_TIMEOUT_TICKS,
+        };
+
+        /// Drives node-b through the full probe → suspect → dead lifecycle.
+        /// Returns the harness with node-b in the Dead state.
+        fn drive_to_dead(node_b: &str, b_addr: SocketAddr) -> TestHarness<SwimTimer> {
+            // node-a is required as an indirect probe helper. Without it, start_indirect_probe
+            // short-circuits directly to Suspect, skipping the INDIRECT_ACK_TIMEOUT_TICKS wait
+            let node_a = "node-a";
+            let a_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+            let mut h = TestHarness::new("node-local", 8000);
+            add_node_harness(&mut h, node_a, a_addr, 1);
+            add_node_harness(&mut h, node_b, b_addr, 1);
+
+            h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
+                if h.protocol.members.get(node_b).map(|m| m.state) == Some(SwimNodeState::Suspect) {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+
+            h.tick_until(SUSPECT_TIMEOUT_TICKS + PROBE_INTERVAL_TICKS, |h| {
+                if h.protocol.members.get(node_b).map(|m| m.state) == Some(SwimNodeState::Dead) {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+
+            let _ = h.protocol.take_outbound();
+            h
+        }
+
+        #[test]
+        fn dead_node_still_present_during_tombstone_window() {
+            let node_b = "node-b";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let mut h = drive_to_dead(node_b, b_addr);
+
+            // Tick up to but not including the tombstone expiry
+            for _ in 0..TOMBSTONE_TIMEOUT_TICKS - 1 {
+                h.tick();
+            }
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Dead,
+                "node-b must remain in members as Dead during the tombstone window"
+            );
+        }
+
+        #[test]
+        fn dead_node_cleaned_up_after_tombstone_window() {
+            let node_b = "node-b";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let mut h = drive_to_dead(node_b, b_addr);
+
+            for _ in 0..TOMBSTONE_TIMEOUT_TICKS {
+                h.tick();
+            }
+
+            assert!(h.protocol.members.get(node_b).is_none());
+        }
+
+        #[test]
+        fn dead_node_rejoin_rejected_during_tombstone_window() {
+            let node_b = "node-b";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let mut h = drive_to_dead(node_b, b_addr);
+
+            // try to rejoin
+            h.step(b_addr, ping(0, "node-b", 0, vec![]));
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Dead,
+                "Dead is terminal - Alive gossip must not resurrect node-b during tombstone window"
+            )
+        }
+
+        #[test]
+        fn node_can_rejoin_after_tombstone_expires() {
+            let node_b = "node-b";
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let mut h = drive_to_dead(node_b, b_addr);
+
+            for _ in 0..TOMBSTONE_TIMEOUT_TICKS {
+                h.tick();
+            }
+
+            // try to rejoin
+            h.step(b_addr, ping(0, "node-b", 0, vec![]));
+
+            assert_eq!(
+                h.protocol.members.get(node_b).unwrap().state,
+                SwimNodeState::Alive
+            );
+        }
     }
 }
