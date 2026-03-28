@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
+use crate::clusters::swims::peer_discovery::JoinConfig;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
     OutboundPacket, SwimCommand, SwimHeader, SwimPacket, SwimQueryCommand, SwimTimer, Topology,
@@ -115,7 +115,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let mut swim = Swim::new(
+    let swim = Swim::new(
         NodeId::new(format!("node-local-{}", port).as_str()),
         addr,
         Topology::new(
@@ -125,10 +125,9 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
             },
         ),
         0,
+        join_config.tries(),
     );
     let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone());
-    Bootstrapper::new(join_config.tries(), &mut swim);
-
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
     tokio::spawn(actor.run(swim));
 

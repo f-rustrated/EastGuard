@@ -1,34 +1,6 @@
-use crate::clusters::swims::swim::Swim;
-
 use std::net::SocketAddr;
 
-pub(crate) struct Bootstrapper<'a> {
-    bootstrap_servers: Vec<JoinAttempt>,
-    swim: &'a mut Swim,
-}
-
-impl<'a> Bootstrapper<'a> {
-    pub fn new(bootstrap_servers: Vec<JoinAttempt>, swim: &'a mut Swim) {
-        Self {
-            bootstrap_servers,
-            swim,
-        }
-        .bootstrap();
-    }
-
-    fn bootstrap(self) {
-        for attempt in self
-            .bootstrap_servers
-            .into_iter()
-            .filter(|t| t.seed_addr != self.swim.advertise_addr)
-            .collect::<Vec<_>>()
-        {
-            self.swim.handle_join(attempt);
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct JoinAttempt {
     pub(crate) seed_addr: SocketAddr,
     pub(crate) ticks_for_wait: u32,
@@ -45,6 +17,17 @@ impl JoinAttempt {
     pub(crate) fn reset_next_ticks_for_wait(&mut self) {
         let attempt = self.max_attempts - self.remaining_attempts;
         self.ticks_for_wait = self.backoff_ticks * self.multiplier.pow(attempt);
+    }
+
+    pub(crate) fn total_ticks_to_exhaust(&self) -> u32 {
+        let mut total = self.ticks_for_wait;
+        for i in 0..self.max_attempts.saturating_sub(1) {
+            total = total.saturating_add(
+                self.backoff_ticks
+                    .saturating_mul(self.multiplier.saturating_pow(i)),
+            );
+        }
+        total
     }
 }
 
@@ -103,9 +86,8 @@ mod tests {
             max_attempts: 3,
         };
 
-        let mut swim = make_protocol("node-local", 8000);
-        let join_config: &JoinConfig = &config;
-        Bootstrapper::new(join_config.tries(), &mut swim);
+        let mut swim = make_protocol("node-local", 8000, config.tries());
+        swim.bootstrap();
 
         assert!(swim.take_outbound().is_empty());
         assert!(swim.take_timer_commands().is_empty());
@@ -122,9 +104,8 @@ mod tests {
             max_attempts: 3,
         };
 
-        let mut swim = make_protocol("node-local", 8000);
-        let join_config: &JoinConfig = &config;
-        Bootstrapper::new(join_config.tries(), &mut swim);
+        let mut swim = make_protocol("node-local", 8000, config.tries());
+        swim.bootstrap();
 
         assert!(swim.take_outbound().is_empty());
         assert!(swim.take_timer_commands().is_empty());
@@ -144,9 +125,8 @@ mod tests {
             max_attempts: 3,
         };
 
-        let mut swim = make_protocol("node-local", 8000);
-        let join_config: &JoinConfig = &config;
-        Bootstrapper::new(join_config.tries(), &mut swim);
+        let mut swim = make_protocol("node-local", 8000, config.tries());
+        swim.bootstrap();
 
         let out = swim.take_outbound();
         assert_eq!(
@@ -158,24 +138,22 @@ mod tests {
 
     #[test]
     fn delay_zero_schedules_retry_timer_and_decrements_attempts() {
-        let mut swim = make_protocol("node-local", 8000);
+        let config = &JoinConfig {
+            seed_addrs: vec!["127.0.0.1:9000".parse().unwrap()],
+            ticks_for_wait: 0,
+            backoff_ticks: 10,
+            multiplier: 2,
+            max_attempts: 3,
+        };
+        let mut swim = make_protocol("node-local", 8000, config.tries());
 
-        Bootstrapper::new(
-            (&JoinConfig {
-                seed_addrs: vec!["127.0.0.1:9000".parse().unwrap()],
-                ticks_for_wait: 0,
-                backoff_ticks: 10,
-                multiplier: 2,
-                max_attempts: 3,
-            })
-                .tries(),
-            &mut swim,
-        );
+        swim.bootstrap();
 
         let _ = swim.take_outbound();
 
         let cmds = swim.take_timer_commands();
-        assert_eq!(cmds.len(), 1, "one retry timer scheduled");
+        // One JoinTry timer + one JoinComplete timer
+        assert_eq!(cmds.len(), 2, "JoinTry + JoinComplete timers scheduled");
     }
 
     // -----------------------------------------------------------------------
@@ -192,10 +170,10 @@ mod tests {
             max_attempts: 3,
         };
         let mut h = TestHarness {
-            protocol: make_protocol("node-local", 8000),
+            protocol: make_protocol("node-local", 8000, config.tries()),
             ticker: Ticker::new(),
         };
-        Bootstrapper::new(config.tries(), &mut h.protocol);
+        h.protocol.bootstrap();
         h.apply_timer_commands();
 
         // First ping sent immediately during start_join
@@ -220,21 +198,21 @@ mod tests {
         let config = JoinConfig {
             seed_addrs: vec!["127.0.0.1:9000".parse().unwrap()],
             ticks_for_wait: 0,
-            backoff_ticks: 10,
+            backoff_ticks: 5,
             multiplier: 2,
             max_attempts: 3,
         };
         let mut h = TestHarness {
-            protocol: make_protocol("node-local", 8000),
+            protocol: make_protocol("node-local", 8000, config.tries()),
             ticker: Ticker::new(),
         };
-        Bootstrapper::new(config.tries(), &mut h.protocol);
+        h.protocol.bootstrap();
         h.apply_timer_commands();
 
         let _ = h.protocol.take_outbound(); // consume immediate ping
 
-        // backoff = 10 * 2^0 = 10 ticks
-        let out = h.tick_n_collect(10);
+        // backoff = 5 * 2^0 = 5 ticks (before protocol period at tick 10)
+        let out = h.tick_n_collect(5);
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -260,11 +238,11 @@ mod tests {
             max_attempts: 2,
         };
         let mut h = TestHarness {
-            protocol: make_protocol("node-local", 8000),
+            protocol: make_protocol("node-local", 8000, config.tries()),
             ticker: Ticker::new(),
         };
 
-        Bootstrapper::new(config.tries(), &mut h.protocol);
+        h.protocol.bootstrap();
         h.apply_timer_commands();
 
         // immediate: first Ping
@@ -312,11 +290,11 @@ mod tests {
             max_attempts: max,
         };
         let mut h = TestHarness {
-            protocol: make_protocol("node-local", 8000),
+            protocol: make_protocol("node-local", 8000, config.tries()),
             ticker: Ticker::new(),
         };
 
-        Bootstrapper::new(config.tries(), &mut h.protocol);
+        h.protocol.bootstrap();
         h.apply_timer_commands();
 
         // 1 immediate ping + (max - 1) retries via ticking
@@ -325,5 +303,65 @@ mod tests {
         let total = count_join_pings(&immediate, "127.0.0.1:9000".parse().unwrap())
             + count_join_pings(&retries, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(total, max as usize, "exactly max_attempts Pings sent");
+    }
+
+    mod total_ticks_to_exhaust {
+        use crate::clusters::swims::peer_discovery::JoinAttempt;
+
+        fn attempt(
+            ticks_for_wait: u32,
+            backoff_ticks: u32,
+            multiplier: u32,
+            max_attempts: u32,
+        ) -> JoinAttempt {
+            JoinAttempt {
+                seed_addr: "127.0.0.1:9000".parse().unwrap(),
+                ticks_for_wait,
+                backoff_ticks,
+                multiplier,
+                max_attempts,
+                remaining_attempts: max_attempts,
+            }
+        }
+
+        #[test]
+        fn total_ticks_zero_attempts() {
+            // max_attempts=0 → no pings sent, no retries → only initial wait counts
+            let a = attempt(5, 10, 2, 0);
+            assert_eq!(a.total_ticks_to_exhaust(), 5);
+        }
+
+        #[test]
+        fn total_ticks_one_attempt() {
+            // max_attempts=1 → one ping, no retries → only initial wait
+            let a = attempt(3, 10, 2, 1);
+            assert_eq!(a.total_ticks_to_exhaust(), 3);
+        }
+
+        #[test]
+        fn total_ticks_uniform_backoff() {
+            // multiplier=1 → backoff_ticks * 1^i = backoff_ticks for every retry
+            // initial_wait=0, backoff=5, max_attempts=3
+            // retries = max_attempts - 1 = 2 intervals: 5*1^0 + 5*1^1 = 10
+            let a = attempt(0, 5, 1, 3);
+            assert_eq!(a.total_ticks_to_exhaust(), 10);
+        }
+
+        #[test]
+        fn total_ticks_exponential_backoff() {
+            // matches the exponential_backoff_fires_at_correct_intervals test:
+            // initial_wait=0, backoff=2, multiplier=3, max_attempts=2
+            // retries: 2 * 3^0 = 2 → total = 0 + 2 = 2
+            let a = attempt(0, 2, 3, 2);
+            assert_eq!(a.total_ticks_to_exhaust(), 2);
+        }
+
+        #[test]
+        fn total_ticks_with_initial_wait() {
+            // initial_wait=4, backoff=3, multiplier=2, max_attempts=3
+            // retries: 3*2^0 + 3*2^1 = 3 + 6 = 9 → total = 4 + 9 = 13
+            let a = attempt(4, 3, 2, 3);
+            assert_eq!(a.total_ticks_to_exhaust(), 13);
+        }
     }
 }

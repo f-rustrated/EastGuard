@@ -11,8 +11,6 @@ pub(crate) mod schedulers;
 #[cfg(test)]
 mod it;
 
-use crate::clusters::swims::peer_discovery::Bootstrapper;
-
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
 use crate::connections::request::QueryCommand;
@@ -59,9 +57,7 @@ impl StartUp {
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
-
-        let mut state = self.env.swim(self.rng_seed);
-        Bootstrapper::new(self.env.bootstrap_servers(), &mut state);
+        let state = self.env.swim(self.rng_seed);
 
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));

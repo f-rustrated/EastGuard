@@ -177,8 +177,9 @@ impl Environment {
         }
     }
 
-    pub(crate) fn bootstrap_servers(&self) -> Vec<JoinAttempt> {
-        self.join_seed_nodes
+    pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
+        let join_attempts = self
+            .join_seed_nodes
             .iter()
             .filter_map(|s| s.parse().ok())
             .map(|addr| JoinAttempt {
@@ -189,10 +190,8 @@ impl Environment {
                 max_attempts: self.join_max_attempts,
                 remaining_attempts: self.join_max_attempts,
             })
-            .collect()
-    }
+            .collect();
 
-    pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
             self.advertise_peer_addr(),
@@ -203,6 +202,7 @@ impl Environment {
                 },
             ),
             rng_seed,
+            join_attempts,
         )
     }
 }

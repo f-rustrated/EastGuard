@@ -4,6 +4,7 @@ use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeId, SwimNode, SwimNodeState};
+
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -69,6 +70,10 @@ pub struct Swim {
     seq_counter: u32,
     last_suspected_seqs: BTreeMap<NodeId, u32>,
 
+    // (Re)join: seed nodes stored as template for re-bootstrapping when all peers are lost
+    join_attempts: Vec<JoinAttempt>,
+    is_joining: bool,
+
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
@@ -81,20 +86,23 @@ impl Swim {
         advertise_addr: SocketAddr,
         topology: Topology,
         rng_seed: u64,
+        join_attempts: Vec<JoinAttempt>,
     ) -> Self {
         let mut swim = Self {
-            node_id,
+            node_id: node_id.clone(),
             advertise_addr,
             incarnation: 0,
             topology,
             members: BTreeMap::new(),
-            live_node_tracker: LiveNodeTracker::new(rng_seed),
+            live_node_tracker: LiveNodeTracker::new(node_id.clone(), rng_seed),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
             last_suspected_seqs: BTreeMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
             pending_indirect_pings: BTreeMap::new(),
+            join_attempts,
+            is_joining: false,
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -105,15 +113,67 @@ impl Swim {
         swim
     }
 
+    pub(crate) fn bootstrap(&mut self) {
+        if self.is_joining {
+            return;
+        }
+        self.is_joining = true;
+
+        let attempts: Vec<JoinAttempt> = self
+            .join_attempts
+            .iter()
+            .filter(|t| t.seed_addr != self.advertise_addr)
+            .cloned()
+            .collect();
+
+        if attempts.is_empty() {
+            self.is_joining = false;
+            return;
+        }
+
+        // Schedule JoinComplete to fire after the longest seed's full retry budget,
+        // so is_joining is only cleared once every seed × attempt has had time to land.
+        let ticks = attempts
+            .iter()
+            .map(|a| a.total_ticks_to_exhaust())
+            .max()
+            .unwrap_or(0);
+
+        for attempt in attempts {
+            self.handle_join(attempt);
+        }
+
+        let seq = self.next_seq();
+        self.pending_timer_commands.push(TimerCommand::SetSchedule {
+            seq,
+            timer: SwimTimer::join_complete(ticks),
+        });
+    }
+
     fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
+        let mut gossip = self.gossip_buffer.collect();
+        // Piggyback self as Alive when there is no other gossip so that peers
+        // which tombstoned this node (e.g. after a partition) can re-admit it.
+        // See: it::simple::dead_node_rejoin_after_full_partition
+        if gossip.is_empty() {
+            gossip.push(SwimNode {
+                node_id: self.node_id.clone(),
+                addr: self.advertise_addr,
+                state: SwimNodeState::Alive,
+                incarnation: self.incarnation,
+            });
+        }
         SwimHeader {
             seq,
             source_node_id: self.node_id.clone(),
             source_incarnation: self.incarnation,
-            gossip: self.gossip_buffer.collect(),
+            gossip,
         }
     }
     pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
+        // TODO: respect attempt.ticks_for_wait as an initial delay — currently the ping is
+        // always sent immediately and ticks_for_wait is overwritten by reset_next_ticks_for_wait
+        // before it is read, so a non-zero initial delay would be silently ignored.
         let seq = self.next_seq();
         let ping = SwimPacket::Ping(self.generate_swim_header(seq));
         self.pending_outbound
@@ -159,6 +219,9 @@ impl Swim {
                     }
                     self.handle_join(join_attempt);
                 }
+                (SwimTimerKind::JoinComplete, _) => {
+                    self.is_joining = false
+                }
                 _ => {}
             },
         }
@@ -177,14 +240,15 @@ impl Swim {
 
     fn start_probe(&mut self) {
         if self.live_node_tracker.is_empty() {
+            tracing::info!(
+                    "[{}] No live peers — try triggering join from seed nodes",
+                    self.node_id
+                );
+            self.bootstrap();
             return;
         }
 
         if let Some(target_node_id) = self.live_node_tracker.next() {
-            if target_node_id == self.node_id {
-                return;
-            }
-
             let target = match self.members.get(&target_node_id).map(|m| m.addr) {
                 Some(addr) => addr,
                 None => return,
@@ -220,7 +284,7 @@ impl Swim {
                 break;
             };
 
-            if peer_node_id == target_node_id || peer_node_id == self.node_id {
+            if peer_node_id == target_node_id {
                 continue;
             }
 
@@ -394,10 +458,10 @@ impl Swim {
                     if self.incarnation <= member.incarnation {
                         let new_incarnation = member.incarnation + 1;
                         tracing::info!(
-                    "Refuting suspicion! (My Inc: {} -> {})",
-                    self.incarnation,
-                    new_incarnation
-                );
+                            "Refuting suspicion! (My Inc: {} -> {})",
+                            self.incarnation,
+                            new_incarnation
+                        );
                         self.incarnation = new_incarnation;
                         // Enqueue refutation so that the cluster learns quickly
                         self.gossip_buffer.enqueue(
@@ -507,8 +571,7 @@ impl Swim {
             }
         };
 
-        self.live_node_tracker
-            .update(node_id.clone(), &member.state);
+        self.live_node_tracker.update(node_id.clone(), &member.state);
         self.topology.update(node_id.clone(), addr, &member.state);
 
         if changed {
@@ -629,7 +692,7 @@ mod tests {
 
         #[test]
         fn ping_from_unknown_node() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             p.step(sender, ping(1, "node-b", 0, vec![]));
@@ -652,7 +715,7 @@ mod tests {
 
         #[test]
         fn ping_from_known_alive_node() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // First ping: introduces node-b into members
@@ -680,7 +743,7 @@ mod tests {
 
         #[test]
         fn ping_with_gossip_applied_before_ack() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             let gossip_entry = node("node-c", 9001, SwimNodeState::Alive, 1);
@@ -711,7 +774,7 @@ mod tests {
 
         #[test]
         fn ping_sender_higher_incarnation_updates_member() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // Introduce node-b at incarnation 1
@@ -730,7 +793,7 @@ mod tests {
 
         #[test]
         fn ping_sender_lower_incarnation_does_not_downgrade() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             // Introduce node-b at incarnation 5
@@ -993,7 +1056,7 @@ mod tests {
 
         #[test]
         fn pingreq_sends_ping_to_target() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -1017,7 +1080,7 @@ mod tests {
 
         #[test]
         fn pingreq_gossip_applied_before_proxy_ping() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
             let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -1123,7 +1186,7 @@ mod tests {
 
         #[test]
         fn refutation_bumps_to_gossip_inc_plus_one() {
-            let mut p = make_protocol("node-local", 8080);
+            let mut p = make_protocol("node-local", 8080, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
             p.incarnation = 2;
 
@@ -1156,7 +1219,7 @@ mod tests {
 
         #[test]
         fn refutation_skipped_when_local_inc_is_higher() {
-            let mut p = make_protocol("node-local", 8000);
+            let mut p = make_protocol("node-local", 8000, vec![]);
             let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
             p.incarnation = 3;
 
@@ -1176,7 +1239,7 @@ mod tests {
 
     #[test]
     fn dead_gossip_does_not_trigger_refutation() {
-        let mut p = make_protocol("node-local", 8000);
+        let mut p = make_protocol("node-local", 8000, vec![]);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         p.step(
@@ -1198,8 +1261,7 @@ mod tests {
     mod tombstone {
         use super::*;
         use crate::schedulers::ticker::{
-            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
-            SUSPECT_TIMEOUT_TICKS, TOMBSTONE_TIMEOUT_TICKS,
+            PROBE_INTERVAL_TICKS, SUSPECT_TIMEOUT_TICKS, TOMBSTONE_TIMEOUT_TICKS,
         };
 
         /// Drives node-b through the full probe → suspect → dead lifecycle.

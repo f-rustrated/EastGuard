@@ -24,8 +24,9 @@ pub mod common {
         },
         schedulers::ticker::Ticker,
     };
+    use crate::clusters::swims::peer_discovery::JoinAttempt;
 
-    pub fn make_protocol(local_id: &str, local_port: u16) -> Swim {
+    pub fn make_protocol(local_id: &str, local_port: u16, join_attempts: Vec<JoinAttempt>) -> Swim {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
             HashMap::new(),
@@ -33,7 +34,7 @@ pub mod common {
                 vnodes_per_pnode: 256,
             },
         );
-        Swim::new(NodeId::new(local_id), addr, topology, 0)
+        Swim::new(NodeId::new(local_id), addr, topology, 0, join_attempts)
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
@@ -46,7 +47,7 @@ pub mod common {
     impl TestHarness<SwimTimer> {
         pub fn new(local_id: &str, local_port: u16) -> Self {
             Self {
-                protocol: make_protocol(local_id, local_port),
+                protocol: make_protocol(local_id, local_port, vec![]),
                 ticker: Ticker::new(),
             }
         }

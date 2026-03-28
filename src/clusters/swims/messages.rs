@@ -105,12 +105,20 @@ pub(crate) enum SwimTimeOutCallback {
 
 #[derive(Debug)]
 pub(crate) enum SwimTimerKind {
+    /// Fires when a direct Ping has not been Acked within the allowed window.
     DirectProbe,
+    /// Fires when no helper has relayed an Ack back within the allowed window.
     IndirectProbe,
+    /// Fires when a suspected node has not refuted within the suspicion window.
     Suspect,
+    /// Fires when the dead-node grace period expires.
     Tombstone,
+    /// Fires when a seed node has not replied to a join Ping and a retry is due.
     JoinTry(JoinAttempt),
+    /// Fires when a proxied PingReq has not been resolved within the allowed window.
     ProxyPing,
+    /// Fires when the entire join batch (all seeds × all attempts) has had enough time to complete.
+    JoinComplete,
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -202,6 +210,14 @@ impl SwimTimer {
             target_node_id: None,
             ticks_remaining: join_try.ticks_for_wait,
             kind: SwimTimerKind::JoinTry(join_try),
+        }
+    }
+
+    pub(crate) fn join_complete(ticks: u32) -> Self {
+        Self {
+            target_node_id: None,
+            kind: SwimTimerKind::JoinComplete,
+            ticks_remaining: ticks,
         }
     }
 

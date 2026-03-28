@@ -6,17 +6,9 @@ use std::ops::Deref;
 
 // Used to decide who to ping. You don't want to waste network traffic pinging nodes you already know are dead.
 pub(super) struct LiveNodeTracker {
+    self_id: NodeId,
     nodes: VecDeque<NodeId>,
     rng: StdRng,
-}
-
-impl Default for LiveNodeTracker {
-    fn default() -> Self {
-        Self {
-            nodes: VecDeque::new(),
-            rng: StdRng::from_entropy(),
-        }
-    }
 }
 
 impl Deref for LiveNodeTracker {
@@ -28,15 +20,16 @@ impl Deref for LiveNodeTracker {
 }
 
 impl LiveNodeTracker {
-    pub(super) fn new(rng_seed: u64) -> Self {
+    pub(super) fn new(self_id: NodeId, rng_seed: u64) -> Self {
         Self {
+            self_id,
             nodes: VecDeque::new(),
             rng: StdRng::seed_from_u64(rng_seed),
         }
     }
 
     pub(super) fn add(&mut self, node_id: NodeId) {
-        if self.nodes.contains(&node_id) {
+        if node_id == self.self_id || self.nodes.contains(&node_id) {
             return;
         }
         let selected = self.rng.gen_range(0..=self.nodes.len());
@@ -49,6 +42,7 @@ impl LiveNodeTracker {
         }
     }
 
+    // LiveNodeTracker ensures that it never returns the node id it's running on
     pub(super) fn next(&mut self) -> Option<NodeId> {
         let node_id = self.nodes.pop_front()?;
         self.nodes.push_back(node_id.clone());
@@ -78,9 +72,13 @@ mod tests {
         NodeId::new(format!("node-{}", n))
     }
 
+    fn tracker() -> LiveNodeTracker {
+        LiveNodeTracker::new(node(0), 0)
+    }
+
     #[test]
     fn test_round_robin_basic() {
-        let mut nodes = LiveNodeTracker::default();
+        let mut nodes = tracker();
         nodes.nodes.push_back(node(1));
         nodes.nodes.push_back(node(2));
         nodes.nodes.push_back(node(3));
@@ -93,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_remove_before_pointer() {
-        let mut nodes = LiveNodeTracker::new(0);
+        let mut nodes = tracker();
         nodes.nodes = vec![node(1), node(2), node(3)].into();
 
         nodes.next();
@@ -107,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_remove_at_pointer() {
-        let mut nodes = LiveNodeTracker::new(0);
+        let mut nodes = tracker();
         nodes.nodes = vec![node(1), node(2), node(3)].into();
         nodes.next();
 
@@ -117,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_remove_last_element_wrap() {
-        let mut nodes = LiveNodeTracker::new(0);
+        let mut nodes = tracker();
         nodes.nodes = vec![node(1), node(2), node(3)].into();
 
         nodes.next();
@@ -130,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_remove_after_pointer() {
-        let mut nodes = LiveNodeTracker::new(0);
+        let mut nodes = tracker();
         nodes.nodes = vec![node(1), node(2), node(3)].into();
 
         nodes.remove(&node(3));
