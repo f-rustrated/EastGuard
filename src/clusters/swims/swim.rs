@@ -5,8 +5,8 @@ use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::net::SocketAddr;
 
 const INDIRECT_PING_COUNT: usize = 3;
@@ -60,36 +60,36 @@ pub struct Swim {
     incarnation: u64,
 
     // Protocol state
-    members: HashMap<NodeId, SwimNode>,
+    members: BTreeMap<NodeId, SwimNode>,
     live_node_tracker: LiveNodeTracker,
     gossip_buffer: GossipBuffer,
     pub(crate) topology: Topology,
 
     // Sequence
     seq_counter: u32,
-    last_suspected_seqs: HashMap<NodeId, u32>,
+    last_suspected_seqs: BTreeMap<NodeId, u32>,
 
     // Output buffers
     pending_outbound: Vec<OutboundPacket>,
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
-    pending_indirect_pings: HashMap<u32, ProxyPing>,
+    pending_indirect_pings: BTreeMap<u32, ProxyPing>,
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology) -> Self {
+    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology, rng_seed: u64) -> Self {
         let mut swim = Self {
             node_id,
             advertise_addr,
             incarnation: 0,
             topology,
-            members: HashMap::new(),
-            live_node_tracker: LiveNodeTracker::default(),
+            members: BTreeMap::new(),
+            live_node_tracker: LiveNodeTracker::new(rng_seed),
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
-            last_suspected_seqs: HashMap::new(),
+            last_suspected_seqs: BTreeMap::new(),
             pending_outbound: vec![],
             pending_timer_commands: vec![],
-            pending_indirect_pings: HashMap::new(),
+            pending_indirect_pings: BTreeMap::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
