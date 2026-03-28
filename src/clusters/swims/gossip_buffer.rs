@@ -89,11 +89,6 @@ impl GossipBuffer {
 
         result
     }
-
-    #[cfg(test)]
-    pub(super) fn contains(&self, node_id: &crate::clusters::NodeId) -> bool {
-        self.entries.iter().any(|e| &e.member.node_id == node_id)
-    }
 }
 
 /// computes LAMBDA * ceil(log₂(N)) (LAMBDA=3, minimum 3) for O(log N) convergence

@@ -22,12 +22,6 @@ pub enum SwimNodeState {
     Dead,
 }
 
-impl SwimNodeState {
-    pub fn not_alive(self) -> bool {
-        self != Alive
-    }
-}
-
 impl SwimNode {
     #[inline]
     pub(crate) fn encoded_size(&self) -> usize {
