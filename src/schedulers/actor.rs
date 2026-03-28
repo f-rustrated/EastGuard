@@ -27,7 +27,7 @@ pub async fn run_scheduling_actor<T>(
                 }
             }
 
-            // What if scheduling actor consistantly gets mailbox and ticker never gets picked in select?
+            // What if scheduling actor constantly gets mailbox and ticker never gets picked in select?
             Some(cmd) = mailbox.recv() => {
                 match cmd {
                     #[cfg(test)]

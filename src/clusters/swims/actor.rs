@@ -30,14 +30,13 @@ impl SwimActor {
 
     pub async fn run(mut self, mut state: Swim) {
         tracing::info!("[{}] SwimActor started.", state.node_id);
-        self.flush_outbound_commands(&mut state).await;
+        self.flush_outbound_commands(&mut state).await; // TODO: do we have to flush outbound commands here?
 
         while let Some(event) = self.mailbox.recv().await {
             match event {
                 SwimCommand::PacketReceived { src, packet } => {
                     state.step(src, packet);
                 }
-
                 SwimCommand::Timeout(tick_event) => {
                     state.handle_timeout(tick_event);
                 }
