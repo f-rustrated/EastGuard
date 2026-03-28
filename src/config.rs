@@ -192,7 +192,7 @@ impl Environment {
             .collect()
     }
 
-    pub(crate) fn swim(&self) -> Swim {
+    pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
             self.advertise_peer_addr(),
@@ -202,6 +202,7 @@ impl Environment {
                     vnodes_per_pnode: self.vnodes_per_node,
                 },
             ),
+            rng_seed,
         )
     }
 }

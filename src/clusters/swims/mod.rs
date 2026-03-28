@@ -33,7 +33,7 @@ pub mod common {
                 vnodes_per_pnode: 256,
             },
         );
-        Swim::new(NodeId::new(local_id), addr, topology)
+        Swim::new(NodeId::new(local_id), addr, topology, 0)
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring
