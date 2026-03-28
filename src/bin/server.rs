@@ -7,5 +7,5 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
-    StartUp::new().run().await
+    StartUp::new(rand::random()).run().await
 }

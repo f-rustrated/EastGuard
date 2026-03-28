@@ -1,214 +1,170 @@
-# EastGuard Architecture Diagram
+# EastGuard Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                                  CLIENT                                     │
-│                   (TCP, bincode-framed request/response)                    │
-└───────────────────────────┬─────────────────────────────────────────────────┘
-                            │  CreateTopic / Produce / Consume / Metadata req
-                            ▼
+│                      (TCP, bincode-framed request/response)                 │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           BROKER (any node)                                 │
+│                            BROKER  (any node)                               │
 │                                                                             │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │                            SWIM                                      │  │
-│   │                                                                      │  │
-│   │   members: HashMap<NodeId, SwimNode>  (Alive / Suspect / Dead)       │  │
-│   │   gossip_buffer: GossipBuffer         (exponential decay)            │  │
-│   │   ── Ping / PingReq / Ack ──► (UDP, to peers)                        │  │
-│   │                                                                      │  │
-│   │   Emits: NodeAlive / NodeDead events                                 │  │
-│   └────────────────────────┬─────────────────────────────────────────────┘  │
-│                            │  NodeAlive → add to ring                       │
-│                            │  NodeDead  → remove from ring                  │
-│                            ▼                                                │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │                         TOPOLOGY                                     │  │
-│   │                                                                      │  │
-│   │   TokenRing: BTreeMap<VirtualNodeToken, VirtualNode>                 │  │
-│   │                                                                      │  │
-│   │   ┌─────────────────────────────────────────────────────────────┐    │  │
-│   │   │  Physical Node (PNode)                                      │    │  │
-│   │   │  ├─ node_id: NodeId                                         │    │  │
-│   │   │  ├─ addr: SocketAddr                                        │    │  │
-│   │   │  └─ attributes: HashMap<String,String>  (rack, region, …)   │    │  │
-│   │   └─────────────────────────────────────────────────────────────┘    │  │
-│   │              │  1 PNode → N VNodes  (default: 256)                   │  │
-│   │   ┌─────────────────────────────────────────────────────────────┐    │  │
-│   │   │  Virtual Node (VNode)                                       │    │  │
-│   │   │  ├─ token: murmur3(node_id + replica_index)                 │    │  │
-│   │   │  ├─ pnode_id: NodeId                                        │    │  │
-│   │   │  └─ [owns a shard of metadata keyspace]                     │    │  │
-│   │   └─────────────────────────────────────────────────────────────┘    │  │
-│   │                                                                      │  │
-│   │   token_owners_for(key, n) → Vec<VNode>   (replica placement)        │  │
-│   └────────────────────────┬─────────────────────────────────────────────┘  │
-│                            │                                                │
-│            ┌───────────────┴─────────────────┐                              │
-│            │  hash(topic_name) → vnode       │  (metadata routing)          │
-│            │  hash(range_id)   → vnode       │                              │
-│            ▼                                 ▼                              │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │                        COORDINATOR                                   │  │
-│   │               (Raft-backed RSM, one per VNode leader)                │  │
-│   │                                                                      │  │
-│   │   ┌─────────────────────────────────────────────────────────────┐    │  │
-│   │   │  Topic                                                      │    │  │
-│   │   │  ├─ name: String                                            │    │  │
-│   │   │  ├─ state: Active | Sealed | Deleted                        │    │  │
-│   │   │  ├─ storage_policy: StoragePolicy                           │    │  │
-│   │   │  └─ ranges: Vec<RangeId>                                    │    │  │
-│   │   └───────────────────────┬─────────────────────────────────────┘    │  │
-│   │                           │  1 Topic → N Ranges                      │  │
-│   │   ┌─────────────────────────────────────────────────────────────┐    │  │
-│   │   │  Range                                                      │    │  │
-│   │   │  ├─ id: RangeId                                             │    │  │
-│   │   │  ├─ keyspace: [start, end)   (contiguous, no interleaving)  │    │  │
-│   │   │  ├─ state: Active | Sealed | Deleting                       │    │  │
-│   │   │  ├─ topic_name, created_at, retention                       │    │  │
-│   │   │  └─ segments: Vec<SegmentId>                                │    │  │
-│   │   └───────────────────────┬─────────────────────────────────────┘    │  │
-│   │                           │  1 Range → N Segments                    │  │
-│   │   ┌─────────────────────────────────────────────────────────────┐    │  │
-│   │   │  Segment                                                    │    │  │
-│   │   │  ├─ id: SegmentId                                           │    │  │
-│   │   │  ├─ state: Active | Sealed | Reassigning                    │    │  │
-│   │   │  ├─ replica_set: Vec<NodeId>                                │    │  │
-│   │   │  ├─ start_offset, length                                    │    │  │
-│   │   │  └─ created_at, sealed_at                                   │    │  │
-│   │   └─────────────────────────────────────────────────────────────┘    │  │
-│   │                                                                      │  │
-│   │   Operations:                                                        │  │
-│   │   ├─ CreateTopic → default Range + Segment                           │  │
-│   │   ├─ SplitRange  → seal range, create 2 child ranges                 │  │
-│   │   ├─ MergeRanges → seal 2 ranges, create 1 child range               │  │
-│   │   └─ NodeDead    → detect under-replicated segments → re-replicate   │  │
-│   └────────────────────────┬─────────────────────────────────────────────┘  │
-│                            │  read / append / replicate                     │
-│                            ▼                                                │
-│   ┌──────────────────────────────────────────────────────────────────────┐  │
-│   │                      STORAGE ENGINE  (fps store)                     │  │
-│   │                                                                      │  │
-│   │   Per-segment on disk:                                               │  │
-│   │                                                                      │  │
-│   │   Append path:                                                       │  │
-│   │   Record(s) → Batch Accumulator ──► WAL write                        │  │
-│   │                  (10ms / size / count)   │                           │  │
-│   │                                          ▼                           │  │
-│   │                                   Segment File   (O_DIRECT, 1 file   │  │
-│   │                                   per segment,   per-segment, ≤1GB)  │  │
-│   │                                          │                           │  │
-│   │                                          ▼                           │  │
-│   │                                    fsync (all replicas)              │  │
-│   │                                          │                           │  │
-│   │                                          ▼                           │  │
-│   │                                   RocksDB Index                      │  │
-│   │                                   (SegmentId, logical_offset)        │  │
-│   │                                    → file byte offset                │  │
-│   │                                          │                           │  │
-│   │                                          ▼                           │  │
-│   │                                        ACK                           │  │
-│   └──────────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  SWIM                                                                 │  │
+│  │  Gossip-based failure detection (Ping / PingReq / Ack over UDP)       │  │
+│  │  Members: Alive | Suspect | Dead    Incarnation numbers for refutation │  │
+│  └──────────────────────────────┬────────────────────────────────────────┘  │
+│                                 │  NodeAlive / NodeDead events               │
+│                                 ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  TOPOLOGY                                                             │  │
+│  │  TokenRing: BTreeMap<Token, VNode>    murmur3 with fixed seed         │  │
+│  │  1 PNode → 256 VNodes                 Physical-node deduplication     │  │
+│  │  token_owners_for(key, n) → Vec<VNode>                                │  │
+│  └──────────────────────────────┬────────────────────────────────────────┘  │
+│                                 │  hash(topic_id / range_id) → VNode        │
+│                                 ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  RAFT-TOPOLOGY BRIDGE                                                 │  │
+│  │  Translates SWIM membership events into Raft ConfChanges              │  │
+│  │  Owns quorum-loss recovery  (authority: clockwise successor on ring)  │  │
+│  │  Drives range transfer on ring reshard                                │  │
+│  └──────────────────────────────┬────────────────────────────────────────┘  │
+│                                 │  ConfChange / Coordinator commands         │
+│                                 ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  COORDINATOR  (MultiRaft RSM — shared Raft log, one entry per group)  │  │
+│  │  Manages topic / range / segment metadata via Raft-committed writes   │  │
+│  │  GC ticker: sealed segments past retention → Deleting → unlink        │  │
+│  └──────────────────────────────┬────────────────────────────────────────┘  │
+│                                 │  read / append / replicate                 │
+│                                 ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  STORAGE ENGINE                                                       │  │
+│  │  Per-segment: WAL + data.seg (O_DIRECT, append-only, ≤ 1 GB)         │  │
+│  │  Shared RocksDB: coordinator state + offset index for all vnodes      │  │
+│  │  Write: WAL fsync → data.seg + fence fsync → RocksDB WriteBatch       │  │
+│  │  Read:  RocksDB index lookup → seek data.seg → stream records         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
-
-────────────────────────────────────────────────────────
-  Data Flow Summary
-────────────────────────────────────────────────────────
-
-  [1] Cluster Formation
-      Client/Peer ──UDP──► SWIM ──► Topology (add/remove PNode → VNodes)
-
-  [2] Metadata Request (e.g. CreateTopic)
-      Client ──TCP──► Broker (proxy)
-                         └── hash(topic_name) ──► Topology
-                                                    └── token_owners_for() → VNode leader
-                                                                               └── Coordinator
-                                                                                    └── creates Topic + Range + Segment
-
-  [3] Produce (write)
-      Client ──TCP session──► Broker
-                                └── Coordinator: which Segment is active? replica_set?
-                                      └── Storage Engine: batch → WAL → file → fsync → index → ACK
-
-  [4] Consume (read)
-      Client ──TCP session──► Broker
-                                └── Coordinator: which Segment holds offset? replica_set?
-                                      └── Storage Engine: RocksDB index lookup (offset → file pos)
-                                            └── Segment File read ──► stream Records ──► Client
-
-  [5] Replica Failure & Self-Healing
-      SWIM: NodeDead ──► Coordinator
-                           └── scan segments with dead node in replica_set
-                                 └── pick new broker (satisfies StoragePolicy constraints from Topology)
-                                       └── Replication session ──► Storage Engine (new replica)
 ```
 
-────────────────────────────────────────────────────────
-File System Layout  ($DATA_DIR = /var/eastguard)
-────────────────────────────────────────────────────────
+---
+
+## Data Model
+
+```
+Topic
+├─ topic_id:       u64
+├─ name:           String
+├─ state:          Active | Sealed | Deleted
+├─ storage_policy: StoragePolicy
+└─ ranges:         Vec<RangeId>
+
+Range
+├─ range_id:       RangeId
+├─ topic_id:       u64
+├─ keyspace:       [start, end)
+├─ state:          Active | Sealed | Deleting
+├─ created_at:     Timestamp
+├─ split_into:     Option<[RangeId; 2]>
+├─ merged_into:    Option<RangeId>
+├─ merged_from:    Option<[RangeId; 2]>
+└─ segments:       Vec<SegmentId>
+
+Segment
+├─ segment_id:     SegmentId
+├─ range_id:       RangeId
+├─ topic_id:       u64
+├─ state:          Active | Sealed | Reassigning | Deleting
+├─ replica_set:    Vec<NodeId>
+├─ size_bytes:     u64
+├─ created_at:     Timestamp
+└─ sealed_at:      Option<Timestamp>
+
+Reassigning state carries: { from: NodeId, to: NodeId }
+```
+
+---
+
+## Filesystem Layout
 
 ```
 /base_dir/
+├── node_id                          # persisted UUID
 │
-├── node_id                         # persisted UUID (already done in config.rs)
+├── raft/
+│   ├── log/                         # Shared Raft log (MultiRaft)
+│   │   ├── 00000001.log             # Entries tagged with group_id
+│   │   └── 00000002.log
+│   └── snapshot/
+│       └── {group_id}/
+│           └── {log_index}.snap     # RocksDB::checkpoint() per vnode
 │
-├── raft/                           # Raft consensus state — one dir per vnode this node participates in
-│   └── {vnode_id}/
-│       ├── log/                    # Raft log entries  (bincode-encoded LogEntry files)
-│       │   ├── 00000000001.log
-│       │   └── 00000000002.log
-│       └── snapshot/              # Periodic Raft snapshots (full coordinator state at a log index)
-│           └── {log_index}.snap
+├── db/                              # Shared RocksDB — all vnodes on this node
+│   # Coordinator state:
+│   #   "vn:{vnode_id}:raft"              → HardState (term, voted_for, commit_index)
+│   #   "vn:{vnode_id}:t:{topic_id}"      → TopicMeta
+│   #   "vn:{vnode_id}:r:{range_id}"      → RangeMeta  (incl. lineage)
+│   #   "vn:{vnode_id}:s:{segment_id}"    → SegmentMeta
+│   # Offset index:
+│   #   "ix:{segment_id}:{offset:020}"    → physical_byte_offset (u64)
+│   # Housekeeping:
+│   #   "hk:indexed:{segment_id}"         → last_indexed_position
+│   #   "hk:raft_offset"                  → persisted_last_offset_raft_log
 │
-├── coordinator/                    # Applied coordinator state — one RocksDB per vnode
-│   └── {vnode_id}/
-│       └── db/                    # RocksDB instance
-│           # Key schema:
-│           #   "t:{topic_name}"          → TopicMeta  (state, policy, range ids)
-│           #   "r:{range_id}"            → RangeMeta  (state, keyspace, topic, segments)
-│           #   "s:{segment_id}"          → SegmentMeta(state, replica_set, offsets, timestamps)
-│
-├── segments/                       # Actual record data — one subdir per range
-│   └── {range_id}/
-│       └── {segment_id}/
-│           ├── wal.log             # Write-ahead log (crash recovery)
-│           │                       #   sequential appends of serialized records before data write
-│           │                       #   truncated/deleted after segment is sealed + fsynced
-│           └── data.seg            # Segment file (O_DIRECT, append-only, ≤1GB)
-│                                   #   binary records, each with: length | key | value | headers
-│
-└── index/                          # Sparse offset index — one shared RocksDB for all segments on this node
-    └── db/
-        # Key schema:
-        #   "{segment_id}:{logical_offset:020}" → file_byte_offset (u64, little-endian)
-        #
-        # Sparse: one entry per batch flush, not per record
-        # Lookup: seek to largest key ≤ target offset, then scan forward in data.seg
+└── segments/
+    └── {range_id}/
+        └── {segment_id}/
+            ├── wal.log              # Write-ahead log (fsynced before data.seg write)
+            └── data.seg             # Append-only record file (O_DIRECT, ≤ 1 GB)
 ```
 
-────────────────────────────────────────────────────────
-Design Rationale
-────────────────────────────────────────────────────────
+---
+
+## Write Pipeline
 
 ```
-raft/ vs coordinator/
-├─ raft/         = the *log* of mutations (how we got here) — needed for Raft consensus
-└─ coordinator/  = the *applied state* (what exists now)    — derived from replaying raft/
-kept separately so reads never block on Raft log replay at startup
+1.  Accumulate records into batch buffer
+2.  Append batch to wal.log
+3.  fsync(wal.log)                        ← WAL is now durable
+4.  Fan-out batch to (R - Q) followers    ← parallel, majority quorum
+5.  Append Fence record to batch          ← fence.wal_offset = current WAL end
+6.  Pad batch to block boundary           ← align_up for O_DIRECT
+7.  Write batch to data.seg (O_DIRECT)
+8.  fsync(data.seg)                       ← data + fence durable on all quorum nodes
+9.  RocksDB WriteBatch (atomic):
+        index entries per record
+        last_indexed_position = fence position
+10. Delete wal.log entries up to fence.wal_offset
+11. ACK to producer
+```
 
-segments/{range_id}/{segment_id}/
-├─ Grouped by range_id so that a range split or merge can be done with a directory rename/move
-├─ wal.log lives beside data.seg so crash recovery is local to one directory
-└─ wal.log is deleted once data.seg is sealed + fsynced (no longer needed)
+---
 
-index/db  (shared RocksDB, not per-segment)
-├─ One RocksDB instance handles many open file handles efficiently
-├─ Prefix scan on "{segment_id}:" gives all index entries for a segment in order
-└─ On segment deletion, batch-delete all keys with that prefix
+## Crash Recovery
 
-Crash Recovery Sequence (on startup)
-1. Replay raft/{vnode_id}/log/ into coordinator/{vnode_id}/db/  (if snapshot is stale)
-2. For each active segment: check wal.log — if wal.log exists but data.seg is incomplete,
-   re-apply WAL records to data.seg and rebuild index entries
-3. Truncate/remove any wal.log whose records are fully reflected in data.seg
-``` 
+```
+1.  Scan data.seg backward → find last valid Fence record
+2.  Truncate data.seg to fence position   ← discard partial writes after fence
+3.  Read last_indexed_position from RocksDB
+4.  Scan data.seg forward: last_indexed_position → fence position
+5.  Rebuild missing index entries via RocksDB WriteBatch
+6.  Re-apply wal.log entries from fence.wal_offset onward
+7.  Append new Fence + fsync(data.seg)
+8.  Delete wal.log entries up to new fence.wal_offset
+```
+
+---
+
+## data.seg Record Format
+
+```
+[crc: u32][type: u8][length: u32][payload: bytes][length: u32]
+                                                  ↑ trailing length — enables O(1) backward scan
+
+Record types:  Data | Fence
+Fence payload: { wal_offset: u64 }
+Alignment:     entire batch padded to BLOCK_SIZE before flush (posix_memalign)
+```

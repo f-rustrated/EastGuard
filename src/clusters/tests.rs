@@ -124,6 +124,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
                 vnodes_per_pnode: 256,
             },
         ),
+        0,
     );
     let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone());
     Bootstrapper::new(join_config.tries(), &mut swim);
@@ -510,8 +511,11 @@ async fn cluster_formation_using_join() {
     bridge.add(&mut h3);
     bridge.spawn();
 
-    // Let all three actors process InitiateJoin and register their timers
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Synchronize: round-trip through each actor's mailbox to guarantee it has
+    // started and flushed its initial join timer commands to the scheduler.
+    let _ = h1.query_topology_count().await;
+    let _ = h2.query_topology_count().await;
+    let _ = h3.query_topology_count().await;
 
     for _ in 0..PROBE_INTERVAL_TICKS * 2 {
         h1.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();

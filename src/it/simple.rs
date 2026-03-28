@@ -72,7 +72,7 @@ fn cluster_setup() -> turmoil::Result {
         let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-1 is running");
         Ok(())
     });
@@ -85,7 +85,7 @@ fn cluster_setup() -> turmoil::Result {
         let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-2 is running");
         Ok(())
     });
@@ -98,7 +98,7 @@ fn cluster_setup() -> turmoil::Result {
         let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-3 is running");
         Ok(())
     });
@@ -136,7 +136,7 @@ fn partition_gossip() -> turmoil::Result {
         let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         Ok(())
     });
 
@@ -147,7 +147,7 @@ fn partition_gossip() -> turmoil::Result {
         let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         Ok(())
     });
 
@@ -158,7 +158,7 @@ fn partition_gossip() -> turmoil::Result {
         let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
         env.advertise_host = Some(me.to_string());
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
-        StartUp::with_env(env).run().await?;
+        StartUp::with_env(env, 0).run().await?;
         Ok(())
     });
 

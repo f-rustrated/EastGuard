@@ -33,15 +33,19 @@ use tokio::sync::mpsc::Sender;
 #[derive(Debug)]
 pub struct StartUp {
     env: Environment,
+    rng_seed: u64,
 }
 
 impl StartUp {
-    pub fn new() -> Self {
-        Self { env: ENV.clone() }
+    pub fn new(rng_seed: u64) -> Self {
+        Self {
+            env: ENV.clone(),
+            rng_seed,
+        }
     }
 
-    pub fn with_env(env: Environment) -> Self {
-        Self { env }
+    pub fn with_env(env: Environment, rng_seed: u64) -> Self {
+        Self { env, rng_seed }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -56,7 +60,7 @@ impl StartUp {
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
 
-        let mut state = self.env.swim();
+        let mut state = self.env.swim(self.rng_seed);
         Bootstrapper::new(self.env.bootstrap_servers(), &mut state);
 
         // Spawn Actors
