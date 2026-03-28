@@ -64,6 +64,10 @@ impl GossipBuffer {
             .insert(insert_pos, GossipEntry { member, remaining });
     }
 
+    pub(super) fn remove(&mut self, node_id: &crate::clusters::NodeId) {
+        self.entries.retain(|e| &e.member.node_id != node_id);
+    }
+
     pub(super) fn collect(&mut self) -> Vec<SwimNode> {
         let mut result = Vec::new();
         let mut total_bytes = 0usize;

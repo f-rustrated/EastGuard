@@ -139,6 +139,7 @@ impl Swim {
                 }
                 (SwimTimerKind::IndirectProbe, Some(target)) => self.try_mark_suspect(target),
                 (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target, seq),
+                (SwimTimerKind::Tombstone, Some(target)) => self.on_tombstone_expired(target),
                 (SwimTimerKind::ProxyPing, None) => {
                     self.pending_indirect_pings.remove(&seq);
                 }
@@ -274,12 +275,25 @@ impl Swim {
 
             self.last_suspected_seqs.remove(&target_node_id);
             self.update_member(
-                target_node_id,
+                target_node_id.clone(),
                 member.addr,
                 SwimNodeState::Dead,
                 member.incarnation,
             );
+            let seq = self.next_seq();
+            self.pending_timer_commands.push(TimerCommand::SetSchedule {
+                seq,
+                timer: SwimTimer::tombstone(target_node_id),
+            });
         }
+    }
+
+    fn on_tombstone_expired(&mut self, node_id: NodeId) {
+        self.members.remove(&node_id);
+        self.live_node_tracker.remove(&node_id);
+        self.gossip_buffer.remove(&node_id);
+        self.topology.remove_node(&node_id);
+        self.last_suspected_seqs.remove(&node_id);
     }
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {

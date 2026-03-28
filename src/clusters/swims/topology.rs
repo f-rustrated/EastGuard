@@ -125,7 +125,7 @@ impl Topology {
             .add_pnode(pnode_id, metadata, self.config.vnodes_per_pnode);
     }
 
-    fn remove_node(&mut self, pnode_id: &NodeId) -> Option<PhysicalNodeMetadata> {
+    pub(super) fn remove_node(&mut self, pnode_id: &NodeId) -> Option<PhysicalNodeMetadata> {
         self.ring
             .remove_pnode(pnode_id, self.config.vnodes_per_pnode)
     }

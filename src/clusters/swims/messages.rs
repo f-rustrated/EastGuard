@@ -5,7 +5,10 @@ use crate::clusters::swims::Topology;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::{
-    ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
+    ticker::{
+        DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
+        TOMBSTONE_TIMEOUT_TICKS,
+    },
     timer::TTimer,
 };
 use bincode::{Decode, Encode};
@@ -105,6 +108,7 @@ pub(crate) enum SwimTimerKind {
     DirectProbe,
     IndirectProbe,
     Suspect,
+    Tombstone,
     JoinTry(JoinAttempt),
     ProxyPing,
 }
@@ -198,6 +202,14 @@ impl SwimTimer {
             target_node_id: None,
             ticks_remaining: join_try.ticks_for_wait,
             kind: SwimTimerKind::JoinTry(join_try),
+        }
+    }
+
+    pub(crate) fn tombstone(target: NodeId) -> Self {
+        Self {
+            target_node_id: Some(target),
+            kind: SwimTimerKind::Tombstone,
+            ticks_remaining: TOMBSTONE_TIMEOUT_TICKS,
         }
     }
 }
