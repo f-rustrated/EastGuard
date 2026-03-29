@@ -1,7 +1,6 @@
 use std::sync::LazyLock;
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 
 use clap::Parser;
 use uuid::Uuid;
@@ -26,11 +25,8 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_DATA_DIR", default_value = "./eastguard/data")]
     pub data_dir: String,
 
-    #[arg(long, env = "EASTGUARD_NODE_ID")]
-    pub node_id: Option<String>,
-
-    #[arg(long, env = "EASTGUARD_NODE_ID_FILE_NAME", default_value = "node_id")]
-    pub node_id_file_name: String,
+    #[arg(long = "node-id-prefix", env = "EASTGUARD_NODE_ID_PREFIX")]
+    pub node_id_prefix: Option<String>,
 
     #[arg(short, long, env = "EASTGUARD_PORT", default_value_t = 2921)]
     pub port: u16,
@@ -89,11 +85,9 @@ impl Environment {
         // 1. Parse arguments from CLI and/or ENV vars
         let env = Environment::parse();
 
-        // 2. Perform side effects (creation/validation) just like before
-        for dir in [&env.data_dir, &env.config_dir] {
-            if let Err(e) = fs::create_dir_all(dir) {
-                tracing::error!("Warning: Could not create directory '{}': {}", dir, e);
-            }
+        // 2. Ensure data directory exists
+        if let Err(e) = fs::create_dir_all(&env.data_dir) {
+            tracing::error!("Warning: Could not create directory '{}': {}", env.data_dir, e);
         }
 
         // Validate write permissions
@@ -128,52 +122,16 @@ impl Environment {
             .expect("Invalid advertise peer address")
     }
 
-    /// Returns the node ID, resolving it from (in priority order):
-    /// 1. The `--node-id` flag / `EASTGUARD_NODE_ID` env var (if set)
-    /// 2. The file at `{config_dir}/{node_id_file_name}` (if it exists and is non-empty)
-    /// 3. A freshly generated UUID v4, which is then persisted to that file
+    /// Returns the node identity for this process start.
+    ///
+    /// - With `--node-id-prefix`: returns `{prefix}::{uuid}` — the prefix lets operators
+    ///   identify the physical node; the UUID ensures each start is a distinct identity so
+    ///   a restarted node is never confused with its previously-dead incarnation.
+    /// - Without a prefix: returns a bare UUID.
     pub fn resolve_node_id(&self) -> String {
-        if let Some(id) = &self.node_id {
-            return id.clone();
-        }
-
-        let path = format!("{}/{}", self.config_dir, self.node_id_file_name);
-
-        if let Ok(contents) = fs::read_to_string(&path) {
-            let id = contents.trim();
-            if !id.is_empty() {
-                return id.to_owned();
-            }
-        }
-
-        self.generate_and_persist_node_id(&path)
-    }
-
-    fn generate_and_persist_node_id(&self, path: &str) -> String {
-        let new_id = Uuid::new_v4().to_string();
-
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(mut file) => {
-                if let Err(e) = file
-                    .write_all(new_id.as_bytes())
-                    .and_then(|_| file.sync_all())
-                {
-                    tracing::error!("Warning: failed to persist node_id '{}': {}", path, e);
-                }
-                new_id
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Another process won — read the canonical ID
-                fs::read_to_string(path)
-                    .ok()
-                    .map(|s| s.trim().to_owned())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(new_id)
-            }
-            Err(e) => {
-                tracing::error!("Warning: failed to create node_id file '{}': {}", path, e);
-                new_id
-            }
+        match &self.node_id_prefix {
+            Some(prefix) => format!("{}::{}", prefix, Uuid::new_v4()),
+            None => Uuid::new_v4().to_string(),
         }
     }
 
@@ -218,8 +176,7 @@ mod tests {
         Environment {
             config_dir: "./eastguard/config".into(),
             data_dir: "./eastguard/data".into(),
-            node_id: None,
-            node_id_file_name: "node_id".into(),
+            node_id_prefix: None,
             port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
@@ -238,7 +195,7 @@ mod tests {
         let env = Environment {
             port: 3000,
             cluster_port: 3001,
-            node_id: Some("node-1".into()),
+            node_id_prefix: Some("node-1".into()),
             ..make_env()
         };
 
@@ -255,8 +212,7 @@ mod tests {
 
         assert_eq!(env.config_dir, "./eastguard/config");
         assert_eq!(env.data_dir, "./eastguard/data");
-        assert_eq!(env.node_id, None);
-        assert_eq!(env.node_id_file_name, "node_id");
+        assert_eq!(env.node_id_prefix, None);
         assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "0.0.0.0");
@@ -272,7 +228,7 @@ mod tests {
     fn test_flags_override() {
         let args = vec![
             "my-server",
-            "--node-id",
+            "--node-id-prefix",
             "node-1",
             "--port",
             "9999",
@@ -286,7 +242,7 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
 
-        assert_eq!(env.node_id, Some("node-1".into()));
+        assert_eq!(env.node_id_prefix, Some("node-1".into()));
         assert_eq!(env.port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
@@ -346,19 +302,19 @@ mod tests {
     #[serial]
     fn test_env_vars_override() {
         unsafe {
-            std::env::set_var("EASTGUARD_NODE_ID", "env-node-1");
+            std::env::set_var("EASTGUARD_NODE_ID_PREFIX", "env-node-1");
             std::env::set_var("EASTGUARD_PORT", "8888");
             std::env::set_var("EASTGUARD_HOST", "0.0.0.0");
         }
 
         let env = Environment::try_parse_from(vec!["my-server"]).expect("Failed to parse env vars");
 
-        assert_eq!(env.node_id, Some("env-node-1".into()));
+        assert_eq!(env.node_id_prefix, Some("env-node-1".into()));
         assert_eq!(env.port, 8888);
         assert_eq!(env.host, "0.0.0.0");
 
         unsafe {
-            std::env::remove_var("EASTGUARD_NODE_ID");
+            std::env::remove_var("EASTGUARD_NODE_ID_PREFIX");
             std::env::remove_var("EASTGUARD_PORT");
             std::env::remove_var("EASTGUARD_HOST");
         }
@@ -374,87 +330,37 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_node_id_from_flag() {
+    fn resolve_node_id_with_prefix_appends_uuid() {
         let env = Environment {
-            node_id: Some("explicit-node".into()),
+            node_id_prefix: Some("my-node".into()),
             ..make_env()
         };
-
-        assert_eq!(env.resolve_node_id(), "explicit-node");
+        let id1 = env.resolve_node_id();
+        let id2 = env.resolve_node_id();
+        // Each call produces a different identity.
+        assert_ne!(id1, id2);
+        // Both carry the operator-configured prefix.
+        assert!(id1.starts_with("my-node::"));
+        assert!(id2.starts_with("my-node::"));
     }
 
     #[test]
-    fn test_resolve_node_id_from_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("node_id");
-        fs::write(&file_path, "file-node-42").unwrap();
-
-        let env = Environment {
-            config_dir: dir.path().to_str().unwrap().into(),
-            ..make_env()
-        };
-
-        assert_eq!(env.resolve_node_id(), "file-node-42");
-    }
-
-    #[test]
-    fn test_resolve_node_id_empty_file_generates_new() {
-        let dir = tempfile::tempdir().unwrap();
-        // Write an empty file — should be treated as absent.
-        fs::write(dir.path().join("node_id"), "").unwrap();
-
-        let env = Environment {
-            config_dir: dir.path().to_str().unwrap().into(),
-            ..make_env()
-        };
-
+    fn resolve_node_id_without_prefix_returns_uuid() {
+        let env = make_env(); // node_id_prefix: None
         let id = env.resolve_node_id();
         assert!(Uuid::parse_str(&id).is_ok());
     }
 
     #[test]
-    fn test_resolve_node_id_generates_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-
+    fn swim_node_id_matches_resolve_node_id_format() {
         let env = Environment {
-            config_dir: dir.path().to_str().unwrap().into(),
+            node_id_prefix: Some("my-node".into()),
             ..make_env()
         };
-
-        let id1 = env.resolve_node_id();
-        // UUID v4 format: 8-4-4-4-12 hex chars
-        assert!(Uuid::parse_str(&id1).is_ok());
-
-        // Second call must return the same persisted value
-        let id2 = env.resolve_node_id();
-        assert_eq!(id1, id2);
-
-        // File must contain the ID
-        let on_disk = fs::read_to_string(dir.path().join("node_id")).unwrap();
-        assert_eq!(on_disk.trim(), id1);
-    }
-
-    #[test]
-    fn test_resolve_node_id_persisted_across_restarts() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Simulate first startup: no node_id passed, UUID is generated and persisted.
-        let id_first_run = Environment {
-            config_dir: dir.path().to_str().unwrap().into(),
-            ..make_env()
-        }
-        .resolve_node_id();
-
-        assert!(Uuid::parse_str(&id_first_run).is_ok());
-
-        // Simulate restart: a fresh Environment pointing to the same config_dir,
-        // still without an explicit node_id. It must recover the persisted UUID.
-        let id_after_restart = Environment {
-            config_dir: dir.path().to_str().unwrap().into(),
-            ..make_env()
-        }
-        .resolve_node_id();
-
-        assert_eq!(id_first_run, id_after_restart);
+        let id1 = env.swim(0).node_id;
+        let id2 = env.swim(0).node_id;
+        assert_ne!(*id1, *id2);
+        assert!(id1.starts_with("my-node::"));
+        assert!(id2.starts_with("my-node::"));
     }
 }
