@@ -4,11 +4,12 @@ use std::net::SocketAddr;
 use crate::clusters::swims::Topology;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
-use crate::schedulers::{
-    ticker::{DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS},
-    timer::TTimer,
-};
+use crate::schedulers::timer::TTimer;
 use bincode::{Decode, Encode};
+
+pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
+pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 6; // 6 × 100ms = 600ms (must cover 4-hop RTT through intermediary, so it should be at least * 2 of DIRECT_ACK_TIMEOUT_TICKS)
+pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct SwimHeader {

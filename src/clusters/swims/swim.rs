@@ -114,7 +114,7 @@ impl Swim {
         self.pending_outbound
             .push(OutboundPacket::new(attempt.seed_addr, ping));
 
-        attempt.reset_next_ticks_for_wait();
+        attempt.update_next_ticks_for_wait();
         attempt.deduct_remaining_attempt();
 
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
@@ -725,12 +725,12 @@ mod tests {
     }
 
     mod ack {
+        use super::messages::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
+        };
         use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness};
-        use crate::schedulers::ticker::{
-            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
-            SUSPECT_TIMEOUT_TICKS,
-        };
+        use crate::schedulers::ticker::PROBE_INTERVAL_TICKS;
 
         use std::net::SocketAddr;
 
@@ -1024,7 +1024,7 @@ mod tests {
     mod proxy_ping {
         use super::*;
         use crate::clusters::swims::swim::tests::{ack, pingreq};
-        use crate::schedulers::ticker::DIRECT_ACK_TIMEOUT_TICKS;
+
         use std::net::SocketAddr;
 
         #[test]

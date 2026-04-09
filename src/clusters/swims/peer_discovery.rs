@@ -42,7 +42,7 @@ impl JoinAttempt {
         self.remaining_attempts = self.remaining_attempts.saturating_sub(1)
     }
 
-    pub(crate) fn reset_next_ticks_for_wait(&mut self) {
+    pub(crate) fn update_next_ticks_for_wait(&mut self) {
         let attempt = self.max_attempts - self.remaining_attempts;
         self.ticks_for_wait = self.backoff_ticks * self.multiplier.pow(attempt);
     }

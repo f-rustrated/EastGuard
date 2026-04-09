@@ -6,12 +6,13 @@ use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
-    OutboundPacket, SwimCommand, SwimHeader, SwimPacket, SwimQueryCommand, SwimTimer, Topology,
-    TopologyConfig,
+    DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, SwimCommand, SwimHeader, SwimPacket,
+    SwimQueryCommand, SwimTimer, Topology, TopologyConfig,
 };
 
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker::{DIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS};
+
+use crate::schedulers::ticker::PROBE_INTERVAL_TICKS;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::{sync::mpsc, time};
