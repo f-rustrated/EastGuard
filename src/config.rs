@@ -92,7 +92,7 @@ impl Environment {
 
         // Validate write permissions
         let test_file = format!("{}/.write_test", env.data_dir);
-        if let Ok(_) = OpenOptions::new().write(true).create(true).open(&test_file) {
+        if OpenOptions::new().write(true).create(true).truncate(true).open(&test_file).is_ok() {
             let _ = fs::remove_file(test_file);
         } else {
             tracing::error!(

@@ -114,7 +114,7 @@ impl Swim {
         self.pending_outbound
             .push(OutboundPacket::new(attempt.seed_addr, ping));
 
-        attempt.reset_next_ticks_for_wait();
+        attempt.update_next_ticks_for_wait();
         attempt.deduct_remaining_attempt();
 
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
@@ -161,7 +161,7 @@ impl Swim {
     pub(crate) fn handle_query(&self, command: SwimQueryCommand) {
         match command {
             SwimQueryCommand::GetMembers { reply } => {
-                let _ = reply.send(self.members.values().map(|s| s.clone()).collect());
+                let _ = reply.send(self.members.values().cloned().collect());
             }
             SwimQueryCommand::GetTopology { reply } => {
                 let _ = reply.send(self.topology.clone());
@@ -266,10 +266,9 @@ impl Swim {
                 return;
             }
 
-            if let Some(seq) = self.last_suspected_seqs.get(&target_node_id) {
-                if registered_seq != *seq {
+            if let Some(seq) = self.last_suspected_seqs.get(&target_node_id)
+                && registered_seq != *seq {
                     return;
-                }
             }
 
             self.last_suspected_seqs.remove(&target_node_id);
@@ -725,12 +724,12 @@ mod tests {
     }
 
     mod ack {
+        use super::messages::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
+        };
         use crate::clusters::SwimNodeState;
         use crate::clusters::swims::swim::tests::{TestHarness, ack, add_node_harness};
-        use crate::schedulers::ticker::{
-            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, PROBE_INTERVAL_TICKS,
-            SUSPECT_TIMEOUT_TICKS,
-        };
+        use crate::schedulers::ticker::PROBE_INTERVAL_TICKS;
 
         use std::net::SocketAddr;
 
@@ -1024,7 +1023,7 @@ mod tests {
     mod proxy_ping {
         use super::*;
         use crate::clusters::swims::swim::tests::{ack, pingreq};
-        use crate::schedulers::ticker::DIRECT_ACK_TIMEOUT_TICKS;
+
         use std::net::SocketAddr;
 
         #[test]

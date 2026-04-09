@@ -112,6 +112,7 @@ impl TcpListener {
 }
 
 impl TcpStream {
+    #[allow(dead_code)]
     pub async fn connect<A: inner::ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
         let inner_stream = inner::TcpStream::connect(addr).await?;
         Ok(Self(inner_stream))

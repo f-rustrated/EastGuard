@@ -14,6 +14,7 @@ pub struct VirtualNodeToken {
 }
 
 #[derive(Clone, Debug)]
+#[expect(dead_code)]
 pub struct VirtualNode {
     replica_index: u64,
     pub pnode_id: NodeId,
@@ -130,6 +131,7 @@ impl Topology {
             .remove_pnode(pnode_id, self.config.vnodes_per_pnode)
     }
 
+    #[allow(dead_code)]
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
         self.ring.token_owners_for(key, n)
     }
@@ -139,6 +141,7 @@ impl Topology {
         self.ring.pnodes.contains_key(id)
     }
 
+    #[expect(dead_code)]
     pub fn num_nodes(&self) -> usize {
         self.ring.pnodes.len()
     }
@@ -178,6 +181,7 @@ fn hash_stable(key: &[u8]) -> u32 {
 
 /// Identity is managed separately via `NodeId`.
 #[derive(Clone, Debug)]
+#[expect(dead_code)]
 pub struct PhysicalNodeMetadata {
     pub address: SocketAddr,
 }

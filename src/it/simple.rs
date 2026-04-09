@@ -11,8 +11,8 @@ use turmoil::Builder;
 
 fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
     Environment {
-        config_dir: format!("./eastguard/config/{}", idx).into(),
-        data_dir: format!("./eastguard/data/{}", idx).into(),
+        config_dir: format!("./eastguard/config/{}", idx),
+        data_dir: format!("./eastguard/data/{}", idx),
         node_id_prefix: Some(node_id),
         port,
         cluster_port,
@@ -65,7 +65,10 @@ async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> bool {
             true
         }
         Some(n) if n.state == SwimNodeState::Dead => {
-            tracing::info!("[TEST] {host} sees '{target}' as Dead (incarnation={})", n.incarnation);
+            tracing::info!(
+                "[TEST] {host} sees '{target}' as Dead (incarnation={})",
+                n.incarnation
+            );
             true
         }
         Some(n) => {
@@ -283,7 +286,9 @@ fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
             check_dead_or_not_exist("node-2", 8082, "node-3").await,
             "node-2 should see node-3 as Dead or absent"
         );
-        tracing::info!("[TEST] Phase 2: OK — node-3 confirmed dead or removed on all surviving nodes");
+        tracing::info!(
+            "[TEST] Phase 2: OK — node-3 confirmed dead or removed on all surviving nodes"
+        );
 
         // Phase 3: node-3 is restarted at ~40s sim time with a fresh UUID.
         // Wait 50s for its join pings to reach the cluster and gossip to converge.
@@ -302,7 +307,10 @@ fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
     while sim.elapsed() < Duration::from_secs(15) {
         sim.step()?;
     }
-    tracing::info!("[TEST] Crashing node-3 at {}s sim time", sim.elapsed().as_secs());
+    tracing::info!(
+        "[TEST] Crashing node-3 at {}s sim time",
+        sim.elapsed().as_secs()
+    );
     sim.crash("node-3");
 
     // Step to ~40s — Phase 2 check completes by ~30s, giving a 10s gap before restart.
@@ -310,7 +318,10 @@ fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
         sim.step()?;
     }
     // Restart node-3 — the host factory runs again with a fresh UUID.
-    tracing::info!("[TEST] Restarting node-3 with fresh UUID at {}s sim time", sim.elapsed().as_secs());
+    tracing::info!(
+        "[TEST] Restarting node-3 with fresh UUID at {}s sim time",
+        sim.elapsed().as_secs()
+    );
     sim.bounce("node-3");
 
     // Run remaining simulation until the checker client completes (~80s).

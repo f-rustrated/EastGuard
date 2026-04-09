@@ -2,10 +2,6 @@ use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
-pub(crate) const DIRECT_ACK_TIMEOUT_TICKS: u32 = 3; // 3 × 100ms = 300ms
-pub(crate) const INDIRECT_ACK_TIMEOUT_TICKS: u32 = 6; // 6 × 100ms = 600ms (must cover 4-hop RTT through intermediary, so it should be at least * 2 of DIRECT_ACK_TIMEOUT_TICKS)
-pub(crate) const SUSPECT_TIMEOUT_TICKS: u32 = 50; // 50 × 100ms = 5s
-
 #[derive(Debug)]
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
@@ -77,7 +73,10 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::swims::{SwimTimeOutCallback, SwimTimer, SwimTimerKind};
+    use crate::clusters::swims::{
+        DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
+        SwimTimeOutCallback, SwimTimer, SwimTimerKind,
+    };
 
     use super::*;
 

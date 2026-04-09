@@ -61,7 +61,7 @@ impl StartUp {
         let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
 
         let mut state = self.env.swim(self.rng_seed);
-        Bootstrapper::new(self.env.bootstrap_servers(), &mut state);
+        Bootstrapper::run(self.env.bootstrap_servers(), &mut state);
 
         // Spawn Actors
         tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));

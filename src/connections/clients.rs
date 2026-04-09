@@ -132,7 +132,7 @@ impl ClientStreamReader {
     pub(crate) async fn handle_client_stream(mut self) {
         loop {
             // * extract queries
-            let query_io = self.read_request::<SessionRequest>().await;
+            let _query_io = self.read_request::<SessionRequest>().await;
         }
     }
 }
