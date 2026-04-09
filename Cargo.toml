@@ -15,7 +15,10 @@ murmur3 = "0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("turmoil"))'] }
+
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3.3.1"
-turmoil = "0.7.1"
+turmoil = { version = "0.7.1", package = "turmoil" }

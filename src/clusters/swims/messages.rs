@@ -79,6 +79,7 @@ pub enum SwimQueryCommand {
     GetMembers {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
+    #[allow(dead_code)]
     GetTopology {
         reply: tokio::sync::oneshot::Sender<Topology>,
     },
@@ -150,7 +151,7 @@ impl TTimer for SwimTimer {
 
     fn to_timeout_callback(self, seq: u32) -> SwimTimeOutCallback {
         SwimTimeOutCallback::TimedOut {
-            seq: seq,
+            seq,
             target_node_id: self.target_node_id,
             phase: self.kind,
         }

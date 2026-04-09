@@ -19,6 +19,7 @@ use tokio::{sync::mpsc, time};
 
 use super::*;
 
+#[allow(dead_code)]
 struct TestHarness {
     pub tx_in: mpsc::Sender<SwimCommand>,
     pub tx_out: mpsc::Sender<OutboundPacket>,
@@ -37,7 +38,7 @@ impl TestHarness {
             }))
             .await
             .unwrap();
-        rx.await.unwrap().iter().count()
+        rx.await.unwrap().len()
     }
 
     pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
@@ -128,7 +129,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         0,
     );
     let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone());
-    Bootstrapper::new(join_config.tries(), &mut swim);
+    Bootstrapper::run(join_config.tries(), &mut swim);
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
     tokio::spawn(actor.run(swim));
@@ -278,8 +279,8 @@ async fn test_gossip_propagation() {
             .unwrap();
 
         // Wait for response
-        if let Some(response) = rx_out.recv().await {
-            if let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet() {
+        if let Some(response) = rx_out.recv().await
+            && let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet() {
                 // Check if our rumor is in this specific Ack
                 if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
                     assert_eq!(rumor.state, SwimNodeState::Dead);
@@ -287,7 +288,6 @@ async fn test_gossip_propagation() {
                     break; // Success!
                 }
             }
-        }
 
         // Brief sleep to allow the actor's async tasks to complete
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -394,7 +394,7 @@ async fn test_indirect_ping_trigger() {
 
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
-    let mut harness = setup_single().await;
+    let harness = setup_single().await;
 
     assert!(
         harness
@@ -493,7 +493,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
 #[tokio::test]
 async fn cluster_formation_using_join() {
     let join_config = JoinConfig {
-        seed_addrs: vec!["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
+        seed_addrs: ["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"]
             .iter()
             .map(|addr| addr.parse().unwrap())
             .collect(),

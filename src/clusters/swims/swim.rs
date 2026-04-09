@@ -161,7 +161,7 @@ impl Swim {
     pub(crate) fn handle_query(&self, command: SwimQueryCommand) {
         match command {
             SwimQueryCommand::GetMembers { reply } => {
-                let _ = reply.send(self.members.values().map(|s| s.clone()).collect());
+                let _ = reply.send(self.members.values().cloned().collect());
             }
             SwimQueryCommand::GetTopology { reply } => {
                 let _ = reply.send(self.topology.clone());
@@ -266,10 +266,9 @@ impl Swim {
                 return;
             }
 
-            if let Some(seq) = self.last_suspected_seqs.get(&target_node_id) {
-                if registered_seq != *seq {
+            if let Some(seq) = self.last_suspected_seqs.get(&target_node_id)
+                && registered_seq != *seq {
                     return;
-                }
             }
 
             self.last_suspected_seqs.remove(&target_node_id);
