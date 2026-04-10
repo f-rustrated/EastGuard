@@ -158,6 +158,7 @@ impl Environment {
                 Default::default(),
                 TopologyConfig {
                     vnodes_per_pnode: self.vnodes_per_node,
+                    replication_factor: 3,
                 },
             ),
             rng_seed,

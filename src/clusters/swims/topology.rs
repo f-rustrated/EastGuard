@@ -5,6 +5,20 @@ use std::net::SocketAddr;
 
 use crate::clusters::{NodeId, SwimNodeState};
 
+/// Deterministic identifier for a shard group, derived from the hash of the first
+/// virtual node on the consistent hash ring for a given key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub struct ShardGroupId(pub u64);
+
+/// A shard group: the set of physical nodes responsible for a key range on the ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ShardGroup {
+    pub id: ShardGroupId,
+    pub members: Vec<NodeId>,
+}
+
 /// node_id and replica_index for tie breaker
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone)]
 pub struct VirtualNodeToken {
@@ -93,6 +107,7 @@ impl TokenRing {
 #[derive(Clone, Debug)]
 pub struct TopologyConfig {
     pub vnodes_per_pnode: u64,
+    pub replication_factor: usize,
 }
 
 impl Topology {
@@ -134,6 +149,24 @@ impl Topology {
     #[allow(dead_code)]
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
         self.ring.token_owners_for(key, n)
+    }
+
+    /// Returns the shard group responsible for `key`.
+    ///
+    /// The group ID is derived deterministically from the key's hash so every node
+    /// in the cluster computes the same ID for the same key. Members are the
+    /// `replication_factor` distinct physical nodes clockwise from the key's
+    /// position on the ring.
+    #[allow(dead_code)]
+    pub fn shard_group_for(&self, key: &[u8]) -> ShardGroup {
+        let owners = self
+            .ring
+            .token_owners_for(key, self.config.replication_factor);
+        let id = ShardGroupId(hash_stable(key) as u64);
+        ShardGroup {
+            id,
+            members: owners.into_iter().map(|vn| vn.pnode_id.clone()).collect(),
+        }
     }
 
     #[cfg(test)]
@@ -214,6 +247,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
 
@@ -235,6 +269,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
 
@@ -260,6 +295,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
 
@@ -284,6 +320,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
 
@@ -307,6 +344,7 @@ mod tests {
             nodes.as_slice(),
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
 
@@ -332,6 +370,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 4,
+                replication_factor: 3,
             },
         );
         // Asking for more replicas than physical nodes exist should return at most 3.
@@ -349,6 +388,7 @@ mod tests {
             ],
             TopologyConfig {
                 vnodes_per_pnode: 150,
+                replication_factor: 3,
             },
         );
 
@@ -364,5 +404,124 @@ mod tests {
         let new_owners = topology.token_owners_for(key, 1);
         assert_eq!(new_owners.len(), 1);
         assert_eq!(new_owners[0].pnode_id, successor_id);
+    }
+
+    // --- ShardGroup tests ---
+
+    #[test]
+    fn shard_group_returns_replication_factor_members() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+
+        let group = topology.shard_group_for(b"topic-blue");
+        assert_eq!(group.members.len(), 3);
+
+        // All members should be distinct
+        let unique: HashSet<_> = group.members.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn shard_group_deterministic_across_calls() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+
+        let group1 = topology.shard_group_for(b"topic-blue");
+        let group2 = topology.shard_group_for(b"topic-blue");
+        assert_eq!(group1, group2);
+    }
+
+    #[test]
+    fn shard_group_id_differs_for_different_keys() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 2,
+            },
+        );
+
+        let group_a = topology.shard_group_for(b"topic-alpha");
+        let group_b = topology.shard_group_for(b"topic-beta");
+        // Murmur3 with seed 0 is deterministic — pin exact IDs
+        assert_eq!(group_a.id, ShardGroupId(449050983));
+        assert_eq!(group_b.id, ShardGroupId(3972680256));
+    }
+
+    #[test]
+    fn shard_group_limited_to_available_nodes() {
+        let topology = topology_from(
+            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 5,
+            },
+        );
+
+        // Only 2 physical nodes, so group can have at most 2 members
+        let group = topology.shard_group_for(b"any-key");
+        assert_eq!(group.members.len(), 2);
+    }
+
+    #[test]
+    fn shard_group_recalculates_on_node_removal() {
+        let mut topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 150,
+                replication_factor: 3,
+            },
+        );
+
+        let key = b"test-key";
+        let before = topology.shard_group_for(key);
+        assert_eq!(before.members.len(), 3);
+
+        let removed = before.members[0].clone();
+        topology.remove_node(&removed);
+
+        let after = topology.shard_group_for(key);
+        assert_eq!(after.members.len(), 2);
+        assert!(!after.members.contains(&removed));
+    }
+
+    #[test]
+    fn shard_group_empty_ring_returns_empty_members() {
+        let topology = topology_from(
+            &[],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+
+        let group = topology.shard_group_for(b"any-key");
+        assert!(group.members.is_empty());
     }
 }
