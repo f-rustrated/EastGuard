@@ -4,12 +4,14 @@ mod config;
 mod connections;
 
 mod clusters;
+mod raft;
 
 mod net;
 pub(crate) mod schedulers;
 
 #[cfg(test)]
 mod it;
+pub(crate) mod macros;
 
 use crate::clusters::swims::peer_discovery::Bootstrapper;
 
