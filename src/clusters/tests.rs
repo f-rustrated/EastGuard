@@ -124,6 +124,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
             Default::default(),
             TopologyConfig {
                 vnodes_per_pnode: 256,
+                replication_factor: 3,
             },
         ),
         0,

@@ -31,6 +31,7 @@ pub mod common {
             HashMap::new(),
             TopologyConfig {
                 vnodes_per_pnode: 256,
+                replication_factor: 3,
             },
         );
         Swim::new(NodeId::new(local_id), addr, topology, 0)
