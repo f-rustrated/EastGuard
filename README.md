@@ -34,7 +34,6 @@ $ cargo run --bin server
 ```shell 
 # Terminal 1 (node-1):
 cargo run --bin server -- \
---node-id node-1 \
 --port 3001 \
 --cluster-port 13001 \
 --data-dir /tmp/eg-node1 \
@@ -46,7 +45,6 @@ cargo run --bin server -- \
 
 # Terminal 2 (node-2):
 cargo run --bin server -- \
---node-id node-2 \
 --port 3002 \
 --cluster-port 13002 \
 --data-dir /tmp/eg-node2 \
@@ -58,7 +56,6 @@ cargo run --bin server -- \
 
 # Terminal 3 (node-3):
 cargo run --bin server -- \
---node-id node-3 \
 --port 3003 \
 --cluster-port 13003 \
 --data-dir /tmp/eg-node3 \
