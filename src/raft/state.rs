@@ -98,6 +98,13 @@ impl Raft {
         std::mem::take(&mut self.pending_timer_commands)
     }
 
+    /// Minimum number of nodes needed for a majority (strict majority).
+    /// For N nodes: N/2 + 1. Examples: 3→2, 4→3, 5→3.
+    fn quorum(&self) -> u32 {
+        let total = self.peers.len() as u32 + 1; // +1 for self
+        total / 2 + 1
+    }
+
     // -------------------------------------------------------------------
     // Event handlers (called by actor)
     // -------------------------------------------------------------------
@@ -194,9 +201,7 @@ impl Raft {
             && resp.vote_granted
         {
             *votes_received += 1;
-            let total_nodes = self.peers.len() as u32 + 1; // +1 for self
-            let majority = (total_nodes).div_ceil(2);
-            if *votes_received >= majority {
+            if *votes_received >= self.quorum() {
                 self.become_leader();
             }
         }
@@ -431,8 +436,7 @@ impl Raft {
                 .count() as u32
                 + 1; // +1 for self
 
-            let majority = (self.peers.len() as u32 + 1).div_ceil(2);
-            if replication_count >= majority {
+            if replication_count >= self.quorum() {
                 self.commit_index = n;
             }
         }
@@ -1013,5 +1017,34 @@ mod tests {
 
         let out = raft.take_outbound();
         assert!(out.is_empty(), "candidate must not send heartbeats");
+    }
+
+    #[test]
+    fn quorum_requires_strict_majority() {
+        // total = peers + 1 (self). Quorum = total / 2 + 1.
+        let expected = [
+            // (total_nodes, expected_quorum)
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (6, 4),
+            (7, 4),
+        ];
+
+        for (total, want) in expected {
+            let peer_count = total - 1;
+            let peers = (0..peer_count)
+                .map(|i| (NodeId::new(format!("peer-{i}")), addr(9000 + i as u16)))
+                .collect();
+            let raft = Raft::new(NodeId::new("self"), addr(8000), peers, 0);
+
+            assert_eq!(
+                raft.quorum(),
+                want,
+                "quorum for {total} nodes should be {want}"
+            );
+        }
     }
 }
