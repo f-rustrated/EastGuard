@@ -1,63 +1,52 @@
 #![allow(dead_code)]
 
-use crate::raft::messages::LogEntry;
+use crate::raft::messages::{LogEntry, RaftCommand};
+use crate::storage::{Entry, MemEngine, StorageEngine};
 
-#[derive(Debug, Default)]
-pub(crate) struct MemLog {
-    entries: Vec<LogEntry>,
+// ---------------------------------------------------------------------------
+// Serialization — lives here because only the Raft layer knows the layout
+//
+// Entry.data layout: [ command discriminant (1 byte) | term: u64 LE (8 bytes) ]
+// ---------------------------------------------------------------------------
+
+fn serialize_command(cmd: &RaftCommand) -> Vec<u8> {
+    match cmd {
+        RaftCommand::Noop => vec![0x00],
+    }
 }
 
-impl MemLog {
-    fn last_index(&self) -> u64 {
-        self.entries.last().map_or(0, |e| e.index)
+fn deserialize_command(data: &[u8]) -> RaftCommand {
+    match data.first() {
+        Some(0x00) | None => RaftCommand::Noop,
+        _ => RaftCommand::Noop,
     }
+}
 
-    fn last_term(&self) -> u64 {
-        self.entries.last().map_or(0, |e| e.term)
-    }
+fn to_entry(entry: &LogEntry) -> Entry {
+    let mut data = Vec::with_capacity(9);
+    data.extend_from_slice(&serialize_command(&entry.command));
+    data.extend_from_slice(&entry.term.to_le_bytes());
+    Entry { index: entry.index, data }
+}
 
-    fn term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            return 0;
-        }
-        self.get(index).map_or(0, |e| e.term)
-    }
+fn from_entry(entry: Entry) -> LogEntry {
+    let command = deserialize_command(&entry.data[0..1]);
+    let term = u64::from_le_bytes(entry.data[1..9].try_into().unwrap());
+    LogEntry { term, index: entry.index, command }
+}
 
-    fn get(&self, index: u64) -> Option<&LogEntry> {
-        if index == 0 {
-            return None;
-        }
-        self.entries.get((index - 1) as usize)
-    }
-
-    fn entries_from(&self, start_index: u64) -> &[LogEntry] {
-        if start_index == 0 || start_index > self.last_index() {
-            return &[];
-        }
-        &self.entries[(start_index - 1) as usize..]
-    }
-
-    fn append(&mut self, entry: LogEntry) {
-        debug_assert_eq!(entry.index, self.last_index() + 1);
-        self.entries.push(entry);
-    }
-
-    fn truncate_from(&mut self, from_index: u64) {
-        if from_index == 0 || from_index > self.last_index() {
-            return;
-        }
-        self.entries.truncate((from_index - 1) as usize);
-    }
+fn deserialize_term(data: &[u8]) -> u64 {
+    u64::from_le_bytes(data[1..9].try_into().unwrap())
 }
 
 // ---------------------------------------------------------------------------
 // RaftLog — the struct Raft interacts with.
-// Backed by MemLog for Phase 1; will be replaced with DiskLog in Phase 2.
+// Backed by MemEngine for Phase 1; will use DiskEngine in Phase 2.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 pub struct RaftLog {
-    engine: MemLog,
+    engine: MemEngine,
 }
 
 impl RaftLog {
@@ -66,31 +55,55 @@ impl RaftLog {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.engine.last_index()
+        self.engine
+            .get_last()
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.index)
     }
 
     pub fn last_term(&self) -> u64 {
-        self.engine.last_term()
+        self.engine
+            .get_last()
+            .ok()
+            .flatten()
+            .map_or(0, |e| deserialize_term(&e.data))
     }
 
     pub fn term_at(&self, index: u64) -> u64 {
-        self.engine.term_at(index)
+        if index == 0 {
+            return 0;
+        }
+        self.engine
+            .get(index)
+            .ok()
+            .flatten()
+            .map_or(0, |e| deserialize_term(&e.data))
     }
 
-    pub fn get(&self, index: u64) -> Option<&LogEntry> {
-        self.engine.get(index)
+    pub fn get(&self, index: u64) -> Option<LogEntry> {
+        self.engine.get(index).ok()?.map(from_entry)
     }
 
-    pub fn entries_from(&self, start_index: u64) -> &[LogEntry] {
-        self.engine.entries_from(start_index)
+    pub fn entries_from(&self, start_index: u64) -> Vec<LogEntry> {
+        let last = self.last_index();
+        if start_index == 0 || start_index > last {
+            return vec![];
+        }
+        self.engine
+            .get_range(start_index, last)
+            .unwrap_or_default()
+            .into_iter()
+            .map(from_entry)
+            .collect()
     }
 
     pub fn append(&mut self, entry: LogEntry) {
-        self.engine.append(entry)
+        let _ = self.engine.append_log(to_entry(&entry));
     }
 
     pub fn truncate_from(&mut self, from_index: u64) {
-        self.engine.truncate_from(from_index)
+        let _ = self.engine.truncate_log(from_index);
     }
 }
 
@@ -101,7 +114,6 @@ impl RaftLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::messages::RaftCommand;
 
     fn entry(term: u64, index: u64) -> LogEntry {
         LogEntry { term, index, command: RaftCommand::Noop }

@@ -1,13 +1,45 @@
 #![allow(dead_code)]
 
+mod memory;
+pub use memory::MemEngine;
+
+/// Append-only log storage — one instance per shard group.
+///
+/// # Directory layout (DiskEngine)
+///
+/// ```text
+/// <base_dir>/
+///     meta/
+///     shards/
+///         <shard_id>/
+///             chunk-<first_index>/
+///                 data.log     ← raw entry bytes
+///                 index.log    ← flat u64 array: index → byte offset in data.log
+///             snapshot/        ← Phase 2
+/// ```
+pub trait StorageEngine {
+    /// Appends an entry to the end of the log.
+    fn append_log(&mut self, entry: Entry) -> Result<(), StorageError>;
+
+    /// Returns all entries in the closed range `[start, end]`.
+    fn get_range(&self, start: Index, end: Index) -> Result<Vec<Entry>, StorageError>;
+
+    /// Returns the entry at `index`, or `None` if it does not exist.
+    fn get(&self, index: Index) -> Result<Option<Entry>, StorageError>;
+
+    /// Returns the last stored entry, or `None` if the log is empty.
+    fn get_last(&self) -> Result<Option<Entry>, StorageError>;
+
+    /// Removes all entries at and after `from` (inclusive).
+    fn truncate_log(&mut self, from: Index) -> Result<(), StorageError>;
+
+    /// Flushes buffered writes to durable storage. No-op for [`MemEngine`].
+    fn sync(&mut self) -> Result<(), StorageError>;
+}
+
 /// Position in the log. 1-based; `0` is reserved to mean "before the log begins".
 pub type Index = u64;
 
-/// A single entry in the log.
-///
-/// `data` is an opaque byte payload. The caller is responsible for encoding
-/// and decoding whatever domain type (e.g. a serialized Raft command) lives
-/// inside it.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub index: Index,
@@ -16,12 +48,18 @@ pub struct Entry {
 
 /// Errors that can be returned by a [`StorageEngine`].
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum StorageError {
     Io(std::io::Error),
     /// The data on disk is unreadable or inconsistent.
-    Corruption { reason: String },
+    Corruption {
+        reason: String,
+    },
     /// The requested index range falls outside the stored log.
-    IndexOutOfRange { requested: Index, last: Index },
+    IndexOutOfRange {
+        requested: Index,
+        last: Index,
+    },
 }
 
 impl std::fmt::Display for StorageError {
@@ -50,39 +88,4 @@ impl From<std::io::Error> for StorageError {
     fn from(e: std::io::Error) -> Self {
         StorageError::Io(e)
     }
-}
-
-/// Append-only log storage — one instance per directory (shard or meta).
-///
-/// # Directory layout
-///
-/// ```text
-/// <base_dir>/
-///     meta/                ← meta store (shard group registry)
-///     shards/
-///         <shard_id>/      ← per-shard store
-///             log/
-///             snapshot/    (Phase 2)
-/// ```
-///
-/// # Ordering invariant
-///
-/// Entries must be appended in strictly ascending index order
-/// (`entry.index == last_index() + 1`). The only mutation allowed beyond
-/// appending is [`StorageEngine::truncate_log`], which removes entries from a
-/// given position onward.
-pub trait StorageEngine {
-    /// Appends a single entry.
-    ///
-    /// The caller must ensure `entry.index == last_index() + 1`.
-    fn append_log(&mut self, entry: Entry) -> Result<(), StorageError>;
-
-    /// Returns all entries in the closed range `[start, end]`.
-    ///
-    /// `get_log(start, start + limit - 1)` gives limit-based semantics.
-    /// Returns an empty `Vec` when the range is empty or inverted.
-    fn get_log(&self, start: Index, end: Index) -> Result<Vec<Entry>, StorageError>;
-
-    /// Returns the index of the last stored entry, or `0` if the log is empty.
-    fn last_index(&self) -> Result<Index, StorageError>;
 }

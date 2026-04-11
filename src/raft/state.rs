@@ -291,7 +291,7 @@ impl Raft {
 
         let prev_log_index = peer_state.next_index.saturating_sub(1);
         let prev_log_term = self.log.term_at(prev_log_index);
-        let entries = self.log.entries_from(peer_state.next_index).to_vec();
+        let entries = self.log.entries_from(peer_state.next_index);
 
         self.pending_outbound.push(OutboundRaftPacket::new(
             peer_id,
