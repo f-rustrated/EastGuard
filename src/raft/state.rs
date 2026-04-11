@@ -120,7 +120,8 @@ impl Raft {
         }
     }
 
-    pub fn step(&mut self, src: SocketAddr, rpc: RaftRpc) {
+    pub fn step(&mut self, src: SocketAddr, rpc: impl Into<RaftRpc>) {
+        let rpc = rpc.into();
         match rpc {
             RaftRpc::RequestVote(req) => self.handle_request_vote(src, req),
             RaftRpc::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
@@ -233,7 +234,12 @@ impl Raft {
     fn become_leader(&mut self) {
         self.role = Role::Leader;
 
-        // Initialize peer states per §5.3.
+        // Cancel election timer, start heartbeat timer.
+        self.cancel_all_timers();
+        self.schedule_heartbeat_timer();
+
+        // next_index is set *before* the noop is appended, so it points
+        // at the noop's index — causing the first AppendEntries to carry it.
         let next = self.log.last_index() + 1;
         self.peer_states.clear();
         for peer_id in self.peers.keys() {
@@ -246,11 +252,13 @@ impl Raft {
             );
         }
 
-        // Cancel election timer, start heartbeat timer.
-        self.cancel_all_timers();
-        self.schedule_heartbeat_timer();
+        // Append a Noop entry at the new term so that all
+        // preceding entries from earlier terms can be committed.
+        // Without this, old-term entries remain in limbo until a real
+        // client proposal arrives.
+        self.add_new_entry(RaftCommand::Noop);
 
-        // Send initial empty AppendEntries (heartbeat) to all peers.
+        // Send AppendEntries (with the Noop) to all peers.
         self.send_heartbeats();
     }
 
@@ -442,6 +450,14 @@ impl Raft {
         }
     }
 
+    fn add_new_entry(&mut self, command: RaftCommand) {
+        self.log.append(LogEntry {
+            term: self.current_term,
+            index: self.log.last_index() + 1,
+            command,
+        });
+    }
+
     /// Propose a command to the Raft log. Only the leader can accept proposals.
     /// In the DS-RSM context, the flow would be as follows:
     //
@@ -456,12 +472,7 @@ impl Raft {
             return Err(ProposeError::NotLeader);
         }
 
-        let entry = LogEntry {
-            term: self.current_term,
-            index: self.log.last_index() + 1,
-            command,
-        };
-        self.log.append(entry);
+        self.add_new_entry(command);
 
         // Immediately replicate to all peers.
         let peers: Vec<(NodeId, SocketAddr)> = self
@@ -590,7 +601,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(addr(8001), RaftRpc::RequestVote(req));
+        raft.step(addr(8001), req);
 
         let out = raft.take_outbound();
         assert_eq!(out.len(), 1);
@@ -615,7 +626,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(addr(8001), RaftRpc::RequestVote(req1));
+        raft.step(addr(8001), req1);
         let _ = raft.take_outbound();
 
         // node-2 asks for vote in same term
@@ -625,7 +636,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(addr(8002), RaftRpc::RequestVote(req2));
+        raft.step(addr(8002), req2);
 
         let out = raft.take_outbound();
         match &out[0].rpc {
@@ -647,7 +658,7 @@ mod tests {
             term: 1,
             vote_granted: true,
         };
-        raft.step(addr(8002), RaftRpc::RequestVoteResponse(resp));
+        raft.step(addr(8002), resp);
 
         assert_eq!(raft.role, Role::Leader);
     }
@@ -662,7 +673,7 @@ mod tests {
             term: 5,
             vote_granted: false,
         };
-        raft.step(addr(8002), RaftRpc::RequestVoteResponse(resp));
+        raft.step(addr(8002), resp);
 
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.current_term, 5);
@@ -689,7 +700,7 @@ mod tests {
             last_log_index: 1,
             last_log_term: 1,
         };
-        raft.step(addr(8001), RaftRpc::RequestVote(req));
+        raft.step(addr(8001), req);
 
         let out = raft.take_outbound();
         match &out[0].rpc {
@@ -705,34 +716,54 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn leader_sends_heartbeats_on_timeout() {
+    fn leader_sends_noop_on_election_then_heartbeats() {
         let (mut raft, _) = three_node_raft("node-1", 8001);
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
         let _ = raft.take_outbound();
         raft.step(
             addr(8002),
-            RaftRpc::RequestVoteResponse(RequestVoteResponse {
+            RequestVoteResponse {
                 term: 1,
                 vote_granted: true,
-            }),
+            },
         );
-        // Leader sends initial heartbeats upon election
+
+        // Initial AppendEntries carry the noop entry
         let initial = raft.take_outbound();
         assert_eq!(initial.len(), 2);
+        for pkt in &initial {
+            let RaftRpc::AppendEntries(ae) = &pkt.rpc else {
+                panic!("expected AppendEntries")
+            };
+            assert_eq!(ae.entries.len(), 1, "initial AE should carry noop");
+            assert_eq!(ae.entries[0].command, RaftCommand::Noop);
+            assert_eq!(ae.entries[0].term, 1);
+        }
 
-        // Heartbeat timeout triggers more
+        // Peers ack the noop
+        for port in [8002, 8003] {
+            raft.step(
+                addr(port),
+                AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    last_log_index: 1,
+                },
+            );
+        }
+        let _ = raft.take_outbound();
+
+        // Subsequent heartbeats are empty
         raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
         let out = raft.take_outbound();
         assert_eq!(out.len(), 2);
         for pkt in &out {
-            match &pkt.rpc {
-                RaftRpc::AppendEntries(ae) => {
-                    assert_eq!(ae.term, 1);
-                    assert!(ae.entries.is_empty()); // heartbeat
-                }
-                _ => panic!("expected AppendEntries"),
-            }
+            let RaftRpc::AppendEntries(ae) = &pkt.rpc else {
+                panic!("expected AppendEntries")
+            };
+            assert_eq!(ae.term, 1);
+            assert!(ae.entries.is_empty(), "heartbeat after ack should be empty");
         }
     }
 
@@ -752,7 +783,7 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        raft.step(addr(8001), RaftRpc::AppendEntries(ae));
+        raft.step(addr(8001), ae);
 
         let out = raft.take_outbound();
         match &out[0].rpc {
@@ -778,7 +809,7 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         };
-        raft.step(addr(8001), RaftRpc::AppendEntries(ae));
+        raft.step(addr(8001), ae);
 
         let out = raft.take_outbound();
         match &out[0].rpc {
@@ -807,7 +838,7 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        raft.step(addr(8001), RaftRpc::AppendEntries(ae));
+        raft.step(addr(8001), ae);
 
         let out = raft.take_outbound();
         match &out[0].rpc {
@@ -834,22 +865,22 @@ mod tests {
         );
         let _ = raft.take_outbound();
 
-        // Propose a command
+        // Noop is at index 1 (appended on election). Propose adds at index 2.
         raft.propose(RaftCommand::Noop).unwrap();
         let _ = raft.take_outbound();
-        assert_eq!(raft.log.last_index(), 1);
+        assert_eq!(raft.log.last_index(), 2);
         assert_eq!(raft.commit_index, 0);
 
-        // node-2 acknowledges
+        // node-2 acknowledges both entries (noop + proposal)
         let resp = AppendEntriesResponse {
             term: 1,
             success: true,
-            last_log_index: 1,
+            last_log_index: 2,
         };
-        raft.step(addr(8002), RaftRpc::AppendEntriesResponse(resp));
+        raft.step(addr(8002), resp);
 
         // Majority achieved (self + node-2 = 2 out of 3)
-        assert_eq!(raft.commit_index, 1);
+        assert_eq!(raft.commit_index, 2);
     }
 
     #[test]
@@ -882,7 +913,7 @@ mod tests {
             }],
             leader_commit: 1,
         };
-        raft.step(addr(8001), RaftRpc::AppendEntries(ae));
+        raft.step(addr(8001), ae);
         let _ = raft.take_outbound();
 
         assert_eq!(raft.commit_index, 1);
@@ -918,7 +949,7 @@ mod tests {
             success: false,
             last_log_index: 0,
         };
-        raft.step(addr(8002), RaftRpc::AppendEntriesResponse(resp));
+        raft.step(addr(8002), resp);
 
         // Should have retried with decremented next_index
         let out = raft.take_outbound();
@@ -956,7 +987,7 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         };
-        raft.step(addr(8003), RaftRpc::AppendEntries(ae));
+        raft.step(addr(8003), ae);
 
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.current_term, 3);
