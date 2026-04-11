@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
-use crate::raft::log::MemLog;
+use crate::raft::log::RaftLog;
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
 
@@ -43,7 +43,7 @@ pub struct Raft {
 
     current_term: u64,
     voted_for: Option<NodeId>,
-    log: MemLog,
+    log: RaftLog,
 
     commit_index: u64,
     role: Role,
@@ -70,7 +70,7 @@ impl Raft {
             peers,
             current_term: 0,
             voted_for: None,
-            log: MemLog::default(),
+            log: RaftLog::new(),
             commit_index: 0,
             role: Role::Follower,
             peer_states: HashMap::new(),

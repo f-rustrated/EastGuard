@@ -2,48 +2,47 @@
 
 use crate::raft::messages::LogEntry;
 
-/// In-memory log store. Will be replaced with RocksDB-backed storage later.
 #[derive(Debug, Default)]
-pub struct MemLog {
+pub(crate) struct MemLog {
     entries: Vec<LogEntry>,
 }
 
 impl MemLog {
-    pub fn last_index(&self) -> u64 {
+    fn last_index(&self) -> u64 {
         self.entries.last().map_or(0, |e| e.index)
     }
 
-    pub fn last_term(&self) -> u64 {
+    fn last_term(&self) -> u64 {
         self.entries.last().map_or(0, |e| e.term)
     }
 
-    pub fn term_at(&self, index: u64) -> u64 {
+    fn term_at(&self, index: u64) -> u64 {
         if index == 0 {
             return 0;
         }
         self.get(index).map_or(0, |e| e.term)
     }
 
-    pub fn get(&self, index: u64) -> Option<&LogEntry> {
+    fn get(&self, index: u64) -> Option<&LogEntry> {
         if index == 0 {
             return None;
         }
         self.entries.get((index - 1) as usize)
     }
 
-    pub fn entries_from(&self, start_index: u64) -> &[LogEntry] {
+    fn entries_from(&self, start_index: u64) -> &[LogEntry] {
         if start_index == 0 || start_index > self.last_index() {
             return &[];
         }
         &self.entries[(start_index - 1) as usize..]
     }
 
-    pub fn append(&mut self, entry: LogEntry) {
+    fn append(&mut self, entry: LogEntry) {
         debug_assert_eq!(entry.index, self.last_index() + 1);
         self.entries.push(entry);
     }
 
-    pub fn truncate_from(&mut self, from_index: u64) {
+    fn truncate_from(&mut self, from_index: u64) {
         if from_index == 0 || from_index > self.last_index() {
             return;
         }
@@ -51,22 +50,66 @@ impl MemLog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RaftLog — the struct Raft interacts with.
+// Backed by MemLog for Phase 1; will be replaced with DiskLog in Phase 2.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct RaftLog {
+    engine: MemLog,
+}
+
+impl RaftLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn last_index(&self) -> u64 {
+        self.engine.last_index()
+    }
+
+    pub fn last_term(&self) -> u64 {
+        self.engine.last_term()
+    }
+
+    pub fn term_at(&self, index: u64) -> u64 {
+        self.engine.term_at(index)
+    }
+
+    pub fn get(&self, index: u64) -> Option<&LogEntry> {
+        self.engine.get(index)
+    }
+
+    pub fn entries_from(&self, start_index: u64) -> &[LogEntry] {
+        self.engine.entries_from(start_index)
+    }
+
+    pub fn append(&mut self, entry: LogEntry) {
+        self.engine.append(entry)
+    }
+
+    pub fn truncate_from(&mut self, from_index: u64) {
+        self.engine.truncate_from(from_index)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::raft::messages::RaftCommand;
 
     fn entry(term: u64, index: u64) -> LogEntry {
-        LogEntry {
-            term,
-            index,
-            command: RaftCommand::Noop,
-        }
+        LogEntry { term, index, command: RaftCommand::Noop }
     }
 
     #[test]
     fn empty_log_defaults() {
-        let log = MemLog::default();
+        let log = RaftLog::new();
         assert_eq!(log.last_index(), 0);
         assert_eq!(log.last_term(), 0);
         assert_eq!(log.term_at(0), 0);
@@ -78,7 +121,7 @@ mod tests {
 
     #[test]
     fn append_and_get() {
-        let mut log = MemLog::default();
+        let mut log = RaftLog::new();
         log.append(entry(1, 1));
         log.append(entry(1, 2));
         log.append(entry(2, 3));
@@ -88,14 +131,13 @@ mod tests {
         assert_eq!(log.term_at(1), 1);
         assert_eq!(log.term_at(2), 1);
         assert_eq!(log.term_at(3), 2);
-
         assert_eq!(log.get(1).unwrap().term, 1);
         assert_eq!(log.get(3).unwrap().term, 2);
     }
 
     #[test]
     fn entries_from_returns_slice() {
-        let mut log = MemLog::default();
+        let mut log = RaftLog::new();
         log.append(entry(1, 1));
         log.append(entry(1, 2));
         log.append(entry(2, 3));
@@ -108,7 +150,7 @@ mod tests {
 
     #[test]
     fn truncate_from_removes_tail() {
-        let mut log = MemLog::default();
+        let mut log = RaftLog::new();
         log.append(entry(1, 1));
         log.append(entry(1, 2));
         log.append(entry(2, 3));
@@ -121,7 +163,7 @@ mod tests {
 
     #[test]
     fn truncate_from_beyond_end_is_noop() {
-        let mut log = MemLog::default();
+        let mut log = RaftLog::new();
         log.append(entry(1, 1));
         log.truncate_from(5);
         assert_eq!(log.last_index(), 1);
