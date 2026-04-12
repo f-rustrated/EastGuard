@@ -126,7 +126,7 @@ impl TTimer for RaftTimer {
     type Callback = RaftTimeoutCallback;
 
     fn tick(&mut self) -> u32 {
-        self.ticks_remaining -= 1;
+        self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
         self.ticks_remaining
     }
 
