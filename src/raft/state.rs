@@ -233,6 +233,8 @@ impl Raft {
         // next_index is set *before* the noop is appended, so it points
         // at the noop's index — causing the first AppendEntries to carry it.
         let next = self.log.last_index() + 1;
+
+        // Peer state tracker needs to be re-initialized on every leadership transition
         self.peer_states.clear();
         for peer_id in self.peers.iter() {
             self.peer_states.insert(
