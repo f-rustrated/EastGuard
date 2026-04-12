@@ -142,7 +142,7 @@ Both actors share the same `Ticker`-based scheduler (via `run_scheduling_actor`)
 
 ## Peer Resolution: NodeId → Connection
 
-The `Raft` state machine is fully transport-agnostic. It identifies peers by `NodeId` only — no `SocketAddr` in the state machine. The resolution chain:
+The `Raft` state machine is fully transport-agnostic. It identifies peers by `NodeId` only — no `SocketAddr`(or the like) in the state machine. The resolution chain:
 
 ```
 SWIM membership table          (NodeId → SocketAddr, maintained by gossip)
