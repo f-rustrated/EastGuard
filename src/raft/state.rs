@@ -433,7 +433,11 @@ impl Raft {
     // And that 'implicit commit' does not violate safety because 'new' entry acts as an election shield that physically prevents that overwrite from happening.
     fn try_advance_commit_index(&mut self) {
         let last = self.log.last_index();
-        for n in (self.commit_index + 1)..=last {
+        let quorum = self.quorum();
+
+        // Scan top-down: the highest current-term entry with quorum
+        // implicitly commits everything below it (log matching property).
+        for n in (self.commit_index + 1..=last).rev() {
             if self.log.term_at(n) != self.current_term {
                 continue;
             }
@@ -444,8 +448,9 @@ impl Raft {
                 .count() as u32
                 + 1; // +1 for self
 
-            if replication_count >= self.quorum() {
+            if replication_count >= quorum {
                 self.commit_index = n;
+                return;
             }
         }
     }
