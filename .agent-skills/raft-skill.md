@@ -38,7 +38,7 @@ Raft (pure sync state machine, one per shard group)
 | `RaftCommand` | `src/raft/messages.rs` | `Noop` for now. Will grow: `CreateTopic`, `AssignRange`, `MoveShard`. |
 | `ProposeError` | `src/raft/messages.rs` | `NotLeader` (returned by `propose()` when not the leader). |
 | `RaftRpc` | `src/raft/messages.rs` | Enum: `RequestVote`, `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`. |
-| `OutboundRaftPacket` | `src/raft/messages.rs` | `{ target: SocketAddr, rpc: RaftRpc }`. Transport-agnostic. |
+| `OutboundRaftPacket` | `src/raft/messages.rs` | `{ target: NodeId, rpc: RaftRpc }`. Transport-agnostic — actor resolves NodeId to connection. |
 | `RaftTimer` | `src/raft/messages.rs` | Implements `TTimer`. Two kinds: `Election`, `Heartbeat`. |
 | `RaftTimeoutCallback` | `src/raft/messages.rs` | `ElectionTimeout` (default), `HeartbeatTimeout`. |
 

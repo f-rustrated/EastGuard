@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
-
 use crate::clusters::NodeId;
 use crate::impl_from_variant;
 use crate::schedulers::timer::TTimer;
@@ -39,6 +37,7 @@ pub struct RequestVote {
 #[derive(Debug, Clone)]
 pub struct RequestVoteResponse {
     pub term: u64,
+    pub node_id: NodeId,
     pub vote_granted: bool,
 }
 
@@ -55,6 +54,7 @@ pub struct AppendEntries {
 #[derive(Debug, Clone)]
 pub struct AppendEntriesResponse {
     pub term: u64,
+    pub node_id: NodeId,
     pub success: bool,
     /// The peer's last log index after applying the entries (used by the leader
     /// to advance `match_index`).
@@ -83,13 +83,14 @@ impl_from_variant!(
 
 #[derive(Debug)]
 pub struct OutboundRaftPacket {
-    // transport-agnostic target address. The actor layer later on should decide how to deliver this
-    pub target: SocketAddr,
+    /// The intended recipient, identified by NodeId.
+    /// The actor/transport layer should resolve this to a connection.
+    pub target: NodeId,
     pub rpc: RaftRpc,
 }
 
 impl OutboundRaftPacket {
-    pub(crate) fn new(target: SocketAddr, rpc: impl Into<RaftRpc>) -> Self {
+    pub(crate) fn new(target: NodeId, rpc: impl Into<RaftRpc>) -> Self {
         Self {
             target,
             rpc: rpc.into(),

@@ -140,6 +140,36 @@ SwimActor (UDP, membership)     RaftActor (TCP, consensus)
 
 Both actors share the same `Ticker`-based scheduler (via `run_scheduling_actor`), but use different timer types (`SwimTimer` vs `RaftTimer`). Timer seq namespacing prevents collisions.
 
+## Peer Resolution: NodeId → Connection
+
+The `Raft` state machine is fully transport-agnostic. It identifies peers by `NodeId` only — no `SocketAddr` in the state machine. The resolution chain:
+
+```
+SWIM membership table          (NodeId → SocketAddr, maintained by gossip)
+       |
+       v
+Topology / hash ring           (key → ShardGroup { members: Vec<NodeId> })
+       |
+       v
+Raft-Topology Bridge           (looks up each member's SocketAddr from SWIM)
+       |
+       v
+RaftActor                      (maintains NodeId → Connection pool)
+       |                        resolves OutboundRaftPacket.target (NodeId)
+       v                        to a persistent TCP connection
+RaftTransportActor              (TCP I/O)
+```
+
+**Key points:**
+
+- `Raft::peers` is a `HashSet<NodeId>` — no addresses. The state machine produces `OutboundRaftPacket { target: NodeId, rpc }`. The actor/transport layer resolves `NodeId → SocketAddr → Connection`.
+
+- The connection pool lives in the actor/transport layer, not the state machine. Since Raft peers are long-lived and exchange frequent heartbeats, connections are persistent (not per-RPC).
+
+- SWIM is the authoritative source of `NodeId → SocketAddr`. When a node's address changes (e.g., restart with new IP), SWIM detects it via gossip. The bridge recreates affected shard groups.
+
+- For ConfChanges (adding/removing a peer mid-term without destroying the group), `Raft` will need `add_peer(NodeId)` / `remove_peer(NodeId)` methods. Until then, membership changes are handled by destroying and recreating the `Raft` instance via `RemoveGroup` + `EnsureGroup`.
+
 ## Invariants
 
 1. **The actor is the sole driver of all Raft instances.** No other code calls `step()`, `handle_timeout()`, or `propose()` on a `Raft` instance in production.
