@@ -56,8 +56,10 @@ Raft uses fixed well-known seq values instead of a rolling counter (unlike SWIM'
 - `cancel_all_timers()`: cancels both seq 0 and seq 1.
 
 Timer durations (at 100ms tick period):
-- Election: 1.5s base + jitter (configurable via `election_jitter`)
-- Heartbeat: 300ms
+- Election: 5s base + jitter (configurable via `election_jitter`)
+- Heartbeat: 1s
+
+These are relaxed compared to typical Raft implementations because DS-RSM manages metadata (topic assignments, range ownership), not data-plane traffic. Consistency matters more than heartbeat latency. At 600 nodes × 256 vnodes, each node hosts ~768 shard groups — relaxed intervals keep timer load manageable (~256 leader heartbeat callbacks/sec).
 
 ## Role Safety
 

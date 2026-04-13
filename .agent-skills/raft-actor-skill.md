@@ -164,9 +164,13 @@ RaftTransportActor              (TCP I/O)
 
 - `Raft::peers` is a `HashSet<NodeId>` — no addresses. The state machine produces `OutboundRaftPacket { target: NodeId, rpc }`. The actor/transport layer resolves `NodeId → SocketAddr → Connection`.
 
-- The connection pool lives in the actor/transport layer, not the state machine. Since Raft peers are long-lived and exchange frequent heartbeats, connections are persistent (not per-RPC).
+- The connection pool (`HashMap<NodeId, RaftWriter>`) lives in `RaftTransportActor`. Connections are persistent and bidirectional — one TCP connection per peer pair, split into `RaftReader`/`RaftWriter` halves.
 
-- SWIM is the authoritative source of `NodeId → SocketAddr`. When a node's address changes (e.g., restart with new IP), SWIM detects it via gossip. The bridge recreates affected shard groups.
+- **Handshake**: On connect, the initiator sends its `NodeId` (length-prefixed bincode). The acceptor reads it to key the write half. This happens before any Raft RPCs.
+
+- **Conflict resolution**: Either side can initiate a connection. On simultaneous connect, the connection initiated by the **lower `NodeId`** wins. The acceptor checks: if a writer for the peer already exists and `peer_id > self.node_id`, the incoming connection is dropped (we initiated as the lower NodeId, so ours takes precedence).
+
+- SWIM is the authoritative source of `NodeId → SocketAddr` (via `SwimQueryCommand::ResolveAddress`). When a node's address changes, SWIM detects it via gossip. The bridge recreates affected shard groups.
 
 - For ConfChanges (adding/removing a peer mid-term without destroying the group), `Raft` will need `add_peer(NodeId)` / `remove_peer(NodeId)` methods. Until then, membership changes are handled by destroying and recreating the `Raft` instance via `RemoveGroup` + `EnsureGroup`.
 

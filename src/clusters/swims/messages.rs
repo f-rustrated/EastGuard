@@ -83,6 +83,11 @@ pub enum SwimQueryCommand {
     GetTopology {
         reply: tokio::sync::oneshot::Sender<Topology>,
     },
+
+    ResolveAddress {
+        node_id: NodeId,
+        reply: tokio::sync::oneshot::Sender<Option<SocketAddr>>,
+    },
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {

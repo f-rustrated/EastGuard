@@ -6,7 +6,7 @@ mod types;
 
 pub(crate) use types::node::*;
 
-const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
+pub(crate) const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 #[cfg(test)]
 pub(crate) mod tests;
