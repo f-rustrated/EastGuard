@@ -109,3 +109,7 @@ They converge to `next_index = match_index + 1` once the peer is caught up. The 
 5. **At most one leader per term.** Enforced by vote dedup (`voted_for`) and log-up-to-date check (§5.4.1).
 
 6. **Dead entries from old terms are not directly committed.** The leader only commits entries matching `current_term`. Preceding entries are implicitly committed once a current-term entry is committed.
+
+## TODO 
+
+- Call LogStore sync() where data has to be flushed  

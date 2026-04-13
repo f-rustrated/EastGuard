@@ -9,6 +9,7 @@ When working on specific tasks, you MUST read the following skill files before w
 - **Swim**: If cluster membership logics need to be updated, read `.agent-skills/swim-skill.md`.
 - **Raft**: If consensus, leader election, log replication, or shard state machine logics need to be updated, read `.agent-skills/raft-skill.md`.
 - **Raft Actor**: If wiring Raft to the network, managing shard group lifecycle, or integrating Raft with SWIM, read `.agent-skills/raft-actor-skill.md`.
+- **Storage**: If working on log persistence, read `.agent-skills/storage-skill.md`.
 
 # Code Quality
 

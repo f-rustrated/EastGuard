@@ -5,6 +5,7 @@ mod connections;
 
 mod clusters;
 mod raft;
+mod storage;
 
 mod net;
 pub(crate) mod schedulers;
