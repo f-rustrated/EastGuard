@@ -7,10 +7,6 @@ use crate::storage::{Entry, MemEngine, StorageEngine, StorageError};
 // Serialization — lives here because only the Raft layer knows the layout
 //
 // Entry.data layout: [ command: COMMAND_LEN bytes | term: TERM_LEN bytes (u64 LE) ]
-//
-// COMMAND_LEN and TERM_LEN are the single source of truth for byte boundaries.
-// Any change to the on-disk format must update these constants — all
-// serialize/deserialize paths derive their offsets from them.
 // ---------------------------------------------------------------------------
 
 /// Bytes reserved for the command discriminant.
@@ -65,11 +61,7 @@ fn deserialize_term(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[COMMAND_LEN..COMMAND_LEN + TERM_LEN].try_into().unwrap())
 }
 
-// ---------------------------------------------------------------------------
-// RaftLog — the struct Raft interacts with.
-// Backed by MemEngine for Phase 1; will use DiskEngine in Phase 2.
-// ---------------------------------------------------------------------------
-
+// TODO: use DiskEngine
 #[derive(Debug, Default)]
 pub struct RaftLog {
     engine: MemEngine,
@@ -128,7 +120,7 @@ impl RaftLog {
     }
 
     pub fn append(&mut self, entry: LogEntry) {
-        // TODO: propagate error 
+        // TODO: propagate error
         let _ = self.engine.append_log(to_entry(&entry));
     }
 

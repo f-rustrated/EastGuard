@@ -1,7 +1,9 @@
+#![allow(dead_code)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::storage::{Entry, Index, StorageEngine, StorageError};
 
@@ -16,13 +18,16 @@ use crate::storage::{Entry, Index, StorageEngine, StorageError};
 
 // TODO: CRC, RocksDB for key-value lookup
 
+type EntryLen = u32;
+
 const DATA_LOG: &str = "data.log";
 const INDEX_LOG: &str = "index.log";
 const INDEX_ENTRY_SIZE: u64 = size_of::<u64>() as u64;
 
 // No file handles kept open; the OS page cache handles read-after-write.
 pub struct DiskEngine {
-    base_dir: PathBuf,
+    data_path: PathBuf,
+    index_path: PathBuf,
     // TODO: first_index > 1 once snapshot support is added (Phase 2).
     first_index: Index,
     num_entries: u64,
@@ -33,53 +38,35 @@ impl DiskEngine {
     pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let base_dir = base_dir.into();
         fs::create_dir_all(&base_dir)?;
-        let num_entries = {
-            let p = base_dir.join(INDEX_LOG);
-            if p.exists() {
-                fs::metadata(&p)?.len() / INDEX_ENTRY_SIZE
-            } else {
-                0
-            }
+        let data_path = base_dir.join(DATA_LOG);
+        let index_path = base_dir.join(INDEX_LOG);
+        let num_entries = if index_path.exists() {
+            fs::metadata(&index_path)?.len() / INDEX_ENTRY_SIZE
+        } else {
+            0
         };
-        let data_bytes = {
-            let p = base_dir.join(DATA_LOG);
-            if p.exists() {
-                fs::metadata(&p)?.len()
-            } else {
-                0
-            }
+        let data_bytes = if data_path.exists() {
+            fs::metadata(&data_path)?.len()
+        } else {
+            0
         };
-        Ok(Self {
-            base_dir,
-            first_index: 1,
-            num_entries,
-            data_bytes,
-        })
-    }
-
-    fn data_path(&self) -> PathBuf {
-        self.base_dir.join(DATA_LOG)
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.base_dir.join(INDEX_LOG)
+        Ok(Self { data_path, index_path, first_index: 1, num_entries, data_bytes })
     }
 
     fn last_index(&self) -> Option<Index> {
         (self.num_entries > 0).then(|| self.first_index + self.num_entries - 1)
     }
-}
 
-/// Reads the byte offset stored at position `pos` in `index.log`.
-fn read_offset_at(index_path: &Path, pos: u64) -> Result<u64, StorageError> {
-    let mut f = File::open(index_path)?;
-    f.seek(SeekFrom::Start(pos * INDEX_ENTRY_SIZE))?;
-    let mut buf = [0u8; size_of::<u64>()];
-    f.read_exact(&mut buf)
-        .map_err(|e| StorageError::Corruption {
-            reason: format!("index.log: {e}"),
-        })?;
-    Ok(u64::from_le_bytes(buf))
+    fn read_offset_at(&self, pos: u64) -> Result<u64, StorageError> {
+        let mut f = File::open(&self.index_path)?;
+        f.seek(SeekFrom::Start(pos * INDEX_ENTRY_SIZE))?;
+        let mut buf = [0u8; size_of::<u64>()];
+        f.read_exact(&mut buf)
+            .map_err(|e| StorageError::Corruption {
+                reason: format!("index.log: {e}"),
+            })?;
+        Ok(u64::from_le_bytes(buf))
+    }
 }
 
 impl StorageEngine for DiskEngine {
@@ -87,27 +74,25 @@ impl StorageEngine for DiskEngine {
         let byte_offset = self.data_bytes;
         debug_assert_eq!(
             self.data_bytes,
-            if self.data_path().exists() {
-                fs::metadata(self.data_path()).unwrap().len()
+            if self.data_path.exists() {
+                fs::metadata(&self.data_path).unwrap().len()
             } else {
                 0
             },
             "data_bytes cache diverged from actual data.log size"
         );
-        // Write data.log before index.log: orphaned data tail is detectable;
-        // dangling index pointer is not.
         let mut dat = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.data_path())?;
-        dat.write_all(&(entry.data.len() as u32).to_le_bytes())?;
+            .open(&self.data_path)?;
+        dat.write_all(&(entry.data.len() as EntryLen).to_le_bytes())?;
         dat.write_all(&entry.data)?;
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.index_path())?
+            .open(&self.index_path)?
             .write_all(&byte_offset.to_le_bytes())?;
-        self.data_bytes += size_of::<u32>() as u64 + entry.data.len() as u64;
+        self.data_bytes += size_of::<EntryLen>() as u64 + entry.data.len() as u64;
         self.num_entries += 1;
         Ok(())
     }
@@ -128,25 +113,20 @@ impl StorageEngine for DiskEngine {
         // One seek into index.log to find the byte offset of `start` in data.log,
         // then one sequential pass through data.log — O(1) file opens regardless of range size.
         let start_pos = start - self.first_index;
-        let byte_offset = read_offset_at(&self.index_path(), start_pos)?;
-        let mut data_file = File::open(self.data_path())?;
+        let byte_offset = self.read_offset_at(start_pos)?;
+        let mut data_file = File::open(&self.data_path)?;
         data_file.seek(SeekFrom::Start(byte_offset))?;
 
         let mut entries = Vec::with_capacity(count);
         for i in 0..count as u64 {
-            let mut len_buf = [0u8; size_of::<u32>()];
-            data_file
-                .read_exact(&mut len_buf)
-                .map_err(|e| StorageError::Corruption {
-                    reason: format!("data.log len at index {}: {e}", start + i),
-                })?;
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut data = vec![0u8; len];
-            data_file
-                .read_exact(&mut data)
-                .map_err(|e| StorageError::Corruption {
-                    reason: format!("data.log data at index {}: {e}", start + i),
-                })?;
+            let mut len_buf = [0u8; size_of::<EntryLen>()];
+            data_file.read_exact(&mut len_buf).map_err(|e| StorageError::Corruption {
+                reason: format!("data.log len at index {}: {e}", start + i),
+            })?;
+            let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
+            data_file.read_exact(&mut data).map_err(|e| StorageError::Corruption {
+                reason: format!("data.log data at index {}: {e}", start + i),
+            })?;
             entries.push(Entry { index: start + i, data });
         }
 
@@ -161,20 +141,17 @@ impl StorageEngine for DiskEngine {
         if pos >= self.num_entries {
             return Ok(None);
         }
-        let byte_offset = read_offset_at(&self.index_path(), pos)?;
-        let mut f = File::open(self.data_path())?;
+        let byte_offset = self.read_offset_at(pos)?;
+        let mut f = File::open(&self.data_path)?;
         f.seek(SeekFrom::Start(byte_offset))?;
-        let mut len_buf = [0u8; size_of::<u32>()];
-        f.read_exact(&mut len_buf)
-            .map_err(|e| StorageError::Corruption {
-                reason: format!("data.log len: {e}"),
-            })?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        let mut data = vec![0u8; len];
-        f.read_exact(&mut data)
-            .map_err(|e| StorageError::Corruption {
-                reason: format!("data.log data: {e}"),
-            })?;
+        let mut len_buf = [0u8; size_of::<EntryLen>()];
+        f.read_exact(&mut len_buf).map_err(|e| StorageError::Corruption {
+            reason: format!("data.log len: {e}"),
+        })?;
+        let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
+        f.read_exact(&mut data).map_err(|e| StorageError::Corruption {
+            reason: format!("data.log data: {e}"),
+        })?;
         Ok(Some(Entry { index, data }))
     }
 
@@ -195,20 +172,14 @@ impl StorageEngine for DiskEngine {
         }
         // pos = number of entries to keep; 0 means truncate everything.
         let pos = from - self.first_index;
-        let new_data_size = if pos == 0 {
-            0
-        } else {
-            read_offset_at(&self.index_path(), pos)?
-        };
-        // Disk before memory: a failed set_len after memory update would leave
-        // the engine believing fewer entries than are actually on disk.
+        let new_data_size = if pos == 0 { 0 } else { self.read_offset_at(pos)? };
         OpenOptions::new()
             .write(true)
-            .open(self.data_path())?
+            .open(&self.data_path)?
             .set_len(new_data_size)?;
         OpenOptions::new()
             .write(true)
-            .open(self.index_path())?
+            .open(&self.index_path)?
             .set_len(pos * INDEX_ENTRY_SIZE)?;
         self.num_entries = pos;
         self.data_bytes = new_data_size;
@@ -216,7 +187,7 @@ impl StorageEngine for DiskEngine {
     }
 
     fn sync(&mut self) -> Result<(), StorageError> {
-        for path in [self.data_path(), self.index_path()] {
+        for path in [&self.data_path, &self.index_path] {
             if path.exists() {
                 OpenOptions::new().write(true).open(path)?.sync_all()?;
             }

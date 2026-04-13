@@ -1,7 +1,6 @@
 mod memory;
 mod disk;
 
-pub use disk::DiskEngine;
 pub use memory::MemEngine;
 
 /// Append-only log storage — one instance per shard group.
@@ -31,6 +30,7 @@ pub trait StorageEngine {
     fn truncate_log(&mut self, from: Index) -> Result<(), StorageError>;
 
     /// Flushes buffered writes to durable storage.
+    #[allow(dead_code)]
     fn sync(&mut self) -> Result<(), StorageError>;
 }
 
