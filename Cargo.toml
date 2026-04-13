@@ -14,9 +14,13 @@ uuid = { version = "1", features = ["v4"] }
 murmur3 = "0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+thiserror = "2.0.18"
+
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("turmoil"))'] }
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(feature, values("turmoil"))',
+] }
 
 [dev-dependencies]
 tempfile = "3"

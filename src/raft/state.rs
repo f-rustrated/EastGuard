@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
-use crate::raft::log::RaftLog;
+use crate::raft::interface::LogStore;
+use crate::raft::log::{LogEntry, RaftLog};
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::storage::{LogStore, MemoryLogStore};
+use crate::storage::MemoryLogStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {

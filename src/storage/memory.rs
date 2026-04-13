@@ -1,17 +1,20 @@
-use super::{Entry, Index, LogStore, StorageError};
+use crate::raft::interface::{LogError, LogStore};
+use crate::raft::log::LogEntry;
+
+use super::Index;
 
 #[derive(Debug, Default)]
 pub struct MemoryLogStore {
-    entries: Vec<Entry>,
+    entries: Vec<LogEntry>,
 }
 
 impl LogStore for MemoryLogStore {
-    fn append_log(&mut self, entry: Entry) -> Result<(), StorageError> {
+    fn append_log(&mut self, entry: LogEntry) -> Result<(), LogError> {
         self.entries.push(entry);
         Ok(())
     }
 
-    fn get_range(&self, start: Index, end: Index) -> Result<Vec<Entry>, StorageError> {
+    fn get_range(&self, start: Index, end: Index) -> Result<Vec<LogEntry>, LogError> {
         if start == 0 || start > end {
             return Ok(vec![]);
         }
@@ -23,18 +26,18 @@ impl LogStore for MemoryLogStore {
         Ok(self.entries[(start - 1) as usize..=(end - 1) as usize].to_vec())
     }
 
-    fn get(&self, index: Index) -> Result<Option<Entry>, StorageError> {
+    fn get(&self, index: Index) -> Result<Option<LogEntry>, LogError> {
         if index == 0 {
             return Ok(None);
         }
         Ok(self.entries.get((index - 1) as usize).cloned())
     }
 
-    fn get_last(&self) -> Result<Option<Entry>, StorageError> {
+    fn get_last(&self) -> Result<Option<LogEntry>, LogError> {
         Ok(self.entries.last().cloned())
     }
 
-    fn truncate_log(&mut self, from: Index) -> Result<(), StorageError> {
+    fn truncate_log(&mut self, from: Index) -> Result<(), LogError> {
         if from == 0 {
             return Ok(());
         }
@@ -47,7 +50,7 @@ impl LogStore for MemoryLogStore {
     }
 
     /// No-op for in-memory storage — there is nothing to flush.
-    fn sync(&mut self) -> Result<(), StorageError> {
+    fn sync(&mut self) -> Result<(), LogError> {
         Ok(())
     }
 }
@@ -55,9 +58,14 @@ impl LogStore for MemoryLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::messages::RaftCommand;
 
-    fn entry(index: Index, data: &[u8]) -> Entry {
-        Entry { index, data: data.to_vec() }
+    fn entry(term: u64, index: Index) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            command: RaftCommand::Noop,
+        }
     }
 
     #[test]
@@ -71,10 +79,10 @@ mod tests {
     #[test]
     fn append_and_get() {
         let mut eng = MemoryLogStore::default();
-        eng.append_log(entry(1, b"a")).unwrap();
-        eng.append_log(entry(2, b"b")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
+        eng.append_log(entry(2, 2)).unwrap();
 
-        assert_eq!(eng.get(1).unwrap().unwrap().data, b"a");
+        assert_eq!(eng.get(1).unwrap().unwrap().term, 1);
         assert_eq!(eng.get_last().unwrap().unwrap().index, 2);
         assert!(eng.get(3).unwrap().is_none());
     }
@@ -82,9 +90,9 @@ mod tests {
     #[test]
     fn truncate_removes_tail() {
         let mut eng = MemoryLogStore::default();
-        eng.append_log(entry(1, b"a")).unwrap();
-        eng.append_log(entry(2, b"b")).unwrap();
-        eng.append_log(entry(3, b"c")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
+        eng.append_log(entry(2, 2)).unwrap();
+        eng.append_log(entry(3, 3)).unwrap();
 
         eng.truncate_log(2).unwrap();
 

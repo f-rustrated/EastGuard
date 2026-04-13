@@ -5,7 +5,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::PathBuf;
 
-use crate::storage::{Entry, Index, LogStore, StorageError};
+use crate::raft::interface::{LogError, LogStore};
+use crate::raft::log::LogEntry;
+use crate::storage::{Entry, Index};
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 //
@@ -35,7 +37,7 @@ pub struct FileLogStore {
 }
 
 impl FileLogStore {
-    pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, StorageError> {
+    pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, LogError> {
         let base_dir = base_dir.into();
         fs::create_dir_all(&base_dir)?;
         let data_path = base_dir.join(DATA_LOG);
@@ -50,27 +52,32 @@ impl FileLogStore {
         } else {
             0
         };
-        Ok(Self { data_path, index_path, first_index: 1, num_entries, data_bytes })
+        Ok(Self {
+            data_path,
+            index_path,
+            first_index: 1,
+            num_entries,
+            data_bytes,
+        })
     }
 
     fn last_index(&self) -> Option<Index> {
         (self.num_entries > 0).then(|| self.first_index + self.num_entries - 1)
     }
 
-    fn read_offset_at(&self, pos: u64) -> Result<u64, StorageError> {
+    fn read_offset_at(&self, pos: u64) -> Result<u64, LogError> {
         let mut f = File::open(&self.index_path)?;
         f.seek(SeekFrom::Start(pos * INDEX_ENTRY_SIZE))?;
         let mut buf = [0u8; size_of::<u64>()];
         f.read_exact(&mut buf)
-            .map_err(|e| StorageError::Corruption {
-                reason: format!("index.log: {e}"),
-            })?;
+            .map_err(|e| LogError::Corruption(format!("index.log: {e}")))?;
         Ok(u64::from_le_bytes(buf))
     }
 }
 
 impl LogStore for FileLogStore {
-    fn append_log(&mut self, entry: Entry) -> Result<(), StorageError> {
+    fn append_log(&mut self, entry: LogEntry) -> Result<(), LogError> {
+        let raw = Entry::from_entry(&entry);
         let byte_offset = self.data_bytes;
         debug_assert_eq!(
             self.data_bytes,
@@ -85,19 +92,19 @@ impl LogStore for FileLogStore {
             .create(true)
             .append(true)
             .open(&self.data_path)?;
-        dat.write_all(&(entry.data.len() as EntryLen).to_le_bytes())?;
-        dat.write_all(&entry.data)?;
+        dat.write_all(&(raw.data.len() as EntryLen).to_le_bytes())?;
+        dat.write_all(&raw.data)?;
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.index_path)?
             .write_all(&byte_offset.to_le_bytes())?;
-        self.data_bytes += size_of::<EntryLen>() as u64 + entry.data.len() as u64;
+        self.data_bytes += size_of::<EntryLen>() as u64 + raw.data.len() as u64;
         self.num_entries += 1;
         Ok(())
     }
 
-    fn get_range(&self, start: Index, end: Index) -> Result<Vec<Entry>, StorageError> {
+    fn get_range(&self, start: Index, end: Index) -> Result<Vec<LogEntry>, LogError> {
         if start == 0 || start > end {
             return Ok(vec![]);
         }
@@ -120,20 +127,26 @@ impl LogStore for FileLogStore {
         let mut entries = Vec::with_capacity(count);
         for i in 0..count as u64 {
             let mut len_buf = [0u8; size_of::<EntryLen>()];
-            data_file.read_exact(&mut len_buf).map_err(|e| StorageError::Corruption {
-                reason: format!("data.log len at index {}: {e}", start + i),
+            data_file.read_exact(&mut len_buf).map_err(|e| {
+                LogError::Corruption(format!("data.log len at index {}: {e}", start + i))
             })?;
             let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
-            data_file.read_exact(&mut data).map_err(|e| StorageError::Corruption {
-                reason: format!("data.log data at index {}: {e}", start + i),
+            data_file.read_exact(&mut data).map_err(|e| {
+                LogError::Corruption(format!("data.log data at index {}: {e}", start + i))
             })?;
-            entries.push(Entry { index: start + i, data });
+            entries.push(
+                Entry {
+                    index: start + i,
+                    data,
+                }
+                .into_log_entry()?,
+            );
         }
 
         Ok(entries)
     }
 
-    fn get(&self, index: Index) -> Result<Option<Entry>, StorageError> {
+    fn get(&self, index: Index) -> Result<Option<LogEntry>, LogError> {
         if index == 0 || index < self.first_index {
             return Ok(None);
         }
@@ -145,24 +158,22 @@ impl LogStore for FileLogStore {
         let mut f = File::open(&self.data_path)?;
         f.seek(SeekFrom::Start(byte_offset))?;
         let mut len_buf = [0u8; size_of::<EntryLen>()];
-        f.read_exact(&mut len_buf).map_err(|e| StorageError::Corruption {
-            reason: format!("data.log len: {e}"),
-        })?;
+        f.read_exact(&mut len_buf)
+            .map_err(|e| LogError::Corruption(format!("data.log len: {e}")))?;
         let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
-        f.read_exact(&mut data).map_err(|e| StorageError::Corruption {
-            reason: format!("data.log data: {e}"),
-        })?;
-        Ok(Some(Entry { index, data }))
+        f.read_exact(&mut data)
+            .map_err(|e| LogError::Corruption(format!("data.log data: {e}")))?;
+        Ok(Some(Entry { index, data }.into_log_entry()?))
     }
 
-    fn get_last(&self) -> Result<Option<Entry>, StorageError> {
+    fn get_last(&self) -> Result<Option<LogEntry>, LogError> {
         let Some(last) = self.last_index() else {
             return Ok(None);
         };
         self.get(last)
     }
 
-    fn truncate_log(&mut self, from: Index) -> Result<(), StorageError> {
+    fn truncate_log(&mut self, from: Index) -> Result<(), LogError> {
         if from == 0 || self.num_entries == 0 {
             return Ok(());
         }
@@ -172,7 +183,11 @@ impl LogStore for FileLogStore {
         }
         // pos = number of entries to keep; 0 means truncate everything.
         let pos = from - self.first_index;
-        let new_data_size = if pos == 0 { 0 } else { self.read_offset_at(pos)? };
+        let new_data_size = if pos == 0 {
+            0
+        } else {
+            self.read_offset_at(pos)?
+        };
         OpenOptions::new()
             .write(true)
             .open(&self.data_path)?
@@ -186,7 +201,7 @@ impl LogStore for FileLogStore {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), StorageError> {
+    fn sync(&mut self) -> Result<(), LogError> {
         for path in [&self.data_path, &self.index_path] {
             if path.exists() {
                 OpenOptions::new().write(true).open(path)?.sync_all()?;
@@ -201,12 +216,14 @@ impl LogStore for FileLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::messages::RaftCommand;
     use tempfile::TempDir;
 
-    fn entry(index: Index, data: &[u8]) -> Entry {
-        Entry {
+    fn entry(term: u64, index: Index) -> LogEntry {
+        LogEntry {
+            term,
             index,
-            data: data.to_vec(),
+            command: RaftCommand::Noop,
         }
     }
 
@@ -247,13 +264,13 @@ mod tests {
     fn append_and_get_by_index() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"alpha")).unwrap();
-        eng.append_log(entry(2, b"beta")).unwrap();
-        eng.append_log(entry(3, b"gamma")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
+        eng.append_log(entry(2, 2)).unwrap();
+        eng.append_log(entry(3, 3)).unwrap();
 
-        assert_eq!(eng.get(1).unwrap().unwrap().data, b"alpha");
-        assert_eq!(eng.get(2).unwrap().unwrap().data, b"beta");
-        assert_eq!(eng.get(3).unwrap().unwrap().data, b"gamma");
+        assert_eq!(eng.get(1).unwrap().unwrap().term, 1);
+        assert_eq!(eng.get(2).unwrap().unwrap().term, 2);
+        assert_eq!(eng.get(3).unwrap().unwrap().term, 3);
         assert!(eng.get(4).unwrap().is_none());
     }
 
@@ -261,12 +278,12 @@ mod tests {
     fn get_last_returns_last_appended() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"x")).unwrap();
-        eng.append_log(entry(2, b"y")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
+        eng.append_log(entry(2, 2)).unwrap();
 
         let last = eng.get_last().unwrap().unwrap();
         assert_eq!(last.index, 2);
-        assert_eq!(last.data, b"y");
+        assert_eq!(last.term, 2);
     }
 
     #[test]
@@ -274,7 +291,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
         for i in 1..=5u64 {
-            eng.append_log(entry(i, &[i as u8])).unwrap();
+            eng.append_log(entry(i, i)).unwrap();
         }
 
         let range = eng.get_range(2, 4).unwrap();
@@ -288,8 +305,8 @@ mod tests {
     fn get_range_clamps_end_to_last_index() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"a")).unwrap();
-        eng.append_log(entry(2, b"b")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
+        eng.append_log(entry(2, 2)).unwrap();
 
         let range = eng.get_range(1, 99).unwrap();
         assert_eq!(range.len(), 2);
@@ -310,7 +327,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
         for i in 1..=5u64 {
-            eng.append_log(entry(i, &[i as u8])).unwrap();
+            eng.append_log(entry(i, i)).unwrap();
         }
 
         eng.truncate_log(3).unwrap();
@@ -324,7 +341,7 @@ mod tests {
     fn truncate_from_first_entry_clears_log() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"only")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
 
         eng.truncate_log(1).unwrap();
 
@@ -336,7 +353,7 @@ mod tests {
     fn truncate_beyond_last_is_noop() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"a")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
 
         eng.truncate_log(999).unwrap();
 
@@ -347,7 +364,7 @@ mod tests {
     fn truncate_index_zero_is_noop() {
         let dir = TempDir::new().unwrap();
         let mut eng = open(&dir);
-        eng.append_log(entry(1, b"a")).unwrap();
+        eng.append_log(entry(1, 1)).unwrap();
 
         eng.truncate_log(0).unwrap();
 
@@ -361,12 +378,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let mut eng = open(&dir);
-            eng.append_log(entry(1, b"persisted")).unwrap();
-            eng.append_log(entry(2, b"data")).unwrap();
+            eng.append_log(entry(1, 1)).unwrap();
+            eng.append_log(entry(2, 2)).unwrap();
         }
 
         let eng = open(&dir);
-        assert_eq!(eng.get(1).unwrap().unwrap().data, b"persisted");
+        assert_eq!(eng.get(1).unwrap().unwrap().term, 1);
         assert_eq!(eng.get_last().unwrap().unwrap().index, 2);
     }
 
@@ -376,7 +393,7 @@ mod tests {
         {
             let mut eng = open(&dir);
             for i in 1..=4u64 {
-                eng.append_log(entry(i, &[i as u8])).unwrap();
+                eng.append_log(entry(i, i)).unwrap();
             }
             eng.truncate_log(3).unwrap();
         }
