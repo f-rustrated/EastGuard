@@ -61,15 +61,20 @@ fn deserialize_term(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[COMMAND_LEN..COMMAND_LEN + TERM_LEN].try_into().unwrap())
 }
 
-// TODO: use FileLogStore
-#[derive(Debug, Default)]
-pub struct RaftLog {
-    store: MemoryLogStore,
+#[derive(Debug)]
+pub struct RaftLog<S: LogStore> {
+    store: S,
 }
 
-impl RaftLog {
+impl RaftLog<MemoryLogStore> {
     pub fn new() -> Self {
-        Self::default()
+        Self { store: MemoryLogStore::default() }
+    }
+}
+
+impl<S: LogStore> RaftLog<S> {
+    pub fn with_store(store: S) -> Self {
+        Self { store }
     }
 
     pub fn last_index(&self) -> u64 {
