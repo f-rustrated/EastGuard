@@ -125,6 +125,7 @@ impl<S: LogStore> RaftLog<S> {
     }
 
     pub fn append(&mut self, entry: LogEntry) {
+        debug_assert_eq!(entry.index, self.last_index() + 1, "log entries must be appended in order");
         // TODO: propagate error
         let _ = self.store.append_log(to_entry(&entry));
     }
