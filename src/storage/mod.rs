@@ -1,11 +1,11 @@
 mod memory;
-mod disk;
+mod file;
 
-pub use memory::MemEngine;
+pub use memory::MemoryLogStore;
 
 /// Append-only log storage — one instance per shard group.
 ///
-/// # Directory layout (DiskEngine)
+/// # Directory layout (FileLogStore)
 ///
 /// ```text
 /// <base_dir>/
@@ -13,7 +13,7 @@ pub use memory::MemEngine;
 ///     index.log    ← [byte_offset: u64 LE]*  (one entry per log entry)
 ///     snapshot     ← Phase 2 (not yet implemented)
 /// ```
-pub trait StorageEngine {
+pub trait LogStore {
     /// Appends an entry to the end of the log.
     fn append_log(&mut self, entry: Entry) -> Result<(), StorageError>;
 
@@ -43,7 +43,7 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
-/// Errors that can be returned by a [`StorageEngine`].
+/// Errors that can be returned by a [`LogStore`].
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),

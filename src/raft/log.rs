@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::raft::messages::{LogEntry, RaftCommand};
-use crate::storage::{Entry, MemEngine, StorageEngine, StorageError};
+use crate::storage::{Entry, LogStore, MemoryLogStore, StorageError};
 
 // ---------------------------------------------------------------------------
 // Serialization — lives here because only the Raft layer knows the layout
@@ -61,10 +61,10 @@ fn deserialize_term(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[COMMAND_LEN..COMMAND_LEN + TERM_LEN].try_into().unwrap())
 }
 
-// TODO: use DiskEngine
+// TODO: use FileLogStore
 #[derive(Debug, Default)]
 pub struct RaftLog {
-    engine: MemEngine,
+    engine: MemoryLogStore,
 }
 
 impl RaftLog {

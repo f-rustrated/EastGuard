@@ -1,11 +1,11 @@
-use super::{Entry, Index, StorageEngine, StorageError};
+use super::{Entry, Index, LogStore, StorageError};
 
 #[derive(Debug, Default)]
-pub struct MemEngine {
+pub struct MemoryLogStore {
     entries: Vec<Entry>,
 }
 
-impl StorageEngine for MemEngine {
+impl LogStore for MemoryLogStore {
     fn append_log(&mut self, entry: Entry) -> Result<(), StorageError> {
         self.entries.push(entry);
         Ok(())
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn empty_engine_returns_none() {
-        let eng = MemEngine::default();
+        let eng = MemoryLogStore::default();
         assert!(eng.get_last().unwrap().is_none());
         assert!(eng.get(1).unwrap().is_none());
         assert!(eng.get_range(1, 5).unwrap().is_empty());
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn append_and_get() {
-        let mut eng = MemEngine::default();
+        let mut eng = MemoryLogStore::default();
         eng.append_log(entry(1, b"a")).unwrap();
         eng.append_log(entry(2, b"b")).unwrap();
 
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn truncate_removes_tail() {
-        let mut eng = MemEngine::default();
+        let mut eng = MemoryLogStore::default();
         eng.append_log(entry(1, b"a")).unwrap();
         eng.append_log(entry(2, b"b")).unwrap();
         eng.append_log(entry(3, b"c")).unwrap();

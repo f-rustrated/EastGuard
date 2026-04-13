@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::PathBuf;
 
-use crate::storage::{Entry, Index, StorageEngine, StorageError};
+use crate::storage::{Entry, Index, LogStore, StorageError};
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 //
@@ -25,7 +25,7 @@ const INDEX_LOG: &str = "index.log";
 const INDEX_ENTRY_SIZE: u64 = size_of::<u64>() as u64;
 
 // No file handles kept open; the OS page cache handles read-after-write.
-pub struct DiskEngine {
+pub struct FileLogStore {
     data_path: PathBuf,
     index_path: PathBuf,
     // TODO: first_index > 1 once snapshot support is added (Phase 2).
@@ -34,7 +34,7 @@ pub struct DiskEngine {
     data_bytes: u64, // mirrors data.log size; verified by debug_assert in append_log
 }
 
-impl DiskEngine {
+impl FileLogStore {
     pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let base_dir = base_dir.into();
         fs::create_dir_all(&base_dir)?;
@@ -69,7 +69,7 @@ impl DiskEngine {
     }
 }
 
-impl StorageEngine for DiskEngine {
+impl LogStore for FileLogStore {
     fn append_log(&mut self, entry: Entry) -> Result<(), StorageError> {
         let byte_offset = self.data_bytes;
         debug_assert_eq!(
@@ -210,8 +210,8 @@ mod tests {
         }
     }
 
-    fn open(dir: &TempDir) -> DiskEngine {
-        DiskEngine::open(dir.path()).unwrap()
+    fn open(dir: &TempDir) -> FileLogStore {
+        FileLogStore::open(dir.path()).unwrap()
     }
 
     // ── Empty engine ─────────────────────────────────────────────────────────

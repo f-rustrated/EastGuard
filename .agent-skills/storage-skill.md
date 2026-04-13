@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`StorageEngine` is an append-only log abstraction for durable, indexed log entry persistence.
+`LogStore` is an append-only log abstraction for durable, indexed log entry persistence.
 Its only responsibility is to store and retrieve log entries safely — crash recovery, write ordering,
 and truncation correctness. It should have no knowledge of other components.
 
@@ -13,7 +13,7 @@ and truncation correctness. It should have no knowledge of other components.
 - **Write ordering**: data must be written before the index pointer that references it. An orphaned data tail is detectable on recovery; a dangling index pointer is not.
 - **Truncation safety**: disk must be updated before in-memory state. A crash mid-truncation must never leave the engine believing fewer entries than are on disk.
 - **Durability is explicit**: `sync()` must be called to make writes durable. Unflushed entries may be lost on crash.
-- **One engine per directory**: never share a `DiskEngine` across callers.
+- **One store per directory**: never share a `FileLogStore` across callers.
 
 ## Invariants
 
@@ -24,9 +24,9 @@ and truncation correctness. It should have no knowledge of other components.
 
 | Type | File |
 |---|---|
-| `StorageEngine` | `src/storage/mod.rs` |
-| `DiskEngine` | `src/storage/disk.rs` |
-| `MemEngine` | `src/storage/memory.rs` |
+| `LogStore` | `src/storage/mod.rs` |
+| `FileLogStore` | `src/storage/disk.rs` |
+| `MemoryLogStore` | `src/storage/memory.rs` |
 
 ## Open TODOs
 
