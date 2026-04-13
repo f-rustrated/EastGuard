@@ -70,7 +70,7 @@ impl Raft {
             peers,
             current_term: 0,
             voted_for: None,
-            log: RaftLog::new(),
+            log: RaftLog::new(), // after we add ShardId to Raft, let's use the DiskEngine
             commit_index: 0,
             role: Role::Follower,
             peer_states: HashMap::new(),
