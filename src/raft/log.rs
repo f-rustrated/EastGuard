@@ -64,7 +64,7 @@ fn deserialize_term(data: &[u8]) -> u64 {
 // TODO: use FileLogStore
 #[derive(Debug, Default)]
 pub struct RaftLog {
-    engine: MemoryLogStore,
+    store: MemoryLogStore,
 }
 
 impl RaftLog {
@@ -73,7 +73,7 @@ impl RaftLog {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.engine
+        self.store
             .get_last()
             .ok()
             .flatten()
@@ -81,7 +81,7 @@ impl RaftLog {
     }
 
     pub fn last_term(&self) -> u64 {
-        self.engine
+        self.store
             .get_last()
             .ok()
             .flatten()
@@ -92,7 +92,7 @@ impl RaftLog {
         if index == 0 {
             return 0;
         }
-        self.engine
+        self.store
             .get(index)
             .ok()
             .flatten()
@@ -101,7 +101,7 @@ impl RaftLog {
 
     pub fn get(&self, index: u64) -> Option<LogEntry> {
         // TODO: propagate corruption error
-        self.engine.get(index).ok()?.map(from_entry).transpose().ok()?
+        self.store.get(index).ok()?.map(from_entry).transpose().ok()?
     }
 
     pub fn entries_from(&self, start_index: u64) -> Vec<LogEntry> {
@@ -110,7 +110,7 @@ impl RaftLog {
             return vec![];
         }
         // TODO: propagate corruption error
-        self.engine
+        self.store
             .get_range(start_index, last)
             .unwrap_or_default()
             .into_iter()
@@ -121,12 +121,12 @@ impl RaftLog {
 
     pub fn append(&mut self, entry: LogEntry) {
         // TODO: propagate error
-        let _ = self.engine.append_log(to_entry(&entry));
+        let _ = self.store.append_log(to_entry(&entry));
     }
 
     pub fn truncate_from(&mut self, from_index: u64) {
         // TODO: propagate error
-        let _ = self.engine.truncate_log(from_index);
+        let _ = self.store.truncate_log(from_index);
     }
 }
 
