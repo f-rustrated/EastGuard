@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 mod memory;
+mod disk;
+
 pub use memory::MemEngine;
 
 /// Append-only log storage — one instance per shard group.
@@ -9,13 +11,9 @@ pub use memory::MemEngine;
 ///
 /// ```text
 /// <base_dir>/
-///     meta/
-///     shards/
-///         <shard_id>/
-///             chunk-<first_index>/
-///                 data.log     ← raw entry bytes
-///                 index.log    ← flat u64 array: index → byte offset in data.log
-///             snapshot/        ← Phase 2
+///     data.log     ← [entry_len: u32 LE | entry_data]*
+///     index.log    ← [byte_offset: u64 LE]*  (one entry per log entry)
+///     snapshot     ← Phase 2 (not yet implemented)
 /// ```
 pub trait StorageEngine {
     /// Appends an entry to the end of the log.
@@ -33,7 +31,7 @@ pub trait StorageEngine {
     /// Removes all entries at and after `from` (inclusive).
     fn truncate_log(&mut self, from: Index) -> Result<(), StorageError>;
 
-    /// Flushes buffered writes to durable storage. No-op for [`MemEngine`].
+    /// Flushes buffered writes to durable storage.
     fn sync(&mut self) -> Result<(), StorageError>;
 }
 
