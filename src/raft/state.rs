@@ -65,7 +65,12 @@ const ELECTION_TIMER_SEQ: u32 = 0;
 const HEARTBEAT_TIMER_SEQ: u32 = 1;
 
 impl<S: LogStore> Raft<S> {
-    pub(crate) fn new(node_id: NodeId, peers: HashSet<NodeId>, election_jitter: u32, store: S) -> Self {
+    pub(crate) fn new(
+        node_id: NodeId,
+        peers: HashSet<NodeId>,
+        election_jitter: u32,
+        store: S,
+    ) -> Self {
         let mut raft = Self {
             node_id,
             peers,
