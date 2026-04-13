@@ -51,3 +51,44 @@ impl StorageEngine for MemEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(index: Index, data: &[u8]) -> Entry {
+        Entry { index, data: data.to_vec() }
+    }
+
+    #[test]
+    fn empty_engine_returns_none() {
+        let eng = MemEngine::default();
+        assert!(eng.get_last().unwrap().is_none());
+        assert!(eng.get(1).unwrap().is_none());
+        assert!(eng.get_range(1, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_and_get() {
+        let mut eng = MemEngine::default();
+        eng.append_log(entry(1, b"a")).unwrap();
+        eng.append_log(entry(2, b"b")).unwrap();
+
+        assert_eq!(eng.get(1).unwrap().unwrap().data, b"a");
+        assert_eq!(eng.get_last().unwrap().unwrap().index, 2);
+        assert!(eng.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn truncate_removes_tail() {
+        let mut eng = MemEngine::default();
+        eng.append_log(entry(1, b"a")).unwrap();
+        eng.append_log(entry(2, b"b")).unwrap();
+        eng.append_log(entry(3, b"c")).unwrap();
+
+        eng.truncate_log(2).unwrap();
+
+        assert_eq!(eng.get_last().unwrap().unwrap().index, 1);
+        assert!(eng.get(2).unwrap().is_none());
+    }
+}

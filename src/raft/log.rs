@@ -1,13 +1,22 @@
 #![allow(dead_code)]
 
 use crate::raft::messages::{LogEntry, RaftCommand};
-use crate::storage::{Entry, MemEngine, StorageEngine};
+use crate::storage::{Entry, MemEngine, StorageEngine, StorageError};
 
 // ---------------------------------------------------------------------------
 // Serialization — lives here because only the Raft layer knows the layout
 //
-// Entry.data layout: [ command discriminant (1 byte) | term: u64 LE (8 bytes) ]
+// Entry.data layout: [ command: COMMAND_LEN bytes | term: TERM_LEN bytes (u64 LE) ]
+//
+// COMMAND_LEN and TERM_LEN are the single source of truth for byte boundaries.
+// Any change to the on-disk format must update these constants — all
+// serialize/deserialize paths derive their offsets from them.
 // ---------------------------------------------------------------------------
+
+/// Bytes reserved for the command discriminant.
+const COMMAND_LEN: usize = 1;
+/// Bytes reserved for the term (u64 little-endian).
+const TERM_LEN: usize = 8;
 
 fn serialize_command(cmd: &RaftCommand) -> Vec<u8> {
     match cmd {
@@ -15,28 +24,45 @@ fn serialize_command(cmd: &RaftCommand) -> Vec<u8> {
     }
 }
 
-fn deserialize_command(data: &[u8]) -> RaftCommand {
+fn deserialize_command(data: &[u8]) -> Result<RaftCommand, StorageError> {
     match data.first() {
-        Some(0x00) | None => RaftCommand::Noop,
-        _ => RaftCommand::Noop,
+        Some(0x00) | None => Ok(RaftCommand::Noop),
+        Some(&b) => Err(StorageError::Corruption {
+            reason: format!("unknown command discriminant: 0x{b:02x}"),
+        }),
     }
 }
 
 fn to_entry(entry: &LogEntry) -> Entry {
-    let mut data = Vec::with_capacity(9);
-    data.extend_from_slice(&serialize_command(&entry.command));
+    let cmd_bytes = serialize_command(&entry.command);
+    debug_assert_eq!(cmd_bytes.len(), COMMAND_LEN, "serialize_command must produce exactly COMMAND_LEN bytes");
+    let mut data = Vec::with_capacity(COMMAND_LEN + TERM_LEN);
+    data.extend_from_slice(&cmd_bytes);
     data.extend_from_slice(&entry.term.to_le_bytes());
     Entry { index: entry.index, data }
 }
 
-fn from_entry(entry: Entry) -> LogEntry {
-    let command = deserialize_command(&entry.data[0..1]);
-    let term = u64::from_le_bytes(entry.data[1..9].try_into().unwrap());
-    LogEntry { term, index: entry.index, command }
+fn from_entry(entry: Entry) -> Result<LogEntry, StorageError> {
+    if entry.data.len() < COMMAND_LEN + TERM_LEN {
+        return Err(StorageError::Corruption {
+            reason: format!(
+                "entry {} payload too short: expected >= {} bytes, got {}",
+                entry.index,
+                COMMAND_LEN + TERM_LEN,
+                entry.data.len()
+            ),
+        });
+    }
+    let command = deserialize_command(&entry.data[..COMMAND_LEN])?;
+    let term = u64::from_le_bytes(
+        entry.data[COMMAND_LEN..COMMAND_LEN + TERM_LEN].try_into().unwrap(),
+    );
+    Ok(LogEntry { term, index: entry.index, command })
 }
 
 fn deserialize_term(data: &[u8]) -> u64 {
-    u64::from_le_bytes(data[1..9].try_into().unwrap())
+    debug_assert!(data.len() >= COMMAND_LEN + TERM_LEN, "entry data too short to deserialize term");
+    u64::from_le_bytes(data[COMMAND_LEN..COMMAND_LEN + TERM_LEN].try_into().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +108,8 @@ impl RaftLog {
     }
 
     pub fn get(&self, index: u64) -> Option<LogEntry> {
-        self.engine.get(index).ok()?.map(from_entry)
+        // TODO: propagate corruption error
+        self.engine.get(index).ok()?.map(from_entry).transpose().ok()?
     }
 
     pub fn entries_from(&self, start_index: u64) -> Vec<LogEntry> {
@@ -90,19 +117,23 @@ impl RaftLog {
         if start_index == 0 || start_index > last {
             return vec![];
         }
+        // TODO: propagate corruption error
         self.engine
             .get_range(start_index, last)
             .unwrap_or_default()
             .into_iter()
             .map(from_entry)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default()
     }
 
     pub fn append(&mut self, entry: LogEntry) {
+        // TODO: propagate error 
         let _ = self.engine.append_log(to_entry(&entry));
     }
 
     pub fn truncate_from(&mut self, from_index: u64) {
+        // TODO: propagate error
         let _ = self.engine.truncate_log(from_index);
     }
 }

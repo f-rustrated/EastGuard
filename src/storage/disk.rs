@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -16,7 +14,7 @@ use crate::storage::{Entry, Index, StorageEngine, StorageError};
 // index.log[i] = byte offset in data.log of entry (first_index + i).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TODO: CRC, RocksDB for key-value lookup 
+// TODO: CRC, RocksDB for key-value lookup
 
 const DATA_LOG: &str = "data.log";
 const INDEX_LOG: &str = "index.log";
@@ -34,7 +32,7 @@ pub struct DiskEngine {
 impl DiskEngine {
     pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let base_dir = base_dir.into();
-        fs::create_dir(&base_dir)?;
+        fs::create_dir_all(&base_dir)?;
         let num_entries = {
             let p = base_dir.join(INDEX_LOG);
             if p.exists() {
@@ -62,7 +60,7 @@ impl DiskEngine {
     fn data_path(&self) -> PathBuf {
         self.base_dir.join(DATA_LOG)
     }
-    
+
     fn index_path(&self) -> PathBuf {
         self.base_dir.join(INDEX_LOG)
     }
@@ -125,12 +123,34 @@ impl StorageEngine for DiskEngine {
             return Ok(vec![]);
         }
         let end = end.min(last);
-        (start..=end)
-            .map(|i| {
-                self.get(i)?
-                    .ok_or(StorageError::IndexOutOfRange { requested: i, last })
-            })
-            .collect()
+        let count = (end - start + 1) as usize;
+
+        // One seek into index.log to find the byte offset of `start` in data.log,
+        // then one sequential pass through data.log — O(1) file opens regardless of range size.
+        let start_pos = start - self.first_index;
+        let byte_offset = read_offset_at(&self.index_path(), start_pos)?;
+        let mut data_file = File::open(self.data_path())?;
+        data_file.seek(SeekFrom::Start(byte_offset))?;
+
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count as u64 {
+            let mut len_buf = [0u8; size_of::<u32>()];
+            data_file
+                .read_exact(&mut len_buf)
+                .map_err(|e| StorageError::Corruption {
+                    reason: format!("data.log len at index {}: {e}", start + i),
+                })?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut data = vec![0u8; len];
+            data_file
+                .read_exact(&mut data)
+                .map_err(|e| StorageError::Corruption {
+                    reason: format!("data.log data at index {}: {e}", start + i),
+                })?;
+            entries.push(Entry { index: start + i, data });
+        }
+
+        Ok(entries)
     }
 
     fn get(&self, index: Index) -> Result<Option<Entry>, StorageError> {

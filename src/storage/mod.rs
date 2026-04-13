@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-
 mod memory;
 mod disk;
 
+pub use disk::DiskEngine;
 pub use memory::MemEngine;
 
 /// Append-only log storage — one instance per shard group.
@@ -46,18 +45,12 @@ pub struct Entry {
 
 /// Errors that can be returned by a [`StorageEngine`].
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum StorageError {
     Io(std::io::Error),
     /// The data on disk is unreadable or inconsistent.
     Corruption {
         reason: String,
-    },
-    /// The requested index range falls outside the stored log.
-    IndexOutOfRange {
-        requested: Index,
-        last: Index,
-    },
+    }
 }
 
 impl std::fmt::Display for StorageError {
@@ -65,10 +58,6 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::Io(e) => write!(f, "storage I/O error: {e}"),
             StorageError::Corruption { reason } => write!(f, "storage corruption: {reason}"),
-            StorageError::IndexOutOfRange { requested, last } => write!(
-                f,
-                "index out of range: requested {requested}, last stored {last}"
-            ),
         }
     }
 }
