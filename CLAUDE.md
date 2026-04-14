@@ -1,21 +1,21 @@
 # east-guard
-EastGuard is a zero-controller messaging system designed for flexible scalability and high operability. This project is significantly inspired by the architecture of LinkedIn's Northguard.
+EastGuard = zero-controller messaging system for flexible scalability + high operability. Inspired by LinkedIn's Northguard architecture.
 
 
 # Rule Routing
-When working on specific tasks, you MUST read the following skill files before writing code:
+When working on specific tasks, MUST read skill files before writing code:
 
-- **Scheduler**: If system needs to trigger certain event later, read `rules/scheduler-skill.md`.
-- **Swim**: If cluster membership logics need to be updated, read `rules/swim-skill.md`.
-- **Raft**: If consensus, leader election, log replication, or shard state machine logics need to be updated, read `rules/raft-skill.md`.
-- **Raft Actor**: If wiring Raft to the network, managing shard group lifecycle, or integrating Raft with SWIM, read `rules/raft-actor-skill.md`.
+- **Scheduler**: System needs trigger event later → read `rules/scheduler-skill.md`.
+- **Swim**: Cluster membership logics need update → read `rules/swim-skill.md`.
+- **Raft**: Consensus, leader election, log replication, or shard state machine logics need update → read `rules/raft-skill.md`.
+- **Raft Actor**: Wiring Raft to network, managing shard group lifecycle, or integrating Raft with SWIM → read `rules/raft-actor-skill.md`.
 
 
 # Code Quality
 
 ## Clippy
-After every code change, run clippy and fix all errors before considering the task done:
+After every code change, run clippy + fix all errors before task done:
 ```sh
 cargo clippy --all-targets --all-features -- -D warnings
 ```
-All warnings are treated as errors (`-D warnings`). Do not use `#[allow(...)]` to suppress legitimate warnings — fix the underlying issue instead. Use `#[allow(dead_code)]` only for code that is intentionally kept for future use or used only in test targets.
+All warnings = errors (`-D warnings`). No `#[allow(...)]` to suppress legitimate warnings — fix underlying issue. Use `#[allow(dead_code)]` only for code intentionally kept for future use or used only in test targets.

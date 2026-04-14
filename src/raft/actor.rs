@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardToken};
@@ -8,7 +9,7 @@ use crate::raft::messages::*;
 use crate::raft::state::Raft;
 use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Commands received by the RaftActor from external sources.
 pub enum RaftCommand {
@@ -24,6 +25,11 @@ pub enum RaftCommand {
     EnsureGroup { group: ShardGroup },
     /// Remove a Raft group.
     RemoveGroup { group_id: ShardGroupId },
+    /// Query the current leader of a shard group.
+    GetLeader {
+        group_id: ShardGroupId,
+        reply: oneshot::Sender<Option<NodeId>>,
+    },
 }
 
 impl From<RaftTimeoutCallback> for RaftCommand {
@@ -115,6 +121,14 @@ impl RaftActor {
                 RaftCommand::RemoveGroup { group_id } => {
                     self.remove_group(group_id).await;
                 }
+
+                RaftCommand::GetLeader { group_id, reply } => {
+                    let leader = self
+                        .groups
+                        .get(&group_id)
+                        .and_then(|raft| raft.current_leader().cloned());
+                    let _ = reply.send(leader);
+                }
             }
         }
     }
@@ -134,8 +148,14 @@ impl RaftActor {
             .cloned()
             .collect();
 
-        // Derive jitter from node_id to spread election timeouts
-        let jitter = (self.node_id.len() as u32) % 10;
+        // Derive jitter from node_id hash to spread election timeouts.
+        // A proper hash avoids collisions that would cause split votes (e.g.
+        // same-length names, sequential names like "node-1"/"node-2").
+        let jitter = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.node_id.hash(&mut hasher);
+            (hasher.finish() % 20) as u32
+        };
         let raft = Raft::new(self.node_id.clone(), peers, jitter, group.id);
 
         tracing::info!(

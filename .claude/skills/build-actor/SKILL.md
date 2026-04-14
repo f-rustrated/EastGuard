@@ -12,22 +12,19 @@ description: >
 
 # Building an Actor
 
-Uses a strict pattern: **pure sync state machine + async actor wrapper**. The state
-machine holds all logic and is trivially testable. The actor handles channels, timers, and I/O.
-Every existing component (Swim, Raft, Ticker) follows this, and new components should too.
+Strict pattern: **pure sync state machine + async actor wrapper**. State machine holds all logic, trivially testable. Actor handles channels, timers, I/O. Every existing component (Swim, Raft, Ticker) follows this. New components must too.
 
 ## Why This Pattern Matters
 
-The sync/async split isn't cosmetic. It gives you:
+Sync/async split gives:
 - **Deterministic testing** -- call methods, check return values, no tokio runtime needed
-- **No accidental I/O** -- the state machine can't send a packet or touch the network
-- **Clean lifecycle** -- the actor owns the async boundary; kill the task, everything stops
-- **Simulation** -- turmoil can control the network without touching protocol logic
+- **No accidental I/O** -- state machine can't send packet or touch network
+- **Clean lifecycle** -- actor owns async boundary; kill task, everything stops
+- **Simulation** -- turmoil controls network without touching protocol logic
 
 ## Step 1: Design the State Machine First
 
-Start with a struct that has no async, no channels, no I/O. It receives events via method calls
-and buffers its side effects for the actor to drain.
+Start with struct. No async, no channels, no I/O. Receives events via method calls, buffers side effects for actor to drain.
 
 ```rust
 pub struct YourStateMachine {
@@ -64,15 +61,15 @@ impl YourStateMachine {
 
 **Key constraints:**
 - No `async fn`. No `.await`. No `mpsc::Sender`. No `tokio::` anything.
-- All side effects go into the `pending_*` vecs.
-- The state machine doesn't know who will consume its output.
+- All side effects go into `pending_*` vecs.
+- State machine doesn't know who consumes its output.
 
 
 ## Step 2: Define Message Types
 
-Create a `messages.rs` (or add to an existing one) with:
+Create `messages.rs` (or add to existing one):
 
-### The actor command enum (what the actor receives)
+### Actor command enum (what actor receives)
 
 ```rust
 pub enum YourActorCommand {
@@ -82,10 +79,9 @@ pub enum YourActorCommand {
 }
 ```
 
-Follow the convention: `PacketReceived` for network input, `Timeout` for timer expiry,
-`Query` for read-only questions answered via oneshot.
+Convention: `PacketReceived` for network input, `Timeout` for timer expiry, `Query` for read-only questions answered via oneshot.
 
-### The outbound packet (what the state machine produces)
+### Outbound packet (what state machine produces)
 
 ```rust
 pub struct YourOutboundPacket {
@@ -94,7 +90,7 @@ pub struct YourOutboundPacket {
 }
 ```
 
-### Query commands (if your component answers external questions)
+### Query commands (if component answers external questions)
 
 ```rust
 pub enum YourQueryCommand {
@@ -104,8 +100,7 @@ pub enum YourQueryCommand {
 
 ## Step 3: Implement TTimer (If You Need Timers)
 
-If your component uses timers, implement the `TTimer` trait from `src/schedulers/timer.rs`.
-This lets you reuse the existing ticker infrastructure.
+If component uses timers, implement `TTimer` trait from `src/schedulers/timer.rs`. Reuses existing ticker infrastructure.
 
 ```rust
 use crate::schedulers::timer::TTimer;
@@ -142,23 +137,18 @@ impl TTimer for YourTimer {
 }
 ```
 
-The `Default` callback on `Callback` is important -- it's what the ticker emits every protocol
-period (10 ticks = 1 second) regardless of any registered timers. If your component doesn't
-need periodic events, you can make the default variant a no-op that the actor ignores.
+`Default` callback on `Callback` matters -- ticker emits it every protocol period (10 ticks = 1 second) regardless of registered timers. If component doesn't need periodic events, make default variant no-op that actor ignores.
 
-**If you share the ticker with existing actors**, your timer callbacks arrive through the same
-channel. You'll need to make the actor command type accept `From<YourTimeoutCallback>`, and the
-scheduling actor's sender must be compatible.
+**Sharing ticker with existing actors**: timer callbacks arrive through same channel. Actor command type needs `From<YourTimeoutCallback>`, scheduling actor's sender must be compatible.
 
-**If your component needs its own ticker**, spawn a separate `run_scheduling_actor` instance
-with its own mailbox.
+**Own ticker needed**: spawn separate `run_scheduling_actor` instance with own mailbox.
 
 ## Step 4: Build the Actor
 
-The actor is an async wrapper that:
-1. Receives events from a mailbox
-2. Feeds them into the sync state machine
-3. Drains output buffers (the "flush")
+Actor = async wrapper that:
+1. Receives events from mailbox
+2. Feeds into sync state machine
+3. Drains output buffers (flush)
 4. Sends results to other actors
 
 ```rust
@@ -220,13 +210,11 @@ impl YourActor {
 }
 ```
 
-**Critical: the flush must happen after EVERY event.** The existing actors enforce this by
-having a single flush call at the bottom of the match, with no early returns or continues
-before it. If you add a branch that skips the flush, side effects are silently lost.
+**Critical: flush must happen after EVERY event.** Existing actors enforce this with single flush call at bottom of match, no early returns or continues before it. Branch that skips flush = side effects silently lost.
 
 ### Multiplexing pattern (like RaftActor)
 
-If your actor manages multiple state machine instances (e.g., one per shard):
+If actor manages multiple state machine instances (e.g., one per shard):
 
 ```rust
 pub struct MultiplexActor {
@@ -237,13 +225,9 @@ pub struct MultiplexActor {
 }
 ```
 
-Each instance emits local seq values for timers. The actor must namespace them to avoid
-collisions in the shared ticker. See `RaftActor.flush()` in `src/raft/actor.rs` for the
-translation pattern: `get_or_alloc_seq(shard_group_id.token(local_seq))` maps each
-`(group_id, local_seq)` pair to a unique global seq.
+Each instance emits local seq values for timers. Actor must namespace them to avoid collisions in shared ticker. See `RaftActor.flush()` in `src/raft/actor.rs` for translation pattern: `get_or_alloc_seq(shard_group_id.token(local_seq))` maps each `(group_id, local_seq)` pair to unique global seq.
 
-When removing a group, cancel all its timers by iterating over known local seqs and
-removing their global mappings.
+When removing group, cancel all its timers by iterating over known local seqs and removing their global mappings.
 
 ## Step 5: Wire Into Startup (lib.rs)
 
@@ -274,14 +258,14 @@ pub async fn run(self) -> Result<()> {
 ```
 
 **Spawn order matters:**
-1. Ticker first (other actors send timer commands to it immediately)
-2. Transport actors (they start listening for network events)
-3. Protocol actors (they flush initial state on startup, producing timer commands)
+1. Ticker first (other actors send timer commands immediately)
+2. Transport actors (start listening for network events)
+3. Protocol actors (flush initial state on startup, producing timer commands)
 4. Client listener last
 
 ## Step 6: Test the State Machine
 
-Write sync tests that don't need tokio:
+Sync tests, no tokio needed:
 
 ```rust
 #[cfg(test)]
@@ -305,8 +289,7 @@ mod tests {
 }
 ```
 
-This is the biggest advantage of the sync-first design: you test protocol logic without
-any async machinery.
+Biggest advantage of sync-first design: test protocol logic without async machinery.
 
 ## Checklist
 
@@ -316,5 +299,5 @@ any async machinery.
 - [ ] Actor calls flush after every event (no early returns before flush)
 - [ ] TTimer implemented if using timers (with `Default` callback)
 - [ ] Channels created and actor spawned in `lib.rs` startup
-- [ ] Sync unit tests exercise the state machine directly
+- [ ] Sync unit tests exercise state machine directly
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
