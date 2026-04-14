@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`run_scheduling_actor` is a generic, tick-based timer actor that drives a `Ticker<T>` state machine at fixed real-time intervals. It owns no protocol logic -- it is a pure timer service that fires callbacks when timers expire and emits periodic "protocol period elapsed" events.
+`run_scheduling_actor` — generic tick-based timer actor driving `Ticker<T>` state machine at fixed real-time intervals. Owns no protocol logic — pure timer service firing callbacks on timer expiry and emitting periodic "protocol period elapsed" events.
 
 ## Architecture
 
@@ -13,10 +13,10 @@ run_scheduling_actor<T: TTimer>(
 )
 ```
 
-The function is generic over any `TTimer` implementation. The current concrete type is `SwimTimer`, but the actor is decoupled from SWIM specifics. It creates a `tokio::time::interval` at `TICK_PERIOD_MS` and a fresh `Ticker<T>`, then enters an infinite `tokio::select!` loop.
+Generic over any `TTimer` implementation. Current concrete type: `SwimTimer`, but actor decoupled from SWIM specifics. Creates `tokio::time::interval` at `TICK_PERIOD_MS` and fresh `Ticker<T>`, enters infinite `tokio::select!` loop.
 
 ## Tick Model
-Every real tick (100 ms), the `Ticker` decrements all active timers and advances a protocol-period counter. When the counter reaches `PROBE_INTERVAL_TICKS` it resets to zero and emits a `Default::default()` callback (the "protocol period elapsed" event).
+Every real tick (100 ms), `Ticker` decrements all active timers and advances protocol-period counter. When counter reaches `PROBE_INTERVAL_TICKS` — resets to zero, emits `Default::default()` callback ("protocol period elapsed" event).
 
 ## Event Loop
 
@@ -32,33 +32,33 @@ loop {
 }
 ```
 
-**On tick:** calls `ticker.advance_clock()`, which decrements every in-flight timer, collects expired-timer callbacks, and optionally emits the protocol-period event. Each callback is sent through `sender`.
+**On tick:** calls `ticker.advance_clock()` — decrements every in-flight timer, collects expired-timer callbacks, optionally emits protocol-period event. Each callback sent through `sender`.
 
-**On mailbox:** receives a `TickerCommand<T>` and either applies a `TimerCommand` (`SetSchedule` / `CancelSchedule`) or, in test builds only, handles `ForceTick`.
+**On mailbox:** receives `TickerCommand<T>`, either applies `TimerCommand` (`SetSchedule` / `CancelSchedule`) or, in test builds only, handles `ForceTick`.
 
 ## Timer Lifecycle
 
-1. **SetSchedule { seq, timer }** -- inserts a timer into the `Ticker`'s `HashMap<u32, T>` keyed by sequence number.
-2. **Each tick** -- `timer.tick()` is called, decrementing the timer's internal counter and returning the remaining ticks.
-3. **Expiry (remaining == 0)** -- `to_timeout_callback(seq)` is called, the callback is collected, and the timer is removed from the map.
-4. **CancelSchedule { seq }** -- removes the timer early, preventing any future callback.
+1. **SetSchedule { seq, timer }** — inserts timer into `Ticker`'s `HashMap<u32, T>` keyed by sequence number.
+2. **Each tick** — `timer.tick()` called, decrementing timer's internal counter, returning remaining ticks.
+3. **Expiry (remaining == 0)** — `to_timeout_callback(seq)` called, callback collected, timer removed from map.
+4. **CancelSchedule { seq }** — removes timer early, preventing future callback.
 
 ## Testing
 
-`TickerCommand::ForceTick` (gated behind `#[cfg(test)]`) lets tests advance the clock by one tick deterministically, without waiting for real time. It calls the same `advance_clock()` path as the interval branch.
+`TickerCommand::ForceTick` (gated behind `#[cfg(test)]`) lets tests advance clock by one tick deterministically without waiting for real time. Calls same `advance_clock()` path as interval branch.
 
 ## Generics
 
-The actor is parameterized over `TTimer`, a trait requiring:
+Actor parameterized over `TTimer`, trait requiring:
 
-- `tick(&mut self) -> u32` -- decrement and return remaining ticks.
-- `to_timeout_callback(self, id: u32) -> Self::Callback` -- produce a callback on expiry.
-- `Callback: Default` -- the default value serves as the protocol-period-elapsed event.
+- `tick(&mut self) -> u32` — decrement and return remaining ticks.
+- `to_timeout_callback(self, id: u32) -> Self::Callback` — produce callback on expiry.
+- `Callback: Default` — default value serves as protocol-period-elapsed event.
 
-Any type satisfying `TTimer` can be plugged in. `SwimTimer` is the only current implementation.
+Any type satisfying `TTimer` can plug in. `SwimTimer` only current implementation.
 
 ## Invariants
 
-- **Biased select** -- the interval branch is always checked before the mailbox branch. This guarantees ticks are never starved by a burst of commands.
-- **Pure timer** -- the actor contains zero protocol logic. All domain behavior lives in the `TTimer` implementation and the consumer of the callback channel.
-- **Infallible loop** -- send failures on the callback channel are silently ignored (`let _ = sender.send(...).await`), so a dropped receiver does not crash the actor.
+- **Biased select** — interval branch always checked before mailbox branch. Guarantees ticks never starved by command burst.
+- **Pure timer** — actor contains zero protocol logic. All domain behavior lives in `TTimer` implementation and callback channel consumer.
+- **Infallible loop** — send failures on callback channel silently ignored (`let _ = sender.send(...).await`), dropped receiver not crash actor.

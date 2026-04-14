@@ -5,20 +5,20 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
-tokio = { version = "1.44.2", features = ["full"] }
-clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.51.1", features = ["full"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 bytes = "1.10.1"
 bincode = { version = "2.0.1" }
-rand = "0.8"
-uuid = { version = "1", features = ["v4"] }
+rand = "0.10.1"
+uuid = { version = "1.23.0", features = ["v4"] }
 murmur3 = "0.5"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("turmoil"))'] }
+unexpected_cfgs = { level = "allow" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 serial_test = "3.3.1"
 turmoil = { version = "0.7.1", package = "turmoil" }

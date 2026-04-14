@@ -2,9 +2,9 @@
 
 ## Purpose
 
-`SwimActor` is the protocol layer actor that drives the SWIM failure-detection state machine (`Swim`). It owns the async boundary: it receives commands from its mailbox, feeds them into the synchronous `Swim` state machine, and flushes all resulting side effects (outbound packets and timer commands) to external channels.
+`SwimActor` — protocol layer actor driving SWIM failure-detection state machine (`Swim`). Owns async boundary: receives commands from mailbox, feeds into synchronous `Swim`, flushes side effects (outbound packets + timer commands) to external channels.
 
-The actor itself contains no protocol logic. All decisions live in `Swim`.
+Actor has no protocol logic. All decisions in `Swim`.
 
 ## Architecture
 
@@ -31,8 +31,8 @@ The actor itself contains no protocol logic. All decisions live in `Swim`.
 
 **Fields:**
 - `mailbox` -- `mpsc::Receiver<SwimCommand>` -- inbound event stream
-- `transport_tx` -- `mpsc::Sender<OutboundPacket>` -- sends UDP packets to the transport actor
-- `scheduler_tx` -- `mpsc::Sender<TickerCommand<SwimTimer>>` -- sends timer set/cancel commands to the ticker
+- `transport_tx` -- `mpsc::Sender<OutboundPacket>` -- sends UDP packets to transport actor
+- `scheduler_tx` -- `mpsc::Sender<TickerCommand<SwimTimer>>` -- sends timer set/cancel commands to ticker
 
 ## Message Flow
 
@@ -46,17 +46,17 @@ The actor itself contains no protocol logic. All decisions live in `Swim`.
 
 ### PacketReceived
 
-Handles inbound `SwimPacket` (Ping, Ack, PingReq). The `Swim` state machine processes gossip, updates membership, and buffers any response packets (e.g., Ack replies, forwarded proxy Acks).
+Handles inbound `SwimPacket` (Ping, Ack, PingReq). `Swim` processes gossip, updates membership, buffers response packets (Ack replies, forwarded proxy Acks).
 
 ### Timeout
 
-Dispatched by the ticker when a timer expires. Drives the probe lifecycle:
-- `ProtocolPeriodElapsed` -- start a new probe round (send Ping to next node)
-- `DirectProbe` timed out -- escalate to indirect probing (send PingReq to K peers)
-- `IndirectProbe` timed out -- mark target as Suspect
-- `Suspect` timed out -- mark target as Dead
+Dispatched by ticker on timer expiry. Drives probe lifecycle:
+- `ProtocolPeriodElapsed` -- start new probe round (Ping next node)
+- `DirectProbe` timed out -- escalate to indirect probing (PingReq to K peers)
+- `IndirectProbe` timed out -- mark target Suspect
+- `Suspect` timed out -- mark target Dead
 - `ProxyPing` timed out -- clean up stale proxy ping entry
-- `JoinTry` timed out -- retry or give up on bootstrap join
+- `JoinTry` timed out -- retry or give up bootstrap join
 
 ### Query
 
@@ -64,35 +64,35 @@ Read-only queries (GetMembers, GetTopology) answered via oneshot reply channels.
 
 ## Outbound Side Effects
 
-After every event, `flush_outbound_commands` drains two buffers from the `Swim` state machine and sends them concurrently via `tokio::join!`:
+After every event, `flush_outbound_commands` drains two buffers from `Swim` and sends concurrently via `tokio::join!`:
 
 1. **Timer commands** (`TimerCommand<SwimTimer>`) -- sent to `scheduler_tx`
-   - `SetSchedule { seq, timer }` -- register a new timer
-   - `CancelSchedule { seq }` -- cancel an existing timer
+   - `SetSchedule { seq, timer }` -- register new timer
+   - `CancelSchedule { seq }` -- cancel existing timer
 2. **Outbound packets** (`OutboundPacket`) -- sent to `transport_tx`
-   - Each packet has a `target: SocketAddr` and a `SwimPacket` payload
+   - Each packet has `target: SocketAddr` and `SwimPacket` payload
 
-The flush also runs once at startup (before entering the event loop) to drain any commands produced during `Swim::new()` initialization.
+Flush also runs once at startup (before event loop) to drain commands produced during `Swim::new()` init.
 
 ## Key Dependencies
 
 | Dependency | Role |
 |---|---|
 | `Swim` (swim.rs) | Pure state machine. All protocol logic. No async, no I/O. |
-| `GossipBuffer` | Piggybacks membership updates onto outbound packets with O(log N) dissemination. |
-| `LiveNodeTracker` | Round-robin selection of probe targets, excluding dead/suspect nodes. |
+| `GossipBuffer` | Piggybacks membership updates onto outbound packets, O(log N) dissemination. |
+| `LiveNodeTracker` | Round-robin probe target selection, excluding dead/suspect nodes. |
 | `Topology` | Consistent hash ring updated on membership changes. |
-| `Bootstrapper` / `JoinAttempt` (peer_discovery.rs) | Seed-node join with exponential backoff. |
-| `SwimTimer` (messages.rs) | Timer definitions with tick counts for each probe phase. |
+| `Bootstrapper` / `JoinAttempt` (peer_discovery.rs) | Seed-node join w/ exponential backoff. |
+| `SwimTimer` (messages.rs) | Timer definitions w/ tick counts per probe phase. |
 
 ## Invariants
 
-1. **Every event must be followed by `flush_outbound_commands`.** The `Swim` state machine buffers all side effects internally. If you skip the flush, packets and timer commands are silently lost. The `run()` loop enforces this -- there is no code path that processes an event without flushing.
+1. **Every event must follow with `flush_outbound_commands`.** `Swim` buffers all side effects internally. Skip flush = packets and timer commands silently lost. `run()` loop enforces this — no code path processes event without flushing.
 
-2. **The actor is the sole driver of the `Swim` state machine.** No other code calls `step()`, `handle_timeout()`, or `handle_query()` on a `Swim` instance in production. This ensures single-threaded access without locks.
+2. **Actor is sole driver of `Swim` state machine.** No other code calls `step()`, `handle_timeout()`, or `handle_query()` on `Swim` in production. Ensures single-threaded access without locks.
 
-3. **`Swim` is fully synchronous.** It never does I/O, never awaits, never touches channels. This separation makes the protocol logic deterministically testable.
+3. **`Swim` fully synchronous.** No I/O, no awaits, no channels. Separation makes protocol logic deterministically testable.
 
-4. **Timer commands flow through the scheduler, not the actor.** The actor converts `TimerCommand` into `TickerCommand` (via `.into()`) and sends it to the ticker actor. The ticker fires `SwimTimeOutCallback` back into the actor's mailbox when timers expire.
+4. **Timer commands flow through scheduler, not actor.** Actor converts `TimerCommand` into `TickerCommand` (via `.into()`) and sends to ticker actor. Ticker fires `SwimTimeOutCallback` back into actor mailbox on expiry.
 
-5. **Sequence numbers (`seq`) correlate probes to responses.** Each probe gets a unique `seq`. Ack messages carry the same `seq` to cancel the corresponding timer. This is also how proxy pings are correlated.
+5. **Sequence numbers (`seq`) correlate probes to responses.** Each probe gets unique `seq`. Ack messages carry same `seq` to cancel corresponding timer. Also how proxy pings correlated.
