@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
+use crate::clusters::raft::messages::*;
+use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardToken};
-use crate::raft::messages::*;
-use crate::raft::state::Raft;
 use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +29,21 @@ pub enum RaftCommand {
     GetLeader {
         group_id: ShardGroupId,
         reply: oneshot::Sender<Option<NodeId>>,
+    },
+    /// Propose a command to a shard group's Raft log. Leader-only.
+    Propose {
+        shard_group_id: ShardGroupId,
+        command: crate::clusters::raft::messages::RaftCommand,
+        reply: oneshot::Sender<Result<(), ProposeError>>,
+    },
+    /// A node died — remove it from all groups where this node is leader.
+    HandleNodeDeath { dead_node_id: NodeId },
+    /// A node joined — add it to groups where this node is leader and the
+    /// new node should be a member. Also EnsureGroup for groups this node
+    /// should newly participate in.
+    HandleNodeJoin {
+        new_node_id: NodeId,
+        affected_groups: Vec<ShardGroup>,
     },
 }
 
@@ -128,6 +143,77 @@ impl RaftActor {
                         .get(&group_id)
                         .and_then(|raft| raft.current_leader().cloned());
                     let _ = reply.send(leader);
+                }
+
+                RaftCommand::Propose {
+                    shard_group_id,
+                    command,
+                    reply,
+                } => {
+                    let result = match self.groups.get_mut(&shard_group_id) {
+                        Some(raft) => raft.propose(command),
+                        None => Err(ProposeError::NotLeader),
+                    };
+                    let _ = reply.send(result);
+                    self.flush(shard_group_id).await;
+                }
+
+                RaftCommand::HandleNodeDeath { dead_node_id } => {
+                    // Collect affected group IDs first (borrow checker).
+                    let affected: Vec<ShardGroupId> = self
+                        .groups
+                        .iter()
+                        .filter(|(_, raft)| raft.is_leader() && raft.has_peer(&dead_node_id))
+                        .map(|(id, _)| *id)
+                        .collect();
+
+                    for group_id in &affected {
+                        if let Some(raft) = self.groups.get_mut(group_id) {
+                            let cmd = crate::clusters::raft::messages::RaftCommand::RemovePeer(
+                                dead_node_id.clone(),
+                            );
+                            let _ = raft.propose(cmd);
+                        }
+                    }
+
+                    for group_id in affected {
+                        self.flush(group_id).await;
+                    }
+                }
+
+                RaftCommand::HandleNodeJoin {
+                    new_node_id,
+                    affected_groups,
+                } => {
+                    let mut flushed = Vec::new();
+
+                    for group in &affected_groups {
+                        if let Some(raft) = self.groups.get_mut(&group.id)
+                            && raft.is_leader()
+                            && !raft.has_peer(&new_node_id)
+                        {
+                            let cmd = crate::clusters::raft::messages::RaftCommand::AddPeer(
+                                new_node_id.clone(),
+                            );
+                            let _ = raft.propose(cmd);
+                            flushed.push(group.id);
+                        }
+                    }
+
+                    // EnsureGroup for groups this node should newly join.
+                    for group in affected_groups {
+                        if !self.groups.contains_key(&group.id)
+                            && group.members.contains(&self.node_id)
+                        {
+                            let group_id = group.id;
+                            self.ensure_group(group);
+                            flushed.push(group_id);
+                        }
+                    }
+
+                    for group_id in flushed {
+                        self.flush(group_id).await;
+                    }
                 }
             }
         }

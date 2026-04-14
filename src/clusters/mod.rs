@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+pub(crate) mod raft;
 pub(crate) mod swims;
 pub(crate) mod transport;
 mod types;

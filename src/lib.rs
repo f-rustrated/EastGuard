@@ -4,7 +4,6 @@ mod config;
 mod connections;
 
 mod clusters;
-mod raft;
 
 mod net;
 pub(crate) mod schedulers;
@@ -60,7 +59,8 @@ impl StartUp {
                 .await?;
 
         let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
-        let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone());
+        let (raft_tx, _raft_rx) = mpsc::channel(64); // RaftActor not wired yet in StartUp
+        let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone(), raft_tx);
 
         let mut state = self.env.swim(self.rng_seed);
         Bootstrapper::run(self.env.bootstrap_servers(), &mut state);

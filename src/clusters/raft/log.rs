@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::raft::messages::LogEntry;
+use crate::clusters::raft::messages::LogEntry;
 
 /// In-memory log store. Will be replaced with RocksDB-backed storage later.
 #[derive(Debug, Default)]
@@ -54,7 +54,7 @@ impl MemLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::messages::RaftCommand;
+    use crate::clusters::raft::messages::RaftCommand;
 
     fn entry(term: u64, index: u64) -> LogEntry {
         LogEntry {

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`RaftActor` is async boundary driving multiple `Raft` state machines -- one per shard group on this node. Same pattern as `SwimActor`: receives commands from mailbox, feeds into synchronous state machines, flushes all side effects (outbound packets and timer commands).
+`RaftActor` is async boundary driving multiple `Raft` state machines -- one per shard group on this node. It receives commands from mailbox, feeds into synchronous state machines, flushes all side effects (outbound packets and timer commands).
 
 Actor contains no consensus logic. All decisions live in `Raft`.
 
@@ -41,25 +41,26 @@ Actor contains no consensus logic. All decisions live in `Raft`.
 ```rust
 pub enum RaftCommand {
     PacketReceived {
-        shard_id: ShardGroupId,
-        src: SocketAddr,
+        shard_group_id: ShardGroupId,
+        from: NodeId,
         rpc: RaftRpc,
     },
-    Timeout {
-        shard_id: ShardGroupId,
-        callback: RaftTimeoutCallback,
+    Timeout(RaftTimeoutCallback),
+    EnsureGroup { group: ShardGroup },
+    RemoveGroup { group_id: ShardGroupId },
+    GetLeader {
+        group_id: ShardGroupId,
+        reply: oneshot::Sender<Option<NodeId>>,
     },
     Propose {
-        shard_id: ShardGroupId,
-        command: RaftCommand,
+        shard_group_id: ShardGroupId,
+        command: messages::RaftCommand,
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
-    Query(RaftQueryCommand),
-    EnsureGroup {
-        group: ShardGroup,
-    },
-    RemoveGroup {
-        group_id: ShardGroupId,
+    HandleNodeDeath { dead_node_id: NodeId },
+    HandleNodeJoin {
+        new_node_id: NodeId,
+        affected_groups: Vec<ShardGroup>,
     },
 }
 ```
@@ -68,43 +69,17 @@ pub enum RaftCommand {
 
 | Variant | Source | Action |
 |---|---|---|
-| `PacketReceived` | Transport layer (TCP) | Lookup `Raft` by `shard_id`, call `raft.step(src, rpc)` |
-| `Timeout` | Ticker (timer expiry) | Lookup `Raft` by `shard_id`, call `raft.handle_timeout(callback)` |
-| `Propose` | Client/Coordinator | Lookup `Raft` by `shard_id`, call `raft.propose(command)`, reply via oneshot |
-| `Query` | External callers | Read-only queries (e.g., `GetLeader { shard_id }`) |
-| `EnsureGroup` | Raft-Topology Bridge | Create `Raft` instance if not exists and this node is member |
-| `RemoveGroup` | Raft-Topology Bridge | Shut down and remove `Raft` instance |
+| `PacketReceived` | Transport layer (TCP) | Lookup `Raft` by `shard_group_id`, call `raft.step(from, rpc)` |
+| `Timeout` | Ticker (timer expiry) | Extract `shard_group_id` from callback, call `raft.handle_timeout(cb)` |
+| `EnsureGroup` | SwimActor / HandleNodeJoin | Create `Raft` instance if not exists and this node is member |
+| `RemoveGroup` | External | Shut down and remove `Raft` instance |
+| `GetLeader` | External callers | Read-only query, returns `Option<NodeId>` via oneshot |
+| `Propose` | Client/Coordinator | Lookup `Raft` by `shard_group_id`, call `raft.propose(command)`, reply via oneshot |
+| `HandleNodeDeath` | SwimActor (from `MembershipEvent::NodeDead`) | For each group where dead node is peer and this node is leader, propose `RemovePeer(dead_node_id)` |
+| `HandleNodeJoin` | SwimActor (from `MembershipEvent::NodeAlive`) | For existing groups where this node is leader and new node not yet a peer: propose `AddPeer`. For groups this node should newly join: `EnsureGroup`. |
 
-## Flush Protocol
 
-After every command, actor must flush **all** groups that were touched:
-
-```rust
-fn flush(&mut self, shard_id: ShardGroupId) {
-    if let Some(raft) = self.groups.get_mut(&shard_id) {
-        for pkt in raft.take_outbound() {
-            let _ = self.transport_tx.send(pkt).await;
-        }
-        for cmd in raft.take_timer_commands() {
-            // Timer commands must be scoped to shard_id to avoid collision
-            // across groups (e.g., prefix seq with shard_id hash)
-            let _ = self.scheduler_tx.send(cmd.into()).await;
-        }
-    }
-}
-```
-
-## Timer Seq Namespacing
-
-Each `Raft` instance uses fixed seq values (`ELECTION_TIMER_SEQ = 0`, `HEARTBEAT_TIMER_SEQ = 1`). Multiple groups share same scheduler, so actor must **namespace** these seqs to avoid collisions:
-
-```
-effective_seq = (shard_group_id_hash << 2) | local_seq
-```
-
-Ensures `Shard #12`'s election timer doesn't cancel `Shard #45`'s election timer.
-
-## Transport: TCP, not UDP
+## Transport: TCP
 
 Raft RPCs go over TCP (reliable, ordered delivery). `RaftTransportActor` listens on dedicated `raft_port`. Each packet tagged with `ShardGroupId` so transport layer routes to correct group.
 
@@ -122,23 +97,25 @@ if was_leader != is_leader {
 }
 ```
 
-Bridge connecting Raft elections to SWIM's `ShardLeader` piggybacking (#35-#38).
+Phase 6 will connect Raft elections to SWIM's `ShardLeader` piggybacking (#35-#38).
 
 ## Relationship to Other Actors
 
 ```
-SwimActor (UDP, membership)     RaftActor (TCP, consensus)
-       |                               |
-       |                               |
-       v                               v
-  SwimTransportActor            RaftTransportActor
-  (cluster_port, UDP)           (raft_port, TCP)
-       |                               |
-       +---------- Ticker <------------+
-              (shared scheduler)
+SwimActor (UDP, membership) ──raft_tx──> RaftActor (TCP, consensus)
+       |    (HandleNodeDeath,                  |
+       |     HandleNodeJoin)                   |
+       v                                       v
+  SwimTransportActor                    RaftTransportActor
+  (cluster_port, UDP)                   (raft_port, TCP)
+       |                                       |
+       +------------ Ticker <-----------------+
+                (shared scheduler)
 ```
 
 Both actors share same `Ticker`-based scheduler (via `run_scheduling_actor`), but use different timer types (`SwimTimer` vs `RaftTimer`). Timer seq namespacing prevents collisions.
+
+SwimActor sends membership-driven commands directly to RaftActor — no intermediate bridge. Topology queries are local (`state.topology.shard_groups_for_node()`).
 
 ## Peer Resolution: NodeId → Connection
 
@@ -151,7 +128,7 @@ SWIM membership table          (NodeId → SocketAddr, maintained by gossip)
 Topology / hash ring           (key → ShardGroup { members: Vec<NodeId> })
        |
        v
-Raft-Topology Bridge           (looks up each member's SocketAddr from SWIM)
+SwimActor                      (sends HandleNodeDeath/HandleNodeJoin to RaftActor)
        |
        v
 RaftActor                      (maintains NodeId → Connection pool)
@@ -170,9 +147,9 @@ RaftTransportActor              (TCP I/O)
 
 - **Conflict resolution**: Either side can initiate connection. On simultaneous connect, connection initiated by **lower `NodeId`** wins. Acceptor checks: if writer for peer already exists and `peer_id > self.node_id`, incoming connection dropped (we initiated as lower NodeId, ours takes precedence).
 
-- SWIM is authoritative source of `NodeId → SocketAddr` (via `SwimQueryCommand::ResolveAddress`). When node's address changes, SWIM detects via gossip. Bridge recreates affected shard groups.
+- SWIM is authoritative source of `NodeId → SocketAddr` (via `SwimQueryCommand::ResolveAddress`). When node's address changes, SWIM detects via gossip.
 
-- For ConfChanges (adding/removing peer mid-term without destroying group), `Raft` will need `add_peer(NodeId)` / `remove_peer(NodeId)` methods. Until then, membership changes handled by destroying and recreating `Raft` instance via `RemoveGroup` + `EnsureGroup`.
+- **ConfChange (AddPeer/RemovePeer)**: `RemovePeer(NodeId)` proposed by leader on `HandleNodeDeath`, `AddPeer(NodeId)` proposed on `HandleNodeJoin`. Both applied on commit via `apply_committed_entries()` — modifies `Raft::peers` and `peer_states` in-place. Group survives with modified membership, no `RemoveGroup` + `EnsureGroup` needed.
 
 ## Invariants
 
@@ -182,6 +159,6 @@ RaftTransportActor              (TCP I/O)
 
 3. **Raft instances are independent.** Processing event for `Shard #12` never touches `Shard #45`'s state.
 
-4. **Group lifecycle controlled by Raft-Topology Bridge.** Actor does not decide when to create or remove groups. Only responds to `EnsureGroup` and `RemoveGroup` commands.
+4. **Group lifecycle controlled by SwimActor.** RaftActor does not decide when to create or remove groups. Only responds to `EnsureGroup`, `RemoveGroup`, `HandleNodeDeath`, and `HandleNodeJoin` commands sent by SwimActor.
 
 5. **Timer commands flow through scheduler.** Actor converts `TimerCommand<RaftTimer>` into `TickerCommand<RaftTimer>` (via `.into()`) and sends to shared ticker. Ticker fires `RaftTimeoutCallback` back into actor's mailbox.

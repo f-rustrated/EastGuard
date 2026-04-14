@@ -18,6 +18,12 @@ pub struct LogEntry {
 pub enum RaftCommand {
     /// Placeholder — real commands (CreateTopic, etc.) will be added later.
     Noop,
+    /// Raft-internal membership change: remove a peer from the group.
+    /// Applied when committed — modifies the Raft peer set directly.
+    RemovePeer(NodeId),
+    /// Raft-internal membership change: add a peer to the group.
+    /// Applied when committed — inserts into peer set, leader initializes PeerState.
+    AddPeer(NodeId),
 }
 
 #[derive(Debug, PartialEq, Eq)]

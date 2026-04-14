@@ -33,6 +33,7 @@ Actor has no protocol logic. All decisions in `Swim`.
 - `mailbox` -- `mpsc::Receiver<SwimCommand>` -- inbound event stream
 - `transport_tx` -- `mpsc::Sender<OutboundPacket>` -- sends UDP packets to transport actor
 - `scheduler_tx` -- `mpsc::Sender<TickerCommand<SwimTimer>>` -- sends timer set/cancel commands to ticker
+- `raft_tx` -- `mpsc::Sender<RaftCommand>` -- sends membership-driven commands to RaftActor (HandleNodeDeath, HandleNodeJoin)
 
 ## Message Flow
 
@@ -58,19 +59,19 @@ Dispatched by ticker on timer expiry. Drives probe lifecycle:
 - `ProxyPing` timed out -- clean up stale proxy ping entry
 - `JoinTry` timed out -- retry or give up bootstrap join
 
-### Query
-
-Read-only queries (GetMembers, GetTopology) answered via oneshot reply channels. No state mutation.
-
 ## Outbound Side Effects
 
-After every event, `flush_outbound_commands` drains two buffers from `Swim` and sends concurrently via `tokio::join!`:
+After every event, `flush_outbound_commands` drains three buffers from `Swim` and sends concurrently via `tokio::join!`:
 
 1. **Timer commands** (`TimerCommand<SwimTimer>`) -- sent to `scheduler_tx`
    - `SetSchedule { seq, timer }` -- register new timer
    - `CancelSchedule { seq }` -- cancel existing timer
 2. **Outbound packets** (`OutboundPacket`) -- sent to `transport_tx`
    - Each packet has `target: SocketAddr` and `SwimPacket` payload
+3. **Raft commands** (from `MembershipEvent`s) -- sent to `raft_tx`
+   - `NodeDead` → `RaftCommand::HandleNodeDeath` (leader proposes RemovePeer)
+   - `NodeAlive` → query `topology.shard_groups_for_node()` locally → `RaftCommand::HandleNodeJoin` (leader proposes AddPeer, EnsureGroup for new memberships)
+   - No event on Suspect (not actionable for Raft group lifecycle)
 
 Flush also runs once at startup (before event loop) to drain commands produced during `Swim::new()` init.
 
@@ -87,12 +88,10 @@ Flush also runs once at startup (before event loop) to drain commands produced d
 
 ## Invariants
 
-1. **Every event must follow with `flush_outbound_commands`.** `Swim` buffers all side effects internally. Skip flush = packets and timer commands silently lost. `run()` loop enforces this — no code path processes event without flushing.
+1. **Actor is sole driver of `Swim` state machine.** No other code calls `step()`, `handle_timeout()`, or `handle_query()` on `Swim` in production. Ensures single-threaded access without locks.
 
-2. **Actor is sole driver of `Swim` state machine.** No other code calls `step()`, `handle_timeout()`, or `handle_query()` on `Swim` in production. Ensures single-threaded access without locks.
+2. **`Swim` fully synchronous.** No I/O, no awaits, no channels. Separation makes protocol logic deterministically testable.
 
-3. **`Swim` fully synchronous.** No I/O, no awaits, no channels. Separation makes protocol logic deterministically testable.
+3. **Timer commands flow through scheduler, not actor.** Actor converts `TimerCommand` into `TickerCommand` (via `.into()`) and sends to ticker actor. Ticker fires `SwimTimeOutCallback` back into actor mailbox on expiry.
 
-4. **Timer commands flow through scheduler, not actor.** Actor converts `TimerCommand` into `TickerCommand` (via `.into()`) and sends to ticker actor. Ticker fires `SwimTimeOutCallback` back into actor mailbox on expiry.
-
-5. **Sequence numbers (`seq`) correlate probes to responses.** Each probe gets unique `seq`. Ack messages carry same `seq` to cancel corresponding timer. Also how proxy pings correlated.
+4. **Sequence numbers (`seq`) correlate probes to responses.** Each probe gets unique `seq`. Ack messages carry same `seq` to cancel corresponding timer. Also how proxy pings correlated.

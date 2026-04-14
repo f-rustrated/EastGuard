@@ -73,6 +73,7 @@ pub struct Swim {
     pending_outbound: Vec<OutboundPacket>,
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
     pending_indirect_pings: BTreeMap<u32, ProxyPing>,
+    pending_membership_events: Vec<MembershipEvent>,
 }
 
 impl Swim {
@@ -95,6 +96,7 @@ impl Swim {
             pending_outbound: vec![],
             pending_timer_commands: vec![],
             pending_indirect_pings: BTreeMap::new(),
+            pending_membership_events: Vec::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -167,9 +169,6 @@ impl Swim {
         match command {
             SwimQueryCommand::GetMembers { reply } => {
                 let _ = reply.send(self.members.values().cloned().collect());
-            }
-            SwimQueryCommand::GetTopology { reply } => {
-                let _ = reply.send(self.topology.clone());
             }
             SwimQueryCommand::ResolveAddress { node_id, reply } => {
                 let addr = self.members.get(&node_id).map(|m| m.addr);
@@ -512,6 +511,17 @@ impl Swim {
                         self.pending_timer_commands
                             .push(TimerCommand::CancelSchedule { seq: suspect_seq });
                     }
+                    self.pending_membership_events
+                        .push(MembershipEvent::NodeAlive {
+                            node_id: node_id.clone(),
+                            addr,
+                        });
+                }
+                SwimNodeState::Dead => {
+                    self.pending_membership_events
+                        .push(MembershipEvent::NodeDead {
+                            node_id: node_id.clone(),
+                        });
                 }
                 SwimNodeState::Suspect => {
                     let seq = self.next_seq();
@@ -521,7 +531,6 @@ impl Swim {
                         timer: SwimTimer::suspect_timer(node_id),
                     });
                 }
-                _ => {}
             }
 
             self.gossip_buffer.enqueue(member, self.members.len());
@@ -541,6 +550,11 @@ impl Swim {
     /// Drain all timer commands buffered since the last call.
     pub(crate) fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimer>> {
         std::mem::take(&mut self.pending_timer_commands)
+    }
+
+    /// Drain all membership events buffered since the last call.
+    pub(crate) fn take_membership_events(&mut self) -> Vec<MembershipEvent> {
+        std::mem::take(&mut self.pending_membership_events)
     }
 }
 
@@ -1181,5 +1195,119 @@ mod tests {
             p.incarnation, 1,
             "current impl refutes Dead — this should change when TODO is fixed"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Membership events
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn membership_event_emitted_on_new_alive_node() {
+        let mut p = make_protocol("node-local", 8000);
+        // Drain events from Swim::new (self-join emits NodeAlive for self)
+        p.take_membership_events();
+
+        let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        p.step(
+            remote_addr,
+            ping(
+                1,
+                "node-remote",
+                0,
+                vec![node("node-remote", 9000, SwimNodeState::Alive, 0)],
+            ),
+        );
+
+        let events = p.take_membership_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            MembershipEvent::NodeAlive { node_id, .. } if *node_id == NodeId::new("node-remote")
+        ));
+    }
+
+    #[test]
+    fn membership_event_emitted_on_node_death() {
+        let mut h = TestHarness::new("node-local", 8000);
+        // Drain initial events
+        h.protocol.take_membership_events();
+
+        // Add a remote node first
+        let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        h.step(
+            remote_addr,
+            ping(
+                1,
+                "node-remote",
+                0,
+                vec![node("node-remote", 9000, SwimNodeState::Alive, 0)],
+            ),
+        );
+        h.protocol.take_membership_events(); // drain Alive event
+
+        // Gossip that the remote node is dead (via a new sender "node-other")
+        h.step(
+            "127.0.0.1:9001".parse().unwrap(),
+            ping(
+                2,
+                "node-other",
+                0,
+                vec![node("node-remote", 9000, SwimNodeState::Dead, 1)],
+            ),
+        );
+
+        let events = h.protocol.take_membership_events();
+        // 2 events: NodeAlive for sender "node-other" + NodeDead for "node-remote"
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MembershipEvent::NodeDead { node_id } if *node_id == NodeId::new("node-remote"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, MembershipEvent::NodeAlive { node_id, .. } if *node_id == NodeId::new("node-other"))));
+    }
+
+    #[test]
+    fn no_membership_event_on_suspect() {
+        let mut h = TestHarness::new("node-local", 8000);
+        h.protocol.take_membership_events();
+
+        // Add a remote node
+        let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        h.step(
+            remote_addr,
+            ping(
+                1,
+                "node-remote",
+                0,
+                vec![node("node-remote", 9000, SwimNodeState::Alive, 0)],
+            ),
+        );
+        h.protocol.take_membership_events();
+
+        // Pre-add "node-other" so its Ping doesn't trigger a new Alive event
+        h.step(
+            "127.0.0.1:9001".parse().unwrap(),
+            ping(
+                2,
+                "node-other",
+                0,
+                vec![node("node-other", 9001, SwimNodeState::Alive, 0)],
+            ),
+        );
+        h.protocol.take_membership_events();
+
+        // Gossip suspect via known sender — only suspect state change, no new node
+        h.step(
+            "127.0.0.1:9001".parse().unwrap(),
+            ping(
+                3,
+                "node-other",
+                0,
+                vec![node("node-remote", 9000, SwimNodeState::Suspect, 0)],
+            ),
+        );
+
+        let events = h.protocol.take_membership_events();
+        assert!(events.is_empty(), "Suspect should not emit membership event");
     }
 }
