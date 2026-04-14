@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
+use crate::clusters::swims::ShardGroupId;
 use crate::raft::log::MemLog;
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -39,6 +40,7 @@ struct PeerState {
 pub struct Raft {
     // Identity
     pub node_id: NodeId,
+    pub shard_group_id: ShardGroupId,
     peers: HashSet<NodeId>,
 
     current_term: u64,
@@ -64,9 +66,15 @@ const ELECTION_TIMER_SEQ: u32 = 0;
 const HEARTBEAT_TIMER_SEQ: u32 = 1;
 
 impl Raft {
-    pub(crate) fn new(node_id: NodeId, peers: HashSet<NodeId>, election_jitter: u32) -> Self {
+    pub(crate) fn new(
+        node_id: NodeId,
+        peers: HashSet<NodeId>,
+        election_jitter: u32,
+        shard_group_id: ShardGroupId,
+    ) -> Self {
         let mut raft = Self {
             node_id,
+            shard_group_id,
             peers,
             current_term: 0,
             voted_for: None,
@@ -90,6 +98,10 @@ impl Raft {
         std::mem::take(&mut self.pending_timer_commands)
     }
 
+    pub fn peers_count(&self) -> usize {
+        self.peers.len()
+    }
+
     /// Minimum number of nodes needed for a majority (strict majority).
     /// For N nodes: N/2 + 1. Examples: 3→2, 4→3, 5→3.
     fn quorum(&self) -> u32 {
@@ -103,10 +115,11 @@ impl Raft {
 
     pub fn handle_timeout(&mut self, event: RaftTimeoutCallback) {
         match event {
-            RaftTimeoutCallback::ElectionTimeout => {
+            RaftTimeoutCallback::Ignored => {}
+            RaftTimeoutCallback::ElectionTimeout { .. } => {
                 self.start_election();
             }
-            RaftTimeoutCallback::HeartbeatTimeout => {
+            RaftTimeoutCallback::HeartbeatTimeout { .. } => {
                 self.send_heartbeats();
             }
         }
@@ -150,8 +163,11 @@ impl Raft {
             last_log_term: self.log.last_term(),
         };
         for peer_id in self.peers.iter() {
-            self.pending_outbound
-                .push(OutboundRaftPacket::new(peer_id.clone(), req.clone()));
+            self.pending_outbound.push(OutboundRaftPacket::new(
+                self.shard_group_id,
+                peer_id.clone(),
+                req.clone(),
+            ));
         }
     }
 
@@ -173,6 +189,7 @@ impl Raft {
         }
 
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             from,
             RequestVoteResponse {
                 term: self.current_term,
@@ -294,6 +311,7 @@ impl Raft {
         let entries = self.log.entries_from(peer_state.next_index).to_vec();
 
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             peer_id,
             AppendEntries {
                 term: self.current_term,
@@ -390,6 +408,7 @@ impl Raft {
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             target,
             AppendEntriesResponse {
                 term: self.current_term,
@@ -480,14 +499,14 @@ impl Raft {
             });
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq: ELECTION_TIMER_SEQ,
-            timer: RaftTimer::election(self.election_jitter),
+            timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
         });
     }
 
     fn schedule_heartbeat_timer(&mut self) {
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq: HEARTBEAT_TIMER_SEQ,
-            timer: RaftTimer::heartbeat(),
+            timer: RaftTimer::heartbeat(self.shard_group_id),
         });
     }
 
@@ -511,14 +530,16 @@ mod tests {
         NodeId::new(id)
     }
 
+    const TEST_SHARD: ShardGroupId = ShardGroupId(0);
+
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0)
+        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0)
+        Raft::new(node(id), peers, 0, TEST_SHARD)
     }
 
     // -------------------------------------------------------------------
@@ -530,7 +551,9 @@ mod tests {
         let mut raft = single_node_raft();
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         assert_eq!(raft.role, Role::Leader);
         assert_eq!(raft.current_term, 1);
@@ -540,12 +563,16 @@ mod tests {
     #[test]
     fn single_node_repeated_elections_increment_term() {
         let mut raft = single_node_raft();
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         assert_eq!(raft.current_term, 1);
 
         // Step down and trigger another election
         raft.step_down(1);
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         assert_eq!(raft.current_term, 2);
     }
 
@@ -557,7 +584,9 @@ mod tests {
     fn candidate_sends_request_vote_to_all_peers() {
         let mut raft = three_node_raft("node-1");
 
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         assert!(matches!(raft.role, Role::Candidate { votes_received: 1 }));
         assert_eq!(raft.current_term, 1);
@@ -628,7 +657,9 @@ mod tests {
     #[test]
     fn candidate_becomes_leader_on_majority() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
 
         // Receive vote from node-2 (now have 2 out of 3 = majority)
@@ -645,7 +676,9 @@ mod tests {
     #[test]
     fn candidate_steps_down_on_higher_term() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
 
         let resp = RequestVoteResponse {
@@ -699,7 +732,9 @@ mod tests {
     fn leader_sends_noop_on_election_then_heartbeats() {
         let mut raft = three_node_raft("node-1");
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -737,7 +772,9 @@ mod tests {
         let _ = raft.take_outbound();
 
         // Subsequent heartbeats are empty
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let out = raft.take_outbound();
         assert_eq!(out.len(), 2);
         for pkt in &out {
@@ -836,7 +873,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -912,7 +951,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -952,7 +993,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader at term 1
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -989,7 +1032,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader at term 1
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -1004,7 +1049,9 @@ mod tests {
         assert_eq!(raft.current_term, 1);
 
         // Stale election timeout arrives — should be ignored
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         assert_eq!(
             raft.role,
@@ -1019,7 +1066,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         let out = raft.take_outbound();
         assert!(out.is_empty(), "follower must not send heartbeats");
@@ -1028,11 +1077,15 @@ mod tests {
     #[test]
     fn candidate_ignores_heartbeat_timeout() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         assert!(matches!(raft.role, Role::Candidate { .. }));
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         let out = raft.take_outbound();
         assert!(out.is_empty(), "candidate must not send heartbeats");
@@ -1057,7 +1110,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0);
+            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD);
 
             assert_eq!(
                 raft.quorum(),

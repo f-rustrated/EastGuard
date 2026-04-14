@@ -1,17 +1,20 @@
 #![allow(dead_code)]
 
+use bincode::{Decode, Encode};
+
 use crate::clusters::NodeId;
+use crate::clusters::swims::ShardGroupId;
 use crate::impl_from_variant;
 use crate::schedulers::timer::TTimer;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct LogEntry {
     pub term: u64,
     pub index: u64,
     pub command: RaftCommand,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
     /// Placeholder — real commands (CreateTopic, etc.) will be added later.
     Noop,
@@ -26,7 +29,7 @@ pub enum ProposeError {
 // RPC messages
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct RequestVote {
     pub term: u64,
     pub candidate_id: NodeId,
@@ -34,14 +37,14 @@ pub struct RequestVote {
     pub last_log_term: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct RequestVoteResponse {
     pub term: u64,
     pub node_id: NodeId,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct AppendEntries {
     pub term: u64,
     pub leader_id: NodeId,
@@ -51,7 +54,7 @@ pub struct AppendEntries {
     pub leader_commit: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct AppendEntriesResponse {
     pub term: u64,
     pub node_id: NodeId,
@@ -61,7 +64,7 @@ pub struct AppendEntriesResponse {
     pub last_log_index: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum RaftRpc {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
@@ -83,15 +86,21 @@ impl_from_variant!(
 
 #[derive(Debug)]
 pub struct OutboundRaftPacket {
+    pub shard_group_id: ShardGroupId,
     /// The intended recipient, identified by NodeId.
-    /// The actor/transport layer should resolve this to a connection.
+    /// The actor/transport layer resolves this to a connection.
     pub target: NodeId,
     pub rpc: RaftRpc,
 }
 
 impl OutboundRaftPacket {
-    pub(crate) fn new(target: NodeId, rpc: impl Into<RaftRpc>) -> Self {
+    pub(crate) fn new(
+        shard_group_id: ShardGroupId,
+        target: NodeId,
+        rpc: impl Into<RaftRpc>,
+    ) -> Self {
         Self {
+            shard_group_id,
             target,
             rpc: rpc.into(),
         }
@@ -99,13 +108,33 @@ impl OutboundRaftPacket {
 }
 
 // ---------------------------------------------------------------------------
+// Wire message (TCP framing: [4-byte len][WireRaftMessage bincode])
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct WireRaftMessage {
+    pub shard_group_id: ShardGroupId,
+    pub sender: NodeId,
+    pub rpc: RaftRpc,
+}
+
+// ---------------------------------------------------------------------------
 // Timer
 // ---------------------------------------------------------------------------
-const ELECTION_TIMEOUT_BASE_TICKS: u32 = 15; // 1.5s base
-const HEARTBEAT_INTERVAL_TICKS: u32 = 3; // 300ms
+//
+// DS-RSM is for metadata management (topic assignments, range ownership) — not
+// data-plane traffic. Consistency matters more than heartbeat latency, so we use
+// relaxed intervals to reduce per-node timer load.
+//
+// With 600 nodes × 256 vnodes, each node participates in ~768 shard groups.
+// At 1s heartbeat: ~256 leader heartbeat callbacks/sec (~512 outbound RPCs/sec).
+// Election timeout at 5s base (5× heartbeat) avoids false elections.
+const ELECTION_TIMEOUT_BASE_TICKS: u32 = 50; // 5s base (+ jitter)
+const HEARTBEAT_INTERVAL_TICKS: u32 = 10; // 1s
 
 #[derive(Debug)]
 pub struct RaftTimer {
+    shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
 }
@@ -118,9 +147,16 @@ pub enum RaftTimerKind {
 
 #[derive(Debug, Default)]
 pub enum RaftTimeoutCallback {
+    /// Emitted by Ticker's protocol-period clock. Raft has no protocol-period
+    /// concept — the actor discards this variant.
     #[default]
-    ElectionTimeout,
-    HeartbeatTimeout,
+    Ignored,
+    ElectionTimeout {
+        shard_group_id: ShardGroupId,
+    },
+    HeartbeatTimeout {
+        shard_group_id: ShardGroupId,
+    },
 }
 
 impl TTimer for RaftTimer {
@@ -133,8 +169,12 @@ impl TTimer for RaftTimer {
 
     fn to_timeout_callback(self, _seq: u32) -> RaftTimeoutCallback {
         match self.kind {
-            RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout,
-            RaftTimerKind::Heartbeat => RaftTimeoutCallback::HeartbeatTimeout,
+            RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: self.shard_group_id,
+            },
+            RaftTimerKind::Heartbeat => RaftTimeoutCallback::HeartbeatTimeout {
+                shard_group_id: self.shard_group_id,
+            },
         }
     }
 
@@ -145,15 +185,17 @@ impl TTimer for RaftTimer {
 }
 
 impl RaftTimer {
-    pub fn election(jitter_ticks: u32) -> Self {
+    pub fn election(jitter_ticks: u32, shard_group_id: ShardGroupId) -> Self {
         Self {
+            shard_group_id,
             kind: RaftTimerKind::Election,
             ticks_remaining: ELECTION_TIMEOUT_BASE_TICKS + jitter_ticks,
         }
     }
 
-    pub fn heartbeat() -> Self {
+    pub fn heartbeat(shard_group_id: ShardGroupId) -> Self {
         Self {
+            shard_group_id,
             kind: RaftTimerKind::Heartbeat,
             ticks_remaining: HEARTBEAT_INTERVAL_TICKS,
         }
