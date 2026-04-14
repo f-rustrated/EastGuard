@@ -25,7 +25,7 @@ and truncation correctness. It should have no knowledge of other components.
 | Type | File |
 |---|---|
 | `LogStore` | `src/storage/mod.rs` |
-| `FileLogStore` | `src/storage/disk.rs` |
+| `FileLogStore` | `src/storage/file.rs` |
 | `MemoryLogStore` | `src/storage/memory.rs` |
 
 ## Open TODOs

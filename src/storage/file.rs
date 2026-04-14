@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use crate::raft::interface::{LogError, LogStore};
@@ -26,10 +26,9 @@ const DATA_LOG: &str = "data.log";
 const INDEX_LOG: &str = "index.log";
 const INDEX_ENTRY_SIZE: u64 = size_of::<u64>() as u64;
 
-// No file handles kept open; the OS page cache handles read-after-write.
 pub struct FileLogStore {
-    data_path: PathBuf,
-    index_path: PathBuf,
+    data_file: File,
+    index_file: File,
     // TODO: first_index > 1 once snapshot support is added (Phase 2).
     first_index: Index,
     num_entries: u64,
@@ -40,21 +39,23 @@ impl FileLogStore {
     pub fn open(base_dir: impl Into<PathBuf>) -> Result<Self, LogError> {
         let base_dir = base_dir.into();
         fs::create_dir_all(&base_dir)?;
-        let data_path = base_dir.join(DATA_LOG);
-        let index_path = base_dir.join(INDEX_LOG);
-        let num_entries = if index_path.exists() {
-            fs::metadata(&index_path)?.len() / INDEX_ENTRY_SIZE
-        } else {
-            0
-        };
-        let data_bytes = if data_path.exists() {
-            fs::metadata(&data_path)?.len()
-        } else {
-            0
-        };
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base_dir.join(DATA_LOG))?;
+        let index_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base_dir.join(INDEX_LOG))?;
+        let num_entries = index_file.metadata()?.len() / INDEX_ENTRY_SIZE;
+        let data_bytes = data_file.metadata()?.len();
         Ok(Self {
-            data_path,
-            index_path,
+            data_file,
+            index_file,
             first_index: 1,
             num_entries,
             data_bytes,
@@ -66,10 +67,9 @@ impl FileLogStore {
     }
 
     fn read_offset_at(&self, pos: u64) -> Result<u64, LogError> {
-        let mut f = File::open(&self.index_path)?;
-        f.seek(SeekFrom::Start(pos * INDEX_ENTRY_SIZE))?;
         let mut buf = [0u8; size_of::<u64>()];
-        f.read_exact(&mut buf)
+        self.index_file
+            .read_at(&mut buf, pos * INDEX_ENTRY_SIZE)
             .map_err(|e| LogError::Corruption(format!("index.log: {e}")))?;
         Ok(u64::from_le_bytes(buf))
     }
@@ -81,24 +81,15 @@ impl LogStore for FileLogStore {
         let byte_offset = self.data_bytes;
         debug_assert_eq!(
             self.data_bytes,
-            if self.data_path.exists() {
-                fs::metadata(&self.data_path).unwrap().len()
-            } else {
-                0
-            },
+            self.data_file.metadata().map(|m| m.len()).unwrap_or(0),
             "data_bytes cache diverged from actual data.log size"
         );
-        let mut dat = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.data_path)?;
-        dat.write_all(&(raw.data.len() as EntryLen).to_le_bytes())?;
-        dat.write_all(&raw.data)?;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.index_path)?
-            .write_all(&byte_offset.to_le_bytes())?;
+        self.data_file
+            .write_at(&(raw.data.len() as EntryLen).to_le_bytes(), byte_offset)?;
+        self.data_file
+            .write_at(&raw.data, byte_offset + size_of::<EntryLen>() as u64)?;
+        self.index_file
+            .write_at(&byte_offset.to_le_bytes(), self.num_entries * INDEX_ENTRY_SIZE)?;
         self.data_bytes += size_of::<EntryLen>() as u64 + raw.data.len() as u64;
         self.num_entries += 1;
         Ok(())
@@ -117,30 +108,28 @@ impl LogStore for FileLogStore {
         let end = end.min(last);
         let count = (end - start + 1) as usize;
 
-        // One seek into index.log to find the byte offset of `start` in data.log,
-        // then one sequential pass through data.log — O(1) file opens regardless of range size.
+        // One read from index.log to find the byte offset of `start` in data.log,
+        // then sequential positioned reads through data.log — O(1) fd opens regardless of range size.
         let start_pos = start - self.first_index;
-        let byte_offset = self.read_offset_at(start_pos)?;
-        let mut data_file = File::open(&self.data_path)?;
-        data_file.seek(SeekFrom::Start(byte_offset))?;
+        let mut current_offset = self.read_offset_at(start_pos)?;
 
         let mut entries = Vec::with_capacity(count);
         for i in 0..count as u64 {
             let mut len_buf = [0u8; size_of::<EntryLen>()];
-            data_file.read_exact(&mut len_buf).map_err(|e| {
-                LogError::Corruption(format!("data.log len at index {}: {e}", start + i))
-            })?;
-            let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
-            data_file.read_exact(&mut data).map_err(|e| {
-                LogError::Corruption(format!("data.log data at index {}: {e}", start + i))
-            })?;
-            entries.push(
-                Entry {
-                    index: start + i,
-                    data,
-                }
-                .into_log_entry()?,
-            );
+            self.data_file
+                .read_at(&mut len_buf, current_offset)
+                .map_err(|e| {
+                    LogError::Corruption(format!("data.log len at index {}: {e}", start + i))
+                })?;
+            let entry_len = EntryLen::from_le_bytes(len_buf) as usize;
+            let mut data = vec![0u8; entry_len];
+            self.data_file
+                .read_at(&mut data, current_offset + size_of::<EntryLen>() as u64)
+                .map_err(|e| {
+                    LogError::Corruption(format!("data.log data at index {}: {e}", start + i))
+                })?;
+            current_offset += size_of::<EntryLen>() as u64 + entry_len as u64;
+            entries.push(Entry { index: start + i, data }.into_log_entry()?);
         }
 
         Ok(entries)
@@ -155,13 +144,14 @@ impl LogStore for FileLogStore {
             return Ok(None);
         }
         let byte_offset = self.read_offset_at(pos)?;
-        let mut f = File::open(&self.data_path)?;
-        f.seek(SeekFrom::Start(byte_offset))?;
         let mut len_buf = [0u8; size_of::<EntryLen>()];
-        f.read_exact(&mut len_buf)
+        self.data_file
+            .read_at(&mut len_buf, byte_offset)
             .map_err(|e| LogError::Corruption(format!("data.log len: {e}")))?;
-        let mut data = vec![0u8; EntryLen::from_le_bytes(len_buf) as usize];
-        f.read_exact(&mut data)
+        let entry_len = EntryLen::from_le_bytes(len_buf) as usize;
+        let mut data = vec![0u8; entry_len];
+        self.data_file
+            .read_at(&mut data, byte_offset + size_of::<EntryLen>() as u64)
             .map_err(|e| LogError::Corruption(format!("data.log data: {e}")))?;
         Ok(Some(Entry { index, data }.into_log_entry()?))
     }
@@ -183,30 +173,17 @@ impl LogStore for FileLogStore {
         }
         // pos = number of entries to keep; 0 means truncate everything.
         let pos = from - self.first_index;
-        let new_data_size = if pos == 0 {
-            0
-        } else {
-            self.read_offset_at(pos)?
-        };
-        OpenOptions::new()
-            .write(true)
-            .open(&self.data_path)?
-            .set_len(new_data_size)?;
-        OpenOptions::new()
-            .write(true)
-            .open(&self.index_path)?
-            .set_len(pos * INDEX_ENTRY_SIZE)?;
+        let new_data_size = if pos == 0 { 0 } else { self.read_offset_at(pos)? };
+        self.data_file.set_len(new_data_size)?;
+        self.index_file.set_len(pos * INDEX_ENTRY_SIZE)?;
         self.num_entries = pos;
         self.data_bytes = new_data_size;
         Ok(())
     }
 
     fn sync(&mut self) -> Result<(), LogError> {
-        for path in [&self.data_path, &self.index_path] {
-            if path.exists() {
-                OpenOptions::new().write(true).open(path)?.sync_all()?;
-            }
-        }
+        self.data_file.sync_all()?;
+        self.index_file.sync_all()?;
         Ok(())
     }
 }

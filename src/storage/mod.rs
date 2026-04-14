@@ -32,10 +32,13 @@ impl Entry {
         }
 
         let command = match self.data.first() {
-            Some(0x00) | None => RaftCommand::Noop,
+            Some(0x00) => RaftCommand::Noop,
             Some(&b) => Err(LogError::Corruption(format!(
                 "unknown command discriminant: 0x{b:02x}"
             )))?,
+            None => Err(LogError::Corruption(format!(
+                "empty data"
+            )))?
         };
 
         let term = u64::from_le_bytes(
