@@ -2,13 +2,14 @@
 EastGuard is a zero-controller messaging system designed for flexible scalability and high operability. This project is significantly inspired by the architecture of LinkedIn's Northguard.
 
 
-# Skill Routing
+# Rule Routing
 When working on specific tasks, you MUST read the following skill files before writing code:
 
-- **Scheduler**: If system needs to trigger certain event later, read `.agent-skills/scheduler-skill.md`.
-- **Swim**: If cluster membership logics need to be updated, read `.agent-skills/swim-skill.md`.
-- **Raft**: If consensus, leader election, log replication, or shard state machine logics need to be updated, read `.agent-skills/raft-skill.md`.
-- **Raft Actor**: If wiring Raft to the network, managing shard group lifecycle, or integrating Raft with SWIM, read `.agent-skills/raft-actor-skill.md`.
+- **Scheduler**: If system needs to trigger certain event later, read `rules/scheduler-skill.md`.
+- **Swim**: If cluster membership logics need to be updated, read `rules/swim-skill.md`.
+- **Raft**: If consensus, leader election, log replication, or shard state machine logics need to be updated, read `rules/raft-skill.md`.
+- **Raft Actor**: If wiring Raft to the network, managing shard group lifecycle, or integrating Raft with SWIM, read `rules/raft-actor-skill.md`.
+
 
 # Code Quality
 
