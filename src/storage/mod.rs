@@ -36,7 +36,7 @@ impl Entry {
             Some(&b) => Err(LogError::Corruption(format!(
                 "unknown command discriminant: 0x{b:02x}"
             )))?,
-            None => Err(LogError::Corruption("empty data".to_string()))?
+            None => Err(LogError::Corruption("empty data".to_string()))?,
         };
 
         let term = u64::from_le_bytes(
