@@ -10,33 +10,20 @@ use tokio::sync::mpsc;
 // PROTOCOL LAYER (SWIM Actor)
 // ==========================================
 
-pub struct SwimActor {
-    mailbox: mpsc::Receiver<SwimCommand>,
-    transport_tx: mpsc::Sender<OutboundPacket>,
-    scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
-    raft_tx: mpsc::Sender<RaftCommand>,
-}
+pub struct SwimActor;
 
 impl SwimActor {
-    pub fn new(
-        mailbox: mpsc::Receiver<SwimCommand>,
+    pub async fn run(
+        mut mailbox: mpsc::Receiver<SwimCommand>,
+        mut state: Swim,
         transport_tx: mpsc::Sender<OutboundPacket>,
-        ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+        scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         raft_tx: mpsc::Sender<RaftCommand>,
-    ) -> Self {
-        Self {
-            mailbox,
-            transport_tx,
-            scheduler_tx: ticker_tx,
-            raft_tx,
-        }
-    }
-
-    pub async fn run(mut self, mut state: Swim) {
+    ) {
         tracing::info!("[{}] SwimActor started.", state.node_id);
-        self.flush_outbound_commands(&mut state).await;
+        Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
 
-        while let Some(event) = self.mailbox.recv().await {
+        while let Some(event) = mailbox.recv().await {
             match event {
                 SwimCommand::PacketReceived { src, packet } => {
                     state.step(src, packet);
@@ -48,19 +35,30 @@ impl SwimActor {
                 SwimCommand::Query(command) => state.handle_query(command),
             }
 
-            self.flush_outbound_commands(&mut state).await;
+            Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
         }
     }
 
-    async fn flush_outbound_commands(&mut self, state: &mut Swim) {
+    async fn flush(
+        state: &mut Swim,
+        transport_tx: &mpsc::Sender<OutboundPacket>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<SwimTimer>>,
+        raft_tx: &mpsc::Sender<RaftCommand>,
+    ) {
         let timer_commands = state.take_timer_commands();
         let outbound_packets = state.take_outbound();
         let membership_events = state.take_membership_events();
 
         // Translate membership events into RaftActor commands.
         // Topology is available synchronously via state.topology — no async roundtrip.
+        // Skip events about our own node — self-registration at startup is not a
+        // membership change that Raft needs to act on.
         let raft_commands: Vec<RaftCommand> = membership_events
             .into_iter()
+            .filter(|event| match event {
+                MembershipEvent::NodeAlive { node_id, .. }
+                | MembershipEvent::NodeDead { node_id } => *node_id != state.node_id,
+            })
             .filter_map(|event| match event {
                 MembershipEvent::NodeDead { node_id } => Some(RaftCommand::HandleNodeDeath {
                     dead_node_id: node_id,
@@ -82,18 +80,18 @@ impl SwimActor {
             async {
                 for cmd in timer_commands {
                     tracing::debug!("[TIMER] {}", cmd);
-                    let _ = self.scheduler_tx.send(cmd.into()).await;
+                    let _ = scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {
                 for pkt in outbound_packets {
                     tracing::debug!("[PACKET] {}", pkt);
-                    let _ = self.transport_tx.send(pkt).await;
+                    let _ = transport_tx.send(pkt).await;
                 }
             },
             async {
                 for cmd in raft_commands {
-                    let _ = self.raft_tx.send(cmd).await;
+                    let _ = raft_tx.send(cmd).await;
                 }
             }
         );

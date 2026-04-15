@@ -117,6 +117,16 @@ impl OutboundRaftPacket {
     }
 }
 
+/// Commands sent from RaftActor to RaftTransportActor.
+#[derive(Debug)]
+pub enum RaftTransportCommand {
+    /// Send an RPC to a peer.
+    Send(OutboundRaftPacket),
+    /// Drop connection and cached address for a dead peer.
+    /// Prevents stale RPCs from flooding a restarted node at the same address.
+    DisconnectPeer(NodeId),
+}
+
 // ---------------------------------------------------------------------------
 // Wire message (TCP framing: [4-byte len][WireRaftMessage bincode])
 // ---------------------------------------------------------------------------

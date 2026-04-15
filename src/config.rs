@@ -87,15 +87,24 @@ impl Environment {
 
         // 2. Ensure data directory exists
         if let Err(e) = fs::create_dir_all(&env.data_dir) {
-            tracing::error!("Warning: Could not create directory '{}': {}", env.data_dir, e);
+            panic!(
+                "Warning: Could not create directory '{}': {}",
+                env.data_dir, e
+            );
         }
 
         // Validate write permissions
         let test_file = format!("{}/.write_test", env.data_dir);
-        if OpenOptions::new().write(true).create(true).truncate(true).open(&test_file).is_ok() {
+        if OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&test_file)
+            .is_ok()
+        {
             let _ = fs::remove_file(test_file);
         } else {
-            tracing::error!(
+            panic!(
                 "Warning: Server directory '{}' may not be writable.",
                 env.data_dir
             );
@@ -115,11 +124,27 @@ impl Environment {
 
     /// The address gossiped to cluster peers — must be routable by other nodes.
     /// Defaults to `host:cluster_port` when `advertise_host` is not set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resulting advertise address is `0.0.0.0`, which is non-routable
+    /// and would cause peers to send probes to an unreachable destination.
     pub(crate) fn advertise_peer_addr(&self) -> std::net::SocketAddr {
         let host = self.advertise_host.as_deref().unwrap_or(&self.host);
-        format!("{}:{}", host, self.cluster_port)
+        let addr: std::net::SocketAddr = format!("{}:{}", host, self.cluster_port)
             .parse()
-            .expect("Invalid advertise peer address")
+            .expect("Invalid advertise peer address");
+
+        if addr.ip().is_unspecified() {
+            panic!(
+                "Advertise address {} is non-routable. \
+                 Set --advertise-host to a routable IP (e.g. 127.0.0.1 for local dev, \
+                 or the node's real IP for production).",
+                addr
+            );
+        }
+
+        addr
     }
 
     /// Returns the node identity for this process start.
@@ -163,6 +188,7 @@ impl Environment {
             ),
             rng_seed,
         )
+        .bootstrap(self.bootstrap_servers())
     }
 }
 
