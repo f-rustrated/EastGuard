@@ -8,7 +8,7 @@ pub(crate) const COMMAND_LEN: usize = 1;
 /// Bytes reserved for the term (u64 little-endian).
 pub(crate) const TERM_LEN: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct LogEntry {
     pub term: u64,
     pub index: u64,

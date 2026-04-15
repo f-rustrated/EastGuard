@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
 use crate::raft::interface::LogStore;
-use crate::raft::log::{LogEntry};
+use crate::raft::log::{LogEntry, RaftLog};
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
 use crate::storage::MemoryLogStore;
@@ -254,6 +254,7 @@ impl<S: LogStore> Raft<S> {
 
     fn become_leader(&mut self) {
         self.role = Role::Leader;
+        self.current_leader = Some(self.node_id.clone());
 
         // Cancel election timer, start heartbeat timer.
         self.cancel_all_timers();
@@ -422,6 +423,7 @@ impl<S: LogStore> Raft<S> {
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             target,
             AppendEntriesResponse {
                 term: self.current_term,
@@ -542,17 +544,17 @@ mod tests {
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
     }
-    
+
     const TEST_SHARD: ShardGroupId = ShardGroupId(0);
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0)
+        Raft::new(node("node-1"), HashSet::new(), 0, MemoryLogStore::default(), TEST_SHARD)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0)
+        Raft::new(node(id), peers, 0, MemoryLogStore::default(), TEST_SHARD)
     }
 
     // -------------------------------------------------------------------
@@ -564,7 +566,7 @@ mod tests {
         let mut raft = single_node_raft();
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout { shard_group_id: TEST_SHARD });
 
         assert_eq!(raft.role, Role::Leader);
         assert_eq!(raft.current_term, 1);
@@ -783,7 +785,7 @@ mod tests {
         let _ = raft.take_outbound();
 
         // Subsequent heartbeats are empty
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout { shard_group_id: TEST_SHARD });
         let out = raft.take_outbound();
         assert_eq!(out.len(), 2);
         for pkt in &out {
