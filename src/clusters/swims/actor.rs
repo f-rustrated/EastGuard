@@ -23,18 +23,14 @@ impl SwimActor {
         tracing::info!("[{}] SwimActor started.", state.node_id);
         Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
 
-        while let Some(event) = mailbox.recv().await {
-            match event {
-                SwimCommand::PacketReceived { src, packet } => {
-                    state.step(src, packet);
-                }
-
-                SwimCommand::Timeout(tick_event) => {
-                    state.handle_timeout(tick_event);
-                }
-                SwimCommand::Query(command) => state.handle_query(command),
+        let mut buf = Vec::with_capacity(64);
+        loop {
+            if mailbox.recv_many(&mut buf, 64).await == 0 {
+                break;
             }
-
+            for event in buf.drain(..) {
+                state.process(event);
+            }
             Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
         }
     }

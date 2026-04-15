@@ -52,99 +52,35 @@ impl RaftReader {
     }
 }
 
-struct RaftWriter(OwnedWriteHalf);
-
-impl RaftWriter {
-    async fn write_node_id(&mut self, node_id: &NodeId) -> std::io::Result<()> {
-        let bytes = bincode::encode_to_vec(node_id, BINCODE_CONFIG)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let len = bytes.len() as u32;
-        self.0.write_all(&len.to_be_bytes()).await?;
-        self.0.write_all(&bytes).await?;
-        Ok(())
-    }
-
-    async fn write_message(&mut self, msg: &WireRaftMessage) -> std::io::Result<()> {
-        let bytes = bincode::encode_to_vec(msg, BINCODE_CONFIG)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let len = bytes.len() as u32;
-        self.0.write_all(&len.to_be_bytes()).await?;
-        self.0.write_all(&bytes).await?;
-        Ok(())
-    }
-}
-
-/// TCP transport for Raft RPCs.
+/// Manages peer connections, address resolution, and dead-peer tracking.
 ///
-/// Either side can initiate a connection. On simultaneous connect, the
-/// connection initiated by the **lower `NodeId`** wins; the other is dropped.
+/// On simultaneous connect, the connection initiated by the **lower `NodeId`**
+/// wins; the other is dropped.
 ///
 /// Handshake: after connecting, the initiator sends its `NodeId`. The acceptor
 /// reads it, and if a connection to that peer already exists (from our own
 /// outbound connect), the tie is broken by NodeId ordering.
-pub struct RaftTransportActor;
+struct RaftWriters {
+    node_id: NodeId,
+    writers: HashMap<NodeId, OwnedWriteHalf>,
+    addr_cache: HashMap<NodeId, SocketAddr>,
+    /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
+    /// to these peers are silently dropped until a new connection is
+    /// accepted (peer restart with new UUID won't hit this — different NodeId).
+    dead_peers: HashSet<NodeId>,
+}
 
-impl RaftTransportActor {
-    pub async fn run(
-        node_id: NodeId,
-        listener: TcpListener,
-        raft_tx: mpsc::Sender<RaftCommand>,
-        mut from_actor: mpsc::Receiver<RaftTransportCommand>,
-        swim_tx: mpsc::Sender<SwimCommand>,
-    ) {
-        let mut writers: HashMap<NodeId, RaftWriter> = HashMap::new();
-        let mut addr_cache: HashMap<NodeId, SocketAddr> = HashMap::new();
-        // Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
-        // to these peers are silently dropped until a new connection is
-        // accepted (peer restart with new UUID won't hit this — different NodeId).
-        let mut dead_peers: HashSet<NodeId> = HashSet::new();
-        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        cleanup_interval.tick().await; // consume immediate first tick
-
-        loop {
-            tokio::select! {
-                Ok((stream, _)) = listener.accept() => {
-                    Self::handle_accepted(
-                        stream, &node_id, &raft_tx, &mut writers,
-                    ).await;
-                }
-                Some(cmd) = from_actor.recv() => {
-                    match cmd {
-                        RaftTransportCommand::Send(pkt) => {
-                            if dead_peers.contains(&pkt.target) {
-                                continue;
-                            }
-                            Self::handle_outbound(
-                                pkt, &node_id, &raft_tx, &swim_tx,
-                                &mut writers, &mut addr_cache,
-                            ).await;
-                        }
-                        RaftTransportCommand::DisconnectPeer(peer_id) => {
-                            writers.remove(&peer_id);
-                            addr_cache.remove(&peer_id);
-                            dead_peers.insert(peer_id.clone());
-                            tracing::info!(
-                                "[{}] Disconnected dead peer {:?}",
-                                node_id, peer_id
-                            );
-                        }
-                    }
-                }
-                _ = cleanup_interval.tick() => {
-                    if !dead_peers.is_empty() {
-                        dead_peers.clear();
-                    }
-                }
-            }
+impl RaftWriters {
+    fn new(node_id: NodeId) -> Self {
+        Self {
+            node_id,
+            writers: HashMap::new(),
+            addr_cache: HashMap::new(),
+            dead_peers: HashSet::new(),
         }
     }
 
-    async fn handle_accepted(
-        stream: TcpStream,
-        node_id: &NodeId,
-        raft_tx: &mpsc::Sender<RaftCommand>,
-        writers: &mut HashMap<NodeId, RaftWriter>,
-    ) {
+    async fn accept(&mut self, stream: TcpStream, raft_tx: &mpsc::Sender<RaftCommand>) {
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftReader(read_half);
 
@@ -152,66 +88,94 @@ impl RaftTransportActor {
             return;
         };
 
-        if writers.contains_key(&peer_id) && peer_id > *node_id {
+        if self.writers.contains_key(&peer_id) && peer_id > self.node_id {
             return;
         }
 
-        writers.insert(peer_id, RaftWriter(write_half));
+        self.writers.insert(peer_id, write_half);
         tokio::spawn(reader.run(raft_tx.clone()));
     }
 
-    async fn handle_outbound(
-        pkt: OutboundRaftPacket,
-        node_id: &NodeId,
+    /// Send a batch of outbound packets, grouping by target NodeId.
+    /// Encodes all messages per target into a single buffer, writes once.
+    async fn send(
+        &mut self,
+        packets: Vec<OutboundRaftPacket>,
         raft_tx: &mpsc::Sender<RaftCommand>,
         swim_tx: &mpsc::Sender<SwimCommand>,
-        writers: &mut HashMap<NodeId, RaftWriter>,
-        addr_cache: &mut HashMap<NodeId, SocketAddr>,
     ) {
-        let target_id = pkt.target.clone();
-        let wire_msg = WireRaftMessage {
-            shard_group_id: pkt.shard_group_id,
-            sender: node_id.clone(),
-            rpc: pkt.rpc,
-        };
-
-        if let Some(writer) = writers.get_mut(&target_id) {
-            if writer.write_message(&wire_msg).await.is_ok() {
-                return;
+        // Group by target — flush_dirty already groups, but be defensive.
+        let mut by_target: HashMap<NodeId, Vec<WireRaftMessage>> = HashMap::new();
+        for pkt in packets {
+            if self.dead_peers.contains(&pkt.target) {
+                continue;
             }
-            writers.remove(&target_id);
+            by_target
+                .entry(pkt.target)
+                .or_default()
+                .push(WireRaftMessage {
+                    shard_group_id: pkt.shard_group_id,
+                    sender: self.node_id.clone(),
+                    rpc: pkt.rpc,
+                });
         }
 
-        let Some(target_addr) = Self::resolve_address(&target_id, swim_tx, addr_cache).await else {
-            tracing::warn!("Cannot resolve address for {:?}", target_id);
-            return;
-        };
+        for (target_id, msgs) in by_target {
+            // Try existing writer
+            if let Some(writer) = self.writers.get_mut(&target_id) {
+                if Self::write_messages(writer, &msgs).await.is_ok() {
+                    continue;
+                }
+                self.writers.remove(&target_id);
+            }
 
-        let Ok(stream) = TcpStream::connect(target_addr).await else {
-            tracing::warn!("Failed to connect to {} ({:?})", target_addr, target_id);
-            return;
-        };
+            // Establish new connection
+            let Some(target_addr) = self.resolve_address(&target_id, swim_tx).await else {
+                tracing::warn!("Cannot resolve address for {:?}", target_id);
+                continue;
+            };
 
-        let (read_half, write_half) = stream.into_split();
-        let mut writer = RaftWriter(write_half);
+            let Ok(stream) = TcpStream::connect(target_addr).await else {
+                tracing::warn!("Failed to connect to {} ({:?})", target_addr, target_id);
+                continue;
+            };
 
-        if writer.write_node_id(node_id).await.is_err() {
-            return;
+            let (read_half, write_half) = stream.into_split();
+            let mut writer = write_half;
+
+            if Self::write_node_id(&mut writer, &self.node_id)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
+
+            if Self::write_messages(&mut writer, &msgs).await.is_err() {
+                continue;
+            }
+            self.writers.insert(target_id, writer);
         }
+    }
 
-        tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
-        if writer.write_message(&wire_msg).await.is_err() {
-            return;
-        }
-        writers.insert(target_id, writer);
+    fn disconnect(&mut self, peer_id: NodeId) {
+        self.writers.remove(&peer_id);
+        self.addr_cache.remove(&peer_id);
+        tracing::info!("[{}] Disconnected dead peer {:?}", self.node_id, peer_id);
+        self.dead_peers.insert(peer_id);
+    }
+
+    fn cleanup_dead_peers(&mut self) {
+        self.dead_peers.clear();
     }
 
     async fn resolve_address(
+        &mut self,
         node_id: &NodeId,
         swim_tx: &mpsc::Sender<SwimCommand>,
-        addr_cache: &mut HashMap<NodeId, SocketAddr>,
     ) -> Option<SocketAddr> {
-        if let Some(&addr) = addr_cache.get(node_id) {
+        if let Some(&addr) = self.addr_cache.get(node_id) {
             return Some(addr);
         }
 
@@ -226,10 +190,76 @@ impl RaftTransportActor {
         }
 
         if let Ok(Some(addr)) = rx.await {
-            addr_cache.insert(node_id.clone(), addr);
+            self.addr_cache.insert(node_id.clone(), addr);
             Some(addr)
         } else {
             None
+        }
+    }
+
+    // --- Wire helpers ---
+
+    async fn write_node_id(writer: &mut OwnedWriteHalf, node_id: &NodeId) -> std::io::Result<()> {
+        let bytes = bincode::encode_to_vec(node_id, BINCODE_CONFIG)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_be_bytes()).await?;
+        writer.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    /// Encode all messages into a single buffer, write once.
+    async fn write_messages(
+        writer: &mut OwnedWriteHalf,
+        msgs: &[WireRaftMessage],
+    ) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        for msg in msgs {
+            let bytes = bincode::encode_to_vec(msg, BINCODE_CONFIG)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let len = bytes.len() as u32;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        writer.write_all(&buf).await?;
+        Ok(())
+    }
+}
+
+/// Thin async boundary — select loop over listener and actor commands.
+pub struct RaftTransportActor;
+
+impl RaftTransportActor {
+    pub async fn run(
+        node_id: NodeId,
+        listener: TcpListener,
+        raft_tx: mpsc::Sender<RaftCommand>,
+        mut from_actor: mpsc::Receiver<RaftTransportCommand>,
+        swim_tx: mpsc::Sender<SwimCommand>,
+    ) {
+        let mut state = RaftWriters::new(node_id);
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        cleanup_interval.tick().await; // consume immediate first tick
+
+        loop {
+            tokio::select! {
+                Ok((stream, _)) = listener.accept() => {
+                    state.accept(stream, &raft_tx).await;
+                }
+                Some(cmd) = from_actor.recv() => {
+                    match cmd {
+                        RaftTransportCommand::Send(packets) => {
+                            state.send(packets, &raft_tx, &swim_tx).await;
+                        }
+                        RaftTransportCommand::DisconnectPeer(peer_id) => {
+                            state.disconnect(peer_id);
+                        }
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    state.cleanup_dead_peers();
+                }
+            }
         }
     }
 }
@@ -262,10 +292,9 @@ mod tests {
         sim.host("client", || async {
             let addr = turmoil::lookup("server");
             let stream = TcpStream::connect((addr, 9000)).await?;
-            let (_, write_half) = stream.into_split();
-            let mut writer = RaftWriter(write_half);
+            let (_, mut write_half) = stream.into_split();
 
-            writer.write_node_id(&NodeId::new("node-abc")).await?;
+            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-abc")).await?;
             Ok(())
         });
 
@@ -300,11 +329,11 @@ mod tests {
         sim.host("client", || async {
             let addr = turmoil::lookup("server");
             let stream = TcpStream::connect((addr, 9000)).await?;
-            let (_, write_half) = stream.into_split();
-            let mut writer = RaftWriter(write_half);
+            let (_, mut write_half) = stream.into_split();
 
-            writer
-                .write_message(&WireRaftMessage {
+            RaftWriters::write_messages(
+                &mut write_half,
+                &[WireRaftMessage {
                     shard_group_id: ShardGroupId(42),
                     sender: NodeId::new("sender-1"),
                     rpc: RaftRpc::RequestVote(RequestVote {
@@ -313,8 +342,9 @@ mod tests {
                         last_log_index: 10,
                         last_log_term: 3,
                     }),
-                })
-                .await?;
+                }],
+            )
+            .await?;
             Ok(())
         });
 
@@ -330,14 +360,13 @@ mod tests {
         sim.host("acceptor", || async {
             let (raft_tx, _raft_rx) = mpsc::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
-            let mut writers: HashMap<NodeId, RaftWriter> = HashMap::new();
-            let node_id = NodeId::new("node-b");
+            let mut state = RaftWriters::new(NodeId::new("node-b"));
 
             let (stream, _) = listener.accept().await?;
-            RaftTransportActor::handle_accepted(stream, &node_id, &raft_tx, &mut writers).await;
+            state.accept(stream, &raft_tx).await;
 
             assert!(
-                writers.contains_key(&NodeId::new("node-a")),
+                state.writers.contains_key(&NodeId::new("node-a")),
                 "writer should be registered after handshake"
             );
             Ok(())
@@ -346,9 +375,8 @@ mod tests {
         sim.host("initiator", || async {
             let addr = turmoil::lookup("acceptor");
             let stream = TcpStream::connect((addr, 9000)).await?;
-            let (_, write_half) = stream.into_split();
-            let mut writer = RaftWriter(write_half);
-            writer.write_node_id(&NodeId::new("node-a")).await?;
+            let (_, mut write_half) = stream.into_split();
+            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-a")).await?;
             Ok(())
         });
 
@@ -369,13 +397,12 @@ mod tests {
             let (raft_tx, _raft_rx) = mpsc::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
-            let mut writers: HashMap<NodeId, RaftWriter> = HashMap::new();
-            let node_id = NodeId::new("node-b");
+            let mut state = RaftWriters::new(NodeId::new("node-b"));
 
             // First connection from node-a
             let (stream, _) = listener.accept().await?;
-            RaftTransportActor::handle_accepted(stream, &node_id, &raft_tx, &mut writers).await;
-            assert!(writers.contains_key(&NodeId::new("node-a")));
+            state.accept(stream, &raft_tx).await;
+            assert!(state.writers.contains_key(&NodeId::new("node-a")));
 
             // Second connection from node-a (simulating simultaneous connect)
             let (stream2, _) = dummy_listener.accept().await?;
@@ -385,7 +412,8 @@ mod tests {
             assert_eq!(peer_id, NodeId::new("node-a"));
 
             // Conflict: node-a < node-b → incoming wins, replace
-            let should_drop = writers.contains_key(&peer_id) && peer_id > NodeId::new("node-b");
+            let should_drop =
+                state.writers.contains_key(&peer_id) && peer_id > NodeId::new("node-b");
             assert!(
                 !should_drop,
                 "lower NodeId's connection should NOT be dropped"
@@ -398,14 +426,12 @@ mod tests {
             let addr = turmoil::lookup("node-b");
 
             let stream1 = TcpStream::connect((addr, 9000)).await?;
-            let (_, write_half) = stream1.into_split();
-            let mut writer = RaftWriter(write_half);
-            writer.write_node_id(&NodeId::new("node-a")).await?;
+            let (_, mut write_half) = stream1.into_split();
+            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-a")).await?;
 
             let stream2 = TcpStream::connect((addr, 9001)).await?;
-            let (_, write_half2) = stream2.into_split();
-            let mut writer2 = RaftWriter(write_half2);
-            writer2.write_node_id(&NodeId::new("node-a")).await?;
+            let (_, mut write_half2) = stream2.into_split();
+            RaftWriters::write_node_id(&mut write_half2, &NodeId::new("node-a")).await?;
 
             Ok(())
         });

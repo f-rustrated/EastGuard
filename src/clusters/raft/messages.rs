@@ -120,8 +120,9 @@ impl OutboundRaftPacket {
 /// Commands sent from RaftActor to RaftTransportActor.
 #[derive(Debug)]
 pub enum RaftTransportCommand {
-    /// Send an RPC to a peer.
-    Send(OutboundRaftPacket),
+    /// Send RPCs to peers. Aggregated by RaftGroups across shard groups
+    /// to reduce channel sends — packets grouped by target NodeId.
+    Send(Vec<OutboundRaftPacket>),
     /// Drop connection and cached address for a dead peer.
     /// Prevents stale RPCs from flooding a restarted node at the same address.
     DisconnectPeer(NodeId),
