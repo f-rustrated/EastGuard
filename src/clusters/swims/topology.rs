@@ -3,17 +3,35 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::SocketAddr;
 
+use bincode::{Decode, Encode};
+
 use crate::clusters::{NodeId, SwimNodeState};
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
 /// virtual node on the consistent hash ring for a given key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct ShardGroupId(pub u64);
+
+impl ShardGroupId {
+    fn new(key: &[u8]) -> Self {
+        Self(hash_stable(key) as u64)
+    }
+    pub(crate) fn token(&self, local_seq: u32) -> ShardToken {
+        ShardToken {
+            group_id: self.0,
+            local_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShardToken {
+    group_id: u64,
+    local_seq: u32,
+}
 
 /// A shard group: the set of physical nodes responsible for a key range on the ring.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ShardGroup {
     pub id: ShardGroupId,
     pub members: Vec<NodeId>,
@@ -162,10 +180,9 @@ impl Topology {
         let owners = self
             .ring
             .token_owners_for(key, self.config.replication_factor);
-        let id = ShardGroupId(hash_stable(key) as u64);
         ShardGroup {
-            id,
             members: owners.into_iter().map(|vn| vn.pnode_id.clone()).collect(),
+            id: ShardGroupId::new(key),
         }
     }
 

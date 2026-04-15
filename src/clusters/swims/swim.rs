@@ -76,7 +76,12 @@ pub struct Swim {
 }
 
 impl Swim {
-    pub fn new(node_id: NodeId, advertise_addr: SocketAddr, topology: Topology, rng_seed: u64) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        advertise_addr: SocketAddr,
+        topology: Topology,
+        rng_seed: u64,
+    ) -> Self {
         let mut swim = Self {
             node_id,
             advertise_addr,
@@ -165,6 +170,10 @@ impl Swim {
             }
             SwimQueryCommand::GetTopology { reply } => {
                 let _ = reply.send(self.topology.clone());
+            }
+            SwimQueryCommand::ResolveAddress { node_id, reply } => {
+                let addr = self.members.get(&node_id).map(|m| m.addr);
+                let _ = reply.send(addr);
             }
         }
     }
@@ -267,8 +276,9 @@ impl Swim {
             }
 
             if let Some(seq) = self.last_suspected_seqs.get(&target_node_id)
-                && registered_seq != *seq {
-                    return;
+                && registered_seq != *seq
+            {
+                return;
             }
 
             self.last_suspected_seqs.remove(&target_node_id);

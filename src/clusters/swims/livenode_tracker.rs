@@ -1,6 +1,6 @@
 use crate::clusters::{NodeId, SwimNodeState};
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
 use std::collections::VecDeque;
 use std::ops::Deref;
 
@@ -14,7 +14,7 @@ impl Default for LiveNodeTracker {
     fn default() -> Self {
         Self {
             nodes: VecDeque::new(),
-            rng: StdRng::from_entropy(),
+            rng: StdRng::from_rng(&mut rand::rng()),
         }
     }
 }
@@ -39,7 +39,11 @@ impl LiveNodeTracker {
         if self.nodes.contains(&node_id) {
             return;
         }
-        let selected = self.rng.gen_range(0..=self.nodes.len());
+        let selected = (0..=self.nodes.len())
+            .collect::<Vec<_>>()
+            .choose(&mut self.rng)
+            .copied()
+            .unwrap_or(0);
         self.nodes.insert(selected, node_id);
     }
 

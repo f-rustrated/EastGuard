@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
 use crate::raft::interface::LogStore;
-use crate::raft::log::{LogEntry, RaftLog};
+use crate::raft::log::{LogEntry};
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
 use crate::storage::MemoryLogStore;
+use crate::clusters::swims::ShardGroupId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -41,6 +42,7 @@ struct PeerState {
 pub struct Raft<S: LogStore = MemoryLogStore> {
     // Identity
     pub node_id: NodeId,
+    pub shard_group_id: ShardGroupId,
     peers: HashSet<NodeId>,
 
     current_term: u64,
@@ -49,6 +51,10 @@ pub struct Raft<S: LogStore = MemoryLogStore> {
 
     commit_index: u64,
     role: Role,
+
+    /// Tracks who the current leader is — set when this node becomes leader
+    /// or when a valid `AppendEntries` is received from a leader.
+    current_leader: Option<NodeId>,
 
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
@@ -71,15 +77,18 @@ impl<S: LogStore> Raft<S> {
         peers: HashSet<NodeId>,
         election_jitter: u32,
         store: S,
+        shard_group_id: ShardGroupId,
     ) -> Self {
         let mut raft = Self {
             node_id,
+            shard_group_id,
             peers,
             current_term: 0,
             voted_for: None,
             log: RaftLog::with_store(store),
             commit_index: 0,
             role: Role::Follower,
+            current_leader: None,
             peer_states: HashMap::new(),
             pending_outbound: Vec::new(),
             pending_timer_commands: Vec::new(),
@@ -97,6 +106,14 @@ impl<S: LogStore> Raft<S> {
         std::mem::take(&mut self.pending_timer_commands)
     }
 
+    pub fn peers_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn current_leader(&self) -> Option<&NodeId> {
+        self.current_leader.as_ref()
+    }
+
     /// Minimum number of nodes needed for a majority (strict majority).
     /// For N nodes: N/2 + 1. Examples: 3→2, 4→3, 5→3.
     fn quorum(&self) -> u32 {
@@ -110,10 +127,11 @@ impl<S: LogStore> Raft<S> {
 
     pub fn handle_timeout(&mut self, event: RaftTimeoutCallback) {
         match event {
-            RaftTimeoutCallback::ElectionTimeout => {
+            RaftTimeoutCallback::Ignored => {}
+            RaftTimeoutCallback::ElectionTimeout { .. } => {
                 self.start_election();
             }
-            RaftTimeoutCallback::HeartbeatTimeout => {
+            RaftTimeoutCallback::HeartbeatTimeout { .. } => {
                 self.send_heartbeats();
             }
         }
@@ -157,8 +175,11 @@ impl<S: LogStore> Raft<S> {
             last_log_term: self.log.last_term(),
         };
         for peer_id in self.peers.iter() {
-            self.pending_outbound
-                .push(OutboundRaftPacket::new(peer_id.clone(), req.clone()));
+            self.pending_outbound.push(OutboundRaftPacket::new(
+                self.shard_group_id,
+                peer_id.clone(),
+                req.clone(),
+            ));
         }
     }
 
@@ -180,6 +201,7 @@ impl<S: LogStore> Raft<S> {
         }
 
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             from,
             RequestVoteResponse {
                 term: self.current_term,
@@ -267,6 +289,7 @@ impl<S: LogStore> Raft<S> {
         self.current_term = new_term;
         self.voted_for = None;
         self.role = Role::Follower;
+        self.current_leader = None;
         self.peer_states.clear();
         self.cancel_all_timers();
         self.reset_election_timer();
@@ -301,6 +324,7 @@ impl<S: LogStore> Raft<S> {
         let entries = self.log.entries_from(peer_state.next_index);
 
         self.pending_outbound.push(OutboundRaftPacket::new(
+            self.shard_group_id,
             peer_id,
             AppendEntries {
                 term: self.current_term,
@@ -333,6 +357,7 @@ impl<S: LogStore> Raft<S> {
             self.peer_states.clear();
         }
 
+        self.current_leader = Some(req.leader_id.clone());
         self.reset_election_timer();
 
         // Log consistency check: prev_log_index must exist with matching term.
@@ -487,14 +512,14 @@ impl<S: LogStore> Raft<S> {
             });
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq: ELECTION_TIMER_SEQ,
-            timer: RaftTimer::election(self.election_jitter),
+            timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
         });
     }
 
     fn schedule_heartbeat_timer(&mut self) {
         self.pending_timer_commands.push(TimerCommand::SetSchedule {
             seq: HEARTBEAT_TIMER_SEQ,
-            timer: RaftTimer::heartbeat(),
+            timer: RaftTimer::heartbeat(self.shard_group_id),
         });
     }
 
@@ -517,15 +542,17 @@ mod tests {
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
     }
+    
+    const TEST_SHARD: ShardGroupId = ShardGroupId(0);
 
-    fn single_node_raft() -> Raft<MemoryLogStore> {
-        Raft::new(node("node-1"), HashSet::new(), 0, MemoryLogStore::default())
+    fn single_node_raft() -> Raft {
+        Raft::new(node("node-1"), HashSet::new(), 0)
     }
 
-    fn three_node_raft(id: &str) -> Raft<MemoryLogStore> {
+    fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, MemoryLogStore::default())
+        Raft::new(node(id), peers, 0)
     }
 
     // -------------------------------------------------------------------
@@ -547,12 +574,16 @@ mod tests {
     #[test]
     fn single_node_repeated_elections_increment_term() {
         let mut raft = single_node_raft();
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         assert_eq!(raft.current_term, 1);
 
         // Step down and trigger another election
         raft.step_down(1);
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         assert_eq!(raft.current_term, 2);
     }
 
@@ -564,7 +595,9 @@ mod tests {
     fn candidate_sends_request_vote_to_all_peers() {
         let mut raft = three_node_raft("node-1");
 
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         assert!(matches!(raft.role, Role::Candidate { votes_received: 1 }));
         assert_eq!(raft.current_term, 1);
@@ -635,7 +668,9 @@ mod tests {
     #[test]
     fn candidate_becomes_leader_on_majority() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
 
         // Receive vote from node-2 (now have 2 out of 3 = majority)
@@ -652,7 +687,9 @@ mod tests {
     #[test]
     fn candidate_steps_down_on_higher_term() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
 
         let resp = RequestVoteResponse {
@@ -706,7 +743,9 @@ mod tests {
     fn leader_sends_noop_on_election_then_heartbeats() {
         let mut raft = three_node_raft("node-1");
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -843,7 +882,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -919,7 +960,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -959,7 +1002,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader at term 1
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -996,7 +1041,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Become leader at term 1
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         raft.step(
             node("node-2"),
@@ -1011,7 +1058,9 @@ mod tests {
         assert_eq!(raft.current_term, 1);
 
         // Stale election timeout arrives — should be ignored
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         assert_eq!(
             raft.role,
@@ -1026,7 +1075,9 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         let out = raft.take_outbound();
         assert!(out.is_empty(), "follower must not send heartbeats");
@@ -1035,14 +1086,140 @@ mod tests {
     #[test]
     fn candidate_ignores_heartbeat_timeout() {
         let mut raft = three_node_raft("node-1");
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
         let _ = raft.take_outbound();
         assert!(matches!(raft.role, Role::Candidate { .. }));
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout);
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
 
         let out = raft.take_outbound();
         assert!(out.is_empty(), "candidate must not send heartbeats");
+    }
+
+    // -------------------------------------------------------------------
+    // current_leader tracking
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn current_leader_none_initially() {
+        let raft = three_node_raft("node-1");
+        assert_eq!(raft.current_leader(), None);
+    }
+
+    #[test]
+    fn current_leader_set_on_becoming_leader() {
+        let mut raft = three_node_raft("node-1");
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let _ = raft.take_outbound();
+
+        raft.step(
+            node("node-2"),
+            RequestVoteResponse {
+                term: 1,
+                node_id: node("node-2"),
+                vote_granted: true,
+            },
+        );
+        let _ = raft.take_outbound();
+
+        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.current_leader(), Some(&node("node-1")));
+    }
+
+    #[test]
+    fn current_leader_set_on_append_entries() {
+        let mut raft = three_node_raft("node-2");
+        assert_eq!(raft.current_leader(), None);
+
+        raft.step(
+            node("node-1"),
+            AppendEntries {
+                term: 1,
+                leader_id: node("node-1"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+        );
+        let _ = raft.take_outbound();
+
+        assert_eq!(raft.current_leader(), Some(&node("node-1")));
+    }
+
+    #[test]
+    fn current_leader_cleared_on_step_down() {
+        let mut raft = three_node_raft("node-1");
+        // Become leader
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let _ = raft.take_outbound();
+        raft.step(
+            node("node-2"),
+            RequestVoteResponse {
+                term: 1,
+                node_id: node("node-2"),
+                vote_granted: true,
+            },
+        );
+        let _ = raft.take_outbound();
+        assert_eq!(raft.current_leader(), Some(&node("node-1")));
+
+        // Higher-term vote request forces step-down
+        raft.step(
+            node("node-3"),
+            RequestVote {
+                term: 5,
+                candidate_id: node("node-3"),
+                last_log_index: 10,
+                last_log_term: 5,
+            },
+        );
+        let _ = raft.take_outbound();
+
+        assert_eq!(raft.current_leader(), None);
+    }
+
+    #[test]
+    fn current_leader_updated_on_new_leader_append_entries() {
+        let mut raft = three_node_raft("node-3");
+
+        // Learn leader from node-1
+        raft.step(
+            node("node-1"),
+            AppendEntries {
+                term: 1,
+                leader_id: node("node-1"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+        );
+        let _ = raft.take_outbound();
+        assert_eq!(raft.current_leader(), Some(&node("node-1")));
+
+        // New leader at higher term
+        raft.step(
+            node("node-2"),
+            AppendEntries {
+                term: 2,
+                leader_id: node("node-2"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+        );
+        let _ = raft.take_outbound();
+        assert_eq!(raft.current_leader(), Some(&node("node-2")));
     }
 
     #[test]
@@ -1064,7 +1241,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0, MemoryLogStore::default());
+            let raft = Raft::new(NodeId::new("self"), peers, 0, MemoryLogStore::default(), TEST_SHARD);
 
             assert_eq!(
                 raft.quorum(),
