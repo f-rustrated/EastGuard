@@ -5,14 +5,8 @@ use bincode::{Decode, Encode};
 use crate::clusters::NodeId;
 use crate::clusters::swims::ShardGroupId;
 use crate::impl_from_variant;
+use crate::clusters::raft::log::LogEntry;
 use crate::schedulers::timer::TTimer;
-
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct LogEntry {
-    pub term: u64,
-    pub index: u64,
-    pub command: RaftCommand,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
@@ -24,6 +18,16 @@ pub enum RaftCommand {
     /// Raft-internal membership change: add a peer to the group.
     /// Applied when committed — inserts into peer set, leader initializes PeerState.
     AddPeer(NodeId),
+}
+
+impl RaftCommand {
+    pub(crate) fn serialize(&self) -> Vec<u8> {
+        match self {
+            RaftCommand::Noop => vec![0x00],
+            RaftCommand::RemovePeer(_) => vec![0x01],
+            RaftCommand::AddPeer(_) => vec![0x02],
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

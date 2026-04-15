@@ -61,7 +61,7 @@ impl From<RaftTimeoutCallback> for RaftCommand {
 /// monotonic counter, preventing collisions across groups in the shared Ticker.
 pub struct RaftActor {
     node_id: NodeId,
-    groups: HashMap<ShardGroupId, Raft>,
+    groups: HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
     mailbox: mpsc::Receiver<RaftCommand>,
     transport_tx: mpsc::Sender<OutboundRaftPacket>,
     scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
@@ -242,7 +242,7 @@ impl RaftActor {
             self.node_id.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
-        let raft = Raft::new(self.node_id.clone(), peers, jitter, group.id);
+        let raft = Raft::new(self.node_id.clone(), peers, jitter, crate::storage::MemoryLogStore::default(), group.id);
 
         tracing::info!(
             "[{}] Created Raft group {:?} with {} peers",
