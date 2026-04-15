@@ -90,6 +90,7 @@ async fn check_node_is_all_alive(host: &str, port: u16) -> turmoil::Result {
 fn cluster_setup() -> turmoil::Result {
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(30))
+        .tcp_capacity(4096)
         .build();
 
     let _ = tracing_subscriber::fmt()
@@ -103,6 +104,7 @@ fn cluster_setup() -> turmoil::Result {
 
         let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
         StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-1 is running");
@@ -116,6 +118,7 @@ fn cluster_setup() -> turmoil::Result {
 
         let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
         StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-2 is running");
@@ -129,6 +132,7 @@ fn cluster_setup() -> turmoil::Result {
 
         let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
         StartUp::with_env(env, 0).run().await?;
         tracing::info!("NODE-3 is running");
@@ -156,6 +160,7 @@ fn partition_gossip() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
         .simulation_duration(Duration::from_secs(120))
+        .tcp_capacity(4096)
         .build();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -167,6 +172,7 @@ fn partition_gossip() -> turmoil::Result {
         let n3 = turmoil::lookup("node-3");
         let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
         StartUp::with_env(env, 0).run().await?;
         Ok(())
@@ -178,6 +184,7 @@ fn partition_gossip() -> turmoil::Result {
         let n3 = turmoil::lookup("node-3");
         let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
         StartUp::with_env(env, 0).run().await?;
         Ok(())
@@ -189,6 +196,7 @@ fn partition_gossip() -> turmoil::Result {
         let n2 = turmoil::lookup("node-2");
         let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
         env.advertise_host = Some(me.to_string());
+
         env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
         StartUp::with_env(env, 0).run().await?;
         Ok(())
@@ -223,6 +231,7 @@ fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
         .simulation_duration(Duration::from_secs(120))
+        .tcp_capacity(4096)
         .build();
 
     let _ = tracing_subscriber::fmt()

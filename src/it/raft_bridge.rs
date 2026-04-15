@@ -64,21 +64,16 @@ async fn start_raft_node(
 
     let ticker_force = ticker_tx.clone();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cluster_port).parse().unwrap();
-    let transport = RaftTransportActor::new(
-        node_id.clone(),
-        bind_addr,
-        raft_tx.clone(),
-        transport_rx,
-        swim_tx,
-    )
-    .await?;
-
-    let raft_actor = RaftActor::new(node_id, raft_mailbox, transport_tx, ticker_tx);
+    let listener = crate::net::TcpListener::bind(bind_addr).await?;
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx));
-    tokio::spawn(transport.run());
-    tokio::spawn(raft_actor.run());
+    {
+        let node_id = node_id.clone();
+        let raft_tx = raft_tx.clone();
+        tokio::spawn(RaftTransportActor::run(node_id, listener, raft_tx, transport_rx, swim_tx));
+    }
+    tokio::spawn(RaftActor::run(node_id, raft_mailbox, transport_tx, ticker_tx));
 
     raft_tx
         .send(RaftCommand::EnsureGroup { group })

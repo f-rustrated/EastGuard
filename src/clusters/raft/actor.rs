@@ -54,64 +54,48 @@ impl From<RaftTimeoutCallback> for RaftCommand {
 }
 
 /// Async boundary that multiplexes multiple Raft state machines — one per
-/// shard group. Follows the same pattern as `SwimActor`.
+/// shard group.
 ///
 /// Timer seqs are namespaced: each `Raft` emits local seqs (0 = election,
 /// 1 = heartbeat). The actor translates these to globally unique seqs via a
 /// monotonic counter, preventing collisions across groups in the shared Ticker.
-pub struct RaftActor {
-    node_id: NodeId,
-    groups: HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
-    mailbox: mpsc::Receiver<RaftCommand>,
-    transport_tx: mpsc::Sender<OutboundRaftPacket>,
-    scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
-    // Timer seq namespacing: (ShardGroupId, local_seq) → global_seq
-    // Every Raft instance emits the same local seqs — 0 for election timer, 1 for heartbeat timer.
-    // If shard group #12 and shard group #45 both emit SetSchedule { seq: 0 }, the Ticker (which stores timers in HashMap<u32,RaftTimer>) would overwrite one with the other.
-    //
-    // So,
-    //  Shard #12 emits: SetSchedule { seq: 0 (election) }
-    //     → Actor translates: seq 0 → global_seq 1
-    //     → Stores mapping: (ShardGroupId(12), 0) → 1
-    //     → Sends to Ticker: SetSchedule { seq: 1 }
-
-    //   Shard #45 emits: SetSchedule { seq: 0 (election) }
-    //     → Actor translates: seq 0 → global_seq 2
-    //     → Stores mapping: (ShardGroupId(45), 0) → 2
-    //     → Sends to Ticker: SetSchedule { seq: 2 }
-    seq_counter: u32,
-    shard_tokens: HashMap<ShardToken, u32>,
-}
+pub struct RaftActor;
 
 impl RaftActor {
-    pub fn new(
+    pub async fn run(
         node_id: NodeId,
-        mailbox: mpsc::Receiver<RaftCommand>,
-        transport_tx: mpsc::Sender<OutboundRaftPacket>,
+        mut mailbox: mpsc::Receiver<RaftCommand>,
+        transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
-    ) -> Self {
-        Self {
-            node_id,
-            groups: HashMap::new(),
-            mailbox,
-            transport_tx,
-            scheduler_tx,
-            seq_counter: 0,
-            shard_tokens: HashMap::new(),
-        }
-    }
+    ) {
+        let mut groups: HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>> =
+            HashMap::new();
 
-    pub async fn run(mut self) {
-        while let Some(cmd) = self.mailbox.recv().await {
+        // Timer seq namespacing: (ShardGroupId, local_seq) → global_seq
+        // Every Raft instance emits the same local seqs — 0 for election timer,
+        // 1 for heartbeat timer. The actor translates to globally unique seqs so
+        // the shared Ticker doesn't overwrite one group's timer with another's.
+        let mut seq_counter: u32 = 0;
+        let mut shard_tokens: HashMap<ShardToken, u32> = HashMap::new();
+
+        while let Some(cmd) = mailbox.recv().await {
             match cmd {
                 RaftCommand::PacketReceived {
                     shard_group_id,
                     from,
                     rpc,
                 } => {
-                    if let Some(raft) = self.groups.get_mut(&shard_group_id) {
+                    if let Some(raft) = groups.get_mut(&shard_group_id) {
                         raft.step(from, rpc);
-                        self.flush(shard_group_id).await;
+                        Self::flush(
+                            shard_group_id,
+                            &mut groups,
+                            &mut seq_counter,
+                            &mut shard_tokens,
+                            &transport_tx,
+                            &scheduler_tx,
+                        )
+                        .await;
                     }
                 }
 
@@ -121,25 +105,47 @@ impl RaftActor {
                         RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
                         RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
                     };
-                    if let Some(raft) = self.groups.get_mut(&shard_group_id) {
+                    if let Some(raft) = groups.get_mut(&shard_group_id) {
                         raft.handle_timeout(cb);
-                        self.flush(shard_group_id).await;
+                        Self::flush(
+                            shard_group_id,
+                            &mut groups,
+                            &mut seq_counter,
+                            &mut shard_tokens,
+                            &transport_tx,
+                            &scheduler_tx,
+                        )
+                        .await;
                     }
                 }
 
                 RaftCommand::EnsureGroup { group } => {
                     let group_id = group.id;
-                    self.ensure_group(group);
-                    self.flush(group_id).await;
+                    Self::ensure_group(&node_id, &mut groups, group);
+                    Self::flush(
+                        group_id,
+                        &mut groups,
+                        &mut seq_counter,
+                        &mut shard_tokens,
+                        &transport_tx,
+                        &scheduler_tx,
+                    )
+                    .await;
                 }
 
                 RaftCommand::RemoveGroup { group_id } => {
-                    self.remove_group(group_id).await;
+                    Self::remove_group(
+                        &node_id,
+                        group_id,
+                        &mut groups,
+                        &mut shard_tokens,
+                        &scheduler_tx,
+                    )
+                    .await;
                 }
 
                 RaftCommand::GetLeader { group_id, reply } => {
-                    let leader = self
-                        .groups
+                    let leader = groups
                         .get(&group_id)
                         .and_then(|raft| raft.current_leader().cloned());
                     let _ = reply.send(leader);
@@ -150,25 +156,37 @@ impl RaftActor {
                     command,
                     reply,
                 } => {
-                    let result = match self.groups.get_mut(&shard_group_id) {
+                    let result = match groups.get_mut(&shard_group_id) {
                         Some(raft) => raft.propose(command),
                         None => Err(ProposeError::NotLeader),
                     };
                     let _ = reply.send(result);
-                    self.flush(shard_group_id).await;
+                    Self::flush(
+                        shard_group_id,
+                        &mut groups,
+                        &mut seq_counter,
+                        &mut shard_tokens,
+                        &transport_tx,
+                        &scheduler_tx,
+                    )
+                    .await;
                 }
 
                 RaftCommand::HandleNodeDeath { dead_node_id } => {
-                    // Collect affected group IDs first (borrow checker).
-                    let affected: Vec<ShardGroupId> = self
-                        .groups
+                    // Evict stale connection + cached address so the transport
+                    // stops sending RPCs to the dead node's address.
+                    let _ = transport_tx
+                        .send(RaftTransportCommand::DisconnectPeer(dead_node_id.clone()))
+                        .await;
+
+                    let affected: Vec<ShardGroupId> = groups
                         .iter()
                         .filter(|(_, raft)| raft.is_leader() && raft.has_peer(&dead_node_id))
                         .map(|(id, _)| *id)
                         .collect();
 
                     for group_id in &affected {
-                        if let Some(raft) = self.groups.get_mut(group_id) {
+                        if let Some(raft) = groups.get_mut(group_id) {
                             let cmd = crate::clusters::raft::messages::RaftCommand::RemovePeer(
                                 dead_node_id.clone(),
                             );
@@ -177,7 +195,15 @@ impl RaftActor {
                     }
 
                     for group_id in affected {
-                        self.flush(group_id).await;
+                        Self::flush(
+                            group_id,
+                            &mut groups,
+                            &mut seq_counter,
+                            &mut shard_tokens,
+                            &transport_tx,
+                            &scheduler_tx,
+                        )
+                        .await;
                     }
                 }
 
@@ -188,7 +214,7 @@ impl RaftActor {
                     let mut flushed = Vec::new();
 
                     for group in &affected_groups {
-                        if let Some(raft) = self.groups.get_mut(&group.id)
+                        if let Some(raft) = groups.get_mut(&group.id)
                             && raft.is_leader()
                             && !raft.has_peer(&new_node_id)
                         {
@@ -200,81 +226,106 @@ impl RaftActor {
                         }
                     }
 
-                    // EnsureGroup for groups this node should newly join.
                     for group in affected_groups {
-                        if !self.groups.contains_key(&group.id)
-                            && group.members.contains(&self.node_id)
+                        if !groups.contains_key(&group.id)
+                            && group.members.contains(&node_id)
                         {
                             let group_id = group.id;
-                            self.ensure_group(group);
+                            Self::ensure_group(&node_id, &mut groups, group);
                             flushed.push(group_id);
                         }
                     }
 
                     for group_id in flushed {
-                        self.flush(group_id).await;
+                        Self::flush(
+                            group_id,
+                            &mut groups,
+                            &mut seq_counter,
+                            &mut shard_tokens,
+                            &transport_tx,
+                            &scheduler_tx,
+                        )
+                        .await;
                     }
                 }
             }
         }
     }
 
-    fn ensure_group(&mut self, group: ShardGroup) {
-        if self.groups.contains_key(&group.id) {
+    fn ensure_group(
+        node_id: &NodeId,
+        groups: &mut HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
+        group: ShardGroup,
+    ) {
+        if groups.contains_key(&group.id) {
             return;
         }
-        if !group.members.contains(&self.node_id) {
+        if !group.members.contains(node_id) {
             return;
         }
 
         let peers: HashSet<NodeId> = group
             .members
             .iter()
-            .filter(|id| *id != &self.node_id)
+            .filter(|id| *id != node_id)
             .cloned()
             .collect();
 
-        // Derive jitter from node_id hash to spread election timeouts.
-        // A proper hash avoids collisions that would cause split votes (e.g.
-        // same-length names, sequential names like "node-1"/"node-2").
         let jitter = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.node_id.hash(&mut hasher);
+            node_id.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
-        let raft = Raft::new(self.node_id.clone(), peers, jitter, crate::storage::MemoryLogStore::default(), group.id);
+        let raft = Raft::new(
+            node_id.clone(),
+            peers,
+            jitter,
+            crate::storage::MemoryLogStore::default(),
+            group.id,
+        );
 
         tracing::info!(
             "[{}] Created Raft group {:?} with {} peers",
-            self.node_id,
+            node_id,
             group.id,
             raft.peers_count()
         );
 
-        self.groups.insert(group.id, raft);
+        groups.insert(group.id, raft);
     }
 
-    async fn remove_group(&mut self, group_id: ShardGroupId) {
-        if self.groups.remove(&group_id).is_none() {
+    async fn remove_group(
+        node_id: &NodeId,
+        group_id: ShardGroupId,
+        groups: &mut HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
+        shard_tokens: &mut HashMap<ShardToken, u32>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+    ) {
+        if groups.remove(&group_id).is_none() {
             return;
         }
 
-        // Cancel any outstanding timers for this group
         for local_seq in [0, 1] {
-            if let Some(global_seq) = self.shard_tokens.remove(&group_id.token(local_seq)) {
-                let _ = self
-                    .scheduler_tx
+            if let Some(global_seq) = shard_tokens.remove(&group_id.token(local_seq)) {
+                let _ = scheduler_tx
                     .send(TimerCommand::CancelSchedule { seq: global_seq }.into())
                     .await;
             }
         }
 
-        tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
+        tracing::info!("[{}] Removed Raft group {:?}", node_id, group_id);
     }
 
     /// Flush outbound packets and timer commands for one shard group.
-    async fn flush(&mut self, shard_group_id: ShardGroupId) {
-        let raft = match self.groups.get_mut(&shard_group_id) {
+    async fn flush(
+        shard_group_id: ShardGroupId,
+        groups: &mut HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
+        seq_counter: &mut u32,
+        shard_tokens: &mut HashMap<ShardToken, u32>,
+        transport_tx: &mpsc::Sender<RaftTransportCommand>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+    ) {
+        let raft = match groups.get_mut(&shard_group_id) {
             Some(r) => r,
             None => return,
         };
@@ -282,7 +333,6 @@ impl RaftActor {
         let timer_commands = raft.take_timer_commands();
         let outbound_packets = raft.take_outbound();
 
-        // Translate local seqs → global seqs (needs &mut self, so done before the concurrent send)
         let translated: Vec<_> = timer_commands
             .into_iter()
             .filter_map(|cmd| match cmd {
@@ -290,37 +340,41 @@ impl RaftActor {
                     seq: local_seq,
                     timer,
                 } => Some(TimerCommand::SetSchedule {
-                    seq: self.get_or_alloc_seq(shard_group_id.token(local_seq)),
+                    seq: Self::get_or_alloc_seq(
+                        shard_group_id.token(local_seq),
+                        seq_counter,
+                        shard_tokens,
+                    ),
                     timer,
                 }),
-                TimerCommand::CancelSchedule { seq: local_seq } => self
-                    .shard_tokens
+                TimerCommand::CancelSchedule { seq: local_seq } => shard_tokens
                     .get(&shard_group_id.token(local_seq))
                     .map(|&global_seq| TimerCommand::CancelSchedule { seq: global_seq }),
             })
             .collect();
 
-        // Send timer commands and outbound packets concurrently
         tokio::join!(
             async {
                 for cmd in translated {
-                    let _ = self.scheduler_tx.send(cmd.into()).await;
+                    let _ = scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {
                 for pkt in outbound_packets {
-                    let _ = self.transport_tx.send(pkt).await;
+                    let _ = transport_tx.send(RaftTransportCommand::Send(pkt)).await;
                 }
             }
         );
     }
 
-    /// Returns a stable global seq for the given `(shard_group_id, local_seq)`.
-    /// Allocates one on first call, reuses it on subsequent calls.
-    fn get_or_alloc_seq(&mut self, token: ShardToken) -> u32 {
-        *self.shard_tokens.entry(token).or_insert_with(|| {
-            self.seq_counter = self.seq_counter.wrapping_add(1);
-            self.seq_counter
+    fn get_or_alloc_seq(
+        token: ShardToken,
+        seq_counter: &mut u32,
+        shard_tokens: &mut HashMap<ShardToken, u32>,
+    ) -> u32 {
+        *shard_tokens.entry(token).or_insert_with(|| {
+            *seq_counter = seq_counter.wrapping_add(1);
+            *seq_counter
         })
     }
 }

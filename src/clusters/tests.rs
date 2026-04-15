@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::peer_discovery::{Bootstrapper, JoinConfig};
+use crate::clusters::swims::peer_discovery::JoinConfig;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
     DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, SwimCommand, SwimHeader, SwimPacket,
@@ -122,7 +123,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let mut swim = Swim::new(
+    let swim = Swim::new(
         NodeId::new(format!("node-local-{}", port).as_str()),
         addr,
         Topology::new(
@@ -133,13 +134,19 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
             },
         ),
         0,
-    );
+    )
+    .bootstrap(join_config.tries());
+
     let (raft_tx, _raft_rx) = tokio::sync::mpsc::channel(64);
-    let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone(), raft_tx);
-    Bootstrapper::run(join_config.tries(), &mut swim);
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
-    tokio::spawn(actor.run(swim));
+    tokio::spawn(SwimActor::run(
+        rx_in,
+        swim,
+        tx_out.clone(),
+        ticker_tx.clone(),
+        raft_tx,
+    ));
 
     TestHarness {
         tx_in,
@@ -287,14 +294,15 @@ async fn test_gossip_propagation() {
 
         // Wait for response
         if let Some(response) = rx_out.recv().await
-            && let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet() {
-                // Check if our rumor is in this specific Ack
-                if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
-                    assert_eq!(rumor.state, SwimNodeState::Dead);
-                    propagated = true;
-                    break; // Success!
-                }
+            && let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet()
+        {
+            // Check if our rumor is in this specific Ack
+            if let Some(rumor) = gossip.iter().find(|m| m.addr == dead_node) {
+                assert_eq!(rumor.state, SwimNodeState::Dead);
+                propagated = true;
+                break; // Success!
             }
+        }
 
         // Brief sleep to allow the actor's async tasks to complete
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

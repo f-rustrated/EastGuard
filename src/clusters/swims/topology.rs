@@ -60,6 +60,9 @@ pub struct Topology {
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
     ring: TokenRing,
+    /// Reverse index: for each physical node, the set of shard groups it participates in.
+    /// Rebuilt after every ring mutation. Makes `shard_groups_for_node()` O(1).
+    node_groups: HashMap<NodeId, HashMap<ShardGroupId, ShardGroup>>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -140,10 +143,13 @@ impl Topology {
             token_ring.add_pnode(pnode_id, metadata, config.vnodes_per_pnode);
         }
 
-        Self {
+        let mut topology = Self {
             config,
             ring: token_ring,
-        }
+            node_groups: HashMap::new(),
+        };
+        topology.rebuild_reverse_index();
+        topology
     }
 
     pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: &SwimNodeState) {
@@ -162,11 +168,45 @@ impl Topology {
         // ? what if metadata needs to be changed ?
         self.ring
             .add_pnode(pnode_id, metadata, self.config.vnodes_per_pnode);
+        self.rebuild_reverse_index();
     }
 
     fn remove_node(&mut self, pnode_id: &NodeId) -> Option<PhysicalNodeMetadata> {
-        self.ring
-            .remove_pnode(pnode_id, self.config.vnodes_per_pnode)
+        let result = self
+            .ring
+            .remove_pnode(pnode_id, self.config.vnodes_per_pnode);
+        if result.is_some() {
+            self.rebuild_reverse_index();
+        }
+        result
+    }
+
+    /// Rebuild the reverse index from the ring. O(total_vnodes × RF).
+    /// Called after every ring mutation.
+    fn rebuild_reverse_index(&mut self) {
+        self.node_groups.clear();
+        let mut seen = std::collections::HashSet::new();
+
+        for token in self.ring.vnodes.keys() {
+            let id = ShardGroupId(token.hash as u64);
+            if !seen.insert(id) {
+                continue;
+            }
+            let owners = self
+                .ring
+                .token_owners_at(token.hash, self.config.replication_factor);
+            let members: Vec<NodeId> = owners.iter().map(|vn| vn.pnode_id.clone()).collect();
+            let group = ShardGroup {
+                id,
+                members: members.clone(),
+            };
+            for member in &members {
+                self.node_groups
+                    .entry(member.clone())
+                    .or_default()
+                    .insert(id, group.clone());
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -192,29 +232,12 @@ impl Topology {
     }
 
     /// Returns all unique shard groups that `node_id` participates in.
-    ///
-    /// Iterates every vnode position on the ring, computes the shard group
-    /// for that position, and includes the group if `node_id` is a member.
-    /// Deduplicates by ShardGroupId.
+    /// O(1) lookup from the precomputed reverse index.
     pub fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<ShardGroup> {
-        use std::collections::HashSet;
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-
-        for token in self.ring.vnodes.keys() {
-            let owners = self
-                .ring
-                .token_owners_at(token.hash, self.config.replication_factor);
-            let members: Vec<NodeId> = owners.iter().map(|vn| vn.pnode_id.clone()).collect();
-
-            if members.contains(node_id) {
-                let id = ShardGroupId(token.hash as u64);
-                if seen.insert(id) {
-                    result.push(ShardGroup { id, members });
-                }
-            }
-        }
-        result
+        self.node_groups
+            .get(node_id)
+            .map(|groups| groups.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     #[expect(dead_code)]

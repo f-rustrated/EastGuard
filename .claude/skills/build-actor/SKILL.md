@@ -151,27 +151,22 @@ Actor = async wrapper that:
 3. Drains output buffers (flush)
 4. Sends results to other actors
 
+No struct needed for simple actors — pass all channels directly to `run()`. Actor is a unit-like struct used only as a namespace for the `run` and `flush` associated functions.
+
 ```rust
-pub struct YourActor {
-    mailbox: mpsc::Receiver<YourActorCommand>,
-    transport_tx: mpsc::Sender<YourOutboundPacket>,
-    scheduler_tx: mpsc::Sender<TickerCommand<YourTimer>>,
-}
+pub struct YourActor;
 
 impl YourActor {
-    pub fn new(
-        mailbox: mpsc::Receiver<YourActorCommand>,
+    pub async fn run(
+        mut mailbox: mpsc::Receiver<YourActorCommand>,
+        mut state: YourStateMachine,
         transport_tx: mpsc::Sender<YourOutboundPacket>,
         scheduler_tx: mpsc::Sender<TickerCommand<YourTimer>>,
-    ) -> Self {
-        Self { mailbox, transport_tx, scheduler_tx }
-    }
-
-    pub async fn run(mut self, mut state: YourStateMachine) {
+    ) {
         // Flush any side effects from initialization
-        self.flush(&mut state).await;
+        Self::flush(&mut state, &transport_tx, &scheduler_tx).await;
 
-        while let Some(event) = self.mailbox.recv().await {
+        while let Some(event) = mailbox.recv().await {
             match event {
                 YourActorCommand::PacketReceived { src, data } => {
                     state.step(/* ... */);
@@ -185,11 +180,15 @@ impl YourActor {
             }
 
             // THIS MUST HAPPEN AFTER EVERY EVENT -- no exceptions
-            self.flush(&mut state).await;
+            Self::flush(&mut state, &transport_tx, &scheduler_tx).await;
         }
     }
 
-    async fn flush(&mut self, state: &mut YourStateMachine) {
+    async fn flush(
+        state: &mut YourStateMachine,
+        transport_tx: &mpsc::Sender<YourOutboundPacket>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<YourTimer>>,
+    ) {
         let timer_commands = state.take_timer_commands();
         let outbound_packets = state.take_outbound();
 
@@ -197,12 +196,12 @@ impl YourActor {
         tokio::join!(
             async {
                 for cmd in timer_commands {
-                    let _ = self.scheduler_tx.send(cmd.into()).await;
+                    let _ = scheduler_tx.send(cmd.into()).await;
                 }
             },
             async {
                 for pkt in outbound_packets {
-                    let _ = self.transport_tx.send(pkt).await;
+                    let _ = transport_tx.send(pkt).await;
                 }
             }
         );
@@ -214,14 +213,26 @@ impl YourActor {
 
 ### Multiplexing pattern (like RaftActor)
 
-If actor manages multiple state machine instances (e.g., one per shard):
+If actor manages multiple state machine instances (e.g., one per shard), same unit-like struct pattern. Domain state declared as local variables inside `run()`:
 
 ```rust
-pub struct MultiplexActor {
-    groups: HashMap<GroupId, YourStateMachine>,
-    // ... channels ...
-    seq_counter: u32,
-    shard_tokens: HashMap<ShardToken, u32>,
+pub struct MultiplexActor;
+
+impl MultiplexActor {
+    pub async fn run(
+        node_id: NodeId,
+        mut mailbox: mpsc::Receiver<YourActorCommand>,
+        transport_tx: mpsc::Sender<YourOutboundPacket>,
+        scheduler_tx: mpsc::Sender<TickerCommand<YourTimer>>,
+    ) {
+        let mut groups: HashMap<GroupId, YourStateMachine> = HashMap::new();
+        let mut seq_counter: u32 = 0;
+        let mut shard_tokens: HashMap<ShardToken, u32> = HashMap::new();
+
+        while let Some(cmd) = mailbox.recv().await {
+            // match cmd, mutate groups, call Self::flush(...)
+        }
+    }
 }
 ```
 
@@ -241,14 +252,11 @@ pub async fn run(self) -> Result<()> {
     let (your_sender, your_mailbox) = mpsc::channel(100);
     let (your_outbound_tx, your_outbound_rx) = mpsc::channel(100);
 
-    // Your actor
-    let your_actor = YourActor::new(your_mailbox, your_outbound_tx, ticker_cmd_tx.clone());
-
     // Your state machine initialization
     let your_state = YourStateMachine::new(/* ... */);
 
     // Spawn (after ticker, before client listener)
-    tokio::spawn(your_actor.run(your_state));
+    tokio::spawn(YourActor::run(your_mailbox, your_state, your_outbound_tx, ticker_cmd_tx.clone()));
 
     // If you have a transport, spawn it too
     // tokio::spawn(your_transport.run());

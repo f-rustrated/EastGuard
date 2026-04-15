@@ -13,7 +13,8 @@ pub(crate) mod schedulers;
 mod it;
 pub(crate) mod macros;
 
-use crate::clusters::swims::peer_discovery::Bootstrapper;
+use crate::clusters::raft::actor::RaftActor;
+use crate::clusters::raft::transport::RaftTransportActor;
 
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
@@ -51,28 +52,58 @@ impl StartUp {
     }
 
     pub async fn run(self) -> Result<()> {
-        // Create a channel for the SwimActor
-        let (swim_sender, swim_mailbox) = mpsc::channel(100); // Actor Events
-        let (tx_outbound, rx_outbound) = mpsc::channel(100); // Network Packets
+        // SWIM channels
+        let (swim_sender, swim_mailbox) = mpsc::channel(100);
+        let (tx_outbound, rx_outbound) = mpsc::channel(100);
+        let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
 
-        let transport =
-            SwimTransportActor::new(self.env.peer_bind_addr(), swim_sender.clone(), rx_outbound)
-                .await?;
+        // Raft channels
+        let (raft_tx, raft_mailbox) = mpsc::channel(4096);
+        let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
+        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(64);
 
-        let (ticker_cmd_tx, ticker_cmd_rx) = mpsc::channel(64);
-        let (raft_tx, _raft_rx) = mpsc::channel(64); // RaftActor not wired yet in StartUp
-        let swim_actor = SwimActor::new(swim_mailbox, tx_outbound, ticker_cmd_tx.clone(), raft_tx);
+        // Build SWIM state and extract node_id before handing state to the actor
+        let state = self.env.swim(self.rng_seed);
+        let node_id = state.node_id.clone();
 
-        let mut state = self.env.swim(self.rng_seed);
-        Bootstrapper::run(self.env.bootstrap_servers(), &mut state);
+        let peer_bind_addr = self.env.peer_bind_addr();
 
-        // Spawn Actors
-        tokio::spawn(run_scheduling_actor(swim_sender.clone(), ticker_cmd_rx));
-        tokio::spawn(transport.run());
-        tokio::spawn(swim_actor.run(state));
+        // Bind sockets before spawning — fail fast on port conflicts
+        let udp_socket = crate::net::UdpSocket::bind(peer_bind_addr).await?;
+        let tcp_listener = crate::net::TcpListener::bind(peer_bind_addr).await?;
 
-        // run handlers
-        let _ = self.receive_client_streams(swim_sender.clone()).await;
+        // Spawn actors (order: tickers → transports → protocols → client)
+        tokio::spawn(run_scheduling_actor(swim_sender.clone(), swim_ticker_rx));
+        tokio::spawn(run_scheduling_actor(raft_tx.clone(), raft_ticker_rx));
+        tokio::spawn(SwimTransportActor::run(
+            udp_socket,
+            swim_sender.clone(),
+            rx_outbound,
+        ));
+        tokio::spawn(RaftTransportActor::run(
+            node_id.clone(),
+            tcp_listener,
+            raft_tx.clone(),
+            raft_transport_rx,
+            swim_sender.clone(),
+        ));
+
+        tokio::spawn(SwimActor::run(
+            swim_mailbox,
+            state,
+            tx_outbound,
+            swim_ticker_tx,
+            raft_tx,
+        ));
+        tokio::spawn(RaftActor::run(
+            node_id,
+            raft_mailbox,
+            raft_transport_tx,
+            raft_ticker_tx,
+        ));
+
+        // Client handler
+        let _ = self.receive_client_streams(swim_sender).await;
         Ok(())
     }
 

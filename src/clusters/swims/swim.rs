@@ -107,6 +107,17 @@ impl Swim {
         swim
     }
 
+    pub fn bootstrap(mut self, bootstrap_servers: Vec<JoinAttempt>) -> Self {
+        for attempt in bootstrap_servers
+            .into_iter()
+            .filter(|t| t.seed_addr != self.advertise_addr)
+            .collect::<Vec<_>>()
+        {
+            self.handle_join(attempt);
+        }
+        self
+    }
+
     fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
         SwimHeader {
             seq,
@@ -491,8 +502,10 @@ impl Swim {
             }
         };
 
-        self.live_node_tracker
-            .update(node_id.clone(), &member.state);
+        if node_id != self.node_id {
+            self.live_node_tracker
+                .update(node_id.clone(), &member.state);
+        }
         self.topology.update(node_id.clone(), addr, &member.state);
 
         if changed {
@@ -1308,6 +1321,9 @@ mod tests {
         );
 
         let events = h.protocol.take_membership_events();
-        assert!(events.is_empty(), "Suspect should not emit membership event");
+        assert!(
+            events.is_empty(),
+            "Suspect should not emit membership event"
+        );
     }
 }
