@@ -3,10 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
-use crate::clusters::swims::ShardGroupId;
-use crate::raft::log::MemLog;
+use crate::raft::interface::LogStore;
+use crate::raft::log::{LogEntry, RaftLog};
 use crate::raft::messages::*;
 use crate::schedulers::ticker_message::TimerCommand;
+use crate::storage::MemoryLogStore;
+use crate::clusters::swims::ShardGroupId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -37,7 +39,7 @@ struct PeerState {
 /// Follows the same pattern as `Swim`: purely synchronous, no async, no I/O.
 /// All outbound packets and timer commands are buffered and drained by the
 /// caller (the actor layer).
-pub struct Raft {
+pub struct Raft<S: LogStore = MemoryLogStore> {
     // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
@@ -45,7 +47,7 @@ pub struct Raft {
 
     current_term: u64,
     voted_for: Option<NodeId>,
-    log: MemLog,
+    log: RaftLog<S>,
 
     commit_index: u64,
     role: Role,
@@ -69,11 +71,12 @@ pub struct Raft {
 const ELECTION_TIMER_SEQ: u32 = 0;
 const HEARTBEAT_TIMER_SEQ: u32 = 1;
 
-impl Raft {
+impl<S: LogStore> Raft<S> {
     pub(crate) fn new(
         node_id: NodeId,
         peers: HashSet<NodeId>,
         election_jitter: u32,
+        store: S,
         shard_group_id: ShardGroupId,
     ) -> Self {
         let mut raft = Self {
@@ -82,7 +85,7 @@ impl Raft {
             peers,
             current_term: 0,
             voted_for: None,
-            log: MemLog::default(),
+            log: RaftLog::with_store(store),
             commit_index: 0,
             role: Role::Follower,
             current_leader: None,
@@ -319,7 +322,7 @@ impl Raft {
 
         let prev_log_index = peer_state.next_index.saturating_sub(1);
         let prev_log_term = self.log.term_at(prev_log_index);
-        let entries = self.log.entries_from(peer_state.next_index).to_vec();
+        let entries = self.log.entries_from(peer_state.next_index);
 
         self.pending_outbound.push(OutboundRaftPacket::new(
             self.shard_group_id,
@@ -545,13 +548,13 @@ mod tests {
     const TEST_SHARD: ShardGroupId = ShardGroupId(0);
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD)
+        Raft::new(node("node-1"), HashSet::new(), 0, MemoryLogStore::default(), TEST_SHARD)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, TEST_SHARD)
+        Raft::new(node(id), peers, 0, MemoryLogStore::default(), TEST_SHARD)
     }
 
     // -------------------------------------------------------------------
@@ -563,9 +566,7 @@ mod tests {
         let mut raft = single_node_raft();
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
-            shard_group_id: TEST_SHARD,
-        });
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout { shard_group_id: TEST_SHARD });
 
         assert_eq!(raft.role, Role::Leader);
         assert_eq!(raft.current_term, 1);
@@ -784,9 +785,7 @@ mod tests {
         let _ = raft.take_outbound();
 
         // Subsequent heartbeats are empty
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
-            shard_group_id: TEST_SHARD,
-        });
+        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout { shard_group_id: TEST_SHARD });
         let out = raft.take_outbound();
         assert_eq!(out.len(), 2);
         for pkt in &out {
@@ -1244,7 +1243,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD);
+            let raft = Raft::new(NodeId::new("self"), peers, 0, MemoryLogStore::default(), TEST_SHARD);
 
             assert_eq!(
                 raft.quorum(),
