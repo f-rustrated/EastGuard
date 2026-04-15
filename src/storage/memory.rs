@@ -1,5 +1,5 @@
-use crate::raft::interface::{LogError, LogStore};
-use crate::raft::log::LogEntry;
+use crate::clusters::raft::interface::{LogError, LogStore};
+use crate::clusters::raft::log::LogEntry;
 
 use super::Index;
 
@@ -58,7 +58,7 @@ impl LogStore for MemoryLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::messages::RaftCommand;
+    use crate::clusters::raft::messages::RaftCommand;
 
     fn entry(term: u64, index: Index) -> LogEntry {
         LogEntry {

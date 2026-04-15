@@ -5,8 +5,8 @@ use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use crate::raft::interface::{LogError, LogStore};
-use crate::raft::log::LogEntry;
+use crate::clusters::raft::interface::{LogError, LogStore};
+use crate::clusters::raft::log::LogEntry;
 use crate::storage::{Entry, Index};
 
 // ── On-disk format ────────────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ impl LogStore for FileLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::messages::RaftCommand;
+    use crate::clusters::raft::messages::RaftCommand;
     use tempfile::TempDir;
 
     fn entry(term: u64, index: Index) -> LogEntry {

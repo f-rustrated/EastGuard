@@ -1,7 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 
-use crate::clusters::swims::Topology;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::timer::TTimer;
@@ -79,11 +78,6 @@ pub enum SwimQueryCommand {
     GetMembers {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
-    #[allow(dead_code)]
-    GetTopology {
-        reply: tokio::sync::oneshot::Sender<Topology>,
-    },
-
     ResolveAddress {
         node_id: NodeId,
         reply: tokio::sync::oneshot::Sender<Option<SocketAddr>>,
@@ -213,4 +207,13 @@ impl SwimTimer {
 pub(crate) struct ProxyPing {
     pub(crate) requester_addr: SocketAddr,
     pub(crate) request_seq: u32,
+}
+
+/// Membership change events emitted by the SWIM state machine.
+/// Consumed by the RaftActor to drive shard group lifecycle.
+#[derive(Debug)]
+#[allow(dead_code)] // NodeAlive fields used when node join handling is added
+pub enum MembershipEvent {
+    NodeAlive { node_id: NodeId, addr: SocketAddr },
+    NodeDead { node_id: NodeId },
 }

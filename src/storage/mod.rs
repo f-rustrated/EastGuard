@@ -3,7 +3,7 @@ mod memory;
 
 pub use memory::MemoryLogStore;
 
-use crate::raft::{
+use crate::clusters::raft::{
     interface::LogError,
     log::{COMMAND_LEN, LogEntry, TERM_LEN},
     messages::RaftCommand,
@@ -36,7 +36,7 @@ impl Entry {
             Some(&b) => Err(LogError::Corruption(format!(
                 "unknown command discriminant: 0x{b:02x}"
             )))?,
-            None => Err(LogError::Corruption("empty data".to_string()))?
+            None => Err(LogError::Corruption("empty data".to_string()))?,
         };
 
         let term = u64::from_le_bytes(

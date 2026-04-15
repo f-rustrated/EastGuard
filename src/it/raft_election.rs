@@ -9,8 +9,8 @@ use turmoil::Builder;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::net::{TcpListener, TcpStream};
-use crate::raft::actor::{RaftActor, RaftCommand};
-use crate::raft::transport::RaftTransportActor;
+use crate::clusters::raft::actor::{RaftActor, RaftCommand};
+use crate::clusters::raft::transport::RaftTransportActor;
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker_message::TickerCommand;
 

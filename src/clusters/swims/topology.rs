@@ -37,7 +37,9 @@ pub struct ShardGroup {
     pub members: Vec<NodeId>,
 }
 
-/// node_id and replica_index for tie breaker
+/// Position on the consistent hash ring. Sorted by `(hash, pnode_id, replica_index)`.
+/// Collisions don't cause ownership conflicts — just means two vnodes share a position.
+/// The tiebreaker ordering determines who appears first in the walk.
 #[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone)]
 pub struct VirtualNodeToken {
     hash: u32,
@@ -89,30 +91,33 @@ impl TokenRing {
         Some(metadata)
     }
 
-    fn walk_clockwise(&self, key: &[u8]) -> impl Iterator<Item = &VirtualNode> {
-        let hash = hash_stable(key);
+    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
+        self.token_owners_at(hash_stable(key), n)
+    }
+
+    fn walk_clockwise_from(
+        &self,
+        hash: u32,
+    ) -> impl Iterator<Item = (&VirtualNodeToken, &VirtualNode)> {
         let start = VirtualNodeToken {
             hash,
             pnode_id: NodeId::new(""),
             replica_index: 0,
         };
-
         self.vnodes
             .range(&start..)
             .chain(self.vnodes.range(..&start))
-            .map(|(_, owner)| owner)
     }
 
-    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
+    fn token_owners_at(&self, hash: u32, n: usize) -> Vec<&VirtualNode> {
         if self.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
         let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
-        for owner in self.walk_clockwise(key) {
+        for (_, owner) in self.walk_clockwise_from(hash) {
             if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
                 continue;
             }
-
             result.push(owner);
             if result.len() == n {
                 break;
@@ -186,9 +191,30 @@ impl Topology {
         }
     }
 
-    #[cfg(test)]
-    pub fn contains_node(&self, id: &NodeId) -> bool {
-        self.ring.pnodes.contains_key(id)
+    /// Returns all unique shard groups that `node_id` participates in.
+    ///
+    /// Iterates every vnode position on the ring, computes the shard group
+    /// for that position, and includes the group if `node_id` is a member.
+    /// Deduplicates by ShardGroupId.
+    pub fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<ShardGroup> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+
+        for token in self.ring.vnodes.keys() {
+            let owners = self
+                .ring
+                .token_owners_at(token.hash, self.config.replication_factor);
+            let members: Vec<NodeId> = owners.iter().map(|vn| vn.pnode_id.clone()).collect();
+
+            if members.contains(node_id) {
+                let id = ShardGroupId(token.hash as u64);
+                if seen.insert(id) {
+                    result.push(ShardGroup { id, members });
+                }
+            }
+        }
+        result
     }
 
     #[expect(dead_code)]
@@ -540,5 +566,76 @@ mod tests {
 
         let group = topology.shard_group_for(b"any-key");
         assert!(group.members.is_empty());
+    }
+
+    // --- shard_groups_for_node tests ---
+
+    #[test]
+    fn shard_groups_for_node_includes_all_participating_groups() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 3,
+            },
+        );
+
+        // With 3 nodes and replication_factor=3, every node is in every group.
+        let groups = topology.shard_groups_for_node(&NodeId::new("node-0"));
+        assert!(!groups.is_empty());
+        for group in &groups {
+            assert!(group.members.contains(&NodeId::new("node-0")));
+            assert_eq!(group.members.len(), 3);
+        }
+    }
+
+    #[test]
+    fn shard_groups_for_node_excludes_non_member() {
+        let topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+                ("node-3", "127.0.0.1:8083"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 2,
+            },
+        );
+
+        // With replication_factor=2 and 4 nodes, not every node is in every group.
+        let groups_0 = topology.shard_groups_for_node(&NodeId::new("node-0"));
+        let groups_3 = topology.shard_groups_for_node(&NodeId::new("node-3"));
+
+        // Each node should have some groups but not all
+        let total_vnodes = 4 * 64; // 256
+        assert!(groups_0.len() < total_vnodes);
+        assert!(groups_3.len() < total_vnodes);
+        assert!(!groups_0.is_empty());
+        assert!(!groups_3.is_empty());
+    }
+
+    #[test]
+    fn shard_groups_for_node_empty_after_removal() {
+        let mut topology = topology_from(
+            &[
+                ("node-0", "127.0.0.1:8080"),
+                ("node-1", "127.0.0.1:8081"),
+                ("node-2", "127.0.0.1:8082"),
+            ],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 3,
+            },
+        );
+
+        topology.remove_node(&NodeId::new("node-0"));
+        let groups = topology.shard_groups_for_node(&NodeId::new("node-0"));
+        assert!(groups.is_empty());
     }
 }

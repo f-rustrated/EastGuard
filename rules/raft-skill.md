@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`Raft` = consensus state machine for DS-RSM (Dynamically-Sharded Replicated State Machine). Each shard group on node runs own independent `Raft` instance. Handles leader election, log replication, commit tracking. Like `Swim`, purely synchronous — no I/O.
+`Raft` = consensus state machine for DS-RSM (Dynamically-Sharded Replicated State Machine). Each shard group on node runs own independent `Raft` instance. Handles leader election, log replication, commit tracking. 
 
 ## DS-RSM Context
 
@@ -10,7 +10,7 @@ EastGuard not use monolithic metadata store or single controller quorum. Metadat
 
 - Single node participates in **many** Raft groups simultaneously (some leader, others follower).
 - Each `Raft` instance has own term, voted_for, log, commit_index — fully independent.
-- `ShardRaftManager` (future) multiplexes all groups through single `RaftActor`.
+- `RaftActor` multiplexes all groups through `HashMap<ShardGroupId, Raft>`.
 - Log storage per-instance (`MemLog`) now; becomes shared store keyed by `(shard_id, index)` when RocksDB added.
 
 ## Architecture
@@ -24,23 +24,28 @@ Raft (pure sync state machine, one per shard group)
     |
     |-- take_outbound()         --> Vec<OutboundRaftPacket>   (drain to transport)
     |-- take_timer_commands()   --> Vec<TimerCommand<RaftTimer>> (drain to scheduler)
+    |
+    |-- is_leader()             --> bool
+    |-- has_peer(node_id)       --> bool
+    |-- current_leader()        --> Option<&NodeId>
+    |-- peers_count()           --> usize
 ```
 
 ## Key Types
 
 | Type | File | Description |
 |---|---|---|
-| `Raft` | `src/raft/state.rs` | Core state machine. Holds term, role, log, peers, commit_index. |
-| `Role` | `src/raft/state.rs` | `Follower`, `Candidate { votes_received }`, `Leader` |
-| `PeerState` | `src/raft/state.rs` | Leader-only. `next_index` (guess) and `match_index` (confirmed truth). |
-| `MemLog` | `src/raft/log.rs` | In-memory log store. 1-based indexing. |
-| `LogEntry` | `src/raft/messages.rs` | `{ term, index, command }` |
-| `RaftCommand` | `src/raft/messages.rs` | `Noop` for now. Will grow: `CreateTopic`, `AssignRange`, `MoveShard`. |
-| `ProposeError` | `src/raft/messages.rs` | `NotLeader` (returned by `propose()` when not leader). |
-| `RaftRpc` | `src/raft/messages.rs` | Enum: `RequestVote`, `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`. |
-| `OutboundRaftPacket` | `src/raft/messages.rs` | `{ target: NodeId, rpc: RaftRpc }`. Transport-agnostic — actor resolves NodeId to connection. |
-| `RaftTimer` | `src/raft/messages.rs` | Implements `TTimer`. Two kinds: `Election`, `Heartbeat`. |
-| `RaftTimeoutCallback` | `src/raft/messages.rs` | `ElectionTimeout` (default), `HeartbeatTimeout`. |
+| `Raft` | `src/clusters/raft/state.rs` | Core state machine. Holds term, role, log, peers, commit_index, last_applied. |
+| `Role` | `src/clusters/raft/state.rs` | `Follower`, `Candidate { votes_received }`, `Leader` |
+| `PeerState` | `src/clusters/raft/state.rs` | Leader-only. `next_index` (guess) and `match_index` (confirmed truth). |
+| `MemLog` | `src/clusters/raft/log.rs` | In-memory log store. 1-based indexing. |
+| `LogEntry` | `src/clusters/raft/messages.rs` | `{ term, index, command }` |
+| `RaftCommand` | `src/clusters/raft/messages.rs` | `Noop`, `RemovePeer(NodeId)`, `AddPeer(NodeId)`. Will grow: `CreateTopic`, `AssignRange`, `MoveShard`. |
+| `ProposeError` | `src/clusters/raft/messages.rs` | `NotLeader` (returned by `propose()` when not leader). |
+| `RaftRpc` | `src/clusters/raft/messages.rs` | Enum: `RequestVote`, `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`. |
+| `OutboundRaftPacket` | `src/clusters/raft/messages.rs` | `{ target: NodeId, rpc: RaftRpc }`. Transport-agnostic — actor resolves NodeId to connection. |
+| `RaftTimer` | `src/clusters/raft/messages.rs` | Implements `TTimer`. Two kinds: `Election`, `Heartbeat`. |
+| `RaftTimeoutCallback` | `src/clusters/raft/messages.rs` | `ElectionTimeout` (default), `HeartbeatTimeout`. |
 
 ## Timer Model
 
@@ -87,8 +92,14 @@ Follower ──[ElectionTimeout]──> Candidate ──[majority votes]──> 
 ## Commit Semantics
 
 - `commit_index` advances when log entry from **current term** replicated on majority (Figure 8 safety rule — cannot directly commit old-term entries).
-- `last_applied` (future, Phase 4.5) tracks last entry applied to per-shard state machine.
-- Apply loop drains `last_applied+1..=commit_index` after each commit advancement.
+- `last_applied` tracks last entry applied. After each commit_index advancement, `apply_committed_entries()` drains `last_applied+1..=commit_index`.
+- **Single-node clusters**: `try_advance_commit_index()` called after `propose()` and `become_leader()` — no peers to ack, quorum=1 (self), so entries commit immediately.
+
+## ConfChange (Membership Changes)
+
+- `RaftCommand::RemovePeer(NodeId)` — removes peer from `self.peers` and `self.peer_states` on commit. Proposed by leader via `HandleNodeDeath` (sent by SwimActor on node death).
+- `RaftCommand::AddPeer(NodeId)` — inserts into `self.peers` on commit. Leader initializes `PeerState` for the new peer. Skips if target is self (self never in peers). Proposed by leader via `HandleNodeJoin` (sent by SwimActor on node join).
+- ConfChange is Raft-internal — modifies the peer set, not the application state machine. Handled in `apply_committed_entries()`, separate from Phase 4's application apply path.
 
 ## Log Replication
 
@@ -102,7 +113,7 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 1. **Raft is purely synchronous.** No async, no I/O, no channels. All side effects buffered in `pending_outbound` and `pending_timer_commands`.
 
-2. **Each Raft instance independent.** In DS-RSM, node runs many Raft instances. Share no state. `ShardRaftManager` (future) maps `ShardGroupId → Raft`.
+2. **Each Raft instance independent.** In DS-RSM, node runs many Raft instances. Share no state. `RaftActor` maps `ShardGroupId → Raft`.
 
 3. **Every event must be followed by draining output buffers.** Actor layer must call `take_outbound()` and `take_timer_commands()` after every `step()`, `handle_timeout()`, or `propose()` call.
 

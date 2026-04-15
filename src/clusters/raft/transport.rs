@@ -6,11 +6,11 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::clusters::raft::actor::RaftCommand;
+use crate::clusters::raft::messages::{OutboundRaftPacket, WireRaftMessage};
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
-use crate::raft::actor::RaftCommand;
-use crate::raft::messages::{OutboundRaftPacket, WireRaftMessage};
 
 struct RaftReader(OwnedReadHalf);
 
@@ -222,8 +222,8 @@ impl RaftTransportActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clusters::raft::messages::{RaftRpc, RequestVote};
     use crate::clusters::swims::ShardGroupId;
-    use crate::raft::messages::{RaftRpc, RequestVote};
     use std::time::Duration;
     use turmoil::Builder;
 

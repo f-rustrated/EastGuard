@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use crate::raft::interface::LogStore;
-use crate::raft::messages::RaftCommand;
+use crate::clusters::raft::interface::LogStore;
+use crate::clusters::raft::messages::RaftCommand;
 
 /// Bytes reserved for the command discriminant.
 pub(crate) const COMMAND_LEN: usize = 1;

@@ -1,4 +1,4 @@
-use crate::raft::log::LogEntry;
+use crate::clusters::raft::log::LogEntry;
 use crate::storage::Index;
 
 /// Append-only log storage — one instance per shard group.

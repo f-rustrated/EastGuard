@@ -41,15 +41,20 @@ impl TestHarness {
         rx.await.unwrap().len()
     }
 
+    /// Check if a node is in the topology ring by verifying it's a known
+    /// member with Alive state (Alive → inserted into ring, Dead → removed).
     pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Query(SwimQueryCommand::GetTopology {
+            .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
                 reply: tx,
             }))
             .await
             .unwrap();
-        rx.await.unwrap().contains_node(&node_id)
+        rx.await
+            .unwrap()
+            .iter()
+            .any(|m| m.node_id == node_id && m.state == SwimNodeState::Alive)
     }
 }
 
@@ -129,7 +134,8 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         ),
         0,
     );
-    let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone());
+    let (raft_tx, _raft_rx) = tokio::sync::mpsc::channel(64);
+    let actor = SwimActor::new(rx_in, tx_out.clone(), ticker_tx.clone(), raft_tx);
     Bootstrapper::run(join_config.tries(), &mut swim);
 
     tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));

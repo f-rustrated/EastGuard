@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
-use crate::raft::interface::LogStore;
-use crate::raft::log::{LogEntry, RaftLog};
-use crate::raft::messages::*;
+use crate::clusters::raft::interface::LogStore;
+use crate::clusters::raft::log::{LogEntry, RaftLog};
+use crate::clusters::raft::messages::*;
+use crate::clusters::swims::ShardGroupId;
 use crate::schedulers::ticker_message::TimerCommand;
 use crate::storage::MemoryLogStore;
-use crate::clusters::swims::ShardGroupId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -50,6 +50,7 @@ pub struct Raft<S: LogStore = MemoryLogStore> {
     log: RaftLog<S>,
 
     commit_index: u64,
+    last_applied: u64,
     role: Role,
 
     /// Tracks who the current leader is — set when this node becomes leader
@@ -87,6 +88,7 @@ impl<S: LogStore> Raft<S> {
             voted_for: None,
             log: RaftLog::with_store(store),
             commit_index: 0,
+            last_applied: 0,
             role: Role::Follower,
             current_leader: None,
             peer_states: HashMap::new(),
@@ -112,6 +114,14 @@ impl<S: LogStore> Raft<S> {
 
     pub fn current_leader(&self) -> Option<&NodeId> {
         self.current_leader.as_ref()
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.role == Role::Leader
+    }
+
+    pub fn has_peer(&self, node_id: &NodeId) -> bool {
+        self.peers.contains(node_id)
     }
 
     /// Minimum number of nodes needed for a majority (strict majority).
@@ -284,6 +294,9 @@ impl<S: LogStore> Raft<S> {
 
         // Send AppendEntries (with the Noop) to all peers.
         self.send_heartbeats();
+
+        // Single-node: commit the Noop immediately (quorum = 1 = self).
+        self.try_advance_commit_index();
     }
 
     fn step_down(&mut self, new_term: u64) {
@@ -384,6 +397,7 @@ impl<S: LogStore> Raft<S> {
         // Advance commit index.
         if req.leader_commit > self.commit_index {
             self.commit_index = req.leader_commit.min(self.log.last_index());
+            self.apply_committed_entries();
         }
 
         self.send_append_entries_response(from, true);
@@ -469,7 +483,56 @@ impl<S: LogStore> Raft<S> {
 
             if replication_count >= quorum {
                 self.commit_index = n;
+                self.apply_committed_entries();
                 return;
+            }
+        }
+    }
+
+    /// Apply committed but unapplied log entries.
+    /// Currently handles Raft-internal ConfChanges (RemovePeer, AddPeer).
+    /// Phase 4 will extend this with application state machine dispatch.
+    fn apply_committed_entries(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let entry = match self.log.get(self.last_applied) {
+                Some(e) => e.clone(),
+                None => continue,
+            };
+            match entry.command {
+                RaftCommand::Noop => {}
+                RaftCommand::RemovePeer(ref node_id) => {
+                    self.peers.remove(node_id);
+                    self.peer_states.remove(node_id);
+                    tracing::info!(
+                        "[{}] ConfChange applied: removed peer {} (index={})",
+                        self.node_id,
+                        node_id,
+                        self.last_applied
+                    );
+                }
+                RaftCommand::AddPeer(ref node_id) => {
+                    // Skip if target is self — self is never in peers.
+                    if node_id == &self.node_id {
+                        continue;
+                    }
+                    self.peers.insert(node_id.clone());
+                    if self.role == Role::Leader {
+                        self.peer_states.insert(
+                            node_id.clone(),
+                            PeerState {
+                                next_index: self.log.last_index() + 1,
+                                match_index: 0,
+                            },
+                        );
+                    }
+                    tracing::info!(
+                        "[{}] ConfChange applied: added peer {} (index={})",
+                        self.node_id,
+                        node_id,
+                        self.last_applied
+                    );
+                }
             }
         }
     }
@@ -503,6 +566,11 @@ impl<S: LogStore> Raft<S> {
         for peer_id in peers {
             self.send_append_entries(peer_id);
         }
+
+        // Single-node cluster: no peers to ack, so commit immediately
+        // (quorum of 1 = self). For multi-node, this is a no-op because
+        // no peer has acked yet.
+        self.try_advance_commit_index();
 
         Ok(())
     }
@@ -1251,5 +1319,191 @@ mod tests {
                 "quorum for {total} nodes should be {want}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // is_leader / has_peer
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_leader_returns_false_for_follower() {
+        let raft = three_node_raft("node-1");
+        assert!(!raft.is_leader());
+    }
+
+    #[test]
+    fn is_leader_returns_true_after_election() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        assert!(raft.is_leader());
+    }
+
+    #[test]
+    fn has_peer_checks_membership() {
+        let raft = three_node_raft("node-1");
+        assert!(raft.has_peer(&node("node-2")));
+        assert!(raft.has_peer(&node("node-3")));
+        assert!(!raft.has_peer(&node("node-1"))); // self is not in peers
+        assert!(!raft.has_peer(&node("node-99")));
+    }
+
+    // -------------------------------------------------------------------
+    // ConfChange: RemovePeer
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn remove_peer_applied_after_commit_single_node() {
+        // Single-node leader: propose RemovePeer for a phantom peer,
+        // verify the apply machinery runs without panicking.
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        raft.take_outbound();
+        raft.take_timer_commands();
+
+        // Single-node commits immediately on propose.
+        let result = raft.propose(RaftCommand::RemovePeer(node("phantom")));
+        assert!(result.is_ok());
+        // last_applied should have advanced
+        assert!(raft.last_applied > 0);
+    }
+
+    #[test]
+    fn remove_peer_removes_from_peers_on_commit() {
+        // 3-node cluster: node-1 is leader, proposes removing node-3.
+        let mut n1 = three_node_raft("node-1");
+        let mut n2 = three_node_raft("node-2");
+
+        // Elect node-1: timeout → candidate
+        n1.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+
+        // node-2 grants vote → node-1 becomes leader
+        let vote_reqs = n1.take_outbound();
+        for pkt in &vote_reqs {
+            if pkt.target == node("node-2") {
+                n2.step(node("node-1"), pkt.rpc.clone());
+            }
+        }
+        let vote_resp = n2.take_outbound();
+        for pkt in vote_resp {
+            n1.step(node("node-2"), pkt.rpc);
+        }
+        assert!(n1.is_leader());
+        n1.take_outbound(); // drain heartbeats
+
+        assert!(n1.has_peer(&node("node-3")));
+
+        // Leader proposes RemovePeer(node-3)
+        let result = n1.propose(RaftCommand::RemovePeer(node("node-3")));
+        assert!(result.is_ok());
+        let ae_pkts = n1.take_outbound();
+
+        // node-2 acks the AppendEntries
+        for pkt in ae_pkts {
+            if pkt.target == node("node-2") {
+                n2.step(node("node-1"), pkt.rpc);
+            }
+        }
+        let acks = n2.take_outbound();
+        for pkt in acks {
+            n1.step(node("node-2"), pkt.rpc);
+        }
+
+        // After majority ack, commit_index advances and RemovePeer is applied
+        assert!(!n1.has_peer(&node("node-3")));
+        assert_eq!(n1.peers_count(), 1); // only node-2 remains
+    }
+
+    // -------------------------------------------------------------------
+    // ConfChange: AddPeer
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn add_peer_single_node_commits_immediately() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        raft.take_outbound();
+        raft.take_timer_commands();
+        assert_eq!(raft.peers_count(), 0);
+
+        let result = raft.propose(RaftCommand::AddPeer(node("node-2")));
+        assert!(result.is_ok());
+        assert!(raft.has_peer(&node("node-2")));
+        assert_eq!(raft.peers_count(), 1);
+    }
+
+    #[test]
+    fn add_peer_skips_self() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        raft.take_outbound();
+
+        let result = raft.propose(RaftCommand::AddPeer(node("node-1")));
+        assert!(result.is_ok());
+        // Self should NOT be in peers
+        assert!(!raft.has_peer(&node("node-1")));
+        assert_eq!(raft.peers_count(), 0);
+    }
+
+    #[test]
+    fn add_peer_leader_initializes_peer_state() {
+        // 3-node cluster, leader adds node-4.
+        let mut n1 = three_node_raft("node-1");
+        let mut n2 = three_node_raft("node-2");
+
+        // Elect node-1
+        n1.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let vote_reqs = n1.take_outbound();
+        for pkt in &vote_reqs {
+            if pkt.target == node("node-2") {
+                n2.step(node("node-1"), pkt.rpc.clone());
+            }
+        }
+        for pkt in n2.take_outbound() {
+            n1.step(node("node-2"), pkt.rpc);
+        }
+        assert!(n1.is_leader());
+        n1.take_outbound();
+
+        assert!(!n1.has_peer(&node("node-4")));
+
+        // Propose AddPeer(node-4)
+        let result = n1.propose(RaftCommand::AddPeer(node("node-4")));
+        assert!(result.is_ok());
+        let ae_pkts = n1.take_outbound();
+
+        // node-2 acks
+        for pkt in ae_pkts {
+            if pkt.target == node("node-2") {
+                n2.step(node("node-1"), pkt.rpc);
+            }
+        }
+        for pkt in n2.take_outbound() {
+            n1.step(node("node-2"), pkt.rpc);
+        }
+
+        // After commit, node-4 is a peer
+        assert!(n1.has_peer(&node("node-4")));
+        assert_eq!(n1.peers_count(), 3); // node-2, node-3, node-4
+
+        // Leader should have initialized peer state — next heartbeat
+        // should include AppendEntries to node-4.
+        n1.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let heartbeats = n1.take_outbound();
+        let targets: Vec<&NodeId> = heartbeats.iter().map(|p| &p.target).collect();
+        assert!(targets.contains(&&node("node-4")));
     }
 }

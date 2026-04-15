@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::clusters::raft::actor::RaftCommand;
 use crate::clusters::swims::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
 
@@ -13,6 +14,7 @@ pub struct SwimActor {
     mailbox: mpsc::Receiver<SwimCommand>,
     transport_tx: mpsc::Sender<OutboundPacket>,
     scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+    raft_tx: mpsc::Sender<RaftCommand>,
 }
 
 impl SwimActor {
@@ -20,11 +22,13 @@ impl SwimActor {
         mailbox: mpsc::Receiver<SwimCommand>,
         transport_tx: mpsc::Sender<OutboundPacket>,
         ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+        raft_tx: mpsc::Sender<RaftCommand>,
     ) -> Self {
         Self {
             mailbox,
             transport_tx,
             scheduler_tx: ticker_tx,
+            raft_tx,
         }
     }
 
@@ -51,6 +55,29 @@ impl SwimActor {
     async fn flush_outbound_commands(&mut self, state: &mut Swim) {
         let timer_commands = state.take_timer_commands();
         let outbound_packets = state.take_outbound();
+        let membership_events = state.take_membership_events();
+
+        // Translate membership events into RaftActor commands.
+        // Topology is available synchronously via state.topology — no async roundtrip.
+        let raft_commands: Vec<RaftCommand> = membership_events
+            .into_iter()
+            .filter_map(|event| match event {
+                MembershipEvent::NodeDead { node_id } => Some(RaftCommand::HandleNodeDeath {
+                    dead_node_id: node_id,
+                }),
+                MembershipEvent::NodeAlive { node_id, .. } => {
+                    let affected_groups = state.topology.shard_groups_for_node(&node_id);
+                    if affected_groups.is_empty() {
+                        return None;
+                    }
+                    Some(RaftCommand::HandleNodeJoin {
+                        new_node_id: node_id,
+                        affected_groups,
+                    })
+                }
+            })
+            .collect();
+
         tokio::join!(
             async {
                 for cmd in timer_commands {
@@ -62,6 +89,11 @@ impl SwimActor {
                 for pkt in outbound_packets {
                     tracing::debug!("[PACKET] {}", pkt);
                     let _ = self.transport_tx.send(pkt).await;
+                }
+            },
+            async {
+                for cmd in raft_commands {
+                    let _ = self.raft_tx.send(cmd).await;
                 }
             }
         );
