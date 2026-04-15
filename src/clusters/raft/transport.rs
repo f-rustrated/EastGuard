@@ -122,40 +122,55 @@ impl RaftWriters {
 
         for (target_id, msgs) in by_target {
             // Try existing writer
-            if let Some(writer) = self.writers.get_mut(&target_id) {
-                if Self::write_messages(writer, &msgs).await.is_ok() {
-                    continue;
-                }
-                self.writers.remove(&target_id);
-            }
-
-            // Establish new connection
-            let Some(target_addr) = self.resolve_address(&target_id, swim_tx).await else {
-                tracing::warn!("Cannot resolve address for {:?}", target_id);
-                continue;
-            };
-
-            let Ok(stream) = TcpStream::connect(target_addr).await else {
-                tracing::warn!("Failed to connect to {} ({:?})", target_addr, target_id);
-                continue;
-            };
-
-            let (read_half, write_half) = stream.into_split();
-            let mut writer = write_half;
-
-            if Self::write_node_id(&mut writer, &self.node_id)
-                .await
-                .is_err()
+            if self.writers.contains_key(&target_id)
+                && self.write_messages_to(&target_id, &msgs).await.is_ok()
             {
                 continue;
             }
 
-            tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
+            // Establish new connection
+            let Some(target_addr) = self.resolve_address(&target_id, swim_tx).await else {
+                tracing::warn!(
+                    "[{}] Cannot resolve address for {:?}",
+                    self.node_id,
+                    target_id
+                );
+                continue;
+            };
 
-            if Self::write_messages(&mut writer, &msgs).await.is_err() {
+            let Ok(stream) = TcpStream::connect(target_addr).await else {
+                tracing::warn!(
+                    "[{}] Failed to connect to {} ({:?})",
+                    self.node_id,
+                    target_addr,
+                    target_id
+                );
+                continue;
+            };
+
+            let (read_half, write_half) = stream.into_split();
+            self.writers.insert(target_id.clone(), write_half);
+
+            if let Err(e) = self.handshake(&target_id).await {
+                tracing::warn!(
+                    "[{}] Handshake with {:?} failed: {e}",
+                    self.node_id,
+                    target_id
+                );
                 continue;
             }
-            self.writers.insert(target_id, writer);
+
+            if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
+                tracing::warn!(
+                    "[{}] Write {} msgs to {:?} failed: {e}",
+                    self.node_id,
+                    msgs.len(),
+                    target_id
+                );
+                continue;
+            }
+
+            tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
         }
     }
 
@@ -198,21 +213,37 @@ impl RaftWriters {
     }
 
     // --- Wire helpers ---
+    // On error, writer is removed from the map so subsequent calls reconnect.
 
-    async fn write_node_id(writer: &mut OwnedWriteHalf, node_id: &NodeId) -> std::io::Result<()> {
-        let bytes = bincode::encode_to_vec(node_id, BINCODE_CONFIG)
+    /// Send handshake (our NodeId) to a writer already in the map.
+    async fn handshake(&mut self, target: &NodeId) -> std::io::Result<()> {
+        let writer = self.writers.get_mut(target).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "no writer for target")
+        })?;
+        let bytes = bincode::encode_to_vec(&self.node_id, BINCODE_CONFIG)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let len = bytes.len() as u32;
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&bytes).await?;
-        Ok(())
+        let result = async {
+            writer.write_all(&len.to_be_bytes()).await?;
+            writer.write_all(&bytes).await
+        }
+        .await;
+
+        if result.is_err() {
+            self.writers.remove(target);
+        }
+        result
     }
 
-    /// Encode all messages into a single buffer, write once.
-    async fn write_messages(
-        writer: &mut OwnedWriteHalf,
+    /// Encode all messages into a single buffer, write to target's connection.
+    async fn write_messages_to(
+        &mut self,
+        target: &NodeId,
         msgs: &[WireRaftMessage],
     ) -> std::io::Result<()> {
+        let writer = self.writers.get_mut(target).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "no writer for target")
+        })?;
         let mut buf = Vec::new();
         for msg in msgs {
             let bytes = bincode::encode_to_vec(msg, BINCODE_CONFIG)
@@ -221,8 +252,11 @@ impl RaftWriters {
             buf.extend_from_slice(&len.to_be_bytes());
             buf.extend_from_slice(&bytes);
         }
-        writer.write_all(&buf).await?;
-        Ok(())
+        let result = writer.write_all(&buf).await;
+        if result.is_err() {
+            self.writers.remove(target);
+        }
+        result
     }
 }
 
@@ -272,6 +306,20 @@ mod tests {
     use std::time::Duration;
     use turmoil::Builder;
 
+    /// Write a length-prefixed bincode-encoded value to a raw write half.
+    /// Used by tests to simulate the peer side of the wire protocol.
+    async fn write_frame(
+        writer: &mut OwnedWriteHalf,
+        value: &impl bincode::Encode,
+    ) -> std::io::Result<()> {
+        let bytes = bincode::encode_to_vec(value, BINCODE_CONFIG)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let len = bytes.len() as u32;
+        writer.write_all(&len.to_be_bytes()).await?;
+        writer.write_all(&bytes).await?;
+        Ok(())
+    }
+
     #[test]
     fn handshake_write_then_read_node_id() -> turmoil::Result {
         let mut sim = Builder::new()
@@ -294,7 +342,7 @@ mod tests {
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream.into_split();
 
-            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-abc")).await?;
+            write_frame(&mut write_half, &NodeId::new("node-abc")).await?;
             Ok(())
         });
 
@@ -331,9 +379,9 @@ mod tests {
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream.into_split();
 
-            RaftWriters::write_messages(
+            write_frame(
                 &mut write_half,
-                &[WireRaftMessage {
+                &WireRaftMessage {
                     shard_group_id: ShardGroupId(42),
                     sender: NodeId::new("sender-1"),
                     rpc: RaftRpc::RequestVote(RequestVote {
@@ -342,7 +390,7 @@ mod tests {
                         last_log_index: 10,
                         last_log_term: 3,
                     }),
-                }],
+                },
             )
             .await?;
             Ok(())
@@ -376,7 +424,7 @@ mod tests {
             let addr = turmoil::lookup("acceptor");
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream.into_split();
-            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-a")).await?;
+            write_frame(&mut write_half, &NodeId::new("node-a")).await?;
             Ok(())
         });
 
@@ -427,11 +475,11 @@ mod tests {
 
             let stream1 = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream1.into_split();
-            RaftWriters::write_node_id(&mut write_half, &NodeId::new("node-a")).await?;
+            write_frame(&mut write_half, &NodeId::new("node-a")).await?;
 
             let stream2 = TcpStream::connect((addr, 9001)).await?;
             let (_, mut write_half2) = stream2.into_split();
-            RaftWriters::write_node_id(&mut write_half2, &NodeId::new("node-a")).await?;
+            write_frame(&mut write_half2, &NodeId::new("node-a")).await?;
 
             Ok(())
         });
