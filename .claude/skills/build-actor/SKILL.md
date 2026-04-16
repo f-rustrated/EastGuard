@@ -24,22 +24,29 @@ Sync/async split gives:
 
 ## Step 1: Design the State Machine First
 
-Start with struct. No async, no channels, no I/O. Receives events via method calls, buffers side effects for actor to drain.
+Start with struct. No async, no channels, no I/O. Receives events via method calls, buffers all side effects into a single `pending_events: Vec<YourEvent>` for the actor to drain.
 
 ```rust
+/// Unified side-effect type. Actor drains and routes by variant.
+pub enum YourEvent {
+    Packet(YourOutboundPacket),
+    Timer(TimerCommand<YourTimer>),
+}
+
 pub struct YourStateMachine {
     // Your domain state
     // ...
 
-    // Output buffers -- the actor drains these after every event
-    pending_outbound: Vec<YourOutboundPacket>,
-    pending_timer_commands: Vec<TimerCommand<YourTimer>>,
+    // Single output buffer -- actor drains after every event batch
+    pending_events: Vec<YourEvent>,
 }
 
 impl YourStateMachine {
-    /// Process an inbound event. Buffers any side effects.
-    pub fn step(&mut self, event: YourEvent) {
-        // Logic here. Push to pending_outbound / pending_timer_commands.
+    /// Process an inbound event. Buffers side effects into pending_events.
+    pub fn step(&mut self, event: YourInbound) {
+        // Logic here. Push YourEvent variants.
+        self.pending_events.push(YourEvent::Packet(/* ... */));
+        self.pending_events.push(YourEvent::Timer(/* ... */));
     }
 
     /// Process a timer expiry.
@@ -47,14 +54,9 @@ impl YourStateMachine {
         // ...
     }
 
-    /// Drain outbound packets. Returns ownership to the caller.
-    pub fn take_outbound(&mut self) -> Vec<YourOutboundPacket> {
-        std::mem::take(&mut self.pending_outbound)
-    }
-
-    /// Drain timer commands.
-    pub fn take_timer_commands(&mut self) -> Vec<TimerCommand<YourTimer>> {
-        std::mem::take(&mut self.pending_timer_commands)
+    /// Drain all buffered events. Returns ownership to the caller.
+    pub(crate) fn take_events(&mut self) -> Vec<YourEvent> {
+        std::mem::take(&mut self.pending_events)
     }
 
     /// Top-level command dispatch. Called by the actor's drain loop.
@@ -71,8 +73,13 @@ impl YourStateMachine {
 
 **Key constraints:**
 - No `async fn`. No `.await`. No `mpsc::Sender`. No `tokio::` anything.
-- All side effects go into `pending_*` vecs.
+- All side effects go into `pending_events` as enum variants.
+- Single buffer, single drain method. No separate `take_outbound()` / `take_timer_commands()`.
 - State machine doesn't know who consumes its output.
+
+**Reference implementations:**
+- `Swim` in `src/clusters/swims/swim.rs` — emits `SwimEvent { Packet, Timer, Membership }`
+- `Raft` in `src/clusters/raft/state.rs` — emits `RaftEvent { OutboundRaftPacket, Timer, LeaderChange }`
 
 
 ## Step 2: Define Message Types
@@ -91,14 +98,17 @@ pub enum YourActorCommand {
 
 Convention: `PacketReceived` for network input, `Timeout` for timer expiry, `Query` for read-only questions answered via oneshot.
 
-### Outbound packet (what state machine produces)
+### Event enum (what state machine produces)
 
 ```rust
-pub struct YourOutboundPacket {
-    pub target: SocketAddr,  // or NodeId if transport resolves addresses
-    pub payload: YourPayload,
+pub enum YourEvent {
+    Packet(YourOutboundPacket),
+    Timer(TimerCommand<YourTimer>),
+    // Add more variants as the component grows
 }
 ```
+
+One variant per output channel the actor routes to. Actor matches on variants and sends to the appropriate channel.
 
 ### Query commands (if component answers external questions)
 
@@ -158,8 +168,8 @@ impl TTimer for YourTimer {
 Actor = async wrapper that:
 1. Receives events from mailbox
 2. Feeds into sync state machine
-3. Drains output buffers (flush)
-4. Sends results to other actors
+3. Drains event buffer
+4. Routes each event variant to the appropriate channel
 
 No struct needed for simple actors — pass all channels directly to `run()`. Actor is a unit-like struct used only as a namespace for the `run` and `flush` associated functions.
 
@@ -195,27 +205,25 @@ impl YourActor {
         transport_tx: &mpsc::Sender<YourOutboundPacket>,
         scheduler_tx: &mpsc::Sender<TickerCommand<YourTimer>>,
     ) {
-        let timer_commands = state.take_timer_commands();
-        let outbound_packets = state.take_outbound();
-
-        // Send concurrently -- neither depends on the other
-        tokio::join!(
-            async {
-                for cmd in timer_commands {
-                    let _ = scheduler_tx.send(cmd.into()).await;
-                }
-            },
-            async {
-                for pkt in outbound_packets {
+        for event in state.take_events() {
+            match event {
+                YourEvent::Packet(pkt) => {
                     let _ = transport_tx.send(pkt).await;
                 }
+                YourEvent::Timer(cmd) => {
+                    let _ = scheduler_tx.send(cmd.into()).await;
+                }
             }
-        );
+        }
     }
 }
 ```
 
-**Critical: flush must happen after draining all pending events.** Output buffers (`pending_*` vecs) accumulate across multiple `process()` calls, so one flush handles the entire batch. `process()` lives on the state machine when dispatch is pure sync (no I/O). If command handling requires async I/O (e.g. sending transport commands), keep it as an actor associated fn instead. Branch that skips flush = side effects silently lost.
+**Flush routes directly** — no intermediate Vecs, no `tokio::join!`. Iterate events, match variant, send to channel. mpsc sends are non-blocking unless buffer full, so sequential dispatch is equivalent to concurrent.
+
+**Critical: flush must happen after draining all pending events.** Output buffers accumulate across multiple `process()` calls, so one flush handles the entire batch. `process()` lives on the state machine when dispatch is pure sync (no I/O). If command handling requires async I/O (e.g. sending transport commands), keep it as an actor associated fn instead. Branch that skips flush = side effects silently lost.
+
+**Translation in flush**: If events need transformation before routing (e.g. membership events → raft commands, timer seq namespacing), extract a helper method rather than inlining complex logic in the match arm. See `SwimActor::to_raft_command()` and `RaftGroups::translate_timer_seq()`.
 
 ### Multiplexing pattern (like RaftActor)
 
@@ -237,34 +245,19 @@ impl YourGroups {
     }
 
     async fn flush_dirty(&mut self, transport_tx: ..., scheduler_tx: ...) {
-        let to_flush: Vec<_> = self.dirty.drain().collect();
+        let to_flush = std::mem::take(&mut self.dirty);
         for group_id in to_flush {
-            // take_outbound, take_timer_commands, translate seqs, send
-        }
-    }
-}
-
-/// Thin async boundary.
-pub struct MultiplexActor;
-
-impl MultiplexActor {
-    pub async fn run(
-        node_id: NodeId,
-        mut mailbox: mpsc::Receiver<YourActorCommand>,
-        transport_tx: mpsc::Sender<YourOutboundPacket>,
-        scheduler_tx: mpsc::Sender<TickerCommand<YourTimer>>,
-    ) {
-        let mut state = YourGroups::new(node_id);
-        let mut buf = Vec::with_capacity(64);
-
-        loop {
-            if mailbox.recv_many(&mut buf, 64).await == 0 {
-                break;
+            let Some(sm) = self.groups.get_mut(&group_id) else { continue };
+            for event in sm.take_events() {
+                match event {
+                    YourEvent::Packet(pkt) => { /* aggregate or send */ }
+                    YourEvent::Timer(cmd) => {
+                        if let Some(cmd) = self.translate_timer_seq(group_id, cmd) {
+                            let _ = scheduler_tx.send(cmd.into()).await;
+                        }
+                    }
+                }
             }
-            for cmd in buf.drain(..) {
-                state.process_command(cmd, &transport_tx, &scheduler_tx).await;
-            }
-            state.flush_dirty(&transport_tx, &scheduler_tx).await;
         }
     }
 }
@@ -273,11 +266,8 @@ impl MultiplexActor {
 See `RaftGroups` in `src/clusters/raft/actor.rs` for the full implementation. Key details:
 
 - `process_command` is async when some commands need I/O (e.g. `DisconnectPeer`, `CancelSchedule`). Channel senders passed as params, not stored in the struct.
-- `flush_dirty` collects dirty group IDs into a local Vec before iterating, avoiding borrow conflicts with `&mut self` methods like `get_or_alloc_seq`.
+- Outbound packets aggregated by target NodeId before sending — batches N shard groups into fewer channel sends.
 
-Each instance emits local seq values for timers. The groups struct namespaces them to avoid collisions in shared ticker: `get_or_alloc_seq(group_id.token(local_seq))` maps each `(group_id, local_seq)` pair to a unique global seq.
-
-When removing group, cancel all its timers by iterating over known local seqs and removing their global mappings.
 
 ## Step 5: Wire Into Startup (lib.rs)
 
@@ -312,12 +302,28 @@ pub async fn run(self) -> Result<()> {
 
 ## Step 6: Test the State Machine
 
-Sync tests, no tokio needed:
+Sync tests, no tokio needed. Use helper functions to filter events by variant:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract only Packet events from take_events().
+    fn packets(sm: &mut YourStateMachine) -> Vec<YourOutboundPacket> {
+        sm.take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                YourEvent::Packet(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drain all events (discard).
+    fn drain(sm: &mut YourStateMachine) {
+        sm.take_events();
+    }
 
     #[test]
     fn basic_behavior() {
@@ -325,13 +331,9 @@ mod tests {
 
         sm.step(some_event);
 
-        let packets = sm.take_outbound();
-        assert_eq!(packets.len(), 1);
+        let pkts = packets(&mut sm);
+        assert_eq!(pkts.len(), 1);
         // assert on contents...
-
-        let timers = sm.take_timer_commands();
-        assert_eq!(timers.len(), 1);
-        // assert on timer type, tick count...
     }
 }
 ```
@@ -341,10 +343,12 @@ Biggest advantage of sync-first design: test protocol logic without async machin
 ## Checklist
 
 - [ ] State machine is `pub struct` with no async, no channels, no I/O
-- [ ] Side effects buffered in `pending_outbound` and `pending_timer_commands`
-- [ ] `take_outbound()` and `take_timer_commands()` drain via `std::mem::take`
-- [ ] Actor drains pending messages via `try_recv()` then flushes once (no early returns before flush)
+- [ ] Side effects buffered in single `pending_events: Vec<YourEvent>`
+- [ ] `YourEvent` enum has one variant per output channel
+- [ ] Single `take_events()` drain via `std::mem::take`
+- [ ] Actor flush iterates events and routes by variant — no intermediate Vecs
+- [ ] Actor drains pending messages via `recv_many` then flushes once (no early returns before flush)
 - [ ] TTimer implemented if using timers (with `Default` callback)
 - [ ] Channels created and actor spawned in `lib.rs` startup
-- [ ] Sync unit tests exercise state machine directly
+- [ ] Sync unit tests with helper functions filtering events by variant
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes

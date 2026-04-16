@@ -6,33 +6,6 @@
 
 Actor contains no consensus logic. All decisions live in `Raft`.
 
-## Architecture
-
-```
-                       mpsc::Receiver<RaftCommand>
-                                 |
-                                 v
-                          +-----------+
-                          | RaftActor |
-                          +-----------+
-                          |  mailbox  |
-                          +-----------+
-                                 |
-                     dispatches by ShardGroupId
-                                 |
-                    +------------+------------+
-                    |            |            |
-               Raft #12    Raft #45    Raft #78
-               (Leader)   (Follower)  (Leader)
-                    |            |            |
-                    +-----+------+-----+------+
-                          |            |
-              take_timer_commands()  take_outbound()
-                          |            |
-                          v            v
-        mpsc::Sender<TickerCommand>  mpsc::Sender<OutboundRaftPacket>
-           (scheduler_tx)               (transport_tx)
-```
 
 **Single actor, multiple state machines:** Instead of spawning one task per shard group, single `RaftActor` multiplexes all groups. Keeps lifecycle management simple, avoids thousands of tokio tasks as shard count grows. Can split later if contention becomes issue.
 
