@@ -202,8 +202,8 @@ impl<S: LogStore> Raft<S> {
             self.reset_election_timer();
         }
 
-        self.pending_events
-            .push(RaftEvent::OutboundRaftPacket(OutboundRaftPacket::new(
+        self.pending_events.push(
+            OutboundRaftPacket::new(
                 self.shard_group_id,
                 from,
                 RequestVoteResponse {
@@ -211,7 +211,9 @@ impl<S: LogStore> Raft<S> {
                     node_id: self.node_id.clone(),
                     vote_granted,
                 },
-            )));
+            )
+            .into(),
+        );
     }
 
     // ! SAFETY: only candidates count votes.
@@ -259,12 +261,14 @@ impl<S: LogStore> Raft<S> {
         self.role = Role::Leader;
         self.current_leader = Some(self.node_id.clone());
 
-        self.pending_events
-            .push(RaftEvent::LeaderChange(LeaderChange {
+        self.pending_events.push(
+            LeaderChange {
                 shard_group_id: self.shard_group_id,
                 leader_node_id: self.node_id.clone(),
                 term: self.current_term,
-            }));
+            }
+            .into(),
+        );
 
         // Cancel election timer, start heartbeat timer.
         self.cancel_all_timers();
@@ -439,8 +443,8 @@ impl<S: LogStore> Raft<S> {
     }
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
-        self.pending_events
-            .push(RaftEvent::OutboundRaftPacket(OutboundRaftPacket::new(
+        self.pending_events.push(
+            OutboundRaftPacket::new(
                 self.shard_group_id,
                 target,
                 AppendEntriesResponse {
@@ -449,7 +453,9 @@ impl<S: LogStore> Raft<S> {
                     success,
                     last_log_index: self.log.last_index(),
                 },
-            )));
+            )
+            .into(),
+        );
     }
 
     // A log entry is committed once it is replicated on a
