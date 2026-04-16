@@ -144,7 +144,7 @@ impl Swim {
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
-    pub(crate) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
+    pub(super) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
             SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
             SwimTimeOutCallback::TimedOut {
@@ -176,7 +176,7 @@ impl Swim {
         }
     }
 
-    pub(crate) fn handle_query(&self, command: SwimQueryCommand) {
+    pub(super) fn handle_query(&self, command: SwimQueryCommand) {
         match command {
             SwimQueryCommand::GetMembers { reply } => {
                 let _ = reply.send(self.members.values().cloned().collect());
@@ -300,8 +300,15 @@ impl Swim {
             );
         }
     }
+    pub fn process(&mut self, event: SwimCommand) {
+        match event {
+            SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
+            SwimCommand::Timeout(tick_event) => self.handle_timeout(tick_event),
+            SwimCommand::Query(command) => self.handle_query(command),
+        }
+    }
 
-    pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
+    pub(super) fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         // 1. Process Gossip (Piggybacked updates)
         for member in packet.gossip() {
             self.apply_membership_update(member.clone());

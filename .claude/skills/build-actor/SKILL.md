@@ -56,6 +56,16 @@ impl YourStateMachine {
     pub fn take_timer_commands(&mut self) -> Vec<TimerCommand<YourTimer>> {
         std::mem::take(&mut self.pending_timer_commands)
     }
+
+    /// Top-level command dispatch. Called by the actor's drain loop.
+    /// Lives on the state machine because it's pure sync — no I/O.
+    pub fn process(&mut self, event: YourActorCommand) {
+        match event {
+            YourActorCommand::PacketReceived { src, data } => self.step(/* ... */),
+            YourActorCommand::Timeout(callback) => self.handle_timeout(callback),
+            YourActorCommand::Query(cmd) => self.handle_query(cmd),
+        }
+    }
 }
 ```
 
@@ -166,20 +176,16 @@ impl YourActor {
         // Flush any side effects from initialization
         Self::flush(&mut state, &transport_tx, &scheduler_tx).await;
 
-        while let Some(event) = mailbox.recv().await {
-            match event {
-                YourActorCommand::PacketReceived { src, data } => {
-                    state.step(/* ... */);
-                }
-                YourActorCommand::Timeout(callback) => {
-                    state.handle_timeout(callback);
-                }
-                YourActorCommand::Query(cmd) => {
-                    state.handle_query(cmd);
-                }
+        // Drain-then-flush: recv_many batches up to `limit` messages,
+        // then flush once. Under load N messages = 1 flush instead of N.
+        let mut buf = Vec::with_capacity(64);
+        loop {
+            if mailbox.recv_many(&mut buf, 64).await == 0 {
+                break;
             }
-
-            // THIS MUST HAPPEN AFTER EVERY EVENT -- no exceptions
+            for event in buf.drain(..) {
+                state.process(event);
+            }
             Self::flush(&mut state, &transport_tx, &scheduler_tx).await;
         }
     }
@@ -209,13 +215,36 @@ impl YourActor {
 }
 ```
 
-**Critical: flush must happen after EVERY event.** Existing actors enforce this with single flush call at bottom of match, no early returns or continues before it. Branch that skips flush = side effects silently lost.
+**Critical: flush must happen after draining all pending events.** Output buffers (`pending_*` vecs) accumulate across multiple `process()` calls, so one flush handles the entire batch. `process()` lives on the state machine when dispatch is pure sync (no I/O). If command handling requires async I/O (e.g. sending transport commands), keep it as an actor associated fn instead. Branch that skips flush = side effects silently lost.
 
 ### Multiplexing pattern (like RaftActor)
 
-If actor manages multiple state machine instances (e.g., one per shard), same unit-like struct pattern. Domain state declared as local variables inside `run()`:
+If actor manages multiple state machine instances (e.g., one per shard), extract a `Groups` struct to encapsulate group lifecycle, dirty tracking, and timer seq namespacing. Actor stays thin — just the mailbox loop.
 
 ```rust
+/// Encapsulates multiplexed state machines and their bookkeeping.
+struct YourGroups {
+    node_id: NodeId,
+    groups: HashMap<GroupId, YourStateMachine>,
+    seq_counter: u32,
+    shard_tokens: HashMap<ShardToken, u32>,
+    dirty: HashSet<GroupId>,
+}
+
+impl YourGroups {
+    async fn process_command(&mut self, cmd: YourActorCommand, ...) {
+        // match cmd, mutate groups, insert into self.dirty
+    }
+
+    async fn flush_dirty(&mut self, transport_tx: ..., scheduler_tx: ...) {
+        let to_flush: Vec<_> = self.dirty.drain().collect();
+        for group_id in to_flush {
+            // take_outbound, take_timer_commands, translate seqs, send
+        }
+    }
+}
+
+/// Thin async boundary.
 pub struct MultiplexActor;
 
 impl MultiplexActor {
@@ -225,18 +254,28 @@ impl MultiplexActor {
         transport_tx: mpsc::Sender<YourOutboundPacket>,
         scheduler_tx: mpsc::Sender<TickerCommand<YourTimer>>,
     ) {
-        let mut groups: HashMap<GroupId, YourStateMachine> = HashMap::new();
-        let mut seq_counter: u32 = 0;
-        let mut shard_tokens: HashMap<ShardToken, u32> = HashMap::new();
+        let mut state = YourGroups::new(node_id);
+        let mut buf = Vec::with_capacity(64);
 
-        while let Some(cmd) = mailbox.recv().await {
-            // match cmd, mutate groups, call Self::flush(...)
+        loop {
+            if mailbox.recv_many(&mut buf, 64).await == 0 {
+                break;
+            }
+            for cmd in buf.drain(..) {
+                state.process_command(cmd, &transport_tx, &scheduler_tx).await;
+            }
+            state.flush_dirty(&transport_tx, &scheduler_tx).await;
         }
     }
 }
 ```
 
-Each instance emits local seq values for timers. Actor must namespace them to avoid collisions in shared ticker. See `RaftActor.flush()` in `src/raft/actor.rs` for translation pattern: `get_or_alloc_seq(shard_group_id.token(local_seq))` maps each `(group_id, local_seq)` pair to unique global seq.
+See `RaftGroups` in `src/clusters/raft/actor.rs` for the full implementation. Key details:
+
+- `process_command` is async when some commands need I/O (e.g. `DisconnectPeer`, `CancelSchedule`). Channel senders passed as params, not stored in the struct.
+- `flush_dirty` collects dirty group IDs into a local Vec before iterating, avoiding borrow conflicts with `&mut self` methods like `get_or_alloc_seq`.
+
+Each instance emits local seq values for timers. The groups struct namespaces them to avoid collisions in shared ticker: `get_or_alloc_seq(group_id.token(local_seq))` maps each `(group_id, local_seq)` pair to a unique global seq.
 
 When removing group, cancel all its timers by iterating over known local seqs and removing their global mappings.
 
@@ -304,7 +343,7 @@ Biggest advantage of sync-first design: test protocol logic without async machin
 - [ ] State machine is `pub struct` with no async, no channels, no I/O
 - [ ] Side effects buffered in `pending_outbound` and `pending_timer_commands`
 - [ ] `take_outbound()` and `take_timer_commands()` drain via `std::mem::take`
-- [ ] Actor calls flush after every event (no early returns before flush)
+- [ ] Actor drains pending messages via `try_recv()` then flushes once (no early returns before flush)
 - [ ] TTimer implemented if using timers (with `Default` callback)
 - [ ] Channels created and actor spawned in `lib.rs` startup
 - [ ] Sync unit tests exercise state machine directly
