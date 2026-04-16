@@ -81,7 +81,7 @@ impl GossipBuffer {
         }
 
         self.entries.retain(|e| e.remaining > 0);
-        self.entries.sort_by(|a, b| b.remaining.cmp(&a.remaining));
+        self.entries.sort_by_key(|b| std::cmp::Reverse(b.remaining));
 
         result
     }
