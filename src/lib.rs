@@ -100,6 +100,7 @@ impl StartUp {
             raft_mailbox,
             raft_transport_tx,
             raft_ticker_tx,
+            swim_sender.clone(),
         ));
 
         // Client handler

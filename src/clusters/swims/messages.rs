@@ -1,8 +1,10 @@
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 
+use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
+use crate::schedulers::ticker_message::TimerCommand;
 use crate::schedulers::timer::TTimer;
 use bincode::{Decode, Encode};
 
@@ -71,6 +73,8 @@ pub enum SwimCommand {
     // From Ticker
     Timeout(SwimTimeOutCallback),
     Query(SwimQueryCommand),
+    // From RaftActor — leader election completed for a shard group
+    AnnounceShardLeader(LeaderChange),
 }
 
 #[derive(Debug)]
@@ -108,6 +112,16 @@ pub(crate) enum SwimTimerKind {
     Suspect,
     JoinTry(JoinAttempt),
     ProxyPing,
+}
+
+/// Unified side-effect type emitted by the Swim state machine.
+/// The actor layer drains these and routes each variant to the
+/// appropriate channel (transport / scheduler / raft).
+#[derive(Debug)]
+pub enum SwimEvent {
+    Packet(OutboundPacket),
+    Timer(TimerCommand<SwimTimer>),
+    Membership(MembershipEvent),
 }
 
 /// Outbound Commands (Logic -> Transport)
@@ -216,4 +230,13 @@ pub(crate) struct ProxyPing {
 pub enum MembershipEvent {
     NodeAlive { node_id: NodeId, addr: SocketAddr },
     NodeDead { node_id: NodeId },
+}
+
+impl MembershipEvent {
+    pub(crate) fn node_id(&self) -> &NodeId {
+        match self {
+            MembershipEvent::NodeAlive { node_id, .. } => node_id,
+            MembershipEvent::NodeDead { node_id } => node_id,
+        }
+    }
 }

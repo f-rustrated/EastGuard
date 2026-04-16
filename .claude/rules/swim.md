@@ -20,13 +20,14 @@ Actor has no protocol logic. All decisions in `Swim`.
                                  |
                           calls into Swim
                                  |
-                    +------------+------------+
-                    |                         |
-        state.take_timer_commands()   state.take_outbound()
-                    |                         |
-                    v                         v
-    mpsc::Sender<TickerCommand>   mpsc::Sender<OutboundPacket>
-       (scheduler_tx)                 (transport_tx)
+                          state.take_events()
+                                 |
+                        SwimEvent routing
+                       /         |         \
+              Packet         Timer      Membership
+                 |              |            |
+                 v              v            v
+          transport_tx    scheduler_tx    raft_tx
 ```
 
 **Fields:**

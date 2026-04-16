@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::state::Raft;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardToken};
+use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardToken, SwimCommand};
 use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
 use tokio::sync::{mpsc, oneshot};
@@ -68,8 +68,11 @@ struct RaftGroups {
     seq_counter: u32,
     /// Maps (ShardGroupId, local_seq) → global_seq for timer namespacing.
     shard_tokens: HashMap<ShardToken, u32>,
-    /// Groups modified since last flush.
+
+    // Groups modified since last flush.
     dirty: HashSet<ShardGroupId>,
+    /// Outbound packets aggregated by target NodeId for batched transport sends.
+    packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
 }
 
 impl RaftGroups {
@@ -80,6 +83,7 @@ impl RaftGroups {
             seq_counter: 0,
             shard_tokens: HashMap::new(),
             dirty: HashSet::new(),
+            packets_by_target: Default::default(),
         }
     }
 
@@ -257,68 +261,68 @@ impl RaftGroups {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    /// Flush outbound packets and timer commands for all dirty groups.
+    /// Flush all side-effects for dirty groups.
     ///
-    /// Aggregates outbound packets by target NodeId — 200 shard groups
-    /// producing messages for the same 2 physical nodes result in 2 batched
-    /// channel sends, not 200 individual ones.
+    /// Drains a single `RaftEvent` stream per group and routes each variant
+    /// to the appropriate channel. Outbound packets are aggregated by target
+    /// NodeId — 200 shard groups producing messages for the same 2 physical
+    /// nodes result in 2 batched channel sends, not 200 individual ones.
     async fn flush_dirty(
         &mut self,
         transport_tx: &mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+        swim_tx: &mpsc::Sender<SwimCommand>,
     ) {
-        let to_flush: Vec<_> = self.dirty.drain().collect();
-
-        let mut all_timer_commands = Vec::new();
-        let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
+        let to_flush = std::mem::take(&mut self.dirty);
 
         for group_id in to_flush {
             let Some(raft) = self.groups.get_mut(&group_id) else {
                 continue;
             };
-
-            let timer_commands = raft.take_timer_commands();
-            let outbound_packets = raft.take_outbound();
-
-            for cmd in timer_commands {
-                let translated = match cmd {
-                    TimerCommand::SetSchedule {
-                        seq: local_seq,
-                        timer,
-                    } => Some(TimerCommand::SetSchedule {
-                        seq: self.get_or_alloc_seq(group_id.token(local_seq)),
-                        timer,
-                    }),
-                    TimerCommand::CancelSchedule { seq: local_seq } => self
-                        .shard_tokens
-                        .get(&group_id.token(local_seq))
-                        .map(|&global_seq| TimerCommand::CancelSchedule { seq: global_seq }),
-                };
-                if let Some(cmd) = translated {
-                    all_timer_commands.push(cmd);
+            for event in raft.take_events() {
+                match event {
+                    RaftEvent::OutboundRaftPacket(pkt) => {
+                        self.packets_by_target
+                            .entry(pkt.target.clone())
+                            .or_default()
+                            .push(pkt);
+                    }
+                    RaftEvent::Timer(cmd) => {
+                        if let Some(cmd) = self.translate_timer_seq(group_id, cmd) {
+                            let _ = scheduler_tx.send(cmd.into()).await;
+                        }
+                    }
+                    RaftEvent::LeaderChange(lc) => {
+                        let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
+                    }
                 }
-            }
-
-            for pkt in outbound_packets {
-                packets_by_target
-                    .entry(pkt.target.clone())
-                    .or_default()
-                    .push(pkt);
             }
         }
 
-        tokio::join!(
-            async {
-                for cmd in all_timer_commands {
-                    let _ = scheduler_tx.send(cmd.into()).await;
-                }
-            },
-            async {
-                for (_, packets) in packets_by_target {
-                    let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
-                }
-            }
-        );
+        for (_, packets) in self.packets_by_target.drain() {
+            let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
+        }
+    }
+
+    /// Translate local timer seqs to globally unique seqs for the shared Ticker.
+    fn translate_timer_seq(
+        &mut self,
+        group_id: ShardGroupId,
+        cmd: TimerCommand<RaftTimer>,
+    ) -> Option<TimerCommand<RaftTimer>> {
+        match cmd {
+            TimerCommand::SetSchedule {
+                seq: local_seq,
+                timer,
+            } => Some(TimerCommand::SetSchedule {
+                seq: self.get_or_alloc_seq(group_id.token(local_seq)),
+                timer,
+            }),
+            TimerCommand::CancelSchedule { seq: local_seq } => self
+                .shard_tokens
+                .get(&group_id.token(local_seq))
+                .map(|&global_seq| TimerCommand::CancelSchedule { seq: global_seq }),
+        }
     }
 
     fn get_or_alloc_seq(&mut self, token: ShardToken) -> u32 {
@@ -338,6 +342,7 @@ impl RaftActor {
         mut mailbox: mpsc::Receiver<RaftCommand>,
         transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
+        swim_tx: mpsc::Sender<SwimCommand>,
     ) {
         let mut state = RaftGroups::new(node_id);
         let mut buf = Vec::with_capacity(64);
@@ -351,7 +356,9 @@ impl RaftActor {
                     .process_command(cmd, &transport_tx, &scheduler_tx)
                     .await;
             }
-            state.flush_dirty(&transport_tx, &scheduler_tx).await;
+            state
+                .flush_dirty(&transport_tx, &scheduler_tx, &swim_tx)
+                .await;
         }
     }
 }

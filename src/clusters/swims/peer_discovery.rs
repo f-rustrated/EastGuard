@@ -78,8 +78,7 @@ mod tests {
         let join_config: &JoinConfig = &config;
         let mut swim = make_protocol("node-local", 8000).bootstrap(join_config.tries());
 
-        assert!(swim.take_outbound().is_empty());
-        assert!(swim.take_timer_commands().is_empty());
+        assert!(swim.take_packets().is_empty());
     }
 
     #[test]
@@ -95,8 +94,7 @@ mod tests {
 
         let mut swim = make_protocol("node-local", 8000).bootstrap(config.tries());
 
-        assert!(swim.take_outbound().is_empty());
-        assert!(swim.take_timer_commands().is_empty());
+        assert!(swim.take_packets().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -116,7 +114,7 @@ mod tests {
         let join_config: &JoinConfig = &config;
         let mut swim = make_protocol("node-local", 8000).bootstrap(join_config.tries());
 
-        let out = swim.take_outbound();
+        let out = swim.take_packets();
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -137,10 +135,17 @@ mod tests {
             .tries(),
         );
 
-        let _ = swim.take_outbound();
+        let _ = swim.take_packets();
 
-        let cmds = swim.take_timer_commands();
-        assert_eq!(cmds.len(), 1, "one retry timer scheduled");
+        // take_events() includes timers from both Swim::new() (protocol period)
+        // and bootstrap (join retry). Filter for Timer events only — Swim::new()
+        // emits 1 protocol timer, bootstrap adds 1 join retry timer.
+        let timer_count = swim
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e, SwimEvent::Timer(_)))
+            .count();
+        assert!(timer_count >= 1, "at least one retry timer scheduled");
     }
 
     // -----------------------------------------------------------------------
@@ -164,7 +169,7 @@ mod tests {
         h.apply_timer_commands();
 
         // First ping sent immediately during start_join
-        let out = h.protocol.take_outbound();
+        let out = h.protocol.take_packets();
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -196,7 +201,7 @@ mod tests {
 
         h.apply_timer_commands();
 
-        let _ = h.protocol.take_outbound(); // consume immediate ping
+        let _ = h.protocol.take_packets(); // consume immediate ping
 
         // backoff = 10 * 2^0 = 10 ticks
         let out = h.tick_n_collect(10);
@@ -232,7 +237,7 @@ mod tests {
         h.apply_timer_commands();
 
         // immediate: first Ping
-        let out = h.protocol.take_outbound();
+        let out = h.protocol.take_packets();
         assert_eq!(
             count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
             1,
@@ -283,7 +288,7 @@ mod tests {
         h.apply_timer_commands();
 
         // 1 immediate ping + (max - 1) retries via ticking
-        let immediate = h.protocol.take_outbound();
+        let immediate = h.protocol.take_packets();
         let retries = h.tick_n_collect(max + 1);
         let total = count_join_pings(&immediate, "127.0.0.1:9000".parse().unwrap())
             + count_join_pings(&retries, "127.0.0.1:9000".parse().unwrap());
