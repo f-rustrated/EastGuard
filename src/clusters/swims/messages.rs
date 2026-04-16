@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 
+use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::timer::TTimer;
@@ -71,6 +72,8 @@ pub enum SwimCommand {
     // From Ticker
     Timeout(SwimTimeOutCallback),
     Query(SwimQueryCommand),
+    // From RaftActor — leader election completed for a shard group
+    AnnounceShardLeader(LeaderChange),
 }
 
 #[derive(Debug)]

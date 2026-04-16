@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
@@ -74,6 +75,7 @@ pub struct Swim {
     pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
     pending_indirect_pings: BTreeMap<u32, ProxyPing>,
     pending_membership_events: Vec<MembershipEvent>,
+    pending_shard_leader_events: Vec<LeaderChange>,
 }
 
 impl Swim {
@@ -97,6 +99,7 @@ impl Swim {
             pending_timer_commands: vec![],
             pending_indirect_pings: BTreeMap::new(),
             pending_membership_events: Vec::new(),
+            pending_shard_leader_events: Vec::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -305,6 +308,7 @@ impl Swim {
             SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
             SwimCommand::Timeout(tick_event) => self.handle_timeout(tick_event),
             SwimCommand::Query(command) => self.handle_query(command),
+            SwimCommand::AnnounceShardLeader(event) => self.announce_shard_leader(event),
         }
     }
 
@@ -575,6 +579,26 @@ impl Swim {
     /// Drain all membership events buffered since the last call.
     pub(crate) fn take_membership_events(&mut self) -> Vec<MembershipEvent> {
         std::mem::take(&mut self.pending_membership_events)
+    }
+
+    /// Buffer a shard leader announcement from Raft for gossip dissemination.
+    /// #35 will wire the full gossip buffer; this stores the event for consumption.
+    pub(crate) fn announce_shard_leader(&mut self, event: LeaderChange) {
+        tracing::info!(
+            "[{}] Shard leader announced: group={:?} leader={} term={}",
+            self.node_id,
+            event.shard_group_id,
+            event.leader_node_id,
+            event.term
+        );
+        self.pending_shard_leader_events.push(event);
+    }
+
+    /// Drain all shard leader events buffered since the last call.
+    /// Used by #35 (ShardLeader gossip buffer) when building gossip packets.
+    #[allow(dead_code)]
+    pub(crate) fn take_shard_leader_events(&mut self) -> Vec<LeaderChange> {
+        std::mem::take(&mut self.pending_shard_leader_events)
     }
 }
 

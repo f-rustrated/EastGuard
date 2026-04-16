@@ -3,9 +3,10 @@
 use bincode::{Decode, Encode};
 
 use crate::clusters::NodeId;
+use crate::clusters::raft::log::LogEntry;
 use crate::clusters::swims::ShardGroupId;
 use crate::impl_from_variant;
-use crate::clusters::raft::log::LogEntry;
+use crate::schedulers::ticker_message::TimerCommand;
 use crate::schedulers::timer::TTimer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -28,6 +29,17 @@ impl RaftCommand {
             RaftCommand::AddPeer(_) => vec![0x02],
         }
     }
+}
+
+/// Emitted by the Raft state machine when this node becomes leader.
+/// Transport-agnostic — no SocketAddr. SWIM resolves addr from its member
+/// table when building gossip packets (late resolution is more correct since
+/// addr may change between emission and gossip time).
+#[derive(Debug, Clone)]
+pub struct LeaderChange {
+    pub shard_group_id: ShardGroupId,
+    pub leader_node_id: NodeId,
+    pub term: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -116,6 +128,18 @@ impl OutboundRaftPacket {
         }
     }
 }
+
+/// Unified side-effect type emitted by the Raft state machine.
+/// The actor layer drains these and routes each variant to the
+/// appropriate channel (transport / scheduler / swim).
+#[derive(Debug)]
+pub enum RaftEvent {
+    OutboundRaftPacket(OutboundRaftPacket),
+    Timer(TimerCommand<RaftTimer>),
+    LeaderChange(LeaderChange),
+}
+
+impl_from_variant!(RaftEvent, LeaderChange, OutboundRaftPacket);
 
 /// Commands sent from RaftActor to RaftTransportActor.
 #[derive(Debug)]

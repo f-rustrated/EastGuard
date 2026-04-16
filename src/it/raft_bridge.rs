@@ -68,12 +68,22 @@ async fn start_raft_node(
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx));
-    {
-        let node_id = node_id.clone();
-        let raft_tx = raft_tx.clone();
-        tokio::spawn(RaftTransportActor::run(node_id, listener, raft_tx, transport_rx, swim_tx));
-    }
-    tokio::spawn(RaftActor::run(node_id, raft_mailbox, transport_tx, ticker_tx));
+
+    tokio::spawn(RaftTransportActor::run(
+        node_id.clone(),
+        listener,
+        raft_tx.clone(),
+        transport_rx,
+        swim_tx.clone(),
+    ));
+
+    tokio::spawn(RaftActor::run(
+        node_id,
+        raft_mailbox,
+        transport_tx,
+        ticker_tx,
+        swim_tx,
+    ));
 
     raft_tx
         .send(RaftCommand::EnsureGroup { group })
