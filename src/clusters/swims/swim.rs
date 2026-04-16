@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
@@ -18,8 +17,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 ///   - `step(src, packet)` — a packet arrived from the network
 ///   - Event handlers       — timer events dispatched by `SwimTicker` via the actor
 ///
-/// All outbound packets are buffered in `pending_outbound`; drain with `take_outbound()`.
-/// All timer commands are buffered in `pending_timer_commands`; drain with `take_timer_commands()`.
+/// All side-effects buffered in `pending_events`; drain with `take_events()`.
 ///
 /// ```text
 ///                    TickEvent::ProtocolPeriodElapsed
@@ -71,11 +69,8 @@ pub struct Swim {
     last_suspected_seqs: BTreeMap<NodeId, u32>,
 
     // Output buffers
-    pending_outbound: Vec<OutboundPacket>,
-    pending_timer_commands: Vec<TimerCommand<SwimTimer>>,
+    pending_events: Vec<SwimEvent>,
     pending_indirect_pings: BTreeMap<u32, ProxyPing>,
-    pending_membership_events: Vec<MembershipEvent>,
-    pending_shard_leader_events: Vec<LeaderChange>,
 }
 
 impl Swim {
@@ -95,11 +90,8 @@ impl Swim {
             gossip_buffer: GossipBuffer::default(),
             seq_counter: 0,
             last_suspected_seqs: BTreeMap::new(),
-            pending_outbound: vec![],
-            pending_timer_commands: vec![],
+            pending_events: Vec::new(),
             pending_indirect_pings: BTreeMap::new(),
-            pending_membership_events: Vec::new(),
-            pending_shard_leader_events: Vec::new(),
         };
         swim.update_member(
             swim.node_id.clone(),
@@ -132,16 +124,20 @@ impl Swim {
     pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
         let seq = self.next_seq();
         let ping = SwimPacket::Ping(self.generate_swim_header(seq));
-        self.pending_outbound
-            .push(OutboundPacket::new(attempt.seed_addr, ping));
+        self.pending_events
+            .push(SwimEvent::Packet(OutboundPacket::new(
+                attempt.seed_addr,
+                ping,
+            )));
 
         attempt.update_next_ticks_for_wait();
         attempt.deduct_remaining_attempt();
 
-        self.pending_timer_commands.push(TimerCommand::SetSchedule {
-            seq,
-            timer: SwimTimer::join_try(attempt),
-        });
+        self.pending_events
+            .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                seq,
+                timer: SwimTimer::join_try(attempt),
+            }));
     }
 
     // -----------------------------------------------------------------------
@@ -209,13 +205,14 @@ impl Swim {
             let seq = self.next_seq();
             let packet = SwimPacket::Ping(self.generate_swim_header(seq));
 
-            self.pending_outbound
-                .push(OutboundPacket::new(target, packet));
+            self.pending_events
+                .push(SwimEvent::Packet(OutboundPacket::new(target, packet)));
 
-            self.pending_timer_commands.push(TimerCommand::SetSchedule {
-                seq,
-                timer: SwimTimer::direct_probe(target_node_id),
-            });
+            self.pending_events
+                .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                    seq,
+                    timer: SwimTimer::direct_probe(target_node_id),
+                }));
         }
     }
 
@@ -260,14 +257,18 @@ impl Swim {
             target: target_addr,
         };
         for target in peer_addrs {
-            self.pending_outbound
-                .push(OutboundPacket::new(target, packet.clone()));
+            self.pending_events
+                .push(SwimEvent::Packet(OutboundPacket::new(
+                    target,
+                    packet.clone(),
+                )));
         }
 
-        self.pending_timer_commands.push(TimerCommand::SetSchedule {
-            seq,
-            timer: SwimTimer::indirect_probe(target_node_id),
-        });
+        self.pending_events
+            .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                seq,
+                timer: SwimTimer::indirect_probe(target_node_id),
+            }));
     }
 
     fn try_mark_suspect(&mut self, target_node_id: NodeId) {
@@ -308,7 +309,15 @@ impl Swim {
             SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
             SwimCommand::Timeout(tick_event) => self.handle_timeout(tick_event),
             SwimCommand::Query(command) => self.handle_query(command),
-            SwimCommand::AnnounceShardLeader(event) => self.announce_shard_leader(event),
+            SwimCommand::AnnounceShardLeader(event) => {
+                tracing::info!(
+                    "[{}] Shard leader announced: group={:?} leader={} term={}",
+                    self.node_id,
+                    event.shard_group_id,
+                    event.leader_node_id,
+                    event.term
+                );
+            }
         }
     }
 
@@ -334,7 +343,8 @@ impl Swim {
                 );
                 let ack = SwimPacket::Ack(self.generate_swim_header(header.seq));
 
-                self.pending_outbound.push(OutboundPacket::new(src, ack))
+                self.pending_events
+                    .push(SwimEvent::Packet(OutboundPacket::new(src, ack)))
             }
 
             SwimPacket::Ack(header) => {
@@ -351,8 +361,10 @@ impl Swim {
                     src,
                     header.source_incarnation,
                 );
-                self.pending_timer_commands
-                    .push(TimerCommand::CancelSchedule { seq: header.seq });
+                self.pending_events
+                    .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
+                        seq: header.seq,
+                    }));
 
                 if let Some(ProxyPing {
                     requester_addr,
@@ -366,8 +378,11 @@ impl Swim {
                         gossip: self.gossip_buffer.collect(),
                     });
 
-                    self.pending_outbound
-                        .push(OutboundPacket::new(requester_addr, forwarded_ack));
+                    self.pending_events
+                        .push(SwimEvent::Packet(OutboundPacket::new(
+                            requester_addr,
+                            forwarded_ack,
+                        )));
                 }
             }
 
@@ -387,12 +402,13 @@ impl Swim {
                     },
                 );
                 let ping = SwimPacket::Ping(self.generate_swim_header(seq));
-                self.pending_outbound
-                    .push(OutboundPacket::new(target, ping));
-                self.pending_timer_commands.push(TimerCommand::SetSchedule {
-                    seq,
-                    timer: SwimTimer::proxy_ping(),
-                });
+                self.pending_events
+                    .push(SwimEvent::Packet(OutboundPacket::new(target, ping)));
+                self.pending_events
+                    .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                        seq,
+                        timer: SwimTimer::proxy_ping(),
+                    }));
             }
         }
     }
@@ -442,8 +458,10 @@ impl Swim {
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
                 if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
-                    self.pending_timer_commands
-                        .push(TimerCommand::CancelSchedule { seq: suspect_seq });
+                    self.pending_events
+                        .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
+                            seq: suspect_seq,
+                        }));
                 }
                 self.update_member(
                     source_node_id.clone(),
@@ -532,28 +550,31 @@ impl Swim {
             match member.state {
                 SwimNodeState::Alive => {
                     if let Some(suspect_seq) = self.last_suspected_seqs.remove(&node_id) {
-                        self.pending_timer_commands
-                            .push(TimerCommand::CancelSchedule { seq: suspect_seq });
+                        self.pending_events
+                            .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
+                                seq: suspect_seq,
+                            }));
                     }
-                    self.pending_membership_events
-                        .push(MembershipEvent::NodeAlive {
+                    self.pending_events
+                        .push(SwimEvent::Membership(MembershipEvent::NodeAlive {
                             node_id: node_id.clone(),
                             addr,
-                        });
+                        }));
                 }
                 SwimNodeState::Dead => {
-                    self.pending_membership_events
-                        .push(MembershipEvent::NodeDead {
+                    self.pending_events
+                        .push(SwimEvent::Membership(MembershipEvent::NodeDead {
                             node_id: node_id.clone(),
-                        });
+                        }));
                 }
                 SwimNodeState::Suspect => {
                     let seq = self.next_seq();
                     self.last_suspected_seqs.insert(node_id.clone(), seq);
-                    self.pending_timer_commands.push(TimerCommand::SetSchedule {
-                        seq,
-                        timer: SwimTimer::suspect_timer(node_id),
-                    });
+                    self.pending_events
+                        .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                            seq,
+                            timer: SwimTimer::suspect_timer(node_id),
+                        }));
                 }
             }
 
@@ -566,39 +587,43 @@ impl Swim {
         self.seq_counter
     }
 
-    /// Drain all outbound packets buffered since the last call.
-    pub(crate) fn take_outbound(&mut self) -> Vec<OutboundPacket> {
-        std::mem::take(&mut self.pending_outbound)
+    pub(crate) fn take_events(&mut self) -> Vec<SwimEvent> {
+        std::mem::take(&mut self.pending_events)
     }
 
-    /// Drain all timer commands buffered since the last call.
-    pub(crate) fn take_timer_commands(&mut self) -> Vec<TimerCommand<SwimTimer>> {
-        std::mem::take(&mut self.pending_timer_commands)
+    /// Push an event back into the buffer. Used by TestHarness to
+    /// selectively drain timers while preserving other events.
+    #[cfg(test)]
+    pub(crate) fn re_buffer(&mut self, event: SwimEvent) {
+        self.pending_events.push(event);
     }
 
-    /// Drain all membership events buffered since the last call.
+    /// Drain only outbound packets. Test convenience.
+    #[cfg(test)]
+    pub(crate) fn take_packets(&mut self) -> Vec<OutboundPacket> {
+        let events = self.take_events();
+        let mut packets = Vec::new();
+        for event in events {
+            match event {
+                SwimEvent::Packet(p) => packets.push(p),
+                other => self.pending_events.push(other),
+            }
+        }
+        packets
+    }
+
+    /// Drain only membership events. Test convenience.
+    #[cfg(test)]
     pub(crate) fn take_membership_events(&mut self) -> Vec<MembershipEvent> {
-        std::mem::take(&mut self.pending_membership_events)
-    }
-
-    /// Buffer a shard leader announcement from Raft for gossip dissemination.
-    /// #35 will wire the full gossip buffer; this stores the event for consumption.
-    pub(crate) fn announce_shard_leader(&mut self, event: LeaderChange) {
-        tracing::info!(
-            "[{}] Shard leader announced: group={:?} leader={} term={}",
-            self.node_id,
-            event.shard_group_id,
-            event.leader_node_id,
-            event.term
-        );
-        self.pending_shard_leader_events.push(event);
-    }
-
-    /// Drain all shard leader events buffered since the last call.
-    /// Used by #35 (ShardLeader gossip buffer) when building gossip packets.
-    #[allow(dead_code)]
-    pub(crate) fn take_shard_leader_events(&mut self) -> Vec<LeaderChange> {
-        std::mem::take(&mut self.pending_shard_leader_events)
+        let events = self.take_events();
+        let mut membership = Vec::new();
+        for event in events {
+            match event {
+                SwimEvent::Membership(m) => membership.push(m),
+                other => self.pending_events.push(other),
+            }
+        }
+        membership
     }
 }
 
@@ -655,7 +680,7 @@ mod tests {
 
     fn add_node_harness(h: &mut TestHarness<SwimTimer>, id: &str, addr: SocketAddr, inc: u64) {
         h.step(addr, ping(1, id, inc, vec![]));
-        let _ = h.protocol.take_outbound();
+        let _ = h.protocol.take_packets();
     }
 
     // -----------------------------------------------------------------------
@@ -684,7 +709,7 @@ mod tests {
             assert_eq!(member.state, SwimNodeState::Alive);
             assert_eq!(member.addr, sender);
 
-            let out = p.take_outbound();
+            let out = p.take_packets();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
             assert!(matches!(
@@ -700,7 +725,7 @@ mod tests {
 
             // First ping: introduces node-b into members
             p.step(sender, ping(1, "node-b", 2, vec![]));
-            let _ = p.take_outbound();
+            let _ = p.take_packets();
 
             let state_before = p.members.get("node-b").unwrap().state;
             let inc_before = p.members.get("node-b").unwrap().incarnation;
@@ -712,7 +737,7 @@ mod tests {
             assert_eq!(member.state, state_before);
             assert_eq!(member.incarnation, inc_before);
 
-            let out = p.take_outbound();
+            let out = p.take_packets();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].target, sender);
             assert!(matches!(
@@ -736,7 +761,7 @@ mod tests {
             );
 
             // Ack's gossip reflects the update applied during this step
-            let out = p.take_outbound();
+            let out = p.take_packets();
             assert_eq!(out.len(), 1);
             match &out[0].packet() {
                 SwimPacket::Ack(header) => {
@@ -759,12 +784,12 @@ mod tests {
 
             // Introduce node-b at incarnation 1
             p.step(sender, ping(1, "node-b", 1, vec![]));
-            let _ = p.take_outbound();
+            let _ = p.take_packets();
             assert_eq!(p.members.get("node-b").unwrap().incarnation, 1);
 
             // Ping from node-b with higher incarnation 5
             p.step(sender, ping(2, "node-b", 5, vec![]));
-            let _ = p.take_outbound();
+            let _ = p.take_packets();
 
             let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, SwimNodeState::Alive);
@@ -778,12 +803,12 @@ mod tests {
 
             // Introduce node-b at incarnation 5
             p.step(sender, ping(1, "node-b", 5, vec![]));
-            let _ = p.take_outbound();
+            let _ = p.take_packets();
             assert_eq!(p.members.get("node-b").unwrap().incarnation, 5);
 
             // Ping from node-b with lower incarnation 1
             p.step(sender, ping(2, "node-b", 1, vec![]));
-            let _ = p.take_outbound();
+            let _ = p.take_packets();
 
             let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, SwimNodeState::Alive);
@@ -815,7 +840,7 @@ mod tests {
 
             // let's Ack before direct ping times out
             h.step(sender, ack(seq, node_b_id, 1, vec![]));
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             assert!(!h.ticker.has_timer(seq));
         }
@@ -832,7 +857,7 @@ mod tests {
 
             // Wait until node-b's direct probe starts
             let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
-            let _ = h.protocol.take_outbound(); // discard the ping
+            let _ = h.protocol.take_packets(); // discard the ping
 
             add_node_harness(&mut h, node_c, c_addr, 1);
 
@@ -840,7 +865,7 @@ mod tests {
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
                 h.tick();
             }
-            let _ = h.protocol.take_outbound(); // discard the PingReqs
+            let _ = h.protocol.take_packets(); // discard the PingReqs
 
             // Send Ack with the (reused) seq — clears the indirect probe
             h.step(b_addr, ack(seq, node_b, 1, vec![]));
@@ -861,7 +886,7 @@ mod tests {
 
             add_node_harness(&mut h, node_b, b_addr, 1);
             let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             // we don't care about node c. It's for indirect request
             add_node_harness(&mut h, node_c, c_addr, 1);
@@ -869,7 +894,7 @@ mod tests {
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
                 h.tick()
             } // we now send indirect ping for node-b
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
                 h.tick()
             } // node-b is now suspect
@@ -901,7 +926,7 @@ mod tests {
 
             add_node_harness(&mut h, node_b, b_addr, 1);
             let seq = h.tick_until(2 * PROBE_INTERVAL_TICKS, |h| h.ticker.probe_seq_for(node_b));
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             // we don't care about node c. It's for indirect request
             add_node_harness(&mut h, node_c, c_addr, 1);
@@ -909,7 +934,7 @@ mod tests {
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
                 h.tick()
             } // we now send indirect ping for node-b
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
                 h.tick()
             } // node-b is now suspect
@@ -956,16 +981,16 @@ mod tests {
             let seq1 = h.tick_until(20 * PROBE_INTERVAL_TICKS, |h| {
                 h.ticker.probe_seq_for(node_b)
             });
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
                 h.tick();
             }
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
             for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS {
                 h.tick();
             }
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             assert!(
                 matches!(
@@ -977,7 +1002,7 @@ mod tests {
 
             // --- Refutation: node-b sends Ack with higher incarnation ---
             h.step(b_addr, ack(seq1, node_b, 2, vec![]));
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             assert_eq!(
                 h.protocol.members.get(node_b).unwrap().state,
@@ -1043,7 +1068,7 @@ mod tests {
             p.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
 
             // A Ping must be sent to the target (node-c)
-            let out = p.take_outbound();
+            let out = p.take_packets();
             assert_eq!(out.len(), 1);
             assert!(
                 out.iter()
@@ -1074,7 +1099,7 @@ mod tests {
             );
 
             // Proxy Ping's gossip should reflect the update (gossip applied in Phase 1, before Ping built)
-            let out = p.take_outbound();
+            let out = p.take_packets();
             assert_eq!(out.len(), 1);
             match &out[0].packet() {
                 SwimPacket::Ping(header) => {
@@ -1102,7 +1127,7 @@ mod tests {
 
             // node-b asks us to ping node-c
             h.step(b_addr, pingreq(1, "node-b", 1, c_addr, vec![]));
-            let _ = h.protocol.take_outbound();
+            let _ = h.protocol.take_packets();
 
             assert_eq!(h.protocol.pending_indirect_pings.len(), 1);
 
@@ -1127,7 +1152,7 @@ mod tests {
             h.step(b_addr, pingreq(42, "node-b", 1, c_addr, vec![]));
 
             // grab the proxy Ping's seq
-            let out = h.protocol.take_outbound();
+            let out = h.protocol.take_packets();
             let proxy_seq = match out[0].packet() {
                 SwimPacket::Ping(header) => header.seq,
                 _ => panic!("expected proxy Ping"),
@@ -1149,7 +1174,7 @@ mod tests {
             );
 
             // forwarded Ack sent back to node-b with original seq=42
-            let out = h.protocol.take_outbound();
+            let out = h.protocol.take_packets();
             assert!(
                 out.iter().any(|p| p.target == b_addr
                     && matches!(p.packet(), SwimPacket::Ack(SwimHeader { seq: 42, .. }))),
@@ -1181,7 +1206,7 @@ mod tests {
             );
 
             assert_eq!(p.incarnation, 6, "must bump to gossip.inc + 1 = 6");
-            let out = p.take_outbound();
+            let out = p.take_packets();
             match &out[0].packet() {
                 SwimPacket::Ack(header) => {
                     assert_eq!(header.source_incarnation, 6);

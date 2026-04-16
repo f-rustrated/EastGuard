@@ -69,12 +69,10 @@ struct RaftGroups {
     /// Maps (ShardGroupId, local_seq) → global_seq for timer namespacing.
     shard_tokens: HashMap<ShardToken, u32>,
 
-    /// dirties
     // Groups modified since last flush.
     dirty: HashSet<ShardGroupId>,
+    /// Outbound packets aggregated by target NodeId for batched transport sends.
     packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
-    timer_buf: Vec<TimerCommand<RaftTimer>>,
-    leader_events: Vec<LeaderChange>,
 }
 
 impl RaftGroups {
@@ -86,8 +84,6 @@ impl RaftGroups {
             shard_tokens: HashMap::new(),
             dirty: HashSet::new(),
             packets_by_target: Default::default(),
-            timer_buf: Default::default(),
-            leader_events: Default::default(),
         }
     }
 
@@ -292,48 +288,41 @@ impl RaftGroups {
                             .push(pkt);
                     }
                     RaftEvent::Timer(cmd) => {
-                        let translated = match cmd {
-                            TimerCommand::SetSchedule {
-                                seq: local_seq,
-                                timer,
-                            } => Some(TimerCommand::SetSchedule {
-                                seq: self.get_or_alloc_seq(group_id.token(local_seq)),
-                                timer,
-                            }),
-                            TimerCommand::CancelSchedule { seq: local_seq } => {
-                                self.shard_tokens.get(&group_id.token(local_seq)).map(
-                                    |&global_seq| TimerCommand::CancelSchedule { seq: global_seq },
-                                )
-                            }
-                        };
-                        if let Some(cmd) = translated {
-                            self.timer_buf.push(cmd.into());
+                        if let Some(cmd) = self.translate_timer_seq(group_id, cmd) {
+                            let _ = scheduler_tx.send(cmd.into()).await;
                         }
                     }
                     RaftEvent::LeaderChange(lc) => {
-                        self.leader_events.push(lc);
+                        let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
                     }
                 }
             }
         }
 
-        tokio::join!(
-            async {
-                for cmd in self.timer_buf.drain(..) {
-                    let _ = scheduler_tx.send(cmd.into()).await;
-                }
-            },
-            async {
-                for (_, packets) in self.packets_by_target.drain() {
-                    let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
-                }
-            },
-            async {
-                for event in self.leader_events.drain(..) {
-                    let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(event)).await;
-                }
-            }
-        );
+        for (_, packets) in self.packets_by_target.drain() {
+            let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
+        }
+    }
+
+    /// Translate local timer seqs to globally unique seqs for the shared Ticker.
+    fn translate_timer_seq(
+        &mut self,
+        group_id: ShardGroupId,
+        cmd: TimerCommand<RaftTimer>,
+    ) -> Option<TimerCommand<RaftTimer>> {
+        match cmd {
+            TimerCommand::SetSchedule {
+                seq: local_seq,
+                timer,
+            } => Some(TimerCommand::SetSchedule {
+                seq: self.get_or_alloc_seq(group_id.token(local_seq)),
+                timer,
+            }),
+            TimerCommand::CancelSchedule { seq: local_seq } => self
+                .shard_tokens
+                .get(&group_id.token(local_seq))
+                .map(|&global_seq| TimerCommand::CancelSchedule { seq: global_seq }),
+        }
     }
 
     fn get_or_alloc_seq(&mut self, token: ShardToken) -> u32 {

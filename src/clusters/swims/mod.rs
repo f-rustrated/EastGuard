@@ -20,7 +20,10 @@ pub mod common {
     use crate::{
         clusters::{
             NodeId,
-            swims::{OutboundPacket, SwimPacket, SwimTimer, Topology, TopologyConfig, swim::Swim},
+            swims::{
+                OutboundPacket, SwimEvent, SwimPacket, SwimTimer, Topology, TopologyConfig,
+                swim::Swim,
+            },
         },
         schedulers::ticker::Ticker,
     };
@@ -66,8 +69,11 @@ pub mod common {
         }
 
         pub fn apply_timer_commands(&mut self) {
-            for cmd in self.protocol.take_timer_commands() {
-                self.ticker.apply(cmd);
+            for event in self.protocol.take_events() {
+                match event {
+                    SwimEvent::Timer(cmd) => self.ticker.apply(cmd),
+                    other => self.protocol.re_buffer(other),
+                }
             }
         }
 
@@ -75,7 +81,7 @@ pub mod common {
             let mut all = vec![];
             for _ in 0..n {
                 self.tick();
-                all.extend(self.protocol.take_outbound());
+                all.extend(self.protocol.take_packets());
             }
             all
         }
