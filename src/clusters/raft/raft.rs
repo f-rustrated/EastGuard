@@ -59,11 +59,6 @@ pub struct Raft {
     election_jitter: u32,
 }
 
-/// Fixed timer seq values. Raft only ever has one election timer and one
-/// heartbeat timer active at a time, so we use well-known constants instead
-/// of a rolling counter.
-const ELECTION_TIMER_SEQ: u32 = 0;
-const HEARTBEAT_TIMER_SEQ: u32 = 1;
 
 impl Raft {
     pub(crate) fn new(

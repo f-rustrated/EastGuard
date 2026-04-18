@@ -3,11 +3,13 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    OutboundRaftPacket, ProposeError, RaftCommand, RaftRpc, RaftTimeoutCallback, RaftTimer,
+    ELECTION_TIMER_SEQ, HEARTBEAT_TIMER_SEQ,
+    LeaderChange, OutboundRaftPacket, ProposeError, RaftCommand, RaftEvent, RaftRpc,
+    RaftTimeoutCallback, RaftTimer,
 };
 use crate::clusters::raft::raft::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
 pub(crate) struct ShardGroupState {
     pub raft: Raft,
@@ -20,9 +22,10 @@ pub(crate) struct MultiRaftStore {
     node_id: NodeId,
     groups: HashMap<ShardGroupId, ShardGroupState>,
     seq_counter: u32,
-    dirty: HashSet<ShardGroupId>, // maybe we can separate dirty markings for storage / transport
+    dirty: HashSet<ShardGroupId>,
     packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
     pending_timer_cmds: Vec<TickerCommand<RaftTimer>>,
+    pending_leader_changes: Vec<LeaderChange>,
 }
 
 impl MultiRaftStore {
@@ -34,6 +37,7 @@ impl MultiRaftStore {
             dirty: HashSet::new(),
             packets_by_target: HashMap::new(),
             pending_timer_cmds: Vec::new(),
+            pending_leader_changes: Vec::new(),
         }
     }
 
@@ -87,19 +91,63 @@ impl MultiRaftStore {
         };
 
         self.pending_timer_cmds.push(
-            crate::schedulers::ticker_message::TimerCommand::CancelSchedule {
+            TimerCommand::CancelSchedule {
                 seq: state.election_seq,
             }
             .into(),
         );
         self.pending_timer_cmds.push(
-            crate::schedulers::ticker_message::TimerCommand::CancelSchedule {
+            TimerCommand::CancelSchedule {
                 seq: state.heartbeat_seq,
             }
             .into(),
         );
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
+    }
+
+    pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
+        if let Some(state) = self.groups.get_mut(&shard_id) {
+            state.raft.step(from, rpc);
+            self.dirty.insert(shard_id);
+        }
+    }
+
+    pub(crate) fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
+        let shard_id = match &cb {
+            RaftTimeoutCallback::Ignored => return,
+            RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
+            RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
+        };
+        if let Some(state) = self.groups.get_mut(&shard_id) {
+            state.raft.handle_timeout(cb);
+            self.dirty.insert(shard_id);
+        }
+    }
+
+    pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
+        self.groups
+            .get(&group_id)
+            .and_then(|s| s.raft.current_leader().cloned())
+    }
+
+    pub(crate) fn handle_node_death(&mut self, dead_node_id: NodeId) {
+        let affected: Vec<ShardGroupId> = self
+            .groups
+            .iter()
+            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&dead_node_id))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for group_id in &affected {
+            if let Some(state) = self.groups.get_mut(group_id) {
+                let _ = state
+                    .raft
+                    .propose(RaftCommand::RemovePeer(dead_node_id.clone()));
+            }
+        }
+
+        self.dirty.extend(affected);
     }
 
     pub(crate) fn handle_node_join(
@@ -141,48 +189,69 @@ impl MultiRaftStore {
         }
     }
 
-    pub(crate) fn handle_node_death(&mut self, dead_node_id: NodeId) {
-        let affected: Vec<ShardGroupId> = self
-            .groups
-            .iter()
-            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&dead_node_id))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for group_id in &affected {
-            if let Some(state) = self.groups.get_mut(group_id) {
-                let _ = state
-                    .raft
-                    .propose(RaftCommand::RemovePeer(dead_node_id.clone()));
+    pub(crate) fn flush(&mut self) {
+        for id in std::mem::take(&mut self.dirty) {
+            let state = self.groups.get_mut(&id).unwrap();
+            let _ = state.raft.take_log_mutations(); // discard — RocksDB stub
+            let events = state.raft.take_events();
+            for event in events {
+                self.route_event(id, event);
             }
         }
-
-        self.dirty.extend(affected);
     }
 
-    pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
-        self.groups
-            .get(&group_id)
-            .and_then(|s| s.raft.current_leader().cloned())
+    pub(crate) fn take_all_outbound(&mut self) -> HashMap<NodeId, Vec<OutboundRaftPacket>> {
+        std::mem::take(&mut self.packets_by_target)
     }
 
-    pub(crate) fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
-        let shard_id = match &cb {
-            RaftTimeoutCallback::Ignored => return,
-            RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
-            RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
-        };
-        if let Some(state) = self.groups.get_mut(&shard_id) {
-            state.raft.handle_timeout(cb);
-            self.dirty.insert(shard_id);
+    pub(crate) fn take_all_timer_commands(&mut self) -> Vec<TickerCommand<RaftTimer>> {
+        std::mem::take(&mut self.pending_timer_cmds)
+    }
+
+    pub(crate) fn take_leader_changes(&mut self) -> Vec<LeaderChange> {
+        std::mem::take(&mut self.pending_leader_changes)
+    }
+
+    fn route_event(&mut self, group_id: ShardGroupId, event: RaftEvent) {
+        match event {
+            RaftEvent::OutboundRaftPacket(pkt) => {
+                self.packets_by_target
+                    .entry(pkt.target.clone())
+                    .or_default()
+                    .push(pkt);
+            }
+            RaftEvent::Timer(cmd) => {
+                if let Some(cmd) = self.translate_timer_seq(group_id, cmd) {
+                    self.pending_timer_cmds.push(cmd.into());
+                }
+            }
+            RaftEvent::LeaderChange(lc) => {
+                self.pending_leader_changes.push(lc);
+            }
         }
     }
 
-    pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
-        if let Some(state) = self.groups.get_mut(&shard_id) {
-            state.raft.step(from, rpc);
-            self.dirty.insert(shard_id);
-        }
+    fn translate_timer_seq(
+        &self,
+        group_id: ShardGroupId,
+        cmd: TimerCommand<RaftTimer>,
+    ) -> Option<TimerCommand<RaftTimer>> {
+        let state = self.groups.get(&group_id)?;
+        Some(match cmd {
+            TimerCommand::SetSchedule { seq: ELECTION_TIMER_SEQ, timer } => {
+                TimerCommand::SetSchedule { seq: state.election_seq, timer }
+            }
+            TimerCommand::SetSchedule { seq: HEARTBEAT_TIMER_SEQ, timer } => {
+                TimerCommand::SetSchedule { seq: state.heartbeat_seq, timer }
+            }
+            TimerCommand::CancelSchedule { seq: ELECTION_TIMER_SEQ } => {
+                TimerCommand::CancelSchedule { seq: state.election_seq }
+            }
+            TimerCommand::CancelSchedule { seq: HEARTBEAT_TIMER_SEQ } => {
+                TimerCommand::CancelSchedule { seq: state.heartbeat_seq }
+            }
+            _ => return None,
+        })
     }
 
     fn alloc_seq(&mut self) -> u32 {
