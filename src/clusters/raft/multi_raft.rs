@@ -217,8 +217,14 @@ impl MultiRaft {
                     .or_default()
                     .push(pkt);
             }
-            RaftEvent::Timer(cmd) => {
-                if let Some(cmd) = self.translate_timer_seq(group_id, cmd) {
+            RaftEvent::Timer(mut cmd) => {
+                if let Some(group) = self.groups.get(&group_id) {
+                    let token = match cmd.seq() {
+                        ELECTION_TIMER_SEQ => group.election_seq,
+                        HEARTBEAT_TIMER_SEQ => group.heartbeat_seq,
+                        _ => return,
+                    };
+                    cmd.set_seq(token);
                     self.pending_timer_cmds.push(cmd.into());
                 }
             }
@@ -226,22 +232,6 @@ impl MultiRaft {
                 self.pending_leader_changes.push(lc);
             }
         }
-    }
-
-    fn translate_timer_seq(
-        &self,
-        group_id: ShardGroupId,
-        mut cmd: TimerCommand<RaftTimer>,
-    ) -> Option<TimerCommand<RaftTimer>> {
-        let state = self.groups.get(&group_id)?;
-        let local_seq = cmd.seq();
-        let global_seq = match local_seq {
-            ELECTION_TIMER_SEQ => state.election_seq,
-            HEARTBEAT_TIMER_SEQ => state.heartbeat_seq,
-            _ => return None,
-        };
-        cmd.set_seq(global_seq);
-        Some(cmd)
     }
 }
 
