@@ -102,6 +102,53 @@ impl MultiRaftStore {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
+    pub(crate) fn handle_node_join(
+        &mut self,
+        new_node_id: NodeId,
+        affected_groups: Vec<ShardGroup>,
+    ) {
+        for group in &affected_groups {
+            if let Some(state) = self.groups.get_mut(&group.id)
+                && state.raft.is_leader()
+                && !state.raft.has_peer(&new_node_id)
+            {
+                let _ = state
+                    .raft
+                    .propose(crate::clusters::raft::messages::RaftCommand::AddPeer(
+                        new_node_id.clone(),
+                    ));
+                self.dirty.insert(group.id);
+            }
+        }
+
+        for group in affected_groups {
+            if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
+                self.ensure_group(group);
+            }
+        }
+    }
+
+    pub(crate) fn handle_node_death(&mut self, dead_node_id: NodeId) {
+        let affected: Vec<ShardGroupId> = self
+            .groups
+            .iter()
+            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&dead_node_id))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for group_id in &affected {
+            if let Some(state) = self.groups.get_mut(group_id) {
+                let _ = state
+                    .raft
+                    .propose(crate::clusters::raft::messages::RaftCommand::RemovePeer(
+                        dead_node_id.clone(),
+                    ));
+            }
+        }
+
+        self.dirty.extend(affected);
+    }
+
     pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
         self.groups
             .get(&group_id)
