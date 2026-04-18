@@ -11,6 +11,8 @@ Use `gh api` for every GitHub interaction. Never use `gh pr`, `gh issue`, `gh re
 
 The repo is `f-rustrated/EastGuard`.
 
+**CRITICAL: Case-sensitive repo name.** The GitHub REST API requires exact casing: `EastGuard`, NOT `east-guard`, `eastguard`, or `Eastguard`. A wrong case returns 404. Always use `f-rustrated/EastGuard` exactly.
+
 ## Common operations reference
 
 ### Pull Requests
