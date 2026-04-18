@@ -1,14 +1,14 @@
 pub(crate) mod actor;
 pub(crate) mod peer_discovery;
 
-mod gossip_buffer;
 mod livenode_tracker;
-mod messages;
+pub(crate) mod messages;
+
 pub(crate) mod swim;
 mod topology;
 
-use gossip_buffer::*;
 use livenode_tracker::*;
+pub(super) use messages::dissemination_buffer::*;
 pub(crate) use messages::*;
 
 pub(crate) use topology::*;

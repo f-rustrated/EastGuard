@@ -170,6 +170,7 @@ async fn test_ping_response() {
         source_node_id: "node-remote".into(),
         source_incarnation: 0,
         gossip: vec![],
+        shard_leaders: vec![],
     });
 
     harness
@@ -214,6 +215,7 @@ async fn test_refutation_mechanism() {
         source_node_id: "node-remote".into(),
         source_incarnation: 0,
         gossip: vec![lie],
+        shard_leaders: vec![],
     });
 
     harness
@@ -267,6 +269,7 @@ async fn test_gossip_propagation() {
                 source_node_id: "node-sender".into(),
                 source_incarnation: 0,
                 gossip: vec![gossip_msg],
+                shard_leaders: vec![],
             }),
         })
         .await
@@ -287,6 +290,7 @@ async fn test_gossip_propagation() {
                     source_node_id: "node-probe".into(),
                     source_incarnation: 0,
                     gossip: vec![],
+                    shard_leaders: vec![],
                 }),
             })
             .await
@@ -348,6 +352,7 @@ async fn test_indirect_ping_trigger() {
                 source_node_id: "node-peer-1".into(),
                 source_incarnation: 1,
                 gossip: vec![p1, p2],
+                shard_leaders: vec![],
             }),
         })
         .await
@@ -438,6 +443,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
                     state: SwimNodeState::Alive,
                     incarnation: 1,
                 }],
+                shard_leaders: vec![],
             }),
         })
         .await;
@@ -470,6 +476,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                         state: SwimNodeState::Alive,
                         incarnation: 1,
                     }],
+                    shard_leaders: vec![],
                 }),
             })
             .await;
@@ -495,6 +502,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                     state: SwimNodeState::Dead,
                     incarnation: 2,
                 }],
+                shard_leaders: vec![],
             }),
         })
         .await;

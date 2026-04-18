@@ -9,7 +9,7 @@ use crate::clusters::{NodeId, SwimNodeState};
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
 /// virtual node on the consistent hash ring for a given key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct ShardGroupId(pub u64);
 
 impl ShardGroupId {
