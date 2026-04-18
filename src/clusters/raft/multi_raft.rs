@@ -102,6 +102,12 @@ impl MultiRaftStore {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
+    pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
+        self.groups
+            .get(&group_id)
+            .and_then(|s| s.raft.current_leader().cloned())
+    }
+
     pub(crate) fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
