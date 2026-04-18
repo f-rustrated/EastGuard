@@ -238,19 +238,26 @@ impl MultiRaftStore {
     ) -> Option<TimerCommand<RaftTimer>> {
         let state = self.groups.get(&group_id)?;
         Some(match cmd {
-            TimerCommand::SetSchedule { seq: ELECTION_TIMER_SEQ, timer } => {
-                TimerCommand::SetSchedule { seq: state.election_seq, timer }
+            TimerCommand::SetSchedule { seq, timer } => {
+                let global_seq = if seq == ELECTION_TIMER_SEQ {
+                    state.election_seq
+                } else if seq == HEARTBEAT_TIMER_SEQ {
+                    state.heartbeat_seq
+                } else {
+                    return None;
+                };
+                TimerCommand::SetSchedule { seq: global_seq, timer }
             }
-            TimerCommand::SetSchedule { seq: HEARTBEAT_TIMER_SEQ, timer } => {
-                TimerCommand::SetSchedule { seq: state.heartbeat_seq, timer }
+            TimerCommand::CancelSchedule { seq } => {
+                let global_seq = if seq == ELECTION_TIMER_SEQ {
+                    state.election_seq
+                } else if seq == HEARTBEAT_TIMER_SEQ {
+                    state.heartbeat_seq
+                } else {
+                    return None;
+                };
+                TimerCommand::CancelSchedule { seq: global_seq }
             }
-            TimerCommand::CancelSchedule { seq: ELECTION_TIMER_SEQ } => {
-                TimerCommand::CancelSchedule { seq: state.election_seq }
-            }
-            TimerCommand::CancelSchedule { seq: HEARTBEAT_TIMER_SEQ } => {
-                TimerCommand::CancelSchedule { seq: state.heartbeat_seq }
-            }
-            _ => return None,
         })
     }
 
