@@ -13,22 +13,6 @@ pub(crate) enum TimerCommand<T> {
     CancelSchedule { seq: u32 },
 }
 
-impl<T> TimerCommand<T> {
-    pub(crate) fn seq(&self) -> u32 {
-        match self {
-            TimerCommand::SetSchedule { seq, .. } | TimerCommand::CancelSchedule { seq } => *seq,
-        }
-    }
-    pub(crate) fn set_seq(mut self, new_seq: u32) -> Self {
-        match &mut self {
-            TimerCommand::SetSchedule { seq, .. } | TimerCommand::CancelSchedule { seq } => {
-                *seq = new_seq;
-            }
-        }
-        self
-    }
-}
-
 impl<T> Display for TimerCommand<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

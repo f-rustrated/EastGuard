@@ -3,28 +3,19 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    ELECTION_TIMER_SEQ, HEARTBEAT_TIMER_SEQ, LeaderChange, OutboundRaftPacket, ProposeError,
-    RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback, RaftTimer,
+    ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
-
-pub(crate) struct ShardGroupState {
-    pub raft: Raft,
-    pub election_seq: u32,  // global ticker seq for election timer
-    pub heartbeat_seq: u32, // global ticker seq for heartbeat timer
-}
+use crate::schedulers::ticker_message::TimerCommand;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
-    groups: HashMap<ShardGroupId, ShardGroupState>,
+    groups: HashMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
-    packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
-    pending_timer_cmds: Vec<TickerCommand<RaftTimer>>,
-    pending_leader_changes: Vec<LeaderChange>,
+    pending_events: Vec<RaftEvent>,
 }
 
 impl MultiRaft {
@@ -34,9 +25,7 @@ impl MultiRaft {
             groups: HashMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
-            packets_by_target: HashMap::new(),
-            pending_timer_cmds: Vec::new(),
-            pending_leader_changes: Vec::new(),
+            pending_events: Vec::new(),
         }
     }
 
@@ -64,7 +53,14 @@ impl MultiRaft {
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
-        let raft = Raft::new(self.node_id.clone(), peers, jitter, group.id);
+        let raft = Raft::new(
+            self.node_id.clone(),
+            peers,
+            jitter,
+            group.id,
+            election_seq,
+            heartbeat_seq,
+        );
 
         tracing::info!(
             "[{}] Created Raft group {:?} with {} peers",
@@ -73,41 +69,30 @@ impl MultiRaft {
             raft.peers_count()
         );
 
-        self.groups.insert(
-            group.id,
-            ShardGroupState {
-                raft,
-                election_seq,
-                heartbeat_seq,
-            },
-        );
+        self.groups.insert(group.id, raft);
         self.dirty.insert(group.id);
     }
 
     pub(crate) fn remove_group(&mut self, group_id: ShardGroupId) {
-        let Some(state) = self.groups.remove(&group_id) else {
+        let Some(raft) = self.groups.remove(&group_id) else {
             return;
         };
 
-        self.pending_timer_cmds.push(
-            TimerCommand::CancelSchedule {
-                seq: state.election_seq,
-            }
-            .into(),
-        );
-        self.pending_timer_cmds.push(
-            TimerCommand::CancelSchedule {
-                seq: state.heartbeat_seq,
-            }
-            .into(),
-        );
+        self.pending_events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: raft.election_seq(),
+            }));
+        self.pending_events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: raft.heartbeat_seq(),
+            }));
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
     pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
-        if let Some(state) = self.groups.get_mut(&shard_id) {
-            state.raft.step(from, rpc);
+        if let Some(raft) = self.groups.get_mut(&shard_id) {
+            raft.step(from, rpc);
             self.dirty.insert(shard_id);
         }
     }
@@ -118,8 +103,8 @@ impl MultiRaft {
             RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
             RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
         };
-        if let Some(state) = self.groups.get_mut(&shard_id) {
-            state.raft.handle_timeout(cb);
+        if let Some(raft) = self.groups.get_mut(&shard_id) {
+            raft.handle_timeout(cb);
             self.dirty.insert(shard_id);
         }
     }
@@ -127,20 +112,20 @@ impl MultiRaft {
     pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
         self.groups
             .get(&group_id)
-            .and_then(|s| s.raft.current_leader().cloned())
+            .and_then(|r| r.current_leader().cloned())
     }
 
     pub(crate) fn remove_node(&mut self, node_id: NodeId) {
         let affected: Vec<ShardGroupId> = self
             .groups
             .iter()
-            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&node_id))
+            .filter(|(_, r)| r.is_leader() && r.has_peer(&node_id))
             .map(|(id, _)| *id)
             .collect();
 
         for group_id in &affected {
-            if let Some(state) = self.groups.get_mut(group_id) {
-                let _ = state.raft.propose(RaftCommand::RemovePeer(node_id.clone()));
+            if let Some(raft) = self.groups.get_mut(group_id) {
+                let _ = raft.propose(RaftCommand::RemovePeer(node_id.clone()));
             }
         }
 
@@ -149,11 +134,11 @@ impl MultiRaft {
 
     pub(crate) fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
-            if let Some(state) = self.groups.get_mut(&group.id)
-                && state.raft.is_leader()
-                && !state.raft.has_peer(&node_id)
+            if let Some(raft) = self.groups.get_mut(&group.id)
+                && raft.is_leader()
+                && !raft.has_peer(&node_id)
             {
-                let _ = state.raft.propose(RaftCommand::AddPeer(node_id.clone()));
+                let _ = raft.propose(RaftCommand::AddPeer(node_id.clone()));
                 self.dirty.insert(group.id);
             }
         }
@@ -171,8 +156,8 @@ impl MultiRaft {
         command: RaftCommand,
     ) -> Result<(), ProposeError> {
         match self.groups.get_mut(&shard_id) {
-            Some(state) => {
-                let result = state.raft.propose(command);
+            Some(raft) => {
+                let result = raft.propose(command);
                 self.dirty.insert(shard_id);
                 result
             }
@@ -180,66 +165,26 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn flush(&mut self) {
+    pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
         for id in std::mem::take(&mut self.dirty) {
-            let state = self.groups.get_mut(&id).unwrap();
+            let raft = self.groups.get_mut(&id).unwrap();
             // RocksDB integration point: replace the discard below with a batch write.
             // take_log_mutations() returns Vec<LogMutation> — iterate and apply each variant:
             //   LogMutation::Append(entry)        → cf_log.put((id, entry.index), bincode(entry))
             //   LogMutation::TruncateFrom(index)  → delete_range cf_log (id, index)..(id, u64::MAX)
             //   LogMutation::HardState { .. }     → cf_meta.put((id, "hard_state"), bincode(...))
             // Batch all mutations for all dirty groups into one WriteBatch before db.write().
-            let _ = state.raft.take_log_mutations();
-            let events = state.raft.take_events();
-            for event in events {
-                self.route_event(id, event);
-            }
+            let _ = raft.take_log_mutations();
+            self.pending_events.extend(raft.take_events());
         }
-    }
 
-    pub(crate) fn take_all_outbound(&mut self) -> HashMap<NodeId, Vec<OutboundRaftPacket>> {
-        std::mem::take(&mut self.packets_by_target)
-    }
-
-    pub(crate) fn take_all_timer_commands(&mut self) -> Vec<TickerCommand<RaftTimer>> {
-        std::mem::take(&mut self.pending_timer_cmds)
-    }
-
-    pub(crate) fn take_leader_changes(&mut self) -> Vec<LeaderChange> {
-        std::mem::take(&mut self.pending_leader_changes)
-    }
-
-    fn route_event(&mut self, group_id: ShardGroupId, event: RaftEvent) {
-        match event {
-            RaftEvent::OutboundRaftPacket(pkt) => {
-                self.packets_by_target
-                    .entry(pkt.target.clone())
-                    .or_default()
-                    .push(pkt);
-            }
-            RaftEvent::Timer(cmd) => {
-                if let Some(group) = self.groups.get(&group_id) {
-                    let token = match cmd.seq() {
-                        ELECTION_TIMER_SEQ => group.election_seq,
-                        HEARTBEAT_TIMER_SEQ => group.heartbeat_seq,
-                        _ => return,
-                    };
-                    self.pending_timer_cmds.push(cmd.set_seq(token).into());
-                }
-            }
-            RaftEvent::LeaderChange(lc) => {
-                self.pending_leader_changes.push(lc);
-            }
-        }
+        std::mem::take(&mut self.pending_events)
     }
 }
 
 #[derive(Debug, Default)]
 struct RaftTimerTokenGenerator(u32);
 impl RaftTimerTokenGenerator {
-    // Lifecycle:
-    //   - add_group() → allocates 2 unique seqs, marks dirty → flush() drains Raft::new()'s election timer (from reset_election_timer()) through translation layer
-    //   - remove_group() → cancels both global seqs in ticker
     fn generate(&mut self) -> u32 {
         self.0 = self.0.wrapping_add(1);
         self.0
@@ -262,10 +207,11 @@ mod tests {
         }
     }
 
-    fn set_seqs(cmds: &[TickerCommand<RaftTimer>]) -> Vec<u32> {
-        cmds.iter()
-            .filter_map(|c| match c {
-                TickerCommand::Schedule(TimerCommand::SetSchedule { seq, .. }) => Some(*seq),
+    fn timer_seqs(events: &[RaftEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                RaftEvent::Timer(TimerCommand::SetSchedule { seq, .. }) => Some(*seq),
                 _ => None,
             })
             .collect()
@@ -278,9 +224,9 @@ mod tests {
 
         store.add_group(shard(1, vec![me.clone(), node("n2")]));
         store.add_group(shard(2, vec![me.clone(), node("n2")]));
-        store.flush();
 
-        let seqs = set_seqs(&store.take_all_timer_commands());
+        let events = store.flush();
+        let seqs = timer_seqs(&events);
         let unique: HashSet<u32> = seqs.iter().cloned().collect();
         assert_eq!(seqs.len(), unique.len());
     }

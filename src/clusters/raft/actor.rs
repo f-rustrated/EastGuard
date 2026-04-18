@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
@@ -71,7 +73,11 @@ impl MultiRaftActor {
 
             for cmd in buf.drain(..) {
                 match cmd {
-                    MultiRaftActorCommand::PacketReceived { shard_group_id, from, rpc } => {
+                    MultiRaftActorCommand::PacketReceived {
+                        shard_group_id,
+                        from,
+                        rpc,
+                    } => {
                         store.step(shard_group_id, from, rpc);
                     }
                     MultiRaftActorCommand::Timeout(cb) => {
@@ -86,7 +92,11 @@ impl MultiRaftActor {
                     MultiRaftActorCommand::GetLeader { group_id, reply } => {
                         let _ = reply.send(store.get_leader(group_id));
                     }
-                    MultiRaftActorCommand::Propose { shard_group_id, command, reply } => {
+                    MultiRaftActorCommand::Propose {
+                        shard_group_id,
+                        command,
+                        reply,
+                    } => {
                         let _ = reply.send(store.propose(shard_group_id, command));
                     }
                     MultiRaftActorCommand::HandleNodeDeath { dead_node_id } => {
@@ -96,22 +106,36 @@ impl MultiRaftActor {
                             .await;
                         store.remove_node(dead_node_id);
                     }
-                    MultiRaftActorCommand::HandleNodeJoin { new_node_id, affected_groups } => {
+                    MultiRaftActorCommand::HandleNodeJoin {
+                        new_node_id,
+                        affected_groups,
+                    } => {
                         store.add_node(new_node_id, affected_groups);
                     }
                 }
             }
 
-            store.flush();
+            let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
 
-            for (_, packets) in store.take_all_outbound() {
+            for event in store.flush() {
+                match event {
+                    RaftEvent::OutboundRaftPacket(pkt) => {
+                        packets_by_target
+                            .entry(pkt.target.clone())
+                            .or_default()
+                            .push(pkt);
+                    }
+                    RaftEvent::Timer(cmd) => {
+                        let _ = scheduler_tx.send(cmd.into()).await;
+                    }
+                    RaftEvent::LeaderChange(lc) => {
+                        let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
+                    }
+                }
+            }
+
+            for (_, packets) in packets_by_target {
                 let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
-            }
-            for cmd in store.take_all_timer_commands() {
-                let _ = scheduler_tx.send(cmd).await;
-            }
-            for lc in store.take_leader_changes() {
-                let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
             }
         }
     }

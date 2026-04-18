@@ -184,9 +184,6 @@ pub struct WireRaftMessage {
 // With 600 nodes × 256 vnodes, each node participates in ~768 shard groups.
 // At 1s heartbeat: ~256 leader heartbeat callbacks/sec (~512 outbound RPCs/sec).
 // Election timeout at 5s base (5× heartbeat) avoids false elections.
-pub(crate) const ELECTION_TIMER_SEQ: u32 = 0;
-pub(crate) const HEARTBEAT_TIMER_SEQ: u32 = 1;
-
 const ELECTION_TIMEOUT_BASE_TICKS: u32 = 50; // 5s base (+ jitter)
 const HEARTBEAT_INTERVAL_TICKS: u32 = 10; // 1s
 

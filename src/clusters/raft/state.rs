@@ -57,8 +57,9 @@ pub struct Raft {
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
     election_jitter: u32,
+    election_seq: u32,
+    heartbeat_seq: u32,
 }
-
 
 impl Raft {
     pub(crate) fn new(
@@ -66,6 +67,8 @@ impl Raft {
         peers: HashSet<NodeId>,
         election_jitter: u32,
         shard_group_id: ShardGroupId,
+        election_seq: u32,
+        heartbeat_seq: u32,
     ) -> Self {
         let mut raft = Self {
             node_id,
@@ -82,9 +85,19 @@ impl Raft {
             current_leader: None,
             peer_states: HashMap::new(),
             election_jitter,
+            election_seq,
+            heartbeat_seq,
         };
         raft.reset_election_timer();
         raft
+    }
+
+    pub(crate) fn election_seq(&self) -> u32 {
+        self.election_seq
+    }
+
+    pub(crate) fn heartbeat_seq(&self) -> u32 {
+        self.heartbeat_seq
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
@@ -111,9 +124,7 @@ impl Raft {
         if index == 0 {
             return 0;
         }
-        self.log
-            .get((index - 1) as usize)
-            .map_or(0, |e| e.term)
+        self.log.get((index - 1) as usize).map_or(0, |e| e.term)
     }
 
     fn log_get(&self, index: u64) -> Option<&LogEntry> {
@@ -643,11 +654,11 @@ impl Raft {
     fn reset_election_timer(&mut self) {
         self.pending_events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: ELECTION_TIMER_SEQ,
+                seq: self.election_seq,
             }));
         self.pending_events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: ELECTION_TIMER_SEQ,
+                seq: self.election_seq,
                 timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
             }));
     }
@@ -655,7 +666,7 @@ impl Raft {
     fn schedule_heartbeat_timer(&mut self) {
         self.pending_events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: HEARTBEAT_TIMER_SEQ,
+                seq: self.heartbeat_seq,
                 timer: RaftTimer::heartbeat(self.shard_group_id),
             }));
     }
@@ -663,14 +674,13 @@ impl Raft {
     fn cancel_all_timers(&mut self) {
         self.pending_events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: ELECTION_TIMER_SEQ,
+                seq: self.election_seq,
             }));
         self.pending_events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: HEARTBEAT_TIMER_SEQ,
+                seq: self.heartbeat_seq,
             }));
     }
-
 }
 
 #[cfg(test)]
@@ -708,13 +718,13 @@ mod tests {
     }
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD)
+        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD, 0, 1)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, TEST_SHARD)
+        Raft::new(node(id), peers, 0, TEST_SHARD, 0, 1)
     }
 
     // -------------------------------------------------------------------
@@ -1407,7 +1417,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD);
+            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD, 0, 1);
 
             assert_eq!(
                 raft.quorum(),
