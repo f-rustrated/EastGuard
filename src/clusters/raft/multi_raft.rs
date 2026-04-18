@@ -41,7 +41,7 @@ impl MultiRaftStore {
         }
     }
 
-    pub(crate) fn ensure_group(&mut self, group: ShardGroup) {
+    pub(crate) fn add_group(&mut self, group: ShardGroup) {
         if self.groups.contains_key(&group.id) {
             return;
         }
@@ -131,11 +131,11 @@ impl MultiRaftStore {
             .and_then(|s| s.raft.current_leader().cloned())
     }
 
-    pub(crate) fn handle_node_death(&mut self, dead_node_id: NodeId) {
+    pub(crate) fn remove_node(&mut self, node_id: NodeId) {
         let affected: Vec<ShardGroupId> = self
             .groups
             .iter()
-            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&dead_node_id))
+            .filter(|(_, s)| s.raft.is_leader() && s.raft.has_peer(&node_id))
             .map(|(id, _)| *id)
             .collect();
 
@@ -143,33 +143,33 @@ impl MultiRaftStore {
             if let Some(state) = self.groups.get_mut(group_id) {
                 let _ = state
                     .raft
-                    .propose(RaftCommand::RemovePeer(dead_node_id.clone()));
+                    .propose(RaftCommand::RemovePeer(node_id.clone()));
             }
         }
 
         self.dirty.extend(affected);
     }
 
-    pub(crate) fn handle_node_join(
+    pub(crate) fn add_node(
         &mut self,
-        new_node_id: NodeId,
+        node_id: NodeId,
         affected_groups: Vec<ShardGroup>,
     ) {
         for group in &affected_groups {
             if let Some(state) = self.groups.get_mut(&group.id)
                 && state.raft.is_leader()
-                && !state.raft.has_peer(&new_node_id)
+                && !state.raft.has_peer(&node_id)
             {
                 let _ = state
                     .raft
-                    .propose(RaftCommand::AddPeer(new_node_id.clone()));
+                    .propose(RaftCommand::AddPeer(node_id.clone()));
                 self.dirty.insert(group.id);
             }
         }
 
         for group in affected_groups {
             if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
-                self.ensure_group(group);
+                self.add_group(group);
             }
         }
     }
@@ -300,8 +300,8 @@ mod tests {
         let me = node("n1");
         let mut store = MultiRaftStore::new(me.clone());
 
-        store.ensure_group(shard(1, vec![me.clone(), node("n2")]));
-        store.ensure_group(shard(2, vec![me.clone(), node("n2")]));
+        store.add_group(shard(1, vec![me.clone(), node("n2")]));
+        store.add_group(shard(2, vec![me.clone(), node("n2")]));
         store.flush();
 
         let seqs = set_seqs(&store.take_all_timer_commands());

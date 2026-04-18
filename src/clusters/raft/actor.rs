@@ -78,7 +78,7 @@ impl MultiRaftActor {
                         store.handle_timeout(cb);
                     }
                     MultiRaftActorCommand::EnsureGroup { group } => {
-                        store.ensure_group(group);
+                        store.add_group(group);
                     }
                     MultiRaftActorCommand::RemoveGroup { group_id } => {
                         store.remove_group(group_id);
@@ -94,10 +94,10 @@ impl MultiRaftActor {
                         let _ = transport_tx
                             .send(RaftTransportCommand::DisconnectPeer(dead_node_id.clone()))
                             .await;
-                        store.handle_node_death(dead_node_id);
+                        store.remove_node(dead_node_id);
                     }
                     MultiRaftActorCommand::HandleNodeJoin { new_node_id, affected_groups } => {
-                        store.handle_node_join(new_node_id, affected_groups);
+                        store.add_node(new_node_id, affected_groups);
                     }
                 }
             }
