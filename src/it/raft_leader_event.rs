@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{RaftActor, RaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, RaftCommand};
 use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
@@ -111,7 +111,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                         swim_tx,
                     ));
                 }
-                tokio::spawn(RaftActor::run(
+                tokio::spawn(MultiRaftActor::run(
                     node_id,
                     raft_mailbox,
                     transport_tx,

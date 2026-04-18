@@ -58,7 +58,7 @@ impl SwimActor {
         }
     }
 
-    /// Translate a membership event into a RaftActor command.
+    /// Translate a membership event into a MultiRaftActor command.
     /// Returns `None` for self-events and nodes with no shard groups.
     fn to_raft_command(state: &Swim, event: MembershipEvent) -> Option<RaftCommand> {
         if *event.node_id() == state.node_id {
