@@ -192,7 +192,13 @@ impl MultiRaftStore {
     pub(crate) fn flush(&mut self) {
         for id in std::mem::take(&mut self.dirty) {
             let state = self.groups.get_mut(&id).unwrap();
-            let _ = state.raft.take_log_mutations(); // discard — RocksDB stub
+            // RocksDB integration point: replace the discard below with a batch write.
+            // take_log_mutations() returns Vec<LogMutation> — iterate and apply each variant:
+            //   LogMutation::Append(entry)        → cf_log.put((id, entry.index), bincode(entry))
+            //   LogMutation::TruncateFrom(index)  → delete_range cf_log (id, index)..(id, u64::MAX)
+            //   LogMutation::HardState { .. }     → cf_meta.put((id, "hard_state"), bincode(...))
+            // Batch all mutations for all dirty groups into one WriteBatch before db.write().
+            let _ = state.raft.take_log_mutations();
             let events = state.raft.take_events();
             for event in events {
                 self.route_event(id, event);
