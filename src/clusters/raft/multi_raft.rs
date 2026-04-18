@@ -7,7 +7,7 @@ use crate::clusters::raft::messages::{
     LeaderChange, OutboundRaftPacket, ProposeError, RaftCommand, RaftEvent, RaftRpc,
     RaftTimeoutCallback, RaftTimer,
 };
-use crate::clusters::raft::raft::Raft;
+use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
