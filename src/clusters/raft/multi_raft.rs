@@ -231,34 +231,17 @@ impl MultiRaft {
     fn translate_timer_seq(
         &self,
         group_id: ShardGroupId,
-        cmd: TimerCommand<RaftTimer>,
+        mut cmd: TimerCommand<RaftTimer>,
     ) -> Option<TimerCommand<RaftTimer>> {
         let state = self.groups.get(&group_id)?;
-        Some(match cmd {
-            TimerCommand::SetSchedule { seq, timer } => {
-                let global_seq = if seq == ELECTION_TIMER_SEQ {
-                    state.election_seq
-                } else if seq == HEARTBEAT_TIMER_SEQ {
-                    state.heartbeat_seq
-                } else {
-                    return None;
-                };
-                TimerCommand::SetSchedule {
-                    seq: global_seq,
-                    timer,
-                }
-            }
-            TimerCommand::CancelSchedule { seq } => {
-                let global_seq = if seq == ELECTION_TIMER_SEQ {
-                    state.election_seq
-                } else if seq == HEARTBEAT_TIMER_SEQ {
-                    state.heartbeat_seq
-                } else {
-                    return None;
-                };
-                TimerCommand::CancelSchedule { seq: global_seq }
-            }
-        })
+        let local_seq = cmd.seq();
+        let global_seq = match local_seq {
+            ELECTION_TIMER_SEQ => state.election_seq,
+            HEARTBEAT_TIMER_SEQ => state.heartbeat_seq,
+            _ => return None,
+        };
+        cmd.set_seq(global_seq);
+        Some(cmd)
     }
 }
 
