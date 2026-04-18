@@ -3,9 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    ELECTION_TIMER_SEQ, HEARTBEAT_TIMER_SEQ,
-    LeaderChange, OutboundRaftPacket, ProposeError, RaftCommand, RaftEvent, RaftRpc,
-    RaftTimeoutCallback, RaftTimer,
+    ELECTION_TIMER_SEQ, HEARTBEAT_TIMER_SEQ, LeaderChange, OutboundRaftPacket, ProposeError,
+    RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback, RaftTimer,
 };
 use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -21,7 +20,7 @@ pub(crate) struct ShardGroupState {
 pub(crate) struct MultiRaft {
     node_id: NodeId,
     groups: HashMap<ShardGroupId, ShardGroupState>,
-    seq_counter: u32,
+    seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
     packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
     pending_timer_cmds: Vec<TickerCommand<RaftTimer>>,
@@ -33,7 +32,7 @@ impl MultiRaft {
         Self {
             node_id,
             groups: HashMap::new(),
-            seq_counter: 0,
+            seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
             packets_by_target: HashMap::new(),
             pending_timer_cmds: Vec::new(),
@@ -62,8 +61,8 @@ impl MultiRaft {
             (hasher.finish() % 20) as u32
         };
 
-        let election_seq = self.alloc_seq();
-        let heartbeat_seq = self.alloc_seq();
+        let election_seq = self.seq_counter.generate();
+        let heartbeat_seq = self.seq_counter.generate();
 
         let raft = Raft::new(self.node_id.clone(), peers, jitter, group.id);
 
@@ -141,28 +140,20 @@ impl MultiRaft {
 
         for group_id in &affected {
             if let Some(state) = self.groups.get_mut(group_id) {
-                let _ = state
-                    .raft
-                    .propose(RaftCommand::RemovePeer(node_id.clone()));
+                let _ = state.raft.propose(RaftCommand::RemovePeer(node_id.clone()));
             }
         }
 
         self.dirty.extend(affected);
     }
 
-    pub(crate) fn add_node(
-        &mut self,
-        node_id: NodeId,
-        affected_groups: Vec<ShardGroup>,
-    ) {
+    pub(crate) fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
             if let Some(state) = self.groups.get_mut(&group.id)
                 && state.raft.is_leader()
                 && !state.raft.has_peer(&node_id)
             {
-                let _ = state
-                    .raft
-                    .propose(RaftCommand::AddPeer(node_id.clone()));
+                let _ = state.raft.propose(RaftCommand::AddPeer(node_id.clone()));
                 self.dirty.insert(group.id);
             }
         }
@@ -252,7 +243,10 @@ impl MultiRaft {
                 } else {
                     return None;
                 };
-                TimerCommand::SetSchedule { seq: global_seq, timer }
+                TimerCommand::SetSchedule {
+                    seq: global_seq,
+                    timer,
+                }
             }
             TimerCommand::CancelSchedule { seq } => {
                 let global_seq = if seq == ELECTION_TIMER_SEQ {
@@ -266,10 +260,17 @@ impl MultiRaft {
             }
         })
     }
+}
 
-    fn alloc_seq(&mut self) -> u32 {
-        self.seq_counter = self.seq_counter.wrapping_add(1);
-        self.seq_counter
+#[derive(Debug, Default)]
+struct RaftTimerTokenGenerator(u32);
+impl RaftTimerTokenGenerator {
+    // Lifecycle:
+    //   - add_group() → allocates 2 unique seqs, marks dirty → flush() drains Raft::new()'s election timer (from reset_election_timer()) through translation layer
+    //   - remove_group() → cancels both global seqs in ticker
+    fn generate(&mut self) -> u32 {
+        self.0 = self.0.wrapping_add(1);
+        self.0
     }
 }
 
@@ -283,7 +284,10 @@ mod tests {
     }
 
     fn shard(id: u64, members: Vec<NodeId>) -> ShardGroup {
-        ShardGroup { id: ShardGroupId(id), members }
+        ShardGroup {
+            id: ShardGroupId(id),
+            members,
+        }
     }
 
     fn set_seqs(cmds: &[TickerCommand<RaftTimer>]) -> Vec<u32> {
