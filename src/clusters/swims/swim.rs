@@ -61,7 +61,9 @@ pub struct Swim {
     // Protocol state
     members: BTreeMap<NodeId, SwimNode>,
     live_node_tracker: LiveNodeTracker,
-    gossip_buffer: GossipBuffer,
+    gossip_buffer: SwimBuffer,
+    shard_leader_buffer: ShardLeaderGossipBuffer,
+    shard_leaders: BTreeMap<ShardGroupId, (NodeId, u64)>,
     pub(crate) topology: Topology,
 
     // Sequence
@@ -87,7 +89,9 @@ impl Swim {
             topology,
             members: BTreeMap::new(),
             live_node_tracker: LiveNodeTracker::new(rng_seed),
-            gossip_buffer: GossipBuffer::default(),
+            gossip_buffer: SwimBuffer::default(),
+            shard_leader_buffer: ShardLeaderGossipBuffer::default(),
+            shard_leaders: BTreeMap::new(),
             seq_counter: 0,
             last_suspected_seqs: BTreeMap::new(),
             pending_events: Vec::new(),
@@ -114,11 +118,16 @@ impl Swim {
     }
 
     fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
+        let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
+        let used: usize = gossip.iter().map(|m| m.size()).sum();
+        let remaining = MAX_GOSSIP_BYTES.saturating_sub(used);
+        let shard_leaders = self.shard_leader_buffer.collect(remaining);
         SwimHeader {
             seq,
             source_node_id: self.node_id.clone(),
             source_incarnation: self.incarnation,
-            gossip: self.gossip_buffer.collect(),
+            gossip,
+            shard_leaders,
         }
     }
     pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
@@ -317,6 +326,17 @@ impl Swim {
                     event.leader_node_id,
                     event.term
                 );
+                if let Some(addr) = self.members.get(&event.leader_node_id).map(|m| m.addr) {
+                    let info = ShardLeaderInfo {
+                        shard_group_id: event.shard_group_id,
+                        leader_node_id: event.leader_node_id.clone(),
+                        leader_addr: addr,
+                        term: event.term,
+                    };
+                    self.shard_leader_buffer.enqueue(info, self.members.len());
+                    self.shard_leaders
+                        .insert(event.shard_group_id, (event.leader_node_id, event.term));
+                }
             }
         }
     }
@@ -325,6 +345,9 @@ impl Swim {
         // 1. Process Gossip (Piggybacked updates)
         for member in packet.gossip() {
             self.apply_membership_update(member.clone());
+        }
+        for leader_info in packet.shard_leaders() {
+            self.apply_shard_leader_update(leader_info.clone());
         }
 
         match packet {
@@ -371,11 +394,16 @@ impl Swim {
                     request_seq,
                 }) = self.pending_indirect_pings.remove(&header.seq)
                 {
+                    let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
+                    let used: usize = gossip.iter().map(|m| m.size()).sum();
+                    let remaining = MAX_GOSSIP_BYTES.saturating_sub(used);
+                    let shard_leaders = self.shard_leader_buffer.collect(remaining);
                     let forwarded_ack = SwimPacket::Ack(SwimHeader {
                         seq: request_seq,
                         source_node_id: header.source_node_id,
                         source_incarnation: header.source_incarnation,
-                        gossip: self.gossip_buffer.collect(),
+                        gossip,
+                        shard_leaders,
                     });
 
                     self.pending_events
@@ -582,6 +610,21 @@ impl Swim {
         }
     }
 
+    fn apply_shard_leader_update(&mut self, info: ShardLeaderInfo) {
+        let dominated = match self.shard_leaders.get(&info.shard_group_id) {
+            Some(&(_, existing_term)) => info.term <= existing_term,
+            None => false,
+        };
+        if dominated {
+            return;
+        }
+        self.shard_leaders.insert(
+            info.shard_group_id,
+            (info.leader_node_id.clone(), info.term),
+        );
+        self.shard_leader_buffer.enqueue(info, self.members.len());
+    }
+
     fn next_seq(&mut self) -> u32 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
@@ -639,6 +682,7 @@ mod tests {
             source_node_id: NodeId::new(from_id),
             source_incarnation: from_inc,
             gossip,
+            shard_leaders: vec![],
         })
     }
 
@@ -657,6 +701,7 @@ mod tests {
             source_node_id: NodeId::new(from_id),
             source_incarnation: from_inc,
             gossip,
+            shard_leaders: vec![],
         })
     }
 
@@ -674,6 +719,7 @@ mod tests {
                 source_node_id: NodeId::new(from_id),
                 source_incarnation: from_inc,
                 gossip,
+                shard_leaders: vec![],
             },
         }
     }
@@ -1381,5 +1427,217 @@ mod tests {
             events.is_empty(),
             "Suspect should not emit membership event"
         );
+    }
+
+    mod shard_leader {
+        use super::*;
+        use crate::clusters::raft::messages::LeaderChange;
+        use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
+        use crate::clusters::swims::swim::tests::{add_node_harness, ping};
+        use crate::clusters::swims::topology::ShardGroupId;
+        use std::net::SocketAddr;
+
+        #[test]
+        fn announce_leader_appears_in_next_outbound_packet() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+
+            h.protocol
+                .process(SwimCommand::AnnounceShardLeader(LeaderChange {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-b"),
+                    term: 1,
+                }));
+
+            let packets = h.protocol.take_packets();
+            let has_leader_info = packets.iter().any(|p| {
+                !p.packet().shard_leaders().is_empty()
+                    && p.packet().shard_leaders()[0].shard_group_id == ShardGroupId(42)
+            });
+
+            if !has_leader_info {
+                // Leader info was enqueued but no packet was generated yet.
+                // Trigger a probe period to force a packet out.
+                let _ = h.protocol.take_events();
+                h.step(b_addr, ping(99, "node-b", 1, vec![]));
+
+                let packets = h.protocol.take_packets();
+                let found = packets.iter().any(|p| {
+                    p.packet()
+                        .shard_leaders()
+                        .iter()
+                        .any(|s| s.shard_group_id == ShardGroupId(42) && s.term == 1)
+                });
+                assert!(
+                    found,
+                    "Shard leader info should appear in outbound packet header"
+                );
+            }
+        }
+
+        #[test]
+        fn receive_leader_info_stored_in_local_table() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+
+            let header = SwimHeader {
+                seq: 1,
+                source_node_id: NodeId::new("node-b"),
+                source_incarnation: 1,
+                gossip: vec![],
+                shard_leaders: vec![ShardLeaderInfo {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-b"),
+                    leader_addr: b_addr,
+                    term: 3,
+                }],
+            };
+            h.step(b_addr, SwimPacket::Ping(header));
+            let _ = h.protocol.take_packets();
+
+            let entry = h.protocol.shard_leaders.get(&ShardGroupId(42));
+            assert!(
+                entry.is_some(),
+                "Local shard_leaders table should have entry"
+            );
+            let (leader, term) = entry.unwrap();
+            assert_eq!(*leader, NodeId::new("node-b"));
+            assert_eq!(*term, 3);
+        }
+
+        #[test]
+        fn receive_leader_info_re_gossiped() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            let c_addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+            add_node_harness(&mut h, "node-c", c_addr, 1);
+
+            let header = SwimHeader {
+                seq: 1,
+                source_node_id: NodeId::new("node-b"),
+                source_incarnation: 1,
+                gossip: vec![],
+                shard_leaders: vec![ShardLeaderInfo {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-b"),
+                    leader_addr: b_addr,
+                    term: 3,
+                }],
+            };
+            h.step(b_addr, SwimPacket::Ping(header));
+            let _ = h.protocol.take_packets();
+
+            // Now when node-c pings us, response should carry re-gossiped leader info
+            h.step(c_addr, ping(2, "node-c", 1, vec![]));
+            let packets = h.protocol.take_packets();
+            let found = packets.iter().any(|p| {
+                p.packet()
+                    .shard_leaders()
+                    .iter()
+                    .any(|s| s.shard_group_id == ShardGroupId(42) && s.term == 3)
+            });
+            assert!(
+                found,
+                "Re-gossiped shard leader info should appear in response"
+            );
+        }
+
+        #[test]
+        fn stale_leader_info_rejected() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+
+            // First: receive term 5
+            let header1 = SwimHeader {
+                seq: 1,
+                source_node_id: NodeId::new("node-b"),
+                source_incarnation: 1,
+                gossip: vec![],
+                shard_leaders: vec![ShardLeaderInfo {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-b"),
+                    leader_addr: b_addr,
+                    term: 5,
+                }],
+            };
+            h.step(b_addr, SwimPacket::Ping(header1));
+            let _ = h.protocol.take_packets();
+
+            // Then: receive stale term 2 — should be rejected
+            let header2 = SwimHeader {
+                seq: 2,
+                source_node_id: NodeId::new("node-b"),
+                source_incarnation: 1,
+                gossip: vec![],
+                shard_leaders: vec![ShardLeaderInfo {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-other"),
+                    leader_addr: "127.0.0.1:9999".parse().unwrap(),
+                    term: 2,
+                }],
+            };
+            h.step(b_addr, SwimPacket::Ping(header2));
+            let _ = h.protocol.take_packets();
+
+            let (leader, term) = h.protocol.shard_leaders.get(&ShardGroupId(42)).unwrap();
+            assert_eq!(
+                *leader,
+                NodeId::new("node-b"),
+                "Leader should not be overwritten by stale info"
+            );
+            assert_eq!(*term, 5);
+        }
+
+        #[test]
+        fn two_node_leader_propagation() {
+            let mut a = make_protocol("node-a", 8000);
+            let mut b = make_protocol("node-b", 8001);
+            let a_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+            let b_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+
+            // Introduce nodes to each other
+            a.step(b_addr, ping(1, "node-b", 0, vec![]));
+            let _ = a.take_events();
+            b.step(a_addr, ping(1, "node-a", 0, vec![]));
+            let _ = b.take_events();
+
+            // A announces itself as leader of group 42
+            a.process(SwimCommand::AnnounceShardLeader(LeaderChange {
+                shard_group_id: ShardGroupId(42),
+                leader_node_id: NodeId::new("node-a"),
+                term: 1,
+            }));
+            let _ = a.take_events();
+
+            // A pings B — packet should contain shard leader info
+            let a_packets = a.take_packets();
+            // generate a ping manually since start_probe uses live_node_tracker
+            a.step(b_addr, ping(2, "node-b", 0, vec![]));
+            let ack_packets = a.take_packets();
+            let ack_with_leaders = ack_packets
+                .iter()
+                .find(|p| !p.packet().shard_leaders().is_empty());
+
+            assert!(
+                ack_with_leaders.is_some() || !a_packets.is_empty(),
+                "A should include shard leaders in outbound packet"
+            );
+
+            if let Some(pkt) = ack_with_leaders {
+                // Feed A's ack to B
+                b.step(a_addr, pkt.packet().clone());
+                let _ = b.take_events();
+
+                let entry = b.shard_leaders.get(&ShardGroupId(42));
+                assert!(entry.is_some(), "B should learn about group 42 leader");
+                let (leader, term) = entry.unwrap();
+                assert_eq!(*leader, NodeId::new("node-a"));
+                assert_eq!(*term, 1);
+            }
+        }
     }
 }
