@@ -102,6 +102,18 @@ impl MultiRaftStore {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
+    pub(crate) fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
+        let shard_id = match &cb {
+            RaftTimeoutCallback::Ignored => return,
+            RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
+            RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
+        };
+        if let Some(state) = self.groups.get_mut(&shard_id) {
+            state.raft.handle_timeout(cb);
+            self.dirty.insert(shard_id);
+        }
+    }
+
     pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
         if let Some(state) = self.groups.get_mut(&shard_id) {
             state.raft.step(from, rpc);
