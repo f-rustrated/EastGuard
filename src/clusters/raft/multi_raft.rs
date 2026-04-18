@@ -128,6 +128,21 @@ impl MultiRaftStore {
         }
     }
 
+    pub(crate) fn propose(
+        &mut self,
+        shard_id: ShardGroupId,
+        command: crate::clusters::raft::messages::RaftCommand,
+    ) -> Result<(), crate::clusters::raft::messages::ProposeError> {
+        match self.groups.get_mut(&shard_id) {
+            Some(state) => {
+                let result = state.raft.propose(command);
+                self.dirty.insert(shard_id);
+                result
+            }
+            None => Err(crate::clusters::raft::messages::ProposeError::NotLeader),
+        }
+    }
+
     pub(crate) fn handle_node_death(&mut self, dead_node_id: NodeId) {
         let affected: Vec<ShardGroupId> = self
             .groups
