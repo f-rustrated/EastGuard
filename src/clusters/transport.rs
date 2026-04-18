@@ -20,7 +20,8 @@ impl SwimTransportActor {
             socket.local_addr().unwrap()
         );
 
-        let mut buf = [0u8; 1024];
+        // MTU 1500 - IP header 20 - UDP header 8 = max unfragmented payload
+        let mut buf = [0u8; 1472];
         loop {
             tokio::select! {
                 // INCOMING: Socket -> Decode -> Actor
