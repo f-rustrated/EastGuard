@@ -81,6 +81,27 @@ impl MultiRaftStore {
         self.dirty.insert(group.id);
     }
 
+    pub(crate) fn remove_group(&mut self, group_id: ShardGroupId) {
+        let Some(state) = self.groups.remove(&group_id) else {
+            return;
+        };
+
+        self.pending_timer_cmds.push(
+            crate::schedulers::ticker_message::TimerCommand::CancelSchedule {
+                seq: state.election_seq,
+            }
+            .into(),
+        );
+        self.pending_timer_cmds.push(
+            crate::schedulers::ticker_message::TimerCommand::CancelSchedule {
+                seq: state.heartbeat_seq,
+            }
+            .into(),
+        );
+
+        tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
+    }
+
     fn alloc_seq(&mut self) -> u32 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
