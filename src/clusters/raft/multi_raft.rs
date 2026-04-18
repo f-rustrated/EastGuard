@@ -217,15 +217,14 @@ impl MultiRaft {
                     .or_default()
                     .push(pkt);
             }
-            RaftEvent::Timer(mut cmd) => {
+            RaftEvent::Timer(cmd) => {
                 if let Some(group) = self.groups.get(&group_id) {
                     let token = match cmd.seq() {
                         ELECTION_TIMER_SEQ => group.election_seq,
                         HEARTBEAT_TIMER_SEQ => group.heartbeat_seq,
                         _ => return,
                     };
-                    cmd.set_seq(token);
-                    self.pending_timer_cmds.push(cmd.into());
+                    self.pending_timer_cmds.push(cmd.set_seq(token).into());
                 }
             }
             RaftEvent::LeaderChange(lc) => {

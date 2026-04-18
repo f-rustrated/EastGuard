@@ -19,12 +19,13 @@ impl<T> TimerCommand<T> {
             TimerCommand::SetSchedule { seq, .. } | TimerCommand::CancelSchedule { seq } => *seq,
         }
     }
-    pub(crate) fn set_seq(&mut self, new_seq: u32) {
-        match self {
+    pub(crate) fn set_seq(mut self, new_seq: u32) -> Self {
+        match &mut self {
             TimerCommand::SetSchedule { seq, .. } | TimerCommand::CancelSchedule { seq } => {
                 *seq = new_seq;
             }
         }
+        self
     }
 }
 
