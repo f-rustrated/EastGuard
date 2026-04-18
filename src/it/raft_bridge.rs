@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{MultiRaftActor, RaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, MultiRaftActorCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -37,7 +37,7 @@ async fn start_raft_node(
     peer_names: &[&str],
 ) -> Result<
     (
-        mpsc::Sender<RaftCommand>,
+        mpsc::Sender<MultiRaftActorCommand>,
         mpsc::Sender<TickerCommand<crate::clusters::raft::messages::RaftTimer>>,
     ),
     Box<dyn std::error::Error>,
@@ -86,7 +86,7 @@ async fn start_raft_node(
     ));
 
     raft_tx
-        .send(RaftCommand::EnsureGroup { group })
+        .send(MultiRaftActorCommand::EnsureGroup { group })
         .await
         .unwrap();
 
@@ -120,13 +120,13 @@ async fn tick_n(
 
 /// Query leader from MultiRaftActor and serve to checker via TCP.
 async fn serve_leader(
-    raft_tx: &mpsc::Sender<RaftCommand>,
+    raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
     group_id: ShardGroupId,
     query_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     raft_tx
-        .send(RaftCommand::GetLeader {
+        .send(MultiRaftActorCommand::GetLeader {
             group_id,
             reply: reply_tx,
         })
@@ -192,7 +192,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
 
                 // Inject node death
                 let _ = raft_tx
-                    .send(RaftCommand::HandleNodeDeath {
+                    .send(MultiRaftActorCommand::HandleNodeDeath {
                         dead_node_id: NodeId::new("node-3"),
                     })
                     .await;
@@ -263,7 +263,7 @@ fn node_join_triggers_add_peer() -> turmoil::Result {
 
                 // Inject node join
                 let _ = raft_tx
-                    .send(RaftCommand::HandleNodeJoin {
+                    .send(MultiRaftActorCommand::HandleNodeJoin {
                         new_node_id: NodeId::new("node-3"),
                         affected_groups: vec![eg],
                     })

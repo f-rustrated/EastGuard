@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{MultiRaftActor, RaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, MultiRaftActorCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -90,7 +90,7 @@ async fn run_raft_node(
 
     // Ensure the shard group
     raft_tx
-        .send(RaftCommand::EnsureGroup {
+        .send(MultiRaftActorCommand::EnsureGroup {
             group: group.clone(),
         })
         .await
@@ -117,7 +117,7 @@ async fn run_raft_node(
     // Query the elected leader
     let (reply_tx, reply_rx) = oneshot::channel();
     raft_tx
-        .send(RaftCommand::GetLeader {
+        .send(MultiRaftActorCommand::GetLeader {
             group_id: group.id,
             reply: reply_tx,
         })
