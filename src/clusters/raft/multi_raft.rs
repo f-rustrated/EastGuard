@@ -266,3 +266,53 @@ impl MultiRaftStore {
         self.seq_counter
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn node(id: &str) -> NodeId {
+        NodeId::new(id)
+    }
+
+    fn shard(id: u64, members: Vec<NodeId>) -> ShardGroup {
+        ShardGroup { id: ShardGroupId(id), members }
+    }
+
+    fn set_seqs(cmds: &[TickerCommand<RaftTimer>]) -> Vec<u32> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                TickerCommand::Schedule(TimerCommand::SetSchedule { seq, .. }) => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timer_seqs_are_unique_across_groups() {
+        let me = node("n1");
+        let mut store = MultiRaftStore::new(me.clone());
+
+        store.ensure_group(shard(1, vec![me.clone(), node("n2")]));
+        store.ensure_group(shard(2, vec![me.clone(), node("n2")]));
+        store.flush();
+
+        let seqs = set_seqs(&store.take_all_timer_commands());
+        let unique: HashSet<u32> = seqs.iter().cloned().collect();
+        assert_eq!(seqs.len(), unique.len());
+    }
+
+    #[test]
+    fn translate_timer_seq_maps_local_to_global() {
+        let me = node("n1");
+        let mut store = MultiRaftStore::new(me.clone());
+
+        store.ensure_group(shard(1, vec![me.clone(), node("n2")]));
+        store.flush();
+
+        let seqs = set_seqs(&store.take_all_timer_commands());
+        assert!(!seqs.contains(&0));
+        assert!(!seqs.contains(&1));
+    }
+}
