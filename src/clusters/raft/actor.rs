@@ -2,7 +2,7 @@
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
-use crate::clusters::raft::multi_raft::MultiRaftStore;
+use crate::clusters::raft::multi_raft::MultiRaft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand};
 use crate::schedulers::ticker_message::TickerCommand;
 
@@ -61,7 +61,7 @@ impl MultiRaftActor {
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
         swim_tx: mpsc::Sender<SwimCommand>,
     ) {
-        let mut store = MultiRaftStore::new(node_id);
+        let mut store = MultiRaft::new(node_id);
         let mut buf = Vec::with_capacity(64);
 
         loop {

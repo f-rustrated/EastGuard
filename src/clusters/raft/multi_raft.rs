@@ -18,7 +18,7 @@ pub(crate) struct ShardGroupState {
 }
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
-pub(crate) struct MultiRaftStore {
+pub(crate) struct MultiRaft {
     node_id: NodeId,
     groups: HashMap<ShardGroupId, ShardGroupState>,
     seq_counter: u32,
@@ -28,7 +28,7 @@ pub(crate) struct MultiRaftStore {
     pending_leader_changes: Vec<LeaderChange>,
 }
 
-impl MultiRaftStore {
+impl MultiRaft {
     pub(crate) fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn timer_seqs_are_unique_across_groups() {
         let me = node("n1");
-        let mut store = MultiRaftStore::new(me.clone());
+        let mut store = MultiRaft::new(me.clone());
 
         store.add_group(shard(1, vec![me.clone(), node("n2")]));
         store.add_group(shard(2, vec![me.clone(), node("n2")]));
