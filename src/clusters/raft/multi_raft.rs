@@ -167,7 +167,9 @@ impl MultiRaft {
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
         for id in std::mem::take(&mut self.dirty) {
-            let raft = self.groups.get_mut(&id).unwrap();
+            let Some(raft) = self.groups.get_mut(&id) else {
+                continue;
+            };
             // RocksDB integration point: replace the discard below with a batch write.
             // take_log_mutations() returns Vec<LogMutation> — iterate and apply each variant:
             //   LogMutation::Append(entry)        → cf_log.put((id, entry.index), bincode(entry))
