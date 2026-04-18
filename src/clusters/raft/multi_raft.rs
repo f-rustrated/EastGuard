@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    OutboundRaftPacket, RaftRpc, RaftTimeoutCallback, RaftTimer,
+    OutboundRaftPacket, ProposeError, RaftCommand, RaftRpc, RaftTimeoutCallback, RaftTimer,
 };
 use crate::clusters::raft::raft::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -114,9 +114,7 @@ impl MultiRaftStore {
             {
                 let _ = state
                     .raft
-                    .propose(crate::clusters::raft::messages::RaftCommand::AddPeer(
-                        new_node_id.clone(),
-                    ));
+                    .propose(RaftCommand::AddPeer(new_node_id.clone()));
                 self.dirty.insert(group.id);
             }
         }
@@ -131,15 +129,15 @@ impl MultiRaftStore {
     pub(crate) fn propose(
         &mut self,
         shard_id: ShardGroupId,
-        command: crate::clusters::raft::messages::RaftCommand,
-    ) -> Result<(), crate::clusters::raft::messages::ProposeError> {
+        command: RaftCommand,
+    ) -> Result<(), ProposeError> {
         match self.groups.get_mut(&shard_id) {
             Some(state) => {
                 let result = state.raft.propose(command);
                 self.dirty.insert(shard_id);
                 result
             }
-            None => Err(crate::clusters::raft::messages::ProposeError::NotLeader),
+            None => Err(ProposeError::NotLeader),
         }
     }
 
@@ -155,9 +153,7 @@ impl MultiRaftStore {
             if let Some(state) = self.groups.get_mut(group_id) {
                 let _ = state
                     .raft
-                    .propose(crate::clusters::raft::messages::RaftCommand::RemovePeer(
-                        dead_node_id.clone(),
-                    ));
+                    .propose(RaftCommand::RemovePeer(dead_node_id.clone()));
             }
         }
 
