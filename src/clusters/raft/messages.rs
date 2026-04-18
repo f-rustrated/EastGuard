@@ -147,6 +147,7 @@ pub enum RaftEvent {
     OutboundRaftPacket(OutboundRaftPacket),
     Timer(TimerCommand<RaftTimer>),
     LeaderChange(LeaderChange),
+    DisconnectPeer(NodeId),
 }
 
 impl_from_variant!(RaftEvent, LeaderChange, OutboundRaftPacket);

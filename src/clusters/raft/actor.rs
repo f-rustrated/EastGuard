@@ -100,18 +100,12 @@ impl MultiRaftActor {
                         let _ = reply.send(store.propose(shard_group_id, command));
                     }
                     MultiRaftActorCommand::HandleNodeDeath { dead_node_id } => {
-                        // Evict stale connection — transport concern, not store concern.
-                        let _ = transport_tx
-                            .send(RaftTransportCommand::DisconnectPeer(dead_node_id.clone()))
-                            .await;
                         store.remove_node(dead_node_id);
                     }
                     MultiRaftActorCommand::HandleNodeJoin {
                         new_node_id,
                         affected_groups,
-                    } => {
-                        store.add_node(new_node_id, affected_groups);
-                    }
+                    } => store.add_node(new_node_id, affected_groups),
                 }
             }
 
@@ -130,6 +124,11 @@ impl MultiRaftActor {
                     }
                     RaftEvent::LeaderChange(lc) => {
                         let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
+                    }
+                    RaftEvent::DisconnectPeer(node_id) => {
+                        let _ = transport_tx
+                            .send(RaftTransportCommand::DisconnectPeer(node_id))
+                            .await;
                     }
                 }
             }

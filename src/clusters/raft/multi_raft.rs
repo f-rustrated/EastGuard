@@ -116,6 +116,9 @@ impl MultiRaft {
     }
 
     pub(crate) fn remove_node(&mut self, node_id: NodeId) {
+        self.pending_events
+            .push(RaftEvent::DisconnectPeer(node_id.clone()));
+
         let affected: Vec<ShardGroupId> = self
             .groups
             .iter()
