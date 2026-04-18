@@ -3,3 +3,4 @@ pub(crate) mod log;
 pub(crate) mod messages;
 pub(crate) mod raft;
 pub(crate) mod transport;
+mod multi_raft;
