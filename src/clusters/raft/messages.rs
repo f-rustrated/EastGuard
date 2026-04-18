@@ -129,6 +129,16 @@ impl OutboundRaftPacket {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum LogMutation {
+    Append(LogEntry),
+    TruncateFrom(u64),
+    HardState {
+        term: u64,
+        voted_for: Option<NodeId>,
+    },
+}
+
 /// Unified side-effect type emitted by the Raft state machine.
 /// The actor layer drains these and routes each variant to the
 /// appropriate channel (transport / scheduler / swim).
