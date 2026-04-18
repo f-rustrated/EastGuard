@@ -11,7 +11,7 @@ use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
 use tokio::sync::{mpsc, oneshot};
 
-/// Commands received by the RaftActor from external sources.
+/// Commands received by the MultiRaftActor from external sources.
 pub enum RaftCommand {
     /// An RPC arrived from a peer via the transport layer.
     PacketReceived {
@@ -334,9 +334,9 @@ impl RaftGroups {
 }
 
 /// Async boundary — receives commands from mailbox, delegates to `RaftGroups`.
-pub struct RaftActor;
+pub struct MultiRaftActor;
 
-impl RaftActor {
+impl MultiRaftActor {
     pub async fn run(
         node_id: NodeId,
         mut mailbox: mpsc::Receiver<RaftCommand>,

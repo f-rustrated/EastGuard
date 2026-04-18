@@ -34,7 +34,7 @@ Actor has no protocol logic. All decisions in `Swim`.
 - `mailbox` -- `mpsc::Receiver<SwimCommand>` -- inbound event stream
 - `transport_tx` -- `mpsc::Sender<OutboundPacket>` -- sends UDP packets to transport actor
 - `scheduler_tx` -- `mpsc::Sender<TickerCommand<SwimTimer>>` -- sends timer set/cancel commands to ticker
-- `raft_tx` -- `mpsc::Sender<RaftCommand>` -- sends membership-driven commands to RaftActor (HandleNodeDeath, HandleNodeJoin)
+- `raft_tx` -- `mpsc::Sender<RaftCommand>` -- sends membership-driven commands to MultiRaftActor (HandleNodeDeath, HandleNodeJoin)
 
 ## Message Flow
 
