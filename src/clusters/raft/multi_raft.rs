@@ -102,6 +102,13 @@ impl MultiRaftStore {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
+    pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
+        if let Some(state) = self.groups.get_mut(&shard_id) {
+            state.raft.step(from, rpc);
+            self.dirty.insert(shard_id);
+        }
+    }
+
     fn alloc_seq(&mut self) -> u32 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
