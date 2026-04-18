@@ -60,11 +60,11 @@ async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> bool {
     }
 }
 
-/// Full-stack E2E: SWIM cluster formation with RaftActor wired in.
+/// Full-stack E2E: SWIM cluster formation with MultiRaftActor wired in.
 ///
 /// Proves the complete pipeline works without panic:
-///   SWIM discover → MembershipEvent::NodeAlive → HandleNodeJoin → RaftActor EnsureGroup/AddPeer
-///   SWIM failure detection → MembershipEvent::NodeDead → HandleNodeDeath → RaftActor RemovePeer
+///   SWIM discover → MembershipEvent::NodeAlive → HandleNodeJoin → MultiRaftActor EnsureGroup/AddPeer
+///   SWIM failure detection → MembershipEvent::NodeDead → HandleNodeDeath → MultiRaftActor RemovePeer
 ///   Node restart → SWIM rejoin → HandleNodeJoin again
 #[test]
 fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {

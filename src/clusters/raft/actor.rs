@@ -11,7 +11,7 @@ use crate::schedulers::ticker_message::{TickerCommand, TimerCommand};
 
 use tokio::sync::{mpsc, oneshot};
 
-/// Commands received by the RaftActor from external sources.
+/// Commands received by the MultiRaftActor from external sources.
 pub enum RaftCommand {
     /// An RPC arrived from a peer via the transport layer.
     PacketReceived {
@@ -63,7 +63,7 @@ impl From<RaftTimeoutCallback> for RaftCommand {
 /// monotonic counter, preventing collisions across groups in the shared Ticker.
 struct RaftGroups {
     node_id: NodeId,
-    groups: HashMap<ShardGroupId, Raft<crate::storage::MemoryLogStore>>,
+    groups: HashMap<ShardGroupId, Raft>,
     /// Monotonic counter for globally unique timer seqs.
     seq_counter: u32,
     /// Maps (ShardGroupId, local_seq) → global_seq for timer namespacing.
@@ -223,13 +223,7 @@ impl RaftGroups {
             self.node_id.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
-        let raft = Raft::new(
-            self.node_id.clone(),
-            peers,
-            jitter,
-            crate::storage::MemoryLogStore::default(),
-            group.id,
-        );
+        let raft = Raft::new(self.node_id.clone(), peers, jitter, group.id);
 
         tracing::info!(
             "[{}] Created Raft group {:?} with {} peers",
@@ -334,9 +328,9 @@ impl RaftGroups {
 }
 
 /// Async boundary — receives commands from mailbox, delegates to `RaftGroups`.
-pub struct RaftActor;
+pub struct MultiRaftActor;
 
-impl RaftActor {
+impl MultiRaftActor {
     pub async fn run(
         node_id: NodeId,
         mut mailbox: mpsc::Receiver<RaftCommand>,

@@ -225,7 +225,7 @@ impl YourActor {
 
 **Translation in flush**: If events need transformation before routing (e.g. membership events → raft commands, timer seq namespacing), extract a helper method rather than inlining complex logic in the match arm. See `SwimActor::to_raft_command()` and `RaftGroups::translate_timer_seq()`.
 
-### Multiplexing pattern (like RaftActor)
+### Multiplexing pattern (like MultiRaftActor)
 
 If actor manages multiple state machine instances (e.g., one per shard), extract a `Groups` struct to encapsulate group lifecycle, dirty tracking, and timer seq namespacing. Actor stays thin — just the mailbox loop.
 

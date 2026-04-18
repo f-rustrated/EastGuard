@@ -2,12 +2,12 @@
 
 ## Purpose
 
-`RaftActor` is async boundary driving multiple `Raft` state machines -- one per shard group on this node. It receives commands from mailbox, feeds into synchronous state machines, flushes all side effects (outbound packets and timer commands).
+`MultiRaftActor` is async boundary driving multiple `Raft` state machines -- one per shard group on this node. It receives commands from mailbox, feeds into synchronous state machines, flushes all side effects (outbound packets and timer commands).
 
 Actor contains no consensus logic. All decisions live in `Raft`.
 
 
-**Single actor, multiple state machines:** Instead of spawning one task per shard group, single `RaftActor` multiplexes all groups. Keeps lifecycle management simple, avoids thousands of tokio tasks as shard count grows. Can split later if contention becomes issue.
+**Single actor, multiple state machines:** Instead of spawning one task per shard group, single `MultiRaftActor` multiplexes all groups. Keeps lifecycle management simple, avoids thousands of tokio tasks as shard count grows. Can split later if contention becomes issue.
 
 ## Command Types
 
@@ -75,7 +75,7 @@ Phase 6 will connect Raft elections to SWIM's `ShardLeader` piggybacking (#35-#3
 ## Relationship to Other Actors
 
 ```
-SwimActor (UDP, membership) ──raft_tx──> RaftActor (TCP, consensus)
+SwimActor (UDP, membership) ──raft_tx──> MultiRaftActor (TCP, consensus)
        |    (HandleNodeDeath,                  |
        |     HandleNodeJoin)                   |
        v                                       v
@@ -88,7 +88,7 @@ SwimActor (UDP, membership) ──raft_tx──> RaftActor (TCP, consensus)
 
 Both actors share same `Ticker`-based scheduler (via `run_scheduling_actor`), but use different timer types (`SwimTimer` vs `RaftTimer`). Timer seq namespacing prevents collisions.
 
-SwimActor sends membership-driven commands directly to RaftActor — no intermediate bridge. Topology queries are local (`state.topology.shard_groups_for_node()`).
+SwimActor sends membership-driven commands directly to MultiRaftActor — no intermediate bridge. Topology queries are local (`state.topology.shard_groups_for_node()`).
 
 ## Peer Resolution: NodeId → Connection
 
@@ -101,10 +101,10 @@ SWIM membership table          (NodeId → SocketAddr, maintained by gossip)
 Topology / hash ring           (key → ShardGroup { members: Vec<NodeId> })
        |
        v
-SwimActor                      (sends HandleNodeDeath/HandleNodeJoin to RaftActor)
+SwimActor                      (sends HandleNodeDeath/HandleNodeJoin to MultiRaftActor)
        |
        v
-RaftActor                      (maintains NodeId → Connection pool)
+MultiRaftActor                      (maintains NodeId → Connection pool)
        |                        resolves OutboundRaftPacket.target (NodeId)
        v                        to a persistent TCP connection
 RaftTransportActor              (TCP I/O)
@@ -132,6 +132,6 @@ RaftTransportActor              (TCP I/O)
 
 3. **Raft instances are independent.** Processing event for `Shard #12` never touches `Shard #45`'s state.
 
-4. **Group lifecycle controlled by SwimActor.** RaftActor does not decide when to create or remove groups. Only responds to `EnsureGroup`, `RemoveGroup`, `HandleNodeDeath`, and `HandleNodeJoin` commands sent by SwimActor.
+4. **Group lifecycle controlled by SwimActor.** MultiRaftActor does not decide when to create or remove groups. Only responds to `EnsureGroup`, `RemoveGroup`, `HandleNodeDeath`, and `HandleNodeJoin` commands sent by SwimActor.
 
 5. **Timer commands flow through scheduler.** Actor converts `TimerCommand<RaftTimer>` into `TickerCommand<RaftTimer>` (via `.into()`) and sends to shared ticker. Ticker fires `RaftTimeoutCallback` back into actor's mailbox.

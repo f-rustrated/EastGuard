@@ -10,7 +10,7 @@ EastGuard not use monolithic metadata store or single controller quorum. Metadat
 
 - Single node participates in **many** Raft groups simultaneously (some leader, others follower).
 - Each `Raft` instance has own term, voted_for, log, commit_index — fully independent.
-- `RaftActor` multiplexes all groups through `HashMap<ShardGroupId, Raft>`.
+- `MultiRaftActor` multiplexes all groups through `HashMap<ShardGroupId, Raft>`.
 - Log storage per-instance (`MemLog`) now; becomes shared store keyed by `(shard_id, index)` when RocksDB added.
 
 ## Architecture
@@ -113,7 +113,7 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 1. **Raft is purely synchronous.** No async, no I/O, no channels. All side effects buffered in `pending_outbound` and `pending_timer_commands`.
 
-2. **Each Raft instance independent.** In DS-RSM, node runs many Raft instances. Share no state. `RaftActor` maps `ShardGroupId → Raft`.
+2. **Each Raft instance independent.** In DS-RSM, node runs many Raft instances. Share no state. `MultiRaftActor` maps `ShardGroupId → Raft`.
 
 3. **Every event must be followed by draining output buffers.** Actor layer must call `take_outbound()` and `take_timer_commands()` after every `step()`, `handle_timeout()`, or `propose()` call.
 

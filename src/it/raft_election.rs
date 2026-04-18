@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{RaftActor, RaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, RaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -80,7 +80,7 @@ async fn run_raft_node(
         swim_tx.clone(),
     ));
 
-    tokio::spawn(RaftActor::run(
+    tokio::spawn(MultiRaftActor::run(
         node_id,
         raft_mailbox,
         transport_tx,
@@ -155,7 +155,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
     leader
 }
 
-/// 3 turmoil hosts each run a full Raft stack (RaftActor + RaftTransportActor +
+/// 3 turmoil hosts each run a full Raft stack (MultiRaftActor + RaftTransportActor +
 /// Ticker + mock SWIM). After ticking through election + heartbeat propagation,
 /// the checker connects to each node and verifies that all agree on the same
 /// elected leader.

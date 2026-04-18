@@ -16,7 +16,7 @@ pub enum SwimCommand {
     // From Ticker
     Timeout(SwimTimeOutCallback),
     Query(SwimQueryCommand),
-    // From RaftActor — leader election completed for a shard group
+    // From MultiRaftActor — leader election completed for a shard group
     AnnounceShardLeader(LeaderChange),
 }
 
@@ -68,7 +68,7 @@ pub enum SwimEvent {
 }
 
 /// Membership change events emitted by the SWIM state machine.
-/// Consumed by the RaftActor to drive shard group lifecycle.
+/// Consumed by the MultiRaftActor to drive shard group lifecycle.
 #[derive(Debug)]
 #[allow(dead_code)] // NodeAlive fields used when node join handling is added
 pub enum MembershipEvent {

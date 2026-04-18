@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{RaftActor, RaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, RaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -77,7 +77,7 @@ async fn start_raft_node(
         swim_tx.clone(),
     ));
 
-    tokio::spawn(RaftActor::run(
+    tokio::spawn(MultiRaftActor::run(
         node_id,
         raft_mailbox,
         transport_tx,
@@ -118,7 +118,7 @@ async fn tick_n(
     }
 }
 
-/// Query leader from RaftActor and serve to checker via TCP.
+/// Query leader from MultiRaftActor and serve to checker via TCP.
 async fn serve_leader(
     raft_tx: &mpsc::Sender<RaftCommand>,
     group_id: ShardGroupId,

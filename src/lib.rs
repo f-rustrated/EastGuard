@@ -4,7 +4,6 @@ mod config;
 mod connections;
 
 mod clusters;
-mod storage;
 
 mod net;
 pub(crate) mod schedulers;
@@ -13,7 +12,7 @@ pub(crate) mod schedulers;
 mod it;
 pub(crate) mod macros;
 
-use crate::clusters::raft::actor::RaftActor;
+use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::transport::RaftTransportActor;
 
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
@@ -95,7 +94,7 @@ impl StartUp {
             swim_ticker_tx,
             raft_tx,
         ));
-        tokio::spawn(RaftActor::run(
+        tokio::spawn(MultiRaftActor::run(
             node_id,
             raft_mailbox,
             raft_transport_tx,

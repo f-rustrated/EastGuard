@@ -3,12 +3,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
-use crate::clusters::raft::interface::LogStore;
-use crate::clusters::raft::log::{LogEntry, RaftLog};
+use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::*;
 use crate::clusters::swims::ShardGroupId;
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::storage::MemoryLogStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -39,7 +37,7 @@ struct PeerState {
 /// Follows the same pattern as `Swim`: purely synchronous, no async, no I/O.
 /// All outbound packets and timer commands are buffered and drained by the
 /// caller (the actor layer).
-pub struct Raft<S: LogStore = MemoryLogStore> {
+pub struct Raft {
     // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
@@ -47,21 +45,17 @@ pub struct Raft<S: LogStore = MemoryLogStore> {
 
     current_term: u64,
     voted_for: Option<NodeId>,
-    log: RaftLog<S>,
-
+    log: Vec<LogEntry>,
+    pending_log_mutations: Vec<LogMutation>, // must persist
+    pending_events: Vec<RaftEvent>,          // volatile side effects
     commit_index: u64,
     last_applied: u64,
     role: Role,
-
     /// Tracks who the current leader is — set when this node becomes leader
     /// or when a valid `AppendEntries` is received from a leader.
     current_leader: Option<NodeId>,
-
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
-
-    pending_events: Vec<RaftEvent>,
-
     election_jitter: u32,
 }
 
@@ -71,12 +65,11 @@ pub struct Raft<S: LogStore = MemoryLogStore> {
 const ELECTION_TIMER_SEQ: u32 = 0;
 const HEARTBEAT_TIMER_SEQ: u32 = 1;
 
-impl<S: LogStore> Raft<S> {
+impl Raft {
     pub(crate) fn new(
         node_id: NodeId,
         peers: HashSet<NodeId>,
         election_jitter: u32,
-        store: S,
         shard_group_id: ShardGroupId,
     ) -> Self {
         let mut raft = Self {
@@ -85,13 +78,14 @@ impl<S: LogStore> Raft<S> {
             peers,
             current_term: 0,
             voted_for: None,
-            log: RaftLog::with_store(store),
+            log: Vec::new(),
+            pending_log_mutations: Vec::new(),
+            pending_events: Vec::new(),
             commit_index: 0,
             last_applied: 0,
             role: Role::Follower,
             current_leader: None,
             peer_states: HashMap::new(),
-            pending_events: Vec::new(),
             election_jitter,
         };
         raft.reset_election_timer();
@@ -100,6 +94,68 @@ impl<S: LogStore> Raft<S> {
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    pub fn take_log_mutations(&mut self) -> Vec<LogMutation> {
+        std::mem::take(&mut self.pending_log_mutations)
+    }
+
+    // -------------------------------------------------------------------
+    // In-memory log helpers (1-based indexing; index 0 means "before log")
+    // -------------------------------------------------------------------
+
+    fn log_last_index(&self) -> u64 {
+        self.log.last().map_or(0, |e| e.index)
+    }
+
+    fn log_last_term(&self) -> u64 {
+        self.log.last().map_or(0, |e| e.term)
+    }
+
+    fn log_term_at(&self, index: u64) -> u64 {
+        if index == 0 {
+            return 0;
+        }
+        self.log
+            .get((index - 1) as usize)
+            .map_or(0, |e| e.term)
+    }
+
+    fn log_get(&self, index: u64) -> Option<&LogEntry> {
+        if index == 0 {
+            return None;
+        }
+        self.log.get((index - 1) as usize)
+    }
+
+    fn log_entries_from(&self, start_index: u64) -> Vec<LogEntry> {
+        let last = self.log_last_index();
+        if start_index == 0 || start_index > last {
+            return vec![];
+        }
+        self.log[(start_index - 1) as usize..].to_vec()
+    }
+
+    fn log_append(&mut self, entry: LogEntry) {
+        self.pending_log_mutations
+            .push(LogMutation::Append(entry.clone()));
+        self.log.push(entry);
+    }
+
+    fn log_truncate_from(&mut self, from_index: u64) {
+        if from_index == 0 || from_index > self.log_last_index() + 1 {
+            return;
+        }
+        self.pending_log_mutations
+            .push(LogMutation::TruncateFrom(from_index));
+        self.log.truncate((from_index - 1) as usize);
+    }
+
+    fn push_hard_state(&mut self) {
+        self.pending_log_mutations.push(LogMutation::HardState {
+            term: self.current_term,
+            voted_for: self.voted_for.clone(),
+        });
     }
 
     pub fn peers_count(&self) -> usize {
@@ -162,6 +218,7 @@ impl<S: LogStore> Raft<S> {
         }
         self.current_term += 1;
         self.voted_for = Some(self.node_id.clone());
+        self.push_hard_state();
 
         if self.peers.is_empty() {
             // Single-node cluster: elect self immediately.
@@ -175,8 +232,8 @@ impl<S: LogStore> Raft<S> {
         let req = RequestVote {
             term: self.current_term,
             candidate_id: self.node_id.clone(),
-            last_log_index: self.log.last_index(),
-            last_log_term: self.log.last_term(),
+            last_log_index: self.log_last_index(),
+            last_log_term: self.log_last_term(),
         };
         for peer_id in self.peers.iter() {
             self.pending_events.push(
@@ -199,6 +256,7 @@ impl<S: LogStore> Raft<S> {
 
         if vote_granted {
             self.voted_for = Some(req.candidate_id);
+            self.push_hard_state();
             self.reset_election_timer();
         }
 
@@ -244,8 +302,8 @@ impl<S: LogStore> Raft<S> {
     /// §5.4.1: A candidate's log is "at least as up-to-date" if its last
     /// entry has a higher term, or the same term with a >= index.
     fn log_is_up_to_date(&self, last_log_index: u64, last_log_term: u64) -> bool {
-        let my_last_term = self.log.last_term();
-        let my_last_index = self.log.last_index();
+        let my_last_term = self.log_last_term();
+        let my_last_index = self.log_last_index();
 
         if last_log_term != my_last_term {
             return last_log_term > my_last_term;
@@ -276,7 +334,7 @@ impl<S: LogStore> Raft<S> {
 
         // next_index is set *before* the noop is appended, so it points
         // at the noop's index — causing the first AppendEntries to carry it.
-        let next = self.log.last_index() + 1;
+        let next = self.log_last_index() + 1;
 
         // Peer state tracker needs to be re-initialized on every leadership transition
         self.peer_states.clear();
@@ -306,6 +364,7 @@ impl<S: LogStore> Raft<S> {
     fn step_down(&mut self, new_term: u64) {
         self.current_term = new_term;
         self.voted_for = None;
+        self.push_hard_state();
         self.role = Role::Follower;
         self.current_leader = None;
         self.peer_states.clear();
@@ -338,8 +397,8 @@ impl<S: LogStore> Raft<S> {
         };
 
         let prev_log_index = peer_state.next_index.saturating_sub(1);
-        let prev_log_term = self.log.term_at(prev_log_index);
-        let entries = self.log.entries_from(peer_state.next_index);
+        let prev_log_term = self.log_term_at(prev_log_index);
+        let entries = self.log_entries_from(peer_state.next_index);
 
         self.pending_events.push(
             OutboundRaftPacket::new(
@@ -383,7 +442,7 @@ impl<S: LogStore> Raft<S> {
 
         // Log consistency check: prev_log_index must exist with matching term.
         if req.prev_log_index > 0 {
-            let local_term = self.log.term_at(req.prev_log_index);
+            let local_term = self.log_term_at(req.prev_log_index);
             if local_term == 0 || local_term != req.prev_log_term {
                 self.send_append_entries_response(from, false);
                 return;
@@ -391,19 +450,19 @@ impl<S: LogStore> Raft<S> {
         }
 
         // Append entries (truncate conflicting suffix first).
-        for entry in &req.entries {
-            let existing_term = self.log.term_at(entry.index);
+        for entry in req.entries {
+            let existing_term = self.log_term_at(entry.index);
             if existing_term != 0 && existing_term != entry.term {
-                self.log.truncate_from(entry.index);
+                self.log_truncate_from(entry.index);
             }
-            if entry.index > self.log.last_index() {
-                self.log.append(entry.clone());
+            if entry.index > self.log_last_index() {
+                self.log_append(entry);
             }
         }
 
         // Advance commit index.
         if req.leader_commit > self.commit_index {
-            self.commit_index = req.leader_commit.min(self.log.last_index());
+            self.commit_index = req.leader_commit.min(self.log_last_index());
             self.apply_committed_entries();
         }
 
@@ -451,7 +510,7 @@ impl<S: LogStore> Raft<S> {
                     term: self.current_term,
                     node_id: self.node_id.clone(),
                     success,
-                    last_log_index: self.log.last_index(),
+                    last_log_index: self.log_last_index(),
                 },
             )
             .into(),
@@ -475,13 +534,13 @@ impl<S: LogStore> Raft<S> {
     // Instead, it appends a new entry at its own term. Once that entry is committed on a majority, all preceding entries (including index 3) are implicitly committed too.
     // And that 'implicit commit' does not violate safety because 'new' entry acts as an election shield that physically prevents that overwrite from happening.
     fn try_advance_commit_index(&mut self) {
-        let last = self.log.last_index();
+        let last = self.log_last_index();
         let quorum = self.quorum();
 
         // Scan top-down: the highest current-term entry with quorum
         // implicitly commits everything below it (log matching property).
         for n in (self.commit_index + 1..=last).rev() {
-            if self.log.term_at(n) != self.current_term {
+            if self.log_term_at(n) != self.current_term {
                 continue;
             }
             let replication_count = self
@@ -505,7 +564,7 @@ impl<S: LogStore> Raft<S> {
     fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let entry = match self.log.get(self.last_applied) {
+            let entry = match self.log_get(self.last_applied) {
                 Some(e) => e.clone(),
                 None => continue,
             };
@@ -531,7 +590,7 @@ impl<S: LogStore> Raft<S> {
                         self.peer_states.insert(
                             node_id.clone(),
                             PeerState {
-                                next_index: self.log.last_index() + 1,
+                                next_index: self.log_last_index() + 1,
                                 match_index: 0,
                             },
                         );
@@ -548,11 +607,12 @@ impl<S: LogStore> Raft<S> {
     }
 
     fn add_new_entry(&mut self, command: RaftCommand) {
-        self.log.append(LogEntry {
+        let entry = LogEntry {
             term: self.current_term,
-            index: self.log.last_index() + 1,
+            index: self.log_last_index() + 1,
             command,
-        });
+        };
+        self.log_append(entry);
     }
 
     /// Propose a command to the Raft log. Only the leader can accept proposals.
@@ -615,6 +675,7 @@ impl<S: LogStore> Raft<S> {
                 seq: HEARTBEAT_TIMER_SEQ,
             }));
     }
+
 }
 
 #[cfg(test)]
@@ -652,19 +713,13 @@ mod tests {
     }
 
     fn single_node_raft() -> Raft {
-        Raft::new(
-            node("node-1"),
-            HashSet::new(),
-            0,
-            MemoryLogStore::default(),
-            TEST_SHARD,
-        )
+        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, MemoryLogStore::default(), TEST_SHARD)
+        Raft::new(node(id), peers, 0, TEST_SHARD)
     }
 
     // -------------------------------------------------------------------
@@ -825,7 +880,7 @@ mod tests {
     fn rejects_vote_if_candidate_log_is_stale() {
         let mut raft = three_node_raft("node-2");
         // Give node-2 a log entry at term 2
-        raft.log.append(LogEntry {
+        raft.log_append(LogEntry {
             term: 2,
             index: 1,
             command: RaftCommand::Noop,
@@ -937,7 +992,7 @@ mod tests {
             }
             _ => panic!("expected AppendEntriesResponse"),
         }
-        assert_eq!(raft.log.last_index(), 1);
+        assert_eq!(raft.log_last_index(), 1);
     }
 
     #[test]
@@ -1015,7 +1070,7 @@ mod tests {
         // Noop is at index 1 (appended on election). Propose adds at index 2.
         raft.propose(RaftCommand::Noop).unwrap();
         drain(&mut raft);
-        assert_eq!(raft.log.last_index(), 2);
+        assert_eq!(raft.log_last_index(), 2);
         assert_eq!(raft.commit_index, 0);
 
         // node-2 acknowledges both entries (noop + proposal)
@@ -1357,13 +1412,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(
-                NodeId::new("self"),
-                peers,
-                0,
-                MemoryLogStore::default(),
-                TEST_SHARD,
-            );
+            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD);
 
             assert_eq!(
                 raft.quorum(),
