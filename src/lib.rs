@@ -4,6 +4,7 @@ mod config;
 mod connections;
 
 mod clusters;
+pub(crate) mod storage;
 
 mod net;
 pub(crate) mod schedulers;
@@ -94,8 +95,10 @@ impl StartUp {
             swim_ticker_tx,
             raft_tx,
         ));
+        let raft_db = crate::storage::RaftDb::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
             node_id,
+            raft_db,
             raft_mailbox,
             raft_transport_tx,
             raft_ticker_tx,

@@ -9,10 +9,12 @@ use crate::clusters::raft::messages::{
 use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
+use crate::storage::{RaftDb, shard_cf_name};
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
+    db: RaftDb,
     groups: HashMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
@@ -20,9 +22,10 @@ pub(crate) struct MultiRaft {
 }
 
 impl MultiRaft {
-    pub(crate) fn new(node_id: NodeId) -> Self {
+    pub(crate) fn new(node_id: NodeId, db: RaftDb) -> Self {
         Self {
             node_id,
+            db,
             groups: HashMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
@@ -80,6 +83,11 @@ impl MultiRaft {
             return;
         }
 
+        let cf_name = shard_cf_name(group.id.0);
+        if !self.db.has_cf(&cf_name) {
+            self.db.create_cf(&cf_name);
+        }
+
         let peers: HashSet<NodeId> = group
             .members
             .iter()
@@ -129,6 +137,8 @@ impl MultiRaft {
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: raft.heartbeat_seq(),
             }));
+
+        self.db.drop_cf(&shard_cf_name(group_id.0));
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
@@ -265,10 +275,21 @@ mod tests {
             .collect()
     }
 
+    fn temp_db() -> (RaftDb, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let db = RaftDb::open(path.clone());
+        (db, path)
+    }
+
+    fn new_store(node_id: NodeId, db: RaftDb) -> MultiRaft {
+        MultiRaft::new(node_id, db)
+    }
+
     #[test]
     fn timer_seqs_are_unique_across_groups() {
+        let (db, _) = temp_db();
         let me = node("n1");
-        let mut store = MultiRaft::new(me.clone());
+        let mut store = new_store(me.clone(), db);
 
         store.add_group(shard(1, vec![me.clone(), node("n2")]));
         store.add_group(shard(2, vec![me.clone(), node("n2")]));
@@ -277,5 +298,59 @@ mod tests {
         let seqs = timer_seqs(&events);
         let unique: HashSet<u32> = seqs.iter().cloned().collect();
         assert_eq!(seqs.len(), unique.len());
+    }
+
+    #[test]
+    fn add_group_creates_cf() {
+        let (db, _) = temp_db();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), db);
+
+        store.add_group(shard(42, vec![me.clone(), node("n2")]));
+
+        assert!(store.db.has_cf(&shard_cf_name(42)));
+    }
+
+    #[test]
+    fn remove_group_drops_cf() {
+        let (db, _) = temp_db();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), db);
+
+        store.add_group(shard(42, vec![me.clone(), node("n2")]));
+        store.remove_group(ShardGroupId(42));
+
+        assert!(!store.db.has_cf(&shard_cf_name(42)));
+    }
+
+    #[test]
+    fn add_group_noop_when_not_member() {
+        let (db, _) = temp_db();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), db);
+
+        store.add_group(shard(42, vec![node("n2"), node("n3")]));
+
+        assert!(!store.db.has_cf(&shard_cf_name(42)));
+        assert!(!store.groups.contains_key(&ShardGroupId(42)));
+    }
+
+    #[test]
+    fn restart_recovers_existing_cfs() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+
+        {
+            let db = RaftDb::open(path.clone());
+            let mut store = new_store(me.clone(), db);
+            store.add_group(shard(1, vec![me.clone(), node("n2")]));
+            store.add_group(shard(2, vec![me.clone(), node("n2")]));
+        }
+
+        // Reopen — simulates a crash+restart.
+        let db = RaftDb::open(path);
+        let store = new_store(me.clone(), db);
+        assert!(store.db.has_cf(&shard_cf_name(1)));
+        assert!(store.db.has_cf(&shard_cf_name(2)));
     }
 }

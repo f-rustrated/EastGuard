@@ -25,6 +25,9 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_DATA_DIR", default_value = "./eastguard/data")]
     pub data_dir: String,
 
+    #[arg(long, env = "EASTGUARD_META_DIR", default_value = "./eastguard/meta")]
+    pub meta_dir: String,
+
     #[arg(long = "node-id-prefix", env = "EASTGUARD_NODE_ID_PREFIX")]
     pub node_id_prefix: Option<String>,
 
@@ -85,35 +88,33 @@ impl Environment {
         // 1. Parse arguments from CLI and/or ENV vars
         let env = Environment::parse();
 
-        // 2. Ensure data directory exists
-        if let Err(e) = fs::create_dir_all(&env.data_dir) {
-            panic!(
-                "Warning: Could not create directory '{}': {}",
-                env.data_dir, e
-            );
-        }
-
-        // Validate write permissions
-        let test_file = format!("{}/.write_test", env.data_dir);
-        if OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&test_file)
-            .is_ok()
-        {
-            let _ = fs::remove_file(test_file);
-        } else {
-            panic!(
-                "Warning: Server directory '{}' may not be writable.",
-                env.data_dir
-            );
+        // 2. Ensure data and meta directories exist and are writable
+        for dir in [&env.data_dir, &env.meta_dir] {
+            if let Err(e) = fs::create_dir_all(dir) {
+                panic!("Warning: Could not create directory '{}': {}", dir, e);
+            }
+            let test_file = format!("{}/.write_test", dir);
+            if OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&test_file)
+                .is_ok()
+            {
+                let _ = fs::remove_file(test_file);
+            } else {
+                panic!("Warning: Server directory '{}' may not be writable.", dir);
+            }
         }
 
         env
     }
     pub(crate) fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    pub(crate) fn raft_db_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.meta_dir).join("raft")
     }
 
     pub(crate) fn peer_bind_addr(&self) -> std::net::SocketAddr {
@@ -203,6 +204,7 @@ mod tests {
         Environment {
             config_dir: "./eastguard/config".into(),
             data_dir: "./eastguard/data".into(),
+            meta_dir: "./eastguard/meta".into(),
             node_id_prefix: None,
             port: 2921,
             cluster_port: 2922,
@@ -239,6 +241,7 @@ mod tests {
 
         assert_eq!(env.config_dir, "./eastguard/config");
         assert_eq!(env.data_dir, "./eastguard/data");
+        assert_eq!(env.meta_dir, "./eastguard/meta");
         assert_eq!(env.node_id_prefix, None);
         assert_eq!(env.port, 2921);
         assert_eq!(env.cluster_port, 2922);
