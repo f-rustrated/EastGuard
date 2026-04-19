@@ -3,7 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftTimeoutCallback,
+    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
+    RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -132,7 +133,7 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: crate::clusters::raft::messages::RaftRpc) {
+    fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.step(from, rpc);
             self.dirty.insert(shard_id);
