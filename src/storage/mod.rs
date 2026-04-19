@@ -34,6 +34,7 @@ pub(crate) enum ShardCfKey {
 }
 
 impl ShardCfKey {
+    #[allow(dead_code)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         match self {
             ShardCfKey::LogEntry(index) => {
@@ -42,15 +43,46 @@ impl ShardCfKey {
                 key.extend_from_slice(&index.to_be_bytes());
                 key
             }
-            ShardCfKey::HardState   => vec![0x02],
-            ShardCfKey::SnapMeta    => vec![0x03],
-            ShardCfKey::SnapData    => vec![0x04],
+            ShardCfKey::HardState    => vec![0x02],
+            ShardCfKey::SnapMeta     => vec![0x03],
+            ShardCfKey::SnapData     => vec![0x04],
             ShardCfKey::AppliedIndex => vec![0x05],
-            ShardCfKey::Epoch       => vec![0x06],
+            ShardCfKey::Epoch        => vec![0x06],
         }
     }
 }
 
 pub(crate) fn shard_cf_name(id: u64) -> String {
     format!("{CF_SHARD_PREFIX}{id:016x}")
+}
+
+/// Opaque handle to the node's RocksDB instance.
+/// Callers interact only through this API — `rocksdb` does not leak outside this module.
+pub(crate) struct RaftDb(rocksdb::DB);
+
+impl RaftDb {
+    pub(crate) fn open(path: std::path::PathBuf) -> Self {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let cf_names = rocksdb::DB::list_cf(&opts, &path).unwrap_or_default();
+        let db = rocksdb::DB::open_cf(&opts, &path, &cf_names)
+            .expect("failed to open RocksDB");
+        Self(db)
+    }
+
+    pub(crate) fn create_cf(&mut self, name: &str) {
+        self.0
+            .create_cf(name, &rocksdb::Options::default())
+            .expect("failed to create column family");
+    }
+
+    pub(crate) fn drop_cf(&mut self, name: &str) {
+        let _ = self.0.drop_cf(name);
+    }
+
+    pub(crate) fn has_cf(&self, name: &str) -> bool {
+        self.0.cf_handle(name).is_some()
+    }
 }
