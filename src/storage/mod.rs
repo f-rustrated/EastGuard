@@ -58,7 +58,9 @@ pub(crate) fn shard_cf_name(id: u64) -> String {
 
 /// Opaque handle to the node's RocksDB instance.
 /// Callers interact only through this API — `rocksdb` does not leak outside this module.
-pub(crate) struct RaftDb(rocksdb::DB);
+pub(crate) struct RaftDb {
+    db: rocksdb::DB
+}
 
 impl RaftDb {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
@@ -69,20 +71,20 @@ impl RaftDb {
         let cf_names = rocksdb::DB::list_cf(&opts, &path).unwrap_or_default();
         let db = rocksdb::DB::open_cf(&opts, &path, &cf_names)
             .expect("failed to open RocksDB");
-        Self(db)
+        Self { db }
     }
 
     pub(crate) fn create_cf(&mut self, name: &str) {
-        self.0
+        self.db
             .create_cf(name, &rocksdb::Options::default())
             .expect("failed to create column family");
     }
 
     pub(crate) fn drop_cf(&mut self, name: &str) {
-        let _ = self.0.drop_cf(name);
+        let _ = self.db.drop_cf(name);
     }
 
     pub(crate) fn has_cf(&self, name: &str) -> bool {
-        self.0.cf_handle(name).is_some()
+        self.db.cf_handle(name).is_some()
     }
 }
