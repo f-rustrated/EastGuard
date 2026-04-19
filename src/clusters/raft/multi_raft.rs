@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
+    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -29,7 +29,49 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn add_group(&mut self, group: ShardGroup) {
+    pub(crate) fn handle_command(&mut self, cmd: MultiRaftCommand) -> MultiRaftReply {
+        use MultiRaftCommand::*;
+        match cmd {
+            PacketReceived {
+                shard_group_id,
+                from,
+                rpc,
+            } => {
+                self.step(shard_group_id, from, rpc);
+                MultiRaftReply::None
+            }
+            Timeout(cb) => {
+                self.handle_timeout(cb);
+                MultiRaftReply::None
+            }
+            EnsureGroup { group } => {
+                self.add_group(group);
+                MultiRaftReply::None
+            }
+            RemoveGroup { group_id } => {
+                self.remove_group(group_id);
+                MultiRaftReply::None
+            }
+            GetLeader { group_id } => MultiRaftReply::GetLeader(self.get_leader(group_id)),
+            Propose {
+                shard_group_id,
+                command,
+            } => MultiRaftReply::Propose(self.propose(shard_group_id, command)),
+            HandleNodeDeath { dead_node_id } => {
+                self.remove_node(dead_node_id);
+                MultiRaftReply::None
+            }
+            HandleNodeJoin {
+                new_node_id,
+                affected_groups,
+            } => {
+                self.add_node(new_node_id, affected_groups);
+                MultiRaftReply::None
+            }
+        }
+    }
+
+    fn add_group(&mut self, group: ShardGroup) {
         if self.groups.contains_key(&group.id) {
             return;
         }
@@ -73,7 +115,7 @@ impl MultiRaft {
         self.dirty.insert(group.id);
     }
 
-    pub(crate) fn remove_group(&mut self, group_id: ShardGroupId) {
+    fn remove_group(&mut self, group_id: ShardGroupId) {
         let Some(raft) = self.groups.remove(&group_id) else {
             return;
         };
@@ -90,14 +132,14 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    pub(crate) fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
+    fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: crate::clusters::raft::messages::RaftRpc) {
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.step(from, rpc);
             self.dirty.insert(shard_id);
         }
     }
 
-    pub(crate) fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
+    fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
             RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
@@ -109,13 +151,13 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
+    fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
         self.groups
             .get(&group_id)
             .and_then(|r| r.current_leader().cloned())
     }
 
-    pub(crate) fn remove_node(&mut self, node_id: NodeId) {
+    fn remove_node(&mut self, node_id: NodeId) {
         self.pending_events
             .push(RaftEvent::DisconnectPeer(node_id.clone()));
 
@@ -135,7 +177,7 @@ impl MultiRaft {
         self.dirty.extend(affected);
     }
 
-    pub(crate) fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
+    fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
             if let Some(raft) = self.groups.get_mut(&group.id)
                 && raft.is_leader()
@@ -153,7 +195,7 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn propose(
+    fn propose(
         &mut self,
         shard_id: ShardGroupId,
         command: RaftCommand,

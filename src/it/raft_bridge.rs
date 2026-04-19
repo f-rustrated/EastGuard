@@ -6,7 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{MultiRaftActor, MultiRaftActorCommand};
+use crate::clusters::raft::actor::MultiRaftActor;
+use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -86,7 +87,7 @@ async fn start_raft_node(
     ));
 
     raft_tx
-        .send(MultiRaftActorCommand::EnsureGroup { group })
+        .send(MultiRaftCommand::EnsureGroup { group }.into())
         .await
         .unwrap();
 
@@ -192,9 +193,12 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
 
                 // Inject node death
                 let _ = raft_tx
-                    .send(MultiRaftActorCommand::HandleNodeDeath {
-                        dead_node_id: NodeId::new("node-3"),
-                    })
+                    .send(
+                        MultiRaftCommand::HandleNodeDeath {
+                            dead_node_id: NodeId::new("node-3"),
+                        }
+                        .into(),
+                    )
                     .await;
 
                 tick_n(&ticker, 100).await;
@@ -263,10 +267,13 @@ fn node_join_triggers_add_peer() -> turmoil::Result {
 
                 // Inject node join
                 let _ = raft_tx
-                    .send(MultiRaftActorCommand::HandleNodeJoin {
-                        new_node_id: NodeId::new("node-3"),
-                        affected_groups: vec![eg],
-                    })
+                    .send(
+                        MultiRaftCommand::HandleNodeJoin {
+                            new_node_id: NodeId::new("node-3"),
+                            affected_groups: vec![eg],
+                        }
+                        .into(),
+                    )
                     .await;
 
                 tick_n(&ticker, 100).await;
