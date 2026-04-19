@@ -11,8 +11,8 @@ use turmoil::Builder;
 
 fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
     Environment {
-        config_dir: format!("./eastguard/config/{}", idx),
-        data_dir: format!("./eastguard/data/{}", idx),
+        config_dir: std::env::temp_dir().join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        data_dir: std::env::temp_dir().join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
         node_id_prefix: Some(node_id),
         port,
         cluster_port,
