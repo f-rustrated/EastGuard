@@ -16,18 +16,6 @@ impl ShardGroupId {
     fn new(key: &[u8]) -> Self {
         Self(hash_stable(key) as u64)
     }
-    pub(crate) fn token(&self, local_seq: u32) -> ShardToken {
-        ShardToken {
-            group_id: self.0,
-            local_seq,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ShardToken {
-    group_id: u64,
-    local_seq: u32,
 }
 
 /// A shard group: the set of physical nodes responsible for a key range on the ring.

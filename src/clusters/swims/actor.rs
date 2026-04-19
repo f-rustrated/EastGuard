@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::clusters::raft::actor::RaftCommand;
+use crate::clusters::raft::actor::MultiRaftActorCommand;
 use crate::clusters::swims::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
 
@@ -18,7 +18,7 @@ impl SwimActor {
         mut state: Swim,
         transport_tx: mpsc::Sender<OutboundPacket>,
         scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
-        raft_tx: mpsc::Sender<RaftCommand>,
+        raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {
         tracing::info!("[{}] SwimActor started.", state.node_id);
         Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
@@ -39,7 +39,7 @@ impl SwimActor {
         state: &mut Swim,
         transport_tx: &mpsc::Sender<OutboundPacket>,
         scheduler_tx: &mpsc::Sender<TickerCommand<SwimTimer>>,
-        raft_tx: &mpsc::Sender<RaftCommand>,
+        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
     ) {
         for event in state.take_events() {
             match event {
@@ -60,13 +60,13 @@ impl SwimActor {
 
     /// Translate a membership event into a MultiRaftActor command.
     /// Returns `None` for self-events and nodes with no shard groups.
-    fn to_raft_command(state: &Swim, event: MembershipEvent) -> Option<RaftCommand> {
+    fn to_raft_command(state: &Swim, event: MembershipEvent) -> Option<MultiRaftActorCommand> {
         if *event.node_id() == state.node_id {
             return None;
         }
 
         match event {
-            MembershipEvent::NodeDead { node_id } => Some(RaftCommand::HandleNodeDeath {
+            MembershipEvent::NodeDead { node_id } => Some(MultiRaftActorCommand::HandleNodeDeath {
                 dead_node_id: node_id,
             }),
             MembershipEvent::NodeAlive { node_id, .. } => {
@@ -74,7 +74,7 @@ impl SwimActor {
                 if affected_groups.is_empty() {
                     return None;
                 }
-                Some(RaftCommand::HandleNodeJoin {
+                Some(MultiRaftActorCommand::HandleNodeJoin {
                     new_node_id: node_id,
                     affected_groups,
                 })

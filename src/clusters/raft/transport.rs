@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::clusters::raft::actor::RaftCommand;
+use crate::clusters::raft::actor::MultiRaftActorCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -39,10 +39,10 @@ impl RaftReader {
             .map(|(msg, _)| msg)
     }
 
-    async fn run(mut self, tx: mpsc::Sender<RaftCommand>) {
+    async fn run(mut self, tx: mpsc::Sender<MultiRaftActorCommand>) {
         while let Some(msg) = self.read_message().await {
             let _ = tx
-                .send(RaftCommand::PacketReceived {
+                .send(MultiRaftActorCommand::PacketReceived {
                     shard_group_id: msg.shard_group_id,
                     from: msg.sender,
                     rpc: msg.rpc,
@@ -80,7 +80,7 @@ impl RaftWriters {
         }
     }
 
-    async fn accept(&mut self, stream: TcpStream, raft_tx: &mpsc::Sender<RaftCommand>) {
+    async fn accept(&mut self, stream: TcpStream, raft_tx: &mpsc::Sender<MultiRaftActorCommand>) {
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftReader(read_half);
 
@@ -101,7 +101,7 @@ impl RaftWriters {
     async fn send(
         &mut self,
         packets: Vec<OutboundRaftPacket>,
-        raft_tx: &mpsc::Sender<RaftCommand>,
+        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
         swim_tx: &mpsc::Sender<SwimCommand>,
     ) {
         // Group by target — flush_dirty already groups, but be defensive.
@@ -267,7 +267,7 @@ impl RaftTransportActor {
     pub async fn run(
         node_id: NodeId,
         listener: TcpListener,
-        raft_tx: mpsc::Sender<RaftCommand>,
+        raft_tx: mpsc::Sender<MultiRaftActorCommand>,
         mut from_actor: mpsc::Receiver<RaftTransportCommand>,
         swim_tx: mpsc::Sender<SwimCommand>,
     ) {
