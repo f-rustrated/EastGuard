@@ -1,6 +1,7 @@
 use super::*;
 
-use crate::clusters::raft::actor::MultiRaftActorCommand;
+use crate::clusters::raft::messages::MultiRaftActorCommand;
+use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::swims::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
 
@@ -66,18 +67,24 @@ impl SwimActor {
         }
 
         match event {
-            MembershipEvent::NodeDead { node_id } => Some(MultiRaftActorCommand::HandleNodeDeath {
-                dead_node_id: node_id,
-            }),
+            MembershipEvent::NodeDead { node_id } => Some(
+                MultiRaftCommand::HandleNodeDeath {
+                    dead_node_id: node_id,
+                }
+                .into(),
+            ),
             MembershipEvent::NodeAlive { node_id, .. } => {
                 let affected_groups = state.topology.shard_groups_for_node(&node_id);
                 if affected_groups.is_empty() {
                     return None;
                 }
-                Some(MultiRaftActorCommand::HandleNodeJoin {
-                    new_node_id: node_id,
-                    affected_groups,
-                })
+                Some(
+                    MultiRaftCommand::HandleNodeJoin {
+                        new_node_id: node_id,
+                        affected_groups,
+                    }
+                    .into(),
+                )
             }
         }
     }

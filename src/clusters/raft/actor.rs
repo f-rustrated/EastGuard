@@ -5,54 +5,12 @@ use std::collections::HashMap;
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand};
+use crate::clusters::swims::SwimCommand;
 use crate::schedulers::ticker_message::TickerCommand;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-/// Commands received by the MultiRaftActor from external sources.
-pub enum MultiRaftActorCommand {
-    /// An RPC arrived from a peer via the transport layer.
-    PacketReceived {
-        shard_group_id: ShardGroupId,
-        from: NodeId,
-        rpc: RaftRpc,
-    },
-    /// A timer expired (election or heartbeat).
-    Timeout(RaftTimeoutCallback),
-    /// Create a Raft group if this node is a member.
-    EnsureGroup { group: ShardGroup },
-    /// Remove a Raft group.
-    RemoveGroup { group_id: ShardGroupId },
-    /// Query the current leader of a shard group.
-    GetLeader {
-        group_id: ShardGroupId,
-        reply: oneshot::Sender<Option<NodeId>>,
-    },
-    /// Propose a command to a shard group's Raft log. Leader-only.
-    Propose {
-        shard_group_id: ShardGroupId,
-        command: crate::clusters::raft::messages::RaftCommand,
-        reply: oneshot::Sender<Result<(), ProposeError>>,
-    },
-    /// A node died — remove it from all groups where this node is leader.
-    HandleNodeDeath { dead_node_id: NodeId },
-    /// A node joined — add it to groups where this node is leader and the
-    /// new node should be a member. Also EnsureGroup for groups this node
-    /// should newly participate in.
-    HandleNodeJoin {
-        new_node_id: NodeId,
-        affected_groups: Vec<ShardGroup>,
-    },
-}
-
-impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
-    fn from(cb: RaftTimeoutCallback) -> Self {
-        MultiRaftActorCommand::Timeout(cb)
-    }
-}
-
-/// Async boundary — receives commands from mailbox, delegates to `MultiRaftStore`.
+/// Async boundary — receives commands from mailbox, delegates to `MultiRaft`.
 pub struct MultiRaftActor;
 
 impl MultiRaftActor {
@@ -65,6 +23,7 @@ impl MultiRaftActor {
     ) {
         let mut store = MultiRaft::new(node_id);
         let mut buf = Vec::with_capacity(64);
+        let mut deferred: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(64);
 
         loop {
             if mailbox.recv_many(&mut buf, 64).await == 0 {
@@ -72,40 +31,10 @@ impl MultiRaftActor {
             }
 
             for cmd in buf.drain(..) {
-                match cmd {
-                    MultiRaftActorCommand::PacketReceived {
-                        shard_group_id,
-                        from,
-                        rpc,
-                    } => {
-                        store.step(shard_group_id, from, rpc);
-                    }
-                    MultiRaftActorCommand::Timeout(cb) => {
-                        store.handle_timeout(cb);
-                    }
-                    MultiRaftActorCommand::EnsureGroup { group } => {
-                        store.add_group(group);
-                    }
-                    MultiRaftActorCommand::RemoveGroup { group_id } => {
-                        store.remove_group(group_id);
-                    }
-                    MultiRaftActorCommand::GetLeader { group_id, reply } => {
-                        let _ = reply.send(store.get_leader(group_id));
-                    }
-                    MultiRaftActorCommand::Propose {
-                        shard_group_id,
-                        command,
-                        reply,
-                    } => {
-                        let _ = reply.send(store.propose(shard_group_id, command));
-                    }
-                    MultiRaftActorCommand::HandleNodeDeath { dead_node_id } => {
-                        store.remove_node(dead_node_id);
-                    }
-                    MultiRaftActorCommand::HandleNodeJoin {
-                        new_node_id,
-                        affected_groups,
-                    } => store.add_node(new_node_id, affected_groups),
+                let (store_cmd, on_reply) = cmd.split();
+                let reply = store.handle_command(store_cmd);
+                if let Some(cb) = on_reply {
+                    deferred.push(Box::new(move || cb(reply)));
                 }
             }
 
@@ -135,6 +64,10 @@ impl MultiRaftActor {
 
             for (_, packets) in packets_by_target {
                 let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
+            }
+
+            for cb in deferred.drain(..) {
+                cb();
             }
         }
     }

@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::clusters::raft::actor::MultiRaftActorCommand;
+use crate::clusters::raft::messages::MultiRaftActorCommand;
+use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -42,11 +43,14 @@ impl RaftReader {
     async fn run(mut self, tx: mpsc::Sender<MultiRaftActorCommand>) {
         while let Some(msg) = self.read_message().await {
             let _ = tx
-                .send(MultiRaftActorCommand::PacketReceived {
-                    shard_group_id: msg.shard_group_id,
-                    from: msg.sender,
-                    rpc: msg.rpc,
-                })
+                .send(
+                    MultiRaftCommand::PacketReceived {
+                        shard_group_id: msg.shard_group_id,
+                        from: msg.sender,
+                        rpc: msg.rpc,
+                    }
+                    .into(),
+                )
                 .await;
         }
     }

@@ -6,7 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::{MultiRaftActor, MultiRaftActorCommand};
+use crate::clusters::raft::actor::MultiRaftActor;
+use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
@@ -90,9 +91,7 @@ async fn run_raft_node(
 
     // Ensure the shard group
     raft_tx
-        .send(MultiRaftActorCommand::EnsureGroup {
-            group: group.clone(),
-        })
+        .send(MultiRaftCommand::EnsureGroup { group: group.clone() }.into())
         .await
         .unwrap();
 
