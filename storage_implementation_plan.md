@@ -38,17 +38,17 @@ buffers outbound RPCs — `MultiRaftStore` drains and persists them. `RaftGroup`
 
 ---
 
-## Module Dependency Graph
+## Dependency Graph
 
 ```
-actor.rs          ──→  store.rs        (MultiRaftStore)
-                        NO import of state.rs
+actor          ──→  store        (MultiRaftStore)
+                    NO import of state
 
-store.rs          ──→  state.rs        (RaftGroup — no generic, no LogStore)
-store.rs          ──→  storage/        (RocksDB, CF ops — internal only)
+store          ──→  state        (RaftGroup — no generic, no LogStore)
+store          ──→  storage/     (RocksDB, CF ops — internal only)
 
-state.rs          ──→  log.rs, messages.rs
-                        NO import of storage/, actor.rs
+state          ──→  log, messages
+                    NO import of storage/, actor
 ```
 
 `MultiRaftActor::run` takes one `MultiRaftStore`:
@@ -481,6 +481,99 @@ writes remain in one `WriteBatch` across both CFs for atomicity.
 
 ---
 
+## Log Entry Lifecycle — In-Memory to Persistent 
+
+### Current state (in-memory only)
+
+`Raft.log: Vec<LogEntry>` holds all entries from index 1 indefinitely. `MultiRaft::flush()` drains `LogMutation`s from
+each dirty `Raft` group but **discards them** (`let _ = raft.take_log_mutations()`). The Vec grows unbounded — no
+compaction, no snapshot, no eviction. This is acceptable for development but not production.
+
+### After RocksDB integration
+
+Entries are **dual-written**: they remain in `RaftGroup`'s in-memory `Vec<LogEntry>` (for fast reads during replication)
+and are persisted to per-shard CFs via `WriteBatch` in `flush()`. The in-memory Vec is the hot path — `log_term_at()`,
+`log_entries_from()`, and `log_get()` all index into it directly without touching RocksDB.
+
+Compaction (`compact_before(index)`) only reclaims RocksDB storage. The in-memory Vec must be truncated separately after
+a snapshot is saved. After truncation, `RaftGroup` must track a `first_index` offset so that 1-based index arithmetic
+still works against the shortened Vec. Reads for indices below `first_index` return `None` — the caller (leader
+replicating to a lagged follower) must fall back to `InstallSnapshot`.
+
+### Transition checklist
+
+1. `flush()` writes `LogMutation`s to `WriteBatch` instead of discarding.
+2. `compact_before(index)` reclaims RocksDB entries + truncates in-memory Vec.
+3. `RaftGroup` tracks `first_index` to adjust Vec indexing after truncation.
+4. `log_term_at()`, `log_get()`, `log_entries_from()` must handle `index < first_index` (return `None` / empty).
+5. Leader detects missing entries → triggers `InstallSnapshot` instead of decrementing `next_index` forever.
+
+---
+
+## New Member Catchup
+
+### How it works today
+
+When a new node joins via SWIM, `HandleNodeJoin` triggers `AddPeer(new_node_id)` on every group where the leader does
+not yet have the new node as a peer. On commit, the leader initializes:
+
+```
+PeerState {
+    next_index:  last_log_index + 1,   // optimistic — assumes peer is caught up
+    match_index: 0,                     // conservative — nothing confirmed
+}
+```
+
+The next heartbeat sends `AppendEntries` with `prev_log_index = next_index - 1`. The new node has an empty log, so it
+rejects. The leader decrements `next_index` by 1 and immediately retries. This repeats until `next_index = 1`, where
+`prev_log_index = 0` (the before-log sentinel). The new node accepts and receives all entries from index 1 onward.
+
+**This works because all entries exist in memory.** The leader's Vec has every entry from index 1.
+
+### After compaction — the gap
+
+Once `compact_before(S)` runs, the leader no longer has entries below index S. A new node that needs entries from index 1
+will keep getting rejections as `next_index` decrements, but the leader cannot serve entries below S. Without
+`InstallSnapshot`, the follower has **no recovery path**.
+
+Required sequence after compaction exists:
+
+```
+Leader: send AppendEntries(prev_log_index = next_index - 1)
+Follower: reject (no matching entry)
+Leader: decrement next_index
+  ...repeat...
+Leader: next_index < first_index  →  entries no longer available
+Leader: switch to InstallSnapshot(snapshot_at_index_S)
+Follower: apply snapshot, set log to start from S
+Leader: resume normal AppendEntries from S+1
+```
+
+### Probing optimization — ConflictTerm / ConflictIndex
+
+Current rejection handling is linear: decrement `next_index` by 1 per round-trip. For a new node with an empty log
+joining a leader with 10,000 entries, this means 10,000 round-trips to converge.
+
+**Raft §5.3 optimization:** The follower includes a hint in `AppendEntriesResponse`:
+
+```
+AppendEntriesResponse {
+    ...
+    conflict_term:  Option<u64>,    // term of the conflicting entry, if any
+    conflict_index: Option<u64>,    // first index of that term (or last_log_index + 1 if empty)
+}
+```
+
+Leader uses the hint to skip entire terms:
+- If `conflict_term` is `None` (follower has no entry at `prev_log_index`): set `next_index = conflict_index`
+  (follower's `last_log_index + 1`). For empty log, jumps straight to 1.
+- If `conflict_term` is `Some(ct)`: leader searches its own log for the last entry of term `ct`. If found, set
+  `next_index` to that entry's index + 1. If not found, set `next_index = conflict_index`.
+
+Worst case drops from O(log_length) to O(number_of_distinct_terms) round-trips — typically single digits.
+
+---
+
 ## Open Questions / TODOs
 
 - **InstallSnapshot RPC** (TODO): Add `InstallSnapshot` to `RaftRpc`. Receiver transitions shard to
@@ -490,6 +583,15 @@ writes remain in one `WriteBatch` across both CFs for atomicity.
   `ensure_group` drains and replays them. Prevents silent message drops when `EnsureGroup` and peer RPCs race.
 - **Background snapshot application** (TODO): Implement `SnapState` tracking and `tokio::spawn` dispatch for snapshot
   install. Required before `InstallSnapshot` RPC is wired up.
+- **In-memory Vec truncation after compaction** (TODO): After `compact_before(S)`, truncate `RaftGroup`'s in-memory
+  `Vec<LogEntry>` and introduce `first_index` offset. All index-based accessors (`log_term_at`, `log_get`,
+  `log_entries_from`) must subtract `first_index` for correct Vec indexing. Reads below `first_index` return `None`.
+- **ConflictTerm/ConflictIndex hint** (TODO): Add `conflict_term: Option<u64>` and `conflict_index: Option<u64>` to
+  `AppendEntriesResponse`. Follower populates on rejection. Leader uses hint to skip terms in bulk instead of
+  decrementing `next_index` by 1. See §New Member Catchup → Probing optimization.
+- **Snapshot-triggered replication fallback** (TODO): When leader's `next_index` for a peer falls below `first_index`
+  (entries compacted), switch from `AppendEntries` to `InstallSnapshot`. Requires `InstallSnapshot` RPC and
+  `SnapState` tracking to be implemented first.
 - **Log compaction trigger**: `MultiRaftStore` triggers `compact_before` after `save_snapshot` when
   `last_applied - snapshot_index > threshold`. Policy TBD.
 - **Safe truncation boundary**: May only compact up to `min(all_replicas.match_index)`. Leader must not compact entries
