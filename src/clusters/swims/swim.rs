@@ -63,7 +63,6 @@ pub struct Swim {
     live_node_tracker: LiveNodeTracker,
     gossip_buffer: SwimBuffer,
     shard_leader_buffer: ShardLeaderGossipBuffer,
-    shard_leaders: BTreeMap<ShardGroupId, (NodeId, u64)>,
     pub(crate) topology: Topology,
 
     // Sequence
@@ -91,7 +90,6 @@ impl Swim {
             live_node_tracker: LiveNodeTracker::new(rng_seed),
             gossip_buffer: SwimBuffer::default(),
             shard_leader_buffer: ShardLeaderGossipBuffer::default(),
-            shard_leaders: BTreeMap::new(),
             seq_counter: 0,
             last_suspected_seqs: BTreeMap::new(),
             pending_events: Vec::new(),
@@ -326,6 +324,8 @@ impl Swim {
                     event.leader_node_id,
                     event.term
                 );
+
+                // ? any possibility that members not found while shard leadership changed?
                 if let Some(addr) = self.members.get(&event.leader_node_id).map(|m| m.addr) {
                     let info = ShardLeaderInfo {
                         shard_group_id: event.shard_group_id,
@@ -333,9 +333,7 @@ impl Swim {
                         leader_addr: addr,
                         term: event.term,
                     };
-                    self.shard_leader_buffer.enqueue(info, self.members.len());
-                    self.shard_leaders
-                        .insert(event.shard_group_id, (event.leader_node_id, event.term));
+                    self.apply_shard_leader_update(&info);
                 }
             }
         }
@@ -347,7 +345,7 @@ impl Swim {
             self.apply_membership_update(member.clone());
         }
         for leader_info in packet.shard_leaders() {
-            self.apply_shard_leader_update(leader_info.clone());
+            self.apply_shard_leader_update(&leader_info);
         }
 
         match packet {
@@ -610,19 +608,12 @@ impl Swim {
         }
     }
 
-    fn apply_shard_leader_update(&mut self, info: ShardLeaderInfo) {
-        let dominated = match self.shard_leaders.get(&info.shard_group_id) {
-            Some(&(_, existing_term)) => info.term <= existing_term,
-            None => false,
-        };
-        if dominated {
+    fn apply_shard_leader_update(&mut self, info: &ShardLeaderInfo) {
+        if !self.topology.update_shard_leader(&info) {
             return;
         }
-        self.shard_leaders.insert(
-            info.shard_group_id,
-            (info.leader_node_id.clone(), info.term),
-        );
-        self.shard_leader_buffer.enqueue(info, self.members.len());
+        self.shard_leader_buffer
+            .enqueue(info.clone(), self.members.len());
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -1497,14 +1488,11 @@ mod tests {
             h.step(b_addr, SwimPacket::Ping(header));
             let _ = h.protocol.take_packets();
 
-            let entry = h.protocol.shard_leaders.get(&ShardGroupId(42));
-            assert!(
-                entry.is_some(),
-                "Local shard_leaders table should have entry"
-            );
-            let (leader, term) = entry.unwrap();
-            assert_eq!(*leader, NodeId::new("node-b"));
-            assert_eq!(*term, 3);
+            let entry = h.protocol.topology.shard_leader(ShardGroupId(42));
+            assert!(entry.is_some(), "Topology should have shard leader entry");
+            let entry = entry.unwrap();
+            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
+            assert_eq!(entry.term, 3);
         }
 
         #[test]
@@ -1583,13 +1571,13 @@ mod tests {
             h.step(b_addr, SwimPacket::Ping(header2));
             let _ = h.protocol.take_packets();
 
-            let (leader, term) = h.protocol.shard_leaders.get(&ShardGroupId(42)).unwrap();
+            let entry = h.protocol.topology.shard_leader(ShardGroupId(42)).unwrap();
             assert_eq!(
-                *leader,
+                entry.leader_node_id,
                 NodeId::new("node-b"),
                 "Leader should not be overwritten by stale info"
             );
-            assert_eq!(*term, 5);
+            assert_eq!(entry.term, 5);
         }
 
         #[test]
@@ -1632,12 +1620,62 @@ mod tests {
                 b.step(a_addr, pkt.packet().clone());
                 let _ = b.take_events();
 
-                let entry = b.shard_leaders.get(&ShardGroupId(42));
+                let entry = b.topology.shard_leader(ShardGroupId(42));
                 assert!(entry.is_some(), "B should learn about group 42 leader");
-                let (leader, term) = entry.unwrap();
-                assert_eq!(*leader, NodeId::new("node-a"));
-                assert_eq!(*term, 1);
+                let entry = entry.unwrap();
+                assert_eq!(entry.leader_node_id, NodeId::new("node-a"));
+                assert_eq!(entry.term, 1);
             }
+        }
+
+        #[test]
+        fn announce_leader_updates_topology() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+
+            h.protocol
+                .process(SwimCommand::AnnounceShardLeader(LeaderChange {
+                    shard_group_id: ShardGroupId(42),
+                    leader_node_id: NodeId::new("node-b"),
+                    term: 1,
+                }));
+            let _ = h.protocol.take_events();
+
+            let entry = h.protocol.topology.shard_leader(ShardGroupId(42));
+            assert!(entry.is_some(), "topology should have shard leader entry");
+            let entry = entry.unwrap();
+            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
+            assert_eq!(entry.leader_addr, b_addr);
+            assert_eq!(entry.term, 1);
+        }
+
+        #[test]
+        fn receive_leader_gossip_updates_topology() {
+            let mut h = TestHarness::new("node-local", 8000);
+            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+            add_node_harness(&mut h, "node-b", b_addr, 1);
+
+            let header = SwimHeader {
+                seq: 1,
+                source_node_id: NodeId::new("node-b"),
+                source_incarnation: 1,
+                gossip: vec![],
+                shard_leaders: vec![ShardLeaderInfo {
+                    shard_group_id: ShardGroupId(99),
+                    leader_node_id: NodeId::new("node-b"),
+                    leader_addr: b_addr,
+                    term: 7,
+                }],
+            };
+            h.step(b_addr, SwimPacket::Ping(header));
+            let _ = h.protocol.take_events();
+
+            let entry = h.protocol.topology.shard_leader(ShardGroupId(99));
+            assert!(entry.is_some(), "topology should have received leader info");
+            let entry = entry.unwrap();
+            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
+            assert_eq!(entry.term, 7);
         }
     }
 }

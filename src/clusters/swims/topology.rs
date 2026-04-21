@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
+use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::clusters::{NodeId, SwimNodeState};
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
@@ -43,6 +44,14 @@ pub struct VirtualNode {
     pnode_metadata: PhysicalNodeMetadata,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ShardLeaderEntry {
+    pub leader_node_id: NodeId,
+    pub leader_addr: SocketAddr,
+    pub term: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Topology {
     config: TopologyConfig,
@@ -51,6 +60,9 @@ pub struct Topology {
     /// Reverse index: for each physical node, the set of shard groups it participates in.
     /// Rebuilt after every ring mutation. Makes `shard_groups_for_node()` O(1).
     node_groups: HashMap<NodeId, HashMap<ShardGroupId, ShardGroup>>,
+    /// Shard leader map: tracks current leader for each shard group.
+    /// NOT auto-cleared on node death — Raft re-election gossips new leader with higher term.
+    shard_leaders: HashMap<ShardGroupId, ShardLeaderEntry>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -135,6 +147,7 @@ impl Topology {
             config,
             ring: token_ring,
             node_groups: HashMap::new(),
+            shard_leaders: HashMap::new(),
         };
         topology.rebuild_reverse_index();
         topology
@@ -231,6 +244,33 @@ impl Topology {
     #[expect(dead_code)]
     pub fn num_nodes(&self) -> usize {
         self.ring.pnodes.len()
+    }
+
+    pub fn update_shard_leader(&mut self, info: &ShardLeaderInfo) -> bool {
+        if let Some(existing) = self.shard_leaders.get(&info.shard_group_id)
+            && info.term <= existing.term
+        {
+            return false;
+        }
+        self.shard_leaders.insert(
+            info.shard_group_id,
+            ShardLeaderEntry {
+                leader_node_id: info.leader_node_id.clone(),
+                leader_addr: info.leader_addr,
+                term: info.term,
+            },
+        );
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn shard_leader(&self, shard_group_id: ShardGroupId) -> Option<&ShardLeaderEntry> {
+        self.shard_leaders.get(&shard_group_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn all_shard_leaders(&self) -> &HashMap<ShardGroupId, ShardLeaderEntry> {
+        &self.shard_leaders
     }
 }
 
@@ -648,5 +688,175 @@ mod tests {
         topology.remove_node(&NodeId::new("node-0"));
         let groups = topology.shard_groups_for_node(&NodeId::new("node-0"));
         assert!(groups.is_empty());
+    }
+
+    // --- shard leader map tests ---
+
+    #[test]
+    fn update_shard_leader_inserts_new_entry() {
+        let mut topology = topology_from(
+            &[("node-0", "127.0.0.1:8080")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+
+        let info = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 1,
+        };
+        assert!(topology.update_shard_leader(&info));
+
+        let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
+        assert_eq!(entry.leader_node_id, NodeId::new("node-0"));
+        assert_eq!(entry.term, 1);
+    }
+
+    #[test]
+    fn update_shard_leader_higher_term_replaces() {
+        let mut topology = topology_from(
+            &[("node-0", "127.0.0.1:8080")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+
+        let info1 = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 1,
+        };
+        topology.update_shard_leader(&info1);
+
+        let info2 = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-1"),
+            leader_addr: "127.0.0.1:8081".parse().unwrap(),
+            term: 3,
+        };
+        assert!(topology.update_shard_leader(&info2));
+
+        let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
+        assert_eq!(entry.leader_node_id, NodeId::new("node-1"));
+        assert_eq!(entry.term, 3);
+    }
+
+    #[test]
+    fn update_shard_leader_stale_term_rejected() {
+        let mut topology = topology_from(
+            &[("node-0", "127.0.0.1:8080")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+
+        let info1 = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 5,
+        };
+        topology.update_shard_leader(&info1);
+
+        let stale = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-1"),
+            leader_addr: "127.0.0.1:8081".parse().unwrap(),
+            term: 2,
+        };
+        assert!(!topology.update_shard_leader(&stale));
+
+        let equal = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-1"),
+            leader_addr: "127.0.0.1:8081".parse().unwrap(),
+            term: 5,
+        };
+        assert!(!topology.update_shard_leader(&equal));
+
+        let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
+        assert_eq!(entry.leader_node_id, NodeId::new("node-0"));
+        assert_eq!(entry.term, 5);
+    }
+
+    #[test]
+    fn shard_leader_survives_node_death() {
+        let mut topology = topology_from(
+            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 2,
+            },
+        );
+
+        let info = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(42),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 1,
+        };
+        topology.update_shard_leader(&info);
+
+        topology.update(
+            NodeId::new("node-0"),
+            "127.0.0.1:8080".parse().unwrap(),
+            &SwimNodeState::Dead,
+        );
+
+        let entry = topology.shard_leader(ShardGroupId(42));
+        assert!(
+            entry.is_some(),
+            "shard leader entry must survive node death"
+        );
+        assert_eq!(entry.unwrap().leader_node_id, NodeId::new("node-0"));
+    }
+
+    #[test]
+    fn shard_leader_returns_none_for_unknown_group() {
+        let topology = topology_from(
+            &[("node-0", "127.0.0.1:8080")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+        assert!(topology.shard_leader(ShardGroupId(999)).is_none());
+    }
+
+    #[test]
+    fn all_shard_leaders_returns_full_map() {
+        let mut topology = topology_from(
+            &[("node-0", "127.0.0.1:8080")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+
+        let info1 = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(10),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 1,
+        };
+        let info2 = ShardLeaderInfo {
+            shard_group_id: ShardGroupId(20),
+            leader_node_id: NodeId::new("node-0"),
+            leader_addr: "127.0.0.1:8080".parse().unwrap(),
+            term: 2,
+        };
+        topology.update_shard_leader(&info1);
+        topology.update_shard_leader(&info2);
+
+        let leaders = topology.all_shard_leaders();
+        assert_eq!(leaders.len(), 2);
+        assert!(leaders.contains_key(&ShardGroupId(10)));
+        assert!(leaders.contains_key(&ShardGroupId(20)));
     }
 }
