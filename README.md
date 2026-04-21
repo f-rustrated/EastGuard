@@ -76,7 +76,10 @@ EastGuard eliminates the monolithic controller bottleneck found in systems (like
 ### Metadata Management 
 Managed via DS-RSM (Dynamically Sharded - Replicated State Machine). Metadata is sharded into vNodes and distributed across the cluster, allowing metadata throughput to scale linearly with the number of brokers.
 
-#### Shard Leader Discovery using SWIM
+#### Leader Discovery (SWIM / UDP)
+
+Raft decides who the leader is; SWIM tells the rest of the cluster. When a Raft instance emits `LeaderChange`, the local `MultiRaftActor` forwards it to SWIM via `AnnounceShardLeader`. SWIM stores it in the topology, enqueues it into a dissemination buffer, and piggybacks it on regular protocol packets (Ping, Ack, PingReq) for epidemic spread. Information flows **one way: Raft → SWIM**, never the reverse. SWIM never tells Raft about leadership — it only sends membership events (node join/death) that affect the peer set. Topology's `shard_leaders` map is an eventually-consistent read cache; stale entries are harmless since the next election's higher term overwrites them.
+
 ```mermaid
 sequenceDiagram
     box rgb(30, 40, 60) Node A
@@ -111,7 +114,10 @@ sequenceDiagram
 ```
 
 
-#### Multi-Raft Transport 
+#### Leadership Lifecycle (TCP + UDP)
+
+Full picture: election happens over TCP (Raft RPCs), then leadership knowledge spreads over UDP (SWIM gossip). Both paths run concurrently after election — followers learn the leader immediately via AppendEntries (TCP), while the rest of the cluster converges in O(log N) rounds via piggybacked gossip (UDP).
+
 ```mermaid
 sequenceDiagram
     box rgb(30, 40, 60) Node A
