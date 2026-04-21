@@ -325,16 +325,13 @@ impl Swim {
                     event.term
                 );
 
-                // ? any possibility that members not found while shard leadership changed?
-                if let Some(addr) = self.members.get(&event.leader_node_id).map(|m| m.addr) {
-                    let info = ShardLeaderInfo {
-                        shard_group_id: event.shard_group_id,
-                        leader_node_id: event.leader_node_id.clone(),
-                        leader_addr: addr,
-                        term: event.term,
-                    };
-                    self.apply_shard_leader_update(&info);
-                }
+                let info = ShardLeaderInfo {
+                    shard_group_id: event.shard_group_id,
+                    leader_node_id: event.leader_node_id,
+                    leader_addr: self.advertise_addr,
+                    term: event.term,
+                };
+                self.apply_shard_leader_update(&info);
             }
         }
     }
@@ -1441,7 +1438,7 @@ mod tests {
             h.protocol
                 .process(SwimCommand::AnnounceShardLeader(LeaderChange {
                     shard_group_id: ShardGroupId(42),
-                    leader_node_id: NodeId::new("node-b"),
+                    leader_node_id: NodeId::new("node-local"),
                     term: 1,
                 }));
 
@@ -1635,13 +1632,12 @@ mod tests {
         #[test]
         fn announce_leader_updates_topology() {
             let mut h = TestHarness::new("node-local", 8000);
-            let b_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-            add_node_harness(&mut h, "node-b", b_addr, 1);
+            let local_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
             h.protocol
                 .process(SwimCommand::AnnounceShardLeader(LeaderChange {
                     shard_group_id: ShardGroupId(42),
-                    leader_node_id: NodeId::new("node-b"),
+                    leader_node_id: NodeId::new("node-local"),
                     term: 1,
                 }));
             let _ = h.protocol.take_events();
@@ -1649,8 +1645,8 @@ mod tests {
             let entry = h.protocol.topology.shard_leader(ShardGroupId(42));
             assert!(entry.is_some(), "topology should have shard leader entry");
             let entry = entry.unwrap();
-            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
-            assert_eq!(entry.leader_addr, b_addr);
+            assert_eq!(entry.leader_node_id, NodeId::new("node-local"));
+            assert_eq!(entry.leader_addr, local_addr);
             assert_eq!(entry.term, 1);
         }
 
