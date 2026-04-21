@@ -11,12 +11,13 @@ use super::timer::SwimTimer;
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
 pub enum SwimCommand {
-    // From Transport
+    // From Transport(External)
     PacketReceived { src: SocketAddr, packet: SwimPacket },
-    // From Ticker
+    // From Ticker(Internal)
     Timeout(SwimTimeOutCallback),
+    // From API (e.g., HTTP API)
     Query(SwimQueryCommand),
-    // From MultiRaftActor — leader election completed for a shard group
+    // From MultiRaftActor(Internal) — leader election completed for a shard group
     AnnounceShardLeader(LeaderChange),
 }
 
