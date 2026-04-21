@@ -344,8 +344,12 @@ impl Swim {
         for member in packet.gossip() {
             self.apply_membership_update(member.clone());
         }
+
+        // Piggybacked shard leader gossip — typically few entries per packet (often zero).
+        // Count bounded by remaining byte budget after membership gossip and
+        // dissemination counter (3 × ceil(log₂(N)) retransmissions per entry).
         for leader_info in packet.shard_leaders() {
-            self.apply_shard_leader_update(&leader_info);
+            self.apply_shard_leader_update(leader_info);
         }
 
         match packet {
@@ -609,7 +613,7 @@ impl Swim {
     }
 
     fn apply_shard_leader_update(&mut self, info: &ShardLeaderInfo) {
-        if !self.topology.update_shard_leader(&info) {
+        if !self.topology.update_shard_leader(info) {
             return;
         }
         self.shard_leader_buffer
