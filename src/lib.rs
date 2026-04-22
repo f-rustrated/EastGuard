@@ -95,7 +95,7 @@ impl StartUp {
             swim_ticker_tx,
             raft_tx,
         ));
-        let raft_db = crate::storage::RaftDb::open(self.env.raft_db_path());
+        let raft_db = crate::storage::Db::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
             node_id,
             raft_db,

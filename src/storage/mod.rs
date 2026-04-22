@@ -60,7 +60,7 @@ pub(crate) fn shard_cf_name(id: u64) -> String {
     format!("{CF_SHARD_PREFIX}{id:016x}")
 }
 
-pub(crate) enum WriteOperation {
+pub(crate) enum DbOp {
     Put {
         cf: String,
         key: Vec<u8>,
@@ -72,33 +72,34 @@ pub(crate) enum WriteOperation {
     },
 }
 
-impl WriteOperation {
+/// we place the following functions under WriteOperation so that Raft details don't leak into Storage layer
+impl DbOp {
     pub(crate) fn put_log_entry(cf: &str, entry: &LogEntry) -> Self {
         let key = ShardCfKey::LogEntry(entry.index).encode();
         let value = bincode::encode_to_vec(entry, BINCODE_CONFIG).expect("encode LogEntry failed");
-        WriteOperation::Put { cf: cf.to_owned(), key, value }
+        DbOp::Put { cf: cf.to_owned(), key, value }
     }
 
     pub(crate) fn put_hard_state(cf: &str, term: u64, voted_for: Option<NodeId>) -> Self {
         let key = ShardCfKey::HardState.encode();
         let value = bincode::encode_to_vec(&(term, voted_for), BINCODE_CONFIG)
             .expect("encode HardState failed");
-        WriteOperation::Put { cf: cf.to_owned(), key, value }
+        DbOp::Put { cf: cf.to_owned(), key, value }
     }
 
     pub(crate) fn delete_from(cf: &str, from_index: u64) -> Self {
         let index = ShardCfKey::LogEntry(from_index).encode();
-        WriteOperation::DeleteFrom { cf: cf.to_owned(), index }
+        DbOp::DeleteFrom { cf: cf.to_owned(), index }
     }
 }
 
 /// Opaque handle to the node's RocksDB instance.
 /// Callers interact only through this API — `rocksdb` does not leak outside this module.
-pub(crate) struct RaftDb {
+pub(crate) struct Db {
     db: rocksdb::DB,
 }
 
-impl RaftDb {
+impl Db {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
@@ -123,18 +124,18 @@ impl RaftDb {
         self.db.cf_handle(name).is_some()
     }
 
-    pub(crate) fn write_batch(&self, operations: &[WriteOperation]) {
+    pub(crate) fn write_batch(&self, operations: &[DbOp]) {
         let mut batch = rocksdb::WriteBatch::default();
         for operation in operations {
             match operation {
-                WriteOperation::Put { cf, key, value } => {
+                DbOp::Put { cf, key, value } => {
                     let cf = self
                         .db
                         .cf_handle(cf)
                         .unwrap_or_else(|| panic!("CF {cf} not found"));
                     batch.put_cf(cf, key, value)
                 }
-                WriteOperation::DeleteFrom { cf, index: start } => {
+                DbOp::DeleteFrom { cf, index: start } => {
                     let cf = self
                         .db
                         .cf_handle(cf)

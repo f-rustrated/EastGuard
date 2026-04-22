@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::clusters::NodeId;
-use crate::storage::RaftDb;
+use crate::storage::Db;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
 use crate::clusters::swims::SwimCommand;
@@ -17,7 +17,7 @@ pub struct MultiRaftActor;
 impl MultiRaftActor {
     pub async fn run(
         node_id: NodeId,
-        db: RaftDb,
+        db: Db,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
