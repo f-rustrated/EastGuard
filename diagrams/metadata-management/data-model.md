@@ -16,32 +16,33 @@ CoordinatorStateMachine (one per shard group)
 │       ├── name:           String           (globally unique — hash(name) → one shard group)
 │       ├── state:          TopicState
 │       ├── storage_policy: StoragePolicy
-│       └── ranges:         Vec<RangeId>     (ordered by keyspace_start)
+│       ├── active_ranges:  Vec<RangeId>     (ordered by keyspace_start — write routing)
+│       ├── ranges:         HashMap<RangeId, RangeMeta>  (all ranges including sealed)
+│       └── next_range_id:  u64              (monotonic counter, scoped to this topic)
 │
-├── ranges: HashMap<RangeId, RangeMeta>
-│   │
-│   └── RangeMeta
-│       ├── range_id:       RangeId
-│       ├── topic_id:       TopicId          (back-reference)
-│       ├── keyspace:       [start, end)     (byte range, never gaps/overlaps)
-│       ├── state:          RangeState
-│       ├── segments:       Vec<SegmentId>   (ordered by creation time)
-│       ├── active_segment: Option<SegmentId>(at most one — the write head)
-│       ├── split_into:     Option<[RangeId; 2]>
-│       ├── merged_into:    Option<RangeId>
-│       └── merged_from:    Option<[RangeId; 2]>
+│   RangeMeta (nested inside TopicMeta)
+│       ├── range_id:        RangeId
+│       ├── keyspace:        [start, end)    (byte range, never gaps/overlaps)
+│       ├── state:           RangeState
+│       ├── active_segment:  Option<SegmentId> (at most one — the write head)
+│       ├── segments:        HashMap<SegmentId, SegmentMeta>  (all segments in this range)
+│       ├── next_segment_id: u64             (monotonic counter, scoped to this range)
+│       ├── next_offset:     u64             (next write position, monotonic within range)
+│       ├── split_into:      Option<[RangeId; 2]>
+│       ├── merged_into:     Option<RangeId>
+│       └── merged_from:     Option<[RangeId; 2]>
 │
-└── segments: HashMap<SegmentId, SegmentMeta>
-    │
-    └── SegmentMeta
-        ├── segment_id:  SegmentId
-        ├── range_id:    RangeId             (back-reference)
-        ├── topic_id:    TopicId             (denormalized for fast lookup)
-        ├── state:       SegmentState
-        ├── replica_set: Vec<NodeId>
-        ├── size_bytes:  u64
-        ├── created_at:  u64                 (monotonic timestamp)
-        └── sealed_at:   Option<u64>
+│   SegmentMeta (nested inside RangeMeta)
+│       ├── segment_id:    SegmentId
+│       ├── state:         SegmentState
+│       ├── replica_set:   Vec<NodeId>
+│       ├── size_bytes:    u64
+│       ├── start_offset:  u64              (first message offset in this segment)
+│       ├── end_offset:    Option<u64>      (last message offset — set on seal, None while Active)
+│       ├── created_at:    u64              (monotonic timestamp)
+│       └── sealed_at:     Option<u64>
+│
+└── topic_name_index: HashMap<String, TopicId>
 ```
 
 ### Ownership Direction
@@ -51,7 +52,14 @@ Topic ──owns──▶ Range ──owns──▶ Segment
   1         *      1         *
 ```
 
-Topic owns ranges. Range owns segments. Back-references (topic_id on Range, range_id on Segment) exist for O(1) parent lookup — denormalized but never out of sync because all mutations go through a single Raft log.
+Ownership expressed by nesting — `TopicMeta` contains its `RangeMeta`s, each `RangeMeta` contains its `SegmentMeta`s. No back-references needed (`topic_id` on Range, `range_id` on Segment removed). Parent is always known from traversal context. All mutations go through a single Raft log, so the nested structure is always consistent.
+
+### Two Range Collections in TopicMeta
+
+`TopicMeta` has two range references serving different purposes:
+
+- **`active_ranges: Vec<RangeId>`** — ordered keyspace coverage for write routing. Only Active ranges. Updated on split (remove parent, insert children) and merge (remove sources, insert merged). Used by write path to find `key K ∈ [start, end)`.
+- **`ranges: HashMap<RangeId, RangeMeta>`** — all ranges ever created for this topic, including Sealed and Deleting. Used for reads (consumers traverse sealed ranges), lineage tracking, and GC.
 
 ### How Range ID and Keyspace Are Determined
 
@@ -220,17 +228,33 @@ Each operation is a single `RaftCommand` variant proposed to the shard group's R
 ```
                      CreateTopic("blue", policy)
                               │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         TopicMeta        RangeMeta       SegmentMeta
-         id: T1           id: R1          id: S1
-         name: "blue"     topic_id: T1    range_id: R1
-         state: Active    keyspace: full  topic_id: T1
-         ranges: [R1]     active: S1      state: Active
-                          state: Active   replica_set: [...]
+                              ▼
+         TopicMeta
+         id: T1
+         name: "blue"
+         state: Active
+         active_ranges: [R0]
+         next_range_id: 1
+              │
+              └── ranges[R0]:
+                  RangeMeta
+                  id: R0
+                  keyspace: full
+                  state: Active
+                  active_segment: S0
+                  next_segment_id: 1
+                  next_offset: 0
+                       │
+                       └── segments[S0]:
+                           SegmentMeta
+                           id: S0
+                           state: Active
+                           start_offset: 0
+                           end_offset: None
+                           replica_set: [...]
 ```
 
-One command creates three entities:
+One command creates three nested entities:
 1. Topic with `state=Active`
 2. Initial range covering full keyspace `[0x00..., 0xFF...]`
 3. Initial segment as write head of that range
@@ -250,18 +274,19 @@ One command creates three entities:
       ▼               ▼
   SegmentMeta      SegmentMeta (new)
   id: S1           id: S2
-  state: Sealed    range_id: R1
-  sealed_at: now   state: Active
+  state: Sealed    state: Active
+  sealed_at: now   start_offset: 500   (= range.next_offset at creation)
+  end_offset: 499  end_offset: None
                    replica_set: [...]
       │
       ▼
   RangeMeta
   id: R1
   active_segment: S2     (was S1)
-  segments: [S1, S2]     (S2 appended)
+  next_segment_id: 3     (incremented)
 ```
 
-Segment roll: seal current, create next, update range's write head.
+Segment roll: seal current (set `end_offset`), create next (set `start_offset` from range's `next_offset`), update range's write head.
 
 **Only valid if:** Segment state is Active. Range state is Active.
 **If range is Sealed:** No new segment created. Segment just sealed. Range has no active_segment.
@@ -269,35 +294,39 @@ Segment roll: seal current, create next, update range's write head.
 ### `SplitRange { range_id, split_point }`
 
 ```
-         SplitRange(R1, midpoint=0x80)
+         SplitRange(R0, midpoint=0x80)
               │
       ┌───────┼───────────────────┐
       ▼       ▼                   ▼
   RangeMeta   RangeMeta (new)     RangeMeta (new)
-  id: R1      id: R2              id: R3
+  id: R0      id: R1              id: R2
   state:      keyspace: [0,0x80)  keyspace: [0x80,0xFF]
    Sealed     state: Active       state: Active
-  split_into: active: S2          active: S3
-   [R2, R3]   segments: [S2]      segments: [S3]
-
-      ▼                 ▼                ▼
-  Seal all         SegmentMeta       SegmentMeta
-  active segs      id: S2            id: S3
-  of R1            state: Active     state: Active
+  split_into: active_segment: S0  active_segment: S0
+   [R1, R2]   next_segment_id: 1  next_segment_id: 1
+              next_offset: 0      next_offset: 0
+      ▼              ▼                   ▼
+  Seal all      SegmentMeta         SegmentMeta
+  active segs   id: S0              id: S0
+  of R0 (set    state: Active       state: Active
+  end_offset)   start_offset: 0     start_offset: 0
 
       ▼
   TopicMeta
-  id: T1
-  ranges: [R2, R3]    (R1 removed, children inserted sorted)
+  active_ranges: [R1, R2]    (R0 removed, children inserted sorted)
+  ranges: {R0, R1, R2}       (R0 stays in map as Sealed)
+  next_range_id: 3
 ```
 
 Full cascade:
-1. Seal parent range R1 (and its active segment)
-2. Create child range R2 with lower half of keyspace
-3. Create child range R3 with upper half of keyspace
-4. Create active segments S2, S3 for each child
-5. Update topic's range list: remove R1, insert R2, R3 in sorted order
-6. Record lineage: R1.split_into = [R2, R3]
+1. Seal parent range R0 (and its active segment — set `end_offset`)
+2. Create child range R1 with lower half of keyspace, `next_offset: 0`
+3. Create child range R2 with upper half of keyspace, `next_offset: 0`
+4. Create active segment S0 in each child, `start_offset: 0`
+5. Update topic: remove R0 from `active_ranges`, insert R1, R2 sorted. R0 stays in `ranges` map as Sealed.
+6. Record lineage: R0.split_into = [R1, R2]
+
+Note: both child ranges have segment S0 — no collision because SegmentId is scoped per-range.
 
 **Keyspace invariant maintained:** `[0, 0x80) ∪ [0x80, 0xFF] = [0, 0xFF]`. No gaps, no overlaps.
 
@@ -305,11 +334,15 @@ Full cascade:
 
 Inverse of split. Only valid for buddy ranges (adjacent keyspaces from same parent):
 
-1. Seal both ranges (and their active segments)
-2. Create merged range covering union of keyspaces
-3. Create active segment for merged range
-4. Update topic's range list
-5. Record lineage on all three ranges
+1. Seal both ranges (and their active segments — set `end_offset`)
+2. Create merged range covering union of keyspaces, `next_offset: 0`, `next_segment_id: 0`
+3. Create active segment S0 for merged range, `start_offset: 0`
+4. Update topic: remove both from `active_ranges`, insert merged range. Both source ranges stay in `ranges` map as Sealed.
+5. Record lineage: source ranges get `merged_into`, merged range gets `merged_from`
+
+**Consumer behavior after merge:**
+- **Single consumer for both ranges:** drain sealed segments from both source ranges to completion (using `end_offset` to know when done), then switch to merged range at offset 0.
+- **Two consumers (one per range):** one consumer takes ownership of merged range, other becomes hot standby. Standby can activate on next split.
 
 ### `DeleteTopic { topic_id }`
 
@@ -436,17 +469,30 @@ A segment seal is routine housekeeping. A range split is a load-balancing decisi
 
 ## ID Generation
 
-All IDs (`TopicId`, `RangeId`, `SegmentId`) are `u64` generated by the `CoordinatorStateMachine` using monotonic counters:
+IDs are `u64` generated by monotonic counters scoped to the entity that owns the child:
 
 ```
-next_topic_id:   u64    (incremented on CreateTopic)
-next_range_id:   u64    (incremented on CreateTopic, SplitRange, MergeRange)
-next_segment_id: u64    (incremented on any segment creation)
+CoordinatorStateMachine
+    next_topic_id:   u64    (incremented on CreateTopic)
+
+TopicMeta
+    next_range_id:   u64    (incremented on CreateTopic, SplitRange, MergeRange)
+
+RangeMeta
+    next_segment_id: u64    (incremented on any segment creation within this range)
 ```
 
-Counters are per-shard-group (each `CoordinatorStateMachine` has its own). IDs are unique within a shard group but NOT globally unique across shard groups. This is fine — `TopicId`, `RangeId`, `SegmentId` are internal identifiers used only within a shard group's state machine. Clients never see them. Externally, topics are identified by **name** (which is globally unique via deterministic hash routing).
+Each counter lives at its natural ownership level:
+- `TopicId` — unique within a shard group
+- `RangeId` — unique within a topic
+- `SegmentId` — unique within a range
 
-**Cross-shard references** (rare, e.g., admin tooling): prefix with `ShardGroupId` → `(ShardGroupId, TopicId)` is globally unique.
+Full identity of any entity is its path through the ownership tree:
+- Topic: `(ShardGroupId, TopicId)`
+- Range: `(ShardGroupId, TopicId, RangeId)`
+- Segment: `(ShardGroupId, TopicId, RangeId, SegmentId)`
+
+Clients never see internal IDs. Externally, topics are identified by **name** (which is globally unique via deterministic hash routing). Ranges and segments are navigated by traversal (key → topic → active range → active segment), not by direct ID lookup.
 
 Counters are part of the replicated state — they advance deterministically on every replica when applying log entries. No coordination needed.
 
@@ -465,8 +511,7 @@ Needed for: duplicate name detection on `CreateTopic`, lookup by name from clien
 Built from forward data (topics map). Rebuilt from snapshot on recovery. Maintained incrementally on apply.
 
 Future indexes (when needed):
-- `segments_by_node: HashMap<NodeId, HashSet<SegmentId>>` — for node failure handling
-- `ranges_by_topic: HashMap<TopicId, Vec<RangeId>>` — redundant with TopicMeta.ranges but useful if ranges map grows large
+- `segments_by_node: HashMap<NodeId, HashSet<(TopicId, RangeId, SegmentId)>>` — for node failure handling (ReassignSegment). Composite key because SegmentId is scoped to its parent range.
 
 ---
 
@@ -482,9 +527,13 @@ Future indexes (when needed):
 
 5. **Delete cascades downward:** Deleting a topic marks all its ranges and segments for deletion. No orphaned ranges or segments.
 
-6. **ID monotonicity:** IDs only increase. Never reused. Gaps allowed (failed proposals don't consume IDs because the counter only advances on committed apply, not on propose).
+6. **ID monotonicity:** IDs only increase within their scope. Never reused. Gaps allowed (failed proposals don't consume IDs because the counter only advances on committed apply, not on propose).
 
 7. **Single shard group owns entire subtree:** A topic and all its ranges and segments live in the same shard group. No cross-shard references within the entity hierarchy.
+
+8. **Offset continuity within a range:** `segment[N].end_offset + 1 == segment[N+1].start_offset`. No gaps, no overlaps within a range's segment chain. On split/merge, child ranges start at offset 0 — clean break from parent's offset space.
+
+9. **Offset monotonicity:** `range.next_offset` only increases. Each write increments it. `segment.start_offset` is set at creation and never changes. `segment.end_offset` is set once on seal and never changes.
 
 ---
 
@@ -567,15 +616,11 @@ For InstallSnapshot (leader → lagging follower), the entire state machine seri
 
 ```rust
 struct SnapshotData {
-    topics:         HashMap<TopicId, TopicMeta>,
-    ranges:         HashMap<RangeId, RangeMeta>,
-    segments:       HashMap<SegmentId, SegmentMeta>,
-    next_topic_id:  u64,
-    next_range_id:  u64,
-    next_segment_id: u64,
+    topics:        HashMap<TopicId, TopicMeta>,
+    next_topic_id: u64,
 }
 ```
 
-Includes ID counters — without them, a restored replica would generate colliding IDs.
+`TopicMeta` contains everything: ranges (with `next_range_id`), segments (with `next_segment_id`), offsets. All ID counters preserved — without them, a restored replica would generate colliding IDs.
 
 `topic_name_index` is NOT snapshotted — rebuilt from `topics` on restore.

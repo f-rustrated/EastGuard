@@ -23,36 +23,43 @@ StoragePolicy { retention_ms, replication_factor }
 
 TopicMeta {
     topic_id, name, state, storage_policy,
-    ranges: Vec<RangeId>
+    active_ranges: Vec<RangeId>,              // keyspace coverage for write routing
+    ranges: HashMap<RangeId, RangeMeta>,      // all ranges including sealed
+    next_range_id: u64,
 }
 
 RangeMeta {
-    range_id, topic_id, keyspace: [start, end),
-    state, segments, active_segment,
+    range_id, keyspace: [start, end),
+    state, active_segment,
+    segments: HashMap<SegmentId, SegmentMeta>,
+    next_segment_id: u64,
+    next_offset: u64,
     split_into, merged_into, merged_from
 }
 
 SegmentMeta {
-    segment_id, range_id, topic_id, state,
-    replica_set, size_bytes, created_at, sealed_at
+    segment_id, state,
+    replica_set, size_bytes,
+    start_offset: u64, end_offset: Option<u64>,
+    created_at, sealed_at
 }
 ```
 
 All types derive `Encode`, `Decode`, `Clone`, `Debug`.
+
+ID counters scoped to parent: `next_range_id` in TopicMeta, `next_segment_id` in RangeMeta. No back-references — ownership expressed by nesting.
 
 ### State Machine (`state_machine.rs`)
 
 ```rust
 struct CoordinatorStateMachine {
     topics:           HashMap<TopicId, TopicMeta>,
-    ranges:           HashMap<RangeId, RangeMeta>,
-    segments:         HashMap<SegmentId, SegmentMeta>,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id:    u64,
-    next_range_id:    u64,
-    next_segment_id:  u64,
 }
 ```
+
+Flat maps for ranges/segments removed — they live nested inside `TopicMeta` and `RangeMeta` respectively.
 
 Pure functions: `apply_create_topic()`, `apply_split_range()`, `apply_seal_segment()`. No I/O, no async.
 
@@ -79,9 +86,9 @@ enum RaftCommand {
     AddPeer(NodeId),
     // New
     CreateTopic { name: String, storage_policy: StoragePolicy },
-    SealSegment { segment_id: SegmentId },
-    SplitRange { range_id: RangeId, split_point: Vec<u8> },
-    MergeRange { range_id_1: RangeId, range_id_2: RangeId },
+    SealSegment { topic_id: TopicId, range_id: RangeId, segment_id: SegmentId },
+    SplitRange { topic_id: TopicId, range_id: RangeId, split_point: Vec<u8> },
+    MergeRange { topic_id: TopicId, range_id_1: RangeId, range_id_2: RangeId },
     DeleteTopic { topic_id: TopicId },
     // Future: MoveShard, ReassignSegment
 }
@@ -326,6 +333,113 @@ GetShardInfo { key: Vec<u8> }
 
 ---
 
+## Phase 6: Hot Range Detection + Auto-Split/Merge
+
+**Goal:** Coordinator detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
+
+### Core Insight
+
+`CoordinatorStateMachine` already sees every `SealSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
+
+### 6a. Per-Range Seal Tracker
+
+Add to `RangeMeta`:
+
+```rust
+struct RangeSealHistory {
+    last_seal_at: u64,          // monotonic timestamp of most recent seal
+    seal_count_in_window: u32,  // seals within sliding window
+    window_start: u64,          // start of current measurement window
+    cooldown_until: u64,        // no split before this time (post-split cooldown)
+}
+
+// In RangeMeta:
+seal_history: RangeSealHistory,
+```
+
+Lives inside `RangeMeta` — no separate tracker map needed. Naturally scoped to the range, cleaned up when range is deleted.
+
+Updated inside `apply_seal_segment()` — pure, deterministic, replicated on every node.
+
+### 6b. Split Decision Logic
+
+After each `apply_seal_segment()`, Coordinator (leader only) evaluates:
+
+```rust
+fn should_split(topic: &TopicMeta, range_id: RangeId, now: u64) -> bool {
+    let range = topic.ranges.get(&range_id);
+
+    range.state == Active
+        && now > range.seal_history.cooldown_until
+        && range.keyspace_width() > MIN_RANGE_WIDTH
+        && range.seal_history.seal_count_in_window >= SPLIT_SEAL_THRESHOLD
+}
+```
+
+Split point = midpoint of keyspace. Simple, no key distribution data needed.
+
+**Constants (initial, tunable):**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `SPLIT_SEAL_THRESHOLD` | 3 | Seals within window to trigger split |
+| `MEASUREMENT_WINDOW_MS` | 300_000 (5 min) | Sliding window for counting seals |
+| `SPLIT_COOLDOWN_MS` | 300_000 (5 min) | No re-split after recent split |
+| `MIN_RANGE_WIDTH` | 256 bytes | Minimum keyspace to prevent fragmentation |
+
+### 6c. Merge Decision Logic
+
+Periodic check by Coordinator leader (on a timer, not per-event):
+
+```rust
+fn should_merge(topic: &TopicMeta, r1: RangeId, r2: RangeId, now: u64) -> bool {
+    let range1 = topic.ranges.get(&r1);
+    let range2 = topic.ranges.get(&r2);
+
+    are_buddies(range1, range2)
+        && range1.state == Active && range2.state == Active
+        && range1.seal_history.seal_count_in_window <= MERGE_SEAL_THRESHOLD
+        && range2.seal_history.seal_count_in_window <= MERGE_SEAL_THRESHOLD
+        && now > range1.seal_history.cooldown_until
+        && now > range2.seal_history.cooldown_until
+}
+```
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `MERGE_SEAL_THRESHOLD` | 0 | Both ranges must be idle (no seals in window) |
+| `MERGE_CHECK_INTERVAL_MS` | 600_000 (10 min) | How often leader scans for merge candidates |
+
+Hysteresis built in: split at 3 seals/window, merge at 0. No oscillation.
+
+### 6d. Proposal Path
+
+Split/merge decisions happen in `MultiRaftActor` after applying entries (Phase 3 dispatch):
+
+```rust
+// After apply_seal_segment():
+if should_split(&topic, range_id, now) {
+    let mid = topic.ranges.get(&range_id).midpoint();
+    shard.raft.propose(RaftCommand::SplitRange { topic_id, range_id, split_point: mid });
+}
+
+// On periodic timer:
+for (topic_id, r1, r2) in shard.state_machine.merge_candidates(now) {
+    shard.raft.propose(RaftCommand::MergeRange { topic_id, range_id_1: r1, range_id_2: r2 });
+}
+```
+
+Leader-only — followers apply committed decisions but never propose. Stale proposals rejected by `apply_split_range()` / `apply_merge_range()` precondition checks.
+
+### 6e. New Timer
+
+Add `MergeCheck` variant to `RaftTimer` for periodic merge scanning. Fires every `MERGE_CHECK_INTERVAL_MS`. Leader-only — set on `become_leader()`, cancelled on stepdown.
+
+**Depends on:** Phases 1-4 (needs working propose pathway + state machine dispatch). Phase 5 not required.
+**Scope:** 2-3 PRs.
+
+---
+
 ## Phase Dependency Graph
 
 ```
@@ -337,16 +451,41 @@ Phase 2 (Extend RaftCommand)
     ▼
 Phase 3 (Application State Machine Dispatch)
     │
-    ▼
-Phase 4 (Propose Pathway)
-    │
-    ▼
+    ├──────────────────────────┐
+    ▼                          ▼
+Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
+    │                          (needs Phase 4 for end-to-end,
+    ▼                           but core logic testable after Phase 3)
 Phase 5 (Leader Forwarding + Epoch)
 ```
 
 ---
 
 ## Backlog (Out of Scope)
+
+### Hot Range Detection Optimizations
+
+Not in Phase 6 — add only when midpoint splitting proves insufficient:
+
+- **Key histogram / percentile-based split points** — requires sampling infrastructure on data plane nodes, probe protocol from Coordinator, memory budget management. Only valuable for highly skewed workloads where midpoint splits don't divide load evenly.
+- **Write throughput metrics** — counting writes/sec rather than seal frequency. More granular but requires data plane → Coordinator reporting pipeline.
+- **Adaptive thresholds** — per-topic or per-range thresholds based on historical patterns instead of global constants.
+- **Predictive splitting** — split before hotspot causes problems, based on trend detection. Requires time-series analysis.
+
+### Consumer Protocol for Range Lifecycle
+
+Not in metadata management scope — data plane concern. But depends on metadata providing:
+- `end_offset` on sealed segments (consumer knows "done with this range")
+- `merged_into` / `split_into` lineage (consumer follows range transitions)
+- `active_ranges` list (consumer discovers current write targets)
+
+Consumer behavior on merge:
+- **Single consumer, both ranges:** drain both sealed ranges to completion, then switch to merged range at offset 0.
+- **Two consumers (one per range):** one takes merged range ownership, other → hot standby for next split.
+
+Consumer behavior on split:
+- **Single consumer:** switches to consuming both child ranges (may spawn second consumer).
+- **Consumer group:** rebalance — assign each child range to a consumer.
 
 ### RocksDB Storage Integration
 
@@ -373,6 +512,15 @@ Consistent with `take_outbound()`, `take_timer_commands()`, `take_log_mutations(
 **5. Client redirect first, transparent forwarding second.**
 Phase 4 returns `NotLeader(leader_hint)` — client redirects. Phase 5 adds transparent forwarding. Both coexist in production.
 
+**6. Nested ownership — no flat maps, no back-references.**
+Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counters (`next_range_id`, `next_segment_id`) scoped to parent entity. Eliminates `topic_id` back-ref on Range, `range_id` back-ref on Segment. Ownership expressed by structure. `DeleteTopic` = drop the `TopicMeta`. `RaftCommand` variants carry `topic_id` (and `range_id` for segment ops) to navigate the tree.
+
+**7. Offsets on segments enable consumer position tracking.**
+`start_offset` / `end_offset` on `SegmentMeta`, `next_offset` on `RangeMeta`. Consumer knows "done with sealed range" when position reaches last segment's `end_offset`. On split/merge, child ranges start at offset 0 — clean break. Consumer protocol (backlog) uses these fields plus `merged_into`/`split_into` lineage to navigate range transitions.
+
+**8. Seal frequency as hot range signal — no external metrics pipeline.**
+`SealSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → Coordinator reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
+
 ---
 
 ## Risk Areas
@@ -382,3 +530,5 @@ Phase 4 returns `NotLeader(leader_hint)` — client redirects. Phase 5 adds tran
 | Pending proposals leak on leader stepdown | Drain and error all pending in `step_down()` |
 | Hash ring divergence between client/broker | Epoch validation catches stale routing (Phase 5) |
 | Bincode format change on new `RaftCommand` variants | In-memory only for now; version byte on `LogEntry` when RocksDB lands |
+| Midpoint split doesn't balance skewed workloads | Acceptable for Phase 6 — percentile-based split in backlog |
+| Seal tracker grows unbounded for long-lived ranges | Sliding window bounded; entries removed on range seal/delete |
