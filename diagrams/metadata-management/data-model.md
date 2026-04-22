@@ -339,6 +339,101 @@ Marks everything for deletion. Data plane GC physically removes segment files. A
 
 ---
 
+## Split and Merge — Triggering Conditions
+
+The Coordinator (shard group leader) monitors range health and proposes `SplitRange` or `MergeRange` when conditions are met. These are system-initiated — clients never request splits or merges directly.
+
+### When Does a Range Split?
+
+A range splits when it becomes a **hot partition** — disproportionate load relative to other ranges in the same topic. The Coordinator monitors:
+
+| Signal | What it measures | Split indicator |
+|---|---|---|
+| **Segment fill rate** | How fast the active segment reaches the size threshold (~1GB) | Segment rolls (seals) significantly faster than peer ranges |
+| **Write throughput** | Writes/sec arriving at the range's active segment | Sustained throughput above a configurable threshold |
+| **Key distribution skew** | Whether writes cluster in a sub-region of the keyspace | High write density in a narrow key band suggests a finer split would help |
+
+**Split point selection:** The Coordinator picks a split point that divides the observed write load roughly evenly. Strategies:
+
+1. **Midpoint (simple):** Bisect the keyspace at `(start + end) / 2`. Works well for uniformly distributed keys.
+2. **Percentile-based (future):** Track key distribution histogram, split at the median write key. Better for skewed workloads but requires sampling infrastructure.
+
+Phase 1 uses midpoint. Percentile-based split is a backlog optimization.
+
+**Cooldown:** After splitting, child ranges enter a monitoring cooldown (e.g., 5 minutes) before they become split candidates themselves. Prevents split storms from transient load spikes.
+
+**Minimum range size:** Ranges below a minimum keyspace width (configurable) are not split further, preventing unbounded fragmentation.
+
+### When Does a Range Merge?
+
+Merge is the inverse of split — recombines **underutilized adjacent ranges** to reduce metadata overhead and improve read efficiency across the keyspace.
+
+**Preconditions (all must hold):**
+
+1. **Buddy ranges only.** The two ranges must be adjacent in keyspace AND share the same parent split (tracked via `split_into` / `merged_from` lineage). Arbitrary adjacent ranges cannot merge — this preserves the binary tree structure and ensures the merged keyspace is contiguous and was once a single range.
+
+2. **Both ranges below utilization threshold.** Combined write throughput of both ranges is low enough that a single range can handle the load. The threshold is a fraction of the split threshold (e.g., split at 10K writes/sec, merge when combined < 3K writes/sec). Hysteresis between split and merge thresholds prevents oscillation.
+
+3. **Both ranges in Active state.** Sealed or Deleting ranges cannot merge.
+
+4. **No in-flight split on either range.** If a range was recently split or has pending split, merge is blocked.
+
+```
+Split threshold:    ████████████████████░░░░  (high — triggers split)
+                                  ↕ hysteresis gap
+Merge threshold:    ██████░░░░░░░░░░░░░░░░░░  (low — triggers merge when BOTH below)
+```
+
+**Why buddy-only merging?**
+
+Without this constraint, merging arbitrary adjacent ranges breaks the binary tree invariant. Consider:
+
+```
+[0x00 ──── 0x40)  [0x40 ──── 0x80)  [0x80 ──── 0xFF]
+     R2                R3                 R4
+     └── from split of R1 ──┘             └── from split of R0
+```
+
+R3 and R4 are adjacent but NOT buddies (different parents). Merging them would create `[0x40, 0xFF]` — a range that never existed as a unit, complicating lineage tracking and future splits. Only R2+R3 (buddies from R1) or a merge after R2+R3 already merged back into R1 (then R1+R4 are buddies from R0) are valid.
+
+### Monitoring Architecture
+
+The Coordinator does not receive a continuous metrics stream. Instead, it uses **periodic sampling**:
+
+```
+Coordinator (shard leader)
+    │
+    │  periodic probe (every N seconds)
+    │
+    ▼
+Data plane nodes hosting segments
+    │
+    │  report: { segment_id, size_bytes, write_rate, key_histogram }
+    │
+    ▼
+Coordinator evaluates split/merge conditions
+    │
+    ▼
+Proposes SplitRange / MergeRange via Raft
+```
+
+- **Who reports:** Data plane nodes that host active segments send periodic heartbeats with size and throughput metrics.
+- **Where evaluated:** The Coordinator (shard group leader) aggregates reports and evaluates thresholds. Only the leader proposes — followers ignore metrics (they'll apply the committed decision).
+- **Consistency:** Split/merge decisions go through Raft. Even if two leaders briefly coexist (network partition), only one proposal commits. The state machine's precondition checks in `apply_split_range()` / `apply_merge_range()` reject stale proposals (e.g., splitting an already-sealed range).
+
+### Segment Seal — Relationship to Split
+
+Segment sealing (`SealSegment`) and range splitting (`SplitRange`) are related but independent:
+
+| Operation | Trigger | Effect |
+|---|---|---|
+| `SealSegment` | Active segment reaches size threshold (~1GB) | Seal current segment, create new one. Range stays Active. Normal segment roll — happens many times during a range's lifetime. |
+| `SplitRange` | Range throughput exceeds split threshold | Seal parent range + all its segments. Create two child ranges with new segments. Structural change to the topic's range tree. |
+
+A segment seal is routine housekeeping. A range split is a load-balancing decision. Segments seal frequently (every ~1GB of writes); ranges split rarely (when sustained load justifies it).
+
+---
+
 ## ID Generation
 
 All IDs (`TopicId`, `RangeId`, `SegmentId`) are `u64` generated by the `CoordinatorStateMachine` using monotonic counters:
