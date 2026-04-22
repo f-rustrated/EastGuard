@@ -1,13 +1,11 @@
-use crate::StartUp;
 use crate::clusters::{SwimNode, SwimNodeState};
 use crate::config::Environment;
 use crate::connections::clients::{ClientStreamReader, ClientStreamWriter};
 use crate::connections::request::ConnectionRequests;
 use crate::connections::request::QueryCommand::GetMembers;
 use crate::net::TcpStream;
-use std::time::Duration;
-use turmoil::Builder;
 
+#[allow(dead_code)]
 fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
     Environment {
         config_dir: std::env::temp_dir().join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
@@ -27,6 +25,7 @@ fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Envir
     }
 }
 
+#[allow(dead_code)]
 async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>> {
     let stream = TcpStream::connect((host, port)).await?;
     let (read_half, write_half) = stream.into_split();
@@ -36,6 +35,7 @@ async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>> {
     Ok(reader.read_request().await?)
 }
 
+#[allow(dead_code)]
 async fn check_alive_count(host: &str, port: u16, expected: usize) -> turmoil::Result {
     let members = get_members(host, port).await?;
     let alive_count = members
@@ -50,6 +50,7 @@ async fn check_alive_count(host: &str, port: u16, expected: usize) -> turmoil::R
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> bool {
     let Ok(members) = get_members(host, port).await else {
         return false;
