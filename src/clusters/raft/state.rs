@@ -48,8 +48,9 @@ pub struct Raft {
     log: Vec<LogEntry>,
     pending_log_mutations: Vec<LogMutation>, // must persist
     pending_events: Vec<RaftEvent>,          // volatile side effects
-    commit_index: u64,
-    last_applied: u64,
+    commit_index: u64,                      // majority voted 
+    stabled_index: u64,                     // flushed to disk 
+    last_applied_index: u64,                // applied to state machine 
     role: Role,
     /// Tracks who the current leader is — set when this node becomes leader
     /// or when a valid `AppendEntries` is received from a leader.
@@ -80,7 +81,8 @@ impl Raft {
             pending_log_mutations: Vec::new(),
             pending_events: Vec::new(),
             commit_index: 0,
-            last_applied: 0,
+            stabled_index: 0,
+            last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
             peer_states: HashMap::new(),
@@ -112,7 +114,7 @@ impl Raft {
     // In-memory log helpers (1-based indexing; index 0 means "before log")
     // -------------------------------------------------------------------
 
-    fn log_last_index(&self) -> u64 {
+    pub(crate) fn log_last_index(&self) -> u64 {
         self.log.last().map_or(0, |e| e.index)
     }
 
@@ -185,6 +187,10 @@ impl Raft {
     fn quorum(&self) -> u32 {
         let total = self.peers.len() as u32 + 1; // +1 for self
         total / 2 + 1
+    }
+    
+    pub(crate) fn stabled_index(&self) -> u64 {
+        self.stabled_index
     }
 
     // -------------------------------------------------------------------
@@ -563,14 +569,24 @@ impl Raft {
             }
         }
     }
+    
+    pub(crate) fn advance_stabled_index(&mut self, value: u64) {
+        self.stabled_index = value;
+    }
 
-    /// Apply committed but unapplied log entries.
-    /// Currently handles Raft-internal ConfChanges (RemovePeer, AddPeer).
+    #[cfg(test)]
+    pub(crate) fn simulate_flush(&mut self) {
+        self.advance_stabled_index(self.log_last_index());
+        self.apply_committed_entries();
+    }
+
+    /// Apply committed (and persisted) but unapplied log entries.
+    /// Currently, handles Raft-internal ConfChanges (RemovePeer, AddPeer).
     /// Phase 4 will extend this with application state machine dispatch.
     fn apply_committed_entries(&mut self) {
-        while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            let entry = match self.log_get(self.last_applied) {
+        while self.last_applied_index < self.commit_index.min(self.stabled_index) {
+            self.last_applied_index += 1;
+            let entry = match self.log_get(self.last_applied_index) {
                 Some(e) => e.clone(),
                 None => continue,
             };
@@ -583,7 +599,7 @@ impl Raft {
                         "[{}] ConfChange applied: removed peer {} (index={})",
                         self.node_id,
                         node_id,
-                        self.last_applied
+                        self.last_applied_index
                     );
                 }
                 RaftCommand::AddPeer(ref node_id) => {
@@ -605,7 +621,7 @@ impl Raft {
                         "[{}] ConfChange applied: added peer {} (index={})",
                         self.node_id,
                         node_id,
-                        self.last_applied
+                        self.last_applied_index
                     );
                 }
             }
@@ -1472,8 +1488,9 @@ mod tests {
         // Single-node commits immediately on propose.
         let result = raft.propose(RaftCommand::RemovePeer(node("phantom")));
         assert!(result.is_ok());
+        raft.simulate_flush();
         // last_applied should have advanced
-        assert!(raft.last_applied > 0);
+        assert!(raft.last_applied_index > 0);
     }
 
     #[test]
@@ -1518,6 +1535,7 @@ mod tests {
         for pkt in acks {
             n1.step(node("node-2"), pkt.rpc);
         }
+        n1.simulate_flush();
 
         // After majority ack, commit_index advances and RemovePeer is applied
         assert!(!n1.has_peer(&node("node-3")));
@@ -1539,6 +1557,7 @@ mod tests {
 
         let result = raft.propose(RaftCommand::AddPeer(node("node-2")));
         assert!(result.is_ok());
+        raft.simulate_flush();
         assert!(raft.has_peer(&node("node-2")));
         assert_eq!(raft.peers_count(), 1);
     }
@@ -1596,6 +1615,7 @@ mod tests {
         for pkt in packets(&mut n2) {
             n1.step(node("node-2"), pkt.rpc);
         }
+        n1.simulate_flush();
 
         // After commit, node-4 is a peer
         assert!(n1.has_peer(&node("node-4")));
