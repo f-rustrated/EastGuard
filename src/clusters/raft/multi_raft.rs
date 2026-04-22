@@ -250,11 +250,11 @@ impl MultiRaft {
 
         if !batch.is_empty() {
             self.db.write_batch(&batch);
-        }
 
-        for (id, last_log_index) in last_indices {
-            if let Some(raft) = self.groups.get_mut(&id) {
-                raft.advance_stabled_index(last_log_index)
+            for (id, last_log_index) in last_indices {
+                if let Some(raft) = self.groups.get_mut(&id) {
+                    raft.advance_stabled_index(last_log_index)
+                }
             }
         }
 
