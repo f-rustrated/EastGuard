@@ -45,8 +45,6 @@ SegmentMeta {
 }
 ```
 
-All types derive `Encode`, `Decode`, `Clone`, `Debug`.
-
 ID counters scoped to parent: `next_range_id` in TopicMeta, `next_segment_id` in RangeMeta. No back-references — ownership expressed by nesting.
 
 ### State Machine (`state_machine.rs`)

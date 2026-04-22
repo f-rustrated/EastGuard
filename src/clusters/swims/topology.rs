@@ -14,8 +14,10 @@ use crate::clusters::{NodeId, SwimNodeState};
 pub struct ShardGroupId(pub u64);
 
 impl ShardGroupId {
-    fn new(key: &[u8]) -> Self {
-        Self(hash_stable(key) as u64)
+    /// Derives a ShardGroupId from a vnode token's hash.
+    /// Only valid when the hash comes from an actual vnode position on the ring.
+    fn from_vnode_hash(hash: u32) -> Self {
+        Self(hash as u64)
     }
 }
 
@@ -189,7 +191,7 @@ impl Topology {
         let mut seen = std::collections::HashSet::new();
 
         for token in self.ring.vnodes.keys() {
-            let id = ShardGroupId(token.hash as u64);
+            let id = ShardGroupId::from_vnode_hash(token.hash);
             if !seen.insert(id) {
                 continue;
             }
@@ -217,19 +219,23 @@ impl Topology {
 
     /// Returns the shard group responsible for `key`.
     ///
-    /// The group ID is derived deterministically from the key's hash so every node
-    /// in the cluster computes the same ID for the same key. Members are the
-    /// `replication_factor` distinct physical nodes clockwise from the key's
-    /// position on the ring.
+    /// Walks the consistent hash ring clockwise from the key's hash position to
+    /// find the nearest vnode. That vnode's token hash becomes the `ShardGroupId`.
+    /// Members are the `replication_factor` distinct physical nodes clockwise
+    /// from the key's position on the ring.
+    ///
+    /// Returns `None` if the ring is empty.
     #[allow(dead_code)]
-    pub fn shard_group_for(&self, key: &[u8]) -> ShardGroup {
+    pub fn shard_group_for(&self, key: &[u8]) -> Option<ShardGroup> {
+        let hash = hash_stable(key);
+        let (nearest_token, _) = self.ring.walk_clockwise_from(hash).next()?;
         let owners = self
             .ring
-            .token_owners_for(key, self.config.replication_factor);
-        ShardGroup {
+            .token_owners_at(hash, self.config.replication_factor);
+        Some(ShardGroup {
+            id: ShardGroupId::from_vnode_hash(nearest_token.hash),
             members: owners.into_iter().map(|vn| vn.pnode_id.clone()).collect(),
-            id: ShardGroupId::new(key),
-        }
+        })
     }
 
     /// Returns all unique shard groups that `node_id` participates in.
@@ -516,7 +522,7 @@ mod tests {
             },
         );
 
-        let group = topology.shard_group_for(b"topic-blue");
+        let group = topology.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(group.members.len(), 3);
 
         // All members should be distinct
@@ -538,8 +544,8 @@ mod tests {
             },
         );
 
-        let group1 = topology.shard_group_for(b"topic-blue");
-        let group2 = topology.shard_group_for(b"topic-blue");
+        let group1 = topology.shard_group_for(b"topic-blue").unwrap();
+        let group2 = topology.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(group1, group2);
     }
 
@@ -557,11 +563,15 @@ mod tests {
             },
         );
 
-        let group_a = topology.shard_group_for(b"topic-alpha");
-        let group_b = topology.shard_group_for(b"topic-beta");
-        // Murmur3 with seed 0 is deterministic — pin exact IDs
-        assert_eq!(group_a.id, ShardGroupId(449050983));
-        assert_eq!(group_b.id, ShardGroupId(3972680256));
+        let group_a = topology.shard_group_for(b"topic-alpha").unwrap();
+        let group_b = topology.shard_group_for(b"topic-beta").unwrap();
+        // IDs now derive from nearest vnode token, not raw key hash.
+        // Just verify they differ — exact values depend on ring layout.
+        assert_ne!(group_a.id, group_b.id);
+        // Both IDs must correspond to actual vnode positions on the ring
+        let all_groups = topology.shard_groups_for_node(&group_a.members[0]);
+        assert!(all_groups.iter().any(|g| g.id == group_a.id));
+        assert!(all_groups.iter().any(|g| g.id == group_b.id));
     }
 
     #[test]
@@ -575,7 +585,7 @@ mod tests {
         );
 
         // Only 2 physical nodes, so group can have at most 2 members
-        let group = topology.shard_group_for(b"any-key");
+        let group = topology.shard_group_for(b"any-key").unwrap();
         assert_eq!(group.members.len(), 2);
     }
 
@@ -594,19 +604,19 @@ mod tests {
         );
 
         let key = b"test-key";
-        let before = topology.shard_group_for(key);
+        let before = topology.shard_group_for(key).unwrap();
         assert_eq!(before.members.len(), 3);
 
         let removed = before.members[0].clone();
         topology.remove_node(&removed);
 
-        let after = topology.shard_group_for(key);
+        let after = topology.shard_group_for(key).unwrap();
         assert_eq!(after.members.len(), 2);
         assert!(!after.members.contains(&removed));
     }
 
     #[test]
-    fn shard_group_empty_ring_returns_empty_members() {
+    fn shard_group_empty_ring_returns_none() {
         let topology = topology_from(
             &[],
             TopologyConfig {
@@ -615,8 +625,7 @@ mod tests {
             },
         );
 
-        let group = topology.shard_group_for(b"any-key");
-        assert!(group.members.is_empty());
+        assert!(topology.shard_group_for(b"any-key").is_none());
     }
 
     // --- shard_groups_for_node tests ---
