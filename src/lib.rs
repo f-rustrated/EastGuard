@@ -8,6 +8,7 @@ mod clusters;
 mod net;
 pub(crate) mod schedulers;
 
+pub(crate) mod impls;
 #[cfg(test)]
 mod it;
 pub(crate) mod macros;
@@ -18,6 +19,7 @@ use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
 use crate::connections::request::QueryCommand;
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
@@ -59,7 +61,7 @@ impl StartUp {
         // Raft channels
         let (raft_tx, raft_mailbox) = mpsc::channel(4096);
         let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
-        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(64);
+        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 4);
 
         // Build SWIM state and extract node_id before handing state to the actor
         let state = self.env.swim(self.rng_seed);
@@ -94,8 +96,10 @@ impl StartUp {
             swim_ticker_tx,
             raft_tx,
         ));
+        let raft_db = MetadataStorage::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
             node_id,
+            Box::new(raft_db),
             raft_mailbox,
             raft_transport_tx,
             raft_ticker_tx,

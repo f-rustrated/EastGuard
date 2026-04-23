@@ -7,11 +7,12 @@ use tokio::sync::mpsc;
 use turmoil::Builder;
 
 use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::LeaderChange;
+use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker_message::TickerCommand;
@@ -42,6 +43,7 @@ async fn swim_handler_with_leader_capture(
 /// 3-node cluster: after election, verify that exactly one node emits a
 /// LeaderChangeEvent with term=1 and correct shard_group_id.
 #[test]
+#[serial_test::serial]
 fn leader_election_emits_leader_change_event() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))
@@ -112,8 +114,12 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                         swim_tx,
                     ));
                 }
+                let db = MetadataStorage::open(
+                    std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+                );
                 tokio::spawn(MultiRaftActor::run(
                     node_id,
+                    Box::new(db),
                     raft_mailbox,
                     transport_tx,
                     ticker_tx,

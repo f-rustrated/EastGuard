@@ -1,3 +1,4 @@
+
 /// Make sure to run the test using RUST_LOG=debug cargo test -- --nocapture
 use crate::StartUp;
 use crate::clusters::{SwimNode, SwimNodeState};
@@ -11,8 +12,9 @@ use turmoil::Builder;
 
 fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
     Environment {
-        config_dir: format!("./eastguard/config/{}", idx),
-        data_dir: format!("./eastguard/data/{}", idx),
+        config_dir: std::env::temp_dir().join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        data_dir: std::env::temp_dir().join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        meta_dir: std::env::temp_dir().join(format!("eastguard-meta-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
         node_id_prefix: Some(node_id),
         port,
         cluster_port,
@@ -87,6 +89,7 @@ async fn check_node_is_all_alive(host: &str, port: u16) -> turmoil::Result {
 }
 
 #[test]
+#[serial_test::serial]
 fn cluster_setup() -> turmoil::Result {
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(30))
@@ -156,6 +159,7 @@ fn cluster_setup() -> turmoil::Result {
 /// node-1 and node-3 are partitioned from each other.
 /// They must learn about each other exclusively through node-2's gossip.
 #[test]
+#[serial_test::serial]
 fn partition_gossip() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
@@ -227,6 +231,7 @@ fn partition_gossip() -> turmoil::Result {
 
 /// node-3 process is killed and restarted.
 #[test]
+#[serial_test::serial]
 fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))

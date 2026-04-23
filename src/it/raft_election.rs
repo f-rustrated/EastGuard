@@ -11,6 +11,7 @@ use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker_message::TickerCommand;
@@ -81,8 +82,10 @@ async fn run_raft_node(
         swim_tx.clone(),
     ));
 
+    let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     tokio::spawn(MultiRaftActor::run(
         node_id,
+        Box::new(db),
         raft_mailbox,
         transport_tx,
         ticker_tx,
@@ -91,7 +94,12 @@ async fn run_raft_node(
 
     // Ensure the shard group
     raft_tx
-        .send(MultiRaftCommand::EnsureGroup { group: group.clone() }.into())
+        .send(
+            MultiRaftCommand::EnsureGroup {
+                group: group.clone(),
+            }
+            .into(),
+        )
         .await
         .unwrap();
 
@@ -159,6 +167,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
 /// the checker connects to each node and verifies that all agree on the same
 /// elected leader.
 #[test]
+#[serial_test::serial]
 fn three_node_raft_elects_leader() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))

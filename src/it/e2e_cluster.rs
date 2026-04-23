@@ -10,8 +10,9 @@ use turmoil::Builder;
 
 fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Environment {
     Environment {
-        config_dir: format!("./eastguard/config/{}", idx),
-        data_dir: format!("./eastguard/data/{}", idx),
+        config_dir: std::env::temp_dir().join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        data_dir: std::env::temp_dir().join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        meta_dir: std::env::temp_dir().join(format!("eastguard-meta-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
         node_id_prefix: Some(node_id),
         port,
         cluster_port,
@@ -67,6 +68,7 @@ async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> bool {
 ///   SWIM failure detection → MembershipEvent::NodeDead → HandleNodeDeath → MultiRaftActor RemovePeer
 ///   Node restart → SWIM rejoin → HandleNodeJoin again
 #[test]
+#[serial_test::serial]
 fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))

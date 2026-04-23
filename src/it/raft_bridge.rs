@@ -11,6 +11,7 @@ use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker_message::TickerCommand;
@@ -78,8 +79,10 @@ async fn start_raft_node(
         swim_tx.clone(),
     ));
 
+    let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     tokio::spawn(MultiRaftActor::run(
         node_id,
+        Box::new(db),
         raft_mailbox,
         transport_tx,
         ticker_tx,
@@ -162,6 +165,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
 /// 3-node cluster: after election, inject HandleNodeDeath for node-3.
 /// Leader proposes RemovePeer. Group continues with 2 members.
 #[test]
+#[serial_test::serial]
 fn node_death_triggers_remove_peer() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))
@@ -231,6 +235,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
 /// 2-node cluster: after election, inject HandleNodeJoin for node-3.
 /// Leader proposes AddPeer. Group expands to include node-3.
 #[test]
+#[serial_test::serial]
 fn node_join_triggers_add_peer() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))

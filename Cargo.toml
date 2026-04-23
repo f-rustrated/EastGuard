@@ -15,6 +15,7 @@ murmur3 = "0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 thiserror = "2.0.18"
+rocksdb = "0.24.0"
 
 
 [lints.rust]

@@ -3,16 +3,19 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
+    LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
     RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
+
+use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
+    storage: Box<dyn RaftStorage>,
     groups: HashMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
@@ -20,9 +23,10 @@ pub(crate) struct MultiRaft {
 }
 
 impl MultiRaft {
-    pub(crate) fn new(node_id: NodeId) -> Self {
+    pub(crate) fn new(node_id: NodeId, storage: Box<dyn RaftStorage>) -> Self {
         Self {
             node_id,
+            storage,
             groups: HashMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
@@ -90,15 +94,19 @@ impl MultiRaft {
         let jitter = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.node_id.hash(&mut hasher);
+            group.id.0.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
 
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
+        let persistent = self.storage.load_state(group.id.0);
+
         let raft = Raft::new(
             self.node_id.clone(),
             peers,
+            persistent,
             jitter,
             group.id,
             election_seq,
@@ -129,6 +137,8 @@ impl MultiRaft {
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: raft.heartbeat_seq(),
             }));
+
+        self.storage.delete_group(group_id);
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
@@ -212,18 +222,30 @@ impl MultiRaft {
     }
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
-        for id in std::mem::take(&mut self.dirty) {
-            let Some(raft) = self.groups.get_mut(&id) else {
+        let dirty: Vec<ShardGroupId> = std::mem::take(&mut self.dirty).into_iter().collect();
+        let mut mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
+        let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
+
+        for id in &dirty {
+            let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
-            // RocksDB integration point: replace the discard below with a batch write.
-            // take_log_mutations() returns Vec<LogMutation> — iterate and apply each variant:
-            //   LogMutation::Append(entry)        → cf_log.put((id, entry.index), bincode(entry))
-            //   LogMutation::TruncateFrom(index)  → delete_range cf_log (id, index)..(id, u64::MAX)
-            //   LogMutation::HardState { .. }     → cf_meta.put((id, "hard_state"), bincode(...))
-            // Batch all mutations for all dirty groups into one WriteBatch before db.write().
-            let _ = raft.take_log_mutations();
+
+            last_indices.insert(*id, raft.log_last_index());
+            for log in raft.take_log_mutations() {
+                mutations.push((*id, log));
+            }
             self.pending_events.extend(raft.take_events());
+        }
+
+        if !mutations.is_empty() {
+            self.storage.persist_mutations(mutations);
+
+            for (id, last_log_index) in last_indices {
+                if let Some(raft) = self.groups.get_mut(&id) {
+                    raft.advance_stabled_index(last_log_index)
+                }
+            }
         }
 
         std::mem::take(&mut self.pending_events)
@@ -240,8 +262,18 @@ impl RaftTimerTokenGenerator {
 }
 
 #[cfg(test)]
+impl MultiRaft {
+    fn stabled_for(&self, id: ShardGroupId) -> u64 {
+        self.groups.get(&id).map_or(0, |r| r.stabled_index())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::clusters::raft::storage::RaftPersistentState;
+    use crate::impls::metadata_storage::MetadataStorage;
     use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {
@@ -265,10 +297,21 @@ mod tests {
             .collect()
     }
 
+    fn temp_storage() -> (Box<dyn RaftStorage>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let db = MetadataStorage::open(path.clone());
+        (Box::new(db), path)
+    }
+
+    fn new_store(node_id: NodeId, storage: Box<dyn RaftStorage>) -> MultiRaft {
+        MultiRaft::new(node_id, storage)
+    }
+
     #[test]
     fn timer_seqs_are_unique_across_groups() {
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = MultiRaft::new(me.clone());
+        let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(1, vec![me.clone(), node("n2")]));
         store.add_group(shard(2, vec![me.clone(), node("n2")]));
@@ -277,5 +320,302 @@ mod tests {
         let seqs = timer_seqs(&events);
         let unique: HashSet<u32> = seqs.iter().cloned().collect();
         assert_eq!(seqs.len(), unique.len());
+    }
+
+    #[test]
+    fn add_group_registers_in_memory() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        store.add_group(shard(42, vec![me.clone(), node("n2")]));
+
+        assert!(store.groups.contains_key(&ShardGroupId(42)));
+    }
+
+    #[test]
+    fn remove_group_deletes_data() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        store.add_group(shard(42, vec![me.clone()]));
+        store.handle_command(MultiRaftCommand::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: ShardGroupId(42),
+            },
+        ));
+        store.flush();
+        assert!(store.storage.load_state(42) != Default::default());
+
+        store.remove_group(ShardGroupId(42));
+        assert!(store.storage.load_state(42) == Default::default());
+    }
+
+    #[test]
+    fn add_group_noop_when_not_member() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        store.add_group(shard(42, vec![node("n2"), node("n3")]));
+
+        assert!(!store.groups.contains_key(&ShardGroupId(42)));
+    }
+
+    #[test]
+    fn restart_recovers_persisted_state() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+
+        {
+            let db = MetadataStorage::open(path.clone());
+            let mut store = new_store(me.clone(), Box::new(db));
+            store.add_group(shard(1, vec![me.clone()]));
+            store.add_group(shard(2, vec![me.clone()]));
+            store.handle_command(MultiRaftCommand::Timeout(
+                RaftTimeoutCallback::ElectionTimeout {
+                    shard_group_id: ShardGroupId(1),
+                },
+            ));
+            store.handle_command(MultiRaftCommand::Timeout(
+                RaftTimeoutCallback::ElectionTimeout {
+                    shard_group_id: ShardGroupId(2),
+                },
+            ));
+            store.flush();
+        }
+
+        let db = MetadataStorage::open(path);
+        assert!(db.load_state(1) != Default::default());
+        assert!(db.load_state(2) != Default::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit 2 — flush() writes to RocksDB
+    // -----------------------------------------------------------------------
+
+    use crate::clusters::raft::log::LogEntry;
+    use crate::clusters::raft::messages::{AppendEntries, RaftRpc};
+
+    const TEST_GROUP_ID: ShardGroupId = ShardGroupId(42);
+
+    /// Elect n1 as leader of a single-node shard group. Single-node clusters
+    /// become leader immediately on ElectionTimeout (no peers to wait for).
+    fn elect_leader(store: &mut MultiRaft) {
+        store.handle_command(MultiRaftCommand::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: TEST_GROUP_ID,
+            },
+        ));
+    }
+
+    fn propose_noop(store: &mut MultiRaft) -> MultiRaftReply {
+        store.handle_command(MultiRaftCommand::Propose {
+            shard_group_id: TEST_GROUP_ID,
+            command: RaftCommand::Noop,
+        })
+    }
+
+    fn read_entry(store: &MultiRaft, index: u64) -> Option<LogEntry> {
+        let state = store.storage.load_state(TEST_GROUP_ID.0);
+        state.log.into_iter().find(|e| e.index == index)
+    }
+
+    fn read_hard_state(store: &MultiRaft) -> RaftPersistentState {
+        store.storage.load_state(TEST_GROUP_ID.0)
+    }
+
+    #[test]
+    fn flush_persists_log_entry() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        elect_leader(&mut store);
+        store.flush(); // persist election HardState
+
+        propose_noop(&mut store);
+        store.flush();
+
+        // The noop appended by become_leader is index 1; our proposal is index 2.
+        let entry = read_entry(&store, 2).expect("entry 2 must be in RocksDB after flush");
+        assert_eq!(entry.index, 2);
+    }
+
+    #[test]
+    fn flush_persists_hard_state() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        elect_leader(&mut store);
+        store.flush();
+
+        let state = read_hard_state(&store);
+        assert_eq!(state.term, 1, "term must be 1 after first election");
+    }
+
+    #[test]
+    fn stabled_advances_after_flush() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        assert_eq!(store.stabled_for(TEST_GROUP_ID), 0);
+
+        elect_leader(&mut store);
+        store.flush();
+        let after_election = store.stabled_for(TEST_GROUP_ID);
+
+        propose_noop(&mut store);
+        store.flush();
+        let after_propose = store.stabled_for(TEST_GROUP_ID);
+
+        assert!(
+            after_propose > after_election,
+            "stabled must advance after appending an entry"
+        );
+    }
+
+    #[test]
+    fn flush_noop_when_not_dirty() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.flush(); // consume dirty from add_group
+
+        // No state changes — flush should be a no-op and return no events.
+        let events = store.flush();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn flush_truncate_removes_entries_from_rocksdb() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let n2 = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone(), n2.clone()]));
+        store.flush(); // consume add_group dirty
+
+        // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
+        store.handle_command(MultiRaftCommand::PacketReceived {
+            shard_group_id: TEST_GROUP_ID,
+            from: n2.clone(),
+            rpc: RaftRpc::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: n2.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: RaftCommand::Noop,
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: RaftCommand::Noop,
+                    },
+                ],
+                leader_commit: 0,
+            }),
+        });
+        store.flush();
+        assert!(
+            read_entry(&store, 1).is_some(),
+            "entry 1 must exist before truncation"
+        );
+        assert!(
+            read_entry(&store, 2).is_some(),
+            "entry 2 must exist before truncation"
+        );
+
+        // n2 re-sends from index 1 at term 2, conflicting with the existing term-1 entries.
+        // Raft truncates from index 1 and replaces with the new entry.
+        store.handle_command(MultiRaftCommand::PacketReceived {
+            shard_group_id: TEST_GROUP_ID,
+            from: n2.clone(),
+            rpc: RaftRpc::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: n2.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 2,
+                    index: 1,
+                    command: RaftCommand::Noop,
+                }],
+                leader_commit: 0,
+            }),
+        });
+        store.flush();
+
+        let new_entry = read_entry(&store, 1).expect("replacement entry 1 must be in RocksDB");
+        assert_eq!(new_entry.term, 2, "entry 1 must be the term-2 replacement");
+        assert!(
+            read_entry(&store, 2).is_none(),
+            "truncated entry 2 must be gone from RocksDB"
+        );
+    }
+
+    #[test]
+    fn restart_restores_log_entries_and_stabled_index() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+
+        let expected_last_index;
+        {
+            let db = MetadataStorage::open(path.clone());
+            let mut store = new_store(me.clone(), Box::new(db));
+            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            elect_leader(&mut store);
+            store.flush();
+            propose_noop(&mut store);
+            store.flush();
+            expected_last_index = store.groups.get(&TEST_GROUP_ID).unwrap().log_last_index();
+        }
+
+        let db = MetadataStorage::open(path);
+        let mut store = new_store(me.clone(), Box::new(db));
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+        assert_eq!(
+            raft.log_last_index(),
+            expected_last_index,
+            "log must be restored from RocksDB after restart"
+        );
+        assert_eq!(
+            raft.stabled_index(),
+            expected_last_index,
+            "stabled_index must equal last restored log entry"
+        );
+    }
+
+    #[test]
+    fn restart_restores_hard_state() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+        {
+            let db = MetadataStorage::open(path.clone());
+            let mut store = new_store(me.clone(), Box::new(db));
+            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            elect_leader(&mut store);
+            store.flush();
+        }
+
+        let db = MetadataStorage::open(path);
+        let mut store = new_store(me.clone(), Box::new(db));
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+        assert_eq!(raft.current_term(), 1);
+        assert_eq!(raft.voted_for(), Some(node("n1")));
     }
 }
