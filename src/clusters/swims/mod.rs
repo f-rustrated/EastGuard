@@ -15,7 +15,7 @@ pub(crate) use topology::*;
 
 #[cfg(test)]
 pub mod common {
-    use std::{collections::HashMap, net::SocketAddr};
+    use std::net::SocketAddr;
 
     use crate::{
         clusters::{
@@ -31,7 +31,7 @@ pub mod common {
     pub fn make_protocol(local_id: &str, local_port: u16) -> Swim {
         let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
         let topology = Topology::new(
-            HashMap::new(),
+            std::iter::empty(),
             TopologyConfig {
                 vnodes_per_pnode: 256,
                 replication_factor: 3,

@@ -1,5 +1,5 @@
 use murmur3::murmur3_32;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::net::SocketAddr;
 
@@ -38,14 +38,6 @@ pub struct VirtualNodeToken {
     replica_index: u64,
 }
 
-#[derive(Clone, Debug)]
-#[expect(dead_code)]
-pub struct VirtualNode {
-    replica_index: u64,
-    pub pnode_id: NodeId,
-    pnode_metadata: PhysicalNodeMetadata,
-}
-
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ShardLeaderEntry {
@@ -63,8 +55,8 @@ pub struct TopologyConfig {
 #[derive(Clone, Debug)]
 pub struct Topology {
     config: TopologyConfig,
-    /// Consistent hash ring: maps virtual node positions to token owners.
-    vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
+    /// Consistent hash ring: virtual node positions keyed by (hash, pnode_id, replica_index).
+    vnodes: BTreeSet<VirtualNodeToken>,
 
     /// Reverse index: for each physical node, the shard group IDs it participates in.
     /// Rebuilt after every ring mutation. Makes `shard_groups_for_node()` O(1).
@@ -79,25 +71,25 @@ pub struct Topology {
 }
 
 impl Topology {
-    pub fn new(nodes: HashMap<NodeId, PhysicalNodeMetadata>, config: TopologyConfig) -> Self {
+    pub fn new(nodes: impl IntoIterator<Item = NodeId>, config: TopologyConfig) -> Self {
         let mut topology = Self {
             config,
-            vnodes: BTreeMap::new(),
+            vnodes: BTreeSet::new(),
             groups: HashMap::new(),
             node_group_ids: HashMap::new(),
             shard_leaders: HashMap::new(),
         };
-        for (pnode_id, metadata) in nodes {
-            topology.add_pnode(pnode_id, metadata);
+        for pnode_id in nodes {
+            topology.add_pnode(pnode_id);
         }
         topology.rebuild_reverse_index();
         topology
     }
 
-    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: &SwimNodeState) {
+    pub(crate) fn update(&mut self, node_id: NodeId, state: &SwimNodeState) {
         match state {
             SwimNodeState::Alive => {
-                self.insert_node(node_id, PhysicalNodeMetadata { address: addr });
+                self.insert_node(node_id);
             }
             SwimNodeState::Dead => {
                 self.remove_node(&node_id);
@@ -106,15 +98,13 @@ impl Topology {
         }
     }
 
-    fn add_pnode(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata) {
+    fn add_pnode(&mut self, pnode_id: NodeId) {
         if self.node_group_ids.contains_key(&pnode_id) {
             return;
         }
         for replica_index in 0..self.config.vnodes_per_pnode {
-            self.vnodes.insert(
-                generate_vnode_token(&pnode_id, replica_index),
-                generate_vnode(&pnode_id, &metadata, replica_index),
-            );
+            self.vnodes
+                .insert(generate_vnode_token(&pnode_id, replica_index));
         }
     }
 
@@ -129,10 +119,7 @@ impl Topology {
         true
     }
 
-    fn walk_clockwise_from(
-        &self,
-        hash: u32,
-    ) -> impl Iterator<Item = (&VirtualNodeToken, &VirtualNode)> {
+    fn walk_clockwise_from(&self, hash: u32) -> impl Iterator<Item = &VirtualNodeToken> {
         let start = VirtualNodeToken {
             hash,
             pnode_id: NodeId::new(""),
@@ -143,16 +130,16 @@ impl Topology {
             .chain(self.vnodes.range(..&start))
     }
 
-    fn token_owners_at(&self, hash: u32, n: usize) -> Vec<&VirtualNode> {
+    fn token_owners_at(&self, hash: u32, n: usize) -> Vec<&NodeId> {
         if self.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
-        let mut result: Vec<&VirtualNode> = Vec::with_capacity(n);
-        for (_, owner) in self.walk_clockwise_from(hash) {
-            if result.iter().any(|o| o.pnode_id == owner.pnode_id) {
+        let mut result: Vec<&NodeId> = Vec::with_capacity(n);
+        for token in self.walk_clockwise_from(hash) {
+            if result.iter().any(|o| **o == token.pnode_id) {
                 continue;
             }
-            result.push(owner);
+            result.push(&token.pnode_id);
             if result.len() == n {
                 break;
             }
@@ -160,8 +147,8 @@ impl Topology {
         result
     }
 
-    fn insert_node(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata) {
-        self.add_pnode(pnode_id, metadata);
+    fn insert_node(&mut self, pnode_id: NodeId) {
+        self.add_pnode(pnode_id);
         self.rebuild_reverse_index();
     }
 
@@ -180,13 +167,13 @@ impl Topology {
         self.node_group_ids.clear();
         let mut seen = HashSet::new();
 
-        for token in self.vnodes.keys() {
+        for token in &self.vnodes {
             let id = ShardGroupId::from_vnode_hash(token.hash);
             if !seen.insert(id) {
                 continue;
             }
             let owners = self.token_owners_at(token.hash, self.config.replication_factor);
-            let members: Vec<NodeId> = owners.iter().map(|vn| vn.pnode_id.clone()).collect();
+            let members: Vec<NodeId> = owners.into_iter().cloned().collect();
             for member in &members {
                 self.node_group_ids
                     .entry(member.clone())
@@ -198,7 +185,7 @@ impl Topology {
     }
 
     #[allow(dead_code)]
-    pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
+    pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&NodeId> {
         let hash = hash_stable(key);
         self.token_owners_at(hash, n)
     }
@@ -213,7 +200,7 @@ impl Topology {
     #[allow(dead_code)]
     pub fn shard_group_for(&self, key: &[u8]) -> Option<&ShardGroup> {
         let hash = hash_stable(key);
-        let (nearest_token, _) = self.walk_clockwise_from(hash).next()?;
+        let nearest_token = self.walk_clockwise_from(hash).next()?;
         let id = ShardGroupId::from_vnode_hash(nearest_token.hash);
         self.groups.get(&id)
     }
@@ -271,18 +258,6 @@ fn generate_vnode_token(node_id: &NodeId, replica_index: u64) -> VirtualNodeToke
     }
 }
 
-fn generate_vnode(
-    node_id: &NodeId,
-    metadata: &PhysicalNodeMetadata,
-    replica_index: u64,
-) -> VirtualNode {
-    VirtualNode {
-        replica_index,
-        pnode_id: node_id.clone(),
-        pnode_metadata: metadata.clone(),
-    }
-}
-
 /// We shouldn't use DefaultHasher because its algorithm and seed are intentionally unstable across
 /// processes, runs, and Rust versions, making the same input produce different hashes in a
 /// distributed system.
@@ -292,38 +267,19 @@ fn hash_stable(key: &[u8]) -> u32 {
     murmur3_32(&mut cursor, 0).expect("Murmur3 hashing failed")
 }
 
-/// Identity is managed separately via `NodeId`.
-#[derive(Clone, Debug)]
-#[expect(dead_code)]
-pub struct PhysicalNodeMetadata {
-    pub address: SocketAddr,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Builds a `Topology` from explicit `(node_id, socket_addr)` pairs.
-    fn topology_from(nodes: &[(&str, &str)], config: TopologyConfig) -> Topology {
-        let map = nodes
-            .iter()
-            .map(|(id, addr)| {
-                let id = NodeId::new(*id);
-                let address: SocketAddr = addr.parse().expect("invalid socket address");
-                (id, PhysicalNodeMetadata { address })
-            })
-            .collect();
-        Topology::new(map, config)
+    fn topology_from(nodes: &[&str], config: TopologyConfig) -> Topology {
+        let ids = nodes.iter().map(|id| NodeId::new(*id));
+        Topology::new(ids, config)
     }
 
     #[test]
     fn new_builds_correct_node_and_vnode_counts() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
@@ -341,23 +297,14 @@ mod tests {
     #[test]
     fn insert_node_adds_node_and_vnodes_to_ring() {
         let mut topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
             },
         );
 
-        topology.insert_node(
-            NodeId::new("node-3"),
-            PhysicalNodeMetadata {
-                address: "127.0.0.1:8083".parse().unwrap(),
-            },
-        );
+        topology.insert_node(NodeId::new("node-3"));
 
         assert_eq!(topology.node_group_ids.len(), 4);
         assert_eq!(topology.vnodes.len(), 16);
@@ -367,23 +314,14 @@ mod tests {
     #[test]
     fn insert_node_is_idempotent_for_duplicate_id() {
         let mut topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
             },
         );
 
-        topology.insert_node(
-            NodeId::new("node-2"),
-            PhysicalNodeMetadata {
-                address: "127.0.0.1:8082".parse().unwrap(),
-            },
-        );
+        topology.insert_node(NodeId::new("node-2"));
 
         assert_eq!(topology.node_group_ids.len(), 3);
         assert_eq!(topology.vnodes.len(), 12);
@@ -392,11 +330,7 @@ mod tests {
     #[test]
     fn remove_node_cleans_up_node_and_its_vnodes() {
         let mut topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
@@ -412,47 +346,34 @@ mod tests {
 
     #[test]
     fn token_owners_for_returns_distinct_physical_nodes_with_distinct_policy() {
-        let node_names: Vec<String> = (0..3).map(|idx| format!("node-{}", idx)).collect();
-        let node_addrs: Vec<String> = (0..3).map(|idx| format!("127.0.{}.1:8080", idx)).collect();
-        let nodes: Vec<(&str, &str)> = node_names
-            .iter()
-            .zip(node_addrs.iter())
-            .map(|(name, addr)| (name.as_str(), addr.as_str()))
-            .collect();
+        let nodes: Vec<String> = (0..3).map(|idx| format!("node-{}", idx)).collect();
+        let node_strs: Vec<&str> = nodes.iter().map(|s| s.as_str()).collect();
         let topology = topology_from(
-            nodes.as_slice(),
+            &node_strs,
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
             },
         );
 
-        let single_owner: Vec<&VirtualNode> = topology.token_owners_for("hello".as_bytes(), 1);
+        let single_owner = topology.token_owners_for(b"hello", 1);
         assert_eq!(single_owner.len(), 1);
 
-        let multiple_owner = topology.token_owners_for("hello".as_bytes(), 3);
+        let multiple_owner = topology.token_owners_for(b"hello", 3);
         assert_eq!(multiple_owner.len(), 3);
-        let physical_node_ids: HashSet<NodeId> = multiple_owner
-            .iter()
-            .map(|node| node.pnode_id.clone())
-            .collect();
+        let physical_node_ids: HashSet<&NodeId> = multiple_owner.into_iter().collect();
         assert_eq!(physical_node_ids.len(), 3);
     }
 
     #[test]
     fn token_owners_for_limited_to_available_node_count_with_distinct_policy() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
             },
         );
-        // Asking for more replicas than physical nodes exist should return at most 3.
         let owners = topology.token_owners_for(b"any-key", 5);
         assert_eq!(owners.len(), 3);
     }
@@ -460,11 +381,7 @@ mod tests {
     #[test]
     fn removing_primary_owner_promotes_next_node() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 150,
                 replication_factor: 3,
@@ -474,15 +391,15 @@ mod tests {
         let key = b"test-key";
         let owners = topology.token_owners_for(key, 2);
         assert_eq!(owners.len(), 2);
-        let primary_id = owners[0].pnode_id.clone();
-        let successor_id = owners[1].pnode_id.clone();
+        let primary_id = owners[0].clone();
+        let successor_id = owners[1].clone();
 
         let mut topology = topology;
         topology.remove_node(&primary_id);
 
         let new_owners = topology.token_owners_for(key, 1);
         assert_eq!(new_owners.len(), 1);
-        assert_eq!(new_owners[0].pnode_id, successor_id);
+        assert_eq!(*new_owners[0], successor_id);
     }
 
     // --- ShardGroup tests ---
@@ -490,11 +407,7 @@ mod tests {
     #[test]
     fn shard_group_returns_replication_factor_members() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 64,
                 replication_factor: 3,
@@ -504,7 +417,6 @@ mod tests {
         let group = topology.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(group.members.len(), 3);
 
-        // All members should be distinct
         let unique: HashSet<_> = group.members.iter().collect();
         assert_eq!(unique.len(), 3);
     }
@@ -512,11 +424,7 @@ mod tests {
     #[test]
     fn shard_group_deterministic_across_calls() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 64,
                 replication_factor: 3,
@@ -531,11 +439,7 @@ mod tests {
     #[test]
     fn shard_group_id_differs_for_different_keys() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 64,
                 replication_factor: 2,
@@ -545,7 +449,6 @@ mod tests {
         let group_a = topology.shard_group_for(b"topic-alpha").unwrap();
         let group_b = topology.shard_group_for(b"topic-beta").unwrap();
         assert_ne!(group_a.id, group_b.id);
-        // Both IDs must exist in the canonical groups map
         assert!(topology.groups.contains_key(&group_a.id));
         assert!(topology.groups.contains_key(&group_b.id));
     }
@@ -553,14 +456,13 @@ mod tests {
     #[test]
     fn shard_group_limited_to_available_nodes() {
         let topology = topology_from(
-            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
+            &["node-0", "node-1"],
             TopologyConfig {
                 vnodes_per_pnode: 64,
                 replication_factor: 5,
             },
         );
 
-        // Only 2 physical nodes, so group can have at most 2 members
         let group = topology.shard_group_for(b"any-key").unwrap();
         assert_eq!(group.members.len(), 2);
     }
@@ -568,11 +470,7 @@ mod tests {
     #[test]
     fn shard_group_recalculates_on_node_removal() {
         let mut topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 150,
                 replication_factor: 3,
@@ -609,18 +507,13 @@ mod tests {
     #[test]
     fn shard_groups_for_node_includes_all_participating_groups() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
             },
         );
 
-        // With 3 nodes and replication_factor=3, every node is in every group.
         let groups = topology.shard_groups_for_node(&NodeId::new("node-0"));
         assert!(!groups.is_empty());
         for group in &groups {
@@ -632,23 +525,16 @@ mod tests {
     #[test]
     fn shard_groups_for_node_excludes_non_member() {
         let topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-                ("node-3", "127.0.0.1:8083"),
-            ],
+            &["node-0", "node-1", "node-2", "node-3"],
             TopologyConfig {
                 vnodes_per_pnode: 64,
                 replication_factor: 2,
             },
         );
 
-        // With replication_factor=2 and 4 nodes, not every node is in every group.
         let groups_0 = topology.shard_groups_for_node(&NodeId::new("node-0"));
         let groups_3 = topology.shard_groups_for_node(&NodeId::new("node-3"));
 
-        // Each node should have some groups but not all
         let total_vnodes = 4 * 64; // 256
         assert!(groups_0.len() < total_vnodes);
         assert!(groups_3.len() < total_vnodes);
@@ -659,11 +545,7 @@ mod tests {
     #[test]
     fn shard_groups_for_node_empty_after_removal() {
         let mut topology = topology_from(
-            &[
-                ("node-0", "127.0.0.1:8080"),
-                ("node-1", "127.0.0.1:8081"),
-                ("node-2", "127.0.0.1:8082"),
-            ],
+            &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 3,
@@ -680,7 +562,7 @@ mod tests {
     #[test]
     fn update_shard_leader_inserts_new_entry() {
         let mut topology = topology_from(
-            &[("node-0", "127.0.0.1:8080")],
+            &["node-0"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 1,
@@ -703,7 +585,7 @@ mod tests {
     #[test]
     fn update_shard_leader_higher_term_replaces() {
         let mut topology = topology_from(
-            &[("node-0", "127.0.0.1:8080")],
+            &["node-0"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 1,
@@ -734,7 +616,7 @@ mod tests {
     #[test]
     fn update_shard_leader_stale_term_rejected() {
         let mut topology = topology_from(
-            &[("node-0", "127.0.0.1:8080")],
+            &["node-0"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 1,
@@ -773,7 +655,7 @@ mod tests {
     #[test]
     fn shard_leader_survives_node_death() {
         let mut topology = topology_from(
-            &[("node-0", "127.0.0.1:8080"), ("node-1", "127.0.0.1:8081")],
+            &["node-0", "node-1"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 2,
@@ -788,11 +670,7 @@ mod tests {
         };
         topology.update_shard_leader(&info);
 
-        topology.update(
-            NodeId::new("node-0"),
-            "127.0.0.1:8080".parse().unwrap(),
-            &SwimNodeState::Dead,
-        );
+        topology.update(NodeId::new("node-0"), &SwimNodeState::Dead);
 
         let entry = topology.shard_leader(ShardGroupId(42));
         assert!(
@@ -805,7 +683,7 @@ mod tests {
     #[test]
     fn shard_leader_returns_none_for_unknown_group() {
         let topology = topology_from(
-            &[("node-0", "127.0.0.1:8080")],
+            &["node-0"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 1,
@@ -817,7 +695,7 @@ mod tests {
     #[test]
     fn all_shard_leaders_returns_full_map() {
         let mut topology = topology_from(
-            &[("node-0", "127.0.0.1:8080")],
+            &["node-0"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
                 replication_factor: 1,

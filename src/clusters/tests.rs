@@ -127,7 +127,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         NodeId::new(format!("node-local-{}", port).as_str()),
         addr,
         Topology::new(
-            Default::default(),
+            std::iter::empty(),
             TopologyConfig {
                 vnodes_per_pnode: 256,
                 replication_factor: 3,

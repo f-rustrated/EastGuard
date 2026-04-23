@@ -562,7 +562,7 @@ impl Swim {
             self.live_node_tracker
                 .update(node_id.clone(), &member.state);
         }
-        self.topology.update(node_id.clone(), addr, &member.state);
+        self.topology.update(node_id.clone(), &member.state);
 
         if changed {
             tracing::info!(
