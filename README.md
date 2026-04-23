@@ -2,12 +2,7 @@
 
 EastGuard is a zero-controller messaging system designed for flexible scalability and high operability. This project is significantly inspired by the architecture of LinkedIn's Northguard.
 
-## Architecture
 
-EastGuard eliminates the monolithic controller bottleneck found in systems (like Kafka) by separating the Control Plane and Data Plane.
-
-- **Metadata (Control Plane):** Managed via DS-RSM (Dynamically Sharded - Replicated State Machine). Metadata is sharded into vNodes and distributed across the cluster, allowing metadata throughput to scale linearly with the number of brokers.
-- **Storage (Data Plane):** Implements Log Striping. Logical logs are broken into granular Segments dispersed across the cluster, ensuring automatic load balancing without external rebalancing tools.
 
 ## Terms
 
@@ -69,7 +64,103 @@ cargo run --bin server -- \
 --join-interval-ms 500
 ```
 
+
+
+## Architecture
+
+EastGuard eliminates the monolithic controller bottleneck found in systems (like Kafka) by separating the Control Plane and Data Plane.
+
+
+- **Storage (Data Plane):** Implements Log Striping. Logical logs are broken into granular Segments dispersed across the cluster, ensuring automatic load balancing without external rebalancing tools.
+
+### Metadata Management 
+Managed via DS-RSM (Dynamically Sharded - Replicated State Machine). Metadata is sharded into vNodes and distributed across the cluster, allowing metadata throughput to scale linearly with the number of brokers.
+
+#### Leader Discovery (SWIM / UDP)
+
+Raft decides who the leader is; SWIM tells the rest of the cluster. When a Raft instance emits `LeaderChange`, the local `MultiRaftActor` forwards it to SWIM via `AnnounceShardLeader`. SWIM stores it in the topology, enqueues it into a dissemination buffer, and piggybacks it on regular protocol packets (Ping, Ack, PingReq) for epidemic spread. Information flows **one way: Raft → SWIM**, never the reverse. SWIM never tells Raft about leadership — it only sends membership events (node join/death) that affect the peer set. Topology's `shard_leaders` map is an eventually-consistent read cache; stale entries are harmless since the next election's higher term overwrites them.
+
+```mermaid
+sequenceDiagram
+    box rgb(30, 40, 60) Node A
+        participant MRA_A as MultiRaftActor<br/>(Manages Rafts)
+        participant Swim_A as SwimActor<br/>(Topo & Gossip)
+    end
+
+    box rgb(60, 40, 40) Node B
+        participant Swim_B as SwimActor<br/>(Topo & Gossip)
+    end
+
+    Note over MRA_A: Step 1: Raft Election
+    MRA_A->>MRA_A: Raft Instance wins election
+
+    Note over MRA_A, Swim_A: Step 2: Local Routing
+    MRA_A->>Swim_A: AnnounceShardLeader
+
+    Note over Swim_A: Step 3: State & Gossip Update
+    Swim_A->>Swim_A: Update Topology<br/>Enqueue to Gossip Buffer
+
+    Note over Swim_A, Swim_B: Step 4: Piggybacked Transport
+    Swim_A->>Swim_B: UDP Ping/Ack + [ShardLeaderInfo]
+
+    Note over Swim_B: Step 5: Receive & Process
+    Swim_B->>Swim_B: Update Topology
+    
+    opt info.term > existing.term
+        Swim_B->>Swim_B: Enqueue to Gossip Buffer
+        Note over Swim_B: Step 6: O(log N) Epidemic Spread<br/>Piggybacks to Nodes C, D, E...
+    end
+
+```
+
+
+#### Leadership Lifecycle (TCP + UDP)
+
+Full picture: election happens over TCP (Raft RPCs), then leadership knowledge spreads over UDP (SWIM gossip). Both paths run concurrently after election — followers learn the leader immediately via AppendEntries (TCP), while the rest of the cluster converges in O(log N) rounds via piggybacked gossip (UDP).
+
+```mermaid
+sequenceDiagram
+    box rgb(30, 40, 60) Node A
+        participant MRA_A as MultiRaftActor<br/>(Raft & Transport)
+        participant Swim_A as SwimActor<br/>(Topo & Gossip)
+    end
+
+    box rgb(60, 40, 40) Node B
+        participant MRA_B as MultiRaftActor<br/>(Raft & Transport)
+        participant Swim_B as SwimActor<br/>(Topo & Gossip)
+    end
+
+    box rgb(40, 60, 40) Node C
+        participant Swim_C as SwimActor<br/>(Topo & Gossip)
+    end
+
+    Note over MRA_A, MRA_B: Phase 1: Raft Election (TCP)
+    MRA_A->>MRA_B: TCP RequestVote
+    MRA_B->>MRA_A: TCP RequestVoteResponse (Granted)
+    MRA_A->>MRA_A: Quorum Reached → Becomes Leader
+
+    Note over MRA_A, Swim_A: Phase 2: Leader Emits Events
+    MRA_A->>Swim_A: AnnounceShardLeader
+
+    par TCP Path — Raft Replication
+        Note over MRA_A, MRA_B: Phase 3a: Heartbeats (TCP)
+        MRA_A->>MRA_B: TCP AppendEntries
+        MRA_B->>MRA_B: Recognizes Leader (A)
+        MRA_B->>MRA_A: TCP AppendEntriesResponse (Success)
+        MRA_A->>MRA_A: Advance Commit Index
+    and UDP Path — Gossip Spread
+        Note over Swim_A, Swim_C: Phase 3b: Epidemic Propagation (UDP)
+        Swim_A->>Swim_B: UDP Ping/Ack + [ShardLeaderInfo]
+        Swim_B->>Swim_B: Update Topology
+        Swim_B->>Swim_C: UDP Piggyback to Node C...<br/>(O(log N) convergence)
+    end
+```
+
+
+
+
 ## References
 
 - [Northguard](https://www.linkedin.com/blog/engineering/infrastructure/introducing-northguard-and-xinfra)
 - [SWIM](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+

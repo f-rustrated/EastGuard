@@ -181,7 +181,7 @@ impl Environment {
             NodeId::new(self.resolve_node_id()),
             self.advertise_peer_addr(),
             Topology::new(
-                Default::default(),
+                std::iter::empty(),
                 TopologyConfig {
                     vnodes_per_pnode: self.vnodes_per_node,
                     replication_factor: 3,

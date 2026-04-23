@@ -74,7 +74,12 @@ impl SwimActor {
                 .into(),
             ),
             MembershipEvent::NodeAlive { node_id, .. } => {
-                let affected_groups = state.topology.shard_groups_for_node(&node_id);
+                let affected_groups: Vec<_> = state
+                    .topology
+                    .shard_groups_for_node(&node_id)
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 if affected_groups.is_empty() {
                     return None;
                 }
