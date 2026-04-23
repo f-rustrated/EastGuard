@@ -116,7 +116,9 @@ impl Db {
     }
 
     fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
+        //ReadOptions mutated per-call — set_iterate_upper_bound(end.to_vec()) changes each time. Can't reuse.
         let mut opts = rocksdb::ReadOptions::default();
+
         opts.set_iterate_upper_bound(end.to_vec());
         self.db
             .iterator_opt(
@@ -132,10 +134,7 @@ impl Db {
         let Some(bytes) = self
             .db
             .get(ShardCfKey::HardState.encode_for(group_id))
-            .unwrap_or_else(|e| {
-                tracing::error!("RocksDB get error: {}", e);
-                None
-            })
+            .unwrap_or_default()
         else {
             return RaftPersistentState::default();
         };
@@ -144,15 +143,14 @@ impl Db {
             bincode::decode_from_slice::<(u64, Option<NodeId>), _>(&bytes, BINCODE_CONFIG)
                 .expect("corrupt HardState");
 
-        let log = self.get_log_entries(group_id);
         RaftPersistentState {
             term,
             voted_for,
-            log,
+            log: self.list_log_entires(group_id),
         }
     }
 
-    fn get_log_entries(&self, group_id: u64) -> Vec<LogEntry> {
+    fn list_log_entires(&self, group_id: u64) -> Vec<LogEntry> {
         let start = ShardCfKey::LogEntry(0).encode_for(group_id);
         let end = ShardCfKey::HardState.encode_for(group_id);
         self.scan_range(&start, &end)
