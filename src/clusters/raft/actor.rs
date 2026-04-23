@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use crate::clusters::NodeId;
-use crate::storage::Db;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
+use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::SwimCommand;
 use crate::schedulers::ticker_message::TickerCommand;
 
@@ -17,13 +17,13 @@ pub struct MultiRaftActor;
 impl MultiRaftActor {
     pub async fn run(
         node_id: NodeId,
-        db: Db,
+        storage: Box<dyn RaftStorage>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
         swim_tx: mpsc::Sender<SwimCommand>,
     ) {
-        let mut store = MultiRaft::new(node_id, db);
+        let mut store = MultiRaft::new(node_id, storage);
         let mut buf = Vec::with_capacity(64);
         let mut deferred: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(64);
 

@@ -1,6 +1,10 @@
 use crate::clusters::{
     BINCODE_CONFIG, NodeId,
-    raft::{log::LogEntry, messages::LogMutation, storage::RaftPersistentState},
+    raft::{
+        log::LogEntry,
+        messages::LogMutation,
+        storage::{RaftPersistentState, RaftStorage},
+    },
     swims::ShardGroupId,
 };
 
@@ -78,26 +82,17 @@ impl DbOp {
 
 /// Opaque handle to the node's RocksDB instance.
 /// Callers interact only through this API — `rocksdb` does not leak outside this module.
-pub(crate) struct Db {
-    db: rocksdb::DB,
-}
+pub(crate) struct Db(rocksdb::DB);
 
 impl Db {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, &path).expect("failed to open RocksDB");
-        Self { db }
+        Self(db)
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).unwrap_or_else(|e| {
-            tracing::error!("RocksDB get error: {}", e);
-            None
-        })
-    }
-
-    pub(crate) fn write_batch(&self, operations: &[DbOp]) {
+    fn write_batch(&self, operations: &[DbOp]) {
         let mut batch = rocksdb::WriteBatch::default();
         for operation in operations {
             match operation {
@@ -113,15 +108,15 @@ impl Db {
         // Raft safety requires WAL sync before acknowledging writes
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
-        self.db
+        self.0
             .write_opt(batch, &write_opts)
             .expect("failed to write batch");
     }
 
-    pub(crate) fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_iterate_upper_bound(end.to_vec());
-        self.db
+        self.0
             .iterator_opt(
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
                 opts,
@@ -132,7 +127,14 @@ impl Db {
     }
 
     pub(crate) fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
-        let Some(bytes) = self.get(&ShardCfKey::HardState.encode_for(group_id)) else {
+        let Some(bytes) = self
+            .0
+            .get(&ShardCfKey::HardState.encode_for(group_id))
+            .unwrap_or_else(|e| {
+                tracing::error!("RocksDB get error: {}", e);
+                None
+            })
+        else {
             return RaftPersistentState::default();
         };
 
@@ -148,7 +150,7 @@ impl Db {
         }
     }
 
-    pub(crate) fn get_log_entries(&self, group_id: u64) -> Vec<LogEntry> {
+    fn get_log_entries(&self, group_id: u64) -> Vec<LogEntry> {
         let start = ShardCfKey::LogEntry(0).encode_for(group_id);
         let end = ShardCfKey::HardState.encode_for(group_id);
         self.scan_range(&start, &end)
@@ -161,17 +163,30 @@ impl Db {
             .collect()
     }
 
-    pub(crate) fn delete_range(&self, group_id: ShardGroupId) {
+    fn delete_range(&self, group_id: ShardGroupId) {
         let start: &[u8] = &group_id.0.to_be_bytes();
         let end: &[u8] = &(group_id.0 + 1).to_be_bytes();
 
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(start, end);
-        self.db.write(batch).expect("failed to delete range");
+        self.0.write(batch).expect("failed to delete range");
+    }
+}
+
+impl RaftStorage for Db {
+    fn load_state(&self, group_id: u64) -> RaftPersistentState {
+        self.take_persistent_state_for(group_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_key(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).ok().flatten()
+    fn persist_mutations(&self, mutations: Vec<(ShardGroupId, LogMutation)>) {
+        let batch: Vec<DbOp> = mutations
+            .into_iter()
+            .map(|(id, log)| DbOp::from_log(&id, log))
+            .collect();
+        self.write_batch(&batch);
+    }
+
+    fn delete_group(&self, group_id: ShardGroupId) {
+        self.delete_range(group_id);
     }
 }

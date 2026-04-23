@@ -3,19 +3,19 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
+    LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
     RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
 
+use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::storage::{Db, DbOp};
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
-    db: Db,
+    storage: Box<dyn RaftStorage>,
     groups: HashMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
@@ -23,10 +23,10 @@ pub(crate) struct MultiRaft {
 }
 
 impl MultiRaft {
-    pub(crate) fn new(node_id: NodeId, db: Db) -> Self {
+    pub(crate) fn new(node_id: NodeId, storage: Box<dyn RaftStorage>) -> Self {
         Self {
             node_id,
-            db,
+            storage,
             groups: HashMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
@@ -101,7 +101,7 @@ impl MultiRaft {
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
-        let persistent = self.db.take_persistent_state_for(group.id.0);
+        let persistent = self.storage.load_state(group.id.0);
 
         let raft = Raft::new(
             self.node_id.clone(),
@@ -138,7 +138,7 @@ impl MultiRaft {
                 seq: raft.heartbeat_seq(),
             }));
 
-        self.db.delete_range(group_id);
+        self.storage.delete_group(group_id);
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
@@ -223,7 +223,7 @@ impl MultiRaft {
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
         let dirty: Vec<ShardGroupId> = std::mem::take(&mut self.dirty).into_iter().collect();
-        let mut batch: Vec<DbOp> = vec![];
+        let mut mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
         let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
 
         for id in &dirty {
@@ -233,13 +233,13 @@ impl MultiRaft {
 
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
-                batch.push(DbOp::from_log(id, log));
+                mutations.push((*id, log));
             }
             self.pending_events.extend(raft.take_events());
         }
 
-        if !batch.is_empty() {
-            self.db.write_batch(&batch);
+        if !mutations.is_empty() {
+            self.storage.persist_mutations(mutations);
 
             for (id, last_log_index) in last_indices {
                 if let Some(raft) = self.groups.get_mut(&id) {
@@ -271,10 +271,9 @@ impl MultiRaft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::BINCODE_CONFIG;
 
     use crate::clusters::raft::storage::RaftPersistentState;
-    use crate::storage::ShardCfKey;
+    use crate::storage::Db;
     use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {
@@ -298,21 +297,21 @@ mod tests {
             .collect()
     }
 
-    fn temp_db() -> (Db, std::path::PathBuf) {
+    fn temp_storage() -> (Box<dyn RaftStorage>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let db = Db::open(path.clone());
-        (db, path)
+        (Box::new(db), path)
     }
 
-    fn new_store(node_id: NodeId, db: Db) -> MultiRaft {
-        MultiRaft::new(node_id, db)
+    fn new_store(node_id: NodeId, storage: Box<dyn RaftStorage>) -> MultiRaft {
+        MultiRaft::new(node_id, storage)
     }
 
     #[test]
     fn timer_seqs_are_unique_across_groups() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(1, vec![me.clone(), node("n2")]));
         store.add_group(shard(2, vec![me.clone(), node("n2")]));
@@ -325,9 +324,9 @@ mod tests {
 
     #[test]
     fn add_group_registers_in_memory() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![me.clone(), node("n2")]));
 
@@ -336,9 +335,9 @@ mod tests {
 
     #[test]
     fn remove_group_deletes_data() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![me.clone()]));
         store.handle_command(MultiRaftCommand::Timeout(
@@ -347,17 +346,17 @@ mod tests {
             },
         ));
         store.flush();
-        assert!(store.db.take_persistent_state_for(42) != Default::default());
+        assert!(store.storage.load_state(42) != Default::default());
 
         store.remove_group(ShardGroupId(42));
-        assert!(store.db.take_persistent_state_for(42) == Default::default());
+        assert!(store.storage.load_state(42) == Default::default());
     }
 
     #[test]
     fn add_group_noop_when_not_member() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![node("n2"), node("n3")]));
 
@@ -371,10 +370,9 @@ mod tests {
 
         {
             let db = Db::open(path.clone());
-            let mut store = new_store(me.clone(), db);
+            let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(1, vec![me.clone()]));
             store.add_group(shard(2, vec![me.clone()]));
-            // Trigger elections to produce HardState mutations
             store.handle_command(MultiRaftCommand::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
@@ -389,8 +387,8 @@ mod tests {
         }
 
         let db = Db::open(path);
-        assert!(db.take_persistent_state_for(1) != Default::default());
-        assert!(db.take_persistent_state_for(2) != Default::default());
+        assert!(db.load_state(1) != Default::default());
+        assert!(db.load_state(2) != Default::default());
     }
 
     // -----------------------------------------------------------------------
@@ -420,21 +418,19 @@ mod tests {
     }
 
     fn read_entry(store: &MultiRaft, index: u64) -> Option<LogEntry> {
-        let key = ShardCfKey::LogEntry(index).encode_for(TEST_GROUP_ID.0);
-        let bytes = store.db.get_key(&key)?;
-        let (entry, _) = bincode::decode_from_slice::<LogEntry, _>(&bytes, BINCODE_CONFIG).ok()?;
-        Some(entry)
+        let state = store.storage.load_state(TEST_GROUP_ID.0);
+        state.log.into_iter().find(|e| e.index == index)
     }
 
     fn read_hard_state(store: &MultiRaft) -> RaftPersistentState {
-        store.db.take_persistent_state_for(TEST_GROUP_ID.0)
+        store.storage.load_state(TEST_GROUP_ID.0)
     }
 
     #[test]
     fn flush_persists_log_entry() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
@@ -450,9 +446,9 @@ mod tests {
 
     #[test]
     fn flush_persists_hard_state() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
@@ -464,9 +460,9 @@ mod tests {
 
     #[test]
     fn stabled_advances_after_flush() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         assert_eq!(store.stabled_for(TEST_GROUP_ID), 0);
@@ -487,9 +483,9 @@ mod tests {
 
     #[test]
     fn flush_noop_when_not_dirty() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
         store.flush(); // consume dirty from add_group
 
@@ -500,10 +496,10 @@ mod tests {
 
     #[test]
     fn flush_truncate_removes_entries_from_rocksdb() {
-        let (db, _) = temp_db();
+        let (storage, _) = temp_storage();
         let me = node("n1");
         let n2 = node("n2");
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), storage);
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone(), n2.clone()]));
         store.flush(); // consume add_group dirty
 
@@ -577,7 +573,7 @@ mod tests {
         let expected_last_index;
         {
             let db = Db::open(path.clone());
-            let mut store = new_store(me.clone(), db);
+            let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
             store.flush();
@@ -587,7 +583,7 @@ mod tests {
         }
 
         let db = Db::open(path);
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), Box::new(db));
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
@@ -609,14 +605,14 @@ mod tests {
         let me = node("n1");
         {
             let db = Db::open(path.clone());
-            let mut store = new_store(me.clone(), db);
+            let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
             store.flush();
         }
 
         let db = Db::open(path);
-        let mut store = new_store(me.clone(), db);
+        let mut store = new_store(me.clone(), Box::new(db));
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
         assert_eq!(raft.current_term(), 1);

@@ -117,7 +117,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 let db = Db::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
                 tokio::spawn(MultiRaftActor::run(
                     node_id,
-                    db,
+                    Box::new(db),
                     raft_mailbox,
                     transport_tx,
                     ticker_tx,
