@@ -112,10 +112,11 @@ impl MultiRaft {
 
         let persistent = if cf_exist {
             let (term, voted_for) = get_hard_state(&self.db, &cf_name).unwrap_or_default();
+            let log = get_log_entries(&self.db, &cf_name);
             RaftPersistentState {
                 term,
                 voted_for,
-                log: get_log_entries(&self.db, &cf_name),
+                log
             }
         } else {
             RaftPersistentState::default()
