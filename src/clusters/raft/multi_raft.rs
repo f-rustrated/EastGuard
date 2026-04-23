@@ -273,7 +273,7 @@ mod tests {
     use super::*;
 
     use crate::clusters::raft::storage::RaftPersistentState;
-    use crate::storage::Db;
+    use crate::impls::metadata_storage::MetadataStorage;
     use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {
@@ -299,7 +299,7 @@ mod tests {
 
     fn temp_storage() -> (Box<dyn RaftStorage>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let db = Db::open(path.clone());
+        let db = MetadataStorage::open(path.clone());
         (Box::new(db), path)
     }
 
@@ -369,7 +369,7 @@ mod tests {
         let me = node("n1");
 
         {
-            let db = Db::open(path.clone());
+            let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(1, vec![me.clone()]));
             store.add_group(shard(2, vec![me.clone()]));
@@ -386,7 +386,7 @@ mod tests {
             store.flush();
         }
 
-        let db = Db::open(path);
+        let db = MetadataStorage::open(path);
         assert!(db.load_state(1) != Default::default());
         assert!(db.load_state(2) != Default::default());
     }
@@ -572,7 +572,7 @@ mod tests {
 
         let expected_last_index;
         {
-            let db = Db::open(path.clone());
+            let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
@@ -582,7 +582,7 @@ mod tests {
             expected_last_index = store.groups.get(&TEST_GROUP_ID).unwrap().log_last_index();
         }
 
-        let db = Db::open(path);
+        let db = MetadataStorage::open(path);
         let mut store = new_store(me.clone(), Box::new(db));
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
@@ -604,14 +604,14 @@ mod tests {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let me = node("n1");
         {
-            let db = Db::open(path.clone());
+            let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
             store.flush();
         }
 
-        let db = Db::open(path);
+        let db = MetadataStorage::open(path);
         let mut store = new_store(me.clone(), Box::new(db));
         store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();

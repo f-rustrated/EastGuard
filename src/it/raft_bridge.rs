@@ -11,10 +11,10 @@ use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker_message::TickerCommand;
-use crate::storage::Db;
 
 const CLUSTER_PORT: u16 = 19000;
 const QUERY_PORT: u16 = 29000;
@@ -79,7 +79,7 @@ async fn start_raft_node(
         swim_tx.clone(),
     ));
 
-    let db = Db::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
+    let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     tokio::spawn(MultiRaftActor::run(
         node_id,
         Box::new(db),

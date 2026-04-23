@@ -4,11 +4,11 @@ mod config;
 mod connections;
 
 mod clusters;
-pub(crate) mod storage;
 
 mod net;
 pub(crate) mod schedulers;
 
+pub(crate) mod impls;
 #[cfg(test)]
 mod it;
 pub(crate) mod macros;
@@ -19,6 +19,7 @@ use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
 use crate::connections::request::QueryCommand;
+use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
@@ -95,7 +96,7 @@ impl StartUp {
             swim_ticker_tx,
             raft_tx,
         ));
-        let raft_db = crate::storage::Db::open(self.env.raft_db_path());
+        let raft_db = MetadataStorage::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
             node_id,
             Box::new(raft_db),

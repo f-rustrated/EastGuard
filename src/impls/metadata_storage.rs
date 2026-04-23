@@ -82,12 +82,12 @@ impl DbOp {
 
 /// Opaque handle to the node's RocksDB instance.
 /// Callers interact only through this API — `rocksdb` does not leak outside this module.
-pub(crate) struct Db {
+pub(crate) struct MetadataStorage {
     db: rocksdb::DB,
     sync_opts: rocksdb::WriteOptions,
 }
 
-impl Db {
+impl MetadataStorage {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
@@ -175,7 +175,7 @@ impl Db {
     }
 }
 
-impl RaftStorage for Db {
+impl RaftStorage for MetadataStorage {
     fn load_state(&self, group_id: u64) -> RaftPersistentState {
         self.take_persistent_state_for(group_id)
     }
