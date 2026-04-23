@@ -4,10 +4,12 @@ use std::hash::{Hash, Hasher};
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
     LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
-    RaftTimeoutCallback,
+    RaftPersistentState, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
-use crate::clusters::raft::storage::{delete_from, get_hard_state, put_hard_state, put_log_entry};
+use crate::clusters::raft::storage::{
+    delete_from, get_hard_state, get_log_entries, put_hard_state, put_log_entry,
+};
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
 use crate::storage::{Db, DbOp, shard_cf_name};
@@ -106,18 +108,21 @@ impl MultiRaft {
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
-        let (current_term, voted_for) =
-            if cf_exist && let Some(value) = get_hard_state(&self.db, &cf_name) {
-                value
-            } else {
-                (0, None)
-            };
+        let persistent = if cf_exist {
+            let (term, voted_for) = get_hard_state(&self.db, &cf_name).unwrap_or_default();
+            RaftPersistentState {
+                term,
+                voted_for,
+                log: get_log_entries(&self.db, &cf_name),
+            }
+        } else {
+            RaftPersistentState::default()
+        };
 
         let raft = Raft::new(
             self.node_id.clone(),
             peers,
-            current_term,
-            voted_for,
+            persistent,
             jitter,
             group.id,
             election_seq,
@@ -575,6 +580,40 @@ mod tests {
         assert!(
             read_entry(&store, 2).is_none(),
             "truncated entry 2 must be gone from RocksDB"
+        );
+    }
+
+    #[test]
+    fn restart_restores_log_entries_and_stabled_index() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+
+        let expected_last_index;
+        {
+            let db = Db::open(path.clone());
+            let mut store = new_store(me.clone(), db);
+            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            elect_leader(&mut store);
+            store.flush();
+            propose_noop(&mut store);
+            store.flush();
+            expected_last_index = store.groups.get(&TEST_GROUP_ID).unwrap().log_last_index();
+        }
+
+        let db = Db::open(path);
+        let mut store = new_store(me.clone(), db);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+        assert_eq!(
+            raft.log_last_index(),
+            expected_last_index,
+            "log must be restored from RocksDB after restart"
+        );
+        assert_eq!(
+            raft.stabled_index(),
+            expected_last_index,
+            "stabled_index must equal last restored log entry"
         );
     }
 

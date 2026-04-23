@@ -132,6 +132,23 @@ impl Db {
         self.db.write(batch).expect("failed to write batch");
     }
 
+    pub(crate) fn scan_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
+        let Some(cf) = self.db.cf_handle(cf_name) else {
+            return vec![];
+        };
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_upper_bound(end.to_vec());
+        self.db
+            .iterator_cf_opt(
+                &cf,
+                opts,
+                rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+            )
+            .flatten()
+            .map(|(_, v)| v.to_vec())
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn get_cf(&self, cf_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let cf = self.db.cf_handle(cf_name)?;

@@ -66,24 +66,24 @@ impl Raft {
     pub(crate) fn new(
         node_id: NodeId,
         peers: HashSet<NodeId>,
-        current_term: u64,
-        voted_for: Option<NodeId>,
+        persistent: RaftPersistentState,
         election_jitter: u32,
         shard_group_id: ShardGroupId,
         election_seq: u32,
         heartbeat_seq: u32,
     ) -> Self {
+        let stabled_index = persistent.stabled_index();
         let mut raft = Self {
             node_id,
             shard_group_id,
             peers,
-            current_term,
-            voted_for,
-            log: Vec::new(),
+            current_term: persistent.term,
+            voted_for: persistent.voted_for,
+            log: persistent.log,
             pending_log_mutations: Vec::new(),
             pending_events: Vec::new(),
             commit_index: 0,
-            stabled_index: 0,
+            stabled_index,
             last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
@@ -746,13 +746,13 @@ mod tests {
     }
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0, None, 0, TEST_SHARD, 0, 1)
+        Raft::new(node("node-1"), HashSet::new(), RaftPersistentState::default(), 0, TEST_SHARD, 0, 1)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, None, 0, TEST_SHARD, 0, 1)
+        Raft::new(node(id), peers, RaftPersistentState::default(), 0, TEST_SHARD, 0, 1)
     }
 
     // -------------------------------------------------------------------
@@ -1445,7 +1445,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0, None, 0, TEST_SHARD, 0, 1);
+            let raft = Raft::new(NodeId::new("self"), peers, RaftPersistentState::default(), 0, TEST_SHARD, 0, 1);
 
             assert_eq!(
                 raft.quorum(),

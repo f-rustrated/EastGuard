@@ -13,15 +13,25 @@ pub struct LeaderChange {
     pub term: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RaftPersistentState {
+    pub(crate) term: u64,
+    pub(crate) voted_for: Option<NodeId>,
+    pub(crate) log: Vec<LogEntry>,
+}
+
+impl RaftPersistentState {
+    pub(crate) fn stabled_index(&self) -> u64 {
+        self.log.last().map_or(0, |e| e.index)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LogMutation {
     Append(LogEntry),
     TruncateFrom(u64),
-    HardState {
-        term: u64,
-        voted_for: Option<NodeId>,
-    },
+    HardState { term: u64, voted_for: Option<NodeId> },
 }
 
 #[derive(Debug)]
