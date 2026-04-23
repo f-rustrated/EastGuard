@@ -12,8 +12,8 @@ pub(crate) const CF_SHARD_PREFIX: &str = "shard-";
 ///   0x05           →  AppliedIndex    (1 byte)
 ///   0x06           →  Epoch           (1 byte)
 ///
-/// Metadata keys (0x02–0x06) sort strictly before all log entries (0x01…).
-/// delete_range on 0x01..0x01+MAX safely compacts only log entries.
+/// Log entries (0x01…) sort strictly before metadata keys (0x02–0x06).
+/// delete_range on 0x01..0x02 safely compacts only log entries.
 #[allow(dead_code)]
 pub(crate) enum ShardCfKey {
     /// Raft log entry at the given 1-based index.
