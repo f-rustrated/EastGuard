@@ -82,14 +82,19 @@ impl DbOp {
 
 /// Opaque handle to the node's RocksDB instance.
 /// Callers interact only through this API — `rocksdb` does not leak outside this module.
-pub(crate) struct Db(rocksdb::DB);
+pub(crate) struct Db {
+    db: rocksdb::DB,
+    sync_opts: rocksdb::WriteOptions,
+}
 
 impl Db {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, &path).expect("failed to open RocksDB");
-        Self(db)
+        let mut sync_opts = rocksdb::WriteOptions::default();
+        sync_opts.set_sync(true);
+        Self { db, sync_opts }
     }
 
     fn write_batch(&self, operations: &[DbOp]) {
@@ -105,18 +110,15 @@ impl Db {
             }
         }
 
-        // Raft safety requires WAL sync before acknowledging writes
-        let mut write_opts = rocksdb::WriteOptions::default();
-        write_opts.set_sync(true);
-        self.0
-            .write_opt(batch, &write_opts)
+        self.db
+            .write_opt(batch, &self.sync_opts)
             .expect("failed to write batch");
     }
 
     fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_iterate_upper_bound(end.to_vec());
-        self.0
+        self.db
             .iterator_opt(
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
                 opts,
@@ -128,7 +130,7 @@ impl Db {
 
     fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
         let Some(bytes) = self
-            .0
+            .db
             .get(ShardCfKey::HardState.encode_for(group_id))
             .unwrap_or_else(|e| {
                 tracing::error!("RocksDB get error: {}", e);
@@ -169,7 +171,9 @@ impl Db {
 
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(start, end);
-        self.0.write(batch).expect("failed to delete range");
+        self.db
+            .write_opt(batch, &self.sync_opts)
+            .expect("failed to delete range");
     }
 }
 
