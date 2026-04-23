@@ -21,7 +21,7 @@ pub(crate) enum ShardCfKey {
 }
 
 impl ShardCfKey {
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Vec<u8> {
         match self {
             ShardCfKey::LogEntry(index) => {
                 let mut key = Vec::with_capacity(9);
@@ -37,7 +37,7 @@ impl ShardCfKey {
         }
     }
 
-    pub(crate) fn encode_for(&self, group_id: u64) -> Vec<u8> {
+    fn encode_for(&self, group_id: u64) -> Vec<u8> {
         let suffix = self.encode();
         let mut key = Vec::with_capacity(8 + suffix.len());
         key.extend_from_slice(&group_id.to_be_bytes());
@@ -126,7 +126,7 @@ impl Db {
             .collect()
     }
 
-    pub(crate) fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
+    fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
         let Some(bytes) = self
             .0
             .get(ShardCfKey::HardState.encode_for(group_id))
