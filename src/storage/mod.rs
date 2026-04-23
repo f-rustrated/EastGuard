@@ -129,7 +129,7 @@ impl Db {
     pub(crate) fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
         let Some(bytes) = self
             .0
-            .get(&ShardCfKey::HardState.encode_for(group_id))
+            .get(ShardCfKey::HardState.encode_for(group_id))
             .unwrap_or_else(|e| {
                 tracing::error!("RocksDB get error: {}", e);
                 None
