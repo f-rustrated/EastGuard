@@ -129,7 +129,12 @@ impl Db {
             }
         }
 
-        self.db.write(batch).expect("failed to write batch");
+        // ! SAFETY: without the following sync option, Raft's safety is not guaranteed
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &write_opts)
+            .expect("failed to write batch");
     }
 
     pub(crate) fn scan_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
