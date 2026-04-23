@@ -573,7 +573,7 @@ impl Raft {
     }
 
     pub(crate) fn advance_stabled_index(&mut self, value: u64) {
-        self.stabled_index = value;
+        self.stabled_index = self.stabled_index.max(value);
     }
 
     #[cfg(test)]

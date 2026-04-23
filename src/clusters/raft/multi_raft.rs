@@ -102,6 +102,7 @@ impl MultiRaft {
         let jitter = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.node_id.hash(&mut hasher);
+            group.id.0.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
 
