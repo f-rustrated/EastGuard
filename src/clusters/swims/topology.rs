@@ -1,5 +1,5 @@
 use murmur3::murmur3_32;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::net::SocketAddr;
 
@@ -55,49 +55,78 @@ pub struct ShardLeaderEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct TopologyConfig {
+    pub vnodes_per_pnode: u64,
+    pub replication_factor: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct Topology {
     config: TopologyConfig,
     /// Consistent hash ring: maps virtual node positions to token owners.
-    ring: TokenRing,
-    /// Reverse index: for each physical node, the set of shard groups it participates in.
+    vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
+
+    /// Reverse index: for each physical node, the shard group IDs it participates in.
     /// Rebuilt after every ring mutation. Makes `shard_groups_for_node()` O(1).
-    node_groups: HashMap<NodeId, HashMap<ShardGroupId, ShardGroup>>,
+    node_group_ids: HashMap<NodeId, Vec<ShardGroupId>>,
+
+    /// Canonical shard group definitions, keyed by ShardGroupId (= nearest vnode's token hash).
+    /// Each group maps a ring position to the RF physical nodes responsible for it.
+    groups: HashMap<ShardGroupId, ShardGroup>,
     /// Shard leader map: tracks current leader for each shard group.
     /// NOT auto-cleared on node death — Raft re-election gossips new leader with higher term.
     shard_leaders: HashMap<ShardGroupId, ShardLeaderEntry>,
 }
 
-#[derive(Default, Clone, Debug)]
-struct TokenRing {
-    vnodes: BTreeMap<VirtualNodeToken, VirtualNode>,
-    pnodes: HashMap<NodeId, PhysicalNodeMetadata>,
-}
+impl Topology {
+    pub fn new(nodes: HashMap<NodeId, PhysicalNodeMetadata>, config: TopologyConfig) -> Self {
+        let mut topology = Self {
+            config,
+            vnodes: BTreeMap::new(),
+            groups: HashMap::new(),
+            node_group_ids: HashMap::new(),
+            shard_leaders: HashMap::new(),
+        };
+        for (pnode_id, metadata) in nodes {
+            topology.add_pnode(pnode_id, metadata);
+        }
+        topology.rebuild_reverse_index();
+        topology
+    }
 
-impl TokenRing {
-    fn add_pnode(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata, vnode_cnt: u64) {
-        if self.pnodes.contains_key(&pnode_id) {
+    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: &SwimNodeState) {
+        match state {
+            SwimNodeState::Alive => {
+                self.insert_node(node_id, PhysicalNodeMetadata { address: addr });
+            }
+            SwimNodeState::Dead => {
+                self.remove_node(&node_id);
+            }
+            SwimNodeState::Suspect => {}
+        }
+    }
+
+    fn add_pnode(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata) {
+        if self.node_group_ids.contains_key(&pnode_id) {
             return;
         }
-        for replica_index in 0..vnode_cnt {
+        for replica_index in 0..self.config.vnodes_per_pnode {
             self.vnodes.insert(
                 generate_vnode_token(&pnode_id, replica_index),
                 generate_vnode(&pnode_id, &metadata, replica_index),
             );
         }
-        self.pnodes.insert(pnode_id, metadata);
     }
 
-    fn remove_pnode(&mut self, pnode_id: &NodeId, vnode_cnt: u64) -> Option<PhysicalNodeMetadata> {
-        let metadata = self.pnodes.remove(pnode_id)?;
-        for replica_index in 0..vnode_cnt {
+    fn remove_pnode(&mut self, pnode_id: &NodeId) -> bool {
+        if !self.node_group_ids.contains_key(pnode_id) {
+            return false;
+        }
+        for replica_index in 0..self.config.vnodes_per_pnode {
             self.vnodes
                 .remove(&generate_vnode_token(pnode_id, replica_index));
         }
-        Some(metadata)
-    }
-
-    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
-        self.token_owners_at(hash_stable(key), n)
+        true
     }
 
     fn walk_clockwise_from(
@@ -130,126 +159,77 @@ impl TokenRing {
         }
         result
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct TopologyConfig {
-    pub vnodes_per_pnode: u64,
-    pub replication_factor: usize,
-}
-
-impl Topology {
-    pub fn new(nodes: HashMap<NodeId, PhysicalNodeMetadata>, config: TopologyConfig) -> Self {
-        let mut token_ring = TokenRing::default();
-        for (pnode_id, metadata) in nodes {
-            token_ring.add_pnode(pnode_id, metadata, config.vnodes_per_pnode);
-        }
-
-        let mut topology = Self {
-            config,
-            ring: token_ring,
-            node_groups: HashMap::new(),
-            shard_leaders: HashMap::new(),
-        };
-        topology.rebuild_reverse_index();
-        topology
-    }
-
-    pub(crate) fn update(&mut self, node_id: NodeId, addr: SocketAddr, state: &SwimNodeState) {
-        match state {
-            SwimNodeState::Alive => {
-                self.insert_node(node_id, PhysicalNodeMetadata { address: addr });
-            }
-            SwimNodeState::Dead => {
-                self.remove_node(&node_id);
-            }
-            SwimNodeState::Suspect => {}
-        }
-    }
 
     fn insert_node(&mut self, pnode_id: NodeId, metadata: PhysicalNodeMetadata) {
-        // ? what if metadata needs to be changed ?
-        self.ring
-            .add_pnode(pnode_id, metadata, self.config.vnodes_per_pnode);
+        self.add_pnode(pnode_id, metadata);
         self.rebuild_reverse_index();
     }
 
-    fn remove_node(&mut self, pnode_id: &NodeId) -> Option<PhysicalNodeMetadata> {
-        let result = self
-            .ring
-            .remove_pnode(pnode_id, self.config.vnodes_per_pnode);
-        if result.is_some() {
+    fn remove_node(&mut self, pnode_id: &NodeId) -> bool {
+        let removed = self.remove_pnode(pnode_id);
+        if removed {
             self.rebuild_reverse_index();
         }
-        result
+        removed
     }
 
-    /// Rebuild the reverse index from the ring. O(total_vnodes × RF).
+    /// Rebuild groups and reverse index from the ring. O(total_vnodes × RF).
     /// Called after every ring mutation.
     fn rebuild_reverse_index(&mut self) {
-        self.node_groups.clear();
-        let mut seen = std::collections::HashSet::new();
+        self.groups.clear();
+        self.node_group_ids.clear();
+        let mut seen = HashSet::new();
 
-        for token in self.ring.vnodes.keys() {
+        for token in self.vnodes.keys() {
             let id = ShardGroupId::from_vnode_hash(token.hash);
             if !seen.insert(id) {
                 continue;
             }
-            let owners = self
-                .ring
-                .token_owners_at(token.hash, self.config.replication_factor);
+            let owners = self.token_owners_at(token.hash, self.config.replication_factor);
             let members: Vec<NodeId> = owners.iter().map(|vn| vn.pnode_id.clone()).collect();
-            let group = ShardGroup {
-                id,
-                members: members.clone(),
-            };
             for member in &members {
-                self.node_groups
+                self.node_group_ids
                     .entry(member.clone())
                     .or_default()
-                    .insert(id, group.clone());
+                    .push(id);
             }
+            self.groups.insert(id, ShardGroup { id, members });
         }
     }
 
     #[allow(dead_code)]
     pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&VirtualNode> {
-        self.ring.token_owners_for(key, n)
+        let hash = hash_stable(key);
+        self.token_owners_at(hash, n)
     }
 
     /// Returns the shard group responsible for `key`.
     ///
     /// Walks the consistent hash ring clockwise from the key's hash position to
     /// find the nearest vnode. That vnode's token hash becomes the `ShardGroupId`.
-    /// Members are the `replication_factor` distinct physical nodes clockwise
-    /// from the key's position on the ring.
+    /// Looks up the canonical `ShardGroup` from the `groups` map.
     ///
     /// Returns `None` if the ring is empty.
     #[allow(dead_code)]
-    pub fn shard_group_for(&self, key: &[u8]) -> Option<ShardGroup> {
+    pub fn shard_group_for(&self, key: &[u8]) -> Option<&ShardGroup> {
         let hash = hash_stable(key);
-        let (nearest_token, _) = self.ring.walk_clockwise_from(hash).next()?;
-        let owners = self
-            .ring
-            .token_owners_at(hash, self.config.replication_factor);
-        Some(ShardGroup {
-            id: ShardGroupId::from_vnode_hash(nearest_token.hash),
-            members: owners.into_iter().map(|vn| vn.pnode_id.clone()).collect(),
-        })
+        let (nearest_token, _) = self.walk_clockwise_from(hash).next()?;
+        let id = ShardGroupId::from_vnode_hash(nearest_token.hash);
+        self.groups.get(&id)
     }
 
     /// Returns all unique shard groups that `node_id` participates in.
-    /// O(1) lookup from the precomputed reverse index.
-    pub fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<ShardGroup> {
-        self.node_groups
+    /// O(G) where G = number of groups for this node (lookups into `groups` map).
+    pub fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<&ShardGroup> {
+        self.node_group_ids
             .get(node_id)
-            .map(|groups| groups.values().cloned().collect())
+            .map(|ids| ids.iter().filter_map(|id| self.groups.get(id)).collect())
             .unwrap_or_default()
     }
 
     #[expect(dead_code)]
     pub fn num_nodes(&self) -> usize {
-        self.ring.pnodes.len()
+        self.node_group_ids.len()
     }
 
     pub fn update_shard_leader(&mut self, info: &ShardLeaderInfo) -> bool {
@@ -322,7 +302,6 @@ pub struct PhysicalNodeMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     /// Builds a `Topology` from explicit `(node_id, socket_addr)` pairs.
     fn topology_from(nodes: &[(&str, &str)], config: TopologyConfig) -> Topology {
@@ -351,12 +330,12 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.ring.pnodes.len(), 3);
-        assert_eq!(topology.ring.vnodes.len(), 12);
+        assert_eq!(topology.node_group_ids.len(), 3);
+        assert_eq!(topology.vnodes.len(), 12);
 
-        assert!(topology.ring.pnodes.contains_key("node-1"));
-        assert!(topology.ring.pnodes.contains_key("node-2"));
-        assert!(!topology.ring.pnodes.contains_key("node-3"));
+        assert!(topology.node_group_ids.contains_key("node-1"));
+        assert!(topology.node_group_ids.contains_key("node-2"));
+        assert!(!topology.node_group_ids.contains_key("node-3"));
     }
 
     #[test]
@@ -380,9 +359,9 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.ring.pnodes.len(), 4);
-        assert_eq!(topology.ring.vnodes.len(), 16);
-        assert!(topology.ring.pnodes.contains_key("node-3"));
+        assert_eq!(topology.node_group_ids.len(), 4);
+        assert_eq!(topology.vnodes.len(), 16);
+        assert!(topology.node_group_ids.contains_key("node-3"));
     }
 
     #[test]
@@ -406,8 +385,8 @@ mod tests {
             },
         );
 
-        assert_eq!(topology.ring.pnodes.len(), 3);
-        assert_eq!(topology.ring.vnodes.len(), 12);
+        assert_eq!(topology.node_group_ids.len(), 3);
+        assert_eq!(topology.vnodes.len(), 12);
     }
 
     #[test]
@@ -425,10 +404,10 @@ mod tests {
         );
 
         let removed = topology.remove_node(&NodeId::new("node-0"));
-        assert!(removed.is_some());
-        assert_eq!(topology.ring.pnodes.len(), 2);
-        assert_eq!(topology.ring.vnodes.len(), 8);
-        assert!(!topology.ring.pnodes.contains_key("node-0"));
+        assert!(removed);
+        assert_eq!(topology.node_group_ids.len(), 2);
+        assert_eq!(topology.vnodes.len(), 8);
+        assert!(!topology.node_group_ids.contains_key("node-0"));
     }
 
     #[test]
@@ -565,13 +544,10 @@ mod tests {
 
         let group_a = topology.shard_group_for(b"topic-alpha").unwrap();
         let group_b = topology.shard_group_for(b"topic-beta").unwrap();
-        // IDs now derive from nearest vnode token, not raw key hash.
-        // Just verify they differ — exact values depend on ring layout.
         assert_ne!(group_a.id, group_b.id);
-        // Both IDs must correspond to actual vnode positions on the ring
-        let all_groups = topology.shard_groups_for_node(&group_a.members[0]);
-        assert!(all_groups.iter().any(|g| g.id == group_a.id));
-        assert!(all_groups.iter().any(|g| g.id == group_b.id));
+        // Both IDs must exist in the canonical groups map
+        assert!(topology.groups.contains_key(&group_a.id));
+        assert!(topology.groups.contains_key(&group_b.id));
     }
 
     #[test]
@@ -604,7 +580,7 @@ mod tests {
         );
 
         let key = b"test-key";
-        let before = topology.shard_group_for(key).unwrap();
+        let before = topology.shard_group_for(key).unwrap().clone();
         assert_eq!(before.members.len(), 3);
 
         let removed = before.members[0].clone();
