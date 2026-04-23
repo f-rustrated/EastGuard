@@ -73,18 +73,17 @@ impl Raft {
         election_seq: u32,
         heartbeat_seq: u32,
     ) -> Self {
-        let stabled_index = persistent.stabled_index();
         let mut raft = Self {
             node_id,
             shard_group_id,
             peers,
+            stabled_index: persistent.stabled_index(),
             current_term: persistent.term,
             voted_for: persistent.voted_for,
             log: persistent.log,
             pending_log_mutations: Vec::new(),
             pending_events: Vec::new(),
             commit_index: 0,
-            stabled_index,
             last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
@@ -700,7 +699,7 @@ impl Raft {
                 seq: self.heartbeat_seq,
             }));
     }
-    
+
     #[cfg(test)]
     pub(crate) fn current_term(&self) -> u64 {
         self.current_term
@@ -747,13 +746,29 @@ mod tests {
     }
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), RaftPersistentState::default(), 0, TEST_SHARD, 0, 1)
+        Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            0,
+            1,
+        )
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, RaftPersistentState::default(), 0, TEST_SHARD, 0, 1)
+        Raft::new(
+            node(id),
+            peers,
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            0,
+            1,
+        )
     }
 
     // -------------------------------------------------------------------
@@ -1446,7 +1461,15 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, RaftPersistentState::default(), 0, TEST_SHARD, 0, 1);
+            let raft = Raft::new(
+                NodeId::new("self"),
+                peers,
+                RaftPersistentState::default(),
+                0,
+                TEST_SHARD,
+                0,
+                1,
+            );
 
             assert_eq!(
                 raft.quorum(),

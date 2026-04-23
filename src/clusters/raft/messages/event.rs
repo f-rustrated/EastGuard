@@ -18,7 +18,11 @@ pub struct LeaderChange {
 pub enum LogMutation {
     Append(LogEntry),
     TruncateFrom(u64),
-    HardState { term: u64, voted_for: Option<NodeId> },
+    // Raft state that MUST survive crashes.
+    HardState {
+        term: u64,
+        voted_for: Option<NodeId>,
+    },
 }
 
 #[derive(Debug)]

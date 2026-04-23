@@ -43,6 +43,7 @@ async fn swim_handler_with_leader_capture(
 /// 3-node cluster: after election, verify that exactly one node emits a
 /// LeaderChangeEvent with term=1 and correct shard_group_id.
 #[test]
+#[serial_test::serial]
 fn leader_election_emits_leader_change_event() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))

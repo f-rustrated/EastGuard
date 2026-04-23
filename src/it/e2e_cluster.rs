@@ -18,7 +18,7 @@ fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Envir
         cluster_port,
         host: "0.0.0.0".into(),
         advertise_host: None,
-        vnodes_per_node: 16, // TODO: 256 hangs when using turmoil. Let's fix it in the future
+        vnodes_per_node: 256,
         join_seed_nodes: vec![],
         join_initial_delay_ms: 1000,
         join_interval_ms: 1000,
@@ -68,6 +68,7 @@ async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> bool {
 ///   SWIM failure detection → MembershipEvent::NodeDead → HandleNodeDeath → MultiRaftActor RemovePeer
 ///   Node restart → SWIM rejoin → HandleNodeJoin again
 #[test]
+#[serial_test::serial]
 fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))

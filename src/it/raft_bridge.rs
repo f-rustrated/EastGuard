@@ -165,6 +165,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
 /// 3-node cluster: after election, inject HandleNodeDeath for node-3.
 /// Leader proposes RemovePeer. Group continues with 2 members.
 #[test]
+#[serial_test::serial]
 fn node_death_triggers_remove_peer() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))
@@ -234,6 +235,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
 /// 2-node cluster: after election, inject HandleNodeJoin for node-3.
 /// Leader proposes AddPeer. Group expands to include node-3.
 #[test]
+#[serial_test::serial]
 fn node_join_triggers_add_peer() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))

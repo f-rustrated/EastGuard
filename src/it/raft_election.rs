@@ -162,6 +162,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
 /// the checker connects to each node and verifies that all agree on the same
 /// elected leader.
 #[test]
+#[serial_test::serial]
 fn three_node_raft_elects_leader() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))

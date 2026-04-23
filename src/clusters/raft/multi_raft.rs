@@ -3,17 +3,14 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
+    MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
     RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
-use crate::clusters::raft::storage::{
-    RaftPersistentState, delete_from, get_hard_state, get_log_entries, put_hard_state,
-    put_log_entry,
-};
+
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::storage::{Db, DbOp, shard_cf_name};
+use crate::storage::{Db, DbOp};
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -87,12 +84,6 @@ impl MultiRaft {
             return;
         }
 
-        let cf_name = shard_cf_name(group.id.0);
-        let cf_exist = self.db.has_cf(&cf_name);
-        if !cf_exist {
-            self.db.create_cf(&cf_name);
-        }
-
         let peers: HashSet<NodeId> = group
             .members
             .iter()
@@ -110,17 +101,7 @@ impl MultiRaft {
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
-        let persistent = if cf_exist {
-            let (term, voted_for) = get_hard_state(&self.db, &cf_name).unwrap_or_default();
-            let log = get_log_entries(&self.db, &cf_name);
-            RaftPersistentState {
-                term,
-                voted_for,
-                log
-            }
-        } else {
-            RaftPersistentState::default()
-        };
+        let persistent = self.db.take_persistent_state_for(group.id.0);
 
         let raft = Raft::new(
             self.node_id.clone(),
@@ -157,7 +138,7 @@ impl MultiRaft {
                 seq: raft.heartbeat_seq(),
             }));
 
-        self.db.drop_cf(&shard_cf_name(group_id.0));
+        self.db.delete_range(group_id);
 
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
@@ -249,20 +230,10 @@ impl MultiRaft {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
-            let cf = shard_cf_name(raft.shard_group_id.0);
+
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
-                match log {
-                    LogMutation::Append(entry) => {
-                        batch.push(put_log_entry(&cf, &entry));
-                    }
-                    LogMutation::TruncateFrom(index) => {
-                        batch.push(delete_from(&cf, index));
-                    }
-                    LogMutation::HardState { term, voted_for } => {
-                        batch.push(put_hard_state(&cf, term, voted_for));
-                    }
-                }
+                batch.push(DbOp::from_log(id, log));
             }
             self.pending_events.extend(raft.take_events());
         }
@@ -301,6 +272,8 @@ impl MultiRaft {
 mod tests {
     use super::*;
     use crate::clusters::BINCODE_CONFIG;
+
+    use crate::clusters::raft::storage::RaftPersistentState;
     use crate::storage::ShardCfKey;
     use std::collections::HashSet;
 
@@ -351,26 +324,33 @@ mod tests {
     }
 
     #[test]
-    fn add_group_creates_cf() {
+    fn add_group_registers_in_memory() {
         let (db, _) = temp_db();
         let me = node("n1");
         let mut store = new_store(me.clone(), db);
 
         store.add_group(shard(42, vec![me.clone(), node("n2")]));
 
-        assert!(store.db.has_cf(&shard_cf_name(42)));
+        assert!(store.groups.contains_key(&ShardGroupId(42)));
     }
 
     #[test]
-    fn remove_group_drops_cf() {
+    fn remove_group_deletes_data() {
         let (db, _) = temp_db();
         let me = node("n1");
         let mut store = new_store(me.clone(), db);
 
-        store.add_group(shard(42, vec![me.clone(), node("n2")]));
-        store.remove_group(ShardGroupId(42));
+        store.add_group(shard(42, vec![me.clone()]));
+        store.handle_command(MultiRaftCommand::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: ShardGroupId(42),
+            },
+        ));
+        store.flush();
+        assert!(store.db.take_persistent_state_for(42) != Default::default());
 
-        assert!(!store.db.has_cf(&shard_cf_name(42)));
+        store.remove_group(ShardGroupId(42));
+        assert!(store.db.take_persistent_state_for(42) == Default::default());
     }
 
     #[test]
@@ -381,27 +361,36 @@ mod tests {
 
         store.add_group(shard(42, vec![node("n2"), node("n3")]));
 
-        assert!(!store.db.has_cf(&shard_cf_name(42)));
         assert!(!store.groups.contains_key(&ShardGroupId(42)));
     }
 
     #[test]
-    fn restart_recovers_existing_cfs() {
+    fn restart_recovers_persisted_state() {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let me = node("n1");
 
         {
             let db = Db::open(path.clone());
             let mut store = new_store(me.clone(), db);
-            store.add_group(shard(1, vec![me.clone(), node("n2")]));
-            store.add_group(shard(2, vec![me.clone(), node("n2")]));
+            store.add_group(shard(1, vec![me.clone()]));
+            store.add_group(shard(2, vec![me.clone()]));
+            // Trigger elections to produce HardState mutations
+            store.handle_command(MultiRaftCommand::Timeout(
+                RaftTimeoutCallback::ElectionTimeout {
+                    shard_group_id: ShardGroupId(1),
+                },
+            ));
+            store.handle_command(MultiRaftCommand::Timeout(
+                RaftTimeoutCallback::ElectionTimeout {
+                    shard_group_id: ShardGroupId(2),
+                },
+            ));
+            store.flush();
         }
 
-        // Reopen — simulates a crash+restart.
         let db = Db::open(path);
-        let store = new_store(me.clone(), db);
-        assert!(store.db.has_cf(&shard_cf_name(1)));
-        assert!(store.db.has_cf(&shard_cf_name(2)));
+        assert!(db.take_persistent_state_for(1) != Default::default());
+        assert!(db.take_persistent_state_for(2) != Default::default());
     }
 
     // -----------------------------------------------------------------------
@@ -431,20 +420,14 @@ mod tests {
     }
 
     fn read_entry(store: &MultiRaft, index: u64) -> Option<LogEntry> {
-        let cf = shard_cf_name(TEST_GROUP_ID.0);
-        let bytes = store
-            .db
-            .get_cf(&cf, &ShardCfKey::LogEntry(index).encode())?;
+        let key = ShardCfKey::LogEntry(index).encode_for(TEST_GROUP_ID.0);
+        let bytes = store.db.get_key(&key)?;
         let (entry, _) = bincode::decode_from_slice::<LogEntry, _>(&bytes, BINCODE_CONFIG).ok()?;
         Some(entry)
     }
 
-    fn read_hard_state(store: &MultiRaft) -> Option<(u64, Option<NodeId>)> {
-        let cf = shard_cf_name(TEST_GROUP_ID.0);
-        let bytes = store.db.get_cf(&cf, &ShardCfKey::HardState.encode())?;
-        let (hs, _) =
-            bincode::decode_from_slice::<(u64, Option<NodeId>), _>(&bytes, BINCODE_CONFIG).ok()?;
-        Some(hs)
+    fn read_hard_state(store: &MultiRaft) -> RaftPersistentState {
+        store.db.take_persistent_state_for(TEST_GROUP_ID.0)
     }
 
     #[test]
@@ -475,8 +458,8 @@ mod tests {
         elect_leader(&mut store);
         store.flush();
 
-        let (term, _) = read_hard_state(&store).expect("HardState must be in RocksDB after flush");
-        assert_eq!(term, 1, "term must be 1 after first election");
+        let state = read_hard_state(&store);
+        assert_eq!(state.term, 1, "term must be 1 after first election");
     }
 
     #[test]

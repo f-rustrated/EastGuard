@@ -20,7 +20,7 @@ fn default_env(idx: u32, node_id: String, port: u16, cluster_port: u16) -> Envir
         cluster_port,
         host: "0.0.0.0".into(),
         advertise_host: None,
-        vnodes_per_node: 16, // TODO: when set to 256, it hangs. Let's fix it
+        vnodes_per_node: 256,
         join_seed_nodes: vec![],
         join_initial_delay_ms: 1000,
         join_interval_ms: 1000,
@@ -89,6 +89,7 @@ async fn check_node_is_all_alive(host: &str, port: u16) -> turmoil::Result {
 }
 
 #[test]
+#[serial_test::serial]
 fn cluster_setup() -> turmoil::Result {
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(30))
@@ -158,6 +159,7 @@ fn cluster_setup() -> turmoil::Result {
 /// node-1 and node-3 are partitioned from each other.
 /// They must learn about each other exclusively through node-2's gossip.
 #[test]
+#[serial_test::serial]
 fn partition_gossip() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
@@ -229,6 +231,7 @@ fn partition_gossip() -> turmoil::Result {
 
 /// node-3 process is killed and restarted.
 #[test]
+#[serial_test::serial]
 fn dead_node_rejoin_after_process_restart() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))

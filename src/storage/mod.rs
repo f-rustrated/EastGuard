@@ -1,35 +1,18 @@
-#[allow(dead_code)]
-pub(crate) const CF_META: &str = "meta";
-pub(crate) const CF_SHARD_PREFIX: &str = "shard-";
+use crate::clusters::{
+    BINCODE_CONFIG, NodeId,
+    raft::{log::LogEntry, messages::LogMutation, storage::RaftPersistentState},
+    swims::ShardGroupId,
+};
 
-/// Per-shard column family key space.
-///
-/// Layout (one CF per shard group):
-///   0x01 + u64 BE  →  LogEntry        (9 bytes; lexicographic = numeric order)
-///   0x02           →  HardState       (1 byte)
-///   0x03           →  SnapMeta        (1 byte)
-///   0x04           →  SnapData        (1 byte)
-///   0x05           →  AppliedIndex    (1 byte)
-///   0x06           →  Epoch           (1 byte)
-///
-/// Log entries (0x01…) sort strictly before metadata keys (0x02–0x06).
-/// delete_range on 0x01..0x02 safely compacts only log entries.
+/// Per-shard key space within the default column family.
+/// read storage-key-layout.md for more information
 #[allow(dead_code)]
 pub(crate) enum ShardCfKey {
-    /// Raft log entry at the given 1-based index.
     LogEntry(u64),
-    /// Durable Raft state (current_term, voted_for) — must survive restarts.
     HardState,
-    /// Snapshot descriptor (last_included_index/term, peers, epoch).
-    /// Leader writes on checkpoint; follower writes on InstallSnapshot RPC arrival.
-    /// Survives crashes mid-transfer — missing SnapData means transfer must restart.
     SnapMeta,
-    /// Full state machine payload (topics, ranges, segments) — only sent to followers too far behind for log replication.
-    /// Written after full out-of-band stream is received and checksum-verified.
     SnapData,
-    /// Highest log index applied to the state machine — determines replay boundary on restart.
     AppliedIndex,
-    /// Shard membership + topology version — incremented on AddPeer/RemovePeer to detect stale routing.
     Epoch,
 }
 
@@ -49,24 +32,48 @@ impl ShardCfKey {
             ShardCfKey::Epoch => vec![0x06],
         }
     }
-}
 
-const LOG_ENTRY_RANGE_END: &[u8] = &[0x02];
-
-pub(crate) fn shard_cf_name(id: u64) -> String {
-    format!("{CF_SHARD_PREFIX}{id:016x}")
+    pub(crate) fn encode_for(&self, group_id: u64) -> Vec<u8> {
+        let suffix = self.encode();
+        let mut key = Vec::with_capacity(8 + suffix.len());
+        key.extend_from_slice(&group_id.to_be_bytes());
+        key.extend_from_slice(&suffix);
+        key
+    }
 }
 
 pub(crate) enum DbOp {
-    Put {
-        cf: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    DeleteFrom {
-        cf: String,
-        index: Vec<u8>,
-    },
+    Put { key: Vec<u8>, value: Vec<u8> },
+    DeleteRange { start: Vec<u8>, end: Vec<u8> },
+}
+impl DbOp {
+    pub(crate) fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
+        fn put_log_entry(group_id: u64, entry: &LogEntry) -> DbOp {
+            let key = ShardCfKey::LogEntry(entry.index).encode_for(group_id);
+            let value =
+                bincode::encode_to_vec(entry, BINCODE_CONFIG).expect("encode LogEntry failed");
+            DbOp::Put { key, value }
+        }
+
+        fn put_hard_state(group_id: u64, term: u64, voted_for: Option<NodeId>) -> DbOp {
+            let key = ShardCfKey::HardState.encode_for(group_id);
+            let value = bincode::encode_to_vec(&(term, voted_for), BINCODE_CONFIG)
+                .expect("encode HardState failed");
+            DbOp::Put { key, value }
+        }
+
+        fn delete_from(group_id: u64, from_index: u64) -> DbOp {
+            let start = ShardCfKey::LogEntry(from_index).encode_for(group_id);
+            let end = ShardCfKey::HardState.encode_for(group_id);
+            DbOp::DeleteRange { start, end }
+        }
+
+        match log {
+            LogMutation::Append(entry) => put_log_entry(id.0, &entry),
+            LogMutation::TruncateFrom(index) => delete_from(id.0, index),
+            LogMutation::HardState { term, voted_for } => put_hard_state(id.0, term, voted_for),
+        }
+    }
 }
 
 /// Opaque handle to the node's RocksDB instance.
@@ -79,31 +86,13 @@ impl Db {
     pub(crate) fn open(path: std::path::PathBuf) -> Self {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-
-        let cf_names = rocksdb::DB::list_cf(&opts, &path).unwrap_or_default();
-        let db = rocksdb::DB::open_cf(&opts, &path, &cf_names).expect("failed to open RocksDB");
+        let db = rocksdb::DB::open(&opts, &path).expect("failed to open RocksDB");
         Self { db }
     }
 
-    pub(crate) fn create_cf(&mut self, name: &str) {
-        self.db
-            .create_cf(name, &rocksdb::Options::default())
-            .expect("failed to create column family");
-    }
-
-    pub(crate) fn drop_cf(&mut self, name: &str) {
-        let _ = self.db.drop_cf(name);
-    }
-
-    pub(crate) fn has_cf(&self, name: &str) -> bool {
-        self.db.cf_handle(name).is_some()
-    }
-
-    pub(crate) fn get_value(&self, cf_name: &str, key: &[u8]) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle(cf_name)?;
-        self.db.get_cf(cf, key).unwrap_or_else(|e| {
-            tracing::error!("Error retrieving: {}", e);
+    pub(crate) fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.db.get(key).unwrap_or_else(|e| {
+            tracing::error!("RocksDB get error: {}", e);
             None
         })
     }
@@ -112,24 +101,16 @@ impl Db {
         let mut batch = rocksdb::WriteBatch::default();
         for operation in operations {
             match operation {
-                DbOp::Put { cf, key, value } => {
-                    let cf = self
-                        .db
-                        .cf_handle(cf)
-                        .unwrap_or_else(|| panic!("CF {cf} not found"));
-                    batch.put_cf(cf, key, value)
+                DbOp::Put { key, value } => {
+                    batch.put(key, value);
                 }
-                DbOp::DeleteFrom { cf, index: start } => {
-                    let cf = self
-                        .db
-                        .cf_handle(cf)
-                        .unwrap_or_else(|| panic!("CF {cf} not found"));
-                    batch.delete_range_cf(&cf, start.as_slice(), LOG_ENTRY_RANGE_END);
+                DbOp::DeleteRange { start, end } => {
+                    batch.delete_range(start, end);
                 }
             }
         }
 
-        // ! SAFETY: without the following sync option, Raft's safety is not guaranteed
+        // Raft safety requires WAL sync before acknowledging writes
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
         self.db
@@ -137,26 +118,60 @@ impl Db {
             .expect("failed to write batch");
     }
 
-    pub(crate) fn scan_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
-        let Some(cf) = self.db.cf_handle(cf_name) else {
-            return vec![];
-        };
+    pub(crate) fn scan_range(&self, start: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_iterate_upper_bound(end.to_vec());
         self.db
-            .iterator_cf_opt(
-                &cf,
-                opts,
+            .iterator_opt(
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
+                opts,
             )
             .flatten()
             .map(|(_, v)| v.to_vec())
             .collect()
     }
 
+    pub(crate) fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
+        let Some(bytes) = self.get(&ShardCfKey::HardState.encode_for(group_id)) else {
+            return RaftPersistentState::default();
+        };
+
+        let ((term, voted_for), _) =
+            bincode::decode_from_slice::<(u64, Option<NodeId>), _>(&bytes, BINCODE_CONFIG)
+                .expect("corrupt HardState");
+
+        let log = self.get_log_entries(group_id);
+        RaftPersistentState {
+            term,
+            voted_for,
+            log,
+        }
+    }
+
+    pub(crate) fn get_log_entries(&self, group_id: u64) -> Vec<LogEntry> {
+        let start = ShardCfKey::LogEntry(0).encode_for(group_id);
+        let end = ShardCfKey::HardState.encode_for(group_id);
+        self.scan_range(&start, &end)
+            .into_iter()
+            .map(|bytes| {
+                let (entry, _) = bincode::decode_from_slice::<LogEntry, _>(&bytes, BINCODE_CONFIG)
+                    .expect("corrupt LogEntry in RocksDB");
+                entry
+            })
+            .collect()
+    }
+
+    pub(crate) fn delete_range(&self, group_id: ShardGroupId) {
+        let start: &[u8] = &group_id.0.to_be_bytes();
+        let end: &[u8] = &(group_id.0 + 1).to_be_bytes();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(start, end);
+        self.db.write(batch).expect("failed to delete range");
+    }
+
     #[cfg(test)]
-    pub(crate) fn get_cf(&self, cf_name: &str, key: &[u8]) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle(cf_name)?;
-        self.db.get_cf(cf, key).ok().flatten()
+    pub(crate) fn get_key(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.db.get(key).ok().flatten()
     }
 }
