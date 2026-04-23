@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::clusters::NodeId;
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::*;
+use crate::clusters::raft::storage::RaftPersistentState;
 use crate::clusters::swims::ShardGroupId;
 use crate::schedulers::ticker_message::TimerCommand;
 

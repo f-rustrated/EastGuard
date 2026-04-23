@@ -4,11 +4,12 @@ use std::hash::{Hash, Hasher};
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
     LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
-    RaftPersistentState, RaftTimeoutCallback,
+    RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
 use crate::clusters::raft::storage::{
-    delete_from, get_hard_state, get_log_entries, put_hard_state, put_log_entry,
+    RaftPersistentState, delete_from, get_hard_state, get_log_entries, put_hard_state,
+    put_log_entry,
 };
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
@@ -111,10 +112,11 @@ impl MultiRaft {
 
         let persistent = if cf_exist {
             let (term, voted_for) = get_hard_state(&self.db, &cf_name).unwrap_or_default();
+            let log = get_log_entries(&self.db, &cf_name);
             RaftPersistentState {
                 term,
                 voted_for,
-                log: get_log_entries(&self.db, &cf_name),
+                log
             }
         } else {
             RaftPersistentState::default()
