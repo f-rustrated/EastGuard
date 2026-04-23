@@ -11,7 +11,7 @@ use crate::clusters::{
 /// Per-shard key space within the default column family.
 /// read storage-key-layout.md for more information
 #[allow(dead_code)]
-pub(crate) enum ShardCfKey {
+enum ShardCfKey {
     LogEntry(u64),
     HardState,
     SnapMeta,
@@ -46,12 +46,12 @@ impl ShardCfKey {
     }
 }
 
-pub(crate) enum DbOp {
+enum DbOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     DeleteRange { start: Vec<u8>, end: Vec<u8> },
 }
 impl DbOp {
-    pub(crate) fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
+    fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
         fn put_log_entry(group_id: u64, entry: &LogEntry) -> DbOp {
             let key = ShardCfKey::LogEntry(entry.index).encode_for(group_id);
             let value =
