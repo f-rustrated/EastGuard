@@ -701,8 +701,8 @@ impl Raft {
     }
     
     #[cfg(test)]
-    pub(crate) fn current_term(&self) -> u64 { 
-        return self.current_term
+    pub(crate) fn current_term(&self) -> u64 {
+        self.current_term
     }
 
     #[cfg(test)]

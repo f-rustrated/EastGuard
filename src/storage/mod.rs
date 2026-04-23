@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_SHARD_PREFIX: &str = "shard-";
 

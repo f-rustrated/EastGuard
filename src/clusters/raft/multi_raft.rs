@@ -401,7 +401,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::clusters::raft::log::LogEntry;
-    use crate::clusters::raft::messages::{AppendEntries, RaftRpc, RequestVote};
+    use crate::clusters::raft::messages::{AppendEntries, RaftRpc};
 
     const TEST_GROUP_ID: ShardGroupId = ShardGroupId(42);
 
