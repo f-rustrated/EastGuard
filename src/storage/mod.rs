@@ -1,7 +1,3 @@
-use crate::clusters::raft::log::LogEntry;
-use crate::clusters::{BINCODE_CONFIG, NodeId};
-
-#[allow(dead_code)]
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_SHARD_PREFIX: &str = "shard-";
 
@@ -101,6 +97,14 @@ impl Db {
 
     pub(crate) fn has_cf(&self, name: &str) -> bool {
         self.db.cf_handle(name).is_some()
+    }
+
+    pub(crate) fn get_value(&self, cf_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let cf = self.db.cf_handle(cf_name)?;
+        self.db.get_cf(cf, key).unwrap_or_else(|e| {
+            tracing::error!("Error retrieving: {}", e);
+            None
+        })
     }
 
     pub(crate) fn write_batch(&self, operations: &[DbOp]) {

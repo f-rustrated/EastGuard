@@ -7,14 +7,15 @@ use crate::clusters::raft::messages::{
     RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::Raft;
+use crate::clusters::raft::storage::{delete_from, get_hard_state, put_hard_state, put_log_entry};
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::storage::{RaftDb, WriteOperation, shard_cf_name};
+use crate::storage::{Db, DbOp, shard_cf_name};
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
-    db: RaftDb,
+    db: Db,
     groups: HashMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
@@ -22,7 +23,7 @@ pub(crate) struct MultiRaft {
 }
 
 impl MultiRaft {
-    pub(crate) fn new(node_id: NodeId, db: RaftDb) -> Self {
+    pub(crate) fn new(node_id: NodeId, db: Db) -> Self {
         Self {
             node_id,
             db,
@@ -84,7 +85,8 @@ impl MultiRaft {
         }
 
         let cf_name = shard_cf_name(group.id.0);
-        if !self.db.has_cf(&cf_name) {
+        let cf_exist = self.db.has_cf(&cf_name);
+        if !cf_exist {
             self.db.create_cf(&cf_name);
         }
 
@@ -104,9 +106,18 @@ impl MultiRaft {
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
 
+        let (current_term, voted_for) =
+            if cf_exist && let Some(value) = get_hard_state(&self.db, &cf_name) {
+                value
+            } else {
+                (0, None)
+            };
+
         let raft = Raft::new(
             self.node_id.clone(),
             peers,
+            current_term,
+            voted_for,
             jitter,
             group.id,
             election_seq,
@@ -223,7 +234,7 @@ impl MultiRaft {
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
         let dirty: Vec<ShardGroupId> = std::mem::take(&mut self.dirty).into_iter().collect();
-        let mut batch: Vec<WriteOperation> = vec![];
+        let mut batch: Vec<DbOp> = vec![];
         let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
 
         for id in &dirty {
@@ -235,13 +246,13 @@ impl MultiRaft {
             for log in raft.take_log_mutations() {
                 match log {
                     LogMutation::Append(entry) => {
-                        batch.push(WriteOperation::put_log_entry(&cf, &entry));
+                        batch.push(put_log_entry(&cf, &entry));
                     }
                     LogMutation::TruncateFrom(index) => {
-                        batch.push(WriteOperation::delete_from(&cf, index));
+                        batch.push(delete_from(&cf, index));
                     }
                     LogMutation::HardState { term, voted_for } => {
-                        batch.push(WriteOperation::put_hard_state(&cf, term, voted_for));
+                        batch.push(put_hard_state(&cf, term, voted_for));
                     }
                 }
             }
@@ -281,9 +292,9 @@ impl MultiRaft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use crate::clusters::BINCODE_CONFIG;
     use crate::storage::ShardCfKey;
+    use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
@@ -306,13 +317,13 @@ mod tests {
             .collect()
     }
 
-    fn temp_db() -> (RaftDb, std::path::PathBuf) {
+    fn temp_db() -> (Db, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let db = RaftDb::open(path.clone());
+        let db = Db::open(path.clone());
         (db, path)
     }
 
-    fn new_store(node_id: NodeId, db: RaftDb) -> MultiRaft {
+    fn new_store(node_id: NodeId, db: Db) -> MultiRaft {
         MultiRaft::new(node_id, db)
     }
 
@@ -372,14 +383,14 @@ mod tests {
         let me = node("n1");
 
         {
-            let db = RaftDb::open(path.clone());
+            let db = Db::open(path.clone());
             let mut store = new_store(me.clone(), db);
             store.add_group(shard(1, vec![me.clone(), node("n2")]));
             store.add_group(shard(2, vec![me.clone(), node("n2")]));
         }
 
         // Reopen — simulates a crash+restart.
-        let db = RaftDb::open(path);
+        let db = Db::open(path);
         let store = new_store(me.clone(), db);
         assert!(store.db.has_cf(&shard_cf_name(1)));
         assert!(store.db.has_cf(&shard_cf_name(2)));
@@ -390,7 +401,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::clusters::raft::log::LogEntry;
-    use crate::clusters::raft::messages::{AppendEntries, RaftRpc};
+    use crate::clusters::raft::messages::{AppendEntries, RaftRpc, RequestVote};
 
     const TEST_GROUP_ID: ShardGroupId = ShardGroupId(42);
 
@@ -565,5 +576,25 @@ mod tests {
             read_entry(&store, 2).is_none(),
             "truncated entry 2 must be gone from RocksDB"
         );
+    }
+
+    #[test]
+    fn restart_restores_hard_state() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+        {
+            let db = Db::open(path.clone());
+            let mut store = new_store(me.clone(), db);
+            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            elect_leader(&mut store);
+            store.flush();
+        }
+
+        let db = Db::open(path);
+        let mut store = new_store(me.clone(), db);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+        assert_eq!(raft.current_term(), 1);
+        assert_eq!(raft.voted_for(), Some(node("n1")));
     }
 }

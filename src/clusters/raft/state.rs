@@ -48,9 +48,9 @@ pub struct Raft {
     log: Vec<LogEntry>,
     pending_log_mutations: Vec<LogMutation>, // must persist
     pending_events: Vec<RaftEvent>,          // volatile side effects
-    commit_index: u64,                      // majority voted 
-    stabled_index: u64,                     // flushed to disk 
-    last_applied_index: u64,                // applied to state machine 
+    commit_index: u64,                       // majority voted
+    stabled_index: u64,                      // flushed to disk
+    last_applied_index: u64,                 // applied to state machine
     role: Role,
     /// Tracks who the current leader is — set when this node becomes leader
     /// or when a valid `AppendEntries` is received from a leader.
@@ -66,6 +66,8 @@ impl Raft {
     pub(crate) fn new(
         node_id: NodeId,
         peers: HashSet<NodeId>,
+        current_term: u64,
+        voted_for: Option<NodeId>,
         election_jitter: u32,
         shard_group_id: ShardGroupId,
         election_seq: u32,
@@ -75,8 +77,8 @@ impl Raft {
             node_id,
             shard_group_id,
             peers,
-            current_term: 0,
-            voted_for: None,
+            current_term,
+            voted_for,
             log: Vec::new(),
             pending_log_mutations: Vec::new(),
             pending_events: Vec::new(),
@@ -188,7 +190,7 @@ impl Raft {
         let total = self.peers.len() as u32 + 1; // +1 for self
         total / 2 + 1
     }
-    
+
     pub(crate) fn stabled_index(&self) -> u64 {
         self.stabled_index
     }
@@ -569,7 +571,7 @@ impl Raft {
             }
         }
     }
-    
+
     pub(crate) fn advance_stabled_index(&mut self, value: u64) {
         self.stabled_index = value;
     }
@@ -697,6 +699,16 @@ impl Raft {
                 seq: self.heartbeat_seq,
             }));
     }
+    
+    #[cfg(test)]
+    pub(crate) fn current_term(&self) -> u64 { 
+        return self.current_term
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for.clone()
+    }
 }
 
 #[cfg(test)]
@@ -734,13 +746,13 @@ mod tests {
     }
 
     fn single_node_raft() -> Raft {
-        Raft::new(node("node-1"), HashSet::new(), 0, TEST_SHARD, 0, 1)
+        Raft::new(node("node-1"), HashSet::new(), 0, None, 0, TEST_SHARD, 0, 1)
     }
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
-        Raft::new(node(id), peers, 0, TEST_SHARD, 0, 1)
+        Raft::new(node(id), peers, 0, None, 0, TEST_SHARD, 0, 1)
     }
 
     // -------------------------------------------------------------------
@@ -1433,7 +1445,7 @@ mod tests {
             let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
-            let raft = Raft::new(NodeId::new("self"), peers, 0, TEST_SHARD, 0, 1);
+            let raft = Raft::new(NodeId::new("self"), peers, 0, None, 0, TEST_SHARD, 0, 1);
 
             assert_eq!(
                 raft.quorum(),
