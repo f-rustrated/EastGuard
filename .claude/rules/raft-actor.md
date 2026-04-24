@@ -47,7 +47,7 @@ pub enum RaftCommand {
 | `EnsureGroup` | SwimActor / HandleNodeJoin | Create `Raft` instance if not exists and this node is member |
 | `RemoveGroup` | External | Shut down and remove `Raft` instance |
 | `GetLeader` | External callers | Read-only query, returns `Option<NodeId>` via oneshot |
-| `Propose` | Client/Coordinator | Lookup `Raft` by `shard_group_id`, call `raft.propose(command)`, reply via oneshot |
+| `Propose` | Client/MetadataStateMachine | Lookup `Raft` by `shard_group_id`, call `raft.propose(command)`, reply via oneshot |
 | `HandleNodeDeath` | SwimActor (from `MembershipEvent::NodeDead`) | For each group where dead node is peer and this node is leader, propose `RemovePeer(dead_node_id)` |
 | `HandleNodeJoin` | SwimActor (from `MembershipEvent::NodeAlive`) | For existing groups where this node is leader and new node not yet a peer: propose `AddPeer`. For groups this node should newly join: `EnsureGroup`. |
 

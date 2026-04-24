@@ -8,7 +8,7 @@ SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from th
 
 **Goal:** Define metadata types and a pure in-memory state machine.
 
-**New module:** `src/clusters/coordinator/`
+
 
 ### Types (`types.rs`)
 
@@ -333,7 +333,7 @@ GetShardInfo { key: Vec<u8> }
 
 ## Phase 6: Hot Range Detection + Auto-Split/Merge
 
-**Goal:** Coordinator detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
+**Goal:** MetadataStateMachine detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
 
 ### Core Insight
 
@@ -361,7 +361,7 @@ Updated inside `apply_seal_segment()` — pure, deterministic, replicated on eve
 
 ### 6b. Split Decision Logic
 
-After each `apply_seal_segment()`, Coordinator (leader only) evaluates:
+After each `apply_seal_segment()`, MetadataStateMachine (leader only) evaluates:
 
 ```rust
 fn should_split(topic: &TopicMeta, range_id: RangeId, now: u64) -> bool {
@@ -387,7 +387,7 @@ Split point = midpoint of keyspace. Simple, no key distribution data needed.
 
 ### 6c. Merge Decision Logic
 
-Periodic check by Coordinator leader (on a timer, not per-event):
+Periodic check by MetadataStateMachine leader (on a timer, not per-event):
 
 ```rust
 fn should_merge(topic: &TopicMeta, r1: RangeId, r2: RangeId, now: u64) -> bool {
@@ -465,8 +465,8 @@ Phase 5 (Leader Forwarding + Epoch)
 
 Not in Phase 6 — add only when midpoint splitting proves insufficient:
 
-- **Key histogram / percentile-based split points** — requires sampling infrastructure on data plane nodes, probe protocol from Coordinator, memory budget management. Only valuable for highly skewed workloads where midpoint splits don't divide load evenly.
-- **Write throughput metrics** — counting writes/sec rather than seal frequency. More granular but requires data plane → Coordinator reporting pipeline.
+- **Key histogram / percentile-based split points** — requires sampling infrastructure on data plane nodes, probe protocol from MetadataStateMachine, memory budget management. Only valuable for highly skewed workloads where midpoint splits don't divide load evenly.
+- **Write throughput metrics** — counting writes/sec rather than seal frequency. More granular but requires data plane → MetadataStateMachine reporting pipeline.
 - **Adaptive thresholds** — per-topic or per-range thresholds based on historical patterns instead of global constants.
 - **Predictive splitting** — split before hotspot causes problems, based on trend detection. Requires time-series analysis.
 
@@ -517,7 +517,7 @@ Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counter
 `start_offset` / `end_offset` on `SegmentMeta`, `next_offset` on `RangeMeta`. Consumer knows "done with sealed range" when position reaches last segment's `end_offset`. On split/merge, child ranges start at offset 0 — clean break. Consumer protocol (backlog) uses these fields plus `merged_into`/`split_into` lineage to navigate range transitions.
 
 **8. Seal frequency as hot range signal — no external metrics pipeline.**
-`SealSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → Coordinator reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
+`SealSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → MetadataStateMachine reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
 
 ---
 

@@ -10,7 +10,7 @@ EastGuard is a zero-controller messaging system designed for flexible scalabilit
 - **Data Plane:** The layer responsible for storing actual application messages.
 - **Consistent Hash Ring:** The topology used to map vNodes to physical brokers. It uses deterministic algorithms to calculate leaders and followers (Clockwise Walk) with constraint filtering (e.g., Rack Awareness).
 - **vNode (Virtual Node):** A logical metadata shard acting as a local controller. It is a fault-tolerant replicated state machine backed by Raft that manages a specific subset of the cluster's metadata.
-- **Coordinator:** The leader of a specific vNode. It executes business logic (e.g., splitting ranges, sealing segments) and replicates state changes to its followers.
+- **MetadataStateMachine:** Pure in-memory state machine managing topic/range/segment metadata within a shard group. Applies committed Raft log entries (e.g., CreateTopic, SplitRange, SealSegment deterministically on every replica. No I/O, no replication logic — Raft handles consensus, MetadataStateMachine handles business logic.
 - **SWIM (Scalable Weakly-consistent Infection-style Membership):** A decentralized protocol using Random Probing and Piggybacked Updates to detect failures and disseminate cluster state without the network saturation caused by central heartbeats.
 - **Topic:** A named collection of ranges that covers the full keyspace.
 - **Range:** The logical log abstraction (analogous to Kafka partitions). Unlike static partitions, ranges can dynamically split or merge with their buddy range to adapt to traffic load.

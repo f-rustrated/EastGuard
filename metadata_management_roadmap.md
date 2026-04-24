@@ -8,8 +8,6 @@ SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from th
 
 **Goal:** Define metadata types and a pure in-memory state machine.
 
-**New module:** `src/clusters/coordinator/`
-
 ### Types (`types.rs`)
 
 ```

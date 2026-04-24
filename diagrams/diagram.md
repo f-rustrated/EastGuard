@@ -31,7 +31,7 @@
 │  │  Owns quorum-loss recovery  (authority: clockwise successor on ring)  │  │
 │  │  Drives range transfer on ring reshard                                │  │
 │  └──────────────────────────────┬────────────────────────────────────────┘  │
-│                                 │  ConfChange / Coordinator commands         │
+│                                 │  ConfChange / MetadataStateMachine commands         │
 │                                 ▼                                            │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │  COORDINATOR  (MultiRaft RSM — shared Raft log, one entry per group)  │  │
@@ -103,7 +103,7 @@ Reassigning state carries: { from: NodeId, to: NodeId }
 │           └── {log_index}.snap     # RocksDB::checkpoint() per vnode
 │
 ├── db/                              # Shared RocksDB — all vnodes on this node
-│   # Coordinator state:
+│   # MetadataStateMachine state:
 │   #   "vn:{vnode_id}:raft"              → HardState (term, voted_for, commit_index)
 │   #   "vn:{vnode_id}:t:{topic_id}"      → TopicMeta
 │   #   "vn:{vnode_id}:r:{range_id}"      → RangeMeta  (incl. lineage)

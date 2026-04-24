@@ -1,4 +1,4 @@
-# Coordinator Data Model — Design Doc
+# MetadataStateMachine Data Model — Design Doc
 
 How Topic, Range, and Segment relate, transition, and cascade through the `MetadataStateMachine`.
 
@@ -55,7 +55,7 @@ enum PartitionStrategy {
 ```
 
 - `Fixed` — topic stays as single full-keyspace range. `SplitRange` rejected at apply. Use when cross-key ordering required.
-- `AutoSplit` — Coordinator may propose `SplitRange` when load thresholds exceeded. Ordering guaranteed within each range, not across ranges.
+- `AutoSplit` — MetadataStateMachine may propose `SplitRange` when load thresholds exceeded. Ordering guaranteed within each range, not across ranges.
 
 Set at `CreateTopic` time via `StoragePolicy`. Immutable after creation.
 
@@ -93,7 +93,7 @@ When a producer writes message with key `K` to topic "blue":
 1. `hash("blue")` → shard group (metadata routing)
 2. Key `K` falls within some range's `[start, end)` → that range's active segment receives the write
 
-Initially one range handles all keys. Coordinator monitors load, proposes `SplitRange` at hotspot boundaries:
+Initially one range handles all keys. MetadataStateMachine monitors load, proposes `SplitRange` at hotspot boundaries:
 
 ```
 [0x00 ─────────────────── 0xFF]        ← CreateTopic (1 range)
@@ -273,7 +273,7 @@ One command creates three nested entities:
 2. Initial range covering full keyspace `[0x00..., 0xFF...]`
 3. Initial segment as write head of that range
 
-**Replica set decision:** Coordinator picks `storage_policy.replication_factor` nodes from the consistent hash ring. Could be the same shard group members or different nodes depending on data plane placement strategy.
+**Replica set decision:** MetadataStateMachine picks `storage_policy.replication_factor` nodes from the consistent hash ring. Could be the same shard group members or different nodes depending on data plane placement strategy.
 
 **Reject if:** `topic_name_index` already contains `name` → duplicate topic error.
 
@@ -390,11 +390,11 @@ Marks everything for deletion. Data plane GC physically removes segment files. A
 
 ## Split and Merge — Triggering Conditions
 
-The Coordinator (shard group leader) monitors range health and proposes `SplitRange` or `MergeRange` when conditions are met. These are system-initiated — clients never request splits or merges directly.
+The MetadataStateMachine (shard group leader) monitors range health and proposes `SplitRange` or `MergeRange` when conditions are met. These are system-initiated — clients never request splits or merges directly.
 
 ### When Does a Range Split?
 
-A range splits when it becomes a **hot partition** — disproportionate load relative to other ranges in the same topic. The Coordinator monitors:
+A range splits when it becomes a **hot partition** — disproportionate load relative to other ranges in the same topic. The MetadataStateMachine monitors:
 
 | Signal | What it measures | Split indicator |
 |---|---|---|
@@ -402,7 +402,7 @@ A range splits when it becomes a **hot partition** — disproportionate load rel
 | **Write throughput** | Writes/sec arriving at the range's active segment | Sustained throughput above a configurable threshold |
 | **Key distribution skew** | Whether writes cluster in a sub-region of the keyspace | High write density in a narrow key band suggests a finer split would help |
 
-**Split point selection:** The Coordinator picks a split point that divides the observed write load roughly evenly. Strategies:
+**Split point selection:** The MetadataStateMachine picks a split point that divides the observed write load roughly evenly. Strategies:
 
 1. **Midpoint (simple):** Bisect the keyspace at `(start + end) / 2`. Works well for uniformly distributed keys.
 2. **Percentile-based (future):** Track key distribution histogram, split at the median write key. Better for skewed workloads but requires sampling infrastructure.
@@ -447,10 +447,10 @@ R3 and R4 are adjacent but NOT buddies (different parents). Merging them would c
 
 ### Monitoring Architecture
 
-The Coordinator does not receive a continuous metrics stream. Instead, it uses **periodic sampling**:
+The MetadataStateMachine does not receive a continuous metrics stream. Instead, it uses **periodic sampling**:
 
 ```
-Coordinator (shard leader)
+MetadataStateMachine (shard leader)
     │
     │  periodic probe (every N seconds)
     │
@@ -460,14 +460,14 @@ Data plane nodes hosting segments
     │  report: { segment_id, size_bytes, write_rate, key_histogram }
     │
     ▼
-Coordinator evaluates split/merge conditions
+MetadataStateMachine evaluates split/merge conditions
     │
     ▼
 Proposes SplitRange / MergeRange via Raft
 ```
 
 - **Who reports:** Data plane nodes that host active segments send periodic heartbeats with size and throughput metrics.
-- **Where evaluated:** The Coordinator (shard group leader) aggregates reports and evaluates thresholds. Only the leader proposes — followers ignore metrics (they'll apply the committed decision).
+- **Where evaluated:** The MetadataStateMachine (shard group leader) aggregates reports and evaluates thresholds. Only the leader proposes — followers ignore metrics (they'll apply the committed decision).
 - **Consistency:** Split/merge decisions go through Raft. Even if two leaders briefly coexist (network partition), only one proposal commits. The state machine's precondition checks in `apply_split_range()` / `apply_merge_range()` reject stale proposals (e.g., splitting an already-sealed range).
 
 ### Segment Seal — Relationship to Split
@@ -616,13 +616,13 @@ Client                    MultiRaftActor                    Raft
 | Operation | Who decides to propose | Trigger |
 |---|---|---|
 | CreateTopic | Client request via Propose pathway | External API call |
-| SealSegment | Coordinator (shard leader) | Active segment reaches size threshold |
-| SplitRange | Coordinator (shard leader) | Range throughput exceeds threshold |
-| MergeRange | Coordinator (shard leader) | Adjacent ranges below utilization threshold |
+| SealSegment | MetadataStateMachine (shard leader) | Active segment reaches size threshold |
+| SplitRange | MetadataStateMachine (shard leader) | Range throughput exceeds threshold |
+| MergeRange | MetadataStateMachine (shard leader) | Adjacent ranges below utilization threshold |
 | DeleteTopic | Client request or retention policy | External API call or TTL expiry |
-| ReassignSegment | Coordinator (shard leader) | Node failure detected via SWIM |
+| ReassignSegment | MetadataStateMachine (shard leader) | Node failure detected via SWIM |
 
-Client-initiated operations come through `MultiRaftActorCommand::Propose` with a `resource_key`. System-initiated operations (seal, split, merge, reassign) are proposed by the Coordinator itself — it monitors conditions and calls `raft.propose()` directly within `MultiRaft` (no `resource_key` routing needed since the shard group is already known).
+Client-initiated operations come through `MultiRaftActorCommand::Propose` with a `resource_key`. System-initiated operations (seal, split, merge, reassign) are proposed by the MetadataStateMachine itself — it monitors conditions and calls `raft.propose()` directly within `MultiRaft` (no `resource_key` routing needed since the shard group is already known).
 
 ---
 
