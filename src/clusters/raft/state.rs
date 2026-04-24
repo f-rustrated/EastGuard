@@ -647,7 +647,7 @@ impl Raft {
     // -> Appended to leader's log
     // -> Replicated to shard #45's followers
     // -> Majority ack -> committed
-    // -> Applied to CoordinatorStateMachine → topic blue exists
+    // -> Applied to MetadataStateMachine → topic blue exists
     pub fn propose(&mut self, command: RaftCommand) -> Result<(), ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader);

@@ -4,7 +4,7 @@ SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from th
 
 ---
 
-## Phase 1: Data Model + CoordinatorStateMachine
+## Phase 1: Data Model + MetadataStateMachine
 
 **Goal:** Define metadata types and a pure in-memory state machine.
 
@@ -50,7 +50,7 @@ ID counters scoped to parent: `next_range_id` in TopicMeta, `next_segment_id` in
 ### State Machine (`state_machine.rs`)
 
 ```rust
-struct CoordinatorStateMachine {
+struct MetadataStateMachine {
     topics:           HashMap<TopicId, TopicMeta>,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id:    u64,
@@ -114,7 +114,7 @@ enum ProposeError {
 
 ## Phase 3: Application State Machine Dispatch
 
-**Goal:** Split `apply_committed_entries()` — ConfChange stays in `Raft`, application commands dispatched to `CoordinatorStateMachine`.
+**Goal:** Split `apply_committed_entries()` — ConfChange stays in `Raft`, application commands dispatched to `MetadataStateMachine`.
 
 This is the TODO at `state.rs:569`:
 > "Phase 4 will extend this with application state machine dispatch."
@@ -141,13 +141,13 @@ fn apply_committed_entries(&mut self) {
 fn take_applied_entries(&mut self) -> Vec<LogEntry>  // new drain method
 ```
 
-### 3b. Embed `CoordinatorStateMachine` per shard group in `MultiRaft`
+### 3b. Embed `MetadataStateMachine` per shard group in `MultiRaft`
 
 ```rust
 // In multi_raft.rs:
 struct ShardGroupState {
     raft: Raft,
-    state_machine: CoordinatorStateMachine,
+    state_machine: MetadataStateMachine,
 }
 
 groups: HashMap<ShardGroupId, ShardGroupState>,
@@ -337,7 +337,7 @@ GetShardInfo { key: Vec<u8> }
 
 ### Core Insight
 
-`CoordinatorStateMachine` already sees every `SealSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
+`MetadataStateMachine` already sees every `SealSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
 
 ### 6a. Per-Range Seal Tracker
 
@@ -441,7 +441,7 @@ Add `MergeCheck` variant to `RaftTimer` for periodic merge scanning. Fires every
 ## Phase Dependency Graph
 
 ```
-Phase 1 (Data Model + CoordinatorStateMachine)
+Phase 1 (Data Model + MetadataStateMachine)
     │
     ▼
 Phase 2 (Extend RaftCommand)
@@ -498,7 +498,7 @@ Covers: RocksDB dependency, `MultiRaft` → `MultiRaftStore` refactor, `WriteBat
 **1. MultiRaftActor handles routing — no separate broker layer.**
 `MultiRaftActorCommand::Propose` takes `resource_key`, not `shard_group_id`. MultiRaft hashes the key to find the shard group, checks leadership, and proposes — all internally. Client handler in `lib.rs` stays thin (just forwards). No async topology queries needed because `ShardGroupId::new(key)` is a pure hash function.
 
-**2. CoordinatorStateMachine lives per shard group, inside MultiRaft(Store).**
+**2. MetadataStateMachine lives per shard group, inside MultiRaft(Store).**
 Not inside `Raft`. Raft remains a pure consensus state machine — no knowledge of topics, ranges, segments.
 
 **3. Application commands use buffer-drain pattern.**

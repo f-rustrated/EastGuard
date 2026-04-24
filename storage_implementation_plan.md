@@ -79,7 +79,7 @@ ShardGroupState {
     raft:          RaftGroup,
     cf:            CF,
     pending:       Vec<(key, val)>,                      // write buffer
-    state_machine: CoordinatorStateMachine,
+    state_machine: MetadataStateMachine,
     applied_index: u64,                                  // persisted — see §Flush
     stabled:       u64,                                  // highest index flushed to RocksDB
     snap_state:    SnapState,                            // TODO: background snapshot apply
@@ -97,7 +97,7 @@ ensure_group(group):
         raft:          RaftGroup::new(...),
         cf:            cf_handle,
         pending:       vec![],
-        state_machine: CoordinatorStateMachine::default(),
+        state_machine: MetadataStateMachine::default(),
         applied_index: read_applied_index(cf) or 0,
         stabled:       last_log_index_from_cf(cf) or 0,
         snap_state:    SnapState::Relax,
@@ -108,7 +108,7 @@ ensure_group(group):
         for (from, rpc) in votes: step(group.id, from, rpc)
 
 remove_group(id):
-    shards.remove(id)          // drops RaftGroup, CF handle, CoordinatorStateMachine atomically
+    shards.remove(id)          // drops RaftGroup, CF handle, MetadataStateMachine atomically
     pending_votes.remove(id)
     db.drop_cf(id.to_string())
 ```
