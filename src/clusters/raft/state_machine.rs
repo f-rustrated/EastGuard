@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+
 use crate::clusters::NodeId;
 use bincode::{Decode, Encode};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct TopicId(pub u64);
@@ -65,7 +68,7 @@ pub struct TopicMeta {
     /// Unix timestamp (ms) when this topic transitioned to `TopicState.Sealed`, if applicable.
     pub sealed_at: Option<u64>,
     /// Unix timestamp (ms) when this topic transitioned to `TopicState.Deleted`, if applicable.
-    pub deleted_at: Option<u64>
+    pub deleted_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -122,4 +125,71 @@ pub struct SegmentMeta {
     pub created_at: u64,
     /// Unix timestamp (ms) when this segment was sealed; used with `retention_ms` to schedule GC.
     pub sealed_at: Option<u64>,
+}
+
+pub(crate) struct MetadataStateMachine {
+    topics: HashMap<TopicId, TopicMeta>,
+    ranges: HashMap<RangeId, RangeMeta>,
+    segments: HashMap<SegmentId, SegmentMeta>,
+    topic_name_index: HashMap<String, TopicId>,
+    next_topic_id: u64,
+    next_range_id: u64,
+    next_segment_id: u64,
+}
+
+impl MetadataStateMachine {
+    pub(crate) fn new() -> Self {
+        todo!()
+    }
+
+    pub(crate) fn apply_create_topic(
+        &mut self,
+        _name: String,
+        _storage_policy: StoragePolicy,
+        _now_ms: u64,
+    ) {
+        todo!()
+    }
+
+    pub(crate) fn apply_split_range(
+        &mut self,
+        _range_id: RangeId,
+        _split_point: Vec<u8>,
+        _now_ms: u64,
+    ) {
+        todo!()
+    }
+
+    pub(crate) fn apply_seal_segment(&mut self, _segment_id: SegmentId, _now_ms: u64) {
+        todo!()
+    }
+
+    pub(crate) fn apply_merge_range(
+        &mut self,
+        _range_id_1: RangeId,
+        _range_id_2: RangeId,
+        _now_ms: u64,
+    ) {
+        todo!()
+    }
+
+    pub(crate) fn apply_delete_topic(&mut self, _topic_id: TopicId, _now_ms: u64) {
+        todo!()
+    }
+
+    pub(crate) fn get_topic_by_name(&self, _name: &str) -> Option<&TopicMeta> {
+        todo!()
+    }
+
+    pub(crate) fn get_topic(&self, _topic_id: TopicId) -> Option<&TopicMeta> {
+        todo!()
+    }
+
+    pub(crate) fn get_range(&self, _range_id: RangeId) -> Option<&RangeMeta> {
+        todo!()
+    }
+
+    pub(crate) fn get_segment(&self, _segment_id: SegmentId) -> Option<&SegmentMeta> {
+        todo!()
+    }
 }
