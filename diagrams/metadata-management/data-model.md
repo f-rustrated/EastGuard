@@ -15,7 +15,7 @@ CoordinatorStateMachine (one per shard group)
 │       ├── topic_id:       TopicId
 │       ├── name:           String           (globally unique — hash(name) → one shard group)
 │       ├── state:          TopicState
-│       ├── storage_policy: StoragePolicy
+│       ├── storage_policy: StoragePolicy { retention_ms, replication_factor, partition_strategy }
 │       ├── active_ranges:  Vec<RangeId>     (ordered by keyspace_start — write routing)
 │       ├── ranges:         HashMap<RangeId, RangeMeta>  (all ranges including sealed)
 │       └── next_range_id:  u64              (monotonic counter, scoped to this topic)
@@ -44,6 +44,20 @@ CoordinatorStateMachine (one per shard group)
 │
 └── topic_name_index: HashMap<String, TopicId>
 ```
+
+### PartitionStrategy
+
+```
+enum PartitionStrategy {
+    AutoSplit,   // system may split hot ranges (no total cross-key ordering)
+    Fixed,       // single range forever, total ordering guaranteed, vertical scale only
+}
+```
+
+- `Fixed` — topic stays as single full-keyspace range. `SplitRange` rejected at apply. Use when cross-key ordering required.
+- `AutoSplit` — Coordinator may propose `SplitRange` when load thresholds exceeded. Ordering guaranteed within each range, not across ranges.
+
+Set at `CreateTopic` time via `StoragePolicy`. Immutable after creation.
 
 ### Ownership Direction
 
@@ -329,6 +343,8 @@ Full cascade:
 Note: both child ranges have segment S0 — no collision because SegmentId is scoped per-range.
 
 **Keyspace invariant maintained:** `[0, 0x80) ∪ [0x80, 0xFF] = [0, 0xFF]`. No gaps, no overlaps.
+
+**Rejected if:** `topic.storage_policy.partition_strategy == Fixed` — topic opted into total ordering, splitting not allowed.
 
 ### `MergeRange { range_id_1, range_id_2 }`
 
