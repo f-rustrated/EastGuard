@@ -93,6 +93,14 @@ gh api repos/f-rustrated/EastGuard/issues --method POST \
   -f body='Issue description'
 ```
 
+**Create an issue with labels (or any array field):**
+```bash
+gh api repos/f-rustrated/EastGuard/issues --method POST \
+  --input - <<< '{"title":"Issue title","body":"Issue description","labels":["bug","priority"]}'
+```
+
+> **`-f` sends strings only.** Fields like `labels` and `assignees` require JSON arrays. Use `--input -` with a full JSON body whenever the payload includes array or non-string fields. Never use `-f labels='["..."]'` — GitHub rejects the string with HTTP 422.
+
 **Update an issue:**
 ```bash
 gh api repos/f-rustrated/EastGuard/issues/NUMBER --method PATCH \
@@ -182,6 +190,7 @@ gh api repos/f-rustrated/EastGuard/pulls/42 --jq '.body'
 
 ## Edge cases
 
+- **Array fields (`labels`, `assignees`, etc.)**: `-f` always sends strings. Use `--input -` with a JSON body for any payload containing arrays or non-string types. Never do `-f labels='["bug"]'` — GitHub returns HTTP 422.
 - **Creating PRs with long bodies**: Use `--input -` with heredoc or pipe from file instead of `-f body=` to avoid shell escaping issues.
 - **Binary content / assets**: Use `gh api` with `--input` for upload endpoints.
 - **Rate limiting**: REST API has separate rate limits from GraphQL. Check `X-RateLimit-Remaining` header if doing bulk operations.
