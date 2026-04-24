@@ -19,7 +19,8 @@ TopicState  { Active, Sealed, Deleted }
 RangeState  { Active, Sealed, Deleting }
 SegmentState { Active, Sealed, Reassigning { from, to }, Deleting }
 
-StoragePolicy { retention_ms, replication_factor }
+StoragePolicy { retention_ms, replication_factor, partition_strategy }
+PartitionStrategy { AutoSplit, Fixed }
 
 TopicMeta {
     topic_id, name, state, storage_policy,
