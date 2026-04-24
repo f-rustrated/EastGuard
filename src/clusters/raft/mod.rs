@@ -5,3 +5,4 @@ pub(crate) mod state;
 pub(crate) mod transport;
 pub(crate) mod multi_raft;
 pub(crate) mod storage;
+mod state_machine;
