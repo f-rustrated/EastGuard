@@ -147,6 +147,11 @@ impl Raft {
     }
 
     fn log_append(&mut self, entry: LogEntry) {
+        debug_assert_eq!(
+            entry.index,
+            self.log_last_index() + 1,
+            "log entry index must be contiguous"
+        );
         self.pending_log_mutations
             .push(LogMutation::Append(entry.clone()));
         self.log.push(entry);
@@ -590,7 +595,15 @@ impl Raft {
             self.last_applied_index += 1;
             let entry = match self.log_get(self.last_applied_index) {
                 Some(e) => e.clone(),
-                None => continue,
+                None => {
+                    // why is the log missing?
+                    tracing::error!(
+                        "[{}] committed entry at index {} missing from log",
+                        self.node_id,
+                        self.last_applied_index
+                    );
+                    break;
+                }
             };
             match entry.command {
                 RaftCommand::Noop => {}
