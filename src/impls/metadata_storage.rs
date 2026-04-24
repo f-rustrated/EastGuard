@@ -8,10 +8,10 @@ use crate::clusters::{
     swims::ShardGroupId,
 };
 
-/// Per-shard key space within the default column family.
-/// read storage-key-layout.md for more information
+/// Key encoder for per-shard entries in the default column family.
+/// Layout: `[group_id: u8×8][group_key: u8]` — group_id prefix scopes all keys to one shard.
 #[allow(dead_code)]
-enum ShardCfKey {
+enum GroupKey {
     LogEntry(u64),
     HardState,
     SnapMeta,
@@ -20,20 +20,20 @@ enum ShardCfKey {
     Epoch,
 }
 
-impl ShardCfKey {
+impl GroupKey {
     fn encode(&self) -> Vec<u8> {
         match self {
-            ShardCfKey::LogEntry(index) => {
+            GroupKey::LogEntry(index) => {
                 let mut key = Vec::with_capacity(9);
                 key.push(0x01);
                 key.extend_from_slice(&index.to_be_bytes());
                 key
             }
-            ShardCfKey::HardState => vec![0x02],
-            ShardCfKey::SnapMeta => vec![0x03],
-            ShardCfKey::SnapData => vec![0x04],
-            ShardCfKey::AppliedIndex => vec![0x05],
-            ShardCfKey::Epoch => vec![0x06],
+            GroupKey::HardState => vec![0x02],
+            GroupKey::SnapMeta => vec![0x03],
+            GroupKey::SnapData => vec![0x04],
+            GroupKey::AppliedIndex => vec![0x05],
+            GroupKey::Epoch => vec![0x06],
         }
     }
 
@@ -53,22 +53,22 @@ enum DbOp {
 impl DbOp {
     fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
         fn put_log_entry(group_id: u64, entry: &LogEntry) -> DbOp {
-            let key = ShardCfKey::LogEntry(entry.index).encode_for(group_id);
+            let key = GroupKey::LogEntry(entry.index).encode_for(group_id);
             let value =
                 bincode::encode_to_vec(entry, BINCODE_CONFIG).expect("encode LogEntry failed");
             DbOp::Put { key, value }
         }
 
         fn put_hard_state(group_id: u64, term: u64, voted_for: Option<NodeId>) -> DbOp {
-            let key = ShardCfKey::HardState.encode_for(group_id);
+            let key = GroupKey::HardState.encode_for(group_id);
             let value = bincode::encode_to_vec(&(term, voted_for), BINCODE_CONFIG)
                 .expect("encode HardState failed");
             DbOp::Put { key, value }
         }
 
         fn delete_from(group_id: u64, from_index: u64) -> DbOp {
-            let start = ShardCfKey::LogEntry(from_index).encode_for(group_id);
-            let end = ShardCfKey::HardState.encode_for(group_id);
+            let start = GroupKey::LogEntry(from_index).encode_for(group_id);
+            let end = GroupKey::HardState.encode_for(group_id);
             DbOp::DeleteRange { start, end }
         }
 
@@ -133,7 +133,7 @@ impl MetadataStorage {
     fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
         let Some(bytes) = self
             .db
-            .get(ShardCfKey::HardState.encode_for(group_id))
+            .get(GroupKey::HardState.encode_for(group_id))
             .unwrap_or_default()
         else {
             return RaftPersistentState::default();
@@ -151,8 +151,8 @@ impl MetadataStorage {
     }
 
     fn list_log_entires(&self, group_id: u64) -> Vec<LogEntry> {
-        let start = ShardCfKey::LogEntry(0).encode_for(group_id);
-        let end = ShardCfKey::HardState.encode_for(group_id);
+        let start = GroupKey::LogEntry(0).encode_for(group_id);
+        let end = GroupKey::HardState.encode_for(group_id);
         self.scan_range(&start, &end)
             .into_iter()
             .map(|bytes| {
