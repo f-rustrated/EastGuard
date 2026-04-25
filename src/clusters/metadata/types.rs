@@ -104,6 +104,11 @@ impl RangeMeta {
             merged_from: None,
         }
     }
+    pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
+        (self.state == RangeState::Active)
+            .then_some(())
+            .ok_or(MetadataError::RangeNotActive)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

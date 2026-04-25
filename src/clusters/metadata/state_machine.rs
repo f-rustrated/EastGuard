@@ -70,9 +70,8 @@ impl MetadataStateMachine {
         }
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
 
-        if range.state != RangeState::Active {
-            return Err(RangeNotActive);
-        }
+        range.validate_active()?;
+
         if range.active_segment != Some(cmd.segment_id) {
             return Err(SegmentNotActive);
         }
@@ -112,9 +111,8 @@ impl MetadataStateMachine {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
-        if range.state != RangeState::Active {
-            return Err(RangeNotActive);
-        }
+        range.validate_active()?;
+
         if cmd.split_point <= range.keyspace_start || cmd.split_point >= range.keyspace_end {
             return Err(InvalidSplitPoint);
         }
@@ -173,12 +171,9 @@ impl MetadataStateMachine {
         {
             let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
             let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
-            if r1.state != RangeState::Active {
-                return Err(RangeNotActive);
-            }
-            if r2.state != RangeState::Active {
-                return Err(RangeNotActive);
-            }
+            r1.validate_active()?;
+            r2.validate_active()?;
+
             let adjacent =
                 r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
             if !adjacent {
