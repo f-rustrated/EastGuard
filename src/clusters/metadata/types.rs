@@ -56,6 +56,42 @@ pub struct RangeMeta {
     pub merged_from: Option<[RangeId; 2]>,
 }
 
+impl RangeMeta {
+    pub(crate) fn new(
+        range_id: RangeId,
+        keyspace_start: Vec<u8>,
+        keyspace_end: Vec<u8>,
+        replica_set: Vec<NodeId>,
+        created_at: u64,
+    ) -> Self {
+        let segment_id = SegmentId(0);
+        let segment = SegmentMeta {
+            segment_id,
+            state: SegmentState::Active,
+            replica_set,
+            size_bytes: 0,
+            start_offset: 0,
+            end_offset: None,
+            created_at,
+            sealed_at: None,
+        };
+
+        RangeMeta {
+            range_id,
+            keyspace_start,
+            keyspace_end,
+            state: RangeState::Active,
+            active_segment: Some(segment_id),
+            segments: HashMap::from([(segment_id, segment)]),
+            next_segment_id: 1,
+            next_offset: 0,
+            split_into: None,
+            merged_into: None,
+            merged_from: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct TopicMeta {
     pub id: TopicId,

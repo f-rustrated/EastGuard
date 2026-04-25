@@ -1,3 +1,4 @@
+pub(crate) mod command;
 pub mod error;
 #[allow(dead_code)]
 pub(crate) mod state_machine;
@@ -11,6 +12,8 @@ pub(crate) use state_machine::*;
 #[allow(unused_imports)]
 pub(crate) use types::*;
 
+#[allow(unused_imports)]
+pub(crate) use command::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct TopicId(pub u64);
 

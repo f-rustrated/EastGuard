@@ -1,12 +1,10 @@
+use super::command::*;
 use super::types::*;
-use crate::clusters::{
-    NodeId,
-    metadata::{
-        RangeId, SegmentId, TopicId,
-        error::MetadataError,
-        strategy::{PartitionStrategy, StoragePolicy},
-    },
+use crate::clusters::metadata::{
+    RangeId, SegmentId, TopicId, error::MetadataError, strategy::PartitionStrategy,
 };
+
+use MetadataError::*;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -21,146 +19,122 @@ impl MetadataStateMachine {
         self.topics.get(id)
     }
 
-    pub fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
+    pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
         self.topic_name_index
             .get(name)
             .and_then(|id| self.topics.get(id))
     }
 
-    pub fn topic_count(&self) -> usize {
+    pub(crate) fn topic_count(&self) -> usize {
         self.topics.len()
     }
 
-    pub fn create_topic(
-        &mut self,
-        name: String,
-        storage_policy: StoragePolicy,
-        replica_set: Vec<NodeId>,
-        created_at: u64, // ? this can be internally generated?
-    ) -> Result<TopicId, MetadataError> {
-        if self.topic_name_index.contains_key(&name) {
-            return Err(MetadataError::TopicNameAlreadyExists(name));
+    pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<ApplyResult, MetadataError> {
+        use MetadataCommand::*;
+        match command {
+            CreateTopic(cmd) => self.create_topic(cmd).map(ApplyResult::TopicCreated),
+            SealSegment(cmd) => self.seal_segment(cmd).map(|()| ApplyResult::SegmentSealed),
+            SplitRange(cmd) => self
+                .split_range(cmd)
+                .map(|(c1, c2)| ApplyResult::RangeSplit(c1, c2)),
+            MergeRange(cmd) => self.merge_range(cmd).map(ApplyResult::RangeMerged),
+            DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted),
+        }
+    }
+
+    fn create_topic(&mut self, cmd: CreateTopic) -> Result<TopicId, MetadataError> {
+        if self.topic_name_index.contains_key(&cmd.name) {
+            return Err(TopicNameAlreadyExists(cmd.name));
         }
         let topic_id = TopicId(self.next_topic_id);
-        let topic = TopicMeta::new(name, topic_id, replica_set, created_at, storage_policy);
-
+        let topic = TopicMeta::new(
+            cmd.name,
+            topic_id,
+            cmd.replica_set,
+            cmd.created_at,
+            cmd.storage_policy,
+        );
         self.topic_name_index.insert(topic.name.clone(), topic_id);
         self.topics.insert(topic.id, topic);
         self.next_topic_id += 1;
         Ok(topic_id)
     }
 
-    pub fn apply_seal_segment(
-        &mut self,
-        topic_id: TopicId,
-        range_id: RangeId,
-        segment_id: SegmentId,
-        sealed_at: u64,
-        new_replica_set: Vec<NodeId>,
-    ) -> Result<(), MetadataError> {
+    fn seal_segment(&mut self, cmd: SealSegment) -> Result<(), MetadataError> {
         let topic = self
             .topics
-            .get_mut(&topic_id)
-            .ok_or(MetadataError::TopicNotFound(topic_id))?;
-
+            .get_mut(&cmd.topic_id)
+            .ok_or(TopicNotFound(cmd.topic_id))?;
         if topic.state != TopicState::Active {
-            return Err(MetadataError::TopicNotActive(topic_id));
+            return Err(TopicNotActive(cmd.topic_id));
         }
-
         let range = topic
             .ranges
-            .get_mut(&range_id)
-            .ok_or(MetadataError::RangeNotFound(topic_id, range_id))?;
-
+            .get_mut(&cmd.range_id)
+            .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id))?;
         if range.state != RangeState::Active {
-            return Err(MetadataError::RangeNotActive(topic_id, range_id));
+            return Err(RangeNotActive(cmd.topic_id, cmd.range_id));
         }
-
-        if range.active_segment != Some(segment_id) {
-            return Err(MetadataError::SegmentNotActive(
-                topic_id, range_id, segment_id,
-            ));
+        if range.active_segment != Some(cmd.segment_id) {
+            return Err(SegmentNotActive(cmd.topic_id, cmd.range_id, cmd.segment_id));
         }
-
         let segment = range
             .segments
-            .get_mut(&segment_id)
-            .ok_or(MetadataError::SegmentNotFound(
-                topic_id, range_id, segment_id,
-            ))?;
-
+            .get_mut(&cmd.segment_id)
+            .ok_or(SegmentNotFound(cmd.topic_id, cmd.range_id, cmd.segment_id))?;
         if segment.state != SegmentState::Active {
-            return Err(MetadataError::SegmentNotActive(
-                topic_id, range_id, segment_id,
-            ));
+            return Err(SegmentNotActive(cmd.topic_id, cmd.range_id, cmd.segment_id));
         }
 
         segment.state = SegmentState::Sealed;
         segment.end_offset = Some(range.next_offset.saturating_sub(1));
-        segment.sealed_at = Some(sealed_at);
+        segment.sealed_at = Some(cmd.sealed_at);
 
         let new_segment_id = SegmentId(range.next_segment_id);
         range.next_segment_id += 1;
-
         let new_segment = SegmentMeta {
             segment_id: new_segment_id,
             state: SegmentState::Active,
-            replica_set: new_replica_set,
+            replica_set: cmd.new_replica_set,
             size_bytes: 0,
             start_offset: range.next_offset,
             end_offset: None,
-            created_at: sealed_at,
+            created_at: cmd.sealed_at,
             sealed_at: None,
         };
-
         range.segments.insert(new_segment_id, new_segment);
         range.active_segment = Some(new_segment_id);
-
         Ok(())
     }
 
-    pub fn apply_split_range(
-        &mut self,
-        topic_id: TopicId,
-        range_id: RangeId,
-        split_point: Vec<u8>,
-        created_at: u64,
-        child1_replica_set: Vec<NodeId>,
-        child2_replica_set: Vec<NodeId>,
-    ) -> Result<(RangeId, RangeId), MetadataError> {
+    fn split_range(&mut self, cmd: SplitRange) -> Result<(RangeId, RangeId), MetadataError> {
         let topic = self
             .topics
-            .get_mut(&topic_id)
-            .ok_or(MetadataError::TopicNotFound(topic_id))?;
-
+            .get_mut(&cmd.topic_id)
+            .ok_or(TopicNotFound(cmd.topic_id))?;
         if topic.state != TopicState::Active {
-            return Err(MetadataError::TopicNotActive(topic_id));
+            return Err(TopicNotActive(cmd.topic_id));
         }
-
         if topic.storage_policy.partition_strategy == PartitionStrategy::Fixed {
-            return Err(MetadataError::SplitNotAllowed(topic_id));
+            return Err(SplitNotAllowed(cmd.topic_id));
         }
-
         let range = topic
             .ranges
-            .get_mut(&range_id)
-            .ok_or(MetadataError::RangeNotFound(topic_id, range_id))?;
-
+            .get_mut(&cmd.range_id)
+            .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id))?;
         if range.state != RangeState::Active {
-            return Err(MetadataError::RangeNotActive(topic_id, range_id));
+            return Err(RangeNotActive(cmd.topic_id, cmd.range_id));
+        }
+        if cmd.split_point <= range.keyspace_start || cmd.split_point >= range.keyspace_end {
+            return Err(InvalidSplitPoint);
         }
 
-        if split_point <= range.keyspace_start || split_point >= range.keyspace_end {
-            return Err(MetadataError::InvalidSplitPoint);
-        }
-
-        // Seal parent's active segment
         if let Some(seg_id) = range.active_segment
             && let Some(seg) = range.segments.get_mut(&seg_id)
         {
             seg.state = SegmentState::Sealed;
             seg.end_offset = Some(range.next_offset.saturating_sub(1));
-            seg.sealed_at = Some(created_at);
+            seg.sealed_at = Some(cmd.created_at);
         }
 
         let parent_start = range.keyspace_start.clone();
@@ -168,136 +142,108 @@ impl MetadataStateMachine {
         range.state = RangeState::Sealed;
         range.active_segment = None;
 
-        // Allocate child IDs
         let child1_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
         let child2_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
 
-        // Record lineage on parent
-        topic.ranges.get_mut(&range_id).unwrap().split_into = Some([child1_id, child2_id]);
+        topic.ranges.get_mut(&cmd.range_id).unwrap().split_into = Some([child1_id, child2_id]);
 
-        // Create child ranges
-        let child1 = Self::new_range(
+        let child1 = RangeMeta::new(
             child1_id,
             parent_start,
-            split_point.clone(),
-            child1_replica_set,
-            created_at,
+            cmd.split_point.clone(),
+            cmd.child1_replica_set,
+            cmd.created_at,
         );
-        let child2 = Self::new_range(
+        let child2 = RangeMeta::new(
             child2_id,
-            split_point,
+            cmd.split_point,
             parent_end,
-            child2_replica_set,
-            created_at,
+            cmd.child2_replica_set,
+            cmd.created_at,
         );
-
         topic.ranges.insert(child1_id, child1);
         topic.ranges.insert(child2_id, child2);
 
-        // Update active_ranges: remove parent, insert children sorted
-        topic.active_ranges.retain(|id| *id != range_id);
+        topic.active_ranges.retain(|id| *id != cmd.range_id);
         Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, child1_id);
         Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, child2_id);
-
         Ok((child1_id, child2_id))
     }
 
-    pub fn apply_merge_range(
-        &mut self,
-        topic_id: TopicId,
-        range_id_1: RangeId,
-        range_id_2: RangeId,
-        created_at: u64,
-        merged_replica_set: Vec<NodeId>,
-    ) -> Result<RangeId, MetadataError> {
+    fn merge_range(&mut self, cmd: MergeRange) -> Result<RangeId, MetadataError> {
         let topic = self
             .topics
-            .get_mut(&topic_id)
-            .ok_or(MetadataError::TopicNotFound(topic_id))?;
-
+            .get_mut(&cmd.topic_id)
+            .ok_or(TopicNotFound(cmd.topic_id))?;
         if topic.state != TopicState::Active {
-            return Err(MetadataError::TopicNotActive(topic_id));
+            return Err(TopicNotActive(cmd.topic_id));
         }
-
-        // Validate both ranges exist and are Active
         {
             let r1 = topic
                 .ranges
-                .get(&range_id_1)
-                .ok_or(MetadataError::RangeNotFound(topic_id, range_id_1))?;
+                .get(&cmd.range_id_1)
+                .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id_1))?;
             let r2 = topic
                 .ranges
-                .get(&range_id_2)
-                .ok_or(MetadataError::RangeNotFound(topic_id, range_id_2))?;
-
+                .get(&cmd.range_id_2)
+                .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id_2))?;
             if r1.state != RangeState::Active {
-                return Err(MetadataError::RangeNotActive(topic_id, range_id_1));
+                return Err(RangeNotActive(cmd.topic_id, cmd.range_id_1));
             }
             if r2.state != RangeState::Active {
-                return Err(MetadataError::RangeNotActive(topic_id, range_id_2));
+                return Err(RangeNotActive(cmd.topic_id, cmd.range_id_2));
             }
-
-            // Check adjacency: one's end must equal the other's start
             let adjacent =
                 r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
             if !adjacent {
-                return Err(MetadataError::RangesNotAdjacent(range_id_1, range_id_2));
+                return Err(RangesNotAdjacent(cmd.range_id_1, cmd.range_id_2));
             }
         }
 
-        // Determine ordering by keyspace
         let (lower_id, upper_id) = {
-            let r1 = &topic.ranges[&range_id_1];
-            let r2 = &topic.ranges[&range_id_2];
+            let r1 = &topic.ranges[&cmd.range_id_1];
+            let r2 = &topic.ranges[&cmd.range_id_2];
             if r1.keyspace_start <= r2.keyspace_start {
-                (range_id_1, range_id_2)
+                (cmd.range_id_1, cmd.range_id_2)
             } else {
-                (range_id_2, range_id_1)
+                (cmd.range_id_2, cmd.range_id_1)
             }
         };
 
         let merged_start = topic.ranges[&lower_id].keyspace_start.clone();
         let merged_end = topic.ranges[&upper_id].keyspace_end.clone();
+        Self::seal_range(&mut topic.ranges, lower_id, cmd.created_at);
+        Self::seal_range(&mut topic.ranges, upper_id, cmd.created_at);
 
-        // Seal both ranges and their active segments
-        Self::seal_range(&mut topic.ranges, lower_id, created_at);
-        Self::seal_range(&mut topic.ranges, upper_id, created_at);
-
-        // Allocate merged range
         let merged_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
+        topic.ranges.get_mut(&cmd.range_id_1).unwrap().merged_into = Some(merged_id);
+        topic.ranges.get_mut(&cmd.range_id_2).unwrap().merged_into = Some(merged_id);
 
-        // Record lineage
-        topic.ranges.get_mut(&range_id_1).unwrap().merged_into = Some(merged_id);
-        topic.ranges.get_mut(&range_id_2).unwrap().merged_into = Some(merged_id);
-
-        let mut merged = Self::new_range(
+        let mut merged = RangeMeta::new(
             merged_id,
             merged_start,
             merged_end,
-            merged_replica_set,
-            created_at,
+            cmd.merged_replica_set,
+            cmd.created_at,
         );
-        merged.merged_from = Some([range_id_1, range_id_2]);
-
+        merged.merged_from = Some([cmd.range_id_1, cmd.range_id_2]);
         topic.ranges.insert(merged_id, merged);
 
-        // Update active_ranges
         topic
             .active_ranges
-            .retain(|id| *id != range_id_1 && *id != range_id_2);
+            .retain(|id| *id != cmd.range_id_1 && *id != cmd.range_id_2);
         Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, merged_id);
-
         Ok(merged_id)
     }
 
-    pub fn apply_delete_topic(&mut self, topic_id: TopicId) -> Result<(), MetadataError> {
+    fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
         let topic = self
             .topics
-            .get_mut(&topic_id)
-            .ok_or(MetadataError::TopicNotFound(topic_id))?;
+            .get_mut(&cmd.topic_id)
+            .ok_or(TopicNotFound(cmd.topic_id))?;
 
         topic.state = TopicState::Deleted;
         topic.active_ranges.clear();
@@ -313,42 +259,6 @@ impl MetadataStateMachine {
         self.topic_name_index.remove(&topic.name);
 
         Ok(())
-    }
-
-    // --- Private helpers ---
-
-    fn new_range(
-        range_id: RangeId,
-        keyspace_start: Vec<u8>,
-        keyspace_end: Vec<u8>,
-        replica_set: Vec<NodeId>,
-        created_at: u64,
-    ) -> RangeMeta {
-        let segment_id = SegmentId(0);
-        let segment = SegmentMeta {
-            segment_id,
-            state: SegmentState::Active,
-            replica_set,
-            size_bytes: 0,
-            start_offset: 0,
-            end_offset: None,
-            created_at,
-            sealed_at: None,
-        };
-
-        RangeMeta {
-            range_id,
-            keyspace_start,
-            keyspace_end,
-            state: RangeState::Active,
-            active_segment: Some(segment_id),
-            segments: HashMap::from([(segment_id, segment)]),
-            next_segment_id: 1,
-            next_offset: 0,
-            split_into: None,
-            merged_into: None,
-            merged_from: None,
-        }
     }
 
     fn seal_range(ranges: &mut HashMap<RangeId, RangeMeta>, range_id: RangeId, sealed_at: u64) {
@@ -381,6 +291,10 @@ impl MetadataStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clusters::{
+        NodeId,
+        metadata::strategy::{PartitionStrategy, StoragePolicy},
+    };
 
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
@@ -407,8 +321,74 @@ mod tests {
     }
 
     fn create_topic(sm: &mut MetadataStateMachine, name: &str) -> TopicId {
-        sm.create_topic(name.to_string(), default_policy(), replica_set(), 1000)
-            .unwrap()
+        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
+            name: name.to_string(),
+            storage_policy: default_policy(),
+            replica_set: replica_set(),
+            created_at: 1000,
+        }));
+        match result.unwrap() {
+            ApplyResult::TopicCreated(id) => id,
+            other => panic!("expected TopicCreated, got {:?}", other),
+        }
+    }
+
+    fn seal_segment(
+        sm: &mut MetadataStateMachine,
+        topic_id: TopicId,
+        range_id: RangeId,
+        segment_id: SegmentId,
+        sealed_at: u64,
+    ) {
+        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+            topic_id,
+            range_id,
+            segment_id,
+            sealed_at,
+            new_replica_set: replica_set(),
+        }));
+        assert_eq!(result.unwrap(), ApplyResult::SegmentSealed);
+    }
+
+    fn split_range(
+        sm: &mut MetadataStateMachine,
+        topic_id: TopicId,
+        range_id: RangeId,
+        split_point: Vec<u8>,
+        created_at: u64,
+    ) -> (RangeId, RangeId) {
+        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+            topic_id,
+            range_id,
+            split_point,
+            created_at,
+            child1_replica_set: replica_set(),
+            child2_replica_set: replica_set(),
+        }));
+        match result.unwrap() {
+            ApplyResult::RangeSplit(c1, c2) => (c1, c2),
+            other => panic!("expected RangeSplit, got {:?}", other),
+        }
+    }
+
+    fn merge_range(
+        sm: &mut MetadataStateMachine,
+        topic_id: TopicId,
+        range_id_1: RangeId,
+        range_id_2: RangeId,
+        created_at: u64,
+    ) -> RangeId {
+        let result = sm.apply(MetadataCommand::MergeRange(MergeRange {
+            topic_id,
+            range_id_1,
+            range_id_2,
+            created_at,
+            merged_replica_set: replica_set(),
+        }));
+        match result.unwrap() {
+            ApplyResult::RangeMerged(id) => id,
+            other => panic!("expected RangeMerged, got {:?}", other),
+        }
     }
 
     // --- CreateTopic ---
@@ -435,11 +415,13 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         create_topic(&mut sm, "blue");
 
-        let result = sm.create_topic("blue".to_string(), default_policy(), replica_set(), 2000);
-        assert_eq!(
-            result,
-            Err(MetadataError::TopicNameAlreadyExists("blue".to_string()))
-        );
+        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
+            name: "blue".to_string(),
+            storage_policy: default_policy(),
+            replica_set: replica_set(),
+            created_at: 2000,
+        }));
+        assert_eq!(result, Err(TopicNameAlreadyExists("blue".to_string())));
     }
 
     #[test]
@@ -495,8 +477,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
-            .unwrap();
+        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));
@@ -508,8 +489,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
-            .unwrap();
+        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         let sealed = &range.segments[&SegmentId(0)];
@@ -523,10 +503,8 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
-            .unwrap();
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(1), 3000, replica_set())
-            .unwrap();
+        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        seal_segment(&mut sm, tid, RangeId(0), SegmentId(1), 3000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(2)));
@@ -537,9 +515,14 @@ mod tests {
     #[test]
     fn seal_segment_bad_topic() {
         let mut sm = MetadataStateMachine::default();
-        let result =
-            sm.apply_seal_segment(TopicId(99), RangeId(0), SegmentId(0), 2000, replica_set());
-        assert_eq!(result, Err(MetadataError::TopicNotFound(TopicId(99))));
+        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+            topic_id: TopicId(99),
+            range_id: RangeId(0),
+            segment_id: SegmentId(0),
+            sealed_at: 2000,
+            new_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(TopicNotFound(TopicId(99))));
     }
 
     #[test]
@@ -547,8 +530,14 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply_seal_segment(tid, RangeId(99), SegmentId(0), 2000, replica_set());
-        assert_eq!(result, Err(MetadataError::RangeNotFound(tid, RangeId(99))));
+        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+            topic_id: tid,
+            range_id: RangeId(99),
+            segment_id: SegmentId(0),
+            sealed_at: 2000,
+            new_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(RangeNotFound(tid, RangeId(99))));
     }
 
     #[test]
@@ -556,14 +545,16 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply_seal_segment(tid, RangeId(0), SegmentId(99), 2000, replica_set());
+        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+            topic_id: tid,
+            range_id: RangeId(0),
+            segment_id: SegmentId(99),
+            sealed_at: 2000,
+            new_replica_set: replica_set(),
+        }));
         assert_eq!(
             result,
-            Err(MetadataError::SegmentNotActive(
-                tid,
-                RangeId(0),
-                SegmentId(99)
-            ))
+            Err(SegmentNotActive(tid, RangeId(0), SegmentId(99)))
         );
     }
 
@@ -574,19 +565,10 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let topic = sm.get_topic(&tid).unwrap();
-        assert_eq!(topic.ranges.len(), 3); // parent + 2 children
+        assert_eq!(topic.ranges.len(), 3);
 
         let child1 = &topic.ranges[&c1];
         assert_eq!(child1.keyspace_start, KEYSPACE_MIN);
@@ -604,16 +586,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.active_ranges, vec![c1, c2]);
@@ -625,21 +598,12 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_split_range(
-            tid,
-            RangeId(0),
-            vec![0x80],
-            2000,
-            replica_set(),
-            replica_set(),
-        )
-        .unwrap();
+        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let parent = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(parent.state, RangeState::Sealed);
         assert_eq!(parent.active_segment, None);
 
-        // Parent's segment should be sealed
         let seg = &parent.segments[&SegmentId(0)];
         assert_eq!(seg.state, SegmentState::Sealed);
     }
@@ -649,16 +613,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let topic = sm.get_topic(&tid).unwrap();
 
@@ -677,16 +632,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.ranges[&RangeId(0)].split_into, Some([c1, c2]));
@@ -695,19 +641,26 @@ mod tests {
     #[test]
     fn split_range_fixed_rejected() {
         let mut sm = MetadataStateMachine::default();
-        let tid = sm
-            .create_topic("ordered".to_string(), fixed_policy(), replica_set(), 1000)
-            .unwrap();
+        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
+            name: "ordered".to_string(),
+            storage_policy: fixed_policy(),
+            replica_set: replica_set(),
+            created_at: 1000,
+        }));
+        let tid = match result.unwrap() {
+            ApplyResult::TopicCreated(id) => id,
+            other => panic!("expected TopicCreated, got {:?}", other),
+        };
 
-        let result = sm.apply_split_range(
-            tid,
-            RangeId(0),
-            vec![0x80],
-            2000,
-            replica_set(),
-            replica_set(),
-        );
-        assert_eq!(result, Err(MetadataError::SplitNotAllowed(tid)));
+        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+            topic_id: tid,
+            range_id: RangeId(0),
+            split_point: vec![0x80],
+            created_at: 2000,
+            child1_replica_set: replica_set(),
+            child2_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(SplitNotAllowed(tid)));
     }
 
     #[test]
@@ -715,21 +668,25 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        // Split point at or beyond keyspace_end
-        let result = sm.apply_split_range(
-            tid,
-            RangeId(0),
-            vec![0xFF],
-            2000,
-            replica_set(),
-            replica_set(),
-        );
-        assert_eq!(result, Err(MetadataError::InvalidSplitPoint));
+        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+            topic_id: tid,
+            range_id: RangeId(0),
+            split_point: vec![0xFF],
+            created_at: 2000,
+            child1_replica_set: replica_set(),
+            child2_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(InvalidSplitPoint));
 
-        // Split point at keyspace_start (empty vec)
-        let result =
-            sm.apply_split_range(tid, RangeId(0), vec![], 2000, replica_set(), replica_set());
-        assert_eq!(result, Err(MetadataError::InvalidSplitPoint));
+        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+            topic_id: tid,
+            range_id: RangeId(0),
+            split_point: vec![],
+            created_at: 2000,
+            child1_replica_set: replica_set(),
+            child2_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(InvalidSplitPoint));
     }
 
     #[test]
@@ -737,24 +694,13 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
         let topic = sm.get_topic(&tid).unwrap();
         let r1 = &topic.ranges[&c1];
         let r2 = &topic.ranges[&c2];
 
-        // Child1.end == Child2.start (no gap)
         assert_eq!(r1.keyspace_end, r2.keyspace_start);
-        // Union covers full keyspace
         assert_eq!(r1.keyspace_start, KEYSPACE_MIN);
         assert_eq!(r2.keyspace_end, KEYSPACE_MAX);
     }
@@ -765,21 +711,9 @@ mod tests {
     fn merge_range_basic() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        let merged_id = sm
-            .apply_merge_range(tid, c1, c2, 3000, replica_set())
-            .unwrap();
+        let merged_id = merge_range(&mut sm, tid, c1, c2, 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
         let merged = &topic.ranges[&merged_id];
@@ -792,21 +726,9 @@ mod tests {
     fn merge_range_active_ranges_updated() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        let merged_id = sm
-            .apply_merge_range(tid, c1, c2, 3000, replica_set())
-            .unwrap();
+        let merged_id = merge_range(&mut sm, tid, c1, c2, 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.active_ranges, vec![merged_id]);
@@ -816,21 +738,9 @@ mod tests {
     fn merge_range_lineage() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        let merged_id = sm
-            .apply_merge_range(tid, c1, c2, 3000, replica_set())
-            .unwrap();
+        let merged_id = merge_range(&mut sm, tid, c1, c2, 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.ranges[&c1].merged_into, Some(merged_id));
@@ -842,46 +752,26 @@ mod tests {
     fn merge_range_non_adjacent_rejected() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        let (c1a, _c1b) = split_range(&mut sm, tid, c1, vec![0x40], 3000);
 
-        // Split into 3 ranges: [min,0x40), [0x40,0x80), [0x80,max)
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        let (c1a, _c1b) = sm
-            .apply_split_range(tid, c1, vec![0x40], 3000, replica_set(), replica_set())
-            .unwrap();
-
-        // c1a=[min,0x40) and c2=[0x80,max) are NOT adjacent
-        let result = sm.apply_merge_range(tid, c1a, c2, 4000, replica_set());
-        assert_eq!(result, Err(MetadataError::RangesNotAdjacent(c1a, c2)));
+        let result = sm.apply(MetadataCommand::MergeRange(MergeRange {
+            topic_id: tid,
+            range_id_1: c1a,
+            range_id_2: c2,
+            created_at: 4000,
+            merged_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(RangesNotAdjacent(c1a, c2)));
     }
 
     #[test]
     fn merge_range_seals_sources() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        sm.apply_merge_range(tid, c1, c2, 3000, replica_set())
-            .unwrap();
+        merge_range(&mut sm, tid, c1, c2, 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.ranges[&c1].state, RangeState::Sealed);
@@ -897,7 +787,8 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_delete_topic(tid).unwrap();
+        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic { topic_id: tid }))
+            .unwrap();
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.state, TopicState::Deleted);
@@ -916,18 +807,20 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_delete_topic(tid).unwrap();
+        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic { topic_id: tid }))
+            .unwrap();
 
         assert!(sm.get_topic_by_name("blue").is_none());
-        // Topic still in map (for GC)
         assert!(sm.get_topic(&tid).is_some());
     }
 
     #[test]
     fn delete_topic_nonexistent() {
         let mut sm = MetadataStateMachine::default();
-        let result = sm.apply_delete_topic(TopicId(99));
-        assert_eq!(result, Err(MetadataError::TopicNotFound(TopicId(99))));
+        let result = sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
+            topic_id: TopicId(99),
+        }));
+        assert_eq!(result, Err(TopicNotFound(TopicId(99))));
     }
 
     // --- Integration ---
@@ -936,21 +829,9 @@ mod tests {
     fn create_split_seal() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, _c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, _c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        // Seal a segment in child range
-        sm.apply_seal_segment(tid, c1, SegmentId(0), 3000, replica_set())
-            .unwrap();
+        seal_segment(&mut sm, tid, c1, SegmentId(0), 3000);
 
         let child = &sm.get_topic(&tid).unwrap().ranges[&c1];
         assert_eq!(child.active_segment, Some(SegmentId(1)));
@@ -961,21 +842,9 @@ mod tests {
     fn split_merge_roundtrip() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        let (c1, c2) = sm
-            .apply_split_range(
-                tid,
-                RangeId(0),
-                vec![0x80],
-                2000,
-                replica_set(),
-                replica_set(),
-            )
-            .unwrap();
-
-        let merged = sm
-            .apply_merge_range(tid, c1, c2, 3000, replica_set())
-            .unwrap();
+        let merged = merge_range(&mut sm, tid, c1, c2, 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
         let range = &topic.ranges[&merged];
@@ -990,16 +859,7 @@ mod tests {
         let t1 = create_topic(&mut sm, "alpha");
         let t2 = create_topic(&mut sm, "beta");
 
-        // Split alpha, leave beta alone
-        sm.apply_split_range(
-            t1,
-            RangeId(0),
-            vec![0x80],
-            2000,
-            replica_set(),
-            replica_set(),
-        )
-        .unwrap();
+        split_range(&mut sm, t1, RangeId(0), vec![0x80], 2000);
 
         let alpha = sm.get_topic(&t1).unwrap();
         assert_eq!(alpha.active_ranges.len(), 2);
