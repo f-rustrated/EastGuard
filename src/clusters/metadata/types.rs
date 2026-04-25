@@ -108,10 +108,26 @@ impl RangeMeta {
             merged_from: None,
         }
     }
-    pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
-        (self.state == RangeState::Active)
-            .then_some(())
-            .ok_or(MetadataError::RangeNotActive)
+    pub(crate) fn validate_active(&self) -> Result<SegmentId, MetadataError> {
+        if self.state != RangeState::Active {
+            return Err(MetadataError::RangeNotActive);
+        }
+        self.active_segment.ok_or(MetadataError::RangeNotActive)
+    }
+
+    pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
+        split_point > &self.keyspace_start && split_point < &self.keyspace_end
+    }
+
+    pub(crate) fn seal(&mut self, created_at: u64) -> Result<(), MetadataError> {
+        if let Some(seg_id) = self.active_segment
+            && let Some(seg) = self.segments.get_mut(&seg_id)
+        {
+            seg.seal(self.next_offset.saturating_sub(1), created_at)?;
+        }
+        self.state = RangeState::Sealed;
+        self.active_segment = None;
+        Ok(())
     }
 }
 

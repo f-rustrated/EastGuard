@@ -1,8 +1,6 @@
 use super::command::*;
 use super::types::*;
-use crate::clusters::metadata::{
-    RangeId, SegmentId, TopicId, error::MetadataError, strategy::PartitionStrategy,
-};
+use crate::clusters::metadata::{RangeId, SegmentId, TopicId, error::MetadataError};
 
 use MetadataError::*;
 use std::collections::HashMap;
@@ -68,17 +66,15 @@ impl MetadataStateMachine {
         topic.validate_active()?;
 
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
+        let active_seg_id = range.validate_active()?;
 
-        range.validate_active()?;
-
-        if range.active_segment != Some(cmd.segment_id) {
+        if active_seg_id != cmd.segment_id {
             return Err(SegmentNotActive);
         }
         let segment = range
             .segments
             .get_mut(&cmd.segment_id)
             .ok_or(SegmentNotFound)?;
-
         segment.seal(range.next_offset.saturating_sub(1), cmd.sealed_at)?;
 
         let new_segment_id = SegmentId(range.next_segment_id);
@@ -111,24 +107,15 @@ impl MetadataStateMachine {
         }
 
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
-        range.validate_active()?;
 
-        if cmd.split_point <= range.keyspace_start || cmd.split_point >= range.keyspace_end {
+        if !range.valid_split_point(&cmd.split_point) {
             return Err(InvalidSplitPoint);
         }
-
-        if let Some(seg_id) = range.active_segment
-            && let Some(seg) = range.segments.get_mut(&seg_id)
-        {
-            seg.state = SegmentState::Sealed;
-            seg.end_offset = Some(range.next_offset.saturating_sub(1));
-            seg.sealed_at = Some(cmd.created_at);
-        }
+        let _ = range.validate_active()?;
+        range.seal(cmd.created_at)?;
 
         let parent_start = range.keyspace_start.clone();
         let parent_end = range.keyspace_end.clone();
-        range.state = RangeState::Sealed;
-        range.active_segment = None;
 
         let child1_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
