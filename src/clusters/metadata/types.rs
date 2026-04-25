@@ -4,7 +4,7 @@ use bincode::{Decode, Encode};
 
 use crate::clusters::{
     NodeId,
-    metadata::{RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+    metadata::{RangeId, SegmentId, TopicId, error::MetadataError, strategy::StoragePolicy},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -39,6 +39,20 @@ pub struct SegmentMeta {
     pub end_offset: Option<u64>,
     pub created_at: u64,
     pub sealed_at: Option<u64>,
+}
+
+impl SegmentMeta {
+    pub(crate) fn seal(&mut self, end_offset: u64, sealed_at: u64) -> Result<(), MetadataError> {
+        if self.state != SegmentState::Active {
+            return Err(MetadataError::SegmentNotActive);
+        }
+
+        self.state = SegmentState::Sealed;
+        self.end_offset = Some(end_offset);
+        self.sealed_at = Some(sealed_at);
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -147,6 +161,29 @@ impl TopicMeta {
             ranges: HashMap::from([(range_id, range)]),
             next_range_id: 1,
         }
+    }
+
+    pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
+        let start = &self.ranges[&range_id].keyspace_start;
+        let pos = self
+            .active_ranges
+            .iter()
+            .position(|id| &self.ranges[id].keyspace_start > start)
+            .unwrap_or(self.active_ranges.len());
+        self.active_ranges.insert(pos, range_id);
+    }
+
+    pub(crate) fn seal_range(&mut self, range_id: RangeId, sealed_at: u64) {
+        let range = self.ranges.get_mut(&range_id).unwrap();
+        if let Some(seg_id) = range.active_segment
+            && let Some(seg) = range.segments.get_mut(&seg_id)
+        {
+            seg.state = SegmentState::Sealed;
+            seg.end_offset = Some(range.next_offset.saturating_sub(1));
+            seg.sealed_at = Some(sealed_at);
+        }
+        range.state = RangeState::Sealed;
+        range.active_segment = None;
     }
 }
 

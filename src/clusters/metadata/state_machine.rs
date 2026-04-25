@@ -68,27 +68,20 @@ impl MetadataStateMachine {
         if topic.state != TopicState::Active {
             return Err(TopicNotActive(cmd.topic_id));
         }
-        let range = topic
-            .ranges
-            .get_mut(&cmd.range_id)
-            .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id))?;
+        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
+
         if range.state != RangeState::Active {
-            return Err(RangeNotActive(cmd.topic_id, cmd.range_id));
+            return Err(RangeNotActive);
         }
         if range.active_segment != Some(cmd.segment_id) {
-            return Err(SegmentNotActive(cmd.topic_id, cmd.range_id, cmd.segment_id));
+            return Err(SegmentNotActive);
         }
         let segment = range
             .segments
             .get_mut(&cmd.segment_id)
-            .ok_or(SegmentNotFound(cmd.topic_id, cmd.range_id, cmd.segment_id))?;
-        if segment.state != SegmentState::Active {
-            return Err(SegmentNotActive(cmd.topic_id, cmd.range_id, cmd.segment_id));
-        }
+            .ok_or(SegmentNotFound)?;
 
-        segment.state = SegmentState::Sealed;
-        segment.end_offset = Some(range.next_offset.saturating_sub(1));
-        segment.sealed_at = Some(cmd.sealed_at);
+        segment.seal(range.next_offset.saturating_sub(1), cmd.sealed_at)?;
 
         let new_segment_id = SegmentId(range.next_segment_id);
         range.next_segment_id += 1;
@@ -118,12 +111,9 @@ impl MetadataStateMachine {
         if topic.storage_policy.partition_strategy == PartitionStrategy::Fixed {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
-        let range = topic
-            .ranges
-            .get_mut(&cmd.range_id)
-            .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id))?;
+        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
         if range.state != RangeState::Active {
-            return Err(RangeNotActive(cmd.topic_id, cmd.range_id));
+            return Err(RangeNotActive);
         }
         if cmd.split_point <= range.keyspace_start || cmd.split_point >= range.keyspace_end {
             return Err(InvalidSplitPoint);
@@ -167,8 +157,8 @@ impl MetadataStateMachine {
         topic.ranges.insert(child2_id, child2);
 
         topic.active_ranges.retain(|id| *id != cmd.range_id);
-        Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, child1_id);
-        Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, child2_id);
+        topic.insert_range_sorted(child1_id);
+        topic.insert_range_sorted(child2_id);
         Ok((child1_id, child2_id))
     }
 
@@ -181,24 +171,18 @@ impl MetadataStateMachine {
             return Err(TopicNotActive(cmd.topic_id));
         }
         {
-            let r1 = topic
-                .ranges
-                .get(&cmd.range_id_1)
-                .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id_1))?;
-            let r2 = topic
-                .ranges
-                .get(&cmd.range_id_2)
-                .ok_or(RangeNotFound(cmd.topic_id, cmd.range_id_2))?;
+            let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
+            let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
             if r1.state != RangeState::Active {
-                return Err(RangeNotActive(cmd.topic_id, cmd.range_id_1));
+                return Err(RangeNotActive);
             }
             if r2.state != RangeState::Active {
-                return Err(RangeNotActive(cmd.topic_id, cmd.range_id_2));
+                return Err(RangeNotActive);
             }
             let adjacent =
                 r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
             if !adjacent {
-                return Err(RangesNotAdjacent(cmd.range_id_1, cmd.range_id_2));
+                return Err(RangesNotAdjacent);
             }
         }
 
@@ -214,8 +198,9 @@ impl MetadataStateMachine {
 
         let merged_start = topic.ranges[&lower_id].keyspace_start.clone();
         let merged_end = topic.ranges[&upper_id].keyspace_end.clone();
-        Self::seal_range(&mut topic.ranges, lower_id, cmd.created_at);
-        Self::seal_range(&mut topic.ranges, upper_id, cmd.created_at);
+
+        topic.seal_range(lower_id, cmd.created_at);
+        topic.seal_range(upper_id, cmd.created_at);
 
         let merged_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
@@ -235,7 +220,8 @@ impl MetadataStateMachine {
         topic
             .active_ranges
             .retain(|id| *id != cmd.range_id_1 && *id != cmd.range_id_2);
-        Self::insert_range_sorted(&topic.ranges, &mut topic.active_ranges, merged_id);
+        topic.insert_range_sorted(merged_id);
+
         Ok(merged_id)
     }
 
@@ -259,32 +245,6 @@ impl MetadataStateMachine {
         self.topic_name_index.remove(&topic.name);
 
         Ok(())
-    }
-
-    fn seal_range(ranges: &mut HashMap<RangeId, RangeMeta>, range_id: RangeId, sealed_at: u64) {
-        let range = ranges.get_mut(&range_id).unwrap();
-        if let Some(seg_id) = range.active_segment
-            && let Some(seg) = range.segments.get_mut(&seg_id)
-        {
-            seg.state = SegmentState::Sealed;
-            seg.end_offset = Some(range.next_offset.saturating_sub(1));
-            seg.sealed_at = Some(sealed_at);
-        }
-        range.state = RangeState::Sealed;
-        range.active_segment = None;
-    }
-
-    fn insert_range_sorted(
-        ranges: &HashMap<RangeId, RangeMeta>,
-        active_ranges: &mut Vec<RangeId>,
-        range_id: RangeId,
-    ) {
-        let start = &ranges[&range_id].keyspace_start;
-        let pos = active_ranges
-            .iter()
-            .position(|id| ranges[id].keyspace_start > *start)
-            .unwrap_or(active_ranges.len());
-        active_ranges.insert(pos, range_id);
     }
 }
 
@@ -537,7 +497,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(RangeNotFound(tid, RangeId(99))));
+        assert_eq!(result, Err(RangeNotFound));
     }
 
     #[test]
@@ -552,10 +512,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(
-            result,
-            Err(SegmentNotActive(tid, RangeId(0), SegmentId(99)))
-        );
+        assert_eq!(result, Err(SegmentNotActive));
     }
 
     // --- SplitRange ---
@@ -762,7 +719,7 @@ mod tests {
             created_at: 4000,
             merged_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(RangesNotAdjacent(c1a, c2)));
+        assert_eq!(result, Err(RangesNotAdjacent));
     }
 
     #[test]
