@@ -15,16 +15,6 @@ pub enum RaftCommand {
     AddPeer(NodeId),
 }
 
-impl RaftCommand {
-    pub(crate) fn serialize(&self) -> Vec<u8> {
-        match self {
-            RaftCommand::Noop => vec![0x00],
-            RaftCommand::RemovePeer(_) => vec![0x01],
-            RaftCommand::AddPeer(_) => vec![0x02],
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProposeError {
     NotLeader,
