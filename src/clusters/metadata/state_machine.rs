@@ -41,49 +41,11 @@ impl MetadataStateMachine {
         if self.topic_name_index.contains_key(&name) {
             return Err(MetadataError::TopicNameAlreadyExists(name));
         }
-
         let topic_id = TopicId(self.next_topic_id);
+        let topic = TopicMeta::new(name, topic_id, replica_set, created_at, storage_policy);
 
-        let range_id = RangeId(0);
-        let segment_id = SegmentId(0);
-
-        let segment = SegmentMeta {
-            segment_id,
-            state: SegmentState::Active,
-            replica_set,
-            size_bytes: 0,
-            start_offset: 0,
-            end_offset: None,
-            created_at,
-            sealed_at: None,
-        };
-
-        let range = RangeMeta {
-            range_id,
-            keyspace_start: KEYSPACE_MIN.to_vec(),
-            keyspace_end: KEYSPACE_MAX.to_vec(),
-            state: RangeState::Active,
-            active_segment: Some(segment_id),
-            segments: HashMap::from([(segment_id, segment)]),
-            next_segment_id: 1,
-            next_offset: 0,
-            split_into: None,
-            merged_into: None,
-            merged_from: None,
-        };
-
-        let topic = TopicMeta {
-            topic_id,
-            name: name.clone(),
-            state: TopicState::Active,
-            storage_policy,
-            active_ranges: vec![range_id],
-            ranges: HashMap::from([(range_id, range)]),
-            next_range_id: 1,
-        };
-
-        self.topics.insert(topic_id, topic);
-        self.topic_name_index.insert(name, topic_id);
+        self.topic_name_index.insert(topic.name.clone(), topic_id);
+        self.topics.insert(topic.id, topic);
         self.next_topic_id += 1;
         Ok(topic_id)
     }
@@ -93,7 +55,6 @@ impl MetadataStateMachine {
         topic_id: TopicId,
         range_id: RangeId,
         segment_id: SegmentId,
-        end_offset: u64,
         sealed_at: u64,
         new_replica_set: Vec<NodeId>,
     ) -> Result<(), MetadataError> {
@@ -135,7 +96,7 @@ impl MetadataStateMachine {
         }
 
         segment.state = SegmentState::Sealed;
-        segment.end_offset = Some(end_offset);
+        segment.end_offset = Some(range.next_offset.saturating_sub(1));
         segment.sealed_at = Some(sealed_at);
 
         let new_segment_id = SegmentId(range.next_segment_id);
@@ -523,7 +484,7 @@ mod tests {
         let id = create_topic(&mut sm, "blue");
 
         let found = sm.get_topic_by_name("blue").unwrap();
-        assert_eq!(found.topic_id, id);
+        assert_eq!(found.id, id);
         assert!(sm.get_topic_by_name("red").is_none());
     }
 
@@ -534,7 +495,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 99, 2000, replica_set())
+        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
             .unwrap();
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
@@ -547,13 +508,13 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 99, 2000, replica_set())
+        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
             .unwrap();
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         let sealed = &range.segments[&SegmentId(0)];
         assert_eq!(sealed.state, SegmentState::Sealed);
-        assert_eq!(sealed.end_offset, Some(99));
+        assert_eq!(sealed.end_offset, Some(0));
         assert_eq!(sealed.sealed_at, Some(2000));
     }
 
@@ -562,9 +523,9 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 10, 2000, replica_set())
+        sm.apply_seal_segment(tid, RangeId(0), SegmentId(0), 2000, replica_set())
             .unwrap();
-        sm.apply_seal_segment(tid, RangeId(0), SegmentId(1), 20, 3000, replica_set())
+        sm.apply_seal_segment(tid, RangeId(0), SegmentId(1), 3000, replica_set())
             .unwrap();
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
@@ -576,14 +537,8 @@ mod tests {
     #[test]
     fn seal_segment_bad_topic() {
         let mut sm = MetadataStateMachine::default();
-        let result = sm.apply_seal_segment(
-            TopicId(99),
-            RangeId(0),
-            SegmentId(0),
-            10,
-            2000,
-            replica_set(),
-        );
+        let result =
+            sm.apply_seal_segment(TopicId(99), RangeId(0), SegmentId(0), 2000, replica_set());
         assert_eq!(result, Err(MetadataError::TopicNotFound(TopicId(99))));
     }
 
@@ -592,7 +547,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply_seal_segment(tid, RangeId(99), SegmentId(0), 10, 2000, replica_set());
+        let result = sm.apply_seal_segment(tid, RangeId(99), SegmentId(0), 2000, replica_set());
         assert_eq!(result, Err(MetadataError::RangeNotFound(tid, RangeId(99))));
     }
 
@@ -601,7 +556,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply_seal_segment(tid, RangeId(0), SegmentId(99), 10, 2000, replica_set());
+        let result = sm.apply_seal_segment(tid, RangeId(0), SegmentId(99), 2000, replica_set());
         assert_eq!(
             result,
             Err(MetadataError::SegmentNotActive(
@@ -994,7 +949,7 @@ mod tests {
             .unwrap();
 
         // Seal a segment in child range
-        sm.apply_seal_segment(tid, c1, SegmentId(0), 50, 3000, replica_set())
+        sm.apply_seal_segment(tid, c1, SegmentId(0), 3000, replica_set())
             .unwrap();
 
         let child = &sm.get_topic(&tid).unwrap().ranges[&c1];

@@ -58,13 +58,60 @@ pub struct RangeMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct TopicMeta {
-    pub topic_id: TopicId,
+    pub id: TopicId,
     pub name: String,
     pub state: TopicState,
     pub storage_policy: StoragePolicy,
     pub active_ranges: Vec<RangeId>,
     pub ranges: HashMap<RangeId, RangeMeta>,
     pub next_range_id: u64,
+}
+impl TopicMeta {
+    pub(crate) fn new(
+        name: String,
+        id: TopicId,
+        replica_set: Vec<NodeId>,
+        created_at: u64,
+        storage_policy: StoragePolicy,
+    ) -> Self {
+        let range_id = RangeId(0);
+        let segment_id = SegmentId(0);
+
+        let segment = SegmentMeta {
+            segment_id,
+            state: SegmentState::Active,
+            replica_set,
+            size_bytes: 0,
+            start_offset: 0,
+            end_offset: None,
+            created_at,
+            sealed_at: None,
+        };
+
+        let range = RangeMeta {
+            range_id,
+            keyspace_start: KEYSPACE_MIN.to_vec(),
+            keyspace_end: KEYSPACE_MAX.to_vec(),
+            state: RangeState::Active,
+            active_segment: Some(segment_id),
+            segments: HashMap::from([(segment_id, segment)]),
+            next_segment_id: 1,
+            next_offset: 0,
+            split_into: None,
+            merged_into: None,
+            merged_from: None,
+        };
+
+        TopicMeta {
+            id,
+            name,
+            state: TopicState::Active,
+            storage_policy,
+            active_ranges: vec![range_id],
+            ranges: HashMap::from([(range_id, range)]),
+            next_range_id: 1,
+        }
+    }
 }
 
 // --- Keyspace Constants ---
