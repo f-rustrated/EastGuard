@@ -152,17 +152,14 @@ impl MetadataStateMachine {
 
         topic.validate_active()?;
 
-        {
-            let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
-            let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
-            r1.validate_active()?;
-            r2.validate_active()?;
+        let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
+        let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
+        r1.validate_active()?;
+        r2.validate_active()?;
 
-            let adjacent =
-                r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
-            if !adjacent {
-                return Err(RangesNotAdjacent);
-            }
+        let adjacent = r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
+        if !adjacent {
+            return Err(RangesNotAdjacent);
         }
 
         let (lower_id, upper_id) = {
