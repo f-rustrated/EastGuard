@@ -122,7 +122,7 @@ impl MetadataStateMachine {
         let child2_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
 
-        topic.ranges.get_mut(&cmd.range_id).unwrap().split_into = Some([child1_id, child2_id]);
+        range.split_into = Some([child1_id, child2_id]);
 
         let child1 = RangeMeta::new(
             child1_id,
