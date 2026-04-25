@@ -168,6 +168,12 @@ impl TopicMeta {
         }
     }
 
+    pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
+        (self.state == TopicState::Active)
+            .then_some(())
+            .ok_or(MetadataError::TopicNotActive(self.id))
+    }
+
     pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
         let start = &self.ranges[&range_id].keyspace_start;
         let pos = self

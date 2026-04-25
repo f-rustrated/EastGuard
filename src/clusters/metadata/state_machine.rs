@@ -65,9 +65,8 @@ impl MetadataStateMachine {
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
-        if topic.state != TopicState::Active {
-            return Err(TopicNotActive(cmd.topic_id));
-        }
+        topic.validate_active()?;
+
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
 
         range.validate_active()?;
@@ -104,9 +103,9 @@ impl MetadataStateMachine {
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
-        if topic.state != TopicState::Active {
-            return Err(TopicNotActive(cmd.topic_id));
-        }
+
+        topic.validate_active()?;
+
         if topic.storage_policy.partition_strategy == PartitionStrategy::Fixed {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
@@ -165,9 +164,9 @@ impl MetadataStateMachine {
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
-        if topic.state != TopicState::Active {
-            return Err(TopicNotActive(cmd.topic_id));
-        }
+
+        topic.validate_active()?;
+
         {
             let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
             let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
