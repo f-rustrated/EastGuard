@@ -129,6 +129,10 @@ impl RangeMeta {
         self.active_segment = None;
         Ok(())
     }
+
+    pub(crate) fn is_next_to(&self, other: &RangeMeta) -> bool {
+        self.keyspace_end == other.keyspace_start || other.keyspace_end == self.keyspace_start
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

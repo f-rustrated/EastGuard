@@ -157,8 +157,7 @@ impl MetadataStateMachine {
         r1.validate_active()?;
         r2.validate_active()?;
 
-        let adjacent = r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
-        if !adjacent {
+        if !r1.is_next_to(r2) {
             return Err(RangesNotAdjacent);
         }
 
