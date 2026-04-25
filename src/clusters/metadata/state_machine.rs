@@ -161,14 +161,10 @@ impl MetadataStateMachine {
             return Err(RangesNotAdjacent);
         }
 
-        let (lower_id, upper_id) = {
-            let r1 = &topic.ranges[&cmd.range_id_1];
-            let r2 = &topic.ranges[&cmd.range_id_2];
-            if r1.keyspace_start <= r2.keyspace_start {
-                (cmd.range_id_1, cmd.range_id_2)
-            } else {
-                (cmd.range_id_2, cmd.range_id_1)
-            }
+        let (lower_id, upper_id) = if r1.keyspace_start <= r2.keyspace_start {
+            (r1.range_id, r2.range_id)
+        } else {
+            (r2.range_id, r1.range_id)
         };
 
         let merged_start = topic.ranges[&lower_id].keyspace_start.clone();
