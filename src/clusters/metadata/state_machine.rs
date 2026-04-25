@@ -106,9 +106,10 @@ impl MetadataStateMachine {
 
         topic.validate_active()?;
 
-        if topic.storage_policy.partition_strategy == PartitionStrategy::Fixed {
+        if !topic.can_split() {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
+
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
         range.validate_active()?;
 

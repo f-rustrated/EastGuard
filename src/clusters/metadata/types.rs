@@ -4,7 +4,11 @@ use bincode::{Decode, Encode};
 
 use crate::clusters::{
     NodeId,
-    metadata::{RangeId, SegmentId, TopicId, error::MetadataError, strategy::StoragePolicy},
+    metadata::{
+        RangeId, SegmentId, TopicId,
+        error::MetadataError,
+        strategy::{PartitionStrategy, StoragePolicy},
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -172,6 +176,9 @@ impl TopicMeta {
         (self.state == TopicState::Active)
             .then_some(())
             .ok_or(MetadataError::TopicNotActive(self.id))
+    }
+    pub(crate) fn can_split(&self) -> bool {
+        self.storage_policy.partition_strategy != PartitionStrategy::Fixed
     }
 
     pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
