@@ -609,7 +609,7 @@ impl Raft {
         }
     }
 
-    /// Directly add a peer to this Raft instance. Called by MultiRaftActor on
+    /// Directly add a peer to this Raft instance. Called by MultiRaft on
     /// SWIM `NodeAlive` events — bypasses the log since SWIM is membership authority.
     pub(crate) fn add_peer(&mut self, node_id: NodeId) {
         if node_id == self.node_id {
@@ -627,7 +627,7 @@ impl Raft {
         }
     }
 
-    /// Directly remove a peer from this Raft instance. Called by MultiRaftActor on
+    /// Directly remove a peer from this Raft instance. Called by MultiRaft on
     /// SWIM `NodeDead` events — bypasses the log since SWIM is membership authority.
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) {
         self.peers.remove(node_id);
