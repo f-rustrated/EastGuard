@@ -181,10 +181,10 @@ impl MultiRaft {
 
     fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
-            if let Some(raft) = self.groups.get_mut(&group.id) {
-                if !raft.has_peer(&node_id) {
-                    raft.add_peer(node_id.clone());
-                }
+            if let Some(raft) = self.groups.get_mut(&group.id)
+                && !raft.has_peer(&node_id)
+            {
+                raft.add_peer(node_id.clone());
             }
         }
 
