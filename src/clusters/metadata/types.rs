@@ -134,7 +134,7 @@ impl RangeMeta {
         self.keyspace_end == other.keyspace_start || other.keyspace_end == self.keyspace_start
     }
 
-    pub(crate) fn delete(&mut self) {
+    fn delete(&mut self) {
         self.state = RangeState::Deleting;
         self.active_segment = None;
         for segment in self.segments.values_mut() {
@@ -219,17 +219,18 @@ impl TopicMeta {
         self.active_ranges.insert(pos, range_id);
     }
 
-    pub(crate) fn seal_range(&mut self, range_id: RangeId, sealed_at: u64) {
-        let range = self.ranges.get_mut(&range_id).unwrap();
-        if let Some(seg_id) = range.active_segment
-            && let Some(seg) = range.segments.get_mut(&seg_id)
-        {
-            seg.state = SegmentState::Sealed;
-            seg.end_offset = Some(range.next_offset.saturating_sub(1));
-            seg.sealed_at = Some(sealed_at);
-        }
-        range.state = RangeState::Sealed;
-        range.active_segment = None;
+    pub(crate) fn seal_range(
+        &mut self,
+        range_id: RangeId,
+        sealed_at: u64,
+    ) -> Result<(), MetadataError> {
+        let range = self
+            .ranges
+            .get_mut(&range_id)
+            .ok_or(MetadataError::RangeNotFound)?;
+
+        range.seal(sealed_at)?;
+        Ok(())
     }
 
     pub(crate) fn delete(&mut self) {

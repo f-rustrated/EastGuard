@@ -170,7 +170,7 @@ impl MetadataStateMachine {
         topic.next_range_id += 1;
 
         for id in [cmd.range_id_1, cmd.range_id_2] {
-            topic.seal_range(id, cmd.created_at);
+            topic.seal_range(id, cmd.created_at)?;
             // SAFETY : Safe to unwrap since we confirmed these IDs exist above
             topic.ranges.get_mut(&id).unwrap().merged_into = Some(merged_id);
         }
