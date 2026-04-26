@@ -31,8 +31,8 @@ pub struct SplitRange {
     pub range_id: RangeId,
     pub split_point: Vec<u8>,
     pub created_at: u64,
-    pub child1_replica_set: Vec<NodeId>,
-    pub child2_replica_set: Vec<NodeId>,
+    pub left_replica_set: Vec<NodeId>,
+    pub right_replica_set: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

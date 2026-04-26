@@ -114,37 +114,34 @@ impl MetadataStateMachine {
         let _ = range.validate_active()?;
         range.seal(cmd.created_at)?;
 
-        let parent_start = range.keyspace_start.clone();
-        let parent_end = range.keyspace_end.clone();
-
-        let child1_id = RangeId(topic.next_range_id);
+        let left_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
-        let child2_id = RangeId(topic.next_range_id);
+        let right_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
 
-        topic.ranges.get_mut(&cmd.range_id).unwrap().split_into = Some([child1_id, child2_id]);
+        range.split_into = Some([left_id, right_id]);
 
-        let child1 = RangeMeta::new(
-            child1_id,
-            parent_start,
+        let left = RangeMeta::new(
+            left_id,
+            range.keyspace_start.clone(),
             cmd.split_point.clone(),
-            cmd.child1_replica_set,
+            cmd.left_replica_set,
             cmd.created_at,
         );
-        let child2 = RangeMeta::new(
-            child2_id,
+        let right = RangeMeta::new(
+            right_id,
             cmd.split_point,
-            parent_end,
-            cmd.child2_replica_set,
+            range.keyspace_end.clone(),
+            cmd.right_replica_set,
             cmd.created_at,
         );
-        topic.ranges.insert(child1_id, child1);
-        topic.ranges.insert(child2_id, child2);
+        topic.ranges.insert(left_id, left);
+        topic.ranges.insert(right_id, right);
 
         topic.active_ranges.retain(|id| *id != cmd.range_id);
-        topic.insert_range_sorted(child1_id);
-        topic.insert_range_sorted(child2_id);
-        Ok((child1_id, child2_id))
+        topic.insert_range_sorted(left_id);
+        topic.insert_range_sorted(right_id);
+        Ok((left_id, right_id))
     }
 
     fn merge_range(&mut self, cmd: MergeRange) -> Result<RangeId, MetadataError> {
@@ -155,39 +152,28 @@ impl MetadataStateMachine {
 
         topic.validate_active()?;
 
-        {
-            let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
-            let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
-            r1.validate_active()?;
-            r2.validate_active()?;
+        let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
+        let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
+        r1.validate_active()?;
+        r2.validate_active()?;
 
-            let adjacent =
-                r1.keyspace_end == r2.keyspace_start || r2.keyspace_end == r1.keyspace_start;
-            if !adjacent {
-                return Err(RangesNotAdjacent);
-            }
+        if !r1.is_next_to(r2) {
+            return Err(RangesNotAdjacent);
         }
 
-        let (lower_id, upper_id) = {
-            let r1 = &topic.ranges[&cmd.range_id_1];
-            let r2 = &topic.ranges[&cmd.range_id_2];
-            if r1.keyspace_start <= r2.keyspace_start {
-                (cmd.range_id_1, cmd.range_id_2)
-            } else {
-                (cmd.range_id_2, cmd.range_id_1)
-            }
+        let (merged_start, merged_end) = if r1.keyspace_start <= r2.keyspace_start {
+            (r1.keyspace_start.clone(), r2.keyspace_end.clone())
+        } else {
+            (r2.keyspace_start.clone(), r1.keyspace_end.clone())
         };
-
-        let merged_start = topic.ranges[&lower_id].keyspace_start.clone();
-        let merged_end = topic.ranges[&upper_id].keyspace_end.clone();
-
-        topic.seal_range(lower_id, cmd.created_at);
-        topic.seal_range(upper_id, cmd.created_at);
-
         let merged_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
-        topic.ranges.get_mut(&cmd.range_id_1).unwrap().merged_into = Some(merged_id);
-        topic.ranges.get_mut(&cmd.range_id_2).unwrap().merged_into = Some(merged_id);
+
+        for id in [cmd.range_id_1, cmd.range_id_2] {
+            topic.seal_range(id, cmd.created_at)?;
+            // SAFETY : Safe to unwrap since we confirmed these IDs exist above
+            topic.ranges.get_mut(&id).unwrap().merged_into = Some(merged_id);
+        }
 
         let mut merged = RangeMeta::new(
             merged_id,
@@ -213,16 +199,7 @@ impl MetadataStateMachine {
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
 
-        topic.state = TopicState::Deleted;
-        topic.active_ranges.clear();
-
-        for range in topic.ranges.values_mut() {
-            range.state = RangeState::Deleting;
-            range.active_segment = None;
-            for segment in range.segments.values_mut() {
-                segment.state = SegmentState::Deleting;
-            }
-        }
+        topic.delete();
 
         self.topic_name_index.remove(&topic.name);
 
@@ -304,8 +281,8 @@ mod tests {
             range_id,
             split_point,
             created_at,
-            child1_replica_set: replica_set(),
-            child2_replica_set: replica_set(),
+            left_replica_set: replica_set(),
+            right_replica_set: replica_set(),
         }));
         match result.unwrap() {
             ApplyResult::RangeSplit(c1, c2) => (c1, c2),
@@ -596,8 +573,8 @@ mod tests {
             range_id: RangeId(0),
             split_point: vec![0x80],
             created_at: 2000,
-            child1_replica_set: replica_set(),
-            child2_replica_set: replica_set(),
+            left_replica_set: replica_set(),
+            right_replica_set: replica_set(),
         }));
         assert_eq!(result, Err(SplitNotAllowed(tid)));
     }
@@ -612,8 +589,8 @@ mod tests {
             range_id: RangeId(0),
             split_point: vec![0xFF],
             created_at: 2000,
-            child1_replica_set: replica_set(),
-            child2_replica_set: replica_set(),
+            left_replica_set: replica_set(),
+            right_replica_set: replica_set(),
         }));
         assert_eq!(result, Err(InvalidSplitPoint));
 
@@ -622,8 +599,8 @@ mod tests {
             range_id: RangeId(0),
             split_point: vec![],
             created_at: 2000,
-            child1_replica_set: replica_set(),
-            child2_replica_set: replica_set(),
+            left_replica_set: replica_set(),
+            right_replica_set: replica_set(),
         }));
         assert_eq!(result, Err(InvalidSplitPoint));
     }
