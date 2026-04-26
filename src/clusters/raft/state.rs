@@ -48,7 +48,7 @@ pub struct Raft {
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
     pending_log_mutations: Vec<LogMutation>, // must persist
-    pending_events: Vec<RaftEvent>,          // volatile side effects
+    events: Vec<RaftEvent>,                  // volatile side effects
     commit_index: u64,                       // majority voted
     stabled_index: u64,                      // flushed to disk
     last_applied_index: u64,                 // applied to state machine
@@ -82,7 +82,7 @@ impl Raft {
             voted_for: persistent.voted_for,
             log: persistent.log,
             pending_log_mutations: Vec::new(),
-            pending_events: Vec::new(),
+            events: Vec::new(),
             commit_index: 0,
             last_applied_index: 0,
             role: Role::Follower,
@@ -96,16 +96,12 @@ impl Raft {
         raft
     }
 
-    pub(crate) fn election_seq(&self) -> u32 {
-        self.election_seq
-    }
-
     pub(crate) fn heartbeat_seq(&self) -> u32 {
         self.heartbeat_seq
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
-        std::mem::take(&mut self.pending_events)
+        std::mem::take(&mut self.events)
     }
 
     pub fn take_log_mutations(&mut self) -> Vec<LogMutation> {
@@ -255,7 +251,7 @@ impl Raft {
             last_log_term: self.log_last_term(),
         };
         for peer_id in self.peers.iter() {
-            self.pending_events.push(
+            self.events.push(
                 OutboundRaftPacket::new(self.shard_group_id, peer_id.clone(), req.clone()).into(),
             );
         }
@@ -279,7 +275,7 @@ impl Raft {
             self.reset_election_timer();
         }
 
-        self.pending_events.push(
+        self.events.push(
             OutboundRaftPacket::new(
                 self.shard_group_id,
                 from,
@@ -338,7 +334,7 @@ impl Raft {
         self.role = Role::Leader;
         self.current_leader = Some(self.node_id.clone());
 
-        self.pending_events.push(
+        self.events.push(
             LeaderChange {
                 shard_group_id: self.shard_group_id,
                 leader_node_id: self.node_id.clone(),
@@ -419,7 +415,7 @@ impl Raft {
         let prev_log_term = self.log_term_at(prev_log_index);
         let entries = self.log_entries_from(peer_state.next_index);
 
-        self.pending_events.push(
+        self.events.push(
             OutboundRaftPacket::new(
                 self.shard_group_id,
                 peer_id,
@@ -521,7 +517,7 @@ impl Raft {
     }
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
-        self.pending_events.push(
+        self.events.push(
             OutboundRaftPacket::new(
                 self.shard_group_id,
                 target,
@@ -632,6 +628,8 @@ impl Raft {
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) {
         self.peers.remove(node_id);
         self.peer_states.remove(node_id);
+        self.events
+            .push(RaftEvent::DisconnectPeer(self.node_id.clone()));
     }
 
     fn add_new_entry(&mut self, command: RaftCommand) {
@@ -674,11 +672,11 @@ impl Raft {
     }
 
     fn reset_election_timer(&mut self) {
-        self.pending_events
+        self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.election_seq,
             }));
-        self.pending_events
+        self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
                 seq: self.election_seq,
                 timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
@@ -686,19 +684,19 @@ impl Raft {
     }
 
     fn schedule_heartbeat_timer(&mut self) {
-        self.pending_events
+        self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
                 seq: self.heartbeat_seq,
                 timer: RaftTimer::heartbeat(self.shard_group_id),
             }));
     }
 
-    fn cancel_all_timers(&mut self) {
-        self.pending_events
+    pub(crate) fn cancel_all_timers(&mut self) {
+        self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.election_seq,
             }));
-        self.pending_events
+        self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.heartbeat_seq,
             }));

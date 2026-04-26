@@ -10,7 +10,6 @@ use crate::clusters::raft::state::Raft;
 
 use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::schedulers::ticker_message::TimerCommand;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -125,18 +124,11 @@ impl MultiRaft {
     }
 
     fn remove_group(&mut self, group_id: ShardGroupId) {
-        let Some(raft) = self.groups.remove(&group_id) else {
+        let Some(mut raft) = self.groups.remove(&group_id) else {
             return;
         };
-
-        self.pending_events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: raft.election_seq(),
-            }));
-        self.pending_events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: raft.heartbeat_seq(),
-            }));
+        raft.cancel_all_timers();
+        self.pending_events.extend(raft.take_events());
 
         self.storage.delete_group(group_id);
 
@@ -169,12 +161,10 @@ impl MultiRaft {
     }
 
     fn remove_node(&mut self, node_id: NodeId) {
-        self.pending_events
-            .push(RaftEvent::DisconnectPeer(node_id.clone()));
-
-        for raft in self.groups.values_mut() {
+        for (group_id, raft) in self.groups.iter_mut() {
             if raft.has_peer(&node_id) {
                 raft.remove_peer(&node_id);
+                self.dirty.insert(*group_id);
             }
         }
     }
@@ -263,6 +253,7 @@ mod tests {
 
     use crate::clusters::raft::storage::RaftPersistentState;
     use crate::impls::metadata_storage::MetadataStorage;
+    use crate::schedulers::ticker_message::TimerCommand;
     use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {
