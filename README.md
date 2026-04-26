@@ -2,6 +2,8 @@
 
 EastGuard is a zero-controller messaging system designed for flexible scalability and high operability. This project is significantly inspired by the architecture of LinkedIn's Northguard.
 
+**Join the community:** [Discord](https://discord.gg/GMdFfeXu)
+
 
 
 ## Terms
