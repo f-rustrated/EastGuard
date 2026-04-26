@@ -133,6 +133,14 @@ impl RangeMeta {
     pub(crate) fn is_next_to(&self, other: &RangeMeta) -> bool {
         self.keyspace_end == other.keyspace_start || other.keyspace_end == self.keyspace_start
     }
+
+    pub(crate) fn delete(&mut self) {
+        self.state = RangeState::Deleting;
+        self.active_segment = None;
+        for segment in self.segments.values_mut() {
+            segment.state = SegmentState::Deleting;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -222,6 +230,15 @@ impl TopicMeta {
         }
         range.state = RangeState::Sealed;
         range.active_segment = None;
+    }
+
+    pub(crate) fn delete(&mut self) {
+        self.state = TopicState::Deleted;
+        self.active_ranges.clear();
+
+        for range in self.ranges.values_mut() {
+            range.delete();
+        }
     }
 }
 

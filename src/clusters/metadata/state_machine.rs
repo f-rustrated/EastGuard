@@ -161,22 +161,19 @@ impl MetadataStateMachine {
             return Err(RangesNotAdjacent);
         }
 
-        let (lower_id, upper_id) = if r1.keyspace_start <= r2.keyspace_start {
-            (r1.range_id, r2.range_id)
+        let (merged_start, merged_end) = if r1.keyspace_start <= r2.keyspace_start {
+            (r1.keyspace_start.clone(), r2.keyspace_end.clone())
         } else {
-            (r2.range_id, r1.range_id)
+            (r2.keyspace_start.clone(), r1.keyspace_end.clone())
         };
-
-        let merged_start = topic.ranges[&lower_id].keyspace_start.clone();
-        let merged_end = topic.ranges[&upper_id].keyspace_end.clone();
-
-        topic.seal_range(lower_id, cmd.created_at);
-        topic.seal_range(upper_id, cmd.created_at);
-
         let merged_id = RangeId(topic.next_range_id);
         topic.next_range_id += 1;
-        topic.ranges.get_mut(&cmd.range_id_1).unwrap().merged_into = Some(merged_id);
-        topic.ranges.get_mut(&cmd.range_id_2).unwrap().merged_into = Some(merged_id);
+
+        for id in [cmd.range_id_1, cmd.range_id_2] {
+            topic.seal_range(id, cmd.created_at);
+            // SAFETY : Safe to unwrap since we confirmed these IDs exist above
+            topic.ranges.get_mut(&id).unwrap().merged_into = Some(merged_id);
+        }
 
         let mut merged = RangeMeta::new(
             merged_id,
@@ -202,16 +199,7 @@ impl MetadataStateMachine {
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
 
-        topic.state = TopicState::Deleted;
-        topic.active_ranges.clear();
-
-        for range in topic.ranges.values_mut() {
-            range.state = RangeState::Deleting;
-            range.active_segment = None;
-            for segment in range.segments.values_mut() {
-                segment.state = SegmentState::Deleting;
-            }
-        }
+        topic.delete();
 
         self.topic_name_index.remove(&topic.name);
 
