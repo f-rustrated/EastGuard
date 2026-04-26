@@ -172,30 +172,19 @@ impl MultiRaft {
         self.pending_events
             .push(RaftEvent::DisconnectPeer(node_id.clone()));
 
-        let affected: Vec<ShardGroupId> = self
-            .groups
-            .iter()
-            .filter(|(_, r)| r.is_leader() && r.has_peer(&node_id))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for group_id in &affected {
-            if let Some(raft) = self.groups.get_mut(group_id) {
-                let _ = raft.propose(RaftCommand::RemovePeer(node_id.clone()));
+        for raft in self.groups.values_mut() {
+            if raft.has_peer(&node_id) {
+                raft.remove_peer(&node_id);
             }
         }
-
-        self.dirty.extend(affected);
     }
 
     fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
-            if let Some(raft) = self.groups.get_mut(&group.id)
-                && raft.is_leader()
-                && !raft.has_peer(&node_id)
-            {
-                let _ = raft.propose(RaftCommand::AddPeer(node_id.clone()));
-                self.dirty.insert(group.id);
+            if let Some(raft) = self.groups.get_mut(&group.id) {
+                if !raft.has_peer(&node_id) {
+                    raft.add_peer(node_id.clone());
+                }
             }
         }
 
