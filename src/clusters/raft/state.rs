@@ -103,6 +103,7 @@ impl Raft {
         self.heartbeat_seq
     }
 
+    #[cfg(test)]
     pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
         &self.state_machine
     }
