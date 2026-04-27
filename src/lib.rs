@@ -14,11 +14,12 @@ mod it;
 pub(crate) mod macros;
 
 use crate::clusters::raft::actor::MultiRaftActor;
+use crate::clusters::raft::messages::{MultiRaftActorCommand, ProposeError};
 use crate::clusters::raft::transport::RaftTransportActor;
 
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
-use crate::connections::request::QueryCommand;
+use crate::connections::request::{ProposeRequest, ProposeResponse, QueryCommand};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -94,7 +95,7 @@ impl StartUp {
             state,
             tx_outbound,
             swim_ticker_tx,
-            raft_tx,
+            raft_tx.clone(),
         ));
         let raft_db = MetadataStorage::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
@@ -107,11 +108,15 @@ impl StartUp {
         ));
 
         // Client handler
-        let _ = self.receive_client_streams(swim_sender).await;
+        let _ = self.receive_client_streams(swim_sender, raft_tx).await;
         Ok(())
     }
 
-    async fn receive_client_streams(self, swim_sender: Sender<SwimCommand>) {
+    async fn receive_client_streams(
+        self,
+        swim_sender: Sender<SwimCommand>,
+        raft_tx: Sender<MultiRaftActorCommand>,
+    ) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -122,7 +127,11 @@ impl StartUp {
 
         //TODO refactor: authentication should be simplified
         while let Ok((stream, _)) = listener.accept().await {
-            if let Err(err) = self.handle_client_stream(stream, swim_sender.clone()).await {
+            // ! the following must be spawned out
+            if let Err(err) = self
+                .handle_client_stream(stream, swim_sender.clone(), raft_tx.clone())
+                .await
+            {
                 tracing::error!("{}", err);
                 continue;
             }
@@ -133,6 +142,7 @@ impl StartUp {
         &self,
         stream: TcpStream,
         swim_sender: Sender<SwimCommand>,
+        raft_tx: Sender<MultiRaftActorCommand>,
     ) -> Result<()> {
         let (read_half, write_half) = stream.into_split();
         // ! TBD writer needs to be run and read handler should hold sender to the writer
@@ -141,15 +151,16 @@ impl StartUp {
         let request = stream_reader.read_request().await?;
 
         match request {
-            ConnectionRequests::Discovery => {
-                // exemplary request
-            }
             ConnectionRequests::Connection(_request) => {
                 // validate connection
                 tokio::spawn(stream_reader.handle_client_stream());
             }
             ConnectionRequests::Query(query_type) => {
                 self.handle_query(stream_writer, swim_sender, query_type)
+                    .await?;
+            }
+            ConnectionRequests::Propose(req) => {
+                self.handle_propose(stream_writer, swim_sender, raft_tx, req)
                     .await?;
             }
         }
@@ -179,5 +190,50 @@ impl StartUp {
                 Ok(())
             }
         }
+    }
+
+    async fn handle_propose(
+        &self,
+        mut writer: ClientStreamWriter,
+        swim_sender: Sender<SwimCommand>,
+        raft_tx: Sender<MultiRaftActorCommand>,
+        req: ProposeRequest,
+    ) -> Result<()> {
+        // 1. Resolve resource_key → ShardGroup via SWIM topology
+        let (send, recv) = tokio::sync::oneshot::channel();
+        swim_sender
+            .send(SwimCommand::Query(SwimQueryCommand::ResolveShardGroup {
+                key: req.resource_key,
+                reply: send,
+            }))
+            .await?;
+
+        let Some(shard_group) = recv.await? else {
+            writer.write(&ProposeResponse::ShardNotFound).await?;
+            return Ok(());
+        };
+
+        // 2. Translate ClientCommand → RaftCommand (fill server-derived fields)
+        let raft_cmd = req.command.into_raft_command(shard_group.members);
+
+        // 3. Propose to MultiRaftActor
+        let (send, recv) = tokio::sync::oneshot::channel();
+        raft_tx
+            .send(MultiRaftActorCommand::Propose {
+                shard_group_id: shard_group.id,
+                command: raft_cmd,
+                reply: send,
+            })
+            .await?;
+
+        // 4. Map result to client response
+        let response = match recv.await? {
+            Ok(()) => ProposeResponse::Success,
+            Err(ProposeError::NotLeader) => ProposeResponse::NotLeader,
+            Err(ProposeError::ShardNotFound) => ProposeResponse::ShardNotFound,
+        };
+
+        writer.write(&response).await?;
+        Ok(())
     }
 }
