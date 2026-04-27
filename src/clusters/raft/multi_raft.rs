@@ -10,7 +10,6 @@ use crate::clusters::raft::state::Raft;
 
 use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::schedulers::ticker_message::TimerCommand;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -125,18 +124,11 @@ impl MultiRaft {
     }
 
     fn remove_group(&mut self, group_id: ShardGroupId) {
-        let Some(raft) = self.groups.remove(&group_id) else {
+        let Some(mut raft) = self.groups.remove(&group_id) else {
             return;
         };
-
-        self.pending_events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: raft.election_seq(),
-            }));
-        self.pending_events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: raft.heartbeat_seq(),
-            }));
+        raft.cancel_all_timers();
+        self.pending_events.extend(raft.take_events());
 
         self.storage.delete_group(group_id);
 
@@ -169,33 +161,20 @@ impl MultiRaft {
     }
 
     fn remove_node(&mut self, node_id: NodeId) {
-        self.pending_events
-            .push(RaftEvent::DisconnectPeer(node_id.clone()));
-
-        let affected: Vec<ShardGroupId> = self
-            .groups
-            .iter()
-            .filter(|(_, r)| r.is_leader() && r.has_peer(&node_id))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for group_id in &affected {
-            if let Some(raft) = self.groups.get_mut(group_id) {
-                let _ = raft.propose(RaftCommand::RemovePeer(node_id.clone()));
+        for (group_id, raft) in self.groups.iter_mut() {
+            if raft.has_peer(&node_id) {
+                raft.remove_peer(&node_id);
+                self.dirty.insert(*group_id);
             }
         }
-
-        self.dirty.extend(affected);
     }
 
     fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
         for group in &affected_groups {
             if let Some(raft) = self.groups.get_mut(&group.id)
-                && raft.is_leader()
                 && !raft.has_peer(&node_id)
             {
-                let _ = raft.propose(RaftCommand::AddPeer(node_id.clone()));
-                self.dirty.insert(group.id);
+                raft.add_peer(node_id.clone());
             }
         }
 
@@ -274,6 +253,7 @@ mod tests {
 
     use crate::clusters::raft::storage::RaftPersistentState;
     use crate::impls::metadata_storage::MetadataStorage;
+    use crate::schedulers::ticker_message::TimerCommand;
     use std::collections::HashSet;
 
     fn node(id: &str) -> NodeId {

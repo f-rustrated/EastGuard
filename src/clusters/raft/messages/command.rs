@@ -11,8 +11,6 @@ use crate::clusters::swims::{ShardGroup, ShardGroupId};
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
     Noop,
-    RemovePeer(NodeId),
-    AddPeer(NodeId),
 }
 
 #[derive(Debug, PartialEq, Eq)]
