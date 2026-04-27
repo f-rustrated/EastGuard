@@ -4,6 +4,7 @@ use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
 use crate::clusters::NodeId;
+use crate::clusters::metadata::command::MetadataCommand;
 use crate::clusters::raft::messages::rpc::{OutboundRaftPacket, RaftRpc};
 use crate::clusters::raft::messages::timer::RaftTimeoutCallback;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -11,11 +12,13 @@ use crate::clusters::swims::{ShardGroup, ShardGroupId};
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
     Noop,
+    Metadata(MetadataCommand),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProposeError {
     NotLeader,
+    ShardNotFound,
 }
 
 pub(crate) enum MultiRaftCommand {
