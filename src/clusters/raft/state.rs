@@ -584,7 +584,7 @@ impl Raft {
     }
 
     /// Apply committed (and persisted) but unapplied log entries.
-    /// Phase 4 will extend this with application state machine dispatch.
+    /// Phase 3 will dispatch Metadata commands to MetadataStateMachine.
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -601,6 +601,9 @@ impl Raft {
             };
             match entry.command {
                 RaftCommand::Noop => {}
+                RaftCommand::Metadata(_) => {
+                    // Phase 3: dispatch to MetadataStateMachine
+                }
             }
         }
     }
@@ -628,8 +631,7 @@ impl Raft {
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) {
         self.peers.remove(node_id);
         self.peer_states.remove(node_id);
-        self.events
-            .push(RaftEvent::DisconnectPeer(self.node_id.clone()));
+        self.events.push(RaftEvent::DisconnectPeer(node_id.clone()));
     }
 
     fn add_new_entry(&mut self, command: RaftCommand) {
@@ -1594,6 +1596,38 @@ mod tests {
         let targets: Vec<&NodeId> = heartbeats.iter().map(|p| &p.target).collect();
         assert!(!targets.contains(&&node("node-3")));
         assert_eq!(n1.peers_count(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Metadata command through Raft log
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn metadata_command_noop_in_phase2() {
+        use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
+        use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+
+        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+            name: "blue".to_string(),
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
+            replica_set: vec![node("node-1"), node("node-2"), node("node-3")],
+            created_at: 1000,
+        }));
+
+        let result = raft.propose(cmd);
+        assert!(result.is_ok());
+        raft.simulate_flush();
+        assert!(raft.last_applied_index > 0);
     }
 
     // -------------------------------------------------------------------

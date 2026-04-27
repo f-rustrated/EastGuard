@@ -80,8 +80,6 @@ See `diagrams/metadata-management/data-model.md` for full entity relationships, 
 enum RaftCommand {
     // Existing
     Noop,
-    RemovePeer(NodeId),
-    AddPeer(NodeId),
     // New
     CreateTopic { name: String, storage_policy: StoragePolicy },
     SealSegment { topic_id: TopicId, range_id: RangeId, segment_id: SegmentId },

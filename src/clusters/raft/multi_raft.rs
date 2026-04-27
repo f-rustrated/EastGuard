@@ -598,4 +598,39 @@ mod tests {
         assert_eq!(raft.current_term(), 1);
         assert_eq!(raft.voted_for(), Some(node("n1")));
     }
+
+    #[test]
+    fn propose_metadata_command_via_multi_raft() {
+        use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
+        use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        elect_leader(&mut store);
+        store.flush();
+
+        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+            name: "test-topic".to_string(),
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
+            replica_set: vec![node("n1"), node("n2"), node("n3")],
+            created_at: 1000,
+        }));
+
+        let reply = store.handle_command(MultiRaftCommand::Propose {
+            shard_group_id: TEST_GROUP_ID,
+            command: cmd,
+        });
+        assert!(matches!(reply, MultiRaftReply::Propose(Ok(()))));
+        store.flush();
+
+        let entry = read_entry(&store, 2).expect("metadata command entry must be persisted");
+        assert_eq!(entry.index, 2);
+    }
 }
