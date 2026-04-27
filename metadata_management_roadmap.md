@@ -108,60 +108,59 @@ enum ProposeError {
 
 ## Phase 3: Application State Machine Dispatch
 
-**Goal:** Split `apply_committed_entries()` — ConfChange stays in `Raft`, application commands dispatched to `MetadataStateMachine`.
+**Goal:** `Raft` owns `MetadataStateMachine` and applies committed metadata commands inline — completing the Raft abstraction (log machine + state machine).
 
-This is the TODO at `state.rs:569`:
-> "Phase 4 will extend this with application state machine dispatch."
+This is the TODO at `state.rs:604`:
+> "Phase 3: dispatch to MetadataStateMachine"
 
-### 3a. Refactor `apply_committed_entries()` in `Raft`
+### 3a. Embed `MetadataStateMachine` inside `Raft`
 
-ConfChange handling (`AddPeer`/`RemovePeer`) stays inside `Raft` — it modifies Raft-internal peer state.
-
-Application commands buffered for caller:
+Raft = log machine + state machine. Not a generic Raft library — domain system. Only one state machine type ever exists. No trait, no generic, direct ownership.
 
 ```rust
-// In Raft:
-pending_applied: Vec<LogEntry>,
-
-fn apply_committed_entries(&mut self) {
-    for entry in last_applied+1..=commit_index:
-        match entry.command:
-            Noop             => {}
-            RemovePeer(id)   => self.peers.remove(id); ...
-            AddPeer(id)      => self.peers.insert(id); ...
-            _                => self.pending_applied.push(entry)  // new
-}
-
-fn take_applied_entries(&mut self) -> Vec<LogEntry>  // new drain method
-```
-
-### 3b. Embed `MetadataStateMachine` per shard group in `MultiRaft`
-
-```rust
-// In multi_raft.rs:
-struct ShardGroupState {
-    raft: Raft,
+// In state.rs:
+pub struct Raft {
+    // ... existing consensus fields ...
     state_machine: MetadataStateMachine,
 }
-
-groups: HashMap<ShardGroupId, ShardGroupState>,
 ```
 
-### 3c. Dispatch in `flush()`
+Initialized to `MetadataStateMachine::default()` in `Raft::new()`.
+
+### 3b. Inline apply in `apply_committed_entries()`
 
 ```rust
-for id in dirty:
-    for entry in shard.raft.take_applied_entries():
-        match entry.command:
-            CreateTopic { .. }  => shard.state_machine.apply_create_topic(..)
-            SplitRange { .. }   => shard.state_machine.apply_split_range(..)
-            SealSegment { .. }  => shard.state_machine.apply_seal_segment(..)
+fn apply_committed_entries(&mut self) {
+    while self.last_applied_index < self.commit_index.min(self.stabled_index) {
+        self.last_applied_index += 1;
+        let entry = self.log_get(self.last_applied_index).clone();
+        match entry.command {
+            RaftCommand::Noop => {}
+            RaftCommand::Metadata(cmd) => {
+                match self.state_machine.apply(cmd) {
+                    Ok(result)  => tracing::debug!("Applied: {:?}", result),
+                    Err(e)      => tracing::error!("Apply error: {:?}", e),
+                }
+            }
+        }
+    }
+}
 ```
 
-Matches `storage_implementation_plan.md` § "State machine application" exactly.
+No buffer-drain pattern. No `take_applied_entries()`. Apply happens at consensus boundary, inside `Raft`, guarded by `commit_index.min(stabled_index)`.
+
+### 3c. Expose read-only accessor
+
+```rust
+pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
+    &self.state_machine
+}
+```
+
+For `MultiRaft` and tests to query applied state.
 
 **Depends on:** Phases 1 + 2.
-**Scope:** 1-2 PRs.
+**Scope:** ~50-80 lines + tests. 1 PR.
 
 ---
 
@@ -360,11 +359,8 @@ Covers: RocksDB dependency, `MultiRaft` → `MultiRaftStore` refactor, `WriteBat
 **1. MultiRaftActor handles routing — no separate broker layer.**
 `MultiRaftActorCommand::Propose` takes `resource_key`, not `shard_group_id`. MultiRaft hashes the key to find the shard group, checks leadership, and proposes — all internally. Client handler in `lib.rs` stays thin (just forwards). No async topology queries needed because `ShardGroupId::new(key)` is a pure hash function.
 
-**2. MetadataStateMachine lives per shard group, inside MultiRaft(Store).**
-Not inside `Raft`. Raft remains a pure consensus state machine — no knowledge of topics, ranges, segments.
-
-**3. Application commands use buffer-drain pattern.**
-Consistent with `take_outbound()`, `take_timer_commands()`, `take_log_mutations()`. New: `take_applied_entries()`.
+**2. `Raft` owns `MetadataStateMachine` directly — no external dispatch.**
+Raft = log machine + state machine. EastGuard is a metadata system, not a generic Raft library. Only one state machine type ever exists. `apply_committed_entries()` calls `self.state_machine.apply()` inline. No buffer-drain, no wrapper struct, no trait/generic. `MultiRaft` stays `HashMap<ShardGroupId, Raft>`.
 
 **4. Commit completion tracked via pending_proposals map.**
 `raft.propose()` returns immediately (entry appended). Actual commit notification comes asynchronously. `MultiRaft` tracks `(shard_id, log_index) → oneshot::Sender` to resolve reply on commit+apply. Leader stepdown drains all pending with `NotLeader`.
