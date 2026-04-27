@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
+use crate::clusters::metadata::state_machine::MetadataStateMachine;
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::storage::RaftPersistentState;
@@ -58,6 +59,7 @@ pub struct Raft {
     current_leader: Option<NodeId>,
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
+    state_machine: MetadataStateMachine,
     election_jitter: u32,
     election_seq: u32,
     heartbeat_seq: u32,
@@ -87,6 +89,7 @@ impl Raft {
             last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
+            state_machine: MetadataStateMachine::default(),
             peer_states: HashMap::new(),
             election_jitter,
             election_seq,
@@ -98,6 +101,10 @@ impl Raft {
 
     pub(crate) fn heartbeat_seq(&self) -> u32 {
         self.heartbeat_seq
+    }
+
+    pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
+        &self.state_machine
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
@@ -583,8 +590,6 @@ impl Raft {
         self.apply_committed_entries();
     }
 
-    /// Apply committed (and persisted) but unapplied log entries.
-    /// Phase 3 will dispatch Metadata commands to MetadataStateMachine.
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -601,9 +606,24 @@ impl Raft {
             };
             match entry.command {
                 RaftCommand::Noop => {}
-                RaftCommand::Metadata(_) => {
-                    // Phase 3: dispatch to MetadataStateMachine
-                }
+                RaftCommand::Metadata(cmd) => match self.state_machine.apply(cmd) {
+                    Ok(result) => {
+                        tracing::debug!(
+                            "[{}] Applied metadata at index {}: {:?}",
+                            self.node_id,
+                            entry.index,
+                            result
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[{}] Metadata apply error at index {}: {:?}",
+                            self.node_id,
+                            entry.index,
+                            e
+                        );
+                    }
+                },
             }
         }
     }
@@ -1728,5 +1748,91 @@ mod tests {
         let events = leader_events(&mut raft);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].term, 2);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 3 — MetadataStateMachine apply
+    // -------------------------------------------------------------------
+
+    use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
+    use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+
+    fn test_create_topic_cmd(name: &str) -> RaftCommand {
+        RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+            name: name.to_string(),
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
+            replica_set: vec![node("n1"), node("n2"), node("n3")],
+            created_at: 1000,
+        }))
+    }
+
+    #[test]
+    fn apply_metadata_command_creates_topic() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        raft.simulate_flush();
+
+        raft.propose(test_create_topic_cmd("blue")).unwrap();
+        raft.simulate_flush();
+
+        assert!(raft.state_machine().get_topic_by_name("blue").is_some());
+    }
+
+    #[test]
+    fn apply_noop_does_not_affect_state_machine() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        raft.simulate_flush();
+
+        raft.propose(RaftCommand::Noop).unwrap();
+        raft.simulate_flush();
+
+        assert_eq!(raft.state_machine().topic_count(), 0);
+    }
+
+    #[test]
+    fn apply_duplicate_topic_logs_error_no_panic() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        raft.simulate_flush();
+
+        raft.propose(test_create_topic_cmd("red")).unwrap();
+        raft.simulate_flush();
+
+        raft.propose(test_create_topic_cmd("red")).unwrap();
+        raft.simulate_flush();
+
+        assert_eq!(raft.state_machine().topic_count(), 1);
+    }
+
+    #[test]
+    fn apply_multiple_topics_independent() {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        raft.simulate_flush();
+
+        raft.propose(test_create_topic_cmd("alpha")).unwrap();
+        raft.propose(test_create_topic_cmd("beta")).unwrap();
+        raft.simulate_flush();
+
+        assert_eq!(raft.state_machine().topic_count(), 2);
+        assert!(raft.state_machine().get_topic_by_name("alpha").is_some());
+        assert!(raft.state_machine().get_topic_by_name("beta").is_some());
     }
 }
