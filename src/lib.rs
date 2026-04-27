@@ -129,7 +129,12 @@ impl StartUp {
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_client_stream(stream, swim_tx, raft).await {
+                let (read_half, write_half) = stream.into_split();
+                let stream_reader = ClientStreamReader::new(read_half);
+                let stream_writer = ClientStreamWriter::new(write_half);
+                if let Err(err) =
+                    handle_client_stream(stream_reader, stream_writer, swim_tx, raft).await
+                {
                     tracing::error!("{}", err);
                 }
             });
@@ -138,13 +143,11 @@ impl StartUp {
 }
 
 async fn handle_client_stream(
-    stream: TcpStream,
+    mut stream_reader: ClientStreamReader,
+    stream_writer: ClientStreamWriter,
     swim_sender: Sender<SwimCommand>,
     raft_tx: Sender<MultiRaftActorCommand>,
 ) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
-    let mut stream_reader = ClientStreamReader::new(read_half);
-    let stream_writer = ClientStreamWriter::new(write_half);
     let request = stream_reader.read_request().await?;
 
     match request {
