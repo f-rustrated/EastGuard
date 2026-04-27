@@ -324,6 +324,43 @@ GetShardInfo { key: Vec<u8> }
 // Returns: { shard_group_id, leader_node_id, leader_addr, epoch }
 ```
 
+### 5d. Client-side routing cache
+
+**What is cached:** Shard → leader mapping. Each entry:
+
+```rust
+struct CachedRoute {
+    shard_group_id: ShardGroupId,
+    leader_node_id: NodeId,
+    leader_addr: SocketAddr,
+    epoch: ShardEpoch,
+}
+```
+
+Client maintains `HashMap<ShardGroupId, CachedRoute>`. No full topology or hash ring on client — server resolves key → shard, client only caches the result.
+
+**Cache population:** Lazy, on first use. Every `GetShardInfo` response and successful `Propose` response populates or updates the cache entry for that shard. No bulk bootstrap — cache warms organically as client operates.
+
+**Invalidation:** Error-driven only. No TTL, no polling.
+
+| Error | Client action |
+|---|---|
+| `NotLeader(None)` | Evict cached route for shard. Retry with `GetShardInfo` to discover new leader. Exponential backoff (election in progress). |
+| `NotLeader(Some(leader_hint))` | Update cache with hint. Retry to hinted leader immediately. If that also fails → evict + `GetShardInfo`. |
+| `EpochNotMatch { current }` | Evict stale entry. Call `GetShardInfo` to get new shard info with current epoch. |
+| `ShardNotFound` | Evict cache entry. Call `GetShardInfo` — shard may have moved after split/merge. |
+| Connection refused / timeout | Evict cached route. `GetShardInfo` to discover new leader. |
+
+**Retry policy:**
+- Max 3 redirect attempts per propose before returning error to caller.
+- On `NotLeader(None)` or connection failure: exponential backoff starting at 100ms, capped at 2s.
+- On `EpochNotMatch`: immediate retry after cache refresh (no backoff — not a transient failure, just stale data).
+
+**Why error-driven, no TTL:**
+- Leader changes are infrequent (metadata control plane, not data plane).
+- Server-side forwarding (§5a) handles most cases transparently — client cache miss only matters when forwarding also fails.
+- Polling would add unnecessary load across all clients × all cached shards.
+
 **Depends on:** Phase 4.
 **Scope:** 2-3 PRs.
 
@@ -452,7 +489,7 @@ Phase 3 (Application State Machine Dispatch)
 Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
     │                          (needs Phase 4 for end-to-end,
     ▼                           but core logic testable after Phase 3)
-Phase 5 (Leader Forwarding + Epoch)
+Phase 5 (Leader Forwarding + Epoch + Client Routing Cache)
 ```
 
 ---

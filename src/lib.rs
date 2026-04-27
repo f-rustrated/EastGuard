@@ -21,7 +21,7 @@ use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
 use crate::connections::request::{ProposeRequest, ProposeResponse, QueryCommand};
 use crate::impls::metadata_storage::MetadataStorage;
-use crate::net::{TcpListener, TcpStream};
+use crate::net::TcpListener;
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
