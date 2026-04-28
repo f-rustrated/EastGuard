@@ -21,7 +21,7 @@ use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::config::Environment;
 use crate::connections::request::{ProposeRequest, ProposeResponse, QueryCommand};
 use crate::impls::metadata_storage::MetadataStorage;
-use crate::net::TcpListener;
+use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
@@ -128,13 +128,9 @@ impl StartUp {
         while let Ok((stream, _)) = listener.accept().await {
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
+
             tokio::spawn(async move {
-                let (read_half, write_half) = stream.into_split();
-                let stream_reader = ClientStreamReader::new(read_half);
-                let stream_writer = ClientStreamWriter::new(write_half);
-                if let Err(err) =
-                    handle_client_stream(stream_reader, stream_writer, swim_tx, raft).await
-                {
+                if let Err(err) = handle_client_stream(stream, swim_tx, raft).await {
                     tracing::error!("{}", err);
                 }
             });
@@ -143,22 +139,22 @@ impl StartUp {
 }
 
 async fn handle_client_stream(
-    mut stream_reader: ClientStreamReader,
-    stream_writer: ClientStreamWriter,
+    stream: TcpStream,
     swim_sender: Sender<SwimCommand>,
     raft_tx: Sender<MultiRaftActorCommand>,
 ) -> Result<()> {
+    let (read_half, write_half) = stream.into_split();
+    let mut stream_reader = ClientStreamReader::new(read_half);
+    let stream_writer = ClientStreamWriter::new(write_half);
     let request = stream_reader.read_request().await?;
 
     match request {
-        ConnectionRequests::Connection(_request) => {
-            stream_reader.handle_client_stream().await;
-        }
+        ConnectionRequests::Connection(_request) => stream_reader.handle_client_stream().await?,
         ConnectionRequests::Query(query_type) => {
-            handle_query(stream_writer, swim_sender, query_type).await?;
+            handle_query(stream_writer, swim_sender, query_type).await?
         }
         ConnectionRequests::Propose(req) => {
-            handle_propose(stream_writer, swim_sender, raft_tx, req).await?;
+            handle_propose(stream_writer, swim_sender, raft_tx, req).await?
         }
     }
     Ok(())

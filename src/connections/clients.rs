@@ -129,10 +129,10 @@ impl ClientStreamReader {
         Ok(request)
     }
 
-    pub(crate) async fn handle_client_stream(mut self) {
+    pub(crate) async fn handle_client_stream(mut self) -> anyhow::Result<()> {
         loop {
             // * extract queries
-            let _query_io = self.read_request::<SessionRequest>().await;
+            let _query_io = self.read_request::<SessionRequest>().await?;
         }
     }
 }
