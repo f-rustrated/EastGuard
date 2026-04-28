@@ -1,7 +1,6 @@
 use bincode::{Decode, Encode};
 
 use crate::clusters::NodeId;
-use crate::clusters::metadata::TopicId;
 use crate::clusters::metadata::command::{CreateTopic, DeleteTopic};
 use crate::clusters::metadata::strategy::StoragePolicy;
 use crate::clusters::raft::messages::RaftCommand;
@@ -38,7 +37,7 @@ pub enum ClientCommand {
         storage_policy: StoragePolicy,
     },
     DeleteTopic {
-        topic_id: TopicId,
+        name: String,
     },
 }
 
@@ -60,7 +59,7 @@ impl ClientCommand {
                 created_at: now_ms,
             }
             .into(),
-            Self::DeleteTopic { topic_id } => DeleteTopic { topic_id }.into(),
+            Self::DeleteTopic { name } => DeleteTopic { name }.into(),
         };
         RaftCommand::Metadata(meta)
     }

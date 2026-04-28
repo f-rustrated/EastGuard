@@ -46,7 +46,7 @@ pub struct MergeRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct DeleteTopic {
-    pub topic_id: TopicId,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
