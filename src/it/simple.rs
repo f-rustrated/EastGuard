@@ -1,4 +1,3 @@
-
 /// Make sure to run the test using RUST_LOG=debug cargo test -- --nocapture
 use crate::StartUp;
 use crate::clusters::{SwimNode, SwimNodeState};
@@ -12,9 +11,18 @@ use turmoil::Builder;
 
 fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
     Environment {
-        config_dir: std::env::temp_dir().join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
-        data_dir: std::env::temp_dir().join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
-        meta_dir: std::env::temp_dir().join(format!("eastguard-meta-{}-{}", idx, uuid::Uuid::new_v4())).to_string_lossy().into_owned(),
+        config_dir: std::env::temp_dir()
+            .join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
+        data_dir: std::env::temp_dir()
+            .join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
+        meta_dir: std::env::temp_dir()
+            .join(format!("eastguard-meta-{}-{}", idx, uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned(),
         node_id_prefix: Some(node_id),
         client_port,
         cluster_port,

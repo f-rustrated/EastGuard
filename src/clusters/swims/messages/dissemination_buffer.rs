@@ -1,9 +1,7 @@
-use std::net::SocketAddr;
-
 use bincode::{Decode, Encode};
 
 use crate::clusters::swims::topology::ShardGroupId;
-use crate::clusters::{BINCODE_CONFIG, NodeId, SwimNode};
+use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId, SwimNode};
 
 // UDP does not handle splitting large messages up.
 // Preventing IP fragmentation is therefore necessary unless we have dedicated fragmentation handling logics.
@@ -118,8 +116,7 @@ impl<T: Disseminable> DisseminationBuffer<T> {
 pub(crate) struct ShardLeaderInfo {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
-    pub leader_addr: SocketAddr,
-    pub client_addr: SocketAddr,
+    pub leader_addr: NodeAddress,
     pub term: u64,
 }
 
@@ -159,7 +156,7 @@ pub(in crate::clusters::swims) fn dissemination_count(cluster_size: usize) -> u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::{NodeId, SwimNodeState};
+    use crate::clusters::{NodeAddress, NodeId, SwimNodeState};
     use std::net::SocketAddr;
 
     fn addr(port: u16) -> SocketAddr {
@@ -169,7 +166,10 @@ mod tests {
     fn member(port: u16, state: SwimNodeState, incarnation: u64) -> SwimNode {
         SwimNode {
             node_id: NodeId::new(port.to_string()),
-            addr: addr(port),
+            addr: NodeAddress {
+                cluster_addr: addr(port),
+                client_addr: addr(port),
+            },
             state,
             incarnation,
         }
@@ -184,7 +184,7 @@ mod tests {
         let result = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(result.len(), 2);
 
-        let addrs: Vec<_> = result.iter().map(|m| m.addr).collect();
+        let addrs: Vec<_> = result.iter().map(|m| m.addr.cluster_addr).collect();
         assert!(addrs.contains(&addr(1)));
         assert!(addrs.contains(&addr(2)));
     }
@@ -244,14 +244,14 @@ mod tests {
 
         let first = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(
-            first[0].addr,
+            first[0].addr.cluster_addr,
             addr(2),
             "member(2) should lead (higher remaining)"
         );
 
         let second = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(
-            second[0].addr,
+            second[0].addr.cluster_addr,
             addr(2),
             "member(2) should still lead after sort() in previous collect()"
         );
@@ -269,8 +269,8 @@ mod tests {
 
         let result = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].addr, addr(2));
-        assert_eq!(result[1].addr, addr(1));
+        assert_eq!(result[0].addr.cluster_addr, addr(2));
+        assert_eq!(result[1].addr.cluster_addr, addr(1));
     }
 
     #[test]
@@ -316,7 +316,7 @@ mod tests {
         buf.enqueue(new, 10);
 
         let result = buf.collect(MAX_GOSSIP_BYTES);
-        assert!(result.iter().any(|m| m.addr == addr(999)));
+        assert!(result.iter().any(|m| m.addr.cluster_addr == addr(999)));
     }
 
     #[test]
@@ -334,8 +334,10 @@ mod tests {
         ShardLeaderInfo {
             shard_group_id: ShardGroupId(group),
             leader_node_id: NodeId::new(leader),
-            leader_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
-            client_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            leader_addr: NodeAddress {
+                cluster_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+                client_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            },
             term,
         }
     }

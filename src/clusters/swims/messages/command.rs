@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
 use crate::clusters::raft::messages::LeaderChange;
+use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::ShardLeaderEntry;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::clusters::swims::peer_discovery::JoinAttempt;
-use crate::clusters::{NodeId, SwimNode};
+use crate::clusters::{NodeAddress, NodeId, SwimNode};
 use crate::schedulers::ticker_message::TimerCommand;
 
 use super::packet::{OutboundPacket, SwimPacket};
@@ -24,14 +24,13 @@ pub enum SwimCommand {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum SwimQueryCommand {
     GetMembers {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
     ResolveAddress {
         node_id: NodeId,
-        reply: tokio::sync::oneshot::Sender<Option<SocketAddr>>,
+        reply: tokio::sync::oneshot::Sender<Option<NodeAddress>>,
     },
     ResolveShardGroup {
         key: Vec<u8>,
@@ -41,6 +40,12 @@ pub enum SwimQueryCommand {
         shard_group_id: ShardGroupId,
         reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
     },
+}
+
+impl From<SwimQueryCommand> for SwimCommand {
+    fn from(value: SwimQueryCommand) -> Self {
+        SwimCommand::Query(value)
+    }
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {

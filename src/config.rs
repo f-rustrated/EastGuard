@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::NodeId;
+use crate::clusters::{NodeAddress, NodeId};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{Topology, TopologyConfig};
@@ -193,8 +193,10 @@ impl Environment {
     pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
-            self.advertise_peer_addr(),
-            self.advertise_client_addr(),
+            NodeAddress {
+                cluster_addr: self.advertise_peer_addr(),
+                client_addr: self.advertise_client_addr(),
+            },
             Topology::new(
                 std::iter::empty(),
                 TopologyConfig {

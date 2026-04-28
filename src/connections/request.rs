@@ -19,18 +19,20 @@ pub struct ConnectionRequest {}
 #[derive(Decode, Encode)]
 pub struct SessionRequest {}
 
+// ! Do we need the following?
 #[derive(Decode, Encode)]
 pub enum QueryCommand {
     GetMembers,
 }
 
-#[derive(Decode, Encode)]
+#[derive(Decode, Encode, Clone)]
 pub struct ProposeRequest {
     pub resource_key: Vec<u8>,
     pub command: ClientCommand,
+    pub forwarded: bool,
 }
 
-#[derive(Decode, Encode)]
+#[derive(Clone, Decode, Encode)]
 pub enum ClientCommand {
     CreateTopic {
         name: String,
@@ -65,7 +67,7 @@ impl ClientCommand {
     }
 }
 
-#[derive(Decode, Encode)]
+#[derive(Debug, Decode, Encode)]
 pub enum ProposeResponse {
     Success,
     Error(ProposeError),

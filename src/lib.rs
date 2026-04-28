@@ -14,12 +14,10 @@ mod it;
 pub(crate) mod macros;
 
 use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{MultiRaftActorCommand, ProposeError};
+use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
-
-use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
+use crate::clusters::swims::SwimCommand;
 use crate::config::Environment;
-use crate::connections::request::{ProposeRequest, ProposeResponse, QueryCommand};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -145,82 +143,19 @@ async fn handle_client_stream(
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut stream_reader = ClientStreamReader::new(read_half);
-    let stream_writer = ClientStreamWriter::new(write_half);
+    let mut stream_writer = ClientStreamWriter::new(write_half);
     let request = stream_reader.read_request().await?;
 
     match request {
         ConnectionRequests::Connection(_request) => {}
         ConnectionRequests::Query(query_type) => {
-            handle_query(stream_writer, swim_sender, query_type).await?
+            stream_writer.handle_query(swim_sender, query_type).await?
         }
         ConnectionRequests::Propose(req) => {
-            handle_propose(stream_writer, swim_sender, raft_tx, req).await?
+            stream_writer
+                .handle_propose(swim_sender, raft_tx, req)
+                .await?
         }
     }
-    Ok(())
-}
-
-async fn handle_query(
-    mut writer: ClientStreamWriter,
-    swim_sender: Sender<SwimCommand>,
-    query_type: QueryCommand,
-) -> Result<()> {
-    match query_type {
-        QueryCommand::GetMembers => {
-            let (send, recv) = tokio::sync::oneshot::channel();
-            swim_sender
-                .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
-                    reply: send,
-                }))
-                .await?;
-
-            let result = recv.await?;
-            writer
-                .write(&result)
-                .await
-                .expect("Failed to write message");
-            Ok(())
-        }
-    }
-}
-
-async fn handle_propose(
-    mut writer: ClientStreamWriter,
-    swim_sender: Sender<SwimCommand>,
-    raft_tx: Sender<MultiRaftActorCommand>,
-    req: ProposeRequest,
-) -> Result<()> {
-    let (send, recv) = tokio::sync::oneshot::channel();
-    swim_sender
-        .send(SwimCommand::Query(SwimQueryCommand::ResolveShardGroup {
-            key: req.resource_key,
-            reply: send,
-        }))
-        .await?;
-
-    let Some(shard_group) = recv.await? else {
-        writer
-            .write(&ProposeResponse::Error(ProposeError::ShardNotFound))
-            .await?;
-        return Ok(());
-    };
-
-    let raft_cmd = req.command.into_raft_command(shard_group.members);
-
-    let (send, recv) = tokio::sync::oneshot::channel();
-    raft_tx
-        .send(MultiRaftActorCommand::Propose {
-            shard_group_id: shard_group.id,
-            command: raft_cmd,
-            reply: send,
-        })
-        .await?;
-
-    let response = match recv.await? {
-        Ok(()) => ProposeResponse::Success,
-        Err(err) => ProposeResponse::Error(err),
-    };
-
-    writer.write(&response).await?;
     Ok(())
 }

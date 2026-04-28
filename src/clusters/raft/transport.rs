@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -10,7 +9,7 @@ use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 
 struct RaftReader(OwnedReadHalf);
@@ -67,7 +66,7 @@ impl RaftReader {
 struct RaftWriters {
     node_id: NodeId,
     writers: HashMap<NodeId, OwnedWriteHalf>,
-    addr_cache: HashMap<NodeId, SocketAddr>,
+    addr_cache: HashMap<NodeId, NodeAddress>,
     /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
@@ -133,7 +132,7 @@ impl RaftWriters {
             }
 
             // Establish new connection
-            let Some(target_addr) = self.resolve_address(&target_id, swim_tx).await else {
+            let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
                 tracing::warn!(
                     "[{}] Cannot resolve address for {:?}",
                     self.node_id,
@@ -142,11 +141,11 @@ impl RaftWriters {
                 continue;
             };
 
-            let Ok(stream) = TcpStream::connect(target_addr).await else {
+            let Ok(stream) = TcpStream::connect(node_addr.cluster_addr).await else {
                 tracing::warn!(
                     "[{}] Failed to connect to {} ({:?})",
                     self.node_id,
-                    target_addr,
+                    node_addr.cluster_addr,
                     target_id
                 );
                 continue;
@@ -193,7 +192,7 @@ impl RaftWriters {
         &mut self,
         node_id: &NodeId,
         swim_tx: &mpsc::Sender<SwimCommand>,
-    ) -> Option<SocketAddr> {
+    ) -> Option<NodeAddress> {
         if let Some(&addr) = self.addr_cache.get(node_id) {
             return Some(addr);
         }
@@ -208,9 +207,9 @@ impl RaftWriters {
             return None;
         }
 
-        if let Ok(Some(addr)) = rx.await {
-            self.addr_cache.insert(node_id.clone(), addr);
-            Some(addr)
+        if let Ok(Some(node_addr)) = rx.await {
+            self.addr_cache.insert(node_id.clone(), node_addr);
+            Some(node_addr)
         } else {
             None
         }

@@ -9,6 +9,7 @@ use turmoil::Builder;
 use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
+use crate::clusters::NodeAddress;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
@@ -26,7 +27,10 @@ async fn mock_swim_handler(
 ) {
     while let Some(cmd) = rx.recv().await {
         if let SwimCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
-            let _ = reply.send(address_map.get(&node_id).copied());
+            let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
+                cluster_addr: addr,
+                client_addr: addr,
+            }));
         }
     }
 }
