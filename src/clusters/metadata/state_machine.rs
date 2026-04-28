@@ -194,14 +194,16 @@ impl MetadataStateMachine {
     }
 
     fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
-        let topic = self
-            .topics
-            .get_mut(&cmd.topic_id)
-            .ok_or(TopicNotFound(cmd.topic_id))?;
+        let topic_id = self
+            .topic_name_index
+            .get(&cmd.name)
+            .copied()
+            .ok_or(MetadataError::TopicNameNotFound(cmd.name.clone()))?;
 
-        topic.delete();
-
-        self.topic_name_index.remove(&topic.name);
+        // Safety: topic_name_index and topics are always in sync —
+        // see invariant below.
+        self.topics.get_mut(&topic_id).unwrap().delete();
+        self.topic_name_index.remove(&cmd.name);
 
         Ok(())
     }
@@ -703,8 +705,10 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic { topic_id: tid }))
-            .unwrap();
+        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
+            name: "blue".into(),
+        }))
+        .unwrap();
 
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.state, TopicState::Deleted);
@@ -721,22 +725,23 @@ mod tests {
     #[test]
     fn delete_topic_removes_name_index() {
         let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
+        let _tid = create_topic(&mut sm, "blue");
 
-        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic { topic_id: tid }))
-            .unwrap();
+        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
+            name: "blue".into(),
+        }))
+        .unwrap();
 
         assert!(sm.get_topic_by_name("blue").is_none());
-        assert!(sm.get_topic(&tid).is_some());
     }
 
     #[test]
     fn delete_topic_nonexistent() {
         let mut sm = MetadataStateMachine::default();
         let result = sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
-            topic_id: TopicId(99),
+            name: "nope".into(),
         }));
-        assert_eq!(result, Err(TopicNotFound(TopicId(99))));
+        assert_eq!(result, Err(MetadataError::TopicNameNotFound("nope".into())));
     }
 
     // --- Integration ---

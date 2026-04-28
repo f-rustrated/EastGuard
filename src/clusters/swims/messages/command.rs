@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use crate::clusters::raft::messages::LeaderChange;
+use crate::clusters::swims::ShardGroup;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::ticker_message::TimerCommand;
@@ -29,6 +30,10 @@ pub enum SwimQueryCommand {
     ResolveAddress {
         node_id: NodeId,
         reply: tokio::sync::oneshot::Sender<Option<SocketAddr>>,
+    },
+    ResolveShardGroup {
+        key: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Option<ShardGroup>>,
     },
 }
 

@@ -191,6 +191,10 @@ impl Swim {
                 let addr = self.members.get(&node_id).map(|m| m.addr);
                 let _ = reply.send(addr);
             }
+            SwimQueryCommand::ResolveShardGroup { key, reply } => {
+                let group = self.topology.shard_group_for(&key).cloned();
+                let _ = reply.send(group);
+            }
         }
     }
 

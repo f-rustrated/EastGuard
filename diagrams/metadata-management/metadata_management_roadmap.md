@@ -68,42 +68,47 @@ See `diagrams/metadata-management/data-model.md` for full entity relationships, 
 
 ---
 
-## Phase 2: Extend RaftCommand
+## Phase 2: Extend RaftCommand ✅
 
 **Goal:** Grow `RaftCommand` from internal-only to include metadata operations.
 
 ### File: `src/clusters/raft/messages/command.rs`
 
-**Extend `RaftCommand`:**
+**`RaftCommand` wraps `MetadataCommand`:**
 
 ```rust
 enum RaftCommand {
-    // Existing
     Noop,
-    // New
-    CreateTopic { name: String, storage_policy: StoragePolicy },
-    SealSegment { topic_id: TopicId, range_id: RangeId, segment_id: SegmentId },
-    SplitRange { topic_id: TopicId, range_id: RangeId, split_point: Vec<u8> },
-    MergeRange { topic_id: TopicId, range_id_1: RangeId, range_id_2: RangeId },
-    DeleteTopic { topic_id: TopicId },
-    // Future: MoveShard, ReassignSegment
+    Metadata(MetadataCommand),
 }
 ```
 
-No `AssignRange` — ranges are never created standalone. They emerge from `CreateTopic` (initial full-keyspace range) or `SplitRange`/`MergeRange` (lifecycle). See `diagrams/metadata-management/data-model.md` § "How Range ID and Keyspace Are Determined".
+`MetadataCommand` is a separate enum in `src/clusters/metadata/command.rs` with typed structs per variant:
 
-**Extend `ProposeError`:**
+```rust
+enum MetadataCommand {
+    CreateTopic(CreateTopic),
+    SealSegment(SealSegment),
+    SplitRange(SplitRange),
+    MergeRange(MergeRange),
+    DeleteTopic(DeleteTopic),
+}
+```
+
+Each struct carries its own fields (e.g., `CreateTopic { name, storage_policy, replica_set, created_at }`). `DeleteTopic` uses `name: String` — resolved to `TopicId` at apply time via `topic_name_index`.
+
+No `AssignRange` — ranges emerge from `CreateTopic` (initial full-keyspace range) or `SplitRange`/`MergeRange` (lifecycle). See `diagrams/metadata-management/data-model.md` § "How Range ID and Keyspace Are Determined".
+
+**`ProposeError`:**
 
 ```rust
 enum ProposeError {
     NotLeader,
     ShardNotFound,
-    EpochNotMatch { current: ShardEpoch },
-    NotLeaderHint(Option<NodeId>),
 }
 ```
 
-**Remove** the manual `serialize()` method (lines 18-26) — `bincode::Encode`/`Decode` handles serialization.
+`EpochNotMatch` and `NotLeaderHint` deferred to Phase 5.
 
 **Depends on:** Phase 1 (needs `TopicId`, `StoragePolicy`, etc.).
 **Scope:** Mostly type changes + match arm updates.
@@ -112,60 +117,55 @@ enum ProposeError {
 
 ## Phase 3: Application State Machine Dispatch
 
-**Goal:** Split `apply_committed_entries()` — ConfChange stays in `Raft`, application commands dispatched to `MetadataStateMachine`.
+**Goal:** `Raft` owns `MetadataStateMachine` and applies committed metadata commands inline.
 
-This is the TODO at `state.rs:569`:
-> "Phase 4 will extend this with application state machine dispatch."
+### 3a. Embed `MetadataStateMachine` inside `Raft`
 
-### 3a. Refactor `apply_committed_entries()` in `Raft`
-
-ConfChange handling (`AddPeer`/`RemovePeer`) stays inside `Raft` — it modifies Raft-internal peer state.
-
-Application commands buffered for caller:
+Raft = log machine + state machine. EastGuard is a metadata system, not a generic Raft library. Only one state machine type ever exists. Direct ownership, no trait, no generic.
 
 ```rust
-// In Raft:
-pending_applied: Vec<LogEntry>,
-
-fn apply_committed_entries(&mut self) {
-    for entry in last_applied+1..=commit_index:
-        match entry.command:
-            Noop             => {}
-            RemovePeer(id)   => self.peers.remove(id); ...
-            AddPeer(id)      => self.peers.insert(id); ...
-            _                => self.pending_applied.push(entry)  // new
-}
-
-fn take_applied_entries(&mut self) -> Vec<LogEntry>  // new drain method
-```
-
-### 3b. Embed `MetadataStateMachine` per shard group in `MultiRaft`
-
-```rust
-// In multi_raft.rs:
-struct ShardGroupState {
-    raft: Raft,
+// In state.rs:
+pub struct Raft {
+    // ... existing consensus fields ...
     state_machine: MetadataStateMachine,
 }
-
-groups: HashMap<ShardGroupId, ShardGroupState>,
 ```
 
-### 3c. Dispatch in `flush()`
+Initialized to `MetadataStateMachine::default()` in `Raft::new()`.
+
+### 3b. Inline apply in `apply_committed_entries()`
 
 ```rust
-for id in dirty:
-    for entry in shard.raft.take_applied_entries():
-        match entry.command:
-            CreateTopic { .. }  => shard.state_machine.apply_create_topic(..)
-            SplitRange { .. }   => shard.state_machine.apply_split_range(..)
-            SealSegment { .. }  => shard.state_machine.apply_seal_segment(..)
+fn apply_committed_entries(&mut self) {
+    while self.last_applied_index < self.commit_index.min(self.stabled_index) {
+        self.last_applied_index += 1;
+        let entry = self.log_get(self.last_applied_index).clone();
+        match entry.command {
+            RaftCommand::Noop => {}
+            RaftCommand::Metadata(cmd) => {
+                match self.state_machine.apply(cmd) {
+                    Ok(result)  => tracing::debug!("Applied: {:?}", result),
+                    Err(e)      => tracing::error!("Apply error: {:?}", e),
+                }
+            }
+        }
+    }
+}
 ```
 
-Matches `storage_implementation_plan.md` § "State machine application" exactly.
+No buffer-drain pattern. No `take_applied_entries()`. Apply happens at consensus boundary, inside `Raft`, guarded by `commit_index.min(stabled_index)`.
 
-**Depends on:** Phases 1 + 2.
-**Scope:** 1-2 PRs.
+Membership changes (`AddPeer`/`RemovePeer`) are handled separately via `MultiRaft` — SWIM is membership authority, not the Raft log.
+
+### 3c. Read-only accessor
+
+```rust
+pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
+    &self.state_machine
+}
+```
+
+For tests to query applied state.
 
 ---
 
@@ -324,6 +324,43 @@ GetShardInfo { key: Vec<u8> }
 // Returns: { shard_group_id, leader_node_id, leader_addr, epoch }
 ```
 
+### 5d. Client-side routing cache
+
+**What is cached:** Shard → leader mapping. Each entry:
+
+```rust
+struct CachedRoute {
+    shard_group_id: ShardGroupId,
+    leader_node_id: NodeId,
+    leader_addr: SocketAddr,
+    epoch: ShardEpoch,
+}
+```
+
+Client maintains `HashMap<ShardGroupId, CachedRoute>`. No full topology or hash ring on client — server resolves key → shard, client only caches the result.
+
+**Cache population:** Lazy, on first use. Every `GetShardInfo` response and successful `Propose` response populates or updates the cache entry for that shard. No bulk bootstrap — cache warms organically as client operates.
+
+**Invalidation:** Error-driven only. No TTL, no polling.
+
+| Error | Client action |
+|---|---|
+| `NotLeader(None)` | Evict cached route for shard. Retry with `GetShardInfo` to discover new leader. Exponential backoff (election in progress). |
+| `NotLeader(Some(leader_hint))` | Update cache with hint. Retry to hinted leader immediately. If that also fails → evict + `GetShardInfo`. |
+| `EpochNotMatch { current }` | Evict stale entry. Call `GetShardInfo` to get new shard info with current epoch. |
+| `ShardNotFound` | Evict cache entry. Call `GetShardInfo` — shard may have moved after split/merge. |
+| Connection refused / timeout | Evict cached route. `GetShardInfo` to discover new leader. |
+
+**Retry policy:**
+- Max 3 redirect attempts per propose before returning error to caller.
+- On `NotLeader(None)` or connection failure: exponential backoff starting at 100ms, capped at 2s.
+- On `EpochNotMatch`: immediate retry after cache refresh (no backoff — not a transient failure, just stale data).
+
+**Why error-driven, no TTL:**
+- Leader changes are infrequent (metadata control plane, not data plane).
+- Server-side forwarding (§5a) handles most cases transparently — client cache miss only matters when forwarding also fails.
+- Polling would add unnecessary load across all clients × all cached shards.
+
 **Depends on:** Phase 4.
 **Scope:** 2-3 PRs.
 
@@ -452,7 +489,7 @@ Phase 3 (Application State Machine Dispatch)
 Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
     │                          (needs Phase 4 for end-to-end,
     ▼                           but core logic testable after Phase 3)
-Phase 5 (Leader Forwarding + Epoch)
+Phase 5 (Leader Forwarding + Epoch + Client Routing Cache)
 ```
 
 ---
