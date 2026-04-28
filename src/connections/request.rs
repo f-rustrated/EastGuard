@@ -3,7 +3,7 @@ use bincode::{Decode, Encode};
 use crate::clusters::NodeId;
 use crate::clusters::metadata::command::{CreateTopic, DeleteTopic};
 use crate::clusters::metadata::strategy::StoragePolicy;
-use crate::clusters::raft::messages::RaftCommand;
+use crate::clusters::raft::messages::{ProposeError, RaftCommand};
 
 #[derive(Decode, Encode)]
 pub enum ConnectionRequests {
@@ -68,7 +68,5 @@ impl ClientCommand {
 #[derive(Decode, Encode)]
 pub enum ProposeResponse {
     Success,
-    NotLeader,
-    ShardNotFound,
-    Error(String),
+    Error(ProposeError),
 }

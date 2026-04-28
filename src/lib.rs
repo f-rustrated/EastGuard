@@ -199,7 +199,9 @@ async fn handle_propose(
         .await?;
 
     let Some(shard_group) = recv.await? else {
-        writer.write(&ProposeResponse::ShardNotFound).await?;
+        writer
+            .write(&ProposeResponse::Error(ProposeError::ShardNotFound))
+            .await?;
         return Ok(());
     };
 
@@ -216,8 +218,7 @@ async fn handle_propose(
 
     let response = match recv.await? {
         Ok(()) => ProposeResponse::Success,
-        Err(ProposeError::NotLeader) => ProposeResponse::NotLeader,
-        Err(ProposeError::ShardNotFound) => ProposeResponse::ShardNotFound,
+        Err(err) => ProposeResponse::Error(err),
     };
 
     writer.write(&response).await?;

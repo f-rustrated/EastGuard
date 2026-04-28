@@ -15,9 +15,9 @@ pub enum RaftCommand {
     Metadata(MetadataCommand),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 pub enum ProposeError {
-    NotLeader,
+    NotLeader(Option<NodeId>),
     ShardNotFound,
 }
 
