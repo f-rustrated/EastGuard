@@ -5,7 +5,7 @@ use anyhow::bail;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{config::SERDE_CONFIG, connections::request::SessionRequest};
+use crate::config::SERDE_CONFIG;
 
 pub struct ClientStreamWriter {
     pub(crate) stream: OwnedWriteHalf,
@@ -127,12 +127,5 @@ impl ClientStreamReader {
         let body = body.unwrap();
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
         Ok(request)
-    }
-
-    pub(crate) async fn handle_client_stream(mut self) -> anyhow::Result<()> {
-        loop {
-            // * extract queries
-            let _query_io = self.read_request::<SessionRequest>().await?;
-        }
     }
 }

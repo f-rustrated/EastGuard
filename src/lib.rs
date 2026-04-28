@@ -149,7 +149,7 @@ async fn handle_client_stream(
     let request = stream_reader.read_request().await?;
 
     match request {
-        ConnectionRequests::Connection(_request) => stream_reader.handle_client_stream().await?,
+        ConnectionRequests::Connection(_request) => {}
         ConnectionRequests::Query(query_type) => {
             handle_query(stream_writer, swim_sender, query_type).await?
         }
