@@ -18,6 +18,7 @@ pub enum ConnectionRequests {
 #[derive(Decode, Encode)]
 pub struct ConnectionRequest {}
 
+#[allow(unused)]
 #[derive(Decode, Encode)]
 pub struct SessionRequest {}
 
