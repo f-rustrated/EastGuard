@@ -7,7 +7,9 @@ use crate::{
         raft::messages::ProposeError,
         swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
     },
-    connections::request::{ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand},
+    connections::request::{
+        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse,
+    },
     net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
 };
 use anyhow::bail;
@@ -50,8 +52,18 @@ impl ClientStreamWriter {
                     .await?;
 
                 let result = recv.await?;
-                self.write(&result).await.expect("Failed to write message");
-                Ok(())
+                self.write(&result).await
+            }
+            QueryCommand::GetShardInfo { key } => {
+                let response = swim_sender
+                    .get_shard_info(key)
+                    .await
+                    .map(|(group, leader)| ShardInfoResponse {
+                        shard_group_id: group.id.0,
+                        leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
+                        leader_addr: leader.map(|e| e.leader_addr),
+                    });
+                self.write(&response).await
             }
         }
     }

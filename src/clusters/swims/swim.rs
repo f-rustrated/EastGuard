@@ -197,6 +197,14 @@ impl Swim {
                 let entry = self.topology.shard_leader(shard_group_id).cloned();
                 let _ = reply.send(entry);
             }
+            SwimQueryCommand::GetShardInfo { key, reply } => {
+                let result = self.topology.shard_group_for(&key).cloned().map(|group| {
+                    // ! While shard group exists, it's possible that there might not be ShardLeaderEntry because of in-transit election
+                    let leader = self.topology.shard_leader(group.id).cloned();
+                    (group, leader)
+                });
+                let _ = reply.send(result);
+            }
         }
     }
 

@@ -40,6 +40,10 @@ pub enum SwimQueryCommand {
         shard_group_id: ShardGroupId,
         reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
     },
+    GetShardInfo {
+        key: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Option<(ShardGroup, Option<ShardLeaderEntry>)>>,
+    },
 }
 
 impl From<SwimQueryCommand> for SwimCommand {

@@ -137,6 +137,17 @@ impl SwimSender {
         recv.await.ok()?
     }
 
+    pub(crate) async fn get_shard_info(
+        &self,
+        key: Vec<u8>,
+    ) -> Option<(ShardGroup, Option<ShardLeaderEntry>)> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::GetShardInfo { key, reply: send })
+            .await
+            .ok()?;
+        recv.await.ok()?
+    }
+
     pub(crate) async fn resolve_address(&self, node_id: NodeId) -> Option<NodeAddress> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(SwimQueryCommand::ResolveAddress {
