@@ -119,6 +119,7 @@ pub(crate) struct ShardLeaderInfo {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
     pub leader_addr: SocketAddr,
+    pub client_addr: SocketAddr,
     pub term: u64,
 }
 
@@ -334,6 +335,7 @@ mod tests {
             shard_group_id: ShardGroupId(group),
             leader_node_id: NodeId::new(leader),
             leader_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            client_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
             term,
         }
     }

@@ -121,11 +121,13 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     let (tx_out, rx_out) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(100);
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let peer_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let client_addr: SocketAddr = format!("127.0.0.1:{}", port + 1000).parse().unwrap();
 
     let swim = Swim::new(
         NodeId::new(format!("node-local-{}", port).as_str()),
-        addr,
+        peer_addr,
+        client_addr,
         Topology::new(
             std::iter::empty(),
             TopologyConfig {
@@ -153,7 +155,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         tx_out,
         rx_out: Some(rx_out),
         ticker_tx,
-        local_addr: addr,
+        local_addr: peer_addr,
         config: join_config,
     }
 }

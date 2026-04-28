@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 
 use crate::clusters::raft::messages::LeaderChange;
-use crate::clusters::swims::ShardGroup;
+use crate::clusters::swims::topology::ShardLeaderEntry;
+use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::{NodeId, SwimNode};
 use crate::schedulers::ticker_message::TimerCommand;
@@ -23,6 +24,7 @@ pub enum SwimCommand {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum SwimQueryCommand {
     GetMembers {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
@@ -34,6 +36,10 @@ pub enum SwimQueryCommand {
     ResolveShardGroup {
         key: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Option<ShardGroup>>,
+    },
+    ResolveShardLeader {
+        shard_group_id: ShardGroupId,
+        reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
     },
 }
 

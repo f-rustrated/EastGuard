@@ -31,8 +31,8 @@ pub struct Environment {
     #[arg(long = "node-id-prefix", env = "EASTGUARD_NODE_ID_PREFIX")]
     pub node_id_prefix: Option<String>,
 
-    #[arg(short, long, env = "EASTGUARD_PORT", default_value_t = 2921)]
-    pub port: u16,
+    #[arg(short = 'p', long = "client-port", env = "EASTGUARD_CLIENT_PORT", default_value_t = 2921)]
+    pub client_port: u16,
 
     #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
@@ -88,6 +88,13 @@ impl Environment {
         // 1. Parse arguments from CLI and/or ENV vars
         let env = Environment::parse();
 
+        if env.client_port == env.cluster_port {
+            panic!(
+                "client_port ({}) and cluster_port ({}) must be different",
+                env.client_port, env.cluster_port
+            );
+        }
+
         // 2. Ensure data and meta directories exist and are writable
         for dir in [&env.data_dir, &env.meta_dir] {
             if let Err(e) = fs::create_dir_all(dir) {
@@ -110,7 +117,7 @@ impl Environment {
         env
     }
     pub(crate) fn bind_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", self.host, self.client_port)
     }
 
     pub(crate) fn raft_db_path(&self) -> std::path::PathBuf {
@@ -176,10 +183,18 @@ impl Environment {
             .collect()
     }
 
+    pub(crate) fn advertise_client_addr(&self) -> std::net::SocketAddr {
+        let host = self.advertise_host.as_deref().unwrap_or(&self.host);
+        format!("{}:{}", host, self.client_port)
+            .parse()
+            .expect("Invalid advertise client address")
+    }
+
     pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
             self.advertise_peer_addr(),
+            self.advertise_client_addr(),
             Topology::new(
                 std::iter::empty(),
                 TopologyConfig {
@@ -206,7 +221,7 @@ mod tests {
             data_dir: "./eastguard/data".into(),
             meta_dir: "./eastguard/meta".into(),
             node_id_prefix: None,
-            port: 2921,
+            client_port: 2921,
             cluster_port: 2922,
             host: "127.0.0.1".into(),
             advertise_host: None,
@@ -222,7 +237,7 @@ mod tests {
     #[test]
     fn test_address_formatting() {
         let env = Environment {
-            port: 3000,
+            client_port: 3000,
             cluster_port: 3001,
             node_id_prefix: Some("node-1".into()),
             ..make_env()
@@ -243,7 +258,7 @@ mod tests {
         assert_eq!(env.data_dir, "./eastguard/data");
         assert_eq!(env.meta_dir, "./eastguard/meta");
         assert_eq!(env.node_id_prefix, None);
-        assert_eq!(env.port, 2921);
+        assert_eq!(env.client_port, 2921);
         assert_eq!(env.cluster_port, 2922);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.vnodes_per_node, 256);
@@ -260,7 +275,7 @@ mod tests {
             "my-server",
             "--node-id-prefix",
             "node-1",
-            "--port",
+            "--client-port",
             "9999",
             "--host",
             "0.0.0.0",
@@ -273,7 +288,7 @@ mod tests {
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
 
         assert_eq!(env.node_id_prefix, Some("node-1".into()));
-        assert_eq!(env.port, 9999);
+        assert_eq!(env.client_port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
         assert_eq!(env.vnodes_per_node, 8);
@@ -293,7 +308,7 @@ mod tests {
 
         let env = Environment::try_parse_from(args).expect("Failed to parse flags");
 
-        assert_eq!(env.port, 9999);
+        assert_eq!(env.client_port, 9999);
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
     }
@@ -333,26 +348,26 @@ mod tests {
     fn test_env_vars_override() {
         unsafe {
             std::env::set_var("EASTGUARD_NODE_ID_PREFIX", "env-node-1");
-            std::env::set_var("EASTGUARD_PORT", "8888");
+            std::env::set_var("EASTGUARD_CLIENT_PORT", "8888");
             std::env::set_var("EASTGUARD_HOST", "0.0.0.0");
         }
 
         let env = Environment::try_parse_from(vec!["my-server"]).expect("Failed to parse env vars");
 
         assert_eq!(env.node_id_prefix, Some("env-node-1".into()));
-        assert_eq!(env.port, 8888);
+        assert_eq!(env.client_port, 8888);
         assert_eq!(env.host, "0.0.0.0");
 
         unsafe {
             std::env::remove_var("EASTGUARD_NODE_ID_PREFIX");
-            std::env::remove_var("EASTGUARD_PORT");
+            std::env::remove_var("EASTGUARD_CLIENT_PORT");
             std::env::remove_var("EASTGUARD_HOST");
         }
     }
 
     #[test]
     fn test_invalid_port_input() {
-        let args = vec!["my-server", "--port", "not-a-number"];
+        let args = vec!["my-server", "--client-port", "not-a-number"];
 
         // This should fail because clap validates u16 automatically
         let result = Environment::try_parse_from(args);

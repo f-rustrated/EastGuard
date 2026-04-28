@@ -56,6 +56,7 @@ pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
     pub(crate) advertise_addr: SocketAddr,
+    advertise_client_addr: SocketAddr,
     incarnation: u64,
 
     // Protocol state
@@ -78,12 +79,14 @@ impl Swim {
     pub fn new(
         node_id: NodeId,
         advertise_addr: SocketAddr,
+        advertise_client_addr: SocketAddr,
         topology: Topology,
         rng_seed: u64,
     ) -> Self {
         let mut swim = Self {
             node_id,
             advertise_addr,
+            advertise_client_addr,
             incarnation: 0,
             topology,
             members: BTreeMap::new(),
@@ -194,6 +197,13 @@ impl Swim {
             SwimQueryCommand::ResolveShardGroup { key, reply } => {
                 let group = self.topology.shard_group_for(&key).cloned();
                 let _ = reply.send(group);
+            }
+            SwimQueryCommand::ResolveShardLeader {
+                shard_group_id,
+                reply,
+            } => {
+                let entry = self.topology.shard_leader(shard_group_id).cloned();
+                let _ = reply.send(entry);
             }
         }
     }
@@ -333,6 +343,7 @@ impl Swim {
                     shard_group_id: event.shard_group_id,
                     leader_node_id: event.leader_node_id,
                     leader_addr: self.advertise_addr,
+                    client_addr: self.advertise_client_addr,
                     term: event.term,
                 };
                 self.apply_shard_leader_update(&info);
@@ -1487,6 +1498,7 @@ mod tests {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
                     leader_addr: b_addr,
+                    client_addr: b_addr,
                     term: 3,
                 }],
             };
@@ -1517,6 +1529,7 @@ mod tests {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
                     leader_addr: b_addr,
+                    client_addr: b_addr,
                     term: 3,
                 }],
             };
@@ -1554,6 +1567,7 @@ mod tests {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
                     leader_addr: b_addr,
+                    client_addr: b_addr,
                     term: 5,
                 }],
             };
@@ -1570,6 +1584,7 @@ mod tests {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-other"),
                     leader_addr: "127.0.0.1:9999".parse().unwrap(),
+                    client_addr: "127.0.0.1:9999".parse().unwrap(),
                     term: 2,
                 }],
             };
@@ -1636,7 +1651,8 @@ mod tests {
         #[test]
         fn announce_leader_updates_topology() {
             let mut h = TestHarness::new("node-local", 8000);
-            let local_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+            let peer_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+            let client_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             h.protocol
                 .process(SwimCommand::AnnounceShardLeader(LeaderChange {
@@ -1650,7 +1666,8 @@ mod tests {
             assert!(entry.is_some(), "topology should have shard leader entry");
             let entry = entry.unwrap();
             assert_eq!(entry.leader_node_id, NodeId::new("node-local"));
-            assert_eq!(entry.leader_addr, local_addr);
+            assert_eq!(entry.leader_addr, peer_addr);
+            assert_eq!(entry.client_addr, client_addr);
             assert_eq!(entry.term, 1);
         }
 
@@ -1669,6 +1686,7 @@ mod tests {
                     shard_group_id: ShardGroupId(99),
                     leader_node_id: NodeId::new("node-b"),
                     leader_addr: b_addr,
+                    client_addr: b_addr,
                     term: 7,
                 }],
             };

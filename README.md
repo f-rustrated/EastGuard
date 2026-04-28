@@ -31,7 +31,7 @@ $ cargo run --bin server
 ```shell 
 # Terminal 1 (node-1):
 cargo run --bin server -- \
---port 3001 \
+--client-port 3001 \
 --cluster-port 13001 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node1 \
@@ -43,7 +43,7 @@ cargo run --bin server -- \
 
 # Terminal 2 (node-2):
 cargo run --bin server -- \
---port 3002 \
+--client-port 3002 \
 --cluster-port 13002 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node2 \
@@ -55,7 +55,7 @@ cargo run --bin server -- \
 
 # Terminal 3 (node-3):
 cargo run --bin server -- \
---port 3003 \
+--client-port 3003 \
 --cluster-port 13003 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node3 \
