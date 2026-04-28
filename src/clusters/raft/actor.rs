@@ -6,6 +6,7 @@ use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
 use crate::clusters::raft::storage::RaftStorage;
+use crate::clusters::swims::ShardGroupId;
 use crate::clusters::swims::SwimCommand;
 use crate::clusters::swims::actor::SwimSender;
 use crate::schedulers::ticker_message::TickerCommand;
@@ -16,6 +17,11 @@ use tokio::sync::mpsc;
 pub struct MultiRaftActor;
 
 impl MultiRaftActor {
+    pub fn channel(buffer: usize) -> (RaftSender, mpsc::Receiver<MultiRaftActorCommand>) {
+        let (tx, rx) = mpsc::channel(buffer);
+        (RaftSender(tx), rx)
+    }
+
     pub async fn run(
         node_id: NodeId,
         storage: Box<dyn RaftStorage>,
@@ -73,5 +79,33 @@ impl MultiRaftActor {
                 cb();
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RaftSender(mpsc::Sender<MultiRaftActorCommand>);
+
+impl RaftSender {
+    pub(crate) async fn propose(
+        &self,
+        shard_group_id: ShardGroupId,
+        command: RaftCommand,
+    ) -> Option<Result<(), ProposeError>> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.0
+            .send(MultiRaftActorCommand::Propose {
+                shard_group_id,
+                command,
+                reply: send,
+            })
+            .await
+            .ok()?;
+        recv.await.ok()
+    }
+}
+
+impl From<RaftSender> for mpsc::Sender<MultiRaftActorCommand> {
+    fn from(value: RaftSender) -> Self {
+        value.0
     }
 }

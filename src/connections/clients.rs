@@ -3,7 +3,8 @@ use std::{io::ErrorKind, net::SocketAddr};
 use crate::{
     clusters::{
         NodeId,
-        raft::messages::{MultiRaftActorCommand, ProposeError},
+        raft::actor::RaftSender,
+        raft::messages::ProposeError,
         swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
     },
     connections::request::{ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand},
@@ -11,10 +12,7 @@ use crate::{
 };
 use anyhow::bail;
 use bytes::{Buf, BytesMut};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc::Sender,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::SERDE_CONFIG;
 
@@ -61,18 +59,13 @@ impl ClientStreamWriter {
     pub(crate) async fn handle_propose(
         &mut self,
         swim_sender: SwimSender,
-        raft_tx: Sender<MultiRaftActorCommand>,
+        raft_sender: RaftSender,
         req: ProposeRequest,
     ) -> anyhow::Result<()> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        swim_sender
-            .send(SwimQueryCommand::ResolveShardGroup {
-                key: req.resource_key.clone(),
-                reply: send,
-            })
-            .await?;
-
-        let Some(shard_group) = recv.await? else {
+        let Some(shard_group) = swim_sender
+            .resolve_shard_group(req.resource_key.clone())
+            .await
+        else {
             self.write(&ProposeResponse::Error(ProposeError::ShardNotFound))
                 .await?;
             return Ok(());
@@ -80,16 +73,13 @@ impl ClientStreamWriter {
 
         let raft_cmd = req.command.clone().into_raft_command(shard_group.members);
 
-        let (send, recv) = tokio::sync::oneshot::channel();
-        raft_tx
-            .send(MultiRaftActorCommand::Propose {
-                shard_group_id: shard_group.id,
-                command: raft_cmd,
-                reply: send,
-            })
-            .await?;
+        let Some(result) = raft_sender.propose(shard_group.id, raft_cmd).await else {
+            self.write(&ProposeResponse::Error(ProposeError::ShardNotFound))
+                .await?;
+            return Ok(());
+        };
 
-        let response = match recv.await? {
+        let response = match result {
             Ok(()) => ProposeResponse::Success,
             Err(ProposeError::NotLeader(ref hint)) if !req.forwarded => {
                 Self::try_forward(&swim_sender, hint.clone(), shard_group.id, req).await

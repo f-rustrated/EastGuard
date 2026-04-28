@@ -13,8 +13,7 @@ pub(crate) mod impls;
 mod it;
 pub(crate) mod macros;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::MultiRaftActorCommand;
+use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
 use crate::clusters::raft::transport::RaftTransportActor;
 
 use crate::clusters::swims::actor::SwimSender;
@@ -32,7 +31,6 @@ use crate::{
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct StartUp {
@@ -59,7 +57,7 @@ impl StartUp {
         let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
 
         // Raft channels
-        let (raft_tx, raft_mailbox) = mpsc::channel(4096);
+        let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
         let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
         let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 4);
 
@@ -78,7 +76,7 @@ impl StartUp {
             swim_sender.clone().into(),
             swim_ticker_rx,
         ));
-        tokio::spawn(run_scheduling_actor(raft_tx.clone(), raft_ticker_rx));
+        tokio::spawn(run_scheduling_actor(raft_tx.clone().into(), raft_ticker_rx));
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
             swim_sender.clone(),
@@ -87,7 +85,7 @@ impl StartUp {
         tokio::spawn(RaftTransportActor::run(
             node_id.clone(),
             tcp_listener,
-            raft_tx.clone(),
+            raft_tx.clone().into(),
             raft_transport_rx,
             swim_sender.clone(),
         ));
@@ -97,7 +95,7 @@ impl StartUp {
             state,
             tx_outbound,
             swim_ticker_tx,
-            raft_tx.clone(),
+            raft_tx.clone().into(),
         ));
         let raft_db = MetadataStorage::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
@@ -114,11 +112,7 @@ impl StartUp {
         Ok(())
     }
 
-    async fn receive_client_streams(
-        self,
-        swim_sender: SwimSender,
-        raft_tx: Sender<MultiRaftActorCommand>,
-    ) {
+    async fn receive_client_streams(self, swim_sender: SwimSender, raft_tx: RaftSender) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -143,7 +137,7 @@ impl StartUp {
 async fn handle_client_stream(
     stream: TcpStream,
     swim_sender: SwimSender,
-    raft_tx: Sender<MultiRaftActorCommand>,
+    raft_sender: RaftSender,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut stream_reader = ClientStreamReader::new(read_half);
@@ -157,7 +151,7 @@ async fn handle_client_stream(
         }
         ConnectionRequests::Propose(req) => {
             stream_writer
-                .handle_propose(swim_sender, raft_tx, req)
+                .handle_propose(swim_sender, raft_sender, req)
                 .await?
         }
     }

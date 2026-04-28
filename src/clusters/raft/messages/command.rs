@@ -57,7 +57,7 @@ pub(crate) enum MultiRaftReply {
 }
 
 /// Commands received by the MultiRaftActor from external sources.
-pub enum MultiRaftActorCommand {
+pub(crate) enum MultiRaftActorCommand {
     /// Fire-and-forget: no reply channel needed.
     Command(MultiRaftCommand),
     /// Query the current leader of a shard group.

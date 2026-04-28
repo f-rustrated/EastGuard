@@ -113,6 +113,16 @@ impl SwimSender {
         self.0.send(cmd.into()).await
     }
 
+    pub(crate) async fn resolve_shard_group(&self, resource_key: Vec<u8>) -> Option<ShardGroup> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveShardGroup {
+            key: resource_key,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
+    }
     pub(crate) async fn resolve_shard_leader(
         &self,
         shard_group_id: ShardGroupId,
