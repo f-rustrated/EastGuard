@@ -16,7 +16,8 @@ pub(crate) mod macros;
 use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
-use crate::clusters::swims::SwimCommand;
+
+use crate::clusters::swims::actor::SwimSender;
 use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -53,7 +54,7 @@ impl StartUp {
 
     pub async fn run(self) -> Result<()> {
         // SWIM channels
-        let (swim_sender, swim_mailbox) = mpsc::channel(100);
+        let (swim_sender, swim_mailbox) = SwimActor::channel(100);
         let (tx_outbound, rx_outbound) = mpsc::channel(100);
         let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
 
@@ -73,7 +74,10 @@ impl StartUp {
         let tcp_listener = crate::net::TcpListener::bind(peer_bind_addr).await?;
 
         // Spawn actors (order: tickers → transports → protocols → client)
-        tokio::spawn(run_scheduling_actor(swim_sender.clone(), swim_ticker_rx));
+        tokio::spawn(run_scheduling_actor(
+            swim_sender.clone().into(),
+            swim_ticker_rx,
+        ));
         tokio::spawn(run_scheduling_actor(raft_tx.clone(), raft_ticker_rx));
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
@@ -112,7 +116,7 @@ impl StartUp {
 
     async fn receive_client_streams(
         self,
-        swim_sender: Sender<SwimCommand>,
+        swim_sender: SwimSender,
         raft_tx: Sender<MultiRaftActorCommand>,
     ) {
         let addr = self.env.bind_addr();
@@ -138,7 +142,7 @@ impl StartUp {
 
 async fn handle_client_stream(
     stream: TcpStream,
-    swim_sender: Sender<SwimCommand>,
+    swim_sender: SwimSender,
     raft_tx: Sender<MultiRaftActorCommand>,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();

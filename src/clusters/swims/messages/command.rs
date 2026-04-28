@@ -12,7 +12,7 @@ use super::timer::SwimTimer;
 
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
-pub enum SwimCommand {
+pub(crate) enum SwimCommand {
     // From Transport(External)
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker(Internal)

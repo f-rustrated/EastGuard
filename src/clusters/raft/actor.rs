@@ -7,6 +7,7 @@ use crate::clusters::raft::messages::*;
 use crate::clusters::raft::multi_raft::MultiRaft;
 use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::SwimCommand;
+use crate::clusters::swims::actor::SwimSender;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::sync::mpsc;
@@ -21,7 +22,7 @@ impl MultiRaftActor {
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
-        swim_tx: mpsc::Sender<SwimCommand>,
+        swim_tx: SwimSender,
     ) {
         let mut store = MultiRaft::new(node_id, storage);
         let mut buf = Vec::with_capacity(64);

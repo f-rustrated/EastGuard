@@ -6,6 +6,7 @@ use crate::clusters::swims::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendError;
 
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
@@ -14,6 +15,10 @@ use tokio::sync::mpsc;
 pub struct SwimActor;
 
 impl SwimActor {
+    pub fn channel(buffer: usize) -> (SwimSender, mpsc::Receiver<SwimCommand>) {
+        let (swim_sender, swim_mailbox) = mpsc::channel(buffer);
+        (SwimSender(swim_sender), swim_mailbox)
+    }
     pub async fn run(
         mut mailbox: mpsc::Receiver<SwimCommand>,
         mut state: Swim,
@@ -92,5 +97,22 @@ impl SwimActor {
                 )
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SwimSender(mpsc::Sender<SwimCommand>);
+impl SwimSender {
+    pub(crate) async fn send(
+        &self,
+        cmd: impl Into<SwimCommand>,
+    ) -> Result<(), SendError<SwimCommand>> {
+        self.0.send(cmd.into()).await
+    }
+}
+
+impl From<SwimSender> for mpsc::Sender<SwimCommand> {
+    fn from(value: SwimSender) -> Self {
+        value.0
     }
 }

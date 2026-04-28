@@ -113,11 +113,11 @@ impl<T: Disseminable> DisseminationBuffer<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct ShardLeaderInfo {
+pub struct ShardLeaderInfo {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
     pub leader_addr: NodeAddress,
-    pub term: u64,
+    pub(crate) term: u64,
 }
 
 impl ShardLeaderInfo {

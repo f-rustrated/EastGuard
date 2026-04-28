@@ -10,6 +10,7 @@ use crate::clusters::NodeAddress;
 use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
+use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
@@ -66,7 +67,7 @@ async fn start_raft_node(
     let (raft_tx, raft_mailbox) = mpsc::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(64);
-    let (swim_tx, swim_rx) = mpsc::channel(64);
+    let (swim_tx, swim_rx) = SwimActor::channel(64);
 
     let ticker_force = ticker_tx.clone();
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cluster_port).parse().unwrap();

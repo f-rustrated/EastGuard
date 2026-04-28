@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
+use crate::clusters::swims::actor::SwimSender;
 use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
@@ -105,7 +106,7 @@ impl RaftWriters {
         &mut self,
         packets: Vec<OutboundRaftPacket>,
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
-        swim_tx: &mpsc::Sender<SwimCommand>,
+        swim_tx: &SwimSender,
     ) {
         // Group by target — flush_dirty already groups, but be defensive.
         let mut by_target: HashMap<NodeId, Vec<WireRaftMessage>> = HashMap::new();
@@ -191,7 +192,7 @@ impl RaftWriters {
     async fn resolve_address(
         &mut self,
         node_id: &NodeId,
-        swim_tx: &mpsc::Sender<SwimCommand>,
+        swim_tx: &SwimSender,
     ) -> Option<NodeAddress> {
         if let Some(&addr) = self.addr_cache.get(node_id) {
             return Some(addr);
@@ -272,7 +273,7 @@ impl RaftTransportActor {
         listener: TcpListener,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
         mut from_actor: mpsc::Receiver<RaftTransportCommand>,
-        swim_tx: mpsc::Sender<SwimCommand>,
+        swim_tx: SwimSender,
     ) {
         let mut state = RaftWriters::new(node_id);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));

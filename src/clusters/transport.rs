@@ -1,4 +1,4 @@
-use crate::clusters::swims::{OutboundPacket, SwimCommand};
+use crate::clusters::swims::{OutboundPacket, SwimCommand, actor::SwimSender};
 
 // ==========================================
 // TRANSPORT LAYER (Presentation)
@@ -12,7 +12,7 @@ pub struct SwimTransportActor;
 impl SwimTransportActor {
     pub async fn run(
         socket: UdpSocket,
-        to_actor: mpsc::Sender<SwimCommand>,
+        to_actor: SwimSender,
         mut from_actor: mpsc::Receiver<OutboundPacket>,
     ) {
         tracing::info!(
