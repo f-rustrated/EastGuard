@@ -1,11 +1,9 @@
 use bincode::{Decode, Encode};
 
 use crate::clusters::NodeId;
-use crate::clusters::metadata::command::{
-    CreateTopic, DeleteTopic, MergeRange, SealSegment, SplitRange,
-};
+use crate::clusters::metadata::TopicId;
+use crate::clusters::metadata::command::{CreateTopic, DeleteTopic};
 use crate::clusters::metadata::strategy::StoragePolicy;
-use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
 use crate::clusters::raft::messages::RaftCommand;
 
 #[derive(Decode, Encode)]
@@ -39,21 +37,6 @@ pub enum ClientCommand {
         name: String,
         storage_policy: StoragePolicy,
     },
-    SealSegment {
-        topic_id: TopicId,
-        range_id: RangeId,
-        segment_id: SegmentId,
-    },
-    SplitRange {
-        topic_id: TopicId,
-        range_id: RangeId,
-        split_point: Vec<u8>,
-    },
-    MergeRange {
-        topic_id: TopicId,
-        range_id_1: RangeId,
-        range_id_2: RangeId,
-    },
     DeleteTopic {
         topic_id: TopicId,
     },
@@ -75,43 +58,6 @@ impl ClientCommand {
                 storage_policy,
                 replica_set,
                 created_at: now_ms,
-            }
-            .into(),
-            Self::SealSegment {
-                topic_id,
-                range_id,
-                segment_id,
-            } => SealSegment {
-                topic_id,
-                range_id,
-                segment_id,
-                sealed_at: now_ms,
-                new_replica_set: replica_set,
-            }
-            .into(),
-            Self::SplitRange {
-                topic_id,
-                range_id,
-                split_point,
-            } => SplitRange {
-                topic_id,
-                range_id,
-                split_point,
-                created_at: now_ms,
-                left_replica_set: replica_set.clone(),
-                right_replica_set: replica_set,
-            }
-            .into(),
-            Self::MergeRange {
-                topic_id,
-                range_id_1,
-                range_id_2,
-            } => MergeRange {
-                topic_id,
-                range_id_1,
-                range_id_2,
-                created_at: now_ms,
-                merged_replica_set: replica_set,
             }
             .into(),
             Self::DeleteTopic { topic_id } => DeleteTopic { topic_id }.into(),
