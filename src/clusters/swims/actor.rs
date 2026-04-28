@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::clusters::NodeAddress;
+use crate::clusters::NodeId;
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::swims::swim::Swim;
@@ -103,11 +105,37 @@ impl SwimActor {
 #[derive(Clone, Debug)]
 pub struct SwimSender(mpsc::Sender<SwimCommand>);
 impl SwimSender {
+    #[inline]
     pub(crate) async fn send(
         &self,
         cmd: impl Into<SwimCommand>,
     ) -> Result<(), SendError<SwimCommand>> {
         self.0.send(cmd.into()).await
+    }
+
+    pub(crate) async fn resolve_shard_leader(
+        &self,
+        shard_group_id: ShardGroupId,
+    ) -> Option<ShardLeaderEntry> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveShardLeader {
+            shard_group_id,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
+    }
+
+    pub(crate) async fn resolve_address(&self, node_id: NodeId) -> Option<NodeAddress> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveAddress {
+            node_id,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
     }
 }
 

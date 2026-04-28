@@ -2,9 +2,9 @@ use std::{io::ErrorKind, net::SocketAddr};
 
 use crate::{
     clusters::{
-        NodeAddress, NodeId,
+        NodeId,
         raft::messages::{MultiRaftActorCommand, ProposeError},
-        swims::{ShardGroupId, ShardLeaderEntry, SwimQueryCommand, actor::SwimSender},
+        swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
     },
     connections::request::{ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand},
     net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
@@ -109,47 +109,20 @@ impl ClientStreamWriter {
     ) -> ProposeResponse {
         // Try 1: use leader hint from Raft → resolve client_addr via SWIM member table
         if let Some(leader_id) = &leader_hint
-            && let Some(node_addr) = Self::resolve_address(swim_sender, leader_id.clone()).await
+            && let Some(node_addr) = swim_sender.resolve_address(leader_id.clone()).await
             && let Ok(response) = Self::forward_to_leader(node_addr.client_addr, &req).await
         {
             return response;
         }
 
         // Try 2: fall back to shard leader gossip (may have different/newer leader info)
-        if let Some(entry) = Self::resolve_shard_leader(swim_sender, shard_group_id).await
+        if let Some(entry) = swim_sender.resolve_shard_leader(shard_group_id).await
             && let Ok(response) = Self::forward_to_leader(entry.leader_addr.client_addr, &req).await
         {
             return response;
         }
 
         ProposeResponse::Error(ProposeError::NotLeader(leader_hint))
-    }
-
-    async fn resolve_address(swim_sender: &SwimSender, node_id: NodeId) -> Option<NodeAddress> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        swim_sender
-            .send(SwimQueryCommand::ResolveAddress {
-                node_id,
-                reply: send,
-            })
-            .await
-            .ok()?;
-        recv.await.ok()?
-    }
-
-    async fn resolve_shard_leader(
-        swim_sender: &SwimSender,
-        shard_group_id: ShardGroupId,
-    ) -> Option<ShardLeaderEntry> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        swim_sender
-            .send(SwimQueryCommand::ResolveShardLeader {
-                shard_group_id,
-                reply: send,
-            })
-            .await
-            .ok()?;
-        recv.await.ok()?
     }
 
     async fn forward_to_leader(
