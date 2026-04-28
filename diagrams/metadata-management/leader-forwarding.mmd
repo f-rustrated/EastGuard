@@ -1,0 +1,46 @@
+sequenceDiagram
+    participant C as Client
+    participant F as Follower Node<br/>(client_port)
+    participant S as SWIM Topology<br/>(on Follower)
+    participant R as Raft<br/>(on Follower)
+    participant L as Leader Node<br/>(client_port)
+
+    C->>F: ProposeRequest { resource_key, command, forwarded: false }
+
+    F->>S: ResolveShardGroup(resource_key)
+    S-->>F: ShardGroup { id, members }
+
+    F->>R: propose(command)
+    R-->>F: Err(NotLeader(Some(leader_id)))
+
+    Note over F: forwarded == false<br> → attempt forward
+
+    F->>S: ResolveShardLeader(shard_group_id)
+    S-->>F: ShardLeaderEntry { client_addr, ... }
+
+    F->>L: TCP connect to client_addr
+    F->>L: ProposeRequest { ..., forwarded: true }
+
+    Note over L: Leader processes<br> propose normally
+
+    L-->>F: ProposeResponse::Success
+    F-->>C: ProposeResponse::Success
+
+    Note over F,L: Failure paths below
+
+
+    Note over F: If leader returns NotLeader<br>(leader changed mid-flight)
+    L-->>F: ProposeResponse::Error(NotLeader)
+    F-->>C: ProposeResponse::Error(NotLeader)
+    Note over F: Max 1 hop — follower<br>does not forward again
+
+
+
+    Note over F: If TCP connect fails<br>or leader unreachable
+    F-->>C: ProposeResponse::Error(NotLeader)
+
+
+
+    Note over F: If ResolveShardLeader<br>returns None (no known leader)
+    F-->>C: ProposeResponse::Error(NotLeader(None))
+
