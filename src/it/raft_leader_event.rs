@@ -17,7 +17,6 @@ use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker_message::TickerCommand;
 
 const CLUSTER_PORT: u16 = 19000;
 const RESULT_PORT: u16 = 39000;
@@ -96,7 +95,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 let (swim_tx, swim_rx) = SwimActor::channel(64);
                 let (leader_events_tx, mut leader_events_rx) = mpsc::channel(64);
 
-                let ticker_force = ticker_tx.clone();
                 let bind_addr: SocketAddr =
                     format!("0.0.0.0:{}", CLUSTER_PORT + port).parse().unwrap();
                 let listener = TcpListener::bind(bind_addr).await?;
@@ -136,22 +134,20 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     .await
                     .unwrap();
 
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-
-                // Drive election
-                for _ in 0..200 {
-                    let _ = ticker_force.send(TickerCommand::ForceTick).await;
-                    tokio::task::yield_now().await;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    tokio::task::yield_now().await;
-                }
-
-                // Collect leader events (non-blocking drain)
+                // Let the scheduler's real interval (100 ms) drive the
+                // election naturally — no ForceTick, no channel pressure.
+                // 15 s = 150 interval ticks, well above the 50-70 tick
+                // election timeout.
                 let mut events = Vec::new();
-                while let Ok(event) = leader_events_rx.try_recv() {
-                    events.push(event);
+                for _ in 0..150 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::task::yield_now().await;
+                    while let Ok(event) = leader_events_rx.try_recv() {
+                        events.push(event);
+                    }
+                    if !events.is_empty() {
+                        break;
+                    }
                 }
 
                 // Serve result to checker via TCP
