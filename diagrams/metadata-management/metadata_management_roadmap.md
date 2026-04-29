@@ -108,7 +108,7 @@ enum ProposeError {
 }
 ```
 
-`EpochNotMatch` and `NotLeaderHint` deferred to Phase 5.
+`NotLeader(Option<NodeId>)` added in Phase 5 — carries leader hint. Epoch cancelled (not needed).
 
 **Depends on:** Phase 1 (needs `TopicId`, `StoragePolicy`, etc.).
 **Scope:** Mostly type changes + match arm updates.
@@ -291,78 +291,52 @@ Client                 lib.rs              MultiRaftActor            Raft
 
 ---
 
-## Phase 5: Leader Forwarding + Epoch Validation
+## Phase 5: Leader Forwarding + Shard Discovery 
 
-**Goal:** Non-leader nodes forward proposals transparently; stale routing detected via epochs.
+**Goal:** Non-leader nodes forward proposals transparently; clients can discover shard → leader mappings.
 
-### 5a. Leader forwarding
+### 5a. Leader forwarding 
 
-When `MultiRaft::propose()` returns `NotLeaderHint(Some(leader_id))`:
-1. Resolve leader address via `SwimQueryCommand::ResolveAddress`
-2. Forward `ProposeRequest` over TCP to leader's node
-3. Relay response back to client
+`ProposeError::NotLeader(Option<NodeId>)` carries leader hint. Non-leader nodes transparently forward proposals to the leader via TCP. Two-strategy forwarding:
+1. **Fast path:** Use leader hint + `ResolveAddress` → `NodeAddress.client_addr` (SWIM membership, converges in ~2-3s)
+2. **Slow path:** Fall back to `ResolveShardLeader` → shard leader gossip
 
-Falls back to `NotLeader(None)` if leader unknown (election in progress) — client retries with backoff.
+Max 1 hop — `ProposeRequest.forwarded: bool` prevents re-forwarding.
 
-### 5b. Epoch validation
+### 5b. Epoch validation — cancelled ❌
 
-```rust
-struct ShardEpoch {
-    conf_ver: u64,  // incremented on AddPeer/RemovePeer commit
-    version: u64,   // incremented on split/merge (future)
-}
-```
+Originally planned to track `conf_ver` per shard group. Cancelled because:
+- Clients never send replica sets — server resolves from SWIM topology
+- SWIM convergence (~2-3s) makes staleness window near-zero
+- `NotLeader` hint + forwarding already handles leader changes
+- Even stale replica sets are self-healing on subsequent operations
 
-Every `Propose` includes client's cached epoch. Shard group validates before accepting:
-- `client_epoch < current_epoch` → `EpochNotMatch { current }` → client refreshes routing cache
+Revisit only if client-side routing cache bypasses server-side routing.
 
-### 5c. Shard discovery query
+### 5c. Shard discovery query 
 
 ```rust
-// New QueryCommand variant:
-GetShardInfo { key: Vec<u8> }
-// Returns: { shard_group_id, leader_node_id, leader_addr, epoch }
+QueryCommand::GetShardInfo { key: Vec<u8> }
+// Returns: Option<ShardInfoResponse { shard_group_id, leader_node_id, leader_addr }>
 ```
 
-### 5d. Client-side routing cache
+Single actor round-trip via `SwimQueryCommand::GetShardInfo` — resolves shard group + leader in one hop.
 
-**What is cached:** Shard → leader mapping. Each entry:
+### 5d. Client-side routing cache (backlog)
 
-```rust
-struct CachedRoute {
-    shard_group_id: ShardGroupId,
-    leader_node_id: NodeId,
-    leader_addr: SocketAddr,
-    epoch: ShardEpoch,
-}
-```
+Client SDK concern. Server-side signals available:
+- `ProposeResponse::Error(NotLeader(Some(leader_id)))` — cache miss
+- `GetShardInfo` — cache population
+- Error-driven invalidation (no TTL, no polling)
 
-Client maintains `HashMap<ShardGroupId, CachedRoute>`. No full topology or hash ring on client — server resolves key → shard, client only caches the result.
+### Architecture changes in Phase 5
 
-**Cache population:** Lazy, on first use. Every `GetShardInfo` response and successful `Propose` response populates or updates the cache entry for that shard. No bulk bootstrap — cache warms organically as client operates.
-
-**Invalidation:** Error-driven only. No TTL, no polling.
-
-| Error | Client action |
-|---|---|
-| `NotLeader(None)` | Evict cached route for shard. Retry with `GetShardInfo` to discover new leader. Exponential backoff (election in progress). |
-| `NotLeader(Some(leader_hint))` | Update cache with hint. Retry to hinted leader immediately. If that also fails → evict + `GetShardInfo`. |
-| `EpochNotMatch { current }` | Evict stale entry. Call `GetShardInfo` to get new shard info with current epoch. |
-| `ShardNotFound` | Evict cache entry. Call `GetShardInfo` — shard may have moved after split/merge. |
-| Connection refused / timeout | Evict cached route. `GetShardInfo` to discover new leader. |
-
-**Retry policy:**
-- Max 3 redirect attempts per propose before returning error to caller.
-- On `NotLeader(None)` or connection failure: exponential backoff starting at 100ms, capped at 2s.
-- On `EpochNotMatch`: immediate retry after cache refresh (no backoff — not a transient failure, just stale data).
-
-**Why error-driven, no TTL:**
-- Leader changes are infrequent (metadata control plane, not data plane).
-- Server-side forwarding (§5a) handles most cases transparently — client cache miss only matters when forwarding also fails.
-- Polling would add unnecessary load across all clients × all cached shards.
+- **`NodeAddress { cluster_addr, client_addr }`** — first-class value object used in `SwimNode.addr`, `ShardLeaderInfo`, `ShardLeaderEntry`, `Swim.self_addr`, `RaftWriters.addr_cache`. Derives `Copy`.
+- **`SwimSender` / `RaftSender`** — typed wrappers encapsulating channel + oneshot request-reply pattern. Clean client handler code in `clients.rs`.
+- **`port` → `client_port`** — explicit naming (`--client-port`, `EASTGUARD_CLIENT_PORT`). Port collision check in `init()`.
 
 **Depends on:** Phase 4.
-**Scope:** 2-3 PRs.
+**Scope:** Completed in 4 PRs (epoch cancelled).
 
 ---
 
@@ -489,7 +463,7 @@ Phase 3 (Application State Machine Dispatch)
 Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
     │                          (needs Phase 4 for end-to-end,
     ▼                           but core logic testable after Phase 3)
-Phase 5 (Leader Forwarding + Epoch + Client Routing Cache)
+Phase 5 (Leader Forwarding + Shard Discovery) ✅
 ```
 
 ---
@@ -561,7 +535,7 @@ Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counter
 | Risk | Mitigation |
 |---|---|
 | Pending proposals leak on leader stepdown | Drain and error all pending in `step_down()` |
-| Hash ring divergence between client/broker | Epoch validation catches stale routing (Phase 5) |
+| Hash ring divergence between client/broker | Server resolves routing from SWIM topology (~2-3s convergence). Leader forwarding handles misrouted proposals. Epoch cancelled — not needed. |
 | Bincode format change on new `RaftCommand` variants | In-memory only for now; version byte on `LogEntry` when RocksDB lands |
 | Midpoint split doesn't balance skewed workloads | Acceptable for Phase 6 — percentile-based split in backlog |
 | Seal tracker grows unbounded for long-lived ranges | Sliding window bounded; entries removed on range seal/delete |

@@ -3,7 +3,7 @@ use super::*;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
-use crate::clusters::{NodeId, SwimNode, SwimNodeState};
+use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -55,7 +55,7 @@ const INDIRECT_PING_COUNT: usize = 3;
 pub struct Swim {
     // Identity
     pub(crate) node_id: NodeId,
-    pub(crate) advertise_addr: SocketAddr,
+    self_addr: NodeAddress,
     incarnation: u64,
 
     // Protocol state
@@ -75,15 +75,10 @@ pub struct Swim {
 }
 
 impl Swim {
-    pub fn new(
-        node_id: NodeId,
-        advertise_addr: SocketAddr,
-        topology: Topology,
-        rng_seed: u64,
-    ) -> Self {
+    pub fn new(node_id: NodeId, self_addr: NodeAddress, topology: Topology, rng_seed: u64) -> Self {
         let mut swim = Self {
             node_id,
-            advertise_addr,
+            self_addr,
             incarnation: 0,
             topology,
             members: BTreeMap::new(),
@@ -97,7 +92,7 @@ impl Swim {
         };
         swim.update_member(
             swim.node_id.clone(),
-            advertise_addr,
+            self_addr,
             SwimNodeState::Alive,
             swim.incarnation,
         );
@@ -107,7 +102,7 @@ impl Swim {
     pub fn bootstrap(mut self, bootstrap_servers: Vec<JoinAttempt>) -> Self {
         for attempt in bootstrap_servers
             .into_iter()
-            .filter(|t| t.seed_addr != self.advertise_addr)
+            .filter(|t| t.seed_addr != self.self_addr.cluster_addr)
             .collect::<Vec<_>>()
         {
             self.handle_join(attempt);
@@ -195,6 +190,21 @@ impl Swim {
                 let group = self.topology.shard_group_for(&key).cloned();
                 let _ = reply.send(group);
             }
+            SwimQueryCommand::ResolveShardLeader {
+                shard_group_id,
+                reply,
+            } => {
+                let entry = self.topology.shard_leader(shard_group_id).cloned();
+                let _ = reply.send(entry);
+            }
+            SwimQueryCommand::GetShardInfo { key, reply } => {
+                let result = self.topology.shard_group_for(&key).cloned().map(|group| {
+                    // ! While shard group exists, it's possible that there might not be ShardLeaderEntry because of in-transit election
+                    let leader = self.topology.shard_leader(group.id).cloned();
+                    (group, leader)
+                });
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -208,16 +218,19 @@ impl Swim {
                 return;
             }
 
-            let target = match self.members.get(&target_node_id).map(|m| m.addr) {
-                Some(addr) => addr,
-                None => return,
+            let Some(cluster_addr) = self
+                .members
+                .get(&target_node_id)
+                .map(|m| m.addr.cluster_addr)
+            else {
+                return;
             };
 
             let seq = self.next_seq();
             let packet = SwimPacket::Ping(self.generate_swim_header(seq));
 
             self.pending_events
-                .push(SwimEvent::Packet(OutboundPacket::new(target, packet)));
+                .push(SwimEvent::Packet(OutboundPacket::new(cluster_addr, packet)));
 
             self.pending_events
                 .push(SwimEvent::Timer(TimerCommand::SetSchedule {
@@ -231,9 +244,12 @@ impl Swim {
     // indirect probe timeout when we receive a long-running Ack message
     // from the previous direct probe
     fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
-        let target_addr = match self.members.get(&target_node_id).map(|m| m.addr) {
-            Some(addr) => addr,
-            None => return,
+        let Some(cluster_addr) = self
+            .members
+            .get(&target_node_id)
+            .map(|m| m.addr.cluster_addr)
+        else {
+            return;
         };
 
         // * OPT : pre-allocation
@@ -249,7 +265,7 @@ impl Swim {
             }
 
             if let Some(peer_member) = self.members.get(&peer_node_id) {
-                peer_addrs.push(peer_member.addr);
+                peer_addrs.push(peer_member.addr.cluster_addr);
 
                 // * OPT : Check length ONLY after a successful insertion
                 if peer_addrs.len() == INDIRECT_PING_COUNT {
@@ -265,7 +281,7 @@ impl Swim {
 
         let packet = SwimPacket::PingReq {
             header: self.generate_swim_header(seq),
-            target: target_addr,
+            target: cluster_addr,
         };
         for target in peer_addrs {
             self.pending_events
@@ -332,7 +348,7 @@ impl Swim {
                 let info = ShardLeaderInfo {
                     shard_group_id: event.shard_group_id,
                     leader_node_id: event.leader_node_id,
-                    leader_addr: self.advertise_addr,
+                    leader_addr: self.self_addr,
                     term: event.term,
                 };
                 self.apply_shard_leader_update(&info);
@@ -459,7 +475,7 @@ impl Swim {
                 self.gossip_buffer.enqueue(
                     SwimNode {
                         node_id: self.node_id.clone(),
-                        addr: self.advertise_addr,
+                        addr: self.self_addr,
                         state: SwimNodeState::Alive,
                         incarnation: new_incarnation,
                     },
@@ -488,6 +504,8 @@ impl Swim {
         // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
+                let mut node_addr = member.addr;
+                node_addr.cluster_addr = addr;
                 if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
                     self.pending_events
                         .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
@@ -496,16 +514,18 @@ impl Swim {
                 }
                 self.update_member(
                     source_node_id.clone(),
-                    addr,
+                    node_addr,
                     SwimNodeState::Alive,
                     remote_inc,
                 );
             }
         } else {
-            // New member discovered via direct message
             self.update_member(
                 source_node_id.clone(),
-                addr,
+                NodeAddress {
+                    cluster_addr: addr,
+                    client_addr: addr,
+                },
                 SwimNodeState::Alive,
                 remote_inc,
             );
@@ -515,7 +535,7 @@ impl Swim {
     fn update_member(
         &mut self,
         node_id: NodeId,
-        addr: SocketAddr,
+        addr: NodeAddress,
         state: SwimNodeState,
         incarnation: u64,
     ) {
@@ -570,7 +590,7 @@ impl Swim {
 
         if changed {
             tracing::info!(
-                "[{}] Member update: {} @ {} → {:?} (inc {})",
+                "[{}] Member update: {} @ {:?} → {:?} (inc {})",
                 self.node_id,
                 node_id,
                 addr,
@@ -589,7 +609,7 @@ impl Swim {
                     self.pending_events
                         .push(SwimEvent::Membership(MembershipEvent::NodeAlive {
                             node_id: node_id.clone(),
-                            addr,
+                            addr: addr.cluster_addr,
                         }));
                 }
                 SwimNodeState::Dead => {
@@ -685,7 +705,10 @@ mod tests {
     fn node(id: &str, port: u16, state: SwimNodeState, inc: u64) -> SwimNode {
         SwimNode {
             node_id: NodeId::new(id),
-            addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            addr: NodeAddress {
+                cluster_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+                client_addr: format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
+            },
             state,
             incarnation: inc,
         }
@@ -749,7 +772,7 @@ mod tests {
                 .get("node-b")
                 .expect("unknown node should be added");
             assert_eq!(member.state, SwimNodeState::Alive);
-            assert_eq!(member.addr, sender);
+            assert_eq!(member.addr.cluster_addr, sender);
 
             let out = p.take_packets();
             assert_eq!(out.len(), 1);
@@ -1486,7 +1509,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: b_addr,
+                    leader_addr: NodeAddress {
+                        cluster_addr: b_addr,
+                        client_addr: b_addr,
+                    },
                     term: 3,
                 }],
             };
@@ -1516,7 +1542,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: b_addr,
+                    leader_addr: NodeAddress {
+                        cluster_addr: b_addr,
+                        client_addr: b_addr,
+                    },
                     term: 3,
                 }],
             };
@@ -1553,7 +1582,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: b_addr,
+                    leader_addr: NodeAddress {
+                        cluster_addr: b_addr,
+                        client_addr: b_addr,
+                    },
                     term: 5,
                 }],
             };
@@ -1569,7 +1601,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-other"),
-                    leader_addr: "127.0.0.1:9999".parse().unwrap(),
+                    leader_addr: NodeAddress {
+                        cluster_addr: "127.0.0.1:9999".parse().unwrap(),
+                        client_addr: "127.0.0.1:9999".parse().unwrap(),
+                    },
                     term: 2,
                 }],
             };
@@ -1636,7 +1671,8 @@ mod tests {
         #[test]
         fn announce_leader_updates_topology() {
             let mut h = TestHarness::new("node-local", 8000);
-            let local_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+            let peer_addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+            let client_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             h.protocol
                 .process(SwimCommand::AnnounceShardLeader(LeaderChange {
@@ -1650,7 +1686,8 @@ mod tests {
             assert!(entry.is_some(), "topology should have shard leader entry");
             let entry = entry.unwrap();
             assert_eq!(entry.leader_node_id, NodeId::new("node-local"));
-            assert_eq!(entry.leader_addr, local_addr);
+            assert_eq!(entry.leader_addr.cluster_addr, peer_addr);
+            assert_eq!(entry.leader_addr.client_addr, client_addr);
             assert_eq!(entry.term, 1);
         }
 
@@ -1668,7 +1705,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(99),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: b_addr,
+                    leader_addr: NodeAddress {
+                        cluster_addr: b_addr,
+                        client_addr: b_addr,
+                    },
                     term: 7,
                 }],
             };

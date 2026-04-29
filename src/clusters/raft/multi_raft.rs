@@ -196,7 +196,7 @@ impl MultiRaft {
                 self.dirty.insert(shard_id);
                 result
             }
-            None => Err(ProposeError::NotLeader),
+            None => Err(ProposeError::NotLeader(None)),
         }
     }
 

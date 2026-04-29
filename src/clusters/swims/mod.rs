@@ -19,7 +19,7 @@ pub mod common {
 
     use crate::{
         clusters::{
-            NodeId,
+            NodeAddress, NodeId,
             swims::{
                 OutboundPacket, SwimEvent, SwimPacket, SwimTimer, Topology, TopologyConfig,
                 swim::Swim,
@@ -29,7 +29,8 @@ pub mod common {
     };
 
     pub fn make_protocol(local_id: &str, local_port: u16) -> Swim {
-        let addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
+        let peer_addr: SocketAddr = format!("127.0.0.1:{}", local_port).parse().unwrap();
+        let client_addr: SocketAddr = format!("127.0.0.1:{}", local_port + 1000).parse().unwrap();
         let topology = Topology::new(
             std::iter::empty(),
             TopologyConfig {
@@ -37,7 +38,15 @@ pub mod common {
                 replication_factor: 3,
             },
         );
-        Swim::new(NodeId::new(local_id), addr, topology, 0)
+        Swim::new(
+            NodeId::new(local_id),
+            NodeAddress {
+                cluster_addr: peer_addr,
+                client_addr,
+            },
+            topology,
+            0,
+        )
     }
 
     /// Test harness that coordinates SwimProtocol + SwimTicker, mirroring

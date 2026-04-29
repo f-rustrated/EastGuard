@@ -6,10 +6,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
+use crate::clusters::NodeAddress;
 use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
+use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
@@ -30,7 +32,10 @@ async fn swim_handler_with_leader_capture(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             SwimCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) => {
-                let _ = reply.send(address_map.get(&node_id).copied());
+                let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
+                    cluster_addr: addr,
+                    client_addr: addr,
+                }));
             }
             SwimCommand::AnnounceShardLeader(event) => {
                 let _ = leader_events_tx.send(event).await;
@@ -88,7 +93,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 let (raft_tx, raft_mailbox) = mpsc::channel(100);
                 let (transport_tx, transport_rx) = mpsc::channel(100);
                 let (ticker_tx, ticker_rx) = mpsc::channel(64);
-                let (swim_tx, swim_rx) = mpsc::channel(64);
+                let (swim_tx, swim_rx) = SwimActor::channel(64);
                 let (leader_events_tx, mut leader_events_rx) = mpsc::channel(64);
 
                 let ticker_force = ticker_tx.clone();

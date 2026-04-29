@@ -1,11 +1,14 @@
 use super::*;
 
+use crate::clusters::NodeAddress;
+use crate::clusters::NodeId;
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::swims::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendError;
 
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
@@ -14,6 +17,10 @@ use tokio::sync::mpsc;
 pub struct SwimActor;
 
 impl SwimActor {
+    pub fn channel(buffer: usize) -> (SwimSender, mpsc::Receiver<SwimCommand>) {
+        let (swim_sender, swim_mailbox) = mpsc::channel(buffer);
+        (SwimSender(swim_sender), swim_mailbox)
+    }
     pub async fn run(
         mut mailbox: mpsc::Receiver<SwimCommand>,
         mut state: Swim,
@@ -92,5 +99,69 @@ impl SwimActor {
                 )
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SwimSender(mpsc::Sender<SwimCommand>);
+impl SwimSender {
+    #[inline]
+    pub(crate) async fn send(
+        &self,
+        cmd: impl Into<SwimCommand>,
+    ) -> Result<(), SendError<SwimCommand>> {
+        self.0.send(cmd.into()).await
+    }
+
+    pub(crate) async fn resolve_shard_group(&self, resource_key: Vec<u8>) -> Option<ShardGroup> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveShardGroup {
+            key: resource_key,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
+    }
+    pub(crate) async fn resolve_shard_leader(
+        &self,
+        shard_group_id: ShardGroupId,
+    ) -> Option<ShardLeaderEntry> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveShardLeader {
+            shard_group_id,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
+    }
+
+    pub(crate) async fn get_shard_info(
+        &self,
+        key: Vec<u8>,
+    ) -> Option<(ShardGroup, Option<ShardLeaderEntry>)> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::GetShardInfo { key, reply: send })
+            .await
+            .ok()?;
+        recv.await.ok()?
+    }
+
+    pub(crate) async fn resolve_address(&self, node_id: NodeId) -> Option<NodeAddress> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveAddress {
+            node_id,
+            reply: send,
+        })
+        .await
+        .ok()?;
+        recv.await.ok()?
+    }
+}
+
+impl From<SwimSender> for mpsc::Sender<SwimCommand> {
+    fn from(value: SwimSender) -> Self {
+        value.0
     }
 }

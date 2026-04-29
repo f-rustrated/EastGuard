@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 
 use crate::clusters::raft::messages::LeaderChange;
-use crate::clusters::swims::ShardGroup;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
-use crate::clusters::{NodeId, SwimNode};
+use crate::clusters::swims::topology::ShardLeaderEntry;
+use crate::clusters::swims::{ShardGroup, ShardGroupId};
+use crate::clusters::{NodeAddress, NodeId, SwimNode};
 use crate::schedulers::ticker_message::TimerCommand;
 
 use super::packet::{OutboundPacket, SwimPacket};
@@ -11,7 +12,7 @@ use super::timer::SwimTimer;
 
 /// Internal Events (Actor Logic)
 #[derive(Debug)]
-pub enum SwimCommand {
+pub(crate) enum SwimCommand {
     // From Transport(External)
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker(Internal)
@@ -29,12 +30,26 @@ pub enum SwimQueryCommand {
     },
     ResolveAddress {
         node_id: NodeId,
-        reply: tokio::sync::oneshot::Sender<Option<SocketAddr>>,
+        reply: tokio::sync::oneshot::Sender<Option<NodeAddress>>,
     },
     ResolveShardGroup {
         key: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Option<ShardGroup>>,
     },
+    ResolveShardLeader {
+        shard_group_id: ShardGroupId,
+        reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
+    },
+    GetShardInfo {
+        key: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Option<(ShardGroup, Option<ShardLeaderEntry>)>>,
+    },
+}
+
+impl From<SwimQueryCommand> for SwimCommand {
+    fn from(value: SwimQueryCommand) -> Self {
+        SwimCommand::Query(value)
+    }
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {

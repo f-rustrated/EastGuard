@@ -675,7 +675,7 @@ impl Raft {
     // -> Applied to MetadataStateMachine → topic blue exists
     pub fn propose(&mut self, command: RaftCommand) -> Result<(), ProposeError> {
         if self.role != Role::Leader {
-            return Err(ProposeError::NotLeader);
+            return Err(ProposeError::NotLeader(self.current_leader.clone()));
         }
 
         self.add_new_entry(command);
@@ -1165,7 +1165,30 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
             raft.propose(RaftCommand::Noop),
-            Err(ProposeError::NotLeader)
+            Err(ProposeError::NotLeader(None))
+        );
+    }
+
+    #[test]
+    fn follower_propose_returns_leader_hint_when_known() {
+        let mut raft = three_node_raft("node-2");
+        // Receive AppendEntries from node-1 so follower learns who leader is
+        raft.step(
+            node("node-1"),
+            RaftRpc::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: node("node-1"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        );
+        assert_eq!(raft.current_leader(), Some(&node("node-1")));
+
+        assert_eq!(
+            raft.propose(RaftCommand::Noop),
+            Err(ProposeError::NotLeader(Some(node("node-1"))))
         );
     }
 

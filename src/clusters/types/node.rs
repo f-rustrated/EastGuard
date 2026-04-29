@@ -8,11 +8,16 @@ use bincode::{Decode, Encode};
 use crate::clusters::BINCODE_CONFIG;
 use crate::clusters::SwimNodeState::Alive;
 
-// Used to decide what to say. You must include Dead/Suspect nodes in your messages so that other nodes learn about these failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub struct NodeAddress {
+    pub cluster_addr: SocketAddr,
+    pub client_addr: SocketAddr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct SwimNode {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
+    pub addr: NodeAddress,
     pub state: SwimNodeState,
     pub incarnation: u64,
 }

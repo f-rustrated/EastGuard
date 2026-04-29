@@ -1,9 +1,10 @@
 use bincode::{Decode, Encode};
 
+use crate::clusters::NodeAddress;
 use crate::clusters::NodeId;
 use crate::clusters::metadata::command::{CreateTopic, DeleteTopic};
 use crate::clusters::metadata::strategy::StoragePolicy;
-use crate::clusters::raft::messages::RaftCommand;
+use crate::clusters::raft::messages::{ProposeError, RaftCommand};
 
 #[derive(Decode, Encode)]
 pub enum ConnectionRequests {
@@ -22,15 +23,24 @@ pub struct SessionRequest {}
 #[derive(Decode, Encode)]
 pub enum QueryCommand {
     GetMembers,
+    GetShardInfo { key: Vec<u8> },
 }
 
-#[derive(Decode, Encode)]
+#[derive(Debug, Decode, Encode)]
+pub struct ShardInfoResponse {
+    pub shard_group_id: u64,
+    pub leader_node_id: Option<String>,
+    pub leader_addr: Option<NodeAddress>,
+}
+
+#[derive(Decode, Encode, Clone)]
 pub struct ProposeRequest {
     pub resource_key: Vec<u8>,
     pub command: ClientCommand,
+    pub forwarded: bool,
 }
 
-#[derive(Decode, Encode)]
+#[derive(Clone, Decode, Encode)]
 pub enum ClientCommand {
     CreateTopic {
         name: String,
@@ -65,10 +75,8 @@ impl ClientCommand {
     }
 }
 
-#[derive(Decode, Encode)]
+#[derive(Debug, Decode, Encode)]
 pub enum ProposeResponse {
     Success,
-    NotLeader,
-    ShardNotFound,
-    Error(String),
+    Error(ProposeError),
 }

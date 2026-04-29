@@ -13,13 +13,11 @@ pub(crate) mod impls;
 mod it;
 pub(crate) mod macros;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{MultiRaftActorCommand, ProposeError};
+use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
 use crate::clusters::raft::transport::RaftTransportActor;
 
-use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
+use crate::clusters::swims::actor::SwimSender;
 use crate::config::Environment;
-use crate::connections::request::{ProposeRequest, ProposeResponse, QueryCommand};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -33,7 +31,6 @@ use crate::{
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct StartUp {
@@ -55,12 +52,12 @@ impl StartUp {
 
     pub async fn run(self) -> Result<()> {
         // SWIM channels
-        let (swim_sender, swim_mailbox) = mpsc::channel(100);
+        let (swim_sender, swim_mailbox) = SwimActor::channel(100);
         let (tx_outbound, rx_outbound) = mpsc::channel(100);
         let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
 
         // Raft channels
-        let (raft_tx, raft_mailbox) = mpsc::channel(4096);
+        let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
         let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
         let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 4);
 
@@ -75,8 +72,11 @@ impl StartUp {
         let tcp_listener = crate::net::TcpListener::bind(peer_bind_addr).await?;
 
         // Spawn actors (order: tickers → transports → protocols → client)
-        tokio::spawn(run_scheduling_actor(swim_sender.clone(), swim_ticker_rx));
-        tokio::spawn(run_scheduling_actor(raft_tx.clone(), raft_ticker_rx));
+        tokio::spawn(run_scheduling_actor(
+            swim_sender.clone().into(),
+            swim_ticker_rx,
+        ));
+        tokio::spawn(run_scheduling_actor(raft_tx.clone().into(), raft_ticker_rx));
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
             swim_sender.clone(),
@@ -85,7 +85,7 @@ impl StartUp {
         tokio::spawn(RaftTransportActor::run(
             node_id.clone(),
             tcp_listener,
-            raft_tx.clone(),
+            raft_tx.clone().into(),
             raft_transport_rx,
             swim_sender.clone(),
         ));
@@ -95,7 +95,7 @@ impl StartUp {
             state,
             tx_outbound,
             swim_ticker_tx,
-            raft_tx.clone(),
+            raft_tx.clone().into(),
         ));
         let raft_db = MetadataStorage::open(self.env.raft_db_path());
         tokio::spawn(MultiRaftActor::run(
@@ -112,11 +112,7 @@ impl StartUp {
         Ok(())
     }
 
-    async fn receive_client_streams(
-        self,
-        swim_sender: Sender<SwimCommand>,
-        raft_tx: Sender<MultiRaftActorCommand>,
-    ) {
+    async fn receive_client_streams(self, swim_sender: SwimSender, raft_tx: RaftSender) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -140,86 +136,24 @@ impl StartUp {
 
 async fn handle_client_stream(
     stream: TcpStream,
-    swim_sender: Sender<SwimCommand>,
-    raft_tx: Sender<MultiRaftActorCommand>,
+    swim_sender: SwimSender,
+    raft_sender: RaftSender,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut stream_reader = ClientStreamReader::new(read_half);
-    let stream_writer = ClientStreamWriter::new(write_half);
+    let mut stream_writer = ClientStreamWriter::new(write_half);
     let request = stream_reader.read_request().await?;
 
     match request {
         ConnectionRequests::Connection(_request) => {}
         ConnectionRequests::Query(query_type) => {
-            handle_query(stream_writer, swim_sender, query_type).await?
+            stream_writer.handle_query(swim_sender, query_type).await?
         }
         ConnectionRequests::Propose(req) => {
-            handle_propose(stream_writer, swim_sender, raft_tx, req).await?
+            stream_writer
+                .handle_propose(swim_sender, raft_sender, req)
+                .await?
         }
     }
-    Ok(())
-}
-
-async fn handle_query(
-    mut writer: ClientStreamWriter,
-    swim_sender: Sender<SwimCommand>,
-    query_type: QueryCommand,
-) -> Result<()> {
-    match query_type {
-        QueryCommand::GetMembers => {
-            let (send, recv) = tokio::sync::oneshot::channel();
-            swim_sender
-                .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
-                    reply: send,
-                }))
-                .await?;
-
-            let result = recv.await?;
-            writer
-                .write(&result)
-                .await
-                .expect("Failed to write message");
-            Ok(())
-        }
-    }
-}
-
-async fn handle_propose(
-    mut writer: ClientStreamWriter,
-    swim_sender: Sender<SwimCommand>,
-    raft_tx: Sender<MultiRaftActorCommand>,
-    req: ProposeRequest,
-) -> Result<()> {
-    let (send, recv) = tokio::sync::oneshot::channel();
-    swim_sender
-        .send(SwimCommand::Query(SwimQueryCommand::ResolveShardGroup {
-            key: req.resource_key,
-            reply: send,
-        }))
-        .await?;
-
-    let Some(shard_group) = recv.await? else {
-        writer.write(&ProposeResponse::ShardNotFound).await?;
-        return Ok(());
-    };
-
-    let raft_cmd = req.command.into_raft_command(shard_group.members);
-
-    let (send, recv) = tokio::sync::oneshot::channel();
-    raft_tx
-        .send(MultiRaftActorCommand::Propose {
-            shard_group_id: shard_group.id,
-            command: raft_cmd,
-            reply: send,
-        })
-        .await?;
-
-    let response = match recv.await? {
-        Ok(()) => ProposeResponse::Success,
-        Err(ProposeError::NotLeader) => ProposeResponse::NotLeader,
-        Err(ProposeError::ShardNotFound) => ProposeResponse::ShardNotFound,
-    };
-
-    writer.write(&response).await?;
     Ok(())
 }
