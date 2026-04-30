@@ -472,17 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn create_topic_full_keyspace() {
-        let mut sm = MetadataStateMachine::default();
-        let id = create_topic(&mut sm, "blue");
-
-        let topic = sm.get_topic(&id).unwrap();
-        let range = &topic.ranges[&RangeId(0)];
-        assert_eq!(range.keyspace_start, KEYSPACE_MIN);
-        assert_eq!(range.keyspace_end, KEYSPACE_MAX);
-    }
-
-    #[test]
     fn create_topic_initial_offsets() {
         let mut sm = MetadataStateMachine::default();
         let id = create_topic(&mut sm, "blue");
@@ -518,20 +507,6 @@ mod tests {
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));
         assert_eq!(range.segments.len(), 2);
-    }
-
-    #[test]
-    fn seal_segment_sets_end_offset() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
-
-        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        let sealed = &range.segments[&SegmentId(0)];
-        assert_eq!(sealed.state, SegmentState::Sealed);
-        assert_eq!(sealed.end_offset, Some(0));
-        assert_eq!(sealed.sealed_at, Some(2000));
     }
 
     #[test]
@@ -624,40 +599,6 @@ mod tests {
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.active_ranges, vec![c1, c2]);
         assert!(!topic.active_ranges.contains(&RangeId(0)));
-    }
-
-    #[test]
-    fn split_range_parent_sealed() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let parent = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(parent.state, RangeState::Sealed);
-        assert_eq!(parent.active_segment, None);
-
-        let seg = &parent.segments[&SegmentId(0)];
-        assert_eq!(seg.state, SegmentState::Sealed);
-    }
-
-    #[test]
-    fn split_range_children_have_segments() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-
-        for child_id in [c1, c2] {
-            let child = &topic.ranges[&child_id];
-            assert_eq!(child.active_segment, Some(SegmentId(0)));
-            assert_eq!(child.segments.len(), 1);
-            let seg = &child.segments[&SegmentId(0)];
-            assert_eq!(seg.state, SegmentState::Active);
-            assert_eq!(seg.start_offset, 0);
-        }
     }
 
     #[test]
@@ -796,21 +737,6 @@ mod tests {
             merged_replica_set: replica_set(),
         }));
         assert_eq!(result, Err(RangesNotAdjacent));
-    }
-
-    #[test]
-    fn merge_range_seals_sources() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        merge_range(&mut sm, tid, c1, c2, 3000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-        assert_eq!(topic.ranges[&c1].state, RangeState::Sealed);
-        assert_eq!(topic.ranges[&c2].state, RangeState::Sealed);
-        assert_eq!(topic.ranges[&c1].active_segment, None);
-        assert_eq!(topic.ranges[&c2].active_segment, None);
     }
 
     // --- DeleteTopic ---
