@@ -43,118 +43,6 @@ impl MetadataStateMachine {
         result
     }
 
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        // Invariant 12: topic_name_index and topics always in sync
-        assert_eq!(
-            self.topic_name_index.len(),
-            self.topics
-                .values()
-                .filter(|t| t.state != TopicState::Deleted)
-                .count(),
-            "topic_name_index out of sync with non-deleted topics"
-        );
-        for (name, id) in &self.topic_name_index {
-            let topic = self
-                .topics
-                .get(id)
-                .expect("name index points to missing topic");
-            assert_eq!(&topic.name, name);
-        }
-
-        // Invariant 6: ID monotonicity
-        for id in self.topics.keys() {
-            assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
-        }
-
-        for topic in self.topics.values() {
-            // Invariant 6: range ID monotonicity
-            for rid in topic.ranges.keys() {
-                assert!(rid.0 < topic.next_range_id, "range ID >= next_range_id");
-            }
-
-            if topic.state == TopicState::Active {
-                // Invariant 1: keyspace coverage — active ranges cover full keyspace
-                if !topic.active_ranges.is_empty() {
-                    let ranges: Vec<&RangeMeta> = topic
-                        .active_ranges
-                        .iter()
-                        .map(|id| &topic.ranges[id])
-                        .collect();
-
-                    assert_eq!(
-                        ranges[0].keyspace_start, KEYSPACE_MIN,
-                        "first range must start at MIN"
-                    );
-                    assert_eq!(
-                        ranges.last().unwrap().keyspace_end,
-                        KEYSPACE_MAX,
-                        "last range must end at MAX"
-                    );
-                    for w in ranges.windows(2) {
-                        assert_eq!(
-                            w[0].keyspace_end, w[1].keyspace_start,
-                            "keyspace gap between active ranges"
-                        );
-                    }
-                }
-            }
-
-            for range in topic.ranges.values() {
-                match range.state {
-                    RangeState::Active => {
-                        // Invariant 2: single active segment per active range
-                        assert!(
-                            range.active_segment.is_some(),
-                            "active range missing active_segment"
-                        );
-                        let seg_id = range.active_segment.unwrap();
-                        let seg = range
-                            .segments
-                            .get(&seg_id)
-                            .expect("active_segment points to missing segment");
-                        assert_eq!(
-                            seg.state,
-                            SegmentState::Active,
-                            "active_segment not in Active state"
-                        );
-                    }
-                    RangeState::Sealed | RangeState::Deleting => {
-                        assert!(
-                            range.active_segment.is_none(),
-                            "sealed/deleting range has active_segment"
-                        );
-                    }
-                }
-
-                // Invariant 6: segment ID monotonicity
-                for sid in range.segments.keys() {
-                    assert!(
-                        sid.0 < range.next_segment_id,
-                        "segment ID >= next_segment_id"
-                    );
-                }
-
-                // Invariant 3: sealed segments have end_offset set
-                for seg in range.segments.values() {
-                    if seg.state == SegmentState::Sealed {
-                        assert!(
-                            seg.end_offset.is_some(),
-                            "sealed segment missing end_offset"
-                        );
-                        assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
-                    }
-                }
-
-                // Invariant 4: lineage consistency — cannot be both split and merged
-                assert!(
-                    range.split_into.is_none() || range.merged_into.is_none(),
-                    "range both split and merged"
-                );
-            }
-        }
-    }
-
     fn create_topic(&mut self, cmd: CreateTopic) -> Result<TopicId, MetadataError> {
         if self.topic_name_index.contains_key(&cmd.name) {
             return Err(TopicNameAlreadyExists(cmd.name));
@@ -321,6 +209,118 @@ impl MetadataStateMachine {
         self.topic_name_index.remove(&cmd.name);
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        // Invariant 12: topic_name_index and topics always in sync
+        assert_eq!(
+            self.topic_name_index.len(),
+            self.topics
+                .values()
+                .filter(|t| t.state != TopicState::Deleted)
+                .count(),
+            "topic_name_index out of sync with non-deleted topics"
+        );
+        for (name, id) in &self.topic_name_index {
+            let topic = self
+                .topics
+                .get(id)
+                .expect("name index points to missing topic");
+            assert_eq!(&topic.name, name);
+        }
+
+        // Invariant 6: ID monotonicity
+        for id in self.topics.keys() {
+            assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
+        }
+
+        for topic in self.topics.values() {
+            // Invariant 6: range ID monotonicity
+            for rid in topic.ranges.keys() {
+                assert!(rid.0 < topic.next_range_id, "range ID >= next_range_id");
+            }
+
+            if topic.state == TopicState::Active {
+                // Invariant 1: keyspace coverage — active ranges cover full keyspace
+                if !topic.active_ranges.is_empty() {
+                    let ranges: Vec<&RangeMeta> = topic
+                        .active_ranges
+                        .iter()
+                        .map(|id| &topic.ranges[id])
+                        .collect();
+
+                    assert_eq!(
+                        ranges[0].keyspace_start, KEYSPACE_MIN,
+                        "first range must start at MIN"
+                    );
+                    assert_eq!(
+                        ranges.last().unwrap().keyspace_end,
+                        KEYSPACE_MAX,
+                        "last range must end at MAX"
+                    );
+                    for w in ranges.windows(2) {
+                        assert_eq!(
+                            w[0].keyspace_end, w[1].keyspace_start,
+                            "keyspace gap between active ranges"
+                        );
+                    }
+                }
+            }
+
+            for range in topic.ranges.values() {
+                match range.state {
+                    RangeState::Active => {
+                        // Invariant 2: single active segment per active range
+                        assert!(
+                            range.active_segment.is_some(),
+                            "active range missing active_segment"
+                        );
+                        let seg_id = range.active_segment.unwrap();
+                        let seg = range
+                            .segments
+                            .get(&seg_id)
+                            .expect("active_segment points to missing segment");
+                        assert_eq!(
+                            seg.state,
+                            SegmentState::Active,
+                            "active_segment not in Active state"
+                        );
+                    }
+                    RangeState::Sealed | RangeState::Deleting => {
+                        assert!(
+                            range.active_segment.is_none(),
+                            "sealed/deleting range has active_segment"
+                        );
+                    }
+                }
+
+                // Invariant 6: segment ID monotonicity
+                for sid in range.segments.keys() {
+                    assert!(
+                        sid.0 < range.next_segment_id,
+                        "segment ID >= next_segment_id"
+                    );
+                }
+
+                // Invariant 3: sealed segments have end_offset set
+                for seg in range.segments.values() {
+                    if seg.state == SegmentState::Sealed {
+                        assert!(
+                            seg.end_offset.is_some(),
+                            "sealed segment missing end_offset"
+                        );
+                        assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
+                    }
+                }
+
+                // Invariant 4: lineage consistency — cannot be both split and merged
+                assert!(
+                    range.split_into.is_none() || range.merged_into.is_none(),
+                    "range both split and merged"
+                );
+            }
+        }
     }
 }
 

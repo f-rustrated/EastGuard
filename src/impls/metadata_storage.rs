@@ -196,15 +196,11 @@ impl RaftStorage for MetadataStorage {
         #[cfg(test)]
         self.assert_invariants();
     }
-}
 
-#[cfg(test)]
-impl MetadataStorage {
+    #[cfg(test)]
     fn assert_invariants(&self) {
         let mut prev_key: Option<Vec<u8>> = None;
-        let iter = self
-            .db
-            .iterator(rocksdb::IteratorMode::Start);
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, _) = item.expect("corrupt RocksDB iterator");
             let key = key.to_vec();
