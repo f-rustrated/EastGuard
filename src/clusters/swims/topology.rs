@@ -94,6 +94,64 @@ impl Topology {
             }
             SwimNodeState::Suspect => {}
         }
+        #[cfg(test)]
+        self.assert_invariants();
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        use std::collections::HashSet;
+
+        // Reverse index matches groups: every node in node_group_ids
+        // must appear as a member of the referenced group.
+        for (node_id, group_ids) in &self.node_group_ids {
+            for gid in group_ids {
+                let group = self.groups.get(gid).expect("node_group_ids references missing group");
+                assert!(
+                    group.members.contains(node_id),
+                    "node {:?} in reverse index for group {:?} but not in group members",
+                    node_id,
+                    gid,
+                );
+            }
+        }
+
+        // Every group member appears in node_group_ids
+        for (gid, group) in &self.groups {
+            for member in &group.members {
+                let ids = self.node_group_ids.get(member).expect("group member missing from node_group_ids");
+                assert!(
+                    ids.contains(gid),
+                    "group {:?} member {:?} missing group in reverse index",
+                    gid,
+                    member,
+                );
+            }
+
+            // All group members are distinct
+            let unique: HashSet<&NodeId> = group.members.iter().collect();
+            assert_eq!(
+                unique.len(),
+                group.members.len(),
+                "group {:?} has duplicate members",
+                gid,
+            );
+        }
+
+        // Vnode count matches: each node should have exactly vnodes_per_pnode vnodes
+        for node_id in self.node_group_ids.keys() {
+            let count = self
+                .vnodes
+                .iter()
+                .filter(|t| t.pnode_id == *node_id)
+                .count();
+            assert_eq!(
+                count, self.config.vnodes_per_pnode as usize,
+                "node {:?} has {count} vnodes, expected {}",
+                node_id,
+                self.config.vnodes_per_pnode,
+            );
+        }
     }
 
     fn add_pnode(&mut self, pnode_id: NodeId) {
@@ -755,5 +813,20 @@ mod tests {
         assert_eq!(leaders.len(), 2);
         assert!(leaders.contains_key(&ShardGroupId(10)));
         assert!(leaders.contains_key(&ShardGroupId(20)));
+    }
+
+    #[test]
+    fn deterministic_across_separate_instances() {
+        let config = TopologyConfig {
+            vnodes_per_pnode: 64,
+            replication_factor: 3,
+        };
+        let t1 = topology_from(&["node-0", "node-1", "node-2"], config.clone());
+        let t2 = topology_from(&["node-0", "node-1", "node-2"], config);
+
+        let g1 = t1.shard_group_for(b"topic-blue").unwrap();
+        let g2 = t2.shard_group_for(b"topic-blue").unwrap();
+        assert_eq!(g1.id, g2.id);
+        assert_eq!(g1.members, g2.members);
     }
 }

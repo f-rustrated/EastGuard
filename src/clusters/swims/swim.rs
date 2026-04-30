@@ -461,9 +461,9 @@ impl Swim {
     }
 
     fn apply_membership_update(&mut self, member: SwimNode) {
-        // Refutation
+        // Refutation: only refute Suspect, not Dead (Dead is terminal per SWIM spec)
         if member.node_id == self.node_id {
-            if member.state.not_alive() && self.incarnation <= member.incarnation {
+            if member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation {
                 let new_incarnation = member.incarnation + 1;
                 tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
@@ -1308,9 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn refutation_on_dead_gossip_current_behavior() {
-        // TODO: Per SWIM spec, Dead is terminal and should NOT trigger refutation.
-        // Fix: add `if member.state == Dead { return; }` guard in apply_membership_update.
+    fn dead_gossip_about_self_does_not_trigger_refutation() {
         let mut p = make_protocol("node-local", 8000);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
@@ -1324,10 +1322,9 @@ mod tests {
             ),
         );
 
-        // TODO: Fix current (incorrect) behavior: Dead gossip triggers refutation
         assert_eq!(
-            p.incarnation, 1,
-            "current impl refutes Dead — this should change when TODO is fixed"
+            p.incarnation, 0,
+            "Dead is terminal — must not trigger refutation"
         );
     }
 

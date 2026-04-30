@@ -491,19 +491,4 @@ mod tests {
         sim.run()
     }
 
-    #[test]
-    fn conflict_higher_node_id_connection_dropped() {
-        let node_b = NodeId::new("node-b");
-        let node_c = NodeId::new("node-c");
-        assert!(node_b < node_c);
-
-        let has_existing = true;
-        let incoming_initiator = node_c.clone();
-        let self_id = node_b;
-        let should_drop = has_existing && incoming_initiator > self_id;
-        assert!(
-            should_drop,
-            "higher NodeId's incoming connection should be dropped"
-        );
-    }
 }
