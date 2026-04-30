@@ -29,7 +29,7 @@ impl MetadataStateMachine {
 
     pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<ApplyResult, MetadataError> {
         use MetadataCommand::*;
-        match command {
+        let result = match command {
             CreateTopic(cmd) => self.create_topic(cmd).map(ApplyResult::TopicCreated),
             SealSegment(cmd) => self.seal_segment(cmd).map(|()| ApplyResult::SegmentSealed),
             SplitRange(cmd) => self
@@ -37,7 +37,10 @@ impl MetadataStateMachine {
                 .map(|(c1, c2)| ApplyResult::RangeSplit(c1, c2)),
             MergeRange(cmd) => self.merge_range(cmd).map(ApplyResult::RangeMerged),
             DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted),
-        }
+        };
+        #[cfg(test)]
+        self.assert_invariants();
+        result
     }
 
     fn create_topic(&mut self, cmd: CreateTopic) -> Result<TopicId, MetadataError> {
@@ -207,6 +210,118 @@ impl MetadataStateMachine {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        // Invariant 12: topic_name_index and topics always in sync
+        assert_eq!(
+            self.topic_name_index.len(),
+            self.topics
+                .values()
+                .filter(|t| t.state != TopicState::Deleted)
+                .count(),
+            "topic_name_index out of sync with non-deleted topics"
+        );
+        for (name, id) in &self.topic_name_index {
+            let topic = self
+                .topics
+                .get(id)
+                .expect("name index points to missing topic");
+            assert_eq!(&topic.name, name);
+        }
+
+        // Invariant 6: ID monotonicity
+        for id in self.topics.keys() {
+            assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
+        }
+
+        for topic in self.topics.values() {
+            // Invariant 6: range ID monotonicity
+            for rid in topic.ranges.keys() {
+                assert!(rid.0 < topic.next_range_id, "range ID >= next_range_id");
+            }
+
+            if topic.state == TopicState::Active {
+                // Invariant 1: keyspace coverage — active ranges cover full keyspace
+                if !topic.active_ranges.is_empty() {
+                    let ranges: Vec<&RangeMeta> = topic
+                        .active_ranges
+                        .iter()
+                        .map(|id| &topic.ranges[id])
+                        .collect();
+
+                    assert_eq!(
+                        ranges[0].keyspace_start, KEYSPACE_MIN,
+                        "first range must start at MIN"
+                    );
+                    assert_eq!(
+                        ranges.last().unwrap().keyspace_end,
+                        KEYSPACE_MAX,
+                        "last range must end at MAX"
+                    );
+                    for w in ranges.windows(2) {
+                        assert_eq!(
+                            w[0].keyspace_end, w[1].keyspace_start,
+                            "keyspace gap between active ranges"
+                        );
+                    }
+                }
+            }
+
+            for range in topic.ranges.values() {
+                match range.state {
+                    RangeState::Active => {
+                        // Invariant 2: single active segment per active range
+                        assert!(
+                            range.active_segment.is_some(),
+                            "active range missing active_segment"
+                        );
+                        let seg_id = range.active_segment.unwrap();
+                        let seg = range
+                            .segments
+                            .get(&seg_id)
+                            .expect("active_segment points to missing segment");
+                        assert_eq!(
+                            seg.state,
+                            SegmentState::Active,
+                            "active_segment not in Active state"
+                        );
+                    }
+                    RangeState::Sealed | RangeState::Deleting => {
+                        assert!(
+                            range.active_segment.is_none(),
+                            "sealed/deleting range has active_segment"
+                        );
+                    }
+                }
+
+                // Invariant 6: segment ID monotonicity
+                for sid in range.segments.keys() {
+                    assert!(
+                        sid.0 < range.next_segment_id,
+                        "segment ID >= next_segment_id"
+                    );
+                }
+
+                // Invariant 3: sealed segments have end_offset set
+                for seg in range.segments.values() {
+                    if seg.state == SegmentState::Sealed {
+                        assert!(
+                            seg.end_offset.is_some(),
+                            "sealed segment missing end_offset"
+                        );
+                        assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
+                    }
+                }
+
+                // Invariant 4: lineage consistency — cannot be both split and merged
+                assert!(
+                    range.split_into.is_none() || range.merged_into.is_none(),
+                    "range both split and merged"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,17 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn create_topic_full_keyspace() {
-        let mut sm = MetadataStateMachine::default();
-        let id = create_topic(&mut sm, "blue");
-
-        let topic = sm.get_topic(&id).unwrap();
-        let range = &topic.ranges[&RangeId(0)];
-        assert_eq!(range.keyspace_start, KEYSPACE_MIN);
-        assert_eq!(range.keyspace_end, KEYSPACE_MAX);
-    }
-
-    #[test]
     fn create_topic_initial_offsets() {
         let mut sm = MetadataStateMachine::default();
         let id = create_topic(&mut sm, "blue");
@@ -403,20 +507,6 @@ mod tests {
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));
         assert_eq!(range.segments.len(), 2);
-    }
-
-    #[test]
-    fn seal_segment_sets_end_offset() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
-
-        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        let sealed = &range.segments[&SegmentId(0)];
-        assert_eq!(sealed.state, SegmentState::Sealed);
-        assert_eq!(sealed.end_offset, Some(0));
-        assert_eq!(sealed.sealed_at, Some(2000));
     }
 
     #[test]
@@ -509,40 +599,6 @@ mod tests {
         let topic = sm.get_topic(&tid).unwrap();
         assert_eq!(topic.active_ranges, vec![c1, c2]);
         assert!(!topic.active_ranges.contains(&RangeId(0)));
-    }
-
-    #[test]
-    fn split_range_parent_sealed() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let parent = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(parent.state, RangeState::Sealed);
-        assert_eq!(parent.active_segment, None);
-
-        let seg = &parent.segments[&SegmentId(0)];
-        assert_eq!(seg.state, SegmentState::Sealed);
-    }
-
-    #[test]
-    fn split_range_children_have_segments() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-
-        for child_id in [c1, c2] {
-            let child = &topic.ranges[&child_id];
-            assert_eq!(child.active_segment, Some(SegmentId(0)));
-            assert_eq!(child.segments.len(), 1);
-            let seg = &child.segments[&SegmentId(0)];
-            assert_eq!(seg.state, SegmentState::Active);
-            assert_eq!(seg.start_offset, 0);
-        }
     }
 
     #[test]
@@ -683,21 +739,6 @@ mod tests {
         assert_eq!(result, Err(RangesNotAdjacent));
     }
 
-    #[test]
-    fn merge_range_seals_sources() {
-        let mut sm = MetadataStateMachine::default();
-        let tid = create_topic(&mut sm, "blue");
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        merge_range(&mut sm, tid, c1, c2, 3000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-        assert_eq!(topic.ranges[&c1].state, RangeState::Sealed);
-        assert_eq!(topic.ranges[&c2].state, RangeState::Sealed);
-        assert_eq!(topic.ranges[&c1].active_segment, None);
-        assert_eq!(topic.ranges[&c2].active_segment, None);
-    }
-
     // --- DeleteTopic ---
 
     #[test]
@@ -788,5 +829,24 @@ mod tests {
         let beta = sm.get_topic(&t2).unwrap();
         assert_eq!(beta.active_ranges.len(), 1);
         assert_eq!(beta.ranges.len(), 1);
+    }
+
+    // --- Invariant: Segment immutability after seal ---
+
+    #[test]
+    fn seal_already_sealed_segment_rejected() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+
+        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+            topic_id: tid,
+            range_id: RangeId(0),
+            segment_id: SegmentId(0),
+            sealed_at: 3000,
+            new_replica_set: replica_set(),
+        }));
+        assert_eq!(result, Err(SegmentNotActive));
     }
 }

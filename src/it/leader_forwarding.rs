@@ -100,7 +100,30 @@ fn forwarded_request_not_forwarded_again() -> turmoil::Result {
     }
 
     sim.client("test-client", async {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Wait for cluster convergence: retry until at least one node
+        // accepts a (non-forwarded) proposal, proving SWIM + Raft are up.
+        let mut converged = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let req = test_propose_request("convergence-probe", false);
+            if let Ok(resp) =
+                tokio::time::timeout(Duration::from_secs(3), send_propose("node-1", 8081, req))
+                    .await
+            {
+                match resp {
+                    ProposeResponse::Success => {
+                        converged = true;
+                        break;
+                    }
+                    ProposeResponse::Error(ProposeError::NotLeader(_)) => {
+                        converged = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(converged, "cluster did not converge within timeout");
 
         // Send forwarded=true to all nodes — followers should return NotLeader
         // (not attempt forwarding), leader should succeed normally

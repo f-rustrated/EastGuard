@@ -218,6 +218,8 @@ impl Raft {
                 self.send_heartbeats();
             }
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     pub fn step(&mut self, from: NodeId, rpc: impl Into<RaftRpc>) {
@@ -228,6 +230,8 @@ impl Raft {
             RaftRpc::AppendEntries(req) => self.handle_append_entries(from, req),
             RaftRpc::AppendEntriesResponse(resp) => self.handle_append_entries_response(resp),
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     // -------------------------------------------------------------------
@@ -591,6 +595,50 @@ impl Raft {
         self.apply_committed_entries();
     }
 
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        // last_applied_index <= commit_index <= log length
+        assert!(
+            self.last_applied_index <= self.commit_index,
+            "last_applied ({}) > commit_index ({})",
+            self.last_applied_index,
+            self.commit_index,
+        );
+        assert!(
+            self.commit_index <= self.log_last_index(),
+            "commit_index ({}) > log_last_index ({})",
+            self.commit_index,
+            self.log_last_index(),
+        );
+
+        // Log indices are contiguous and 1-based
+        for (i, entry) in self.log.iter().enumerate() {
+            assert_eq!(
+                entry.index,
+                (i + 1) as u64,
+                "log entry at position {i} has non-contiguous index {}",
+                entry.index,
+            );
+        }
+
+        // Leader must have peer_states for all peers
+        if self.role == Role::Leader {
+            for peer in &self.peers {
+                assert!(
+                    self.peer_states.contains_key(peer),
+                    "leader missing peer_state for {:?}",
+                    peer,
+                );
+            }
+        }
+
+        // Self is never in peers
+        assert!(
+            !self.peers.contains(&self.node_id),
+            "self found in peers set",
+        );
+    }
+
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -691,6 +739,8 @@ impl Raft {
         // no peer has acked yet.
         self.try_advance_commit_index();
 
+        #[cfg(test)]
+        self.assert_invariants();
         Ok(())
     }
 
@@ -1858,5 +1908,89 @@ mod tests {
         assert_eq!(raft.state_machine().topic_count(), 2);
         assert!(raft.state_machine().get_topic_by_name("alpha").is_some());
         assert!(raft.state_machine().get_topic_by_name("beta").is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Figure 8 safety: old-term entries not directly committed
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn old_term_entries_not_committed_until_current_term_entry_committed() {
+        // Follower receives a term-1 entry from a leader that crashes before committing.
+        // A new leader at term 2 must NOT commit the term-1 entry directly.
+        // It commits only after a term-2 entry achieves quorum.
+        let mut raft = three_node_raft("node-1");
+
+        // Receive term-1 entry as a follower (simulating replication from a crashed leader)
+        raft.step(
+            node("node-2"),
+            RaftRpc::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: node("node-2"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: RaftCommand::Noop,
+                }],
+                leader_commit: 0,
+            }),
+        );
+        drain(&mut raft);
+        raft.simulate_flush();
+        assert_eq!(raft.log_last_index(), 1);
+        assert_eq!(raft.commit_index, 0);
+
+        // node-1 wins election at term 2
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        raft.step(
+            node("node-3"),
+            RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                term: 2,
+                node_id: node("node-3"),
+                vote_granted: true,
+            }),
+        );
+        drain(&mut raft);
+        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.current_term, 2);
+        // become_leader appends a Noop at term 2 (index 2)
+        assert_eq!(raft.log_last_index(), 2);
+        assert_eq!(raft.log_term_at(1), 1);
+        assert_eq!(raft.log_term_at(2), 2);
+
+        // node-3 acks only the old term-1 entry (index 1) but not the term-2 entry
+        raft.step(
+            node("node-3"),
+            AppendEntriesResponse {
+                term: 2,
+                node_id: node("node-3"),
+                success: true,
+                last_log_index: 1,
+            },
+        );
+        // commit_index must NOT advance — the replicated entry is term 1, not current term
+        assert_eq!(
+            raft.commit_index, 0,
+            "term-1 entry must not be directly committed even with majority"
+        );
+
+        // node-3 acks the term-2 entry (index 2)
+        raft.step(
+            node("node-3"),
+            AppendEntriesResponse {
+                term: 2,
+                node_id: node("node-3"),
+                success: true,
+                last_log_index: 2,
+            },
+        );
+        // Now both entries committed (term-2 entry at index 2 has quorum,
+        // implicitly committing the term-1 entry at index 1)
+        assert_eq!(raft.commit_index, 2);
     }
 }

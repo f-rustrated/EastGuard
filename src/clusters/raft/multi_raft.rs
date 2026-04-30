@@ -633,4 +633,91 @@ mod tests {
         let entry = read_entry(&store, 2).expect("metadata command entry must be persisted");
         assert_eq!(entry.index, 2);
     }
+
+    #[test]
+    fn groups_are_independent_no_cross_contamination() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        // Single-node groups so election succeeds immediately
+        store.add_group(shard(1, vec![me.clone()]));
+        store.add_group(shard(2, vec![me.clone()]));
+        store.flush();
+
+        // Elect leader in group 1 only
+        store.handle_command(MultiRaftCommand::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: ShardGroupId(1),
+            },
+        ));
+        store.flush();
+
+        // Propose to group 1
+        store.handle_command(MultiRaftCommand::Propose {
+            shard_group_id: ShardGroupId(1),
+            command: RaftCommand::Noop,
+        });
+        store.flush();
+
+        let g1 = store.groups.get(&ShardGroupId(1)).unwrap();
+        assert_eq!(g1.current_term(), 1);
+        assert!(g1.log_last_index() >= 2);
+
+        let g2 = store.groups.get(&ShardGroupId(2)).unwrap();
+        assert_eq!(g2.current_term(), 0, "group 2 term must be unaffected");
+        assert_eq!(
+            g2.log_last_index(),
+            0,
+            "group 2 log must be empty"
+        );
+    }
+
+    #[test]
+    fn stale_metadata_proposal_rejected_gracefully() {
+        use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
+        use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+
+        elect_leader(&mut store);
+        store.flush();
+
+        let make_cmd = || {
+            RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+                name: "blue".to_string(),
+                storage_policy: StoragePolicy {
+                    retention_ms: 3_600_000,
+                    replication_factor: 3,
+                    partition_strategy: PartitionStrategy::AutoSplit,
+                },
+                replica_set: vec![node("n1"), node("n2"), node("n3")],
+                created_at: 1000,
+            }))
+        };
+
+        // First proposal succeeds
+        store.handle_command(MultiRaftCommand::Propose {
+            shard_group_id: TEST_GROUP_ID,
+            command: make_cmd(),
+        });
+        store.flush();
+
+        // Duplicate proposal: must not panic, state machine rejects at apply
+        store.handle_command(MultiRaftCommand::Propose {
+            shard_group_id: TEST_GROUP_ID,
+            command: make_cmd(),
+        });
+        store.flush();
+
+        let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+        assert_eq!(
+            raft.state_machine().topic_count(),
+            1,
+            "duplicate must not create a second topic"
+        );
+    }
 }

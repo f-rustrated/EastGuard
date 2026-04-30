@@ -175,6 +175,8 @@ impl Swim {
                 _ => {}
             },
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     pub(super) fn handle_query(&self, command: SwimQueryCommand) {
@@ -354,6 +356,8 @@ impl Swim {
                 self.apply_shard_leader_update(&info);
             }
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     pub(super) fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
@@ -458,12 +462,14 @@ impl Swim {
                     }));
             }
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     fn apply_membership_update(&mut self, member: SwimNode) {
-        // Refutation
+        // Refutation: only refute Suspect, not Dead (Dead is terminal per SWIM spec)
         if member.node_id == self.node_id {
-            if member.state.not_alive() && self.incarnation <= member.incarnation {
+            if member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation {
                 let new_incarnation = member.incarnation + 1;
                 tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
@@ -683,6 +689,55 @@ impl Swim {
             }
         }
         membership
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        // Self never in live_node_tracker (excluded from probe targets)
+        assert!(
+            !self.live_node_tracker.contains(&self.node_id),
+            "self ({}) found in live_node_tracker",
+            self.node_id,
+        );
+
+        // live_node_tracker only contains Alive nodes from members
+        for node_id in self.live_node_tracker.iter() {
+            let member = self
+                .members
+                .get(node_id)
+                .expect("live_node_tracker contains unknown node");
+            assert_eq!(
+                member.state,
+                SwimNodeState::Alive,
+                "live_node_tracker contains non-Alive node {:?} (state={:?})",
+                node_id,
+                member.state,
+            );
+        }
+
+        // No Dead or Suspect nodes in live_node_tracker
+        for (node_id, member) in &self.members {
+            if member.state != SwimNodeState::Alive {
+                assert!(
+                    !self.live_node_tracker.contains(node_id),
+                    "Dead/Suspect node {:?} found in live_node_tracker",
+                    node_id,
+                );
+            }
+        }
+
+        // last_suspected_seqs only contains Suspect nodes
+        for node_id in self.last_suspected_seqs.keys() {
+            if let Some(member) = self.members.get(node_id) {
+                assert_eq!(
+                    member.state,
+                    SwimNodeState::Suspect,
+                    "last_suspected_seqs contains non-Suspect node {:?} (state={:?})",
+                    node_id,
+                    member.state,
+                );
+            }
+        }
     }
 }
 
@@ -1308,9 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn refutation_on_dead_gossip_current_behavior() {
-        // TODO: Per SWIM spec, Dead is terminal and should NOT trigger refutation.
-        // Fix: add `if member.state == Dead { return; }` guard in apply_membership_update.
+    fn dead_gossip_about_self_does_not_trigger_refutation() {
         let mut p = make_protocol("node-local", 8000);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
@@ -1324,10 +1377,9 @@ mod tests {
             ),
         );
 
-        // TODO: Fix current (incorrect) behavior: Dead gossip triggers refutation
         assert_eq!(
-            p.incarnation, 1,
-            "current impl refutes Dead — this should change when TODO is fixed"
+            p.incarnation, 0,
+            "Dead is terminal — must not trigger refutation"
         );
     }
 

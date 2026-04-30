@@ -20,4 +20,7 @@ pub(crate) trait RaftStorage: Send {
     fn load_state(&self, group_id: u64) -> RaftPersistentState;
     fn persist_mutations(&self, mutations: Vec<(ShardGroupId, LogMutation)>);
     fn delete_group(&self, group_id: ShardGroupId);
+
+    #[cfg(test)]
+    fn assert_invariants(&self);
 }
