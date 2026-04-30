@@ -175,6 +175,8 @@ impl Swim {
                 _ => {}
             },
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     pub(super) fn handle_query(&self, command: SwimQueryCommand) {
@@ -354,6 +356,57 @@ impl Swim {
                 self.apply_shard_leader_update(&info);
             }
         }
+        #[cfg(test)]
+        self.assert_invariants();
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        // Self never in live_node_tracker (excluded from probe targets)
+        assert!(
+            !self.live_node_tracker.contains(&self.node_id),
+            "self ({}) found in live_node_tracker",
+            self.node_id,
+        );
+
+        // live_node_tracker only contains Alive nodes from members
+        for node_id in self.live_node_tracker.iter() {
+            let member = self
+                .members
+                .get(node_id)
+                .expect("live_node_tracker contains unknown node");
+            assert_eq!(
+                member.state,
+                SwimNodeState::Alive,
+                "live_node_tracker contains non-Alive node {:?} (state={:?})",
+                node_id,
+                member.state,
+            );
+        }
+
+        // No Dead or Suspect nodes in live_node_tracker
+        for (node_id, member) in &self.members {
+            if member.state != SwimNodeState::Alive {
+                assert!(
+                    !self.live_node_tracker.contains(node_id),
+                    "Dead/Suspect node {:?} found in live_node_tracker",
+                    node_id,
+                );
+            }
+        }
+
+        // last_suspected_seqs only contains Suspect nodes
+        for node_id in self.last_suspected_seqs.keys() {
+            if let Some(member) = self.members.get(node_id) {
+                assert_eq!(
+                    member.state,
+                    SwimNodeState::Suspect,
+                    "last_suspected_seqs contains non-Suspect node {:?} (state={:?})",
+                    node_id,
+                    member.state,
+                );
+            }
+        }
     }
 
     pub(super) fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
@@ -458,6 +511,8 @@ impl Swim {
                     }));
             }
         }
+        #[cfg(test)]
+        self.assert_invariants();
     }
 
     fn apply_membership_update(&mut self, member: SwimNode) {
