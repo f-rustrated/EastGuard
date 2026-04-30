@@ -33,19 +33,19 @@ Raft (pure sync state machine, one per shard group)
 
 ## Key Types
 
-| Type | File | Description |
-|---|---|---|
-| `Raft` | `src/clusters/raft/state.rs` | Core state machine. Holds term, role, log, peers, commit_index, last_applied. |
-| `Role` | `src/clusters/raft/state.rs` | `Follower`, `Candidate { votes_received }`, `Leader` |
-| `PeerState` | `src/clusters/raft/state.rs` | Leader-only. `next_index` (guess) and `match_index` (confirmed truth). |
-| `MemLog` | `src/clusters/raft/log.rs` | In-memory log store. 1-based indexing. |
-| `LogEntry` | `src/clusters/raft/messages.rs` | `{ term, index, command }` |
-| `RaftCommand` | `src/clusters/raft/messages.rs` | `Noop`, `RemovePeer(NodeId)`, `AddPeer(NodeId)`. Will grow: `CreateTopic`, `AssignRange`, `MoveShard`. |
-| `ProposeError` | `src/clusters/raft/messages.rs` | `NotLeader` (returned by `propose()` when not leader). |
-| `RaftRpc` | `src/clusters/raft/messages.rs` | Enum: `RequestVote`, `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`. |
-| `OutboundRaftPacket` | `src/clusters/raft/messages.rs` | `{ target: NodeId, rpc: RaftRpc }`. Transport-agnostic — actor resolves NodeId to connection. |
-| `RaftTimer` | `src/clusters/raft/messages.rs` | Implements `TTimer`. Two kinds: `Election`, `Heartbeat`. |
-| `RaftTimeoutCallback` | `src/clusters/raft/messages.rs` | `ElectionTimeout` (default), `HeartbeatTimeout`. |
+| Type | Description |
+|---|---|
+| `Raft` | Core state machine. Holds term, role, log, peers, commit_index, last_applied. |
+| `Role` | `Follower`, `Candidate { votes_received }`, `Leader` |
+| `PeerState` | Leader-only. `next_index` (guess) and `match_index` (confirmed truth). |
+| `MemLog` | In-memory log store. 1-based indexing. |
+| `LogEntry` | `{ term, index, command }` |
+| `RaftCommand` | `Noop`, `RemovePeer(NodeId)`, `AddPeer(NodeId)`. Will grow: `CreateTopic`, `AssignRange`, `MoveShard`. |
+| `ProposeError` | `NotLeader` (returned by `propose()` when not leader). |
+| `RaftRpc` | Enum: `RequestVote`, `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`. |
+| `OutboundRaftPacket` | `{ target: NodeId, rpc: RaftRpc }`. Transport-agnostic — actor resolves NodeId to connection. |
+| `RaftTimer` | Implements `TTimer`. Two kinds: `Election`, `Heartbeat`. |
+| `RaftTimeoutCallback` | `ElectionTimeout` (default), `HeartbeatTimeout`. |
 
 ## Timer Model
 

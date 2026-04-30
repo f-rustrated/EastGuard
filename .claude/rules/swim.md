@@ -30,11 +30,6 @@ Actor has no protocol logic. All decisions in `Swim`.
           transport_tx    scheduler_tx    raft_tx
 ```
 
-**Fields:**
-- `mailbox` -- `mpsc::Receiver<SwimCommand>` -- inbound event stream
-- `transport_tx` -- `mpsc::Sender<OutboundPacket>` -- sends UDP packets to transport actor
-- `scheduler_tx` -- `mpsc::Sender<TickerCommand<SwimTimer>>` -- sends timer set/cancel commands to ticker
-- `raft_tx` -- `mpsc::Sender<RaftCommand>` -- sends membership-driven commands to MultiRaftActor (HandleNodeDeath, HandleNodeJoin)
 
 ## Message Flow
 
@@ -76,16 +71,6 @@ After every event, `flush_outbound_commands` drains three buffers from `Swim` an
 
 Flush also runs once at startup (before event loop) to drain commands produced during `Swim::new()` init.
 
-## Key Dependencies
-
-| Dependency | Role |
-|---|---|
-| `Swim` (swim.rs) | Pure state machine. All protocol logic. No async, no I/O. |
-| `GossipBuffer` | Piggybacks membership updates onto outbound packets, O(log N) dissemination. |
-| `LiveNodeTracker` | Round-robin probe target selection, excluding dead/suspect nodes. |
-| `Topology` | Consistent hash ring updated on membership changes. |
-| `Bootstrapper` / `JoinAttempt` (peer_discovery.rs) | Seed-node join w/ exponential backoff. |
-| `SwimTimer` (messages.rs) | Timer definitions w/ tick counts per probe phase. |
 
 ## Invariants
 
