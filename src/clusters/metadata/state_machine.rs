@@ -326,8 +326,9 @@ impl MetadataStateMachine {
                 );
 
                 // Invariant 16: seal_history timestamps are monotonically ordered
-                for w in range.seal_history.seal_timestamps.windows(2) {
-                    assert!(w[0] <= w[1], "seal_history timestamps not sorted");
+                let ts = &range.seal_history.seal_timestamps;
+                for i in 1..ts.len() {
+                    assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
                 }
 
                 // Invariant 17: split children have created_by_split_at set
@@ -353,6 +354,8 @@ impl MetadataStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
     use crate::clusters::{
         NodeId,
         metadata::{
@@ -939,7 +942,7 @@ mod tests {
     #[test]
     fn should_split_cooldown_blocks() {
         let mut history = RangeSealHistory {
-            seal_timestamps: Vec::new(),
+            seal_timestamps: VecDeque::new(),
             created_by_split_at: Some(1000),
         };
         history.record_seal(1100);

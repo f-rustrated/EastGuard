@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use bincode::{Decode, Encode};
 
@@ -155,7 +155,7 @@ impl RangeMeta {
 
     fn with_split_origin(mut self, created_at: u64) -> Self {
         self.seal_history = RangeSealHistory {
-            seal_timestamps: Vec::new(),
+            seal_timestamps: VecDeque::new(),
             created_by_split_at: Some(created_at),
         };
         self
@@ -404,15 +404,17 @@ pub const MERGE_SEAL_THRESHOLD: usize = 0;
 // TODO : range will have many different kinds of split strategy which is ideally configurable.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RangeSealHistory {
-    pub seal_timestamps: Vec<u64>,
+    pub seal_timestamps: VecDeque<u64>,
     pub created_by_split_at: Option<u64>,
 }
 
 impl RangeSealHistory {
     pub fn record_seal(&mut self, sealed_at: u64) {
-        self.seal_timestamps.push(sealed_at);
+        self.seal_timestamps.push_back(sealed_at);
         let cutoff = sealed_at.saturating_sub(MEASUREMENT_WINDOW_MS);
-        self.seal_timestamps.retain(|&t| t > cutoff);
+        while self.seal_timestamps.front().is_some_and(|&t| t <= cutoff) {
+            self.seal_timestamps.pop_front();
+        }
     }
 
     pub fn seal_count(&self) -> usize {
