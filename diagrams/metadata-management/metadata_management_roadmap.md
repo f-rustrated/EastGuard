@@ -354,7 +354,7 @@ Client SDK concern. Server-side signals available:
 
 ```rust
 struct RangeSealHistory {
-    seal_timestamps: Vec<u64>,         // recent seal times within measurement window
+    seal_timestamps: VecDeque<u64>,         // recent seal times within measurement window
     created_by_split_at: Option<u64>,  // cooldown anchor for child ranges
 }
 ```
