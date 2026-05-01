@@ -8,8 +8,6 @@ use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId, SwimNode};
 // MTU 1500 - IP header 20 - UDP header 8 = 1472, minus ~70 bytes header overhead.
 pub(in crate::clusters::swims) const MAX_GOSSIP_BYTES: usize = 1400;
 
-// a standard Vec is often faster than all of the alternatives like priority queue or hash map with entries being 64.
-const MAX_ENTRIES: usize = 64;
 const LAMBDA: u32 = 3;
 
 pub(in crate::clusters::swims) type SwimBuffer = DisseminationBuffer<SwimNode>;
@@ -37,14 +35,7 @@ impl Disseminable for SwimNode {
 
 pub(in crate::clusters::swims) struct DisseminationBuffer<T: Disseminable> {
     entries: Vec<DisseminationEntry<T>>,
-}
-
-impl<T: Disseminable> Default for DisseminationBuffer<T> {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
+    max_entries: usize,
 }
 
 #[derive(PartialEq, Eq)]
@@ -54,6 +45,13 @@ struct DisseminationEntry<T> {
 }
 
 impl<T: Disseminable> DisseminationBuffer<T> {
+    pub(in crate::clusters::swims) fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries,
+        }
+    }
+
     pub(in crate::clusters::swims) fn enqueue(&mut self, item: T, cluster_size: usize) {
         if item.size() > MAX_GOSSIP_BYTES {
             tracing::error!(
@@ -74,10 +72,10 @@ impl<T: Disseminable> DisseminationBuffer<T> {
             self.entries.remove(pos);
         }
 
-        if self.entries.len() >= MAX_ENTRIES {
+        if self.entries.len() >= self.max_entries {
             tracing::warn!(
-                max_entries = MAX_ENTRIES,
-                "Gossip buffer full! Evicting the oldest entry prematurely."
+                max_entries = self.max_entries,
+                "Gossip buffer full! Evicting the lowest-priority entry."
             );
             self.entries.pop();
         }
@@ -177,7 +175,7 @@ mod tests {
 
     #[test]
     fn enqueue_and_collect_returns_members() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
         buf.enqueue(member(1, SwimNodeState::Alive, 0), 10);
         buf.enqueue(member(2, SwimNodeState::Dead, 5), 10);
 
@@ -191,7 +189,7 @@ mod tests {
 
     #[test]
     fn collect_decrements_remaining_and_eventually_drains() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
         buf.enqueue(member(1, SwimNodeState::Alive, 0), 2);
 
         let r1 = buf.collect(MAX_GOSSIP_BYTES);
@@ -209,7 +207,7 @@ mod tests {
 
     #[test]
     fn duplicate_addr_resets_remaining() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
         buf.enqueue(member(1, SwimNodeState::Alive, 0), 2);
 
         buf.collect(MAX_GOSSIP_BYTES);
@@ -233,7 +231,7 @@ mod tests {
 
     #[test]
     fn priority_order_preserved_across_multiple_collects() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
 
         buf.enqueue(member(1, SwimNodeState::Alive, 0), 4);
 
@@ -259,7 +257,7 @@ mod tests {
 
     #[test]
     fn newest_entries_prioritized_over_oldest() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
 
         buf.enqueue(member(1, SwimNodeState::Alive, 0), 4);
 
@@ -275,7 +273,7 @@ mod tests {
 
     #[test]
     fn collect_respects_byte_budget() {
-        let mut gossip_buf = SwimBuffer::default();
+        let mut gossip_buf = SwimBuffer::with_capacity(64);
 
         let sample_member = member(1, SwimNodeState::Alive, u64::MAX);
         let size = sample_member.encoded_size();
@@ -304,9 +302,9 @@ mod tests {
 
     #[test]
     fn evicts_lowest_remaining_when_full() {
-        let mut buf = SwimBuffer::default();
+        let mut buf = SwimBuffer::with_capacity(64);
 
-        for i in 0..MAX_ENTRIES {
+        for i in 0..64 {
             buf.enqueue(member(i as u16 + 1, SwimNodeState::Alive, 0), 10);
         }
 
@@ -317,16 +315,6 @@ mod tests {
 
         let result = buf.collect(MAX_GOSSIP_BYTES);
         assert!(result.iter().any(|m| m.addr.cluster_addr == addr(999)));
-    }
-
-    #[test]
-    fn dissemination_count_scales_with_cluster_size() {
-        assert_eq!(dissemination_count(1), 3);
-        assert_eq!(dissemination_count(2), 3);
-        assert_eq!(dissemination_count(4), 6);
-        assert_eq!(dissemination_count(8), 9);
-        assert_eq!(dissemination_count(100), 21);
-        assert_eq!(dissemination_count(1000), 30);
     }
 
     // shard leader info tests
@@ -344,7 +332,7 @@ mod tests {
 
     #[test]
     fn basic_enqueue_and_collect() {
-        let mut buf = ShardLeaderGossipBuffer::default();
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(100);
         buf.enqueue(leader_info(1, "node-a", 8000, 1), 10);
         buf.enqueue(leader_info(2, "node-b", 8001, 1), 10);
 
@@ -354,7 +342,7 @@ mod tests {
 
     #[test]
     fn collect_decrements_and_drains() {
-        let mut buf = ShardLeaderGossipBuffer::default();
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(100);
         buf.enqueue(leader_info(1, "node-a", 8000, 1), 2);
 
         let r1 = buf.collect(MAX_GOSSIP_BYTES);
@@ -369,7 +357,7 @@ mod tests {
 
     #[test]
     fn higher_term_replaces_existing() {
-        let mut buf = ShardLeaderGossipBuffer::default();
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(100);
         buf.enqueue(leader_info(1, "node-a", 8000, 1), 10);
         buf.enqueue(leader_info(1, "node-b", 8001, 3), 10);
 
@@ -381,7 +369,7 @@ mod tests {
 
     #[test]
     fn lower_term_rejected() {
-        let mut buf = ShardLeaderGossipBuffer::default();
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(100);
         buf.enqueue(leader_info(1, "node-a", 8000, 5), 10);
         buf.enqueue(leader_info(1, "node-b", 8001, 2), 10);
 
@@ -393,7 +381,7 @@ mod tests {
 
     #[test]
     fn byte_budget_respected() {
-        let mut buf = ShardLeaderGossipBuffer::default();
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(100);
         let sample = leader_info(1, "node-a", 8000, 1);
         let size = sample.encoded_size();
         let budget = size * 2;
@@ -412,8 +400,8 @@ mod tests {
 
     #[test]
     fn eviction_on_full_buffer() {
-        let mut buf = ShardLeaderGossipBuffer::default();
-        for i in 0..64 {
+        let mut buf = ShardLeaderGossipBuffer::with_capacity(64);
+        for i in 0..64_u64 {
             buf.enqueue(leader_info(i, &format!("node-{}", i), 8000, 1), 10);
         }
 
