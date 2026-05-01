@@ -4,7 +4,7 @@ SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from th
 
 ---
 
-## Phase 1: Data Model + MetadataStateMachine
+## Phase 1: Data Model + MetadataStateMachine ✅
 
 **Goal:** Define metadata types and a pure in-memory state machine.
 
@@ -115,7 +115,7 @@ enum ProposeError {
 
 ---
 
-## Phase 3: Application State Machine Dispatch
+## Phase 3: Application State Machine Dispatch ✅
 
 **Goal:** `Raft` owns `MetadataStateMachine` and applies committed metadata commands inline.
 
@@ -169,7 +169,7 @@ For tests to query applied state.
 
 ---
 
-## Phase 4: Client → Raft Propose Pathway
+## Phase 4: Client → Raft Propose Pathway ✅
 
 **Goal:** Wire end-to-end path: Client → `MultiRaftActor` → hash(key) → propose to local Raft → commit → apply → respond.
 
@@ -340,7 +340,7 @@ Client SDK concern. Server-side signals available:
 
 ---
 
-## Phase 6: Hot Range Detection + Auto-Split/Merge 
+## Phase 6: Hot Range Detection + Auto-Split/Merge ✅
 
 **Goal:** MetadataStateMachine detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
 
@@ -427,27 +427,26 @@ Stale proposals (e.g., merge proposed but range split before commit) are safe �
 - **Stale `RollSegment` is no-op, not error.** If `active_seg_id != cmd.segment_id`, returns `Ok(())` — expected during leader transitions, not worth error logging.
 
 **Depends on:** Phases 1-4 (needs working propose pathway + state machine dispatch). Phase 5 not required.
-**Status:** Implemented.
 
 ---
 
 ## Phase Dependency Graph
 
 ```
-Phase 1 (Data Model + MetadataStateMachine)
+Phase 1 (Data Model + MetadataStateMachine)              ✅
     │
     ▼
-Phase 2 (Extend RaftCommand)
+Phase 2 (Extend RaftCommand)                             ✅
     │
     ▼
-Phase 3 (Application State Machine Dispatch)
+Phase 3 (Application State Machine Dispatch)             ✅
     │
     ├──────────────────────────┐
     ▼                          ▼
-Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
-    │                          (needs Phase 4 for end-to-end,
-    ▼                           but core logic testable after Phase 3)
-Phase 5 (Leader Forwarding + Shard Discovery) ✅
+Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection) ✅
+    │                          ✅
+    ▼
+Phase 5 (Leader Forwarding + Shard Discovery)            ✅
 ```
 
 ---

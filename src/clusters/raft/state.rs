@@ -688,8 +688,6 @@ impl Raft {
                         }
                     }
 
-                    // OPTION 1: take proposal here, and discard if not leader(as follows, with cons being creation of unused data)
-                    // OPTION 2: don't raise a proposal - which will require state_machine to be aware of the role.
                     let proposals = self.state_machine.take_pending_proposals();
                     if self.role == Role::Leader {
                         for cmd in proposals {
