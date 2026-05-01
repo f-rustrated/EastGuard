@@ -1,7 +1,9 @@
 use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
+pub const TICK_PERIOD_MS: u64 = 100;
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
+
 #[derive(Debug)]
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
@@ -30,10 +32,10 @@ where
         }
     }
 
-    pub fn advance_clock(&mut self) -> Vec<T::Callback> {
+    pub fn advance_clock(&mut self, now: u64) -> Vec<T::Callback> {
         let mut events = Vec::new();
 
-        // 1. Age every in-flight probe
+        // 1. Age every in-flight timer
         let mut timeout_seqs: Vec<u32> = vec![];
         for (seq, probe) in self.timers.iter_mut() {
             if probe.tick() == 0 {
@@ -43,7 +45,7 @@ where
 
         for seq in timeout_seqs {
             let probe = self.timers.remove(&seq).unwrap();
-            events.push(probe.to_timeout_callback(seq));
+            events.push(probe.to_timeout_callback(seq, now));
         }
 
         // 2. Advance the protocol clock
@@ -84,7 +86,7 @@ mod tests {
     fn no_protocol_period_before_interval_elapses() {
         let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-            let events = ticker.advance_clock();
+            let events = ticker.advance_clock(0);
             assert!(
                 !events
                     .iter()
@@ -97,9 +99,9 @@ mod tests {
     fn protocol_period_fires_at_interval() {
         let mut ticker = Ticker::<SwimTimer>::new();
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
-            ticker.advance_clock();
+            ticker.advance_clock(0);
         }
-        let events = ticker.advance_clock();
+        let events = ticker.advance_clock(0);
         assert!(
             events
                 .iter()
@@ -116,7 +118,7 @@ mod tests {
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
-            let events = ticker.advance_clock();
+            let events = ticker.advance_clock(0);
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
@@ -126,7 +128,7 @@ mod tests {
             )));
         }
 
-        let events = ticker.advance_clock();
+        let events = ticker.advance_clock(0);
         assert!(events.iter().any(|e| matches!(
             e,
             SwimTimeOutCallback::TimedOut {
@@ -147,10 +149,10 @@ mod tests {
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
-            ticker.advance_clock();
+            ticker.advance_clock(0);
         }
 
-        let events = ticker.advance_clock();
+        let events = ticker.advance_clock(0);
         assert!(events.iter().any(|e| matches!(
             e,
             SwimTimeOutCallback::TimedOut {
@@ -171,7 +173,7 @@ mod tests {
         ticker.apply(TimerCommand::CancelSchedule { seq: 1 });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS + 1 {
-            let events = ticker.advance_clock();
+            let events = ticker.advance_clock(0);
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
@@ -193,7 +195,7 @@ mod tests {
         });
 
         for _ in 0..SUSPECT_TIMEOUT_TICKS - 1 {
-            let events = ticker.advance_clock();
+            let events = ticker.advance_clock(0);
             assert!(!events.iter().any(|e| matches!(
                 e,
                 SwimTimeOutCallback::TimedOut {
@@ -203,7 +205,7 @@ mod tests {
             )));
         }
 
-        let events = ticker.advance_clock();
+        let events = ticker.advance_clock(0);
 
         assert!(events.iter().any(|e| matches!(
             e,

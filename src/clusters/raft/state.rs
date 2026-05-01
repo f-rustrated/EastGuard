@@ -226,8 +226,8 @@ impl Raft {
             RaftTimeoutCallback::HeartbeatTimeout { .. } => {
                 self.send_heartbeats();
             }
-            RaftTimeoutCallback::MergeCheckTimeout { .. } => {
-                self.evaluate_merges();
+            RaftTimeoutCallback::MergeCheckTimeout { now, .. } => {
+                self.evaluate_merges(now);
             }
         }
         #[cfg(test)]
@@ -794,15 +794,10 @@ impl Raft {
             }));
     }
 
-    fn evaluate_merges(&mut self) {
+    pub(crate) fn evaluate_merges(&mut self, now: u64) {
         if self.role != Role::Leader {
             return;
         }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
 
         let merge_proposals = self.state_machine.evaluate_merges(now);
         for cmd in merge_proposals {

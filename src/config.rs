@@ -5,11 +5,11 @@ use std::fs::{self, OpenOptions};
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::{NodeAddress, NodeId};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{Topology, TopologyConfig};
-use crate::schedulers::actor::TICK_PERIOD_MS;
+use crate::clusters::{NodeAddress, NodeId};
+use crate::schedulers::ticker::TICK_PERIOD_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug, Clone)]
@@ -31,7 +31,12 @@ pub struct Environment {
     #[arg(long = "node-id-prefix", env = "EASTGUARD_NODE_ID_PREFIX")]
     pub node_id_prefix: Option<String>,
 
-    #[arg(short = 'p', long = "client-port", env = "EASTGUARD_CLIENT_PORT", default_value_t = 2921)]
+    #[arg(
+        short = 'p',
+        long = "client-port",
+        env = "EASTGUARD_CLIENT_PORT",
+        default_value_t = 2921
+    )]
     pub client_port: u16,
 
     #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]

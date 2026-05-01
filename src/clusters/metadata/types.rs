@@ -398,8 +398,6 @@ pub const KEYSPACE_MIN: &[u8] = &[];
 pub const KEYSPACE_MAX: &[u8] = &[0xFF];
 
 // --- Hot Range Detection Constants ---
-// Seal frequency is the load signal: split when >= SPLIT_SEAL_THRESHOLD seals, SPLIT_SEAL_THRESHOLD min window, merge when 0.
-// Hysteresis (split = SPLIT_SEAL_THRESHOLD, merge = MERGE_SEAL_THRESHOLD) prevents oscillation. Cooldown blocks re-splitting children.
 pub const SPLIT_SEAL_THRESHOLD: usize = 3;
 pub const MEASUREMENT_WINDOW_MS: u64 = 300_000; // 5 min sliding window
 pub const SPLIT_COOLDOWN_MS: u64 = 300_000; // 5 min cooldown after a split
