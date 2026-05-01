@@ -5,7 +5,7 @@ use bincode::{Decode, Encode};
 use crate::clusters::{
     NodeId,
     metadata::{
-        RangeId, SegmentId, TopicId,
+        RangeId, SegmentId, SplitRange, TopicId,
         error::MetadataError,
         strategy::{PartitionStrategy, StoragePolicy},
     },
@@ -46,6 +46,23 @@ pub struct SegmentMeta {
 }
 
 impl SegmentMeta {
+    pub(crate) fn new(
+        segment_id: SegmentId,
+        replica_set: Vec<NodeId>,
+        start_offset: u64,
+        created_at: u64,
+    ) -> Self {
+        SegmentMeta {
+            segment_id,
+            state: SegmentState::Active,
+            replica_set: replica_set,
+            size_bytes: 0,
+            start_offset,
+            end_offset: None,
+            created_at,
+            sealed_at: None,
+        }
+    }
     pub(crate) fn seal(&mut self, end_offset: u64, sealed_at: u64) -> Result<(), MetadataError> {
         if self.state != SegmentState::Active {
             return Err(MetadataError::SegmentNotActive);
@@ -72,6 +89,7 @@ pub struct RangeMeta {
     pub split_into: Option<[RangeId; 2]>,
     pub merged_into: Option<RangeId>,
     pub merged_from: Option<[RangeId; 2]>,
+    pub seal_history: RangeSealHistory,
 }
 
 impl RangeMeta {
@@ -83,16 +101,7 @@ impl RangeMeta {
         created_at: u64,
     ) -> Self {
         let segment_id = SegmentId(0);
-        let segment = SegmentMeta {
-            segment_id,
-            state: SegmentState::Active,
-            replica_set,
-            size_bytes: 0,
-            start_offset: 0,
-            end_offset: None,
-            created_at,
-            sealed_at: None,
-        };
+        let segment = SegmentMeta::new(segment_id, replica_set, 0, created_at);
 
         RangeMeta {
             range_id,
@@ -106,7 +115,50 @@ impl RangeMeta {
             split_into: None,
             merged_into: None,
             merged_from: None,
+            seal_history: RangeSealHistory::default(),
         }
+    }
+
+    pub(crate) fn split(
+        &mut self,
+        cmd: SplitRange,
+        left_id: RangeId,
+        right_id: RangeId,
+    ) -> Result<(RangeMeta, RangeMeta), MetadataError> {
+        if !self.valid_split_point(&cmd.split_point) {
+            return Err(MetadataError::InvalidSplitPoint);
+        }
+        let _ = self.validate_active()?;
+
+        self.seal(cmd.created_at)?;
+        self.split_into = Some([left_id, right_id]);
+        let left = RangeMeta::new(
+            left_id,
+            self.keyspace_start.clone(),
+            cmd.split_point.clone(),
+            cmd.left_replica_set,
+            cmd.created_at,
+        )
+        .with_split_origin(cmd.created_at);
+
+        let right = RangeMeta::new(
+            right_id,
+            cmd.split_point,
+            self.keyspace_end.clone(),
+            cmd.right_replica_set,
+            cmd.created_at,
+        )
+        .with_split_origin(cmd.created_at);
+
+        Ok((left, right))
+    }
+
+    fn with_split_origin(mut self, created_at: u64) -> Self {
+        self.seal_history = RangeSealHistory {
+            seal_timestamps: Vec::new(),
+            created_by_split_at: Some(created_at),
+        };
+        self
     }
     pub(crate) fn validate_active(&self) -> Result<SegmentId, MetadataError> {
         if self.state != RangeState::Active {
@@ -117,6 +169,74 @@ impl RangeMeta {
 
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
         split_point > &self.keyspace_start && split_point < &self.keyspace_end
+    }
+    pub(crate) fn roll_segment(
+        &mut self,
+        segment_to_seal: SegmentId,
+        replica_set: Vec<NodeId>,
+        requested_at: u64,
+    ) -> Result<bool, MetadataError> {
+        let segment = self
+            .segments
+            .get_mut(&segment_to_seal)
+            .ok_or(MetadataError::SegmentNotFound)?;
+        segment.seal(self.next_offset.saturating_sub(1), requested_at)?;
+
+        let new_segment_id = SegmentId(self.next_segment_id);
+        let new_segment = SegmentMeta::new(
+            new_segment_id,
+            replica_set.clone(),
+            self.next_offset,
+            requested_at,
+        );
+
+        self.segments.insert(new_segment_id, new_segment);
+        self.active_segment = Some(new_segment_id);
+        self.seal_history.record_seal(requested_at);
+        self.next_segment_id += 1;
+
+        Ok(self.seal_history.should_split(requested_at))
+    }
+
+    pub(crate) fn merge(
+        &mut self,
+        other: &mut RangeMeta,
+        merged_id: RangeId,
+        replica_set: Vec<NodeId>,
+        requested_at: u64,
+    ) -> Result<RangeMeta, MetadataError> {
+        if !self.is_next_to(other) {
+            return Err(MetadataError::RangesNotAdjacent);
+        }
+
+        let (merged_start, merged_end) = if self.keyspace_start <= other.keyspace_start {
+            (self.keyspace_start.clone(), other.keyspace_end.clone())
+        } else {
+            (other.keyspace_start.clone(), self.keyspace_end.clone())
+        };
+
+        self.seal(requested_at)?;
+        other.seal(requested_at)?;
+        self.merged_into = Some(merged_id);
+        other.merged_into = Some(merged_id);
+        let mut merged = RangeMeta::new(
+            merged_id,
+            merged_start,
+            merged_end,
+            replica_set,
+            requested_at,
+        );
+
+        // To make sure of determinsim
+        let merged_from = if self.range_id < other.range_id {
+            [self.range_id, other.range_id]
+        } else {
+            [other.range_id, self.range_id]
+        };
+
+        merged.merged_from = Some(merged_from);
+
+        Ok(merged)
     }
 
     pub(crate) fn seal(&mut self, created_at: u64) -> Result<(), MetadataError> {
@@ -141,6 +261,37 @@ impl RangeMeta {
             segment.state = SegmentState::Deleting;
         }
     }
+
+    /// Compute the midpoint of two byte-slice keyspace bounds.
+    pub fn compute_midpoint(&self) -> Vec<u8> {
+        let len = self
+            .keyspace_start
+            .len()
+            .max(self.keyspace_end.len())
+            .max(1);
+
+        let mut s = vec![0u8; len];
+        let mut e = vec![0u8; len];
+        s[..self.keyspace_start.len()].copy_from_slice(&self.keyspace_start);
+        e[..self.keyspace_end.len()].copy_from_slice(&self.keyspace_end);
+
+        let mut result = vec![0u8; len];
+        let mut carry = 0u16;
+        for i in 0..len {
+            let val = carry * 256 + s[i] as u16 + e[i] as u16;
+            result[i] = (val / 2) as u8;
+            carry = val % 2;
+        }
+
+        result
+    }
+
+    pub(crate) fn mergeable_with(&self, r2: &RangeMeta, now: u64) -> bool {
+        let r1_recent = self.seal_history.recent_seal_count(now);
+        let r2_recent = r2.seal_history.recent_seal_count(now);
+
+        r1_recent == MERGE_SEAL_THRESHOLD && r2_recent == MERGE_SEAL_THRESHOLD
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -162,32 +313,13 @@ impl TopicMeta {
         storage_policy: StoragePolicy,
     ) -> Self {
         let range_id = RangeId(0);
-        let segment_id = SegmentId(0);
-
-        let segment = SegmentMeta {
-            segment_id,
-            state: SegmentState::Active,
-            replica_set,
-            size_bytes: 0,
-            start_offset: 0,
-            end_offset: None,
-            created_at,
-            sealed_at: None,
-        };
-
-        let range = RangeMeta {
+        let range = RangeMeta::new(
             range_id,
-            keyspace_start: KEYSPACE_MIN.to_vec(),
-            keyspace_end: KEYSPACE_MAX.to_vec(),
-            state: RangeState::Active,
-            active_segment: Some(segment_id),
-            segments: HashMap::from([(segment_id, segment)]),
-            next_segment_id: 1,
-            next_offset: 0,
-            split_into: None,
-            merged_into: None,
-            merged_from: None,
-        };
+            KEYSPACE_MIN.to_vec(),
+            KEYSPACE_MAX.to_vec(),
+            replica_set,
+            created_at,
+        );
 
         TopicMeta {
             id,
@@ -198,6 +330,22 @@ impl TopicMeta {
             ranges: HashMap::from([(range_id, range)]),
             next_range_id: 1,
         }
+    }
+
+    pub(crate) fn get_ranges_mut<const N: usize>(
+        &mut self,
+        ranges: [&RangeId; N],
+    ) -> Result<[&mut RangeMeta; N], MetadataError> {
+        let options = self.ranges.get_disjoint_mut(ranges);
+
+        let vec_ranges: Vec<&mut RangeMeta> = options
+            .into_iter()
+            .map(|opt| opt.ok_or(MetadataError::RangeNotFound)) // Bubble up the error
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // ! SAFETY: We can safely unwrap() here because we know the Vec was built
+        // ! from an array of exactly size N, so it will never fail.
+        Ok(vec_ranges.try_into().unwrap())
     }
 
     pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
@@ -244,6 +392,45 @@ impl TopicMeta {
 }
 
 // --- Keyspace Constants ---
-
 pub const KEYSPACE_MIN: &[u8] = &[];
 pub const KEYSPACE_MAX: &[u8] = &[0xFF];
+
+// --- Hot Range Detection Constants ---
+pub const SPLIT_SEAL_THRESHOLD: usize = 3;
+pub const MEASUREMENT_WINDOW_MS: u64 = 300_000;
+pub const SPLIT_COOLDOWN_MS: u64 = 300_000;
+pub const MERGE_SEAL_THRESHOLD: usize = 0;
+
+// TODO : range will have many different kinds of split strategy which is ideally configurable.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct RangeSealHistory {
+    pub seal_timestamps: Vec<u64>,
+    pub created_by_split_at: Option<u64>,
+}
+
+impl RangeSealHistory {
+    pub fn record_seal(&mut self, sealed_at: u64) {
+        self.seal_timestamps.push(sealed_at);
+        let cutoff = sealed_at.saturating_sub(MEASUREMENT_WINDOW_MS);
+        self.seal_timestamps.retain(|&t| t > cutoff);
+    }
+
+    pub fn seal_count(&self) -> usize {
+        self.seal_timestamps.len()
+    }
+
+    pub fn should_split(&self, now: u64) -> bool {
+        if self.seal_count() < SPLIT_SEAL_THRESHOLD {
+            return false;
+        }
+        match self.created_by_split_at {
+            Some(split_at) => now.saturating_sub(split_at) >= SPLIT_COOLDOWN_MS,
+            None => true,
+        }
+    }
+
+    pub fn recent_seal_count(&self, now: u64) -> usize {
+        let cutoff = now.saturating_sub(MEASUREMENT_WINDOW_MS);
+        self.seal_timestamps.iter().filter(|&&t| t > cutoff).count()
+    }
+}

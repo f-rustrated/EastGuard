@@ -1,6 +1,6 @@
 use super::command::*;
 use super::types::*;
-use crate::clusters::metadata::{RangeId, SegmentId, TopicId, error::MetadataError};
+use crate::clusters::metadata::{RangeId, TopicId, error::MetadataError};
 
 use MetadataError::*;
 use std::collections::HashMap;
@@ -10,6 +10,7 @@ pub struct MetadataStateMachine {
     topics: HashMap<TopicId, TopicMeta>,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
+    pending_proposals: Vec<MetadataCommand>,
 }
 
 impl MetadataStateMachine {
@@ -27,11 +28,15 @@ impl MetadataStateMachine {
         self.topics.len()
     }
 
+    pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
+        std::mem::take(&mut self.pending_proposals)
+    }
+
     pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<ApplyResult, MetadataError> {
         use MetadataCommand::*;
         let result = match command {
             CreateTopic(cmd) => self.create_topic(cmd).map(ApplyResult::TopicCreated),
-            SealSegment(cmd) => self.seal_segment(cmd).map(|()| ApplyResult::SegmentSealed),
+            RollSegment(cmd) => self.roll_segment(cmd).map(|()| ApplyResult::SegmentRolled),
             SplitRange(cmd) => self
                 .split_range(cmd)
                 .map(|(c1, c2)| ApplyResult::RangeSplit(c1, c2)),
@@ -61,39 +66,40 @@ impl MetadataStateMachine {
         Ok(topic_id)
     }
 
-    fn seal_segment(&mut self, cmd: SealSegment) -> Result<(), MetadataError> {
+    fn roll_segment(&mut self, cmd: RollSegment) -> Result<(), MetadataError> {
         let topic = self
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
         topic.validate_active()?;
+        let can_split = topic.can_split();
 
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
         let active_seg_id = range.validate_active()?;
-
         if active_seg_id != cmd.segment_id {
-            return Err(SegmentNotActive);
+            return Ok(());
         }
-        let segment = range
-            .segments
-            .get_mut(&cmd.segment_id)
-            .ok_or(SegmentNotFound)?;
-        segment.seal(range.next_offset.saturating_sub(1), cmd.sealed_at)?;
 
-        let new_segment_id = SegmentId(range.next_segment_id);
-        range.next_segment_id += 1;
-        let new_segment = SegmentMeta {
-            segment_id: new_segment_id,
-            state: SegmentState::Active,
-            replica_set: cmd.new_replica_set,
-            size_bytes: 0,
-            start_offset: range.next_offset,
-            end_offset: None,
-            created_at: cmd.sealed_at,
-            sealed_at: None,
-        };
-        range.segments.insert(new_segment_id, new_segment);
-        range.active_segment = Some(new_segment_id);
+        let should_split =
+            range.roll_segment(cmd.segment_id, cmd.new_replica_set.clone(), cmd.sealed_at)?;
+
+        if can_split && should_split {
+            // The following guards against ranges too narrow to split. When keyspace_start and keyspace_end are 1 unit apart (e.g., [0x40] and [0x41]),
+            // integer division truncates: (0x40 + 0x41) / 2 = 0x40, which equals keyspace_start.
+            // That fails valid_split_point (requires strictly between), so the split is skipped.
+            let mid = range.compute_midpoint();
+            if range.valid_split_point(&mid) {
+                self.pending_proposals
+                    .push(MetadataCommand::SplitRange(SplitRange {
+                        topic_id: cmd.topic_id,
+                        range_id: cmd.range_id,
+                        split_point: mid,
+                        created_at: cmd.sealed_at,
+                        left_replica_set: cmd.new_replica_set.clone(),
+                        right_replica_set: cmd.new_replica_set,
+                    }));
+            }
+        }
         Ok(())
     }
 
@@ -102,46 +108,19 @@ impl MetadataStateMachine {
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?;
-
         topic.validate_active()?;
-
         if !topic.can_split() {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
-
-        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
-
-        if !range.valid_split_point(&cmd.split_point) {
-            return Err(InvalidSplitPoint);
-        }
-        let _ = range.validate_active()?;
-        range.seal(cmd.created_at)?;
-
         let left_id = RangeId(topic.next_range_id);
-        topic.next_range_id += 1;
-        let right_id = RangeId(topic.next_range_id);
-        topic.next_range_id += 1;
+        let right_id = RangeId(topic.next_range_id + 1);
+        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
+        let (left, right) = range.split(cmd, left_id, right_id)?;
 
-        range.split_into = Some([left_id, right_id]);
-
-        let left = RangeMeta::new(
-            left_id,
-            range.keyspace_start.clone(),
-            cmd.split_point.clone(),
-            cmd.left_replica_set,
-            cmd.created_at,
-        );
-        let right = RangeMeta::new(
-            right_id,
-            cmd.split_point,
-            range.keyspace_end.clone(),
-            cmd.right_replica_set,
-            cmd.created_at,
-        );
+        topic.next_range_id += 2;
+        topic.active_ranges.retain(|id| *id != range.range_id);
         topic.ranges.insert(left_id, left);
         topic.ranges.insert(right_id, right);
-
-        topic.active_ranges.retain(|id| *id != cmd.range_id);
         topic.insert_range_sorted(left_id);
         topic.insert_range_sorted(right_id);
         Ok((left_id, right_id))
@@ -154,46 +133,71 @@ impl MetadataStateMachine {
             .ok_or(TopicNotFound(cmd.topic_id))?;
 
         topic.validate_active()?;
-
-        let r1 = topic.ranges.get(&cmd.range_id_1).ok_or(RangeNotFound)?;
-        let r2 = topic.ranges.get(&cmd.range_id_2).ok_or(RangeNotFound)?;
-        r1.validate_active()?;
-        r2.validate_active()?;
-
-        if !r1.is_next_to(r2) {
-            return Err(RangesNotAdjacent);
-        }
-
-        let (merged_start, merged_end) = if r1.keyspace_start <= r2.keyspace_start {
-            (r1.keyspace_start.clone(), r2.keyspace_end.clone())
-        } else {
-            (r2.keyspace_start.clone(), r1.keyspace_end.clone())
-        };
         let merged_id = RangeId(topic.next_range_id);
-        topic.next_range_id += 1;
-
-        for id in [cmd.range_id_1, cmd.range_id_2] {
-            topic.seal_range(id, cmd.created_at)?;
-            // SAFETY : Safe to unwrap since we confirmed these IDs exist above
-            topic.ranges.get_mut(&id).unwrap().merged_into = Some(merged_id);
-        }
-
-        let mut merged = RangeMeta::new(
-            merged_id,
-            merged_start,
-            merged_end,
-            cmd.merged_replica_set,
-            cmd.created_at,
-        );
-        merged.merged_from = Some([cmd.range_id_1, cmd.range_id_2]);
+        let [r1, r2] = topic.get_ranges_mut([&cmd.range_id_1, &cmd.range_id_2])?;
+        let merged = r1.merge(r2, merged_id, cmd.merged_replica_set, cmd.created_at)?;
         topic.ranges.insert(merged_id, merged);
-
         topic
             .active_ranges
             .retain(|id| *id != cmd.range_id_1 && *id != cmd.range_id_2);
         topic.insert_range_sorted(merged_id);
+        topic.next_range_id += 1;
 
         Ok(merged_id)
+    }
+
+    // ! SAFETY: When the loop evaluates the [1, 2] pair and decides it is mergeable,
+    // ! it generates the event and immediately stops looking at the rest of that topic's ranges
+    // !
+    // ! However, we still have an asynchronous race condition to worry about.
+    // ! Take the following example:
+    // !    1. the following method proposes merging (1, 2).
+    // !    2. The MergeRange command goes into a queue (or a Raft log) to be processed.
+    // !    3. Before the command is executed, range 2 receives a massive burst of traffic and splits into 2A and 2B.
+    // !    4. The MergeRange(1, 2) command is finally executed by your merge function.
+    // ! By the time the command executes, range 2 might be split, already sealed, or completely deleted
+    pub(crate) fn evaluate_merges(&self, now: u64) -> Vec<MetadataCommand> {
+        let mut proposals = Vec::new();
+
+        for topic in self.topics.values() {
+            if topic.validate_active().is_err() {
+                continue;
+            }
+            if !topic.can_split() {
+                continue;
+            }
+            if topic.active_ranges.len() < 2 {
+                continue;
+            }
+
+            for pair in topic.active_ranges.windows(2) {
+                let (r1, r2) = (&topic.ranges[&pair[0]], &topic.ranges[&pair[1]]);
+                if r1.state != RangeState::Active || r2.state != RangeState::Active {
+                    continue;
+                }
+
+                if r1.mergeable_with(r2, now) {
+                    let replica_set = r1
+                        .active_segment
+                        .and_then(|sid| r1.segments.get(&sid))
+                        // ? why taking replicaset from r1 - what about r2?
+                        .map(|s| s.replica_set.clone())
+                        .unwrap_or_default();
+
+                    proposals.push(MetadataCommand::MergeRange(MergeRange {
+                        topic_id: topic.id,
+                        range_id_1: r1.range_id,
+                        range_id_2: r2.range_id,
+                        created_at: now,
+                        merged_replica_set: replica_set,
+                    }));
+
+                    break;
+                }
+            }
+        }
+
+        proposals
     }
 
     fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
@@ -319,6 +323,27 @@ impl MetadataStateMachine {
                     range.split_into.is_none() || range.merged_into.is_none(),
                     "range both split and merged"
                 );
+
+                // Invariant 16: seal_history timestamps are monotonically ordered
+                for w in range.seal_history.seal_timestamps.windows(2) {
+                    assert!(w[0] <= w[1], "seal_history timestamps not sorted");
+                }
+
+                // Invariant 17: split children have created_by_split_at set
+                if let Some([left, right]) = range.split_into {
+                    if let Some(left_range) = topic.ranges.get(&left) {
+                        assert!(
+                            left_range.seal_history.created_by_split_at.is_some(),
+                            "split child missing created_by_split_at"
+                        );
+                    }
+                    if let Some(right_range) = topic.ranges.get(&right) {
+                        assert!(
+                            right_range.seal_history.created_by_split_at.is_some(),
+                            "split child missing created_by_split_at"
+                        );
+                    }
+                }
             }
         }
     }
@@ -329,7 +354,10 @@ mod tests {
     use super::*;
     use crate::clusters::{
         NodeId,
-        metadata::strategy::{PartitionStrategy, StoragePolicy},
+        metadata::{
+            SegmentId,
+            strategy::{PartitionStrategy, StoragePolicy},
+        },
     };
 
     fn default_policy() -> StoragePolicy {
@@ -369,21 +397,21 @@ mod tests {
         }
     }
 
-    fn seal_segment(
+    fn roll_segment(
         sm: &mut MetadataStateMachine,
         topic_id: TopicId,
         range_id: RangeId,
         segment_id: SegmentId,
         sealed_at: u64,
     ) {
-        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             topic_id,
             range_id,
             segment_id,
             sealed_at,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result.unwrap(), ApplyResult::SegmentSealed);
+        assert_eq!(result.unwrap(), ApplyResult::SegmentRolled);
     }
 
     fn split_range(
@@ -495,14 +523,14 @@ mod tests {
         assert!(sm.get_topic_by_name("red").is_none());
     }
 
-    // --- SealSegment ---
+    // --- RollSegment ---
 
     #[test]
-    fn seal_segment_creates_next() {
+    fn roll_segment_creates_next() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));
@@ -510,12 +538,12 @@ mod tests {
     }
 
     #[test]
-    fn seal_segment_increments_segment_id() {
+    fn roll_segment_increments_segment_id() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(1), 3000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 3000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(2)));
@@ -524,9 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn seal_segment_bad_topic() {
+    fn roll_segment_bad_topic() {
         let mut sm = MetadataStateMachine::default();
-        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             topic_id: TopicId(99),
             range_id: RangeId(0),
             segment_id: SegmentId(0),
@@ -537,11 +565,11 @@ mod tests {
     }
 
     #[test]
-    fn seal_segment_bad_range() {
+    fn roll_segment_bad_range() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             topic_id: tid,
             range_id: RangeId(99),
             segment_id: SegmentId(0),
@@ -552,18 +580,22 @@ mod tests {
     }
 
     #[test]
-    fn seal_segment_wrong_active_segment() {
+    fn roll_segment_stale_is_noop() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             topic_id: tid,
             range_id: RangeId(0),
             segment_id: SegmentId(99),
             sealed_at: 2000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(SegmentNotActive));
+        assert_eq!(result, Ok(ApplyResult::SegmentRolled));
+
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.active_segment, Some(SegmentId(0)));
+        assert_eq!(range.segments.len(), 1);
     }
 
     // --- SplitRange ---
@@ -793,7 +825,7 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
         let (c1, _c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
-        seal_segment(&mut sm, tid, c1, SegmentId(0), 3000);
+        roll_segment(&mut sm, tid, c1, SegmentId(0), 3000);
 
         let child = &sm.get_topic(&tid).unwrap().ranges[&c1];
         assert_eq!(child.active_segment, Some(SegmentId(1)));
@@ -834,19 +866,212 @@ mod tests {
     // --- Invariant: Segment immutability after seal ---
 
     #[test]
-    fn seal_already_sealed_segment_rejected() {
+    fn roll_already_rolled_segment_is_noop() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        seal_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
-        let result = sm.apply(MetadataCommand::SealSegment(SealSegment {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             topic_id: tid,
             range_id: RangeId(0),
             segment_id: SegmentId(0),
             sealed_at: 3000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(SegmentNotActive));
+        assert_eq!(result, Ok(ApplyResult::SegmentRolled));
+
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.active_segment, Some(SegmentId(1)));
+        assert_eq!(range.segments.len(), 2);
+    }
+
+    // --- Hot Range Detection ---
+
+    #[test]
+    fn seal_history_records_timestamps() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), 3000);
+
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.seal_history.seal_count(), 3);
+    }
+
+    #[test]
+    fn seal_history_prunes_old_entries() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
+        // Jump far beyond the window — both old entries pruned
+        let far_future = 2000 + MEASUREMENT_WINDOW_MS + 1;
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), far_future);
+
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.seal_history.seal_count(), 1);
+    }
+
+    #[test]
+    fn should_split_threshold_met() {
+        let mut history = RangeSealHistory::default();
+        history.record_seal(1000);
+        history.record_seal(2000);
+        history.record_seal(3000);
+
+        assert!(history.should_split(3000));
+    }
+
+    #[test]
+    fn should_split_below_threshold() {
+        let mut history = RangeSealHistory::default();
+        history.record_seal(1000);
+        history.record_seal(2000);
+
+        assert!(!history.should_split(2000));
+    }
+
+    #[test]
+    fn should_split_cooldown_blocks() {
+        let mut history = RangeSealHistory {
+            seal_timestamps: Vec::new(),
+            created_by_split_at: Some(1000),
+        };
+        history.record_seal(1100);
+        history.record_seal(1200);
+        history.record_seal(1300);
+
+        // Within cooldown — blocked
+        assert!(!history.should_split(1300));
+
+        // After cooldown — allowed
+        assert!(history.should_split(1000 + SPLIT_COOLDOWN_MS));
+    }
+
+    #[test]
+    fn auto_proposal_on_hot_range() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        for i in 0..SPLIT_SEAL_THRESHOLD {
+            roll_segment(
+                &mut sm,
+                tid,
+                RangeId(0),
+                SegmentId(i as u64),
+                1000 * (i as u64 + 1),
+            );
+        }
+
+        let proposals = sm.take_pending_proposals();
+        assert_eq!(proposals.len(), 1);
+        assert!(matches!(proposals[0], MetadataCommand::SplitRange(_)));
+    }
+
+    #[test]
+    fn no_auto_proposal_below_threshold() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        for i in 0..(SPLIT_SEAL_THRESHOLD - 1) {
+            roll_segment(
+                &mut sm,
+                tid,
+                RangeId(0),
+                SegmentId(i as u64),
+                1000 * (i as u64 + 1),
+            );
+        }
+
+        let proposals = sm.take_pending_proposals();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn no_auto_proposal_for_fixed_strategy() {
+        let mut sm = MetadataStateMachine::default();
+        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
+            name: "ordered".to_string(),
+            storage_policy: fixed_policy(),
+            replica_set: replica_set(),
+            created_at: 1000,
+        }));
+        let tid = match result.unwrap() {
+            ApplyResult::TopicCreated(id) => id,
+            other => panic!("expected TopicCreated, got {:?}", other),
+        };
+
+        for i in 0..SPLIT_SEAL_THRESHOLD {
+            roll_segment(
+                &mut sm,
+                tid,
+                RangeId(0),
+                SegmentId(i as u64),
+                2000 * (i as u64 + 1),
+            );
+        }
+
+        let proposals = sm.take_pending_proposals();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn evaluate_merges_cold_adjacent() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+
+        // Both children are cold (no seals)
+        let proposals = sm.evaluate_merges(2000 + SPLIT_COOLDOWN_MS + 1);
+        assert_eq!(proposals.len(), 1);
+        assert!(matches!(proposals[0], MetadataCommand::MergeRange(_)));
+    }
+
+    #[test]
+    fn evaluate_merges_one_hot() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+        let (c1, _c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        sm.take_pending_proposals(); // discard any split proposals
+
+        // Seal one child — makes it hot
+        roll_segment(&mut sm, tid, c1, SegmentId(0), 3000);
+
+        let proposals = sm.evaluate_merges(3000);
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn split_clears_seal_history() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 3000);
+
+        let topic = sm.get_topic(&tid).unwrap();
+        assert!(topic.ranges[&c1].seal_history.seal_timestamps.is_empty());
+        assert!(topic.ranges[&c2].seal_history.seal_timestamps.is_empty());
+    }
+
+    #[test]
+    fn split_sets_cooldown() {
+        let mut sm = MetadataStateMachine::default();
+        let tid = create_topic(&mut sm, "blue");
+        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+
+        let topic = sm.get_topic(&tid).unwrap();
+        assert_eq!(
+            topic.ranges[&c1].seal_history.created_by_split_at,
+            Some(2000)
+        );
+        assert_eq!(
+            topic.ranges[&c2].seal_history.created_by_split_at,
+            Some(2000)
+        );
     }
 }
