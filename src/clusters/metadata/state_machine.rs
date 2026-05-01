@@ -149,13 +149,13 @@ impl MetadataStateMachine {
     // ! SAFETY: When the loop evaluates the [1, 2] pair and decides it is mergeable,
     // ! it generates the event and immediately stops looking at the rest of that topic's ranges
     // !
-    // ! However, we still have an asynchronous race condition to worry about.
-    // ! Take the following example:
+    // ! Caution on race condition. Take the following example:
     // !    1. the following method proposes merging (1, 2).
     // !    2. The MergeRange command goes into a queue (or a Raft log) to be processed.
     // !    3. Before the command is executed, range 2 receives a massive burst of traffic and splits into 2A and 2B.
     // !    4. The MergeRange(1, 2) command is finally executed by your merge function.
     // ! By the time the command executes, range 2 might be split, already sealed, or completely deleted
+    // * This is already safe as the 'stale' proposal fails gracefully at apply time, following "stale proposals are safe" invariant
     pub(crate) fn evaluate_merges(&self, now: u64) -> Vec<MetadataCommand> {
         let mut proposals = Vec::new();
 
@@ -180,7 +180,8 @@ impl MetadataStateMachine {
                     let replica_set = r1
                         .active_segment
                         .and_then(|sid| r1.segments.get(&sid))
-                        // ? why taking replicaset from r1 - what about r2?
+                        // ? Why replica set from r1?
+                        // Arbitrary: both ranges are cold (idle) and likely have the same replica set since they were created by the same split
                         .map(|s| s.replica_set.clone())
                         .unwrap_or_default();
 

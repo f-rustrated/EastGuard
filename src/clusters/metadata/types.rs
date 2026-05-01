@@ -55,7 +55,7 @@ impl SegmentMeta {
         SegmentMeta {
             segment_id,
             state: SegmentState::Active,
-            replica_set: replica_set,
+            replica_set,
             size_bytes: 0,
             start_offset,
             end_offset: None,

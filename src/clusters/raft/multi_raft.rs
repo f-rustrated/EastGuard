@@ -210,6 +210,19 @@ impl MultiRaft {
         let mut mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
         let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
 
+        // Drain auto-proposals from previous flush and propose them.
+        // They become regular log entries, persisted in the same batch below.
+        for id in &dirty {
+            let Some(raft) = self.groups.get_mut(id) else {
+                continue;
+            };
+            for cmd in raft.take_pending_proposals() {
+                if let Err(e) = raft.propose(cmd) {
+                    tracing::warn!("Auto-proposal rejected for {:?}: {:?}", id, e);
+                }
+            }
+        }
+
         for id in &dirty {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
@@ -228,40 +241,6 @@ impl MultiRaft {
             for (id, last_log_index) in &last_indices {
                 if let Some(raft) = self.groups.get_mut(id) {
                     raft.advance_stabled_index(*last_log_index)
-                }
-            }
-        }
-
-        // ! TODO lazy execution?
-        // Drain auto-proposals generated during apply_committed_entries()
-        let mut auto_mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
-        let mut auto_last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
-
-        for id in &dirty {
-            let Some(raft) = self.groups.get_mut(id) else {
-                continue;
-            };
-            let proposals = raft.take_pending_proposals();
-            if proposals.is_empty() {
-                continue;
-            }
-            for cmd in proposals {
-                if let Err(e) = raft.propose(cmd) {
-                    tracing::warn!("Auto-proposal rejected for {:?}: {:?}", id, e);
-                }
-            }
-            auto_last_indices.insert(*id, raft.log_last_index());
-            for log in raft.take_log_mutations() {
-                auto_mutations.push((*id, log));
-            }
-            self.pending_events.extend(raft.take_events());
-        }
-
-        if !auto_mutations.is_empty() {
-            self.storage.persist_mutations(auto_mutations);
-            for (id, last_log_index) in auto_last_indices {
-                if let Some(raft) = self.groups.get_mut(&id) {
-                    raft.advance_stabled_index(last_log_index)
                 }
             }
         }
