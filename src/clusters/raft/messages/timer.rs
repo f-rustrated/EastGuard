@@ -7,7 +7,7 @@ const MERGE_CHECK_INTERVAL_TICKS: u32 = 6_000; // 10 minutes
 
 #[derive(Debug)]
 pub struct RaftTimer {
-    shard_group_id: ShardGroupId,
+    pub(crate) shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
 }

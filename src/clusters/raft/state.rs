@@ -2045,4 +2045,33 @@ mod tests {
         // implicitly committing the term-1 entry at index 1)
         assert_eq!(raft.commit_index, 2);
     }
+
+    #[test]
+    fn merge_check_timer_scheduled_on_leadership() {
+        let seqs = test_timer_seqs();
+        let merge_seq = seqs.merge_check;
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            seqs,
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+
+        let events = raft.take_events();
+        let merge_check_set = events.iter().any(|e| match e {
+            RaftEvent::Timer(TimerCommand::SetSchedule { seq, timer }) => {
+                *seq == merge_seq && timer.shard_group_id == TEST_SHARD
+            }
+            _ => false,
+        });
+        assert!(
+            merge_check_set,
+            "merge_check timer must be scheduled on become_leader"
+        );
+    }
 }
