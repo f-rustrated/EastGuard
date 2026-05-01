@@ -153,7 +153,7 @@ impl Swim {
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
-    pub(super) fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
+    pub fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
             SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
             SwimTimeOutCallback::TimedOut {
@@ -185,37 +185,6 @@ impl Swim {
         }
         #[cfg(test)]
         self.assert_invariants();
-    }
-
-    pub(super) fn handle_query(&self, command: SwimQueryCommand) {
-        match command {
-            SwimQueryCommand::GetMembers { reply } => {
-                let _ = reply.send(self.members.values().cloned().collect());
-            }
-            SwimQueryCommand::ResolveAddress { node_id, reply } => {
-                let addr = self.members.get(&node_id).map(|m| m.addr);
-                let _ = reply.send(addr);
-            }
-            SwimQueryCommand::ResolveShardGroup { key, reply } => {
-                let group = self.topology.shard_group_for(&key).cloned();
-                let _ = reply.send(group);
-            }
-            SwimQueryCommand::ResolveShardLeader {
-                shard_group_id,
-                reply,
-            } => {
-                let entry = self.topology.shard_leader(shard_group_id).cloned();
-                let _ = reply.send(entry);
-            }
-            SwimQueryCommand::GetShardInfo { key, reply } => {
-                let result = self.topology.shard_group_for(&key).cloned().map(|group| {
-                    // ! While shard group exists, it's possible that there might not be ShardLeaderEntry because of in-transit election
-                    let leader = self.topology.shard_leader(group.id).cloned();
-                    (group, leader)
-                });
-                let _ = reply.send(result);
-            }
-        }
     }
 
     fn start_probe(&mut self) {
@@ -341,34 +310,39 @@ impl Swim {
             );
         }
     }
-    pub fn process(&mut self, event: SwimCommand) {
-        match event {
-            SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
-            SwimCommand::Timeout(tick_event) => self.handle_timeout(tick_event),
-            SwimCommand::Query(command) => self.handle_query(command),
-            SwimCommand::AnnounceShardLeader(event) => {
-                tracing::info!(
-                    "[{}] Shard leader announced: group={:?} leader={} term={}",
-                    self.node_id,
-                    event.shard_group_id,
-                    event.leader_node_id,
-                    event.term
-                );
-
-                let info = ShardLeaderInfo {
-                    shard_group_id: event.shard_group_id,
-                    leader_node_id: event.leader_node_id,
-                    leader_addr: self.self_addr,
-                    term: event.term,
-                };
-                self.apply_shard_leader_update(&info);
-            }
-        }
+    pub fn announce_shard_leader(
+        &mut self,
+        shard_group_id: ShardGroupId,
+        leader_node_id: NodeId,
+        term: u64,
+    ) {
+        tracing::info!(
+            "[{}] Shard leader announced: group={:?} leader={} term={}",
+            self.node_id,
+            shard_group_id,
+            leader_node_id,
+            term
+        );
+        let info = ShardLeaderInfo {
+            shard_group_id,
+            leader_node_id,
+            leader_addr: self.self_addr,
+            term,
+        };
+        self.apply_shard_leader_update(&info);
         #[cfg(test)]
         self.assert_invariants();
     }
 
-    pub(super) fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
+    pub fn get_members(&self) -> Vec<SwimNode> {
+        self.members.values().cloned().collect()
+    }
+
+    pub fn resolve_address(&self, node_id: &NodeId) -> Option<NodeAddress> {
+        self.members.get(node_id).map(|m| m.addr)
+    }
+
+    pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         // 1. Process Gossip (Piggybacked updates)
         for member in packet.gossip() {
             self.apply_membership_update(member.clone());
@@ -1510,7 +1484,6 @@ mod tests {
 
     mod shard_leader {
         use super::*;
-        use crate::clusters::raft::messages::LeaderChange;
         use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
         use crate::clusters::swims::swim::tests::{add_node_harness, ping};
         use crate::clusters::swims::topology::ShardGroupId;
@@ -1523,11 +1496,7 @@ mod tests {
             add_node_harness(&mut h, "node-b", b_addr, 1);
 
             h.protocol
-                .process(SwimCommand::AnnounceShardLeader(LeaderChange {
-                    shard_group_id: ShardGroupId(42),
-                    leader_node_id: NodeId::new("node-local"),
-                    term: 1,
-                }));
+                .announce_shard_leader(ShardGroupId(42), NodeId::new("node-local"), 1);
 
             let packets = h.protocol.take_packets();
             let has_leader_info = packets.iter().any(|p| {
@@ -1694,11 +1663,7 @@ mod tests {
             let _ = b.take_events();
 
             // A announces itself as leader of group 42
-            a.process(SwimCommand::AnnounceShardLeader(LeaderChange {
-                shard_group_id: ShardGroupId(42),
-                leader_node_id: NodeId::new("node-a"),
-                term: 1,
-            }));
+            a.announce_shard_leader(ShardGroupId(42), NodeId::new("node-a"), 1);
             let _ = a.take_events();
 
             // A pings B — packet should contain shard leader info
@@ -1735,11 +1700,7 @@ mod tests {
             let client_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
             h.protocol
-                .process(SwimCommand::AnnounceShardLeader(LeaderChange {
-                    shard_group_id: ShardGroupId(42),
-                    leader_node_id: NodeId::new("node-local"),
-                    term: 1,
-                }));
+                .announce_shard_leader(ShardGroupId(42), NodeId::new("node-local"), 1);
             let _ = h.protocol.take_events();
 
             let entry = h.protocol.topology.shard_leader(ShardGroupId(42));

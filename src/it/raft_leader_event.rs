@@ -12,7 +12,7 @@ use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
+use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -24,19 +24,19 @@ const RESULT_PORT: u16 = 39000;
 /// Mock SWIM handler that responds to ResolveAddress queries and collects
 /// LeaderChangeEvents for later retrieval.
 async fn swim_handler_with_leader_capture(
-    mut rx: mpsc::Receiver<SwimCommand>,
+    mut rx: mpsc::Receiver<SwimActorCommand>,
     address_map: HashMap<NodeId, SocketAddr>,
     leader_events_tx: mpsc::Sender<LeaderChange>,
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            SwimCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) => {
+            SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) => {
                 let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
                     cluster_addr: addr,
                     client_addr: addr,
                 }));
             }
-            SwimCommand::AnnounceShardLeader(event) => {
+            SwimActorCommand::Protocol(SwimCommand::AnnounceShardLeader(event)) => {
                 let _ = leader_events_tx.send(event).await;
             }
             _ => {}

@@ -9,7 +9,7 @@ use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::actor::SwimSender;
-use crate::clusters::swims::{SwimCommand, SwimQueryCommand};
+use crate::clusters::swims::SwimQueryCommand;
 use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 
@@ -199,10 +199,10 @@ impl RaftWriters {
         }
 
         let (tx, rx) = oneshot::channel();
-        let query = SwimCommand::Query(SwimQueryCommand::ResolveAddress {
+        let query = SwimQueryCommand::ResolveAddress {
             node_id: node_id.clone(),
             reply: tx,
-        });
+        };
 
         if swim_tx.send(query).await.is_err() {
             return None;

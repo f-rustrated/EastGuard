@@ -17,10 +17,15 @@ pub(crate) enum SwimCommand {
     PacketReceived { src: SocketAddr, packet: SwimPacket },
     // From Ticker(Internal)
     Timeout(SwimTimeOutCallback),
-    // From API (e.g., HTTP API)
-    Query(SwimQueryCommand),
     // From MultiRaftActor(Internal) — leader election completed for a shard group
     AnnounceShardLeader(LeaderChange),
+}
+
+/// Actor-level command envelope. Lives only in eastguard (carries tokio oneshot via Query).
+#[derive(Debug)]
+pub(crate) enum SwimActorCommand {
+    Protocol(SwimCommand),
+    Query(SwimQueryCommand),
 }
 
 #[derive(Debug)]
@@ -46,15 +51,27 @@ pub enum SwimQueryCommand {
     },
 }
 
-impl From<SwimQueryCommand> for SwimCommand {
-    fn from(value: SwimQueryCommand) -> Self {
-        SwimCommand::Query(value)
-    }
-}
-
 impl From<SwimTimeOutCallback> for SwimCommand {
     fn from(value: SwimTimeOutCallback) -> Self {
         SwimCommand::Timeout(value)
+    }
+}
+
+impl From<SwimCommand> for SwimActorCommand {
+    fn from(cmd: SwimCommand) -> Self {
+        SwimActorCommand::Protocol(cmd)
+    }
+}
+
+impl From<SwimTimeOutCallback> for SwimActorCommand {
+    fn from(cb: SwimTimeOutCallback) -> Self {
+        SwimActorCommand::Protocol(SwimCommand::Timeout(cb))
+    }
+}
+
+impl From<SwimQueryCommand> for SwimActorCommand {
+    fn from(q: SwimQueryCommand) -> Self {
+        SwimActorCommand::Query(q)
     }
 }
 

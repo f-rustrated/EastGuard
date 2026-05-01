@@ -5,6 +5,6 @@ mod timer;
 
 pub use command::{MembershipEvent, SwimEvent, SwimQueryCommand};
 
-pub(crate) use command::{SwimCommand, SwimTimeOutCallback, SwimTimerKind};
+pub(crate) use command::{SwimActorCommand, SwimCommand, SwimTimeOutCallback, SwimTimerKind};
 pub use packet::{OutboundPacket, SwimHeader, SwimPacket};
 pub(crate) use timer::*;
