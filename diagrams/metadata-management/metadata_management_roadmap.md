@@ -477,11 +477,11 @@ Consumer behavior on split:
 - **Single consumer:** switches to consuming both child ranges (may spawn second consumer).
 - **Consumer group:** rebalance — assign each child range to a consumer.
 
-### RocksDB Storage Integration
+### RocksDB Storage Integration ✅ (log persistence)
 
-Durable storage per `storage_implementation_plan.md`. Can begin after Phase 3.
+Durable storage implemented. Single RocksDB instance shared across all shard groups with composite keys (`[group_id BE][key_type][index BE]`). Covers: RocksDB dependency, `RaftStorage` trait, `MetadataStorage` implementation, atomic `WriteBatch` flush with fsync, `LogMutation` drain pattern, `stabled_index` tracking, HardState persistence, startup recovery, multi-group isolation, `delete_group()` via range delete.
 
-Covers: RocksDB dependency, `MultiRaft` → `MultiRaftStore` refactor, `WriteBatch` flush, startup recovery, snapshots, log compaction, InstallSnapshot RPC. See `storage_implementation_plan.md` for full design.
+**Remaining (snapshot subsystem):** InstallSnapshot RPC, snapshot creation/restore on `MetadataStateMachine`, log compaction, applied index persistence. Logs grow unbounded until snapshots land — acceptable for current scale.
 
 ---
 
@@ -519,6 +519,6 @@ Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counter
 |---|---|
 | Pending proposals leak on leader stepdown | Drain and error all pending in `step_down()` |
 | Hash ring divergence between client/broker | Server resolves routing from SWIM topology (~2-3s convergence). Leader forwarding handles misrouted proposals. Epoch cancelled — not needed. |
-| Bincode format change on new `RaftCommand` variants | In-memory only for now; version byte on `LogEntry` when RocksDB lands |
+| Bincode format change on new `RaftCommand` variants | RocksDB persists entries now; version byte on `LogEntry` when format changes needed |
 | Midpoint split doesn't balance skewed workloads | Acceptable for Phase 6 — percentile-based split in backlog |
 | Seal tracker grows unbounded for long-lived ranges | Sliding window bounded; entries removed on range seal/delete |
