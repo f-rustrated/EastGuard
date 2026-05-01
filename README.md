@@ -35,6 +35,7 @@ cargo run --bin server -- \
 --cluster-port 13001 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node1 \
+--meta-dir /tmp/eg-node1-meta \
 --config-dir /tmp/eg-node1-config \
 --join-seed-nodes 127.0.0.1:13002 \
 --join-seed-nodes 127.0.0.1:13003 \
@@ -47,6 +48,7 @@ cargo run --bin server -- \
 --cluster-port 13002 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node2 \
+--meta-dir /tmp/eg-node2-meta \
 --config-dir /tmp/eg-node2-config \
 --join-seed-nodes 127.0.0.1:13001 \
 --join-seed-nodes 127.0.0.1:13003 \
@@ -59,6 +61,7 @@ cargo run --bin server -- \
 --cluster-port 13003 \
 --advertise-host 127.0.0.1 \
 --data-dir /tmp/eg-node3 \
+--meta-dir /tmp/eg-node3-meta \
 --config-dir /tmp/eg-node3-config \
 --join-seed-nodes 127.0.0.1:13001 \
 --join-seed-nodes 127.0.0.1:13002 \
