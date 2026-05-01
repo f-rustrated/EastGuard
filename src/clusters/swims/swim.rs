@@ -10,6 +10,7 @@ use std::collections::btree_map::Entry;
 use std::net::SocketAddr;
 
 const INDIRECT_PING_COUNT: usize = 3;
+const SWIM_GOSSIP_CAPACITY: usize = 64;
 
 /// SWIM protocol state machine. No async, no channels, no timers.
 ///
@@ -76,6 +77,11 @@ pub struct Swim {
 
 impl Swim {
     pub fn new(node_id: NodeId, self_addr: NodeAddress, topology: Topology, rng_seed: u64) -> Self {
+        // Each node leads at most vnodes_per_pnode shard groups on average, but at startup all
+        // replication_factor * vnodes_per_pnode groups this node participates in may elect it as
+        // leader simultaneously, so the buffer must hold all of them without eviction.
+        let shard_leader_buffer_capacity =
+            topology.replication_factor() * topology.vnodes_per_pnode();
         let mut swim = Self {
             node_id,
             self_addr,
@@ -83,8 +89,10 @@ impl Swim {
             topology,
             members: BTreeMap::new(),
             live_node_tracker: LiveNodeTracker::new(rng_seed),
-            gossip_buffer: SwimBuffer::default(),
-            shard_leader_buffer: ShardLeaderGossipBuffer::default(),
+            gossip_buffer: SwimBuffer::with_capacity(SWIM_GOSSIP_CAPACITY),
+            shard_leader_buffer: ShardLeaderGossipBuffer::with_capacity(
+                shard_leader_buffer_capacity,
+            ),
             seq_counter: 0,
             last_suspected_seqs: BTreeMap::new(),
             pending_events: Vec::new(),

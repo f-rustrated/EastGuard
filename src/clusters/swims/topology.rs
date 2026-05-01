@@ -84,6 +84,14 @@ impl Topology {
         topology
     }
 
+    pub(crate) fn vnodes_per_pnode(&self) -> usize {
+        self.config.vnodes_per_pnode as usize
+    }
+
+    pub(crate) fn replication_factor(&self) -> usize {
+        self.config.replication_factor
+    }
+
     pub(crate) fn update(&mut self, node_id: NodeId, state: &SwimNodeState) {
         match state {
             SwimNodeState::Alive => {
