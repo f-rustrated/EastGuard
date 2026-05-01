@@ -11,7 +11,7 @@ use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimCommand, SwimQueryCommand};
+use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimActorCommand, SwimQueryCommand};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -23,11 +23,11 @@ const QUERY_PORT: u16 = 29000;
 
 /// Mock SWIM handler — only responds to ResolveAddress queries.
 async fn mock_swim_handler(
-    mut rx: mpsc::Receiver<SwimCommand>,
+    mut rx: mpsc::Receiver<SwimActorCommand>,
     address_map: HashMap<NodeId, SocketAddr>,
 ) {
     while let Some(cmd) = rx.recv().await {
-        if let SwimCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
+        if let SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
             let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
                 cluster_addr: addr,
                 client_addr: addr,

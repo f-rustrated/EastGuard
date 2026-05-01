@@ -8,8 +8,8 @@ use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::peer_discovery::JoinConfig;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{
-    DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, SwimCommand, SwimHeader, SwimPacket,
-    SwimQueryCommand, SwimTimer, Topology, TopologyConfig,
+    DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, SwimActorCommand, SwimCommand, SwimHeader,
+    SwimPacket, SwimQueryCommand, SwimTimer, Topology, TopologyConfig,
 };
 
 use crate::schedulers::actor::run_scheduling_actor;
@@ -23,7 +23,7 @@ use super::*;
 
 #[allow(dead_code)]
 struct TestHarness {
-    pub tx_in: mpsc::Sender<SwimCommand>,
+    pub tx_in: mpsc::Sender<SwimActorCommand>,
     pub tx_out: mpsc::Sender<OutboundPacket>,
     pub rx_out: Option<mpsc::Receiver<OutboundPacket>>,
     pub ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
@@ -35,7 +35,7 @@ impl TestHarness {
     pub async fn query_topology_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
+            .send(SwimActorCommand::Query(SwimQueryCommand::GetMembers {
                 reply: tx,
             }))
             .await
@@ -48,7 +48,7 @@ impl TestHarness {
     pub async fn query_topology_includes(&self, node_id: NodeId) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx_in
-            .send(SwimCommand::Query(SwimQueryCommand::GetMembers {
+            .send(SwimActorCommand::Query(SwimQueryCommand::GetMembers {
                 reply: tx,
             }))
             .await
@@ -63,7 +63,7 @@ impl TestHarness {
 /// Routes `OutboundPacket`s between test harnesses, simulating a network.
 /// Call `add()` for every harness, then `spawn()` to start routing.
 struct NetworkBridge {
-    routes: HashMap<SocketAddr, mpsc::Sender<SwimCommand>>,
+    routes: HashMap<SocketAddr, mpsc::Sender<SwimActorCommand>>,
     inbounds: Vec<(SocketAddr, mpsc::Receiver<OutboundPacket>)>,
 }
 
@@ -90,10 +90,10 @@ impl NetworkBridge {
                 while let Some(pkt) = rx.recv().await {
                     if let Some(tx) = routes.get(&pkt.target) {
                         let _ = tx
-                            .send(SwimCommand::PacketReceived {
+                            .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
                                 src: sender_addr,
                                 packet: pkt.packet().clone(),
-                            })
+                            }))
                             .await;
                     }
                 }
@@ -180,10 +180,10 @@ async fn test_ping_response() {
 
     harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: remote_addr,
             packet: ping,
-        })
+        }))
         .await
         .unwrap();
 
@@ -228,10 +228,10 @@ async fn test_refutation_mechanism() {
 
     harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: remote_addr,
             packet: ping,
-        })
+        }))
         .await
         .unwrap();
 
@@ -273,7 +273,7 @@ async fn test_gossip_propagation() {
 
     harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 300,
@@ -282,7 +282,7 @@ async fn test_gossip_propagation() {
                 gossip: vec![gossip_msg],
                 shard_leaders: vec![],
             }),
-        })
+        }))
         .await
         .unwrap();
 
@@ -294,7 +294,7 @@ async fn test_gossip_propagation() {
         // Send a fresh probe
         harness
             .tx_in
-            .send(SwimCommand::PacketReceived {
+            .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
                 src: probe_addr,
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 400 + i, // Increment seq to keep packets distinct
@@ -303,7 +303,7 @@ async fn test_gossip_propagation() {
                     gossip: vec![],
                     shard_leaders: vec![],
                 }),
-            })
+            }))
             .await
             .unwrap();
 
@@ -362,7 +362,7 @@ async fn test_indirect_ping_trigger() {
 
     harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: peer_1,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
@@ -371,7 +371,7 @@ async fn test_indirect_ping_trigger() {
                 gossip: vec![p1, p2],
                 shard_leaders: vec![],
             }),
-        })
+        }))
         .await
         .unwrap();
 
@@ -448,7 +448,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
     let new_node: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let _ = harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
@@ -465,7 +465,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
                 }],
                 shard_leaders: vec![],
             }),
-        })
+        }))
         .await;
 
     assert!(
@@ -484,7 +484,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
         // Step 1: add the node via Alive gossip
         let _ = harness
             .tx_in
-            .send(SwimCommand::PacketReceived {
+            .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
                 src: sender_addr,
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 1,
@@ -501,7 +501,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                     }],
                     shard_leaders: vec![],
                 }),
-            })
+            }))
             .await;
     }
 
@@ -513,7 +513,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
     // Step 2: mark the node as Dead via gossip
     let _ = harness
         .tx_in
-        .send(SwimCommand::PacketReceived {
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 2,
@@ -530,7 +530,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                 }],
                 shard_leaders: vec![],
             }),
-        })
+        }))
         .await;
 
     assert!(

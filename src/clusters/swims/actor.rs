@@ -17,12 +17,12 @@ use tokio::sync::mpsc::error::SendError;
 pub struct SwimActor;
 
 impl SwimActor {
-    pub fn channel(buffer: usize) -> (SwimSender, mpsc::Receiver<SwimCommand>) {
+    pub fn channel(buffer: usize) -> (SwimSender, mpsc::Receiver<SwimActorCommand>) {
         let (swim_sender, swim_mailbox) = mpsc::channel(buffer);
         (SwimSender(swim_sender), swim_mailbox)
     }
     pub async fn run(
-        mut mailbox: mpsc::Receiver<SwimCommand>,
+        mut mailbox: mpsc::Receiver<SwimActorCommand>,
         mut state: Swim,
         transport_tx: mpsc::Sender<OutboundPacket>,
         scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
@@ -37,9 +37,47 @@ impl SwimActor {
                 break;
             }
             for event in buf.drain(..) {
-                state.process(event);
+                match event {
+                    SwimActorCommand::Protocol(cmd) => match cmd {
+                        SwimCommand::PacketReceived { src, packet } => state.step(src, packet),
+                        SwimCommand::Timeout(event) => state.handle_timeout(event),
+                        SwimCommand::AnnounceShardLeader(event) => state.announce_shard_leader(
+                            event.shard_group_id,
+                            event.leader_node_id,
+                            event.term,
+                        ),
+                    },
+                    SwimActorCommand::Query(q) => Self::handle_query(&state, q),
+                }
             }
             Self::flush(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
+        }
+    }
+
+    fn handle_query(state: &Swim, command: SwimQueryCommand) {
+        match command {
+            SwimQueryCommand::GetMembers { reply } => {
+                let _ = reply.send(state.get_members());
+            }
+            SwimQueryCommand::ResolveAddress { node_id, reply } => {
+                let _ = reply.send(state.resolve_address(&node_id));
+            }
+            SwimQueryCommand::ResolveShardGroup { key, reply } => {
+                let _ = reply.send(state.topology.shard_group_for(&key).cloned());
+            }
+            SwimQueryCommand::ResolveShardLeader {
+                shard_group_id,
+                reply,
+            } => {
+                let _ = reply.send(state.topology.shard_leader(shard_group_id).cloned());
+            }
+            SwimQueryCommand::GetShardInfo { key, reply } => {
+                let result = state.topology.shard_group_for(&key).cloned().map(|group| {
+                    let leader = state.topology.shard_leader(group.id).cloned();
+                    (group, leader)
+                });
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -103,13 +141,13 @@ impl SwimActor {
 }
 
 #[derive(Clone, Debug)]
-pub struct SwimSender(mpsc::Sender<SwimCommand>);
+pub struct SwimSender(mpsc::Sender<SwimActorCommand>);
 impl SwimSender {
     #[inline]
     pub(crate) async fn send(
         &self,
-        cmd: impl Into<SwimCommand>,
-    ) -> Result<(), SendError<SwimCommand>> {
+        cmd: impl Into<SwimActorCommand>,
+    ) -> Result<(), SendError<SwimActorCommand>> {
         self.0.send(cmd.into()).await
     }
 
@@ -160,7 +198,7 @@ impl SwimSender {
     }
 }
 
-impl From<SwimSender> for mpsc::Sender<SwimCommand> {
+impl From<SwimSender> for mpsc::Sender<SwimActorCommand> {
     fn from(value: SwimSender) -> Self {
         value.0
     }

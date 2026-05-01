@@ -290,10 +290,17 @@ Control panel sections:
 
 Tasks:
 
-1. Extract `east-guard-core` workspace crate: move pure state machine modules out of `east-guard`; confirm `east-guard`
-   still compiles; confirm `east-guard-core` compiles with no `tokio`/`rocksdb` in its dependency tree
+1. Extract `eastguard-core` workspace crate (two sub-steps):
+   - **1a. Refactor eastguard first**: make the structural changes inside the existing `east-guard` crate
+     (remove `Swim::process` / `Swim::handle_query`, make `step` / `handle_timeout` `pub`, add
+     `announce_shard_leader`, add query accessor methods, update `actor.rs` dispatch, update tests).
+     Run `cargo clippy` to verify before touching the new crate.
+   - **1b. Migrate to eastguard-core**: copy the refactored pure-state-machine files into `eastguard-core`
+     (only path adjustments needed, no logic changes); replace the originals in `east-guard` with
+     `pub use eastguard_core::...` re-export shims; confirm `east-guard` still compiles; confirm
+     `eastguard-core` has no `tokio` / `rocksdb` in its dependency tree.
 2. Create `simulator/wasm/Cargo.toml` — add `wasm-bindgen`, `serde`, `serde-json`, `getrandom` (`js` feature); depend
-   on `east-guard-core`
+   on `eastguard-core`
 3. Implement `VirtualNetwork` with enqueue / deliver / fault rules
 4. Implement `SimNode` wrapping one `Swim` + `Topology` + `MetadataStateMachine` + `Vec<Raft>` (one per shard group)
 5. Implement `SimulatorEngine::new(node_count, shards, seed)` — create nodes with only seed address knowledge; real SWIM
@@ -387,7 +394,7 @@ Tasks:
 - `serde` + `serde-json` for snapshot serialization (return `JsValue` from `tick()`)
 - `getrandom` with `js` feature for seeded RNG in WASM
 - `wasm-pack` as the build tool (`wasm-pack build --target web`)
-- The WASM crate depends on `east-guard-core` (see Prerequisite below), NOT on the main `east-guard` crate
+- The WASM crate depends on `eastguard-core` (see Prerequisite below), NOT on the main `east-guard` crate
 
 ### JavaScript side
 
@@ -399,19 +406,19 @@ Tasks:
 
 ---
 
-## Prerequisite — Extract `east-guard-core` Workspace Crate
+## Prerequisite — Extract `eastguard-core` Workspace Crate
 
 The main `east-guard` crate has `tokio`, `rocksdb`, and other native-only dependencies at the root. WebAssembly cannot
 compile these. The pure state machines (`Swim`, `Raft`, `Topology`, `MetadataStateMachine`, `Ticker`) are async-free
 and I/O-free, but they currently live in the same crate as the actors and storage layer that are not.
 
-**Solution:** Create a new workspace crate `east-guard-core` containing only the pure state machines. No `tokio`, no
+**Solution:** Create a new workspace crate `eastguard-core` containing only the pure state machines. No `tokio`, no
 `rocksdb`, no async. The main `east-guard` crate becomes a thin layer of actors + storage that depends on
-`east-guard-core`. The WASM crate also depends on `east-guard-core`.
+`eastguard-core`. The WASM crate also depends on `eastguard-core`.
 
 ```
 Workspace
-├── east-guard-core/     ← NEW: pure state machines only (no tokio, no rocksdb)
+├── eastguard-core/     ← NEW: pure state machines only (no tokio, no rocksdb)
 │   └── src/
 │       ├── swim/        (moved from east-guard/src/clusters/swims/)
 │       ├── raft/        (moved from east-guard/src/clusters/raft/)
@@ -419,13 +426,13 @@ Workspace
 │       ├── metadata/    (moved from east-guard/src/clusters/metadata/)
 │       └── scheduler/   (moved from east-guard/src/schedulers/)
 │
-├── east-guard/          ← existing crate; actors + storage; depends on east-guard-core
+├── east-guard/          ← existing crate; actors + storage; depends on eastguard-core
 │   └── src/
 │       ├── clusters/    (actors, transport — keep tokio here)
 │       └── ...
 │
 └── simulator/
-    └── wasm/            ← depends on east-guard-core only
+    └── wasm/            ← depends on eastguard-core only
 ```
 
 This refactor is the prerequisite for Phase 1. It is also a net improvement to the main codebase — the protocol logic
