@@ -23,7 +23,7 @@ impl TTimer for SwimTimer {
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, seq: u32) -> SwimTimeOutCallback {
+    fn to_timeout_callback(self, seq: u32, _now: u64) -> SwimTimeOutCallback {
         SwimTimeOutCallback::TimedOut {
             seq,
             target_node_id: self.target_node_id,

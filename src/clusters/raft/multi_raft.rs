@@ -151,7 +151,7 @@ impl MultiRaft {
             RaftTimeoutCallback::Ignored => return,
             RaftTimeoutCallback::ElectionTimeout { shard_group_id }
             | RaftTimeoutCallback::HeartbeatTimeout { shard_group_id }
-            | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id } => *shard_group_id,
+            | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. } => *shard_group_id,
         };
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.handle_timeout(cb);

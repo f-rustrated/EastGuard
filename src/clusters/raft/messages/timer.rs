@@ -7,7 +7,7 @@ const MERGE_CHECK_INTERVAL_TICKS: u32 = 6_000; // 10 minutes
 
 #[derive(Debug)]
 pub struct RaftTimer {
-    shard_group_id: ShardGroupId,
+    pub(crate) shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
 }
@@ -31,6 +31,7 @@ pub enum RaftTimeoutCallback {
     },
     MergeCheckTimeout {
         shard_group_id: ShardGroupId,
+        now: u64,
     },
 }
 
@@ -42,7 +43,7 @@ impl TTimer for RaftTimer {
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, _seq: u32) -> RaftTimeoutCallback {
+    fn to_timeout_callback(self, _seq: u32, now: u64) -> RaftTimeoutCallback {
         match self.kind {
             RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: self.shard_group_id,
@@ -52,6 +53,7 @@ impl TTimer for RaftTimer {
             },
             RaftTimerKind::MergeCheck => RaftTimeoutCallback::MergeCheckTimeout {
                 shard_group_id: self.shard_group_id,
+                now,
             },
         }
     }

@@ -1,13 +1,9 @@
-use crate::schedulers::ticker::Ticker;
+use crate::schedulers::ticker::{TICK_PERIOD_MS, Ticker};
 use crate::schedulers::ticker_message::TickerCommand;
 use crate::schedulers::timer::TTimer;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
-
-/// One real-time tick = 100 ms.
-/// PROTOCOL_PERIOD_TICKS (10) × TICK_PERIOD_MS (100 ms) = 1 s per probe round.
-pub const TICK_PERIOD_MS: u64 = 100;
 
 pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
@@ -22,17 +18,16 @@ pub async fn run_scheduling_actor<T>(
         tokio::select! {
             biased;
             _ = interval.tick() => {
-                for event in ticker.advance_clock() {
+                for event in ticker.advance_clock(now_ms()) {
                     let _ = sender.send(event.into()).await;
                 }
             }
 
-            // What if scheduling actor consistantly gets mailbox and ticker never gets picked in select?
             Some(cmd) = mailbox.recv() => {
                 match cmd {
                     #[cfg(test)]
                     TickerCommand::ForceTick => {
-                        for event in ticker.advance_clock() {
+                        for event in ticker.advance_clock(now_ms()) {
                             let _ = sender.send(event.into()).await;
                         }
                     }
@@ -44,4 +39,11 @@ pub async fn run_scheduling_actor<T>(
 
         }
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

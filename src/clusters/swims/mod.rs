@@ -65,7 +65,7 @@ pub mod common {
         }
 
         pub fn tick(&mut self) {
-            let events = self.ticker.advance_clock();
+            let events = self.ticker.advance_clock(0);
             for event in events {
                 self.protocol.handle_timeout(event);
                 self.apply_timer_commands();
