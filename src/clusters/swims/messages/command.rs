@@ -2,76 +2,23 @@ use std::net::SocketAddr;
 
 use crate::clusters::raft::messages::LeaderChange;
 use crate::clusters::swims::peer_discovery::JoinAttempt;
-use crate::clusters::swims::topology::ShardLeaderEntry;
-use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::clusters::{NodeAddress, NodeId, SwimNode};
+use crate::clusters::NodeId;
 use crate::schedulers::ticker_message::TimerCommand;
 
 use super::packet::{OutboundPacket, SwimPacket};
 use super::timer::SwimTimer;
 
-/// Internal Events (Actor Logic)
+/// Inputs to the Swim state machine (tokio-free, WASM-safe).
 #[derive(Debug)]
 pub(crate) enum SwimCommand {
-    // From Transport(External)
     PacketReceived { src: SocketAddr, packet: SwimPacket },
-    // From Ticker(Internal)
     Timeout(SwimTimeOutCallback),
-    // From MultiRaftActor(Internal) — leader election completed for a shard group
     AnnounceShardLeader(LeaderChange),
-}
-
-/// Actor-level command envelope. Lives only in eastguard (carries tokio oneshot via Query).
-#[derive(Debug)]
-pub(crate) enum SwimActorCommand {
-    Protocol(SwimCommand),
-    Query(SwimQueryCommand),
-}
-
-#[derive(Debug)]
-pub enum SwimQueryCommand {
-    GetMembers {
-        reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
-    },
-    ResolveAddress {
-        node_id: NodeId,
-        reply: tokio::sync::oneshot::Sender<Option<NodeAddress>>,
-    },
-    ResolveShardGroup {
-        key: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Option<ShardGroup>>,
-    },
-    ResolveShardLeader {
-        shard_group_id: ShardGroupId,
-        reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
-    },
-    GetShardInfo {
-        key: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Option<(ShardGroup, Option<ShardLeaderEntry>)>>,
-    },
 }
 
 impl From<SwimTimeOutCallback> for SwimCommand {
     fn from(value: SwimTimeOutCallback) -> Self {
         SwimCommand::Timeout(value)
-    }
-}
-
-impl From<SwimCommand> for SwimActorCommand {
-    fn from(cmd: SwimCommand) -> Self {
-        SwimActorCommand::Protocol(cmd)
-    }
-}
-
-impl From<SwimTimeOutCallback> for SwimActorCommand {
-    fn from(cb: SwimTimeOutCallback) -> Self {
-        SwimActorCommand::Protocol(SwimCommand::Timeout(cb))
-    }
-}
-
-impl From<SwimQueryCommand> for SwimActorCommand {
-    fn from(q: SwimQueryCommand) -> Self {
-        SwimActorCommand::Query(q)
     }
 }
 
