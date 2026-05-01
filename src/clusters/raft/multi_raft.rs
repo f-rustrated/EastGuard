@@ -6,7 +6,7 @@ use crate::clusters::raft::messages::{
     LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
     RaftTimeoutCallback,
 };
-use crate::clusters::raft::state::Raft;
+use crate::clusters::raft::state::{Raft, TimerSeqs};
 
 use crate::clusters::raft::storage::RaftStorage;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -99,6 +99,7 @@ impl MultiRaft {
 
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
+        let merge_check_seq = self.seq_counter.generate();
 
         let persistent = self.storage.load_state(group.id.0);
 
@@ -108,8 +109,11 @@ impl MultiRaft {
             persistent,
             jitter,
             group.id,
-            election_seq,
-            heartbeat_seq,
+            TimerSeqs {
+                election: election_seq,
+                heartbeat: heartbeat_seq,
+                merge_check: merge_check_seq,
+            },
         );
 
         tracing::info!(
@@ -145,8 +149,9 @@ impl MultiRaft {
     fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
-            RaftTimeoutCallback::ElectionTimeout { shard_group_id } => *shard_group_id,
-            RaftTimeoutCallback::HeartbeatTimeout { shard_group_id } => *shard_group_id,
+            RaftTimeoutCallback::ElectionTimeout { shard_group_id }
+            | RaftTimeoutCallback::HeartbeatTimeout { shard_group_id }
+            | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id } => *shard_group_id,
         };
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.handle_timeout(cb);
@@ -205,6 +210,19 @@ impl MultiRaft {
         let mut mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
         let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
 
+        // Drain auto-proposals from previous flush and propose them.
+        // They become regular log entries, persisted in the same batch below.
+        for id in &dirty {
+            let Some(raft) = self.groups.get_mut(id) else {
+                continue;
+            };
+            for cmd in raft.take_pending_proposals() {
+                if let Err(e) = raft.propose(cmd) {
+                    tracing::warn!("Auto-proposal rejected for {:?}: {:?}", id, e);
+                }
+            }
+        }
+
         for id in &dirty {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
@@ -220,9 +238,9 @@ impl MultiRaft {
         if !mutations.is_empty() {
             self.storage.persist_mutations(mutations);
 
-            for (id, last_log_index) in last_indices {
-                if let Some(raft) = self.groups.get_mut(&id) {
-                    raft.advance_stabled_index(last_log_index)
+            for (id, last_log_index) in &last_indices {
+                if let Some(raft) = self.groups.get_mut(id) {
+                    raft.advance_stabled_index(*last_log_index)
                 }
             }
         }
@@ -666,11 +684,7 @@ mod tests {
 
         let g2 = store.groups.get(&ShardGroupId(2)).unwrap();
         assert_eq!(g2.current_term(), 0, "group 2 term must be unaffected");
-        assert_eq!(
-            g2.log_last_index(),
-            0,
-            "group 2 log must be empty"
-        );
+        assert_eq!(g2.log_last_index(), 0, "group 2 log must be empty");
     }
 
     #[test]

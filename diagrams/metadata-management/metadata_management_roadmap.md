@@ -4,7 +4,7 @@ SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from th
 
 ---
 
-## Phase 1: Data Model + MetadataStateMachine
+## Phase 1: Data Model + MetadataStateMachine ✅
 
 **Goal:** Define metadata types and a pure in-memory state machine.
 
@@ -59,7 +59,7 @@ struct MetadataStateMachine {
 
 Flat maps for ranges/segments removed — they live nested inside `TopicMeta` and `RangeMeta` respectively.
 
-Pure functions: `apply_create_topic()`, `apply_split_range()`, `apply_seal_segment()`. No I/O, no async.
+Pure functions: `apply_create_topic()`, `apply_split_range()`, `apply_roll_segment()`. No I/O, no async.
 
 See `diagrams/metadata-management/data-model.md` for full entity relationships, state transitions, cascading effects, and invariants.
 
@@ -88,7 +88,7 @@ enum RaftCommand {
 ```rust
 enum MetadataCommand {
     CreateTopic(CreateTopic),
-    SealSegment(SealSegment),
+    RollSegment(RollSegment),
     SplitRange(SplitRange),
     MergeRange(MergeRange),
     DeleteTopic(DeleteTopic),
@@ -115,7 +115,7 @@ enum ProposeError {
 
 ---
 
-## Phase 3: Application State Machine Dispatch
+## Phase 3: Application State Machine Dispatch ✅
 
 **Goal:** `Raft` owns `MetadataStateMachine` and applies committed metadata commands inline.
 
@@ -169,7 +169,7 @@ For tests to query applied state.
 
 ---
 
-## Phase 4: Client → Raft Propose Pathway
+## Phase 4: Client → Raft Propose Pathway ✅
 
 **Goal:** Wire end-to-end path: Client → `MultiRaftActor` → hash(key) → propose to local Raft → commit → apply → respond.
 
@@ -340,130 +340,113 @@ Client SDK concern. Server-side signals available:
 
 ---
 
-## Phase 6: Hot Range Detection + Auto-Split/Merge
+## Phase 6: Hot Range Detection + Auto-Split/Merge ✅
 
 **Goal:** MetadataStateMachine detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
 
 ### Core Insight
 
-`MetadataStateMachine` already sees every `SealSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
+`MetadataStateMachine` already sees every `RollSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
 
 ### 6a. Per-Range Seal Tracker
 
-Add to `RangeMeta`:
+`RangeSealHistory` on `RangeMeta`:
 
 ```rust
 struct RangeSealHistory {
-    last_seal_at: u64,          // monotonic timestamp of most recent seal
-    seal_count_in_window: u32,  // seals within sliding window
-    window_start: u64,          // start of current measurement window
-    cooldown_until: u64,        // no split before this time (post-split cooldown)
+    seal_timestamps: VecDeque<u64>,         // recent seal times within measurement window
+    created_by_split_at: Option<u64>,  // cooldown anchor for child ranges
 }
-
-// In RangeMeta:
-seal_history: RangeSealHistory,
 ```
 
 Lives inside `RangeMeta` — no separate tracker map needed. Naturally scoped to the range, cleaned up when range is deleted.
 
-Updated inside `apply_seal_segment()` — pure, deterministic, replicated on every node.
+Updated inside `RangeMeta::roll_segment()` via `record_seal()` — pure, deterministic, replicated on every node. Old timestamps pruned on each seal (sliding window).
 
 ### 6b. Split Decision Logic
 
-After each `apply_seal_segment()`, MetadataStateMachine (leader only) evaluates:
+`RangeMeta::roll_segment()` returns `should_split` bool. `MetadataStateMachine::roll_segment()` checks the return value (leader-only evaluation via `pending_proposals` buffer):
 
 ```rust
-fn should_split(topic: &TopicMeta, range_id: RangeId, now: u64) -> bool {
-    let range = topic.ranges.get(&range_id);
+// RangeSealHistory::should_split():
+seal_count >= SPLIT_SEAL_THRESHOLD
+    && (no split cooldown OR cooldown expired)
 
-    range.state == Active
-        && now > range.seal_history.cooldown_until
-        && range.keyspace_width() > MIN_RANGE_WIDTH
-        && range.seal_history.seal_count_in_window >= SPLIT_SEAL_THRESHOLD
-}
+// RangeMeta::roll_segment() returns should_split
+// MetadataStateMachine checks: can_split && should_split && valid_split_point(midpoint)
 ```
 
-Split point = midpoint of keyspace. Simple, no key distribution data needed.
+Split point = midpoint of keyspace (`RangeMeta::compute_midpoint()`). `valid_split_point()` guards against ranges too narrow to split (integer truncation makes midpoint equal to start).
 
-**Constants (initial, tunable):**
+**Constants:**
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `SPLIT_SEAL_THRESHOLD` | 3 | Seals within window to trigger split |
 | `MEASUREMENT_WINDOW_MS` | 300_000 (5 min) | Sliding window for counting seals |
 | `SPLIT_COOLDOWN_MS` | 300_000 (5 min) | No re-split after recent split |
-| `MIN_RANGE_WIDTH` | 256 bytes | Minimum keyspace to prevent fragmentation |
+| `MERGE_SEAL_THRESHOLD` | 0 | Both ranges must be idle (no seals in window) |
 
 ### 6c. Merge Decision Logic
 
-Periodic check by MetadataStateMachine leader (on a timer, not per-event):
+Periodic check by leader via `MergeCheckTimeout` timer (not per-event):
 
 ```rust
-fn should_merge(topic: &TopicMeta, r1: RangeId, r2: RangeId, now: u64) -> bool {
-    let range1 = topic.ranges.get(&r1);
-    let range2 = topic.ranges.get(&r2);
-
-    are_buddies(range1, range2)
-        && range1.state == Active && range2.state == Active
-        && range1.seal_history.seal_count_in_window <= MERGE_SEAL_THRESHOLD
-        && range2.seal_history.seal_count_in_window <= MERGE_SEAL_THRESHOLD
-        && now > range1.seal_history.cooldown_until
-        && now > range2.seal_history.cooldown_until
-}
+// MetadataStateMachine::evaluate_merges(now):
+// For each topic with AutoSplit strategy and 2+ active ranges:
+//   Walk adjacent pairs in active_ranges (sorted by keyspace_start)
+//   If both ranges have recent_seal_count(now) == MERGE_SEAL_THRESHOLD:
+//     Propose MergeRange, break (one merge per topic per evaluation)
 ```
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `MERGE_SEAL_THRESHOLD` | 0 | Both ranges must be idle (no seals in window) |
-| `MERGE_CHECK_INTERVAL_MS` | 600_000 (10 min) | How often leader scans for merge candidates |
+`RangeMeta::mergeable_with()` checks both ranges are cold. Hysteresis built in: split at 3 seals/window, merge at 0. No oscillation.
 
-Hysteresis built in: split at 3 seals/window, merge at 0. No oscillation.
+### 6d. Proposal Path — Lazy Execution
 
-### 6d. Proposal Path
+Auto-proposals flow through a two-level buffer:
 
-Split/merge decisions happen in `MultiRaftActor` after applying entries (Phase 3 dispatch):
+1. `MetadataStateMachine::pending_proposals` — populated during `apply()` (deterministic on all replicas, but only leader drains them)
+2. `Raft::pending_proposals` — leader wraps in `RaftCommand::Metadata(...)`, drained by `MultiRaft::flush()`
 
-```rust
-// After apply_seal_segment():
-if should_split(&topic, range_id, now) {
-    let mid = topic.ranges.get(&range_id).midpoint();
-    shard.raft.propose(RaftCommand::SplitRange { topic_id, range_id, split_point: mid });
-}
+**Lazy execution:** `MultiRaft::flush()` drains `pending_proposals` at the **start** of the next flush cycle, proposing them as regular entries. They are persisted in the same batch — no second persist pass. ~100ms latency (one tick) is negligible for decisions based on 5-minute windows.
 
-// On periodic timer:
-for (topic_id, r1, r2) in shard.state_machine.merge_candidates(now) {
-    shard.raft.propose(RaftCommand::MergeRange { topic_id, range_id_1: r1, range_id_2: r2 });
-}
-```
+**Anti-recursion:** `apply_committed_entries()` never calls `propose()`. Auto-proposals are buffered, not acted on inline. `SplitRange` apply does not generate further proposals (children start with empty seal history). Max depth: 1 level.
 
-Leader-only — followers apply committed decisions but never propose. Stale proposals rejected by `apply_split_range()` / `apply_merge_range()` precondition checks.
+Stale proposals (e.g., merge proposed but range split before commit) are safe — `apply_split_range()` / `apply_merge_range()` precondition checks reject them. `RollSegment` with wrong segment ID is a no-op (stale seal).
 
-### 6e. New Timer
+### 6e. MergeCheck Timer
 
-Add `MergeCheck` variant to `RaftTimer` for periodic merge scanning. Fires every `MERGE_CHECK_INTERVAL_MS`. Leader-only — set on `become_leader()`, cancelled on stepdown.
+`RaftTimerKind::MergeCheck` variant, `MERGE_CHECK_INTERVAL_TICKS = 6000` (10 min at 100ms/tick). Set on `become_leader()`, cancelled on stepdown via `cancel_all_timers()`. On timeout, leader calls `evaluate_merges()` with wall-clock time and reschedules.
+
+### 6f. Key Design Decisions
+
+- **`RangeSealHistory` uses timestamp Vec, not counter+window.** Pruning on each seal keeps the Vec bounded. `recent_seal_count(now)` re-evaluates against current time for merge checks.
+- **Split logic lives on `RangeMeta`.** `roll_segment()`, `split()`, `merge()`, `compute_midpoint()`, `mergeable_with()` are methods on `RangeMeta` — state machine dispatches, range owns the logic.
+- **`TimerSeqs` struct groups timer seq values.** Avoids too-many-arguments on `Raft::new()`.
+- **Child ranges get `created_by_split_at` via `with_split_origin()` builder.** Enforces cooldown without adding parameters to `RangeMeta::new()`.
+- **Stale `RollSegment` is no-op, not error.** If `active_seg_id != cmd.segment_id`, returns `Ok(())` — expected during leader transitions, not worth error logging.
 
 **Depends on:** Phases 1-4 (needs working propose pathway + state machine dispatch). Phase 5 not required.
-**Scope:** 2-3 PRs.
 
 ---
 
 ## Phase Dependency Graph
 
 ```
-Phase 1 (Data Model + MetadataStateMachine)
+Phase 1 (Data Model + MetadataStateMachine)              ✅
     │
     ▼
-Phase 2 (Extend RaftCommand)
+Phase 2 (Extend RaftCommand)                             ✅
     │
     ▼
-Phase 3 (Application State Machine Dispatch)
+Phase 3 (Application State Machine Dispatch)             ✅
     │
     ├──────────────────────────┐
     ▼                          ▼
-Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection)
-    │                          (needs Phase 4 for end-to-end,
-    ▼                           but core logic testable after Phase 3)
-Phase 5 (Leader Forwarding + Shard Discovery) ✅
+Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection) ✅
+    │                          ✅
+    ▼
+Phase 5 (Leader Forwarding + Shard Discovery)            ✅
 ```
 
 ---
@@ -526,7 +509,7 @@ Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counter
 `start_offset` / `end_offset` on `SegmentMeta`, `next_offset` on `RangeMeta`. Consumer knows "done with sealed range" when position reaches last segment's `end_offset`. On split/merge, child ranges start at offset 0 — clean break. Consumer protocol (backlog) uses these fields plus `merged_into`/`split_into` lineage to navigate range transitions.
 
 **8. Seal frequency as hot range signal — no external metrics pipeline.**
-`SealSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → MetadataStateMachine reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
+`RollSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → MetadataStateMachine reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
 
 ---
 

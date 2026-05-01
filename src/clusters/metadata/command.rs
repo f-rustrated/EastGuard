@@ -17,7 +17,7 @@ pub struct CreateTopic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct SealSegment {
+pub struct RollSegment {
     pub topic_id: TopicId,
     pub range_id: RangeId,
     pub segment_id: SegmentId,
@@ -52,7 +52,7 @@ pub struct DeleteTopic {
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum MetadataCommand {
     CreateTopic(CreateTopic),
-    SealSegment(SealSegment),
+    RollSegment(RollSegment),
     SplitRange(SplitRange),
     MergeRange(MergeRange),
     DeleteTopic(DeleteTopic),
@@ -61,7 +61,7 @@ pub enum MetadataCommand {
 impl_from_variant!(
     MetadataCommand,
     CreateTopic,
-    SealSegment,
+    RollSegment,
     SplitRange,
     MergeRange,
     DeleteTopic
@@ -70,7 +70,7 @@ impl_from_variant!(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyResult {
     TopicCreated(TopicId),
-    SegmentSealed,
+    SegmentRolled,
     RangeSplit(RangeId, RangeId),
     RangeMerged(RangeId),
     TopicDeleted,

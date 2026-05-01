@@ -60,9 +60,15 @@ pub struct Raft {
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
+    pending_proposals: Vec<RaftCommand>,
     election_jitter: u32,
-    election_seq: u32,
-    heartbeat_seq: u32,
+    timer_seqs: TimerSeqs,
+}
+
+pub(crate) struct TimerSeqs {
+    pub election: u32,
+    pub heartbeat: u32,
+    pub merge_check: u32,
 }
 
 impl Raft {
@@ -72,8 +78,7 @@ impl Raft {
         persistent: RaftPersistentState,
         election_jitter: u32,
         shard_group_id: ShardGroupId,
-        election_seq: u32,
-        heartbeat_seq: u32,
+        timer_seqs: TimerSeqs,
     ) -> Self {
         let mut raft = Self {
             node_id,
@@ -90,17 +95,17 @@ impl Raft {
             role: Role::Follower,
             current_leader: None,
             state_machine: MetadataStateMachine::default(),
+            pending_proposals: Vec::new(),
             peer_states: HashMap::new(),
             election_jitter,
-            election_seq,
-            heartbeat_seq,
+            timer_seqs,
         };
         raft.reset_election_timer();
         raft
     }
 
     pub(crate) fn heartbeat_seq(&self) -> u32 {
-        self.heartbeat_seq
+        self.timer_seqs.heartbeat
     }
 
     #[cfg(test)]
@@ -114,6 +119,10 @@ impl Raft {
 
     pub fn take_log_mutations(&mut self) -> Vec<LogMutation> {
         std::mem::take(&mut self.pending_log_mutations)
+    }
+
+    pub(crate) fn take_pending_proposals(&mut self) -> Vec<RaftCommand> {
+        std::mem::take(&mut self.pending_proposals)
     }
 
     // -------------------------------------------------------------------
@@ -216,6 +225,9 @@ impl Raft {
             }
             RaftTimeoutCallback::HeartbeatTimeout { .. } => {
                 self.send_heartbeats();
+            }
+            RaftTimeoutCallback::MergeCheckTimeout { .. } => {
+                self.evaluate_merges();
             }
         }
         #[cfg(test)]
@@ -355,9 +367,10 @@ impl Raft {
             .into(),
         );
 
-        // Cancel election timer, start heartbeat timer.
+        // Cancel election timer, start heartbeat + merge check timers.
         self.cancel_all_timers();
         self.schedule_heartbeat_timer();
+        self.schedule_merge_check_timer();
 
         // next_index is set *before* the noop is appended, so it points
         // at the noop's index — causing the first AppendEntries to carry it.
@@ -655,24 +668,33 @@ impl Raft {
             };
             match entry.command {
                 RaftCommand::Noop => {}
-                RaftCommand::Metadata(cmd) => match self.state_machine.apply(cmd) {
-                    Ok(result) => {
-                        tracing::debug!(
-                            "[{}] Applied metadata at index {}: {:?}",
-                            self.node_id,
-                            entry.index,
-                            result
-                        );
+                RaftCommand::Metadata(cmd) => {
+                    match self.state_machine.apply(cmd) {
+                        Ok(result) => {
+                            tracing::debug!(
+                                "[{}] Applied metadata at index {}: {:?}",
+                                self.node_id,
+                                entry.index,
+                                result
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[{}] Metadata apply error at index {}: {:?}",
+                                self.node_id,
+                                entry.index,
+                                e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "[{}] Metadata apply error at index {}: {:?}",
-                            self.node_id,
-                            entry.index,
-                            e
-                        );
+
+                    let proposals = self.state_machine.take_pending_proposals();
+                    if self.role == Role::Leader {
+                        for cmd in proposals {
+                            self.pending_proposals.push(RaftCommand::Metadata(cmd));
+                        }
                     }
-                },
+                }
             }
         }
     }
@@ -747,11 +769,11 @@ impl Raft {
     fn reset_election_timer(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.election_seq,
+                seq: self.timer_seqs.election,
             }));
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.election_seq,
+                seq: self.timer_seqs.election,
                 timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
             }));
     }
@@ -759,19 +781,49 @@ impl Raft {
     fn schedule_heartbeat_timer(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.heartbeat_seq,
+                seq: self.timer_seqs.heartbeat,
                 timer: RaftTimer::heartbeat(self.shard_group_id),
             }));
+    }
+
+    fn schedule_merge_check_timer(&mut self) {
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
+                seq: self.timer_seqs.merge_check,
+                timer: RaftTimer::merge_check(self.shard_group_id),
+            }));
+    }
+
+    fn evaluate_merges(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let merge_proposals = self.state_machine.evaluate_merges(now);
+        for cmd in merge_proposals {
+            self.pending_proposals.push(RaftCommand::Metadata(cmd));
+        }
+
+        self.schedule_merge_check_timer();
     }
 
     pub(crate) fn cancel_all_timers(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.election_seq,
+                seq: self.timer_seqs.election,
             }));
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.heartbeat_seq,
+                seq: self.timer_seqs.heartbeat,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.merge_check,
             }));
     }
 
@@ -820,6 +872,14 @@ mod tests {
         raft.take_events();
     }
 
+    fn test_timer_seqs() -> TimerSeqs {
+        TimerSeqs {
+            election: 0,
+            heartbeat: 1,
+            merge_check: 2,
+        }
+    }
+
     fn single_node_raft() -> Raft {
         Raft::new(
             node("node-1"),
@@ -827,8 +887,7 @@ mod tests {
             RaftPersistentState::default(),
             0,
             TEST_SHARD,
-            0,
-            1,
+            test_timer_seqs(),
         )
     }
 
@@ -841,8 +900,7 @@ mod tests {
             RaftPersistentState::default(),
             0,
             TEST_SHARD,
-            0,
-            1,
+            test_timer_seqs(),
         )
     }
 
@@ -1565,8 +1623,7 @@ mod tests {
                 RaftPersistentState::default(),
                 0,
                 TEST_SHARD,
-                0,
-                1,
+                test_timer_seqs(),
             );
 
             assert_eq!(

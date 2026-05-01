@@ -33,7 +33,7 @@ Ownership expressed by nesting — no back-references. Parent always known from 
 | RaftCommand variant | Method | Effect |
 |---|---|---|
 | `CreateTopic` | `apply_create_topic()` | Creates topic + initial full-keyspace range + initial segment |
-| `SealSegment` | `apply_seal_segment()` | Seals active segment, creates next segment (segment roll) |
+| `RollSegment` | `apply_roll_segment()` | Seals active segment, creates next segment (segment roll) |
 | `SplitRange` | `apply_split_range()` | Seals parent range, creates two child ranges with new segments |
 | `MergeRange` | `apply_merge_range()` | Seals both source ranges, creates merged range with new segment |
 | `DeleteTopic` | `apply_delete_topic()` | Cascades Deleting state to all ranges and segments |
@@ -69,3 +69,7 @@ Ownership expressed by nesting — no back-references. Parent always known from 
 14. **Split point strictly interior.** `split_point` must satisfy `keyspace_start < split_point < keyspace_end`. Boundary values rejected.
 
 15. **Merge requires adjacency.** Only ranges with contiguous keyspaces (`r1.keyspace_end == r2.keyspace_start` or vice versa) can merge.
+
+16. **Seal history determinism.** `seal_history` on `RangeMeta` is updated only inside `apply_roll_segment()`, which runs on ALL replicas. `seal_timestamps` are monotonically ordered. No leader-only state leaks into `RangeSealHistory`. The split/merge *decision* is leader-only, but the data it reads is deterministic.
+
+17. **Split cooldown on children.** Child ranges created by `apply_split_range()` always have `seal_history.created_by_split_at` set to the split's `created_at` timestamp. This enforces `SPLIT_COOLDOWN_MS` before children can be re-split.
