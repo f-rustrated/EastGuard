@@ -401,7 +401,6 @@ pub const MEASUREMENT_WINDOW_MS: u64 = 300_000;
 pub const SPLIT_COOLDOWN_MS: u64 = 300_000;
 pub const MERGE_SEAL_THRESHOLD: usize = 0;
 
-// TODO : range will have many different kinds of split strategy which is ideally configurable.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RangeSealHistory {
     pub seal_timestamps: VecDeque<u64>,
