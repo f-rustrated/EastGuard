@@ -3,7 +3,7 @@ use tokio::sync::oneshot;
 use crate::clusters::NodeId;
 use crate::clusters::swims::ShardGroupId;
 
-use super::command::{MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand};
+use super::command::{MultiRaftCommand, ProposeError, RaftCommand};
 use super::timer::RaftTimeoutCallback;
 
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
@@ -36,35 +36,7 @@ impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
     }
 }
 
-pub type OnReply = Box<dyn FnOnce(MultiRaftReply) + Send>;
-
-impl MultiRaftActorCommand {
-    pub(crate) fn split(self) -> (MultiRaftCommand, Option<OnReply>) {
-        match self {
-            Self::Command(cmd) => (cmd, None),
-            Self::GetLeader { group_id, reply } => (
-                MultiRaftCommand::GetLeader { group_id },
-                Some(Box::new(move |r| {
-                    if let MultiRaftReply::GetLeader(v) = r {
-                        let _ = reply.send(v);
-                    }
-                })),
-            ),
-            Self::Propose {
-                shard_group_id,
-                command,
-                reply,
-            } => (
-                MultiRaftCommand::Propose {
-                    shard_group_id,
-                    command,
-                },
-                Some(Box::new(move |r| {
-                    if let MultiRaftReply::Propose(v) = r {
-                        let _ = reply.send(v);
-                    }
-                })),
-            ),
-        }
-    }
+pub(crate) enum DeferredReply {
+    GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
+    Propose(oneshot::Sender<Result<(), ProposeError>>, Result<(), ProposeError>),
 }

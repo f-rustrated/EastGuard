@@ -142,14 +142,17 @@ impl Topology {
         if self.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
+        self.collect_distinct_owners(hash, n)
+    }
+
+    fn collect_distinct_owners(&self, hash: u32, n: usize) -> Vec<&NodeId> {
         let mut result: Vec<&NodeId> = Vec::with_capacity(n);
         for token in self.walk_clockwise_from(hash) {
-            if result.iter().any(|o| **o == token.pnode_id) {
-                continue;
-            }
-            result.push(&token.pnode_id);
-            if result.len() == n {
-                break;
+            if !result.iter().any(|o| **o == token.pnode_id) {
+                result.push(&token.pnode_id);
+                if result.len() == n {
+                    break;
+                }
             }
         }
         result
@@ -256,10 +259,13 @@ impl Topology {
 
     #[cfg(test)]
     fn assert_invariants(&self) {
-        use std::collections::HashSet;
+        self.assert_reverse_index_consistent();
+        self.assert_groups_consistent();
+        self.assert_vnode_counts();
+    }
 
-        // Reverse index matches groups: every node in node_group_ids
-        // must appear as a member of the referenced group.
+    #[cfg(test)]
+    fn assert_reverse_index_consistent(&self) {
         for (node_id, group_ids) in &self.node_group_ids {
             for gid in group_ids {
                 let group = self
@@ -270,12 +276,15 @@ impl Topology {
                     group.members.contains(node_id),
                     "node {:?} in reverse index for group {:?} but not in group members",
                     node_id,
-                    gid,
+                    gid
                 );
             }
         }
+    }
 
-        // Every group member appears in node_group_ids
+    #[cfg(test)]
+    fn assert_groups_consistent(&self) {
+        use std::collections::HashSet;
         for (gid, group) in &self.groups {
             for member in &group.members {
                 let ids = self
@@ -286,21 +295,21 @@ impl Topology {
                     ids.contains(gid),
                     "group {:?} member {:?} missing group in reverse index",
                     gid,
-                    member,
+                    member
                 );
             }
-
-            // All group members are distinct
             let unique: HashSet<&NodeId> = group.members.iter().collect();
             assert_eq!(
                 unique.len(),
                 group.members.len(),
                 "group {:?} has duplicate members",
-                gid,
+                gid
             );
         }
+    }
 
-        // Vnode count matches: each node should have exactly vnodes_per_pnode vnodes
+    #[cfg(test)]
+    fn assert_vnode_counts(&self) {
         for node_id in self.node_group_ids.keys() {
             let count = self
                 .vnodes
@@ -310,7 +319,7 @@ impl Topology {
             assert_eq!(
                 count, self.config.vnodes_per_pnode as usize,
                 "node {:?} has {count} vnodes, expected {}",
-                node_id, self.config.vnodes_per_pnode,
+                node_id, self.config.vnodes_per_pnode
             );
         }
     }

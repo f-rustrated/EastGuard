@@ -39,6 +39,21 @@ impl ClientStreamWriter {
         Ok(())
     }
 
+    pub(crate) async fn dispatch(
+        &mut self,
+        swim_sender: SwimSender,
+        raft_sender: RaftSender,
+        request: ConnectionRequests,
+    ) -> anyhow::Result<()> {
+        match request {
+            ConnectionRequests::Connection(_) => Ok(()),
+            ConnectionRequests::Query(q) => self.handle_query(swim_sender, q).await,
+            ConnectionRequests::Propose(req) => {
+                self.handle_propose(swim_sender, raft_sender, req).await
+            }
+        }
+    }
+
     pub(crate) async fn handle_query(
         &mut self,
         swim_sender: SwimSender,
@@ -57,7 +72,7 @@ impl ClientStreamWriter {
             QueryCommand::GetShardInfo { key } => {
                 let response = swim_sender
                     .get_shard_info(key)
-                    .await
+                    .await?
                     .map(|(group, leader)| ShardInfoResponse {
                         shard_group_id: group.id.0,
                         leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
@@ -74,33 +89,34 @@ impl ClientStreamWriter {
         raft_sender: RaftSender,
         req: ProposeRequest,
     ) -> anyhow::Result<()> {
+        let response = Self::execute_propose(&swim_sender, &raft_sender, req).await?;
+        self.write(&response).await?;
+        Ok(())
+    }
+
+    async fn execute_propose(
+        swim_sender: &SwimSender,
+        raft_sender: &RaftSender,
+        req: ProposeRequest,
+    ) -> anyhow::Result<ProposeResponse> {
         let Some(shard_group) = swim_sender
             .resolve_shard_group(req.resource_key.clone())
-            .await
+            .await?
         else {
-            self.write(&ProposeResponse::Error(ProposeError::ShardNotFound))
-                .await?;
-            return Ok(());
+            return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
         };
-
         let raft_cmd = req.command.clone().into_raft_command(shard_group.members);
-
         let Some(result) = raft_sender.propose(shard_group.id, raft_cmd).await else {
-            self.write(&ProposeResponse::Error(ProposeError::ShardNotFound))
-                .await?;
-            return Ok(());
+            return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
         };
-
         let response = match result {
             Ok(()) => ProposeResponse::Success,
             Err(ProposeError::NotLeader(ref hint)) if !req.forwarded => {
-                Self::try_forward(&swim_sender, hint.clone(), shard_group.id, req).await
+                Self::try_forward(swim_sender, hint.clone(), shard_group.id, req).await
             }
             Err(err) => ProposeResponse::Error(err),
         };
-
-        self.write(&response).await?;
-        Ok(())
+        Ok(response)
     }
 
     async fn try_forward(
@@ -109,22 +125,61 @@ impl ClientStreamWriter {
         shard_group_id: ShardGroupId,
         req: ProposeRequest,
     ) -> ProposeResponse {
-        // Try 1: use leader hint from Raft → resolve client_addr via SWIM member table
-        if let Some(leader_id) = &leader_hint
-            && let Some(node_addr) = swim_sender.resolve_address(leader_id.clone()).await
-            && let Ok(response) = Self::forward_to_leader(node_addr.client_addr, &req).await
-        {
-            return response;
+        if let Some(resp) = Self::try_forward_via_hint(swim_sender, &leader_hint, &req).await {
+            return resp;
         }
-
-        // Try 2: fall back to shard leader gossip (may have different/newer leader info)
-        if let Some(entry) = swim_sender.resolve_shard_leader(shard_group_id).await
-            && let Ok(response) = Self::forward_to_leader(entry.leader_addr.client_addr, &req).await
-        {
-            return response;
+        if let Some(resp) = Self::try_forward_via_gossip(swim_sender, shard_group_id, &req).await {
+            return resp;
         }
-
         ProposeResponse::Error(ProposeError::NotLeader(leader_hint))
+    }
+
+    async fn try_forward_via_hint(
+        swim_sender: &SwimSender,
+        leader_hint: &Option<NodeId>,
+        req: &ProposeRequest,
+    ) -> Option<ProposeResponse> {
+        let leader_id = leader_hint.as_ref()?;
+        let node_addr = match swim_sender.resolve_address(leader_id.clone()).await {
+            Ok(Some(addr)) => addr,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!("Resolve address for {} failed: {e}", leader_id);
+                return None;
+            }
+        };
+        match Self::forward_to_leader(node_addr.client_addr, req).await {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                tracing::debug!("Forward via hint to {} failed: {e}", node_addr.client_addr);
+                None
+            }
+        }
+    }
+
+    async fn try_forward_via_gossip(
+        swim_sender: &SwimSender,
+        shard_group_id: ShardGroupId,
+        req: &ProposeRequest,
+    ) -> Option<ProposeResponse> {
+        let entry = match swim_sender.resolve_shard_leader(shard_group_id).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!("Resolve shard leader for {:?} failed: {e}", shard_group_id);
+                return None;
+            }
+        };
+        match Self::forward_to_leader(entry.leader_addr.client_addr, req).await {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                tracing::debug!(
+                    "Forward via gossip to {} failed: {e}",
+                    entry.leader_addr.client_addr
+                );
+                None
+            }
+        }
     }
 
     async fn forward_to_leader(
@@ -161,31 +216,24 @@ impl ClientStreamReader {
     }
     pub async fn read_bytes(&mut self) -> Result<BytesMut, std::io::Error> {
         loop {
-            // 1. Attempt to parse what we already have buffered
-            //    If we received multiple messages in one packet, this ensures we process them all
-            //    before reading from the socket again.
             if let Some(msg) = self.parse_frame()? {
                 return Ok(msg);
             }
-
-            // 2. If no full frame is available, read more data from the socket.
-            //    'read_buf' automatically appends to the BytesMut
-            let n = self.stream.read_buf(&mut self.buffer).await?;
-            if 0 == n {
-                // If we hit EOF but still have partial data, that's an error
-                return if self.buffer.is_empty() {
-                    Err(std::io::Error::new(
-                        ErrorKind::ConnectionAborted,
-                        "Connection closed",
-                    ))
-                } else {
-                    Err(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "Partial frame received",
-                    ))
-                };
-            }
+            self.read_more().await?;
         }
+    }
+
+    async fn read_more(&mut self) -> Result<(), std::io::Error> {
+        let n = self.stream.read_buf(&mut self.buffer).await?;
+        if n == 0 {
+            let kind = if self.buffer.is_empty() {
+                ErrorKind::ConnectionAborted
+            } else {
+                ErrorKind::UnexpectedEof
+            };
+            return Err(std::io::Error::new(kind, "Connection closed"));
+        }
+        Ok(())
     }
 
     /// Tries to split off a full message from the internal buffer.

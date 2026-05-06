@@ -3,55 +3,59 @@
 use std::collections::{HashMap, HashSet};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::actor::SwimSender;
-use crate::clusters::swims::SwimQueryCommand;
 use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 
 struct RaftReader(OwnedReadHalf);
 
 impl RaftReader {
-    async fn read_node_id(&mut self) -> Option<NodeId> {
-        let len = self.0.read_u32().await.ok()? as usize;
-        if len > 1024 {
-            return None;
-        }
+    async fn read_node_id(&mut self) -> anyhow::Result<NodeId> {
+        let len = self.0.read_u32().await? as usize;
+        anyhow::ensure!(len <= 1024, "NodeId frame too large: {len} bytes");
         let mut buf = vec![0u8; len];
-        self.0.read_exact(&mut buf).await.ok()?;
-        bincode::decode_from_slice::<NodeId, _>(&buf, BINCODE_CONFIG)
-            .ok()
-            .map(|(id, _)| id)
+        self.0.read_exact(&mut buf).await?;
+        let (id, _) = bincode::decode_from_slice::<NodeId, _>(&buf, BINCODE_CONFIG)?;
+        Ok(id)
     }
 
-    async fn read_message(&mut self) -> Option<WireRaftMessage> {
-        let len = self.0.read_u32().await.ok()? as usize;
-        if len > 4 * 1024 * 1024 {
-            return None;
-        }
+    async fn read_message(&mut self) -> anyhow::Result<WireRaftMessage> {
+        let len = self.0.read_u32().await? as usize;
+        anyhow::ensure!(
+            len <= 4 * 1024 * 1024,
+            "Raft message frame too large: {len} bytes"
+        );
         let mut buf = vec![0u8; len];
-        self.0.read_exact(&mut buf).await.ok()?;
-        bincode::decode_from_slice::<WireRaftMessage, _>(&buf, BINCODE_CONFIG)
-            .ok()
-            .map(|(msg, _)| msg)
+        self.0.read_exact(&mut buf).await?;
+        let (msg, _) = bincode::decode_from_slice::<WireRaftMessage, _>(&buf, BINCODE_CONFIG)?;
+        Ok(msg)
     }
 
     async fn run(mut self, tx: mpsc::Sender<MultiRaftActorCommand>) {
-        while let Some(msg) = self.read_message().await {
-            let _ = tx
-                .send(
-                    MultiRaftCommand::PacketReceived {
-                        shard_group_id: msg.shard_group_id,
-                        from: msg.sender,
-                        rpc: msg.rpc,
-                    }
-                    .into(),
-                )
-                .await;
+        loop {
+            match self.read_message().await {
+                Ok(msg) => {
+                    let _ = tx
+                        .send(
+                            MultiRaftCommand::PacketReceived {
+                                shard_group_id: msg.shard_group_id,
+                                from: msg.sender,
+                                rpc: msg.rpc,
+                            }
+                            .into(),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::debug!("RaftReader connection closed: {e}");
+                    break;
+                }
+            }
         }
     }
 }
@@ -88,7 +92,8 @@ impl RaftWriters {
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftReader(read_half);
 
-        let Some(peer_id) = reader.read_node_id().await else {
+        let Ok(peer_id) = reader.read_node_id().await else {
+            tracing::error!("Failed to read peer NodeId during accept");
             return;
         };
 
@@ -100,15 +105,22 @@ impl RaftWriters {
         tokio::spawn(reader.run(raft_tx.clone()));
     }
 
-    /// Send a batch of outbound packets, grouping by target NodeId.
-    /// Encodes all messages per target into a single buffer, writes once.
     async fn send(
         &mut self,
         packets: Vec<OutboundRaftPacket>,
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
         swim_tx: &SwimSender,
     ) {
-        // Group by target — flush_dirty already groups, but be defensive.
+        let by_target = self.group_packets(packets);
+        for (target_id, msgs) in by_target {
+            self.send_to_target(target_id, msgs, raft_tx, swim_tx).await;
+        }
+    }
+
+    fn group_packets(
+        &self,
+        packets: Vec<OutboundRaftPacket>,
+    ) -> HashMap<NodeId, Vec<WireRaftMessage>> {
         let mut by_target: HashMap<NodeId, Vec<WireRaftMessage>> = HashMap::new();
         for pkt in packets {
             if self.dead_peers.contains(&pkt.target) {
@@ -123,59 +135,69 @@ impl RaftWriters {
                     rpc: pkt.rpc,
                 });
         }
+        by_target
+    }
 
-        for (target_id, msgs) in by_target {
-            // Try existing writer
-            if self.writers.contains_key(&target_id)
-                && self.write_messages_to(&target_id, &msgs).await.is_ok()
-            {
-                continue;
-            }
-
-            // Establish new connection
-            let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
-                tracing::warn!(
-                    "[{}] Cannot resolve address for {:?}",
-                    self.node_id,
-                    target_id
-                );
-                continue;
-            };
-
-            let Ok(stream) = TcpStream::connect(node_addr.cluster_addr).await else {
-                tracing::warn!(
-                    "[{}] Failed to connect to {} ({:?})",
-                    self.node_id,
-                    node_addr.cluster_addr,
-                    target_id
-                );
-                continue;
-            };
-
-            let (read_half, write_half) = stream.into_split();
-            self.writers.insert(target_id.clone(), write_half);
-
-            if let Err(e) = self.handshake(&target_id).await {
-                tracing::warn!(
-                    "[{}] Handshake with {:?} failed: {e}",
-                    self.node_id,
-                    target_id
-                );
-                continue;
-            }
-
-            if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
-                tracing::warn!(
-                    "[{}] Write {} msgs to {:?} failed: {e}",
-                    self.node_id,
-                    msgs.len(),
-                    target_id
-                );
-                continue;
-            }
-
-            tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
+    async fn send_to_target(
+        &mut self,
+        target_id: NodeId,
+        msgs: Vec<WireRaftMessage>,
+        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+        swim_tx: &SwimSender,
+    ) {
+        if self.writers.contains_key(&target_id)
+            && self.write_messages_to(&target_id, &msgs).await.is_ok()
+        {
+            return;
         }
+        self.connect_and_send(target_id, msgs, raft_tx, swim_tx)
+            .await;
+    }
+
+    async fn connect_and_send(
+        &mut self,
+        target_id: NodeId,
+        msgs: Vec<WireRaftMessage>,
+        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+        swim_tx: &SwimSender,
+    ) {
+        let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
+            tracing::warn!(
+                "[{}] Cannot resolve address for {:?}",
+                self.node_id,
+                target_id
+            );
+            return;
+        };
+        let Ok(stream) = TcpStream::connect(node_addr.cluster_addr).await else {
+            tracing::warn!(
+                "[{}] Failed to connect to {} ({:?})",
+                self.node_id,
+                node_addr.cluster_addr,
+                target_id
+            );
+            return;
+        };
+        let (read_half, write_half) = stream.into_split();
+        self.writers.insert(target_id.clone(), write_half);
+        if let Err(e) = self.handshake(&target_id).await {
+            tracing::warn!(
+                "[{}] Handshake with {:?} failed: {e}",
+                self.node_id,
+                target_id
+            );
+            return;
+        }
+        if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
+            tracing::warn!(
+                "[{}] Write {} msgs to {:?} failed: {e}",
+                self.node_id,
+                msgs.len(),
+                target_id
+            );
+            return;
+        }
+        tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
     }
 
     fn disconnect(&mut self, peer_id: NodeId) {
@@ -197,22 +219,16 @@ impl RaftWriters {
         if let Some(&addr) = self.addr_cache.get(node_id) {
             return Some(addr);
         }
-
-        let (tx, rx) = oneshot::channel();
-        let query = SwimQueryCommand::ResolveAddress {
-            node_id: node_id.clone(),
-            reply: tx,
-        };
-
-        if swim_tx.send(query).await.is_err() {
-            return None;
-        }
-
-        if let Ok(Some(node_addr)) = rx.await {
-            self.addr_cache.insert(node_id.clone(), node_addr);
-            Some(node_addr)
-        } else {
-            None
+        match swim_tx.resolve_address(node_id.clone()).await {
+            Ok(Some(node_addr)) => {
+                self.addr_cache.insert(node_id.clone(), node_addr);
+                Some(node_addr)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!("Resolve address for {:?} failed: {e}", node_id);
+                None
+            }
         }
     }
 
@@ -490,5 +506,4 @@ mod tests {
 
         sim.run()
     }
-
 }

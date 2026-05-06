@@ -42,6 +42,18 @@ impl SwimNode {
             .map(|v| v.len())
             .unwrap_or(0)
     }
+
+    pub(crate) fn resolve_state(&mut self, state: SwimNodeState, incarnation: u64) -> bool {
+        let old_state = self.state;
+        let old_inc = self.incarnation;
+        if incarnation > self.incarnation {
+            self.incarnation = incarnation;
+            self.state = state;
+        } else if incarnation == self.incarnation {
+            self.state = self.state.max(state);
+        }
+        self.state != old_state || self.incarnation != old_inc
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]

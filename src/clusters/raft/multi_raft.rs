@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    LogMutation, MultiRaftCommand, MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc,
-    RaftTimeoutCallback,
+    DeferredReply, LogMutation, MultiRaftActorCommand, MultiRaftCommand, MultiRaftReply,
+    ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::{Raft, TimerSeqs};
 
@@ -19,6 +19,7 @@ pub(crate) struct MultiRaft {
     seq_counter: RaftTimerTokenGenerator,
     dirty: HashSet<ShardGroupId>,
     pending_events: Vec<RaftEvent>,
+    deferred: Vec<DeferredReply>,
 }
 
 impl MultiRaft {
@@ -30,6 +31,40 @@ impl MultiRaft {
             seq_counter: RaftTimerTokenGenerator::default(),
             dirty: HashSet::new(),
             pending_events: Vec::new(),
+            deferred: Vec::new(),
+        }
+    }
+
+    pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
+        match cmd {
+            MultiRaftActorCommand::Command(c) => {
+                self.handle_command(c);
+            }
+            MultiRaftActorCommand::GetLeader { group_id, reply } => {
+                let result = self.get_leader(group_id);
+                self.deferred.push(DeferredReply::GetLeader(reply, result));
+            }
+            MultiRaftActorCommand::Propose {
+                shard_group_id,
+                command,
+                reply,
+            } => {
+                let result = self.propose(shard_group_id, command);
+                self.deferred.push(DeferredReply::Propose(reply, result));
+            }
+        }
+    }
+
+    pub(crate) fn fire_deferred(&mut self) {
+        for reply in self.deferred.drain(..) {
+            match reply {
+                DeferredReply::GetLeader(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::Propose(sender, v) => {
+                    let _ = sender.send(v);
+                }
+            }
         }
     }
 
@@ -175,15 +210,22 @@ impl MultiRaft {
     }
 
     fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
-        for group in &affected_groups {
+        self.add_peer_to_existing_groups(&node_id, &affected_groups);
+        self.ensure_new_groups(affected_groups);
+    }
+
+    fn add_peer_to_existing_groups(&mut self, node_id: &NodeId, groups: &[ShardGroup]) {
+        for group in groups {
             if let Some(raft) = self.groups.get_mut(&group.id)
-                && !raft.has_peer(&node_id)
+                && !raft.has_peer(node_id)
             {
                 raft.add_peer(node_id.clone());
             }
         }
+    }
 
-        for group in affected_groups {
+    fn ensure_new_groups(&mut self, groups: Vec<ShardGroup>) {
+        for group in groups {
             if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
                 self.add_group(group);
             }
@@ -207,12 +249,14 @@ impl MultiRaft {
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
         let dirty: Vec<ShardGroupId> = std::mem::take(&mut self.dirty).into_iter().collect();
-        let mut mutations: Vec<(ShardGroupId, LogMutation)> = vec![];
-        let mut last_indices: HashMap<ShardGroupId, u64> = HashMap::new();
+        self.flush_auto_proposals(&dirty);
+        let (mutations, last_indices) = self.collect_mutations(&dirty);
+        self.persist_and_advance(mutations, last_indices);
+        std::mem::take(&mut self.pending_events)
+    }
 
-        // Drain auto-proposals from previous flush and propose them.
-        // They become regular log entries, persisted in the same batch below.
-        for id in &dirty {
+    fn flush_auto_proposals(&mut self, dirty: &[ShardGroupId]) {
+        for id in dirty {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
@@ -222,30 +266,41 @@ impl MultiRaft {
                 }
             }
         }
+    }
 
-        for id in &dirty {
+    fn collect_mutations(
+        &mut self,
+        dirty: &[ShardGroupId],
+    ) -> (Vec<(ShardGroupId, LogMutation)>, HashMap<ShardGroupId, u64>) {
+        let mut mutations = vec![];
+        let mut last_indices = HashMap::new();
+        for id in dirty {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
-
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
                 mutations.push((*id, log));
             }
             self.pending_events.extend(raft.take_events());
         }
+        (mutations, last_indices)
+    }
 
-        if !mutations.is_empty() {
-            self.storage.persist_mutations(mutations);
-
-            for (id, last_log_index) in &last_indices {
-                if let Some(raft) = self.groups.get_mut(id) {
-                    raft.advance_stabled_index(*last_log_index)
-                }
+    fn persist_and_advance(
+        &mut self,
+        mutations: Vec<(ShardGroupId, LogMutation)>,
+        last_indices: HashMap<ShardGroupId, u64>,
+    ) {
+        if mutations.is_empty() {
+            return;
+        }
+        self.storage.persist_mutations(mutations);
+        for (id, last_log_index) in last_indices {
+            if let Some(raft) = self.groups.get_mut(&id) {
+                raft.advance_stabled_index(last_log_index);
             }
         }
-
-        std::mem::take(&mut self.pending_events)
     }
 }
 

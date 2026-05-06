@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
@@ -160,31 +161,51 @@ impl Swim {
                 seq,
                 target_node_id,
                 phase,
-            } => match (phase, target_node_id) {
-                (SwimTimerKind::DirectProbe, Some(target)) => {
-                    self.start_indirect_probe(target, seq)
-                }
-                (SwimTimerKind::IndirectProbe, Some(target)) => self.try_mark_suspect(target),
-                (SwimTimerKind::Suspect, Some(target)) => self.try_mark_dead(target, seq),
-                (SwimTimerKind::ProxyPing, None) => {
-                    self.pending_indirect_pings.remove(&seq);
-                }
-                (SwimTimerKind::JoinTry(join_attempt), None) => {
-                    if join_attempt.remaining_attempts == 0 {
-                        tracing::warn!(
-                            "[{}] Join to {} exhausted all attempts — giving up",
-                            self.node_id,
-                            join_attempt.seed_addr
-                        );
-                        return;
-                    }
-                    self.handle_join(join_attempt);
-                }
-                _ => {}
-            },
+            } => {
+                self.handle_timed_out(seq, target_node_id, phase);
+            }
         }
         #[cfg(test)]
         self.assert_invariants();
+    }
+
+    fn handle_timed_out(&mut self, seq: u32, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
+        if let Some(target) = target_node_id {
+            self.handle_probe_timeout(seq, target, phase);
+        } else {
+            self.handle_non_probe_timeout(seq, phase);
+        }
+    }
+
+    fn handle_probe_timeout(&mut self, seq: u32, target: NodeId, phase: SwimTimerKind) {
+        match phase {
+            SwimTimerKind::DirectProbe => self.start_indirect_probe(target, seq),
+            SwimTimerKind::IndirectProbe => self.try_mark_suspect(target),
+            SwimTimerKind::Suspect => self.try_mark_dead(target, seq),
+            SwimTimerKind::ProxyPing | SwimTimerKind::JoinTry(_) => {}
+        }
+    }
+
+    fn handle_non_probe_timeout(&mut self, seq: u32, phase: SwimTimerKind) {
+        match phase {
+            SwimTimerKind::ProxyPing => {
+                self.pending_indirect_pings.remove(&seq);
+            }
+            SwimTimerKind::JoinTry(attempt) => self.handle_join_timeout(attempt),
+            SwimTimerKind::DirectProbe | SwimTimerKind::IndirectProbe | SwimTimerKind::Suspect => {}
+        }
+    }
+
+    fn handle_join_timeout(&mut self, join_attempt: JoinAttempt) {
+        if join_attempt.remaining_attempts == 0 {
+            tracing::warn!(
+                "[{}] Join to {} exhausted all attempts — giving up",
+                self.node_id,
+                join_attempt.seed_addr
+            );
+            return;
+        }
+        self.handle_join(join_attempt);
     }
 
     fn start_probe(&mut self) {
@@ -231,27 +252,7 @@ impl Swim {
             return;
         };
 
-        // * OPT : pre-allocation
-        let mut peer_addrs = Vec::with_capacity(INDIRECT_PING_COUNT);
-
-        for _ in 0..self.live_node_tracker.len() {
-            let Some(peer_node_id) = self.live_node_tracker.next() else {
-                break;
-            };
-
-            if peer_node_id == target_node_id || peer_node_id == self.node_id {
-                continue;
-            }
-
-            if let Some(peer_member) = self.members.get(&peer_node_id) {
-                peer_addrs.push(peer_member.addr.cluster_addr);
-
-                // * OPT : Check length ONLY after a successful insertion
-                if peer_addrs.len() == INDIRECT_PING_COUNT {
-                    break;
-                }
-            }
-        }
+        let peer_addrs = self.select_ping_peers(&target_node_id);
 
         if peer_addrs.is_empty() {
             self.try_mark_suspect(target_node_id);
@@ -275,6 +276,34 @@ impl Swim {
                 seq,
                 timer: SwimTimer::indirect_probe(target_node_id),
             }));
+    }
+
+    fn select_ping_peers(&mut self, target_node_id: &NodeId) -> Vec<SocketAddr> {
+        let mut peer_addrs = Vec::with_capacity(INDIRECT_PING_COUNT);
+        for _ in 0..self.live_node_tracker.len() {
+            let Some(peer_node_id) = self.live_node_tracker.next() else {
+                break;
+            };
+            if self.try_add_ping_peer(&peer_node_id, target_node_id, &mut peer_addrs) {
+                break;
+            }
+        }
+        peer_addrs
+    }
+
+    fn try_add_ping_peer(
+        &self,
+        peer: &NodeId,
+        target: &NodeId,
+        addrs: &mut Vec<SocketAddr>,
+    ) -> bool {
+        if *peer == *target || *peer == self.node_id {
+            return false;
+        }
+        if let Some(member) = self.members.get(peer) {
+            addrs.push(member.addr.cluster_addr);
+        }
+        addrs.len() == INDIRECT_PING_COUNT
     }
 
     fn try_mark_suspect(&mut self, target_node_id: NodeId) {
@@ -343,109 +372,108 @@ impl Swim {
     }
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
-        // 1. Process Gossip (Piggybacked updates)
-        for member in packet.gossip() {
-            self.apply_membership_update(member.clone());
-        }
-
-        // Piggybacked shard leader gossip — typically few entries per packet (often zero).
-        // Count bounded by remaining byte budget after membership gossip and
-        // dissemination counter (3 × ceil(log₂(N)) retransmissions per entry).
-        for leader_info in packet.shard_leaders() {
-            self.apply_shard_leader_update(leader_info);
-        }
-
+        self.process_piggybacked_gossip(&packet);
         match packet {
-            SwimPacket::Ping(header) => {
-                tracing::info!(
-                    "[{}] ← Received Ping from {} ({}) seq={}",
-                    self.node_id,
-                    header.source_node_id,
-                    src,
-                    header.seq
-                );
-                self.handle_incarnation_check(
-                    header.source_node_id,
-                    src,
-                    header.source_incarnation,
-                );
-                let ack = SwimPacket::Ack(self.generate_swim_header(header.seq));
-
-                self.pending_events
-                    .push(SwimEvent::Packet(OutboundPacket::new(src, ack)))
-            }
-
-            SwimPacket::Ack(header) => {
-                tracing::info!(
-                    "[{}] ← Received Ack  from {} ({}) seq={}",
-                    self.node_id,
-                    header.source_node_id,
-                    src,
-                    header.seq
-                );
-                // TODO: should we ONLY handle Ack message with seq that we can identify?
-                self.handle_incarnation_check(
-                    header.source_node_id.clone(),
-                    src,
-                    header.source_incarnation,
-                );
-                self.pending_events
-                    .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
-                        seq: header.seq,
-                    }));
-
-                if let Some(ProxyPing {
-                    requester_addr,
-                    request_seq,
-                }) = self.pending_indirect_pings.remove(&header.seq)
-                {
-                    let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
-                    let used: usize = gossip.iter().map(|m| m.size()).sum();
-                    let remaining = MAX_GOSSIP_BYTES.saturating_sub(used);
-                    let shard_leaders = self.shard_leader_buffer.collect(remaining);
-                    let forwarded_ack = SwimPacket::Ack(SwimHeader {
-                        seq: request_seq,
-                        source_node_id: header.source_node_id,
-                        source_incarnation: header.source_incarnation,
-                        gossip,
-                        shard_leaders,
-                    });
-
-                    self.pending_events
-                        .push(SwimEvent::Packet(OutboundPacket::new(
-                            requester_addr,
-                            forwarded_ack,
-                        )));
-                }
-            }
-
-            SwimPacket::PingReq { header, target, .. } => {
-                self.handle_incarnation_check(
-                    header.source_node_id.clone(),
-                    src,
-                    header.source_incarnation,
-                );
-                let seq = self.next_seq();
-
-                self.pending_indirect_pings.insert(
-                    seq,
-                    ProxyPing {
-                        request_seq: header.seq,
-                        requester_addr: src,
-                    },
-                );
-                let ping = SwimPacket::Ping(self.generate_swim_header(seq));
-                self.pending_events
-                    .push(SwimEvent::Packet(OutboundPacket::new(target, ping)));
-                self.pending_events
-                    .push(SwimEvent::Timer(TimerCommand::SetSchedule {
-                        seq,
-                        timer: SwimTimer::proxy_ping(),
-                    }));
-            }
+            SwimPacket::Ping(header) => self.handle_ping(src, header),
+            SwimPacket::Ack(header) => self.handle_ack(src, header),
+            SwimPacket::PingReq { header, target, .. } => self.handle_ping_req(src, header, target),
         }
         #[cfg(test)]
         self.assert_invariants();
+    }
+
+    fn process_piggybacked_gossip(&mut self, packet: &SwimPacket) {
+        for member in packet.gossip() {
+            self.apply_membership_update(member.clone());
+        }
+        for leader_info in packet.shard_leaders() {
+            self.apply_shard_leader_update(leader_info);
+        }
+    }
+
+    fn handle_ping(&mut self, src: SocketAddr, header: SwimHeader) {
+        tracing::info!(
+            "[{}] ← Received Ping from {} ({}) seq={}",
+            self.node_id,
+            header.source_node_id,
+            src,
+            header.seq
+        );
+        self.handle_incarnation_check(header.source_node_id, src, header.source_incarnation);
+        let ack = SwimPacket::Ack(self.generate_swim_header(header.seq));
+        self.pending_events
+            .push(SwimEvent::Packet(OutboundPacket::new(src, ack)));
+    }
+
+    fn handle_ack(&mut self, src: SocketAddr, header: SwimHeader) {
+        tracing::info!(
+            "[{}] ← Received Ack  from {} ({}) seq={}",
+            self.node_id,
+            header.source_node_id,
+            src,
+            header.seq
+        );
+        self.handle_incarnation_check(
+            header.source_node_id.clone(),
+            src,
+            header.source_incarnation,
+        );
+        self.pending_events
+            .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
+                seq: header.seq,
+            }));
+        self.maybe_forward_ack(&header);
+    }
+
+    fn maybe_forward_ack(&mut self, header: &SwimHeader) {
+        let Some(ProxyPing {
+            requester_addr,
+            request_seq,
+        }) = self.pending_indirect_pings.remove(&header.seq)
+        else {
+            return;
+        };
+        let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
+        let used: usize = gossip.iter().map(|m| m.size()).sum();
+        let shard_leaders = self
+            .shard_leader_buffer
+            .collect(MAX_GOSSIP_BYTES.saturating_sub(used));
+        let forwarded_ack = SwimPacket::Ack(SwimHeader {
+            seq: request_seq,
+            source_node_id: header.source_node_id.clone(),
+            source_incarnation: header.source_incarnation,
+            gossip,
+            shard_leaders,
+        });
+        self.pending_events
+            .push(SwimEvent::Packet(OutboundPacket::new(
+                requester_addr,
+                forwarded_ack,
+            )));
+    }
+
+    fn handle_ping_req(&mut self, src: SocketAddr, header: SwimHeader, target: SocketAddr) {
+        self.handle_incarnation_check(
+            header.source_node_id.clone(),
+            src,
+            header.source_incarnation,
+        );
+        let seq = self.next_seq();
+        self.pending_indirect_pings.insert(
+            seq,
+            ProxyPing {
+                request_seq: header.seq,
+                requester_addr: src,
+            },
+        );
+        let ping = SwimPacket::Ping(self.generate_swim_header(seq));
+        self.pending_events
+            .push(SwimEvent::Packet(OutboundPacket::new(target, ping)));
+        self.pending_events
+            .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                seq,
+                timer: SwimTimer::proxy_ping(),
+            }));
     }
 
     fn apply_membership_update(&mut self, member: SwimNode) {
@@ -488,28 +516,16 @@ impl Swim {
         addr: SocketAddr,
         remote_inc: u64,
     ) {
-        // If we receive a direct message from someone, they are obviously Alive.
-        // If their incarnation is higher than we thought, update it.
         if let Some(member) = self.members.get(&source_node_id) {
             if remote_inc > member.incarnation {
                 let mut node_addr = member.addr;
                 node_addr.cluster_addr = addr;
-                if let Some(suspect_seq) = self.last_suspected_seqs.remove(&source_node_id) {
-                    self.pending_events
-                        .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
-                            seq: suspect_seq,
-                        }));
-                }
-                self.update_member(
-                    source_node_id.clone(),
-                    node_addr,
-                    SwimNodeState::Alive,
-                    remote_inc,
-                );
+                self.cancel_suspect_timer(&source_node_id);
+                self.update_member(source_node_id, node_addr, SwimNodeState::Alive, remote_inc);
             }
         } else {
             self.update_member(
-                source_node_id.clone(),
+                source_node_id,
                 NodeAddress {
                     cluster_addr: addr,
                     client_addr: addr,
@@ -527,55 +543,10 @@ impl Swim {
         state: SwimNodeState,
         incarnation: u64,
     ) {
-        let (changed, member) = match self.members.entry(node_id.clone()) {
-            Entry::Vacant(e) => {
-                let node = SwimNode {
-                    node_id: node_id.clone(),
-                    addr,
-                    state,
-                    incarnation,
-                };
-                e.insert(node.clone());
-
-                (true, node)
-            }
-
-            Entry::Occupied(mut e) => {
-                let node = e.get_mut();
-
-                // Dead is a terminal state.
-                // If it's dead, ignore the update and exit the function entirely.
-                // After this "tombstone" period, the node is deleted from the HashMap entirely
-                // To join the cluster again, a node should join it with new node ID.
-                if node.state == SwimNodeState::Dead {
-                    return;
-                }
-
-                let old_state = node.state;
-                let old_inc = node.incarnation;
-
-                // RULE: Higher incarnation always wins.
-                if incarnation > node.incarnation {
-                    node.incarnation = incarnation;
-                    node.state = state;
-                }
-                // RULE: Equal incarnation, stricter state wins (Dead > Suspect > Alive)
-                else if incarnation == node.incarnation {
-                    // Requires `SwimNodeState` to derive `PartialOrd, Ord`
-                    node.state = node.state.max(state);
-                }
-
-                let changed = node.state != old_state || node.incarnation != old_inc;
-                (changed, node.clone())
-            }
+        let Some((changed, member)) = self.upsert_member(&node_id, addr, state, incarnation) else {
+            return;
         };
-
-        if node_id != self.node_id {
-            self.live_node_tracker
-                .update(node_id.clone(), &member.state);
-        }
-        self.topology.update(node_id.clone(), &member.state);
-
+        self.sync_trackers(&node_id, &member);
         if changed {
             tracing::info!(
                 "[{}] Member update: {} @ {:?} → {:?} (inc {})",
@@ -585,39 +556,82 @@ impl Swim {
                 member.state,
                 incarnation
             );
-
-            match member.state {
-                SwimNodeState::Alive => {
-                    if let Some(suspect_seq) = self.last_suspected_seqs.remove(&node_id) {
-                        self.pending_events
-                            .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
-                                seq: suspect_seq,
-                            }));
-                    }
-                    self.pending_events
-                        .push(SwimEvent::Membership(MembershipEvent::NodeAlive {
-                            node_id: node_id.clone(),
-                            addr: addr.cluster_addr,
-                        }));
-                }
-                SwimNodeState::Dead => {
-                    self.pending_events
-                        .push(SwimEvent::Membership(MembershipEvent::NodeDead {
-                            node_id: node_id.clone(),
-                        }));
-                }
-                SwimNodeState::Suspect => {
-                    let seq = self.next_seq();
-                    self.last_suspected_seqs.insert(node_id.clone(), seq);
-                    self.pending_events
-                        .push(SwimEvent::Timer(TimerCommand::SetSchedule {
-                            seq,
-                            timer: SwimTimer::suspect_timer(node_id),
-                        }));
-                }
-            }
-
+            self.emit_state_change(&node_id, &member);
             self.gossip_buffer.enqueue(member, self.members.len());
+        }
+    }
+
+    fn upsert_member(
+        &mut self,
+        node_id: &NodeId,
+        addr: NodeAddress,
+        state: SwimNodeState,
+        incarnation: u64,
+    ) -> Option<(bool, SwimNode)> {
+        match self.members.entry(node_id.clone()) {
+            Entry::Vacant(e) => {
+                let node = SwimNode {
+                    node_id: node_id.clone(),
+                    addr,
+                    state,
+                    incarnation,
+                };
+                e.insert(node.clone());
+                Some((true, node))
+            }
+            Entry::Occupied(mut e) => {
+                let node = e.get_mut();
+                if node.state == SwimNodeState::Dead {
+                    return None;
+                }
+                let changed = node.resolve_state(state, incarnation);
+                Some((changed, node.clone()))
+            }
+        }
+    }
+
+    fn sync_trackers(&mut self, node_id: &NodeId, member: &SwimNode) {
+        if *node_id != self.node_id {
+            self.live_node_tracker
+                .update(node_id.clone(), &member.state);
+        }
+        self.topology.update(node_id.clone(), &member.state);
+    }
+
+    fn emit_state_change(&mut self, node_id: &NodeId, member: &SwimNode) {
+        match member.state {
+            SwimNodeState::Alive => {
+                self.cancel_suspect_timer(node_id);
+                self.pending_events
+                    .push(SwimEvent::Membership(MembershipEvent::NodeAlive {
+                        node_id: node_id.clone(),
+                        addr: member.addr.cluster_addr,
+                    }));
+            }
+            SwimNodeState::Dead => {
+                self.pending_events
+                    .push(SwimEvent::Membership(MembershipEvent::NodeDead {
+                        node_id: node_id.clone(),
+                    }));
+            }
+            SwimNodeState::Suspect => {
+                let seq = self.next_seq();
+                self.last_suspected_seqs.insert(node_id.clone(), seq);
+                self.pending_events
+                    .push(SwimEvent::Timer(TimerCommand::SetSchedule {
+                        seq,
+                        timer: SwimTimer::suspect_timer(node_id.clone()),
+                    }));
+            }
+        }
+    }
+
+    fn cancel_suspect_timer(&mut self, node_id: &NodeId) {
+        if let Some(suspect_seq) = self.last_suspected_seqs.remove(node_id) {
+            self.pending_events
+                .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
+                    seq: suspect_seq,
+                }));
         }
     }
 
@@ -673,16 +687,98 @@ impl Swim {
         membership
     }
 
+    pub(crate) fn dispatch(&mut self, event: SwimActorCommand) {
+        match event {
+            SwimActorCommand::Protocol(cmd) => self.dispatch_protocol(cmd),
+            SwimActorCommand::Query(q) => self.handle_query(q),
+        }
+    }
+
+    fn dispatch_protocol(&mut self, cmd: SwimCommand) {
+        match cmd {
+            SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
+            SwimCommand::Timeout(event) => self.handle_timeout(event),
+            SwimCommand::AnnounceShardLeader(event) => {
+                self.announce_shard_leader(event.shard_group_id, event.leader_node_id, event.term)
+            }
+        }
+    }
+
+    fn handle_query(&self, command: SwimQueryCommand) {
+        match command {
+            SwimQueryCommand::GetMembers { reply } => {
+                let _ = reply.send(self.get_members());
+            }
+            SwimQueryCommand::ResolveAddress { node_id, reply } => {
+                let _ = reply.send(self.resolve_address(&node_id));
+            }
+            SwimQueryCommand::ResolveShardGroup { key, reply } => {
+                let _ = reply.send(self.topology.shard_group_for(&key).cloned());
+            }
+            SwimQueryCommand::ResolveShardLeader {
+                shard_group_id,
+                reply,
+            } => {
+                let _ = reply.send(self.topology.shard_leader(shard_group_id).cloned());
+            }
+            SwimQueryCommand::GetShardInfo { key, reply } => {
+                let _ = reply.send(self.get_shard_info(&key));
+            }
+        }
+    }
+
+    fn get_shard_info(&self, key: &[u8]) -> Option<(ShardGroup, Option<ShardLeaderEntry>)> {
+        self.topology.shard_group_for(key).cloned().map(|group| {
+            let leader = self.topology.shard_leader(group.id).cloned();
+            (group, leader)
+        })
+    }
+
+    pub(crate) fn to_raft_command(&self, event: MembershipEvent) -> Option<MultiRaftActorCommand> {
+        if *event.node_id() == self.node_id {
+            return None;
+        }
+        match event {
+            MembershipEvent::NodeDead { node_id } => Some(
+                MultiRaftCommand::HandleNodeDeath {
+                    dead_node_id: node_id,
+                }
+                .into(),
+            ),
+            MembershipEvent::NodeAlive { node_id, .. } => {
+                let affected_groups: Vec<_> = self
+                    .topology
+                    .shard_groups_for_node(&node_id)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if affected_groups.is_empty() {
+                    return None;
+                }
+                Some(
+                    MultiRaftCommand::HandleNodeJoin {
+                        new_node_id: node_id,
+                        affected_groups,
+                    }
+                    .into(),
+                )
+            }
+        }
+    }
+
     #[cfg(test)]
     fn assert_invariants(&self) {
-        // Self never in live_node_tracker (excluded from probe targets)
         assert!(
             !self.live_node_tracker.contains(&self.node_id),
             "self ({}) found in live_node_tracker",
-            self.node_id,
+            self.node_id
         );
+        self.assert_tracker_only_alive();
+        self.assert_suspected_seqs_consistent();
+    }
 
-        // live_node_tracker only contains Alive nodes from members
+    #[cfg(test)]
+    fn assert_tracker_only_alive(&self) {
         for node_id in self.live_node_tracker.iter() {
             let member = self
                 .members
@@ -693,22 +789,22 @@ impl Swim {
                 SwimNodeState::Alive,
                 "live_node_tracker contains non-Alive node {:?} (state={:?})",
                 node_id,
-                member.state,
+                member.state
             );
         }
-
-        // No Dead or Suspect nodes in live_node_tracker
         for (node_id, member) in &self.members {
             if member.state != SwimNodeState::Alive {
                 assert!(
                     !self.live_node_tracker.contains(node_id),
                     "Dead/Suspect node {:?} found in live_node_tracker",
-                    node_id,
+                    node_id
                 );
             }
         }
+    }
 
-        // last_suspected_seqs only contains Suspect nodes
+    #[cfg(test)]
+    fn assert_suspected_seqs_consistent(&self) {
         for node_id in self.last_suspected_seqs.keys() {
             if let Some(member) = self.members.get(node_id) {
                 assert_eq!(
@@ -716,7 +812,7 @@ impl Swim {
                     SwimNodeState::Suspect,
                     "last_suspected_seqs contains non-Suspect node {:?} (state={:?})",
                     node_id,
-                    member.state,
+                    member.state
                 );
             }
         }

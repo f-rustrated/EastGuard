@@ -13,4 +13,5 @@ pub enum MetadataError {
     SplitNotAllowed(TopicId),
     RangesNotAdjacent,
     InvalidSplitPoint,
+    StaleSegment,
 }

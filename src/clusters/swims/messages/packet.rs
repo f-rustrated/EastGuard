@@ -45,23 +45,28 @@ impl SwimPacket {
     }
 }
 
-impl Display for SwimPacket {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let (kind, header, target) = match self {
+impl SwimPacket {
+    fn kind_header_target(&self) -> (&str, &SwimHeader, Option<&SocketAddr>) {
+        match self {
             Self::Ping(h) => ("PING", h, None),
             Self::Ack(h) => ("ACK", h, None),
             Self::PingReq { target, header } => ("PINGREQ", header, Some(target)),
-        };
-
-        write!(f, "[{}] seq: {}, ", kind, header.seq)?;
-
-        if let Some(t) = target {
-            write!(f, "target: {}, ", t)?;
         }
+    }
+}
 
+impl Display for SwimPacket {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let (kind, header, target) = self.kind_header_target();
+        let target_str = target
+            .map(|t| format!(", target: {}", t))
+            .unwrap_or_default();
         write!(
             f,
-            "source: {} (inc:{}), gossip: {}",
+            "[{}] seq: {}{}, source: {} (inc:{}), gossip: {}",
+            kind,
+            header.seq,
+            target_str,
             header.source_node_id,
             header.source_incarnation,
             header.gossip.len()
