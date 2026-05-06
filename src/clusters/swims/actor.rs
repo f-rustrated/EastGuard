@@ -58,7 +58,7 @@ impl SwimActor {
                     let _ = scheduler_tx.send(cmd.into()).await;
                 }
                 SwimEvent::Membership(m) => {
-                    if let Some(cmd) = state.to_raft_command(m) {
+                    if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
                         let _ = raft_tx.send(cmd).await;
                     }
                 }

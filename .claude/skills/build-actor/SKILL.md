@@ -223,7 +223,7 @@ impl YourActor {
 
 **Critical: flush must happen after draining all pending events.** Output buffers accumulate across multiple `process()` calls, so one flush handles the entire batch. `process()` lives on the state machine when dispatch is pure sync (no I/O). If command handling requires async I/O (e.g. sending transport commands), keep it as an actor associated fn instead. Branch that skips flush = side effects silently lost.
 
-**Translation in flush**: If events need transformation before routing (e.g. membership events → raft commands, timer seq namespacing), extract a helper method rather than inlining complex logic in the match arm. See `SwimActor::to_raft_command()` and `RaftGroups::translate_timer_seq()`.
+**Translation in flush**: If events need transformation before routing (e.g. membership events → raft commands, timer seq namespacing), extract a helper method rather than inlining complex logic in the match arm. See `MembershipEvent::into_raft_command()` and `RaftGroups::translate_timer_seq()`.
 
 ### Multiplexing pattern (like MultiRaftActor)
 

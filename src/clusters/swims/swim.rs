@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 
@@ -732,38 +731,6 @@ impl Swim {
             let leader = self.topology.shard_leader(group.id).cloned();
             (group, leader)
         })
-    }
-
-    pub(crate) fn to_raft_command(&self, event: MembershipEvent) -> Option<MultiRaftActorCommand> {
-        if *event.node_id() == self.node_id {
-            return None;
-        }
-        match event {
-            MembershipEvent::NodeDead { node_id } => Some(
-                MultiRaftCommand::HandleNodeDeath {
-                    dead_node_id: node_id,
-                }
-                .into(),
-            ),
-            MembershipEvent::NodeAlive { node_id, .. } => {
-                let affected_groups: Vec<_> = self
-                    .topology
-                    .shard_groups_for_node(&node_id)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                if affected_groups.is_empty() {
-                    return None;
-                }
-                Some(
-                    MultiRaftCommand::HandleNodeJoin {
-                        new_node_id: node_id,
-                        affected_groups,
-                    }
-                    .into(),
-                )
-            }
-        }
     }
 
     #[cfg(test)]
