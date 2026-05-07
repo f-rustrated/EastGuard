@@ -41,19 +41,14 @@ async fn mock_swim_handler(
 ///
 /// After enough ticks for election + heartbeat propagation, queries the elected
 /// leader and serves it to the checker via a TCP endpoint.
-async fn run_raft_node(
+fn build_address_map(
     node_name: &str,
     cluster_port: u16,
-    query_port: u16,
-    group: ShardGroup,
     peer_names: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let node_id = NodeId::new(node_name);
-
-    // Build address map from turmoil hostnames
+) -> HashMap<NodeId, SocketAddr> {
     let mut address_map = HashMap::new();
     address_map.insert(
-        node_id.clone(),
+        NodeId::new(node_name),
         SocketAddr::new(turmoil::lookup(node_name), cluster_port),
     );
     for &peer in peer_names {
@@ -63,22 +58,56 @@ async fn run_raft_node(
             SocketAddr::new(turmoil::lookup(peer), CLUSTER_PORT + peer_idx),
         );
     }
+    address_map
+}
 
-    // Create channels
+async fn drive_ticks(
+    ticker: &mpsc::Sender<TickerCommand<crate::clusters::raft::messages::RaftTimer>>,
+    count: usize,
+) {
+    for _ in 0..count {
+        let _ = ticker.send(TickerCommand::ForceTick).await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn serve_leader(
+    query_port: u16,
+    leader: Option<NodeId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
+    let (stream, _) = listener.accept().await?;
+    let (_read, mut write) = stream.into_split();
+    let bytes = bincode::encode_to_vec(&leader, BINCODE_CONFIG).unwrap();
+    let len = bytes.len() as u32;
+    write.write_all(&len.to_be_bytes()).await?;
+    write.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn run_raft_node(
+    node_name: &str,
+    cluster_port: u16,
+    query_port: u16,
+    group: ShardGroup,
+    peer_names: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let node_id = NodeId::new(node_name);
+    let address_map = build_address_map(node_name, cluster_port, peer_names);
+
     let (raft_tx, raft_mailbox) = mpsc::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(64);
     let (swim_tx, swim_rx) = SwimActor::channel(64);
-
     let ticker_force = ticker_tx.clone();
 
-    // Create and spawn actors
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cluster_port).parse().unwrap();
     let listener = crate::net::TcpListener::bind(bind_addr).await?;
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx));
-
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,
@@ -86,7 +115,6 @@ async fn run_raft_node(
         transport_rx,
         swim_tx.clone(),
     ));
-
     let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     tokio::spawn(MultiRaftActor::run(
         node_id,
@@ -97,7 +125,6 @@ async fn run_raft_node(
         swim_tx,
     ));
 
-    // Ensure the shard group
     raft_tx
         .send(
             MultiRaftCommand::EnsureGroup {
@@ -107,26 +134,11 @@ async fn run_raft_node(
         )
         .await
         .unwrap();
-
-    // Let the actor process EnsureGroup and send timer commands to the ticker
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
+    drive_ticks(&ticker_force, 200).await;
 
-    // Drive the ticker with ForceTick. Between each tick, yield + sleep to give
-    // transport and actor tasks time to process RPCs across the network.
-    //
-    // Election timeout = 50 base + ~6-8 jitter ticks. After election, the leader
-    // sends heartbeats (AppendEntries) which tell followers the leader_id.
-    // 200 ticks with interleaved yields is more than enough for the full cycle.
-    for _ in 0..200 {
-        let _ = ticker_force.send(TickerCommand::ForceTick).await;
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::task::yield_now().await;
-    }
-
-    // Query the elected leader
     let (reply_tx, reply_rx) = oneshot::channel();
     raft_tx
         .send(MultiRaftActorCommand::GetLeader {
@@ -136,18 +148,8 @@ async fn run_raft_node(
         .await
         .unwrap();
     let leader = reply_rx.await.unwrap();
+    serve_leader(query_port, leader).await?;
 
-    // Serve the result to the checker via TCP
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
-    let (stream, _) = listener.accept().await?;
-    let (_read, mut write) = stream.into_split();
-
-    let bytes = bincode::encode_to_vec(&leader, BINCODE_CONFIG).unwrap();
-    let len = bytes.len() as u32;
-    write.write_all(&len.to_be_bytes()).await?;
-    write.write_all(&bytes).await?;
-
-    // Keep actors alive for the rest of the simulation
     tokio::time::sleep(Duration::from_secs(600)).await;
     Ok(())
 }

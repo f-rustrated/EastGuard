@@ -329,67 +329,28 @@ async fn test_gossip_propagation() {
     );
 }
 
-#[tokio::test]
-async fn test_indirect_ping_trigger() {
-    // This tests the timer logic: Tick -> Ping -> Timeout -> Indirect Ping
-    // Drives the TickerActor directly via TickerCommand::ForceTick.
-
-    let mut harness = setup_single().await;
-    let mut rx_out = harness.rx_out.take().unwrap();
-    let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-
-    // 1. Manually add two Alive peers to the actor
-    // We do this by sending them as gossip from a "bootstrap" packet
-    let p1 = SwimNode {
-        node_id: "node-peer-1".into(),
-        addr: NodeAddress {
-            cluster_addr: peer_1,
-            client_addr: peer_1,
-        },
+fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
+    SwimNode {
+        node_id: name.into(),
+        addr: NodeAddress { cluster_addr: addr, client_addr: addr },
         state: SwimNodeState::Alive,
         incarnation: 1,
-    };
-    let p2 = SwimNode {
-        node_id: "node-peer-2".into(),
-        addr: NodeAddress {
-            cluster_addr: peer_2,
-            client_addr: peer_2,
-        },
-        state: SwimNodeState::Alive,
-        incarnation: 1,
-    };
+    }
+}
 
-    harness
-        .tx_in
-        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
-            src: peer_1,
-            packet: SwimPacket::Ping(SwimHeader {
-                seq: 1,
-                source_node_id: "node-peer-1".into(),
-                source_incarnation: 1,
-                gossip: vec![p1, p2],
-                shard_leaders: vec![],
-            }),
-        }))
-        .await
-        .unwrap();
+async fn force_ticks(ticker_tx: &mpsc::Sender<TickerCommand<SwimTimer>>, count: usize) {
+    for _ in 0..count {
+        ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+    }
+}
 
-    let _ack = rx_out.recv().await.unwrap(); // Clear the Ack
-
-    // 2. Force-tick PROBE_INTERVAL_TICKS times so the ticker fires a
-    //    ProtocolPeriodElapsed, which makes SwimProtocol start a probe.
-    //    LiveNodeTracker inserts at a random position, so start_probe() may land
-    //    on self and skip. Retry up to 3 periods to guarantee hitting a peer.
+async fn wait_for_ping(
+    harness: &TestHarness,
+    rx_out: &mut mpsc::Receiver<OutboundPacket>,
+) -> SocketAddr {
     let mut target_addr = None;
     for _ in 0..3 {
-        for _ in 0..PROBE_INTERVAL_TICKS {
-            harness
-                .ticker_tx
-                .send(TickerCommand::ForceTick)
-                .await
-                .unwrap();
-        }
+        force_ticks(&harness.ticker_tx, PROBE_INTERVAL_TICKS as usize).await;
         match time::timeout(Duration::from_millis(100), rx_out.recv()).await {
             Ok(Some(pkt)) if matches!(pkt.packet(), SwimPacket::Ping(_)) => {
                 target_addr = Some(pkt.target);
@@ -398,32 +359,34 @@ async fn test_indirect_ping_trigger() {
             _ => {}
         }
     }
-    let target_addr = target_addr.expect("Actor should send a Ping within 3 protocol periods");
+    target_addr.expect("Actor should send a Ping within 3 protocol periods")
+}
 
-    // 3. DON'T send an Ack. Force-tick DIRECT_ACK_TIMEOUT_TICKS times so the
-    //    direct probe timeout and the state machine transitions to indirect probing.
-    for _ in 0..DIRECT_ACK_TIMEOUT_TICKS {
-        harness
-            .ticker_tx
-            .send(TickerCommand::ForceTick)
-            .await
-            .unwrap();
-    }
+#[tokio::test]
+async fn test_indirect_ping_trigger() {
+    let mut harness = setup_single().await;
+    let mut rx_out = harness.rx_out.take().unwrap();
+    let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-    // 4. Expect Indirect Pings (PingReq) sent to the *other* peer
+    harness.tx_in.send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
+        src: peer_1,
+        packet: SwimPacket::Ping(SwimHeader {
+            seq: 1, source_node_id: "node-peer-1".into(), source_incarnation: 1,
+            gossip: vec![make_peer("node-peer-1", peer_1), make_peer("node-peer-2", peer_2)],
+            shard_leaders: vec![],
+        }),
+    })).await.unwrap();
+    let _ack = rx_out.recv().await.unwrap();
+
+    let target_addr = wait_for_ping(&harness, &mut rx_out).await;
+    force_ticks(&harness.ticker_tx, DIRECT_ACK_TIMEOUT_TICKS as usize).await;
+
     let indirect_ping = time::timeout(Duration::from_millis(100), rx_out.recv())
-        .await
-        .expect("Should send indirect ping")
-        .unwrap();
-
+        .await.expect("Should send indirect ping").unwrap();
     match indirect_ping.packet() {
-        SwimPacket::PingReq {
-            target: req_target, ..
-        } => {
-            assert_eq!(
-                *req_target, target_addr,
-                "PingReq should target the failed node"
-            );
+        SwimPacket::PingReq { target: req_target, .. } => {
+            assert_eq!(*req_target, target_addr, "PingReq should target the failed node");
         }
         _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet()),
     }

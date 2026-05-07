@@ -73,34 +73,30 @@ impl MetadataStateMachine {
             .ok_or(TopicNotFound(cmd.topic_id))?;
         topic.validate_active()?;
         let can_split = topic.can_split();
-
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
         let active_seg_id = range.validate_active()?;
         if active_seg_id != cmd.segment_id {
-            return Ok(());
+            return Err(StaleSegment);
         }
-
         let should_split =
             range.roll_segment(cmd.segment_id, cmd.new_replica_set.clone(), cmd.sealed_at)?;
-
-        if can_split && should_split {
-            // The following guards against ranges too narrow to split. When keyspace_start and keyspace_end are 1 unit apart (e.g., [0x40] and [0x41]),
-            // integer division truncates: (0x40 + 0x41) / 2 = 0x40, which equals keyspace_start.
-            // That fails valid_split_point (requires strictly between), so the split is skipped.
-            let mid = range.compute_midpoint();
-            if range.valid_split_point(&mid) {
-                self.pending_proposals
-                    .push(MetadataCommand::SplitRange(SplitRange {
-                        topic_id: cmd.topic_id,
-                        range_id: cmd.range_id,
-                        split_point: mid,
-                        created_at: cmd.sealed_at,
-                        left_replica_set: cmd.new_replica_set.clone(),
-                        right_replica_set: cmd.new_replica_set,
-                    }));
+        if should_split && can_split {
+            match range.build_split_proposal(&cmd) {
+                Ok(proposal) => self.pending_proposals.push(proposal),
+                Err(e) => tracing::debug!(
+                    "Split proposal skipped for range {:?}: {:?}",
+                    cmd.range_id,
+                    e
+                ),
             }
         }
         Ok(())
+    }
+
+    fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
+        let topic = self.topics.get_mut(&id).ok_or(TopicNotFound(id))?;
+        topic.validate_active()?;
+        Ok(topic)
     }
 
     fn split_range(&mut self, cmd: SplitRange) -> Result<(RangeId, RangeId), MetadataError> {
@@ -112,18 +108,7 @@ impl MetadataStateMachine {
         if !topic.can_split() {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
-        let left_id = RangeId(topic.next_range_id);
-        let right_id = RangeId(topic.next_range_id + 1);
-        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
-        let (left, right) = range.split(cmd, left_id, right_id)?;
-
-        topic.next_range_id += 2;
-        topic.active_ranges.retain(|id| *id != range.range_id);
-        topic.ranges.insert(left_id, left);
-        topic.ranges.insert(right_id, right);
-        topic.insert_range_sorted(left_id);
-        topic.insert_range_sorted(right_id);
-        Ok((left_id, right_id))
+        topic.execute_split(cmd)
     }
 
     fn merge_range(&mut self, cmd: MergeRange) -> Result<RangeId, MetadataError> {
@@ -157,48 +142,10 @@ impl MetadataStateMachine {
     // ! By the time the command executes, range 2 might be split, already sealed, or completely deleted
     // * This is already safe as the 'stale' proposal fails gracefully at apply time, following "stale proposals are safe" invariant
     pub(crate) fn evaluate_merges(&self, now: u64) -> Vec<MetadataCommand> {
-        let mut proposals = Vec::new();
-
-        for topic in self.topics.values() {
-            if topic.validate_active().is_err() {
-                continue;
-            }
-            if !topic.can_split() {
-                continue;
-            }
-            if topic.active_ranges.len() < 2 {
-                continue;
-            }
-
-            for pair in topic.active_ranges.windows(2) {
-                let (r1, r2) = (&topic.ranges[&pair[0]], &topic.ranges[&pair[1]]);
-                if r1.state != RangeState::Active || r2.state != RangeState::Active {
-                    continue;
-                }
-
-                if r1.mergeable_with(r2, now) {
-                    let replica_set = r1
-                        .active_segment
-                        .and_then(|sid| r1.segments.get(&sid))
-                        // ? Why replica set from r1?
-                        // Arbitrary: both ranges are cold (idle) and likely have the same replica set since they were created by the same split
-                        .map(|s| s.replica_set.clone())
-                        .unwrap_or_default();
-
-                    proposals.push(MetadataCommand::MergeRange(MergeRange {
-                        topic_id: topic.id,
-                        range_id_1: r1.range_id,
-                        range_id_2: r2.range_id,
-                        created_at: now,
-                        merged_replica_set: replica_set,
-                    }));
-
-                    break;
-                }
-            }
-        }
-
-        proposals
+        self.topics
+            .values()
+            .filter_map(|topic| topic.find_mergeable_pair(now))
+            .collect()
     }
 
     fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
@@ -218,7 +165,15 @@ impl MetadataStateMachine {
 
     #[cfg(test)]
     fn assert_invariants(&self) {
-        // Invariant 12: topic_name_index and topics always in sync
+        self.assert_name_index_sync();
+        self.assert_topic_id_monotonicity();
+        for topic in self.topics.values() {
+            topic.assert_invariants();
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_name_index_sync(&self) {
         assert_eq!(
             self.topic_name_index.len(),
             self.topics
@@ -234,119 +189,12 @@ impl MetadataStateMachine {
                 .expect("name index points to missing topic");
             assert_eq!(&topic.name, name);
         }
+    }
 
-        // Invariant 6: ID monotonicity
+    #[cfg(test)]
+    fn assert_topic_id_monotonicity(&self) {
         for id in self.topics.keys() {
             assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
-        }
-
-        for topic in self.topics.values() {
-            // Invariant 6: range ID monotonicity
-            for rid in topic.ranges.keys() {
-                assert!(rid.0 < topic.next_range_id, "range ID >= next_range_id");
-            }
-
-            if topic.state == TopicState::Active {
-                // Invariant 1: keyspace coverage — active ranges cover full keyspace
-                if !topic.active_ranges.is_empty() {
-                    let ranges: Vec<&RangeMeta> = topic
-                        .active_ranges
-                        .iter()
-                        .map(|id| &topic.ranges[id])
-                        .collect();
-
-                    assert_eq!(
-                        ranges[0].keyspace_start, KEYSPACE_MIN,
-                        "first range must start at MIN"
-                    );
-                    assert_eq!(
-                        ranges.last().unwrap().keyspace_end,
-                        KEYSPACE_MAX,
-                        "last range must end at MAX"
-                    );
-                    for w in ranges.windows(2) {
-                        assert_eq!(
-                            w[0].keyspace_end, w[1].keyspace_start,
-                            "keyspace gap between active ranges"
-                        );
-                    }
-                }
-            }
-
-            for range in topic.ranges.values() {
-                match range.state {
-                    RangeState::Active => {
-                        // Invariant 2: single active segment per active range
-                        assert!(
-                            range.active_segment.is_some(),
-                            "active range missing active_segment"
-                        );
-                        let seg_id = range.active_segment.unwrap();
-                        let seg = range
-                            .segments
-                            .get(&seg_id)
-                            .expect("active_segment points to missing segment");
-                        assert_eq!(
-                            seg.state,
-                            SegmentState::Active,
-                            "active_segment not in Active state"
-                        );
-                    }
-                    RangeState::Sealed | RangeState::Deleting => {
-                        assert!(
-                            range.active_segment.is_none(),
-                            "sealed/deleting range has active_segment"
-                        );
-                    }
-                }
-
-                // Invariant 6: segment ID monotonicity
-                for sid in range.segments.keys() {
-                    assert!(
-                        sid.0 < range.next_segment_id,
-                        "segment ID >= next_segment_id"
-                    );
-                }
-
-                // Invariant 3: sealed segments have end_offset set
-                for seg in range.segments.values() {
-                    if seg.state == SegmentState::Sealed {
-                        assert!(
-                            seg.end_offset.is_some(),
-                            "sealed segment missing end_offset"
-                        );
-                        assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
-                    }
-                }
-
-                // Invariant 4: lineage consistency — cannot be both split and merged
-                assert!(
-                    range.split_into.is_none() || range.merged_into.is_none(),
-                    "range both split and merged"
-                );
-
-                // Invariant 16: seal_history timestamps are monotonically ordered
-                let ts = &range.seal_history.seal_timestamps;
-                for i in 1..ts.len() {
-                    assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
-                }
-
-                // Invariant 17: split children have created_by_split_at set
-                if let Some([left, right]) = range.split_into {
-                    if let Some(left_range) = topic.ranges.get(&left) {
-                        assert!(
-                            left_range.seal_history.created_by_split_at.is_some(),
-                            "split child missing created_by_split_at"
-                        );
-                    }
-                    if let Some(right_range) = topic.ranges.get(&right) {
-                        assert!(
-                            right_range.seal_history.created_by_split_at.is_some(),
-                            "split child missing created_by_split_at"
-                        );
-                    }
-                }
-            }
         }
     }
 }
@@ -584,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn roll_segment_stale_is_noop() {
+    fn roll_segment_stale_is_rejected() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
@@ -595,7 +443,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result, Ok(ApplyResult::SegmentRolled));
+        assert_eq!(result, Err(MetadataError::StaleSegment));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(0)));
@@ -870,7 +718,7 @@ mod tests {
     // --- Invariant: Segment immutability after seal ---
 
     #[test]
-    fn roll_already_rolled_segment_is_noop() {
+    fn roll_already_rolled_segment_is_stale() {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
@@ -883,7 +731,7 @@ mod tests {
             sealed_at: 3000,
             new_replica_set: replica_set(),
         }));
-        assert_eq!(result, Ok(ApplyResult::SegmentRolled));
+        assert_eq!(result, Err(MetadataError::StaleSegment));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));

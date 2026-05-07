@@ -32,23 +32,16 @@ impl MultiRaftActor {
     ) {
         let mut store = MultiRaft::new(node_id, storage);
         let mut buf = Vec::with_capacity(64);
-        let mut deferred: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(64);
 
         loop {
             if mailbox.recv_many(&mut buf, 64).await == 0 {
                 break;
             }
-
             for cmd in buf.drain(..) {
-                let (store_cmd, on_reply) = cmd.split();
-                let reply = store.handle_command(store_cmd);
-                if let Some(cb) = on_reply {
-                    deferred.push(Box::new(move || cb(reply)));
-                }
+                store.process(cmd);
             }
 
             let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
-
             for event in store.flush() {
                 match event {
                     RaftEvent::OutboundRaftPacket(pkt) => {
@@ -70,14 +63,11 @@ impl MultiRaftActor {
                     }
                 }
             }
-
-            for (_, packets) in packets_by_target {
+            for packets in packets_by_target.into_values() {
                 let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
             }
 
-            for cb in deferred.drain(..) {
-                cb();
-            }
+            store.fire_deferred();
         }
     }
 }

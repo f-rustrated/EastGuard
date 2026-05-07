@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 
-use crate::clusters::raft::messages::LeaderChange;
-use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::NodeId;
+use crate::clusters::raft::messages::{LeaderChange, MultiRaftActorCommand, MultiRaftCommand};
+use crate::clusters::swims::peer_discovery::JoinAttempt;
+use crate::clusters::swims::topology::Topology;
 use crate::schedulers::ticker_message::TimerCommand;
 
 use super::packet::{OutboundPacket, SwimPacket};
@@ -66,6 +67,41 @@ impl MembershipEvent {
         match self {
             MembershipEvent::NodeAlive { node_id, .. } => node_id,
             MembershipEvent::NodeDead { node_id } => node_id,
+        }
+    }
+
+    pub(crate) fn into_raft_command(
+        self,
+        local_node_id: &NodeId,
+        topology: &Topology,
+    ) -> Option<MultiRaftActorCommand> {
+        if self.node_id() == local_node_id {
+            return None;
+        }
+        match self {
+            MembershipEvent::NodeDead { node_id } => Some(
+                MultiRaftCommand::HandleNodeDeath {
+                    dead_node_id: node_id,
+                }
+                .into(),
+            ),
+            MembershipEvent::NodeAlive { node_id, .. } => {
+                let affected_groups: Vec<_> = topology
+                    .shard_groups_for_node(&node_id)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if affected_groups.is_empty() {
+                    return None;
+                }
+                Some(
+                    MultiRaftCommand::HandleNodeJoin {
+                        new_node_id: node_id,
+                        affected_groups,
+                    }
+                    .into(),
+                )
+            }
         }
     }
 }

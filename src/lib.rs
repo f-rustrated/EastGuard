@@ -24,10 +24,7 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
-    connections::{
-        clients::{ClientStreamReader, ClientStreamWriter},
-        request::ConnectionRequests,
-    },
+    connections::clients::{ClientStreamReader, ClientStreamWriter},
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -143,17 +140,5 @@ async fn handle_client_stream(
     let mut stream_reader = ClientStreamReader::new(read_half);
     let mut stream_writer = ClientStreamWriter::new(write_half);
     let request = stream_reader.read_request().await?;
-
-    match request {
-        ConnectionRequests::Connection(_request) => {}
-        ConnectionRequests::Query(query_type) => {
-            stream_writer.handle_query(swim_sender, query_type).await?
-        }
-        ConnectionRequests::Propose(req) => {
-            stream_writer
-                .handle_propose(swim_sender, raft_sender, req)
-                .await?
-        }
-    }
-    Ok(())
+    stream_writer.dispatch(swim_sender, raft_sender, request).await
 }

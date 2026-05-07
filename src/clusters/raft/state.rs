@@ -313,21 +313,24 @@ impl Raft {
         );
     }
 
-    // ! SAFETY: only candidates count votes.
     fn handle_request_vote_response(&mut self, resp: RequestVoteResponse) {
         if resp.term > self.current_term {
             self.step_down(resp.term);
             return;
         }
+        self.count_vote_if_eligible(resp);
+    }
 
-        if let Role::Candidate { votes_received } = &mut self.role
-            && resp.term == self.current_term
-            && resp.vote_granted
-        {
-            *votes_received += 1;
-            if *votes_received >= self.quorum() {
-                self.become_leader();
-            }
+    fn count_vote_if_eligible(&mut self, resp: RequestVoteResponse) {
+        let Role::Candidate { votes_received } = &mut self.role else {
+            return;
+        };
+        if resp.term != self.current_term || !resp.vote_granted {
+            return;
+        }
+        *votes_received += 1;
+        if *votes_received >= self.quorum() {
+            self.become_leader();
         }
     }
 
@@ -462,35 +465,45 @@ impl Raft {
     // ! - Candidates step down on same term : because receiving entries while being a candidate means another node already won.
     // ! - Followers process normally. All roles must respond.
     fn handle_append_entries(&mut self, from: NodeId, req: AppendEntries) {
-        // Stale term: reject.
         if req.term < self.current_term {
-            self.send_append_entries_response(from.clone(), false);
+            self.reject_append_entries(from);
             return;
         }
 
-        // If term is current or newer, recognize leader and reset to follower.
+        // ! recognizing leader must happen regardless of whether the log entries are accepted
+        // ! Even if the log consistency check fails and entries are rejected, the follower should not start a new election.
+        self.recognize_leader(&req);
+
+        if !self.check_log_consistency(req.prev_log_index, req.prev_log_term) {
+            self.reject_append_entries(from);
+            return;
+        }
+        self.replicate_entries(req.entries);
+        self.advance_follower_commit(req.leader_commit);
+        self.accept_append_entries(from);
+    }
+
+    fn recognize_leader(&mut self, req: &AppendEntries) {
         if req.term > self.current_term {
             self.step_down(req.term);
         } else if self.role != Role::Follower {
-            // Same term but we're candidate — step down.
             self.role = Role::Follower;
             self.peer_states.clear();
         }
-
         self.current_leader = Some(req.leader_id.clone());
         self.reset_election_timer();
+    }
 
-        // Log consistency check: prev_log_index must exist with matching term.
-        if req.prev_log_index > 0 {
-            let local_term = self.log_term_at(req.prev_log_index);
-            if local_term == 0 || local_term != req.prev_log_term {
-                self.send_append_entries_response(from, false);
-                return;
-            }
+    fn check_log_consistency(&self, prev_log_index: u64, prev_log_term: u64) -> bool {
+        if prev_log_index == 0 {
+            return true;
         }
+        let local_term = self.log_term_at(prev_log_index);
+        local_term != 0 && local_term == prev_log_term
+    }
 
-        // Append entries (truncate conflicting suffix first).
-        for entry in req.entries {
+    fn replicate_entries(&mut self, entries: Vec<LogEntry>) {
+        for entry in entries {
             let existing_term = self.log_term_at(entry.index);
             if existing_term != 0 && existing_term != entry.term {
                 self.log_truncate_from(entry.index);
@@ -499,14 +512,13 @@ impl Raft {
                 self.log_append(entry);
             }
         }
+    }
 
-        // Advance commit index.
-        if req.leader_commit > self.commit_index {
-            self.commit_index = req.leader_commit.min(self.log_last_index());
+    fn advance_follower_commit(&mut self, leader_commit: u64) {
+        if leader_commit > self.commit_index {
+            self.commit_index = leader_commit.min(self.log_last_index());
             self.apply_committed_entries();
         }
-
-        self.send_append_entries_response(from, true);
     }
 
     // ! SAFETY
@@ -539,6 +551,14 @@ impl Raft {
                 self.send_append_entries(resp.node_id);
             }
         }
+    }
+
+    fn accept_append_entries(&mut self, target: NodeId) {
+        self.send_append_entries_response(target, true);
+    }
+
+    fn reject_append_entries(&mut self, target: NodeId) {
+        self.send_append_entries_response(target, false);
     }
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
@@ -655,46 +675,43 @@ impl Raft {
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
-            let entry = match self.log_get(self.last_applied_index) {
-                Some(e) => e.clone(),
-                None => {
-                    tracing::error!(
-                        "[{}] committed entry at index {} missing from log",
-                        self.node_id,
-                        self.last_applied_index
-                    );
-                    break;
-                }
+            let Some(entry) = self.log_get(self.last_applied_index).cloned() else {
+                tracing::error!(
+                    "[{}] committed entry at index {} missing from log",
+                    self.node_id,
+                    self.last_applied_index
+                );
+                break;
             };
             match entry.command {
                 RaftCommand::Noop => {}
-                RaftCommand::Metadata(cmd) => {
-                    match self.state_machine.apply(cmd) {
-                        Ok(result) => {
-                            tracing::debug!(
-                                "[{}] Applied metadata at index {}: {:?}",
-                                self.node_id,
-                                entry.index,
-                                result
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[{}] Metadata apply error at index {}: {:?}",
-                                self.node_id,
-                                entry.index,
-                                e
-                            );
-                        }
-                    }
+                RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
+            }
+        }
+    }
 
-                    let proposals = self.state_machine.take_pending_proposals();
-                    if self.role == Role::Leader {
-                        for cmd in proposals {
-                            self.pending_proposals.push(RaftCommand::Metadata(cmd));
-                        }
-                    }
-                }
+    fn apply_metadata_entry(
+        &mut self,
+        cmd: crate::clusters::metadata::command::MetadataCommand,
+        index: u64,
+    ) {
+        match self.state_machine.apply(cmd) {
+            Ok(result) => tracing::debug!(
+                "[{}] Applied metadata at index {}: {:?}",
+                self.node_id,
+                index,
+                result
+            ),
+            Err(e) => tracing::error!(
+                "[{}] Metadata apply error at index {}: {:?}",
+                self.node_id,
+                index,
+                e
+            ),
+        }
+        if self.role == Role::Leader {
+            for cmd in self.state_machine.take_pending_proposals() {
+                self.pending_proposals.push(RaftCommand::Metadata(cmd));
             }
         }
     }

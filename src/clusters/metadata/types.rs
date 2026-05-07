@@ -6,6 +6,7 @@ use crate::clusters::{
     NodeId,
     metadata::{
         RangeId, SegmentId, SplitRange, TopicId,
+        command::{MergeRange, MetadataCommand, RollSegment},
         error::MetadataError,
         strategy::{PartitionStrategy, StoragePolicy},
     },
@@ -170,6 +171,25 @@ impl RangeMeta {
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
         split_point > &self.keyspace_start && split_point < &self.keyspace_end
     }
+
+    pub(crate) fn build_split_proposal(
+        &self,
+        cmd: &RollSegment,
+    ) -> Result<MetadataCommand, MetadataError> {
+        let mid = self.compute_midpoint();
+        if !self.valid_split_point(&mid) {
+            return Err(MetadataError::InvalidSplitPoint);
+        }
+        Ok(MetadataCommand::SplitRange(SplitRange {
+            topic_id: cmd.topic_id,
+            range_id: cmd.range_id,
+            split_point: mid,
+            created_at: cmd.sealed_at,
+            left_replica_set: cmd.new_replica_set.clone(),
+            right_replica_set: cmd.new_replica_set.clone(),
+        }))
+    }
+
     pub(crate) fn roll_segment(
         &mut self,
         segment_to_seal: SegmentId,
@@ -208,13 +228,10 @@ impl RangeMeta {
         if !self.is_next_to(other) {
             return Err(MetadataError::RangesNotAdjacent);
         }
+        self.validate_sealable()?;
+        other.validate_sealable()?;
 
-        let (merged_start, merged_end) = if self.keyspace_start <= other.keyspace_start {
-            (self.keyspace_start.clone(), other.keyspace_end.clone())
-        } else {
-            (other.keyspace_start.clone(), self.keyspace_end.clone())
-        };
-
+        let (merged_start, merged_end) = self.merged_keyspace(other);
         self.seal(requested_at)?;
         other.seal(requested_at)?;
         self.merged_into = Some(merged_id);
@@ -226,17 +243,30 @@ impl RangeMeta {
             replica_set,
             requested_at,
         );
-
-        // To make sure of determinsim
-        let merged_from = if self.range_id < other.range_id {
-            [self.range_id, other.range_id]
-        } else {
-            [other.range_id, self.range_id]
-        };
-
-        merged.merged_from = Some(merged_from);
-
+        merged.merged_from = Some(Self::ordered_pair(self.range_id, other.range_id));
         Ok(merged)
+    }
+
+    fn merged_keyspace(&self, other: &RangeMeta) -> (Vec<u8>, Vec<u8>) {
+        if self.keyspace_start <= other.keyspace_start {
+            (self.keyspace_start.clone(), other.keyspace_end.clone())
+        } else {
+            (other.keyspace_start.clone(), self.keyspace_end.clone())
+        }
+    }
+
+    fn ordered_pair(a: RangeId, b: RangeId) -> [RangeId; 2] {
+        if a < b { [a, b] } else { [b, a] }
+    }
+
+    fn validate_sealable(&self) -> Result<(), MetadataError> {
+        if let Some(seg_id) = self.active_segment
+            && let Some(seg) = self.segments.get(&seg_id)
+            && seg.state != SegmentState::Active
+        {
+            return Err(MetadataError::SegmentNotActive);
+        }
+        Ok(())
     }
 
     pub(crate) fn seal(&mut self, created_at: u64) -> Result<(), MetadataError> {
@@ -291,6 +321,72 @@ impl RangeMeta {
         let r2_recent = r2.seal_history.recent_seal_count(now);
 
         r1_recent == MERGE_SEAL_THRESHOLD && r2_recent == MERGE_SEAL_THRESHOLD
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        self.assert_active_segment_state();
+        for sid in self.segments.keys() {
+            assert!(
+                sid.0 < self.next_segment_id,
+                "segment ID >= next_segment_id"
+            );
+        }
+        self.assert_sealed_segments();
+        assert!(
+            self.split_into.is_none() || self.merged_into.is_none(),
+            "range both split and merged"
+        );
+        self.assert_seal_history();
+    }
+
+    #[cfg(test)]
+    fn assert_active_segment_state(&self) {
+        match self.state {
+            RangeState::Active => {
+                assert!(
+                    self.active_segment.is_some(),
+                    "active range missing active_segment"
+                );
+                let seg_id = self.active_segment.unwrap();
+                let seg = self
+                    .segments
+                    .get(&seg_id)
+                    .expect("active_segment points to missing segment");
+                assert_eq!(
+                    seg.state,
+                    SegmentState::Active,
+                    "active_segment not in Active state"
+                );
+            }
+            RangeState::Sealed | RangeState::Deleting => {
+                assert!(
+                    self.active_segment.is_none(),
+                    "sealed/deleting range has active_segment"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_sealed_segments(&self) {
+        for seg in self.segments.values() {
+            if seg.state == SegmentState::Sealed {
+                assert!(
+                    seg.end_offset.is_some(),
+                    "sealed segment missing end_offset"
+                );
+                assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_seal_history(&self) {
+        let ts = &self.seal_history.seal_timestamps;
+        for i in 1..ts.len() {
+            assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
+        }
     }
 }
 
@@ -353,8 +449,63 @@ impl TopicMeta {
             .then_some(())
             .ok_or(MetadataError::TopicNotActive(self.id))
     }
+    pub(crate) fn is_merge_eligible(&self) -> bool {
+        self.state == TopicState::Active && self.can_split() && self.active_ranges.len() >= 2
+    }
+
     pub(crate) fn can_split(&self) -> bool {
         self.storage_policy.partition_strategy != PartitionStrategy::Fixed
+    }
+
+    pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
+        if !self.is_merge_eligible() {
+            return None;
+        }
+        self.active_ranges.windows(2).find_map(|pair| {
+            self.try_merge_pair(&self.ranges[&pair[0]], &self.ranges[&pair[1]], now)
+        })
+    }
+
+    fn try_merge_pair(&self, r1: &RangeMeta, r2: &RangeMeta, now: u64) -> Option<MetadataCommand> {
+        if r1.state != RangeState::Active || r2.state != RangeState::Active {
+            return None;
+        }
+        if !r1.mergeable_with(r2, now) {
+            return None;
+        }
+        let replica_set = r1
+            .active_segment
+            .and_then(|sid| r1.segments.get(&sid))
+            .map(|s| s.replica_set.clone())
+            .unwrap_or_default();
+        Some(MetadataCommand::MergeRange(MergeRange {
+            topic_id: self.id,
+            range_id_1: r1.range_id,
+            range_id_2: r2.range_id,
+            created_at: now,
+            merged_replica_set: replica_set,
+        }))
+    }
+
+    pub(crate) fn execute_split(
+        &mut self,
+        cmd: SplitRange,
+    ) -> Result<(RangeId, RangeId), MetadataError> {
+        let left_id = RangeId(self.next_range_id);
+        let right_id = RangeId(self.next_range_id + 1);
+        let range = self
+            .ranges
+            .get_mut(&cmd.range_id)
+            .ok_or(MetadataError::RangeNotFound)?;
+        let (left, right) = range.split(cmd, left_id, right_id)?;
+        let parent_range_id = range.range_id;
+        self.next_range_id += 2;
+        self.active_ranges.retain(|id| *id != parent_range_id);
+        self.ranges.insert(left_id, left);
+        self.ranges.insert(right_id, right);
+        self.insert_range_sorted(left_id);
+        self.insert_range_sorted(right_id);
+        Ok((left_id, right_id))
     }
 
     pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
@@ -387,6 +538,66 @@ impl TopicMeta {
 
         for range in self.ranges.values_mut() {
             range.delete();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_invariants(&self) {
+        for rid in self.ranges.keys() {
+            assert!(rid.0 < self.next_range_id, "range ID >= next_range_id");
+        }
+        if self.state == TopicState::Active {
+            self.assert_keyspace_coverage();
+        }
+        for range in self.ranges.values() {
+            range.assert_invariants();
+            self.assert_split_children_cooldown(range);
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_keyspace_coverage(&self) {
+        if self.active_ranges.is_empty() {
+            return;
+        }
+        let ranges: Vec<&RangeMeta> = self
+            .active_ranges
+            .iter()
+            .map(|id| &self.ranges[id])
+            .collect();
+        assert_eq!(
+            ranges[0].keyspace_start, KEYSPACE_MIN,
+            "first range must start at MIN"
+        );
+        assert_eq!(
+            ranges.last().unwrap().keyspace_end,
+            KEYSPACE_MAX,
+            "last range must end at MAX"
+        );
+        for w in ranges.windows(2) {
+            assert_eq!(
+                w[0].keyspace_end, w[1].keyspace_start,
+                "keyspace gap between active ranges"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_split_children_cooldown(&self, range: &RangeMeta) {
+        let Some([left, right]) = range.split_into else {
+            return;
+        };
+        if let Some(left_range) = self.ranges.get(&left) {
+            assert!(
+                left_range.seal_history.created_by_split_at.is_some(),
+                "split child missing created_by_split_at"
+            );
+        }
+        if let Some(right_range) = self.ranges.get(&right) {
+            assert!(
+                right_range.seal_history.created_by_split_at.is_some(),
+                "split child missing created_by_split_at"
+            );
         }
     }
 }

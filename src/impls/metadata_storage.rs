@@ -14,28 +14,42 @@ use crate::clusters::{
 #[allow(dead_code)]
 enum GroupKey {
     LogEntry(u64),
-    HardState,
-    SnapMeta,
-    SnapData,
-    AppliedIndex,
-    Epoch,
+    Fixed(u8),
 }
 
 impl GroupKey {
+    fn hard_state() -> Self {
+        Self::Fixed(0x02)
+    }
+    #[allow(dead_code)]
+    fn snap_meta() -> Self {
+        Self::Fixed(0x03)
+    }
+    #[allow(dead_code)]
+    fn snap_data() -> Self {
+        Self::Fixed(0x04)
+    }
+    #[allow(dead_code)]
+    fn applied_index() -> Self {
+        Self::Fixed(0x05)
+    }
+    #[allow(dead_code)]
+    fn epoch() -> Self {
+        Self::Fixed(0x06)
+    }
+
     fn encode(&self) -> Vec<u8> {
         match self {
-            GroupKey::LogEntry(index) => {
-                let mut key = Vec::with_capacity(9);
-                key.push(0x01);
-                key.extend_from_slice(&index.to_be_bytes());
-                key
-            }
-            GroupKey::HardState => vec![0x02],
-            GroupKey::SnapMeta => vec![0x03],
-            GroupKey::SnapData => vec![0x04],
-            GroupKey::AppliedIndex => vec![0x05],
-            GroupKey::Epoch => vec![0x06],
+            GroupKey::LogEntry(index) => Self::encode_log_entry(*index),
+            GroupKey::Fixed(tag) => vec![*tag],
         }
+    }
+
+    fn encode_log_entry(index: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(9);
+        key.push(0x01);
+        key.extend_from_slice(&index.to_be_bytes());
+        key
     }
 
     fn encode_for(&self, group_id: u64) -> Vec<u8> {
@@ -61,7 +75,7 @@ impl DbOp {
         }
 
         fn put_hard_state(group_id: u64, term: u64, voted_for: Option<NodeId>) -> DbOp {
-            let key = GroupKey::HardState.encode_for(group_id);
+            let key = GroupKey::hard_state().encode_for(group_id);
             let value = bincode::encode_to_vec(&(term, voted_for), BINCODE_CONFIG)
                 .expect("encode HardState failed");
             DbOp::Put { key, value }
@@ -69,7 +83,7 @@ impl DbOp {
 
         fn delete_from(group_id: u64, from_index: u64) -> DbOp {
             let start = GroupKey::LogEntry(from_index).encode_for(group_id);
-            let end = GroupKey::HardState.encode_for(group_id);
+            let end = GroupKey::hard_state().encode_for(group_id);
             DbOp::DeleteRange { start, end }
         }
 
@@ -134,7 +148,7 @@ impl MetadataStorage {
     fn take_persistent_state_for(&self, group_id: u64) -> RaftPersistentState {
         let Some(bytes) = self
             .db
-            .get(GroupKey::HardState.encode_for(group_id))
+            .get(GroupKey::hard_state().encode_for(group_id))
             .unwrap_or_default()
         else {
             return RaftPersistentState::default();
@@ -153,7 +167,7 @@ impl MetadataStorage {
 
     fn list_log_entires(&self, group_id: u64) -> Vec<LogEntry> {
         let start = GroupKey::LogEntry(0).encode_for(group_id);
-        let end = GroupKey::HardState.encode_for(group_id);
+        let end = GroupKey::hard_state().encode_for(group_id);
         self.scan_range(&start, &end)
             .into_iter()
             .map(|bytes| {
@@ -269,7 +283,7 @@ mod tests {
     fn key_encoding_preserves_sort_order() {
         let g1_log1 = GroupKey::LogEntry(1).encode_for(1);
         let g1_log2 = GroupKey::LogEntry(2).encode_for(1);
-        let g1_hard = GroupKey::HardState.encode_for(1);
+        let g1_hard = GroupKey::hard_state().encode_for(1);
         let g2_log1 = GroupKey::LogEntry(1).encode_for(2);
 
         assert!(g1_log1 < g1_log2, "log entries must sort by index");
