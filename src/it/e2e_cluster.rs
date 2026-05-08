@@ -1,7 +1,7 @@
 use crate::StartUp;
 use crate::clusters::{SwimNode, SwimNodeState};
 use crate::config::Environment;
-use crate::connections::clients::{ClientStreamReader, ClientStreamWriter};
+use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::request::ConnectionRequests;
 use crate::connections::request::QueryCommand::GetMembers;
 use crate::net::TcpStream;
@@ -30,7 +30,7 @@ fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -
 async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>> {
     let stream = TcpStream::connect((host, port)).await?;
     let (read_half, write_half) = stream.into_split();
-    let mut writer = ClientStreamWriter::new(write_half);
+    let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer.write(&ConnectionRequests::Query(GetMembers)).await?;
     Ok(reader.read_request().await?)

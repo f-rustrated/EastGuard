@@ -6,7 +6,7 @@ use crate::StartUp;
 use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::clusters::raft::messages::ProposeError;
 use crate::config::Environment;
-use crate::connections::clients::{ClientStreamReader, ClientStreamWriter};
+use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::request::{
     ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse,
 };
@@ -58,7 +58,7 @@ fn test_propose_request(name: &str, forwarded: bool) -> ConnectionRequests {
 async fn send_propose(host: &str, port: u16, req: ConnectionRequests) -> ProposeResponse {
     let stream = TcpStream::connect((host, port)).await.unwrap();
     let (read_half, write_half) = stream.into_split();
-    let mut writer = ClientStreamWriter::new(write_half);
+    let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer.write(&req).await.unwrap();
     reader.read_request().await.unwrap()

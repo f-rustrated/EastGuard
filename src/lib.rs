@@ -138,7 +138,7 @@ async fn handle_client_stream(
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut stream_reader = ClientStreamReader::new(read_half);
-    let mut stream_writer = ClientStreamWriter::new(write_half);
+    let mut stream_writer = ClientStreamWriter::new(write_half, swim_sender, raft_sender);
     let request = stream_reader.read_request().await?;
-    stream_writer.dispatch(swim_sender, raft_sender, request).await
+    stream_writer.dispatch(request).await
 }

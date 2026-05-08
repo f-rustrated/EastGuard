@@ -20,14 +20,23 @@ use crate::config::SERDE_CONFIG;
 
 pub struct ClientStreamWriter {
     pub(crate) stream: OwnedWriteHalf,
+    swim_sender: SwimSender,
+    raft_sender: RaftSender,
 }
 
 impl ClientStreamWriter {
-    pub(crate) fn new(write_half: OwnedWriteHalf) -> Self {
-        Self { stream: write_half }
+    pub(crate) fn new(
+        write_half: OwnedWriteHalf,
+        swim_sender: SwimSender,
+        raft_sender: RaftSender,
+    ) -> Self {
+        Self {
+            stream: write_half,
+            swim_sender,
+            raft_sender,
+        }
     }
 
-    // TODO: refactor
     pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
         let len = (encoded.len() as u32).to_be_bytes();
@@ -39,49 +48,33 @@ impl ClientStreamWriter {
         Ok(())
     }
 
-    pub(crate) async fn dispatch(
-        &mut self,
-        swim_sender: SwimSender,
-        raft_sender: RaftSender,
-        request: ConnectionRequests,
-    ) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(&mut self, request: ConnectionRequests) -> anyhow::Result<()> {
         match request {
             ConnectionRequests::Connection(_) => Ok(()),
-            ConnectionRequests::Query(q) => self.handle_query(swim_sender, q).await,
-            ConnectionRequests::Propose(req) => {
-                self.handle_propose(swim_sender, raft_sender, req).await
-            }
+            ConnectionRequests::Query(q) => self.handle_query(q).await,
+            ConnectionRequests::Propose(req) => self.handle_propose(req).await,
         }
     }
 
-    pub(crate) async fn handle_query(
-        &mut self,
-        swim_sender: SwimSender,
-        query_type: QueryCommand,
-    ) -> anyhow::Result<()> {
+    async fn handle_query(&mut self, query_type: QueryCommand) -> anyhow::Result<()> {
         match query_type {
-            QueryCommand::GetMembers => self.handle_get_members(swim_sender).await,
-            QueryCommand::GetShardInfo { key } => {
-                self.handle_get_shard_info(swim_sender, key).await
-            }
+            QueryCommand::GetMembers => self.handle_get_members().await,
+            QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(key).await,
         }
     }
 
-    async fn handle_get_members(&mut self, swim_sender: SwimSender) -> anyhow::Result<()> {
+    async fn handle_get_members(&mut self) -> anyhow::Result<()> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        swim_sender
+        self.swim_sender
             .send(SwimQueryCommand::GetMembers { reply: send })
             .await?;
         let result = recv.await?;
         self.write(&result).await
     }
 
-    async fn handle_get_shard_info(
-        &mut self,
-        swim_sender: SwimSender,
-        key: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let response = swim_sender
+    async fn handle_get_shard_info(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
+        let response = self
+            .swim_sender
             .get_shard_info(key)
             .await?
             .map(|(group, leader)| ShardInfoResponse {
@@ -92,36 +85,28 @@ impl ClientStreamWriter {
         self.write(&response).await
     }
 
-    pub(crate) async fn handle_propose(
-        &mut self,
-        swim_sender: SwimSender,
-        raft_sender: RaftSender,
-        req: ProposeRequest,
-    ) -> anyhow::Result<()> {
-        let response = Self::execute_propose(&swim_sender, &raft_sender, req).await?;
+    async fn handle_propose(&mut self, req: ProposeRequest) -> anyhow::Result<()> {
+        let response = self.execute_propose(req).await?;
         self.write(&response).await?;
         Ok(())
     }
 
-    async fn execute_propose(
-        swim_sender: &SwimSender,
-        raft_sender: &RaftSender,
-        req: ProposeRequest,
-    ) -> anyhow::Result<ProposeResponse> {
-        let Some(shard_group) = swim_sender
+    async fn execute_propose(&self, req: ProposeRequest) -> anyhow::Result<ProposeResponse> {
+        let Some(shard_group) = self
+            .swim_sender
             .resolve_shard_group(req.resource_key.clone())
             .await?
         else {
             return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
         };
         let raft_cmd = req.command.clone().into_raft_command(shard_group.members);
-        let Some(result) = raft_sender.propose(shard_group.id, raft_cmd).await else {
+        let Some(result) = self.raft_sender.propose(shard_group.id, raft_cmd).await else {
             return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
         };
         let response = match result {
             Ok(()) => ProposeResponse::Success,
             Err(ProposeError::NotLeader(ref hint)) if !req.forwarded => {
-                Self::try_forward(swim_sender, hint.clone(), shard_group.id, req).await
+                self.try_forward(hint.clone(), shard_group.id, req).await
             }
             Err(err) => ProposeResponse::Error(err),
         };
@@ -129,27 +114,28 @@ impl ClientStreamWriter {
     }
 
     async fn try_forward(
-        swim_sender: &SwimSender,
+        &self,
         leader_hint: Option<NodeId>,
         shard_group_id: ShardGroupId,
         req: ProposeRequest,
     ) -> ProposeResponse {
-        if let Some(resp) = Self::try_forward_via_hint(swim_sender, &leader_hint, &req).await {
+        if let Some(resp) = self.try_forward_via_hint(&leader_hint, &req).await {
             return resp;
         }
-        if let Some(resp) = Self::try_forward_via_gossip(swim_sender, shard_group_id, &req).await {
+        if let Some(resp) = self.try_forward_via_gossip(shard_group_id, &req).await {
             return resp;
         }
         ProposeResponse::Error(ProposeError::NotLeader(leader_hint))
     }
 
     async fn try_forward_via_hint(
-        swim_sender: &SwimSender,
+        &self,
         leader_hint: &Option<NodeId>,
         req: &ProposeRequest,
     ) -> Option<ProposeResponse> {
         let leader_id = leader_hint.as_ref()?;
-        let node_addr = swim_sender
+        let node_addr = self
+            .swim_sender
             .resolve_address(leader_id.clone())
             .await
             .inspect_err(|e| tracing::debug!("Resolve address for {} failed: {e}", leader_id))
@@ -164,11 +150,12 @@ impl ClientStreamWriter {
     }
 
     async fn try_forward_via_gossip(
-        swim_sender: &SwimSender,
+        &self,
         shard_group_id: ShardGroupId,
         req: &ProposeRequest,
     ) -> Option<ProposeResponse> {
-        let entry = swim_sender
+        let entry = self
+            .swim_sender
             .resolve_shard_leader(shard_group_id)
             .await
             .inspect_err(|e| {
@@ -193,7 +180,7 @@ impl ClientStreamWriter {
     ) -> anyhow::Result<ProposeResponse> {
         let stream = TcpStream::connect(addr).await?;
         let (read_half, write_half) = stream.into_split();
-        let mut writer = ClientStreamWriter::new(write_half);
+        let mut writer = ClientRawWriter::new(write_half);
         let mut reader = ClientStreamReader::new(read_half);
 
         let forwarded_req = ConnectionRequests::Propose(ProposeRequest {
@@ -202,6 +189,26 @@ impl ClientStreamWriter {
         });
         writer.write(&forwarded_req).await?;
         reader.read_request().await
+    }
+}
+
+pub struct ClientRawWriter {
+    stream: OwnedWriteHalf,
+}
+
+impl ClientRawWriter {
+    pub fn new(write_half: OwnedWriteHalf) -> Self {
+        Self { stream: write_half }
+    }
+    pub async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+        let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
+        let len = (encoded.len() as u32).to_be_bytes();
+        self.stream.write_all(&len).await.expect("write len failed");
+        self.stream
+            .write_all(&encoded)
+            .await
+            .expect("write encoded failed");
+        Ok(())
     }
 }
 
