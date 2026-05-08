@@ -50,19 +50,6 @@ impl SwimActor {
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
     ) {
         for event in state.take_events() {
-<<<<<<< Updated upstream
-            match event {
-                SwimEvent::Packet(pkt) => {
-                    let _ = transport_tx.send(pkt).await;
-                }
-                SwimEvent::Timer(cmd) => {
-                    let _ = scheduler_tx.send(cmd.into()).await;
-                }
-                SwimEvent::Membership(m) => {
-                    if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
-                        let _ = raft_tx.send(cmd).await;
-                    }
-=======
             Self::route_swim_event(state, event, transport_tx, scheduler_tx, raft_tx).await;
         }
     }
@@ -82,9 +69,8 @@ impl SwimActor {
                 let _ = scheduler_tx.send(cmd.into()).await;
             }
             SwimEvent::Membership(m) => {
-                if let Some(cmd) = state.to_raft_command(m) {
+                if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
                     let _ = raft_tx.send(cmd).await;
->>>>>>> Stashed changes
                 }
             }
         }
