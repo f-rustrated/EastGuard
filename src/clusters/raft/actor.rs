@@ -41,33 +41,62 @@ impl MultiRaftActor {
                 store.process(cmd);
             }
 
-            let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
-            for event in store.flush() {
-                match event {
-                    RaftEvent::OutboundRaftPacket(pkt) => {
-                        packets_by_target
-                            .entry(pkt.target.clone())
-                            .or_default()
-                            .push(pkt);
-                    }
-                    RaftEvent::Timer(cmd) => {
-                        let _ = scheduler_tx.send(cmd.into()).await;
-                    }
-                    RaftEvent::LeaderChange(lc) => {
-                        let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
-                    }
-                    RaftEvent::DisconnectPeer(node_id) => {
-                        let _ = transport_tx
-                            .send(RaftTransportCommand::DisconnectPeer(node_id))
-                            .await;
-                    }
-                }
-            }
-            for packets in packets_by_target.into_values() {
-                let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
-            }
-
+            Self::flush_events(&mut store, &transport_tx, &scheduler_tx, &swim_tx).await;
             store.fire_deferred();
+        }
+    }
+
+    async fn flush_events(
+        store: &mut MultiRaft,
+        transport_tx: &mpsc::Sender<RaftTransportCommand>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+        swim_tx: &SwimSender,
+    ) {
+        let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
+        for event in store.flush() {
+            Self::route_event(
+                event,
+                &mut packets_by_target,
+                transport_tx,
+                scheduler_tx,
+                swim_tx,
+            )
+            .await;
+        }
+        Self::send_batched_packets(packets_by_target, transport_tx).await;
+    }
+
+    async fn route_event(
+        event: RaftEvent,
+        packets: &mut HashMap<NodeId, Vec<OutboundRaftPacket>>,
+        transport_tx: &mpsc::Sender<RaftTransportCommand>,
+        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+        swim_tx: &SwimSender,
+    ) {
+        match event {
+            RaftEvent::OutboundRaftPacket(pkt) => {
+                packets.entry(pkt.target.clone()).or_default().push(pkt);
+            }
+            RaftEvent::Timer(cmd) => {
+                let _ = scheduler_tx.send(cmd.into()).await;
+            }
+            RaftEvent::LeaderChange(lc) => {
+                let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
+            }
+            RaftEvent::DisconnectPeer(node_id) => {
+                let _ = transport_tx
+                    .send(RaftTransportCommand::DisconnectPeer(node_id))
+                    .await;
+            }
+        }
+    }
+
+    async fn send_batched_packets(
+        packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
+        transport_tx: &mpsc::Sender<RaftTransportCommand>,
+    ) {
+        for packets in packets_by_target.into_values() {
+            let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
         }
     }
 }
