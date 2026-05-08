@@ -168,6 +168,10 @@ impl RangeMeta {
         self.active_segment.ok_or(MetadataError::RangeNotActive)
     }
 
+    pub(crate) fn should_split(&self, sealed_at: u64) -> bool {
+        self.seal_history.should_split(sealed_at)
+    }
+
     pub(crate) fn validate_active_segment(&self, expected: SegmentId) -> Result<(), MetadataError> {
         let active_seg_id = self.validate_active()?;
         if active_seg_id != expected {

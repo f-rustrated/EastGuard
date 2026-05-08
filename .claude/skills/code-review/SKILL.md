@@ -43,7 +43,7 @@ All AI agents performing code reviews must follow these guidelines to ensure con
 
 - Property testing based on assert_invariants for any unit testing
 - Oracle testing based on unittest
-- Preper blackbox testing on integration testing
+- Prefer blackbox testing on integration testing
 
 ## Review Comment Style
 

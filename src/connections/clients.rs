@@ -153,7 +153,8 @@ impl ClientStreamWriter {
             .resolve_address(leader_id.clone())
             .await
             .inspect_err(|e| tracing::debug!("Resolve address for {} failed: {e}", leader_id))
-            .ok()??;
+            .ok()
+            .flatten()?;
         Self::forward_to_leader(node_addr.client_addr, req)
             .await
             .inspect_err(|e| {
@@ -173,7 +174,8 @@ impl ClientStreamWriter {
             .inspect_err(|e| {
                 tracing::debug!("Resolve shard leader for {:?} failed: {e}", shard_group_id)
             })
-            .ok()??;
+            .ok()
+            .flatten()?;
         Self::forward_to_leader(entry.leader_addr.client_addr, req)
             .await
             .inspect_err(|e| {

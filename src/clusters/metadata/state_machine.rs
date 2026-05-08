@@ -73,12 +73,11 @@ impl MetadataStateMachine {
         range.validate_active_segment(cmd.segment_id)?;
         range.roll_segment(cmd.segment_id, cmd.new_replica_set.clone(), cmd.sealed_at)?;
 
-        let should_split = range.seal_history.should_split(cmd.sealed_at);
-        if should_split && can_split {
+        if range.should_split(cmd.sealed_at) && can_split {
             match range.build_split_proposal(&cmd) {
                 Ok(p) => self.pending_proposals.push(p),
                 Err(e) => {
-                    tracing::info!("Split proposal skipped for range: {:?}", e)
+                    tracing::debug!("Split proposal skipped for range {:?}: {:?}", cmd.range_id, e)
                 }
             }
         }
