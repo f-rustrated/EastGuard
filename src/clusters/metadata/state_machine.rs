@@ -67,27 +67,19 @@ impl MetadataStateMachine {
     }
 
     fn roll_segment(&mut self, cmd: RollSegment) -> Result<(), MetadataError> {
-        let topic = self
-            .topics
-            .get_mut(&cmd.topic_id)
-            .ok_or(TopicNotFound(cmd.topic_id))?;
-        topic.validate_active()?;
+        let topic = self.get_active_topic_mut(cmd.topic_id)?;
         let can_split = topic.can_split();
         let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
-        let active_seg_id = range.validate_active()?;
-        if active_seg_id != cmd.segment_id {
-            return Err(StaleSegment);
-        }
-        let should_split =
-            range.roll_segment(cmd.segment_id, cmd.new_replica_set.clone(), cmd.sealed_at)?;
+        range.validate_active_segment(cmd.segment_id)?;
+        range.roll_segment(cmd.segment_id, cmd.new_replica_set.clone(), cmd.sealed_at)?;
+
+        let should_split = range.seal_history.should_split(cmd.sealed_at);
         if should_split && can_split {
             match range.build_split_proposal(&cmd) {
-                Ok(proposal) => self.pending_proposals.push(proposal),
-                Err(e) => tracing::debug!(
-                    "Split proposal skipped for range {:?}: {:?}",
-                    cmd.range_id,
-                    e
-                ),
+                Ok(p) => self.pending_proposals.push(p),
+                Err(e) => {
+                    tracing::info!("Split proposal skipped for range: {:?}", e)
+                }
             }
         }
         Ok(())

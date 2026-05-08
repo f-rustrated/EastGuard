@@ -168,6 +168,14 @@ impl RangeMeta {
         self.active_segment.ok_or(MetadataError::RangeNotActive)
     }
 
+    pub(crate) fn validate_active_segment(&self, expected: SegmentId) -> Result<(), MetadataError> {
+        let active_seg_id = self.validate_active()?;
+        if active_seg_id != expected {
+            return Err(MetadataError::StaleSegment);
+        }
+        Ok(())
+    }
+
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
         split_point > &self.keyspace_start && split_point < &self.keyspace_end
     }
@@ -195,7 +203,7 @@ impl RangeMeta {
         segment_to_seal: SegmentId,
         replica_set: Vec<NodeId>,
         requested_at: u64,
-    ) -> Result<bool, MetadataError> {
+    ) -> Result<(), MetadataError> {
         let segment = self
             .segments
             .get_mut(&segment_to_seal)
@@ -215,7 +223,7 @@ impl RangeMeta {
         self.seal_history.record_seal(requested_at);
         self.next_segment_id += 1;
 
-        Ok(self.seal_history.should_split(requested_at))
+        Ok(())
     }
 
     pub(crate) fn merge(
@@ -225,17 +233,41 @@ impl RangeMeta {
         replica_set: Vec<NodeId>,
         requested_at: u64,
     ) -> Result<RangeMeta, MetadataError> {
+        self.validate_mergeable(other)?;
+        self.seal_for_merge(other, merged_id, requested_at)?;
+        Ok(self.build_merged_range(other, merged_id, replica_set, requested_at))
+    }
+
+    fn validate_mergeable(&self, other: &RangeMeta) -> Result<(), MetadataError> {
         if !self.is_next_to(other) {
             return Err(MetadataError::RangesNotAdjacent);
         }
         self.validate_sealable()?;
         other.validate_sealable()?;
+        Ok(())
+    }
 
-        let (merged_start, merged_end) = self.merged_keyspace(other);
+    fn seal_for_merge(
+        &mut self,
+        other: &mut RangeMeta,
+        merged_id: RangeId,
+        requested_at: u64,
+    ) -> Result<(), MetadataError> {
         self.seal(requested_at)?;
         other.seal(requested_at)?;
         self.merged_into = Some(merged_id);
         other.merged_into = Some(merged_id);
+        Ok(())
+    }
+
+    fn build_merged_range(
+        &self,
+        other: &RangeMeta,
+        merged_id: RangeId,
+        replica_set: Vec<NodeId>,
+        requested_at: u64,
+    ) -> RangeMeta {
+        let (merged_start, merged_end) = self.merged_keyspace(other);
         let mut merged = RangeMeta::new(
             merged_id,
             merged_start,
@@ -244,7 +276,7 @@ impl RangeMeta {
             requested_at,
         );
         merged.merged_from = Some(Self::ordered_pair(self.range_id, other.range_id));
-        Ok(merged)
+        merged
     }
 
     fn merged_keyspace(&self, other: &RangeMeta) -> (Vec<u8>, Vec<u8>) {

@@ -60,27 +60,36 @@ impl ClientStreamWriter {
         query_type: QueryCommand,
     ) -> anyhow::Result<()> {
         match query_type {
-            QueryCommand::GetMembers => {
-                let (send, recv) = tokio::sync::oneshot::channel();
-                swim_sender
-                    .send(SwimQueryCommand::GetMembers { reply: send })
-                    .await?;
-
-                let result = recv.await?;
-                self.write(&result).await
-            }
+            QueryCommand::GetMembers => self.handle_get_members(swim_sender).await,
             QueryCommand::GetShardInfo { key } => {
-                let response = swim_sender
-                    .get_shard_info(key)
-                    .await?
-                    .map(|(group, leader)| ShardInfoResponse {
-                        shard_group_id: group.id.0,
-                        leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
-                        leader_addr: leader.map(|e| e.leader_addr),
-                    });
-                self.write(&response).await
+                self.handle_get_shard_info(swim_sender, key).await
             }
         }
+    }
+
+    async fn handle_get_members(&mut self, swim_sender: SwimSender) -> anyhow::Result<()> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        swim_sender
+            .send(SwimQueryCommand::GetMembers { reply: send })
+            .await?;
+        let result = recv.await?;
+        self.write(&result).await
+    }
+
+    async fn handle_get_shard_info(
+        &mut self,
+        swim_sender: SwimSender,
+        key: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let response = swim_sender
+            .get_shard_info(key)
+            .await?
+            .map(|(group, leader)| ShardInfoResponse {
+                shard_group_id: group.id.0,
+                leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
+                leader_addr: leader.map(|e| e.leader_addr),
+            });
+        self.write(&response).await
     }
 
     pub(crate) async fn handle_propose(
@@ -140,21 +149,17 @@ impl ClientStreamWriter {
         req: &ProposeRequest,
     ) -> Option<ProposeResponse> {
         let leader_id = leader_hint.as_ref()?;
-        let node_addr = match swim_sender.resolve_address(leader_id.clone()).await {
-            Ok(Some(addr)) => addr,
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::debug!("Resolve address for {} failed: {e}", leader_id);
-                return None;
-            }
-        };
-        match Self::forward_to_leader(node_addr.client_addr, req).await {
-            Ok(resp) => Some(resp),
-            Err(e) => {
-                tracing::debug!("Forward via hint to {} failed: {e}", node_addr.client_addr);
-                None
-            }
-        }
+        let node_addr = swim_sender
+            .resolve_address(leader_id.clone())
+            .await
+            .inspect_err(|e| tracing::debug!("Resolve address for {} failed: {e}", leader_id))
+            .ok()??;
+        Self::forward_to_leader(node_addr.client_addr, req)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!("Forward via hint to {} failed: {e}", node_addr.client_addr)
+            })
+            .ok()
     }
 
     async fn try_forward_via_gossip(
@@ -162,24 +167,22 @@ impl ClientStreamWriter {
         shard_group_id: ShardGroupId,
         req: &ProposeRequest,
     ) -> Option<ProposeResponse> {
-        let entry = match swim_sender.resolve_shard_leader(shard_group_id).await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::debug!("Resolve shard leader for {:?} failed: {e}", shard_group_id);
-                return None;
-            }
-        };
-        match Self::forward_to_leader(entry.leader_addr.client_addr, req).await {
-            Ok(resp) => Some(resp),
-            Err(e) => {
+        let entry = swim_sender
+            .resolve_shard_leader(shard_group_id)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!("Resolve shard leader for {:?} failed: {e}", shard_group_id)
+            })
+            .ok()??;
+        Self::forward_to_leader(entry.leader_addr.client_addr, req)
+            .await
+            .inspect_err(|e| {
                 tracing::debug!(
                     "Forward via gossip to {} failed: {e}",
                     entry.leader_addr.client_addr
-                );
-                None
-            }
-        }
+                )
+            })
+            .ok()
     }
 
     async fn forward_to_leader(

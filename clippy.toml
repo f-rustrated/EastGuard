@@ -29,6 +29,6 @@ disallowed-types = [
     # --- Turmoil TCP Halves ---
     { path = "turmoil::net::tcp::OwnedReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
     { path = "turmoil::net::tcp::OwnedWriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
-    { path = "turmoil::net::tcp::ReadHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
-    { path = "turmoil::net::tcp::WriteHalf", reason = "Direct dependency on replaceable dependency is prohibited" },
+    { path = "turmoil::net::tcp::ReadHalf", reason = "Direct dependency on replaceable dependency is prohibited", allow-invalid = true },
+    { path = "turmoil::net::tcp::WriteHalf", reason = "Direct dependency on replaceable dependency is prohibited", allow-invalid = true },
 ]
