@@ -24,7 +24,7 @@
 
 7. **No active segment catch-up needed.** In the seal-on-failure model, when a follower crashes, the segment is sealed and a new segment is created with a replacement node. The crashed node is NOT in the new segment's `replica_set`. There is nothing to "catch up" on — the node was replaced, not lagged.
 
-8. **Sealed segment repair for incomplete copies.** The recovering node may have incomplete copies of sealed segments (crash happened mid-replication). The coordinator detects under-replicated sealed segments via the reverse index (`node_segment_index`) and triggers repair: a healthy replica streams the full segment to the recovering node via the consume protocol. This is the same sealed segment repair from D3 — no special recovery protocol.
+8. **Sealed segment repair for incomplete copies.** The recovering node may have incomplete copies of sealed segments (crash happened mid-replication). The coordinator detects under-replicated sealed segments by scanning MetadataStateMachine segment metadata (filtering by `replica_set.contains(recovering_node)`) and triggers repair: a healthy replica streams the full segment to the recovering node via the consume protocol. This is the same sealed segment repair from D3 — no special recovery protocol.
 
 9. **Available for future assignments.** After local recovery completes, the node rejoins the cluster (SWIM alive) and becomes eligible for future segment `replica_set` assignments. New segments may include this node via the least-loaded placement strategy (D4).
 

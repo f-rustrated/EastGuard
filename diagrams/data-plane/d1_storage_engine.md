@@ -34,7 +34,7 @@ WAL records additionally carry `(shard_group_id, range_id, segment_id)` so repla
 
 Record types: `Data` (user payload), `BatchEnd` (marks flush boundary).
 
-**O_DIRECT alignment:** O_DIRECT requires sector-aligned buffers and file offsets (typically 4KB). Individual records are variable-length, so alignment is at the **batch level** — each batch is padded to the next 4KB boundary before writing. The `BatchEnd` record absorbs the padding. Reads account for padding by scanning records within a batch and stopping at `BatchEnd`.
+**O_DIRECT alignment (segment files only):** O_DIRECT requires sector-aligned buffers and file offsets (typically 4KB). Individual records are variable-length, so alignment is at the **batch level** — each batch is padded to the next 4KB boundary before writing. The `BatchEnd` record absorbs the padding. Reads account for padding by scanning records within a batch and stopping at `BatchEnd`. WAL uses standard buffered I/O + fsync (write-once-read-never in normal path — O_DIRECT alignment constraints add unnecessary complexity with no benefit).
 
 ## Sparse Offset Index
 
@@ -52,8 +52,8 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 ## Write Path (single node)
 
 1. Accumulate records in application buffer until batch trigger (10ms / 20k records / 10MB)
-2. Write batch to WAL (O_DIRECT, aligned), fsync WAL — durability point, ACK producer here
-3. Append records to segment file(s) (O_DIRECT, aligned) — async, for serving reads
+2. Write batch to WAL (buffered I/O), fsync WAL — durability point, ACK producer here
+3. Append records to segment file(s) (O_DIRECT, aligned) — async, derived from WAL
 4. Update sparse index in RocksDB (batch boundary entries only) — async
 5. Track `size_bytes` — when approaching 1GB, signal metadata layer to propose `RollSegment`
 

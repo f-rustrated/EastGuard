@@ -57,16 +57,31 @@ No quorum. No ISR. ALL replicas must ack. If any fails → seal segment, open ne
 
 ## Failure Response
 
+### Follower Failure (detected by segment leader)
+
 When a follower fails to ack within timeout:
 
 1. Segment leader (broker) stops accepting new produces for this segment
-2. Segment leader sends `SealRequest` to vnode leader, including `end_offset` — the last offset committed (ACKed by all replicas before the failure)
-3. Vnode leader proposes `RollSegment` via Raft with `new_replica_set` excluding failed node and `end_offset` from the SealRequest
+2. Segment leader sends `SealRequest` to coordinator (vnode leader), including `end_offset` — the last offset committed (ACKed by all replicas before the failure)
+3. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding failed node and `end_offset` from the SealRequest. Previous segment leader preserved at `replica_set[0]` (cache locality, active producer connections).
 4. Raft commits → MetadataStateMachine seals old segment (sets `end_offset`), creates new segment (`start_offset = end_offset + 1`)
 5. Coordinator notifies affected brokers via `data_port`
 6. Segment leader opens new segment file with healthy replica set
 7. Blocked producer streams resume against new segment — un-ACKed records retried by producer against new segment
 8. Sealed old segment queued for under-replication repair (async)
+
+### Leader Failure (detected by follower)
+
+When the segment leader crashes or becomes unreachable, followers detect via ReplicaAppend timeout or TCP connection drop:
+
+1. Follower sends `SealRequest` to coordinator, including the follower's last known `commit_offset` as `end_offset`
+2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding the dead leader. A surviving follower is promoted to `replica_set[0]` (new segment leader).
+3. Raft commits → MetadataStateMachine seals old segment, creates new segment
+4. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
+5. New segment leader accepts produce. Producer discovers new leader via metadata query.
+6. Sealed old segment queued for under-replication repair (async)
+
+Both paths use the same `SealRequest` → `RollSegment` mechanism. Any node in the replica_set can initiate a seal — not just the segment leader.
 
 ### Offset Handoff: Data Plane → Metadata Plane
 
