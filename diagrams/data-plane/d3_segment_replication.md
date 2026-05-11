@@ -72,16 +72,18 @@ When a follower fails to ack within timeout:
 
 ### Leader Failure (detected by follower)
 
-When the segment leader crashes or becomes unreachable, followers detect via ReplicaAppend timeout or TCP connection drop:
+When the segment leader crashes or becomes unreachable, followers detect via **TCP connection drop** on the persistent replication connection. ReplicaAppend is NOT periodic (only sent when there's produce traffic), so its absence alone is not a failure signal.
 
 1. Follower sends `SealRequest` to coordinator, including the follower's last known `commit_offset` as `end_offset`
-2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding the dead leader. A surviving follower is promoted to `replica_set[0]` (new segment leader).
+2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding the dead leader. Previous segment leader preserved at `replica_set[0]` if healthy; otherwise a surviving follower is promoted.
 3. Raft commits → MetadataStateMachine seals old segment, creates new segment
 4. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
 5. New segment leader accepts produce. Producer discovers new leader via metadata query.
 6. Sealed old segment queued for under-replication repair (async)
 
 Both paths use the same `SealRequest` → `RollSegment` mechanism. Any node in the replica_set can initiate a seal — not just the segment leader.
+
+**SealRequest idempotency:** Multiple followers may detect the same leader failure and send concurrent SealRequests. MetadataStateMachine's `apply_roll_segment()` checks preconditions — if the segment is already sealed, subsequent proposals are no-ops (DS-RSM invariant 9).
 
 ### Offset Handoff: Data Plane → Metadata Plane
 
@@ -124,7 +126,7 @@ Separate from Raft TCP transport (`raft_port`) because:
 
 ## Sealed Segment Replication (self-healing)
 
-When a sealed segment is under-replicated (replica count < `replication_factor`), the coordinator assigns a new node and triggers repair. The repair protocol is the consume protocol between brokers — read from healthy replica, write to new replica. No special protocol needed.
+When a sealed segment is under-replicated (replica count < `replication_factor`), the coordinator assigns a replacement node, updates the sealed segment's `replica_set` via Raft (`ReassignSegment`), and triggers repair. The replacement sends `CatchUpRequest` to a healthy replica — the only use of `CatchUpRequest` in the system. In the seal-on-failure model, active segments never need catch-up: any replica failure triggers seal-and-replace, and the new segment starts fresh with all replicas in sync from `start_offset`. Nodes get new NodeIds on restart, so a recovered node is a new node — it doesn't rejoin old replica sets.
 
 ---
 

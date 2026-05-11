@@ -15,32 +15,35 @@ Write path:
   Records batched (10ms / 20k records / 10MB)
     → WAL (sequential append, fsync)         ← durability point
     → ACK producer                           ← immediately after WAL fsync
-    → Segment file(s) (append, fsync)        ← async, derived from WAL
-    → Sparse index in RocksDB (update)       ← async, derived from segments
+    → Cache (in-memory)                      ← serves reads immediately
+    → Segment file(s) (checkpoint flush)     ← background, driven by checkpoint
+    → Sparse index in RocksDB (update)       ← after segment file flush
 
 Read path:
-  Offset → sparse index (nearest entry) → seek segment file → scan forward
+  Check cache (hot tail reads)
+    → hit: serve from memory, zero disk I/O
+    → miss: sparse index → seek segment file → scan forward (cold reads)
 ```
 
-Producer latency is bounded by WAL fsync only — one sequential write to the active WAL file. Segment file writes and index updates are off the critical path — they are derived state, rebuildable from the WAL.
+Producer latency is bounded by WAL fsync only — one sequential write to the active WAL file. After ACK, records enter the in-memory cache where they serve consumer reads immediately. Segment file writes happen in the background, driven by checkpoint logic. WAL is the sole disk I/O on the critical path — no contention between WAL and segment file writes.
 
-**Post-ACK failure handling:** After WAL fsync + producer ACK, steps 3-4 must eventually complete but need not be immediate. WAL is the source of truth; everything else is derived.
+**Post-ACK failure handling:** After WAL fsync + producer ACK, cache population and segment file writes must eventually complete. WAL is the source of truth; everything else is derived.
 
-- **Node crash before segment write:** WAL replay rebuilds segment files. Each WAL record carries its assigned offset. On replay, records with offset ≤ segment's `end_offset` are skipped (already written), records beyond are appended — making replay idempotent.
-- **Segment write fails at runtime** (disk full, I/O error): Retry from WAL. If retries fail (persistent disk error), the node marks itself unhealthy, SWIM detects it, segments are sealed and data recovered from replicas.
+- **Node crash before segment file flush:** WAL replay rebuilds segment files and repopulates cache. Each WAL record carries its assigned offset. On replay, records with offset ≤ segment's `end_offset` are skipped (already written), records beyond are appended — making replay idempotent.
+- **Segment file write fails at runtime** (disk full, I/O error): Retry from cache/WAL. If retries fail (persistent disk error), the disk is likely dead — WAL fsync also fails on the same disk → produce path fails → replication ack timeouts on peers → seal triggered via write-path detection (1a or 1b). No explicit "mark unhealthy" mechanism needed — the write-path failure detection handles it naturally. Consumer reads from this node fail; consumers retry from other replicas.
 - **Index update fails:** Sparse index is rebuilt from segment files on demand. Non-critical.
 
 **WAL (Write-Ahead Log):**
 - Segmented log per node — a sequence of fixed-size files (~64MB each), rotated on size limit. ALL writes go to the single active WAL file first.
-- Provides truly sequential writes at the disk level regardless of how many active segments exist on this node. Multiple segments share one WAL — one active file at a time.
-- fsynced before any other writes — the durability guarantee.
-- Old WAL files deleted (file-level `unlink`) once all their records are durably in segment files. Deletion gated by a **flushed WAL position** watermark: a WAL file is only unlinked when ALL its records have confirmed segment file writes (segment's `end_offset` ≥ WAL file's last record offset). This makes the WAL→segment transition idempotent regardless of crash timing.
-- On crash recovery: replay from oldest un-deleted WAL file to rebuild any segment file / index entries that were lost. Replay is idempotent — records already in segment files are skipped by offset comparison.
+- Truly sequential writes — all records from all segments append to one active file. WAL is the sole disk write on the critical path. Segment file writes are background checkpoint flushes, never competing with WAL fsync for disk I/O on the produce path.
+- fsynced before any other writes — the durability guarantee. Batching amortizes fsync cost: one WAL fsync per batch covers all segments in that batch. 10ms batch window → ~100 fsyncs/sec total, not per-segment.
+- Old WAL files deleted (file-level `unlink`) once all their records are durably in segment files. Deletion gated by a **checkpoint position** watermark: a WAL file is only unlinked when ALL its records have been flushed to their segment files (segment's `end_offset` ≥ WAL file's last record offset). This makes the WAL→segment transition idempotent regardless of crash timing.
+- On crash recovery: replay from oldest un-deleted WAL file to rebuild cache, segment files, and index entries. Replay is idempotent — records already in segment files are skipped by offset comparison.
 
 **Segment files:**
-- One file per segment. Written after WAL. fsynced as part of the batch.
-- Serve consumer reads — consumers read directly from segment files, not the WAL.
-- O_DIRECT for both writes and reads — bypasses OS page cache to avoid double-buffering (WAL already has the data) and to prevent cold consumer reads from evicting hot pages.
+- One file per segment. Written by background checkpoint from cache, not directly from WAL.
+- Serve cold consumer reads (cache misses). Hot tail reads served from cache without touching segment files.
+- O_DIRECT for both writes and reads. WAL uses standard buffered I/O + fsync (write-once-read-never in normal path — O_DIRECT alignment constraints add unnecessary complexity with no benefit). O_DIRECT for segment files because: (1) no double buffering — data exists in cache + disk, not also in page cache; (2) predictable fsync latency reflecting actual disk performance; (3) no cache pollution from cold consumer reads evicting hot data.
 
 **Sparse index in RocksDB:**
 - NOT every offset indexed. Sparse — e.g., one entry per N records or per batch.
@@ -49,11 +52,12 @@ Producer latency is bounded by WAL fsync only — one sequential write to the ac
 - Reduces RocksDB write amplification and memory overhead vs full index.
 - Separate RocksDB instance from metadata store.
 
-**Application-level read cache:**
-- Since O_DIRECT bypasses page cache, the application manages its own cache for segment file reads.
+**Application-level cache (write staging + read serving):**
+- Serves dual purpose: (1) staging area for records between WAL and segment files, and (2) read-serving layer for consumer requests. After WAL fsync + producer ACK, records enter the cache immediately and are readable by consumers before the checkpoint flushes them to segment files.
 - Cache is consume-stream-aware: tracks active consume connections and their read positions (learned from incoming consume requests, not from committed consumer offsets). Pre-populates cache ahead of active readers.
-- Hot tail reads (consumer chasing the write head) served from cache.
-- Cold reads (old sealed segments) go directly to disk — no cache pollution.
+- Hot tail reads (consumer chasing the write head) served from cache — zero disk I/O for the most common consumer pattern.
+- Cold reads (old sealed segments, already flushed and evicted from cache) go directly to segment files via O_DIRECT — no cache pollution.
+- **Checkpoint:** Background process flushes cached records to segment files. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient). After checkpoint flush + fsync, the corresponding WAL files become eligible for deletion and cache entries for those records become evictable.
 
 ### 2. Primary-Backup Replication with Seal-on-Failure
 
@@ -96,33 +100,6 @@ Each failure creates a new segment — more file handles, more offset index entr
 
 Consumer reads are simpler and faster: ANY replica has ALL committed data. Followers track a `commit_offset` piggybacked on each `ReplicaAppend` from the leader — one extra `u64` per replication message. Followers serve reads only up to `commit_offset`, preventing the brief window where a follower has fsynced records that the leader hasn't confirmed committed. No ISR tracking, no watermark advancement protocol. Consumer can read from the nearest/fastest replica. (Follower reads are standard in modern systems: Kafka KIP-392, Pulsar bookie reads, Northguard.)
 
-### 3. Write Path: WAL-first, Batched fsync
-
-Records are batched in memory (10ms / 20k records / 10MB, whichever threshold hit first). When a batch is ready:
-
-1. **Write to WAL** (sequential append, fsync) — the durability point
-2. **ACK producer** — immediately after WAL fsync on all replicas
-3. **Append to segment file(s)** (O_DIRECT, fsync) — async, derived from WAL
-4. **Update sparse index** in RocksDB — async, derived from segments
-
-Steps 3-4 are off the critical path. Producer latency = WAL fsync latency only. If the node crashes before segment files or index are written, WAL replay recovers them (idempotent by offset comparison).
-
-**Why WAL-first:**
-
-- **Minimal producer latency.** One sequential write to the active WAL file. Segment file writes (potentially to multiple files) and RocksDB index updates don't block the producer.
-- **True sequential writes.** All records from all active segments on this node append to the single active WAL file sequentially. No random I/O regardless of segment count.
-- **Crash safety.** WAL is the source of truth. Segment files and index are derived and rebuildable.
-- **Batching amortizes fsync cost.** One WAL fsync per batch covers all segments in that batch. 10ms batch window → ~100 fsyncs/sec total, not per-segment.
-
-**Why O_DIRECT (segment files, not WAL):**
-
-O_DIRECT is used for segment file reads and writes, NOT for WAL. WAL uses standard buffered I/O + fsync (write-once-read-never in normal path — page cache bypassing has no benefit, and alignment constraints add unnecessary complexity).
-
-For segment files:
-- **No double buffering.** Without O_DIRECT, data exists in three places: application buffer, page cache, disk. With O_DIRECT, it's two: application buffer, disk. Halves memory overhead.
-- **Predictable fsync latency.** O_DIRECT writes go directly to disk (or disk controller cache). fsync latency reflects actual disk performance, not page cache flush behavior.
-- **No cache pollution from cold reads.** Consumers reading old sealed segments don't evict hot pages. Application-level cache handles hot reads explicitly.
-
 ---
 
 ## Replication Failure Detection
@@ -164,7 +141,7 @@ Segment leader (broker D)                    Vnode leader (A)
 
 The segment leader (broker) cannot propose Raft commands — it's not in the vnode Raft group. It sends a `SealRequest` RPC to the coordinator, which proposes `RollSegment` on its behalf and replies with the new segment info after Raft commit. Same request-reply pattern as client `ProposeRequest`/`ProposeResponse`.
 
-The initiator (D) learns the result via RPC response (~100ms total). Other brokers learn via `data_port`: E receives `SegmentSealed` from D, G receives self-authorizing `ReplicaAppend` for the new segment from D. Recovered F queries the coordinator.
+The initiator (D) learns the result via RPC response (~100ms total). Other brokers learn via `data_port`: E receives `SegmentSealed` from D, G receives self-authorizing `ReplicaAppend` for the new segment from D. When F recovers (with a new NodeId), it queries the coordinator to learn that segment 7 is sealed and it is not in segment 8's `replica_set`. F's partial copy of segment 7 is orphaned — eligible for local GC.
 
 **Segment leader preference on roll:** The coordinator preserves the previous segment leader at `replica_set[0]` when possible. Only when the leader itself failed does a new node take position 0 — preserving cache locality and active producer connections.
 
@@ -180,13 +157,14 @@ The initiator (D) learns the result via RPC response (~100ms total). Other broke
 
 **1b. Follower detects leader failure.**
 
-Followers also detect leader absence. If no `ReplicaAppend` received within a configurable timeout (or TCP connection to leader drops), the follower sends `SealRequest` to the coordinator — same RPC, same `RollSegment` proposal path. Any node can send `SealRequest`, not just the segment leader.
+Followers detect leader failure via **TCP connection drop** — the replication connection between leader and follower is persistent, so a leader crash or network partition causes an immediate TCP RST or timeout. ReplicaAppend is NOT periodic (only sent when there's produce traffic), so "no ReplicaAppend" alone is not a failure signal — it may just mean the segment is idle.
+
+On TCP drop, the follower sends `SealRequest` to the coordinator — same RPC, same `RollSegment` proposal path. Any node in the `replica_set` can send `SealRequest`, not just the segment leader.
 
 ```
 Segment follower (broker E)                  Coordinator (vnode leader A)
    |                                              |
-   |  No ReplicaAppend from D within timeout      |
-   |  (or TCP connection to D dropped)            |
+   |  TCP connection to D dropped                 |
    |                                              |
    E ──(SealRequest RPC)─────────────────────────> A
    |    { shard_group_id, range_id, segment_id,   |
@@ -203,14 +181,16 @@ Segment follower (broker E)                  Coordinator (vnode leader A)
    Producer discovers new leader via metadata     |
 ```
 
+**SealRequest idempotency:** Multiple followers may detect the same leader failure and send concurrent SealRequests. This is safe — the coordinator may propose multiple `RollSegment` commands, but MetadataStateMachine's `apply_roll_segment()` checks preconditions: if the segment is already sealed, subsequent proposals are no-ops. Same guarantee as DS-RSM invariant 9 ("stale proposals are safe").
+
 **What this catches:**
-- Leader crash (TCP connection drops, ReplicaAppend stops)
-- Leader disk failure (leader can't fsync WAL, stops replicating)
+- Leader crash (TCP connection drops)
+- Leader disk failure (leader can't fsync WAL, stops replicating, connection drops)
 - Network partition between followers and leader
 
-**Detection latency:** Sub-second (ReplicaAppend timeout).
+**Detection latency:** Sub-second (TCP connection drop detection).
 
-This is the complement of 1a — together they cover both leader and follower failures at the write-path level, without waiting for SWIM.
+This is the complement of 1a — together they cover both leader and follower failures at the write-path level, without waiting for SWIM. For the case where the leader hangs without TCP dropping (partial failure), SWIM eventually catches it (6-7s).
 
 ### Path 2: SWIM Node Death (slower, node-level)
 
@@ -238,8 +218,8 @@ For each shard group where this node is leader:
 | Follower crash | ✓ (sub-second) | — | ✓ (6-7s) | Leader detects via ReplicaAppend timeout |
 | Follower disk failure | ✓ (sub-second) | — | ✗ | SWIM pings are UDP (network), not disk |
 | Follower slow disk | ✓ (sub-second) | — | ✗ | Treated as failure — seal and move on |
-| Leader crash | — | ✓ (sub-second) | ✓ (6-7s) | Follower detects via ReplicaAppend absence or TCP drop |
-| Leader disk failure | — | ✓ (sub-second) | ✗ | Leader stops replicating, followers detect timeout |
+| Leader crash | — | ✓ (sub-second) | ✓ (6-7s) | Follower detects via TCP connection drop |
+| Leader disk failure | — | ✓ (sub-second) | ✗ | Leader connection drops, followers detect |
 | Network partition | ✓ (sub-second) | ✓ (sub-second) | ✓ (6-7s) | Write-path catches first for active segments |
 | Idle segment, node dead | ✗ | ✗ | ✓ (6-7s) | No produce traffic → write-path never triggers |
 | Idle segment, disk dead | ✗ | ✗ | ✗ | Gap — caught on next produce to that segment |
@@ -248,13 +228,23 @@ For each shard group where this node is leader:
 
 ### Sealed Segment Repair
 
-After sealing, the old segment may be under-replicated (missing the failed node's copy). The coordinator detects this and triggers **sealed segment replication** — literally the consume protocol between brokers:
+After sealing, the old segment may be under-replicated — e.g., segment 7 had `replica_set = [D, E, F]`, F died, now only D and E have copies. The desired state: `replication_factor` healthy nodes each holding a complete copy.
 
-```
-Healthy Replica ── read segment records ──> New Replica (write to local segment file)
-```
+**Detection:** The coordinator knows immediately. When it commits `RollSegment` (which sealed the segment because F failed), the sealed segment's `replica_set` still lists F. The coordinator marks the sealed segment as under-replicated as part of the same apply — no separate detection step.
 
-No special protocol. Sealed segments are immutable. Replication = read + write. Uses the same consume read path and the same append write path. Self-healing.
+For SWIM-triggered seals (`HandleNodeDeath`): the coordinator scans MetadataStateMachine for sealed segments where the dead node is in `replica_set` (see Under-Replication Detection below).
+
+**Repair flow:**
+1. Coordinator selects a replacement node H (least-loaded, not already in `replica_set`)
+2. Coordinator proposes a `ReassignSegment` command via Raft, updating the sealed segment's `replica_set` from `[D, E, F]` to `[D, E, H]`
+3. After Raft commit, coordinator sends `CatchUpRequest` assignment to H via `data_port`
+4. H sends `CatchUpRequest { segment_id, from_offset: 0, to_offset: end_offset }` to D or E
+5. Healthy replica streams the full sealed segment to H — same consume read path, same append write path
+6. Once H has all data (verified by offset), repair is complete
+
+**Orphaned copies:** The failed node F, if it recovers (with a new NodeId), discovers via metadata query that it is no longer in the `replica_set`. F's local copy of segment 7 is orphaned and eligible for GC.
+
+No special protocol. Sealed segments are immutable. Replication = read + write. Self-healing.
 
 ---
 
@@ -323,7 +313,7 @@ Any node that needs segment state but isn't a direct participant (e.g., routing 
 - `SegmentSealed` — segment leader → old followers (cleanup)
 - `SealRequest/Response` — segment leader or follower → coordinator (failure-triggered seal)
 - `ReplicaAppend` — segment leader → followers (replication)
-- `CatchUpRequest` — replica → replica (catch up on missing records). Three use cases: (1) new follower joining active segment's replica_set after seal-and-replace, (2) temporarily disconnected follower catching up on missed ReplicaAppend batches, (3) sealed segment repair (copying data to replacement node). All three are "give me records from offset X to Y" — same protocol.
+- `CatchUpRequest` — replacement replica → healthy replica (sealed segment repair). Copies a sealed segment's data from a healthy replica to a replacement node assigned by the coordinator. In the seal-on-failure model, there is no "catch up" for active segments: any replica failure triggers seal-and-replace, and the new segment starts fresh with all replicas in sync from `start_offset`. Nodes get new NodeIds on restart, so a recovered node is a new node — it doesn't rejoin old replica sets.
 
 Port layout:
 - `client_port` (2921, TCP) — external clients only (produce, consume, query)
@@ -434,5 +424,5 @@ Periodic fsync-and-ack between segment replicas. Catches disk failure on idle se
 | Frequent segment seals under flaky network | Ack timeout tuned conservatively (e.g. 500ms–1s). Transient network blips don't trigger seal. SWIM convergence (~6-7s) handles true node death. Sealed segment count is observable — alert if excessive. |
 | Application cache complexity | O_DIRECT bypasses page cache — application must manage its own read cache. Consume-stream-aware caching provides better eviction policy than OS page cache, but adds implementation complexity. |
 | Sparse index RocksDB grows large | Index is sparse (one entry per batch). Segment deletion triggers range-delete in index. Rebuilt from segment files on crash — not authoritative. |
-| Segment leader failover latency | For active segments: followers detect leader absence sub-second via ReplicaAppend timeout and trigger seal. For idle segments: SWIM detects node death in ~6-7s. Total failover bounded by write-path detection (active) or SWIM detection (idle). |
+| Segment leader failover latency | For active segments: followers detect leader crash sub-second via TCP connection drop and trigger seal. For idle segments: SWIM detects node death in ~6-7s. Leader hang without TCP drop: SWIM catches it (6-7s). |
 | Data transport competing with Raft transport | Separate ports, separate TCP connections, separate actors. Raft heartbeats (1s interval, small packets) unaffected by data throughput. |

@@ -53,25 +53,30 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 
 1. Accumulate records in application buffer until batch trigger (10ms / 20k records / 10MB)
 2. Write batch to WAL (buffered I/O), fsync WAL — durability point, ACK producer here
-3. Append records to segment file(s) (O_DIRECT, aligned) — async, derived from WAL
-4. Update sparse index in RocksDB (batch boundary entries only) — async
-5. Track `size_bytes` — when approaching 1GB, signal metadata layer to propose `RollSegment`
+3. Insert records into application cache — readable by consumers immediately
+4. Background checkpoint: flush cached records to segment file(s) (O_DIRECT, aligned)
+5. After checkpoint flush + fsync: update sparse index, mark WAL files eligible for deletion
+6. Track `size_bytes` — when approaching 1GB, signal metadata layer to propose `RollSegment`
+
+WAL is the sole disk write on the critical path (steps 1-2). Steps 3-5 involve no disk I/O on the produce path — cache insertion is in-memory, segment file writes are background checkpoint flushes.
 
 ## Read Path
 
-1. Check application-level cache for requested offset range
-2. Cache miss: resolve `(range_id, segment_id, offset)` → nearest `byte_position` via sparse index (`seek_for_prev`)
-3. `pread()` on segment file (O_DIRECT) at `byte_position`, scan forward to exact offset
-4. Populate application cache with fetched records
+1. Check application cache for requested offset range
+2. Cache hit (hot tail reads): serve from memory — zero disk I/O
+3. Cache miss (cold reads): resolve `(range_id, segment_id, offset)` → nearest `byte_position` via sparse index (`seek_for_prev`)
+4. `pread()` on segment file (O_DIRECT) at `byte_position`, scan forward to exact offset
 5. Stream records forward until requested `max_bytes` or EOF
 
-## Application-Level Read Cache
+## Application Cache (write staging + read serving)
 
-Since O_DIRECT bypasses the OS page cache, the application manages its own read cache:
+Dual-purpose cache between WAL and segment files. Since O_DIRECT bypasses the OS page cache, the application manages its own:
 
+- **Write staging.** After WAL fsync + producer ACK, records enter cache and are immediately readable by consumers. Records remain in cache until the background checkpoint flushes them to segment files.
 - **Consume-stream-aware.** Tracks active consumer sessions and their read positions. Pre-fetches ahead of active consumers.
-- **Hot tail reads served from cache.** Consumer chasing the write head reads data that was just written — served from the write buffer or cache, zero disk I/O.
-- **Cold reads bypass cache.** Consumers reading old sealed segments go directly to disk. No eviction of hot data.
+- **Hot tail reads served from cache.** Consumer chasing the write head reads data that was just written — served from cache, zero disk I/O. This is the most common consumer pattern.
+- **Cold reads bypass cache.** Consumers reading old sealed segments (already flushed and evicted) go directly to segment files via O_DIRECT. No eviction of hot data.
+- **Checkpoint drives eviction.** After checkpoint flush + fsync, cached records become evictable (they're now durable in segment files). Corresponding WAL files also become eligible for deletion.
 
 ## WAL Lifecycle
 
@@ -79,21 +84,21 @@ The WAL is a sequence of fixed-size log files, not a single ever-growing file. T
 
 **Rotation:** When the active WAL file reaches the size limit (~64MB), it is sealed (no more writes) and a new file is opened with the next sequence number. Writes always go to exactly one file — the active one.
 
-**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been durably fsynced to their respective segment files. DataActor tracks the per-segment-file fsync progress and determines when a WAL file is fully drained.
+**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. DataActor tracks the checkpoint position (per-segment `end_offset` progress) to determine when a WAL file is fully drained.
 
 ```
 WAL file lifecycle:
 
-  wal-000001.log  [active]   → batch writes + fsync
-                  [sealed]   → size limit reached, new file opened
-                  [draining] → segment files catching up
-                  [deleted]  → all records in segment files, unlink
+  wal-000001.log  [active]       → batch writes + fsync
+                  [sealed]       → size limit reached, new file opened
+                  [checkpointing] → cache flushing records to segment files
+                  [deleted]      → all records checkpointed, unlink
 
 Deletion condition for wal-NNNNNN.log:
   For every record in this file:
-    the target segment file has fsynced past this record's position
+    the target segment file has fsynced past this record's offset
 ```
 
-**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D6). The oldest un-deleted file is effectively the checkpoint — no separate checkpoint file needed.
+**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D6). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
 
-**Bounded WAL size:** Under normal operation, the lag between WAL write and segment file fsync is small (segment file writes are async but fast — same batch, same disk). WAL accumulation is bounded by the slowest segment file writer across all active segments on the node. If a segment file writer falls behind (e.g., slow disk for one segment), the WAL files for that period are retained until it catches up.
+**Bounded WAL size:** Under normal operation, the lag between WAL write and checkpoint is bounded by checkpoint frequency and cache size. WAL accumulation is bounded by the slowest checkpoint across all active segments on the node. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient).

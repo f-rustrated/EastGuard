@@ -12,7 +12,7 @@
 |---|---|---|
 | Size limit (~1GB) | DataActor monitoring `size_bytes` | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Follower failure | Write-path timeout on `ReplicaAppend` (leader detects) | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` with updated `replica_set` |
-| Leader failure | ReplicaAppend timeout or TCP drop (follower detects) | Follower sends `SealRequest` to coordinator → coordinator proposes `RollSegment`, promotes surviving follower to leader |
+| Leader failure | TCP connection drop (follower detects) | Follower sends `SealRequest` to coordinator → coordinator proposes `RollSegment`, promotes surviving follower to leader. Multiple concurrent SealRequests are idempotent (precondition check in `apply_roll_segment`). |
 | Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Node death | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed) |
 
