@@ -210,6 +210,13 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                     )
                     .await;
 
+                if name == "node-3" {
+                    // Dead node stops participating — in production,
+                    // a dead process doesn't run elections.
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    return Ok(());
+                }
+
                 tick_n(&ticker, 100).await;
                 serve_leader(&raft_tx, g.id, QUERY_PORT + port).await?;
                 tokio::time::sleep(Duration::from_secs(600)).await;
