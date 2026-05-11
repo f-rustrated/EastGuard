@@ -21,15 +21,16 @@ Segment Leader
    |
    |── wait for ALL: local fsync + all follower acks
    |── ACK to producer (records committed)
+   |── insert into cache (in-memory, serves reads immediately)
    |
-   v (async, off critical path)
-   |── append to segment file (O_DIRECT)
+   v (background, off critical path)
+   |── checkpoint: flush cache → segment file (O_DIRECT)
    |── update sparse index
 ```
 
 Local WAL fsync and follower fan-out happen in parallel. Since `network_rtt + remote_fsync > local_fsync` in practice, the local fsync is hidden behind replication latency. Produce latency = `max(local_fsync, max(follower_fsyncs))`.
 
-Followers write to their own WAL and fsync before acking. Their segment file writes and index updates are also async.
+Followers follow the same path: WAL fsync before ack, then cache insertion, then background checkpoint to segment files.
 
 ## Replica Authorization on ReplicaAppend
 
