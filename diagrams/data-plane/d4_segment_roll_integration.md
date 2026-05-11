@@ -10,12 +10,13 @@
 
 | Trigger | Source | Mechanism |
 |---|---|---|
-| Size limit (~1GB) | DataActor monitoring `size_bytes` | Segment leader sends `SealRequest` to vnode leader → vnode proposes `RollSegment` |
-| Replica failure | Write-path timeout on `ReplicaAppend` | Segment leader sends `SealRequest` to vnode leader → vnode proposes `RollSegment` with updated `replica_set` |
-| Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to vnode leader → vnode proposes `RollSegment` |
-| Node death | SWIM `NodeDead` event | Vnode leader proposes `RollSegment` for all affected active segments (vnode-initiated, no broker request needed) |
+| Size limit (~1GB) | DataActor monitoring `size_bytes` | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
+| Follower failure | Write-path timeout on `ReplicaAppend` (leader detects) | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` with updated `replica_set` |
+| Leader failure | TCP connection drop (follower detects) | Follower sends `SealRequest` to coordinator → coordinator proposes `RollSegment`, promotes surviving follower to leader. Multiple concurrent SealRequests are idempotent (precondition check in `apply_roll_segment`). |
+| Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
+| Node death | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed) |
 
-All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First three are broker-initiated (via `SealRequest`, which carries `end_offset` — see D3 "Offset Handoff"). Last one is vnode-initiated (SWIM event processed directly by vnode leader — vnode queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
+All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First four are broker-initiated (via `SealRequest`, which carries `end_offset` — see D3 "Offset Handoff"). Last one is coordinator-initiated (SWIM event processed directly by coordinator — coordinator queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
 
 **`size_bytes` tracking:** During normal operation, DataActor tracks `size_bytes` locally — updating `SegmentMeta.size_bytes` via Raft per produce would be prohibitively expensive. `SegmentMeta.size_bytes` in MetadataStateMachine is set once at seal time (final size carried in `SealRequest`/`RollSegment`). DataActor is the authority during the segment's active lifetime; MetadataStateMachine records the final value for sealed segment metadata.
 
@@ -35,9 +36,9 @@ For nodes not directly involved (e.g., routing queries), metadata query to the v
 
 Segment leader = `replica_set[0]`. Deterministic from metadata — any node reading `SegmentMeta` knows the leader without election or extra state.
 
-`replica_set` ordering is set at segment creation time by the Raft leader proposing `CreateTopic` or `RollSegment`. The Raft leader chooses `replica_set[0]` based on load distribution — it can spread data write leadership across nodes by varying which node is placed first. This is independent of Raft leadership: the Raft leader handles metadata consensus (small writes), while `replica_set[0]` handles data writes (high throughput, fan-out replication). Different concerns, potentially different nodes.
+`replica_set` ordering is set at segment creation time by the coordinator proposing `CreateTopic` or `RollSegment`. The coordinator chooses `replica_set[0]` based on load distribution — it can spread data write leadership across nodes by varying which node is placed first. This is independent of Raft leadership: the coordinator handles metadata consensus (small writes), while `replica_set[0]` handles data writes (high throughput, fan-out replication). Different concerns, potentially different nodes.
 
-On seal-and-replace, the new segment gets a new `replica_set` with a potentially different `[0]` — the Raft leader can rebalance data write leadership at each segment transition.
+On seal-and-replace, the coordinator preserves the previous segment leader at `replica_set[0]` when possible — preserving cache locality and active producer connections. Only when the leader itself failed does a new node take position 0 (a surviving follower is promoted). Initial segment creation uses least-loaded placement (see below).
 
 Producer routing: client discovers the segment leader via `GetShardInfo` or produce-forwarding (same 1-hop pattern as metadata propose).
 
