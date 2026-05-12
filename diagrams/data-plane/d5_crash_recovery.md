@@ -1,8 +1,8 @@
-# Phase D6: Crash Recovery
+# Phase D5: Crash Recovery
 
 **Goal:** Recover data plane state after node crash. Distinct from Raft log recovery (which already works).
 
-**Depends on:** Phase D1 (storage engine format). Phase D3 (replication) for sealed segment repair, but local recovery (Phase 1) is independent.
+**Depends on:** Phase D1 (storage engine format). Phase D2 (replication) for sealed segment repair, but local recovery (Phase 1) is independent.
 
 ---
 
@@ -28,9 +28,9 @@ After WAL replay, the node scans its data directory and builds a **local segment
 
 7. **No active segment catch-up needed.** In the seal-on-failure model, when a follower crashes, the segment is sealed and a new segment is created with a replacement node. The crashed node is NOT in the new segment's `replica_set`. There is nothing to "catch up" on — the node was replaced, not lagged.
 
-8. **Sealed segment repair with local data reuse.** The recovering node may have incomplete copies of sealed segments from its previous lifecycle. When the coordinator assigns this node to a sealed segment's `replica_set` and triggers repair via `CatchUpRequest`, the node checks its local segment inventory. If it already has partial or complete data, it advertises `local_end_offset` — the healthy replica streams only the delta. Complete matches (common when the node crashed after fsync but before the seal was processed) require zero network transfer. This is the same sealed segment repair from D3 — no special recovery protocol.
+8. **Sealed segment repair with local data reuse.** The recovering node may have incomplete copies of sealed segments from its previous lifecycle. When the coordinator assigns this node to a sealed segment's `replica_set` and triggers repair via `CatchUpRequest`, the node checks its local segment inventory. If it already has partial or complete data, it advertises `local_end_offset` — the healthy replica streams only the delta. Complete matches (common when the node crashed after fsync but before the seal was processed) require zero network transfer. This is the same sealed segment repair from D2 — no special recovery protocol.
 
-9. **Available for future assignments.** After local recovery completes, the node rejoins the cluster (SWIM alive) and becomes eligible for future segment `replica_set` assignments. New segments may include this node via the least-loaded placement strategy (D4).
+9. **Available for future assignments.** After local recovery completes, the node rejoins the cluster (SWIM alive) and becomes eligible for future segment `replica_set` assignments. New segments may include this node via the least-loaded placement strategy (D3).
 
 ## Properties
 

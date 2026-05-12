@@ -1,8 +1,8 @@
-# Phase D3: Segment Replication
+# Phase D2: Segment Replication
 
 **Goal:** Primary-backup replication. fsync on ALL replicas before producer ACK. Seal-on-failure.
 
-**Depends on:** Phase D2 (produce API for end-to-end testing).
+**Depends on:** Phase D1 (storage engine).
 
 ---
 
@@ -43,7 +43,7 @@ ReplicaAppend {
     segment_id,
     replica_set: [D, E, G],    // from SealResponse / metadata
     records,
-    commit_offset: u64,        // highest committed offset (see D2 "Follower Read Safety")
+    commit_offset: u64,        // highest committed offset (see D6 "Follower Read Safety")
 }
 ```
 

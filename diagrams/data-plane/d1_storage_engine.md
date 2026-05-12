@@ -99,6 +99,6 @@ Deletion condition for wal-NNNNNN.log:
     the target segment file has fsynced past this record's offset
 ```
 
-**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D6). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
+**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D5). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
 
 **Bounded WAL size:** Under normal operation, the lag between WAL write and checkpoint is bounded by checkpoint frequency and cache size. WAL accumulation is bounded by the slowest checkpoint across all active segments on the node. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient).

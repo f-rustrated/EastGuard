@@ -1,8 +1,8 @@
-# Phase D5: Consumer Range Tracking
+# Phase D4: Consumer Range Tracking
 
 **Goal:** Consumers follow range lifecycle transitions (split, merge, seal) without losing messages.
 
-**Depends on:** Phase D4 (segment roll working, ranges actually transition in production).
+**Depends on:** Phase D3 (segment roll working, ranges actually transition in production).
 
 ---
 

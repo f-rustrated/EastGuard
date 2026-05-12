@@ -1,8 +1,8 @@
-# Phase D2: Produce/Consume Client API
+# Phase D6: Produce/Consume Client API
 
-**Goal:** End-to-end path from client produce/consume through to local segment files. Sessionized streaming protocol with pipelining and windowing.
+**Goal:** End-to-end path from client produce/consume through to storage engine. Sessionized streaming protocol with pipelining and windowing. DataActor wires together all internal machinery (storage, replication, lifecycle, recovery) behind the client-facing protocol.
 
-**Depends on:** Phase D1 (storage engine).
+**Depends on:** Phase D4 (consumer range tracking), Phase D5 (crash recovery).
 
 ---
 
@@ -14,7 +14,7 @@ Sessionized and streaming (following Northguard's approach):
 2. Broker responds with initial window size (flow control)
 3. Producer sends `Append { stream_id, seq, records }` — multiple in-flight without waiting for ack (pipelining)
 4. Broker acks committed records: `Ack { ack_seq, updated_window }` — M acks for N appends (batched)
-5. Broker only acks records that have been fsync'd (and replicated, once D3 is implemented)
+5. Broker only acks records that have been fsync'd and replicated (D2)
 
 Windowing prevents producer from overwhelming the broker. Broker adjusts window based on backpressure from disk/replication.
 
@@ -63,4 +63,4 @@ DataActor needs read access to MetadataStateMachine state (topic → range → s
 - **Option A:** DataActor queries MultiRaftActor via channel (request-reply, like existing `GetLeader`)
 - **Option B:** MetadataStateMachine state replicated to DataActor via applied-entry events
 
-Option A is simpler for Phase D2. Option B may be needed later for performance (avoid per-produce round-trip to Raft actor).
+Option A is simpler initially. Option B may be needed later for performance (avoid per-produce round-trip to Raft actor).

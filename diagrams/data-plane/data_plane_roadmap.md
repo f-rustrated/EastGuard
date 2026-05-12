@@ -210,7 +210,7 @@ Metadata nodes (vnode Raft group) and data nodes (segment `replica_set`) are **i
 
 **Data path** — primary-backup replication. Per-segment ordering. High throughput (producer payloads). This roadmap.
 
-**Data↔Metadata path** — segment lifecycle coordination via `data_port` (TCP). Segment leader sends `SealRequest` to coordinator on failure detection. Coordinator sends `SegmentAssignment` to segment leader on segment creation/roll. See Phase D4 for full event propagation details.
+**Data↔Metadata path** — segment lifecycle coordination via `data_port` (TCP). Segment leader sends `SealRequest` to coordinator on failure detection. Coordinator sends `SegmentAssignment` to segment leader on segment creation/roll. See Phase D3 for full event propagation details.
 
 Port layout:
 - `client_port` (2921, TCP) — external clients only (produce, consume, query)
@@ -223,12 +223,14 @@ Port layout:
 
 | Phase | Goal | Depends on | Details |
 |---|---|---|---|
-| [D1: Storage Engine](d1_storage_engine.md) | WAL, segment files, sparse index, per-segment cache | Nothing | Local single-node storage |
-| [D2: Produce/Consume API](d2_produce_consume_api.md) | Client produce/consume, DataActor, routing | D1 | End-to-end client path |
-| [D3: Segment Replication](d3_segment_replication.md) | Primary-backup, seal-on-failure, DataTransportActor | D2 | Multi-node durability |
-| [D4: Segment Roll Integration](d4_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D3, metadata Phase 6 | Connect storage to metadata |
-| [D5: Consumer Range Tracking](d5_consumer_range_tracking.md) | Follow split/merge/seal transitions | D4 | Consumer discovers range changes |
-| [D6: Crash Recovery](d6_crash_recovery.md) | WAL replay, index rebuild, sealed segment repair | D1 (D3 for repair) | Data plane recovery |
+| [D1: Storage Engine](d1_storage_engine.md) | WAL, segment files, sparse index, per-segment actor | Nothing | Local single-node storage |
+| [D2: Segment Replication](d2_segment_replication.md) | Primary-backup, seal-on-failure, DataTransportActor | D1 | Multi-node durability |
+| [D3: Segment Roll Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
+| [D4: Consumer Range Tracking](d4_consumer_range_tracking.md) | Follow split/merge/seal transitions | D3 | Consumer discovers range changes |
+| [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
+| [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume, DataActor, routing | D4, D5 | Client-facing integration layer |
+
+Phases D1–D5 produce sync state machines, each unit-testable with deterministic inputs — following the same sync-first pattern as `Swim`, `Raft`, and `MetadataStateMachine`. D6 is the async integration layer (DataActor + client protocol) that wires everything together.
 
 ### Phase Dependency Graph
 
@@ -237,16 +239,17 @@ D1 (Storage Engine)
  |
  ├──────────────────┐
  v                  v
-D2 (Client API)   D6 (Crash Recovery)
- |                  (also needs D3 for peer catch-up)
+D2 (Replication)  D5 (Crash Recovery)
+ |                  |
+ v                  |
+D3 (Segment Roll)   |
+ |                  |
+ v                  |
+D4 (Range Tracking) |
+ |                  |
+ ├──────────────────┘
  v
-D3 (Replication)
- |
- v
-D4 (Segment Roll Integration)
- |
- v
-D5 (Consumer Range Tracking)
+D6 (Produce/Consume API)
 ```
 
 ---

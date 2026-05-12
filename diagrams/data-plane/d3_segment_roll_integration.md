@@ -1,8 +1,8 @@
-# Phase D4: Segment Roll Integration
+# Phase D3: Segment Roll Integration
 
 **Goal:** Connect storage engine lifecycle to metadata lifecycle. Four triggers for segment seal.
 
-**Depends on:** Phase D3 (replication), existing metadata Phase 6 (auto-split/merge).
+**Depends on:** Phase D2 (replication), existing metadata Phase 6 (auto-split/merge).
 
 ---
 
@@ -15,7 +15,7 @@
 | Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Node death (leader or follower) | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed). For leader failure, a surviving follower is promoted to `replica_set[0]`. Write-path timeout and SWIM may race for the same follower failure — `apply_roll_segment()` precondition check makes duplicate proposals no-ops. |
 
-All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First four are broker-initiated (via `SealRequest`, which carries `end_offset` — see D3 "Offset Handoff"). Last one is coordinator-initiated (SWIM event processed directly by coordinator — coordinator queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
+All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First three are broker-initiated (via `SealRequest`, which carries `end_offset` — see D2 "Offset Handoff"). Last one is coordinator-initiated (SWIM event processed directly by coordinator — coordinator queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
 
 **`size_bytes` tracking:** During normal operation, DataActor tracks `size_bytes` locally — updating `SegmentMeta.size_bytes` via Raft per produce would be prohibitively expensive. `SegmentMeta.size_bytes` in MetadataStateMachine is set once at seal time (final size carried in `SealRequest`/`RollSegment`). DataActor is the authority during the segment's active lifetime; MetadataStateMachine records the final value for sealed segment metadata.
 
