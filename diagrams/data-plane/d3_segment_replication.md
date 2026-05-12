@@ -71,20 +71,20 @@ When a follower fails to ack within timeout:
 7. Blocked producer streams resume against new segment — un-ACKed records retried by producer against new segment
 8. Sealed old segment queued for under-replication repair (async)
 
-### Leader Failure (detected by follower)
+### Leader Failure (detected by SWIM)
 
-When the segment leader crashes or becomes unreachable, followers detect via **TCP connection drop** on the persistent replication connection. ReplicaAppend is NOT periodic (only sent when there's produce traffic), so its absence alone is not a failure signal.
+Leader failure is detected via SWIM node death (~6-7s). When the coordinator receives `HandleNodeDeath` for the segment leader, it proposes `RollSegment` for all affected active segments — same mechanism as any SWIM-triggered seal.
 
-1. Follower sends `SealRequest` to coordinator, including the follower's last known `commit_offset` as `end_offset`
-2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding the dead leader. Previous segment leader preserved at `replica_set[0]` if healthy; otherwise a surviving follower is promoted.
+1. SWIM detects leader (D) as dead → coordinator receives `HandleNodeDeath(D)`
+2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding D. A surviving follower is promoted to `replica_set[0]` (new segment leader).
 3. Raft commits → MetadataStateMachine seals old segment, creates new segment
 4. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
 5. New segment leader accepts produce. Producer discovers new leader via metadata query.
 6. Sealed old segment queued for under-replication repair (async)
 
-Both paths use the same `SealRequest` → `RollSegment` mechanism. Any node in the replica_set can initiate a seal — not just the segment leader.
+Follower failure uses `SealRequest` (segment leader → coordinator). Leader failure uses the SWIM `HandleNodeDeath` path (coordinator-initiated, no `SealRequest` needed).
 
-**SealRequest idempotency:** Multiple followers may detect the same leader failure and send concurrent SealRequests. MetadataStateMachine's `apply_roll_segment()` checks preconditions — if the segment is already sealed, subsequent proposals are no-ops (DS-RSM invariant 9).
+**RollSegment idempotency:** Both paths may fire for the same failure — write-path timeout and SWIM detection can race. MetadataStateMachine's `apply_roll_segment()` checks preconditions — if the segment is already sealed, subsequent proposals are no-ops (DS-RSM invariant 9).
 
 ### Offset Handoff: Data Plane → Metadata Plane
 
@@ -127,7 +127,9 @@ Separate from Raft TCP transport (`raft_port`) because:
 
 ## Sealed Segment Replication (self-healing)
 
-When a sealed segment is under-replicated (replica count < `replication_factor`), the coordinator assigns a replacement node, updates the sealed segment's `replica_set` via Raft (`ReassignSegment`), and triggers repair. The replacement sends `CatchUpRequest` to a healthy replica — the only use of `CatchUpRequest` in the system. In the seal-on-failure model, active segments never need catch-up: any replica failure triggers seal-and-replace, and the new segment starts fresh with all replicas in sync from `start_offset`. Nodes get new NodeIds on restart, so a recovered node is a new node — it doesn't rejoin old replica sets.
+When a sealed segment is under-replicated (replica count < `replication_factor`), the coordinator assigns a replacement node, updates the sealed segment's `replica_set` via Raft (`ReassignSegment`), and triggers repair. The replacement sends `CatchUpRequest` to a healthy replica — the only use of `CatchUpRequest` in the system. In the seal-on-failure model, active segments never need catch-up: any replica failure triggers seal-and-replace, and the new segment starts fresh with all replicas in sync from `start_offset`.
+
+Nodes get new NodeIds on restart (UUID regenerated) — from the cluster's perspective, a recovered node is a new member. However, its local disk may still contain segment data from a previous lifecycle. On `CatchUpRequest`, the replacement node checks its local segment inventory and advertises its `local_end_offset` — the healthy replica streams only the delta, or nothing if the data is already complete. See roadmap "Local Data Reuse on Recovery" for details.
 
 ---
 
@@ -200,10 +202,11 @@ Broker E: receives SegmentSealed from D. Closes segment 7 for writes.
 Broker G: receives first ReplicaAppend for segment 8 from D (self-authorizing).
            Validates replica_set, opens segment 8 file, starts accepting.
 
-Broker F: (if recovered) queries coordinator or receives rejection on next
-           ReplicaAppend attempt. Learns segment 7 is sealed.
+Broker F: (if recovered, with new NodeId) is a new cluster member.
            F is NOT in segment 8's replica_set.
-           F's copy of segment 7 may be incomplete — repaired async.
+           If later assigned to a sealed segment's replica_set, F checks
+           its local disk for existing data and advertises local_end_offset
+           in CatchUpRequest — skipping data it already has.
 ```
 
 **Step 5: Sealed segment repair (async)**

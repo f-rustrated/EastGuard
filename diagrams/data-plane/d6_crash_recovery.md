@@ -16,15 +16,19 @@
 4. **Truncate partial writes.** WAL and segment files may have partial records at tail (crash mid-write). Backward scan using trailing length + CRC to find last valid record, truncate.
 5. **Delete fully-drained WAL files.** After replay, WAL files whose records are all in segment files can be deleted.
 
+### Phase 1.5: Local Segment Inventory
+
+After WAL replay, the node scans its data directory and builds a **local segment inventory**: `(shard_group_id, range_id, segment_id) → local_end_offset`. This is data that persists across restarts even though the node gets a new NodeId. The inventory is used during sealed segment repair — when the node receives a `CatchUpRequest`, it checks the inventory and advertises what it already has, skipping redundant network transfer.
+
 ### Phase 2: Metadata Discovery (requires network)
 
-6. **Query metadata for current segment assignments.** The recovering node queries the vnode leaders for each shard group it participates in, asking: which segments have this node in their `replica_set`? During downtime, segments this node was in may have been sealed and replaced (seal-on-failure removes the crashed node from the new `replica_set`).
+6. **Query metadata for current segment assignments.** The recovering node (with its new NodeId) queries the vnode leaders to learn its current segment assignments. During downtime, segments this node was in may have been sealed and replaced (seal-on-failure removes the crashed node from the new `replica_set`).
 
 ### Phase 3: Sealed Segment Repair (async, coordinator-driven)
 
 7. **No active segment catch-up needed.** In the seal-on-failure model, when a follower crashes, the segment is sealed and a new segment is created with a replacement node. The crashed node is NOT in the new segment's `replica_set`. There is nothing to "catch up" on — the node was replaced, not lagged.
 
-8. **Sealed segment repair for incomplete copies.** The recovering node may have incomplete copies of sealed segments (crash happened mid-replication). The coordinator detects under-replicated sealed segments by scanning MetadataStateMachine segment metadata (filtering by `replica_set.contains(recovering_node)`) and triggers repair: a healthy replica streams the full segment to the recovering node via the consume protocol. This is the same sealed segment repair from D3 — no special recovery protocol.
+8. **Sealed segment repair with local data reuse.** The recovering node may have incomplete copies of sealed segments from its previous lifecycle. When the coordinator assigns this node to a sealed segment's `replica_set` and triggers repair via `CatchUpRequest`, the node checks its local segment inventory. If it already has partial or complete data, it advertises `local_end_offset` — the healthy replica streams only the delta. Complete matches (common when the node crashed after fsync but before the seal was processed) require zero network transfer. This is the same sealed segment repair from D3 — no special recovery protocol.
 
 9. **Available for future assignments.** After local recovery completes, the node rejoins the cluster (SWIM alive) and becomes eligible for future segment `replica_set` assignments. New segments may include this node via the least-loaded placement strategy (D4).
 
@@ -37,6 +41,7 @@
 - `DataActor` startup runs local recovery (Phase 1) before accepting produce/consume commands
 - No active segment catch-up exists — seal-on-failure replaces crashed nodes, it does not wait for them
 - Sealed segment repair is coordinator-driven and async — does not block the recovering node from accepting new work
+- Local segment inventory enables data reuse across NodeId changes — reduces repair bandwidth proportionally to locally-available data
 
 ## Data Loss Semantics
 

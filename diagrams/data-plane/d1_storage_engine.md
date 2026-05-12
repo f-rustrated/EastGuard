@@ -68,9 +68,9 @@ WAL is the sole disk write on the critical path (steps 1-2). Steps 3-5 involve n
 4. `pread()` on segment file (O_DIRECT) at `byte_position`, scan forward to exact offset
 5. Stream records forward until requested `max_bytes` or EOF
 
-## Application Cache (write staging + read serving)
+## Per-Segment Actor (write staging + read serving)
 
-Dual-purpose cache between WAL and segment files. Since O_DIRECT bypasses the OS page cache, the application manages its own:
+Each segment has its own actor that owns the cache, checkpoint, and read path. A single shared actor would bottleneck on concurrent write staging and read serving across all segments on the node — per-segment actors keep contention local. Since O_DIRECT bypasses the OS page cache, each actor manages its own cache:
 
 - **Write staging.** After WAL fsync + producer ACK, records enter cache and are immediately readable by consumers. Records remain in cache until the background checkpoint flushes them to segment files.
 - **Consume-stream-aware.** Tracks active consumer sessions and their read positions. Pre-fetches ahead of active consumers.

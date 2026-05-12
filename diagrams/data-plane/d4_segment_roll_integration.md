@@ -12,9 +12,8 @@
 |---|---|---|
 | Size limit (~1GB) | DataActor monitoring `size_bytes` | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Follower failure | Write-path timeout on `ReplicaAppend` (leader detects) | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` with updated `replica_set` |
-| Leader failure | TCP connection drop (follower detects) | Follower sends `SealRequest` to coordinator → coordinator proposes `RollSegment`, promotes surviving follower to leader. Multiple concurrent SealRequests are idempotent (precondition check in `apply_roll_segment`). |
 | Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
-| Node death | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed) |
+| Node death (leader or follower) | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed). For leader failure, a surviving follower is promoted to `replica_set[0]`. Write-path timeout and SWIM may race for the same follower failure — `apply_roll_segment()` precondition check makes duplicate proposals no-ops. |
 
 All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First four are broker-initiated (via `SealRequest`, which carries `end_offset` — see D3 "Offset Handoff"). Last one is coordinator-initiated (SWIM event processed directly by coordinator — coordinator queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
 
