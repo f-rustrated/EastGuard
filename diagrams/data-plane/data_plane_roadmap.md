@@ -30,7 +30,7 @@ Producer latency is bounded by WAL fsync only — one sequential write to the ac
 **Key design choices:**
 
 - **Shared WAL per node.** All segments append to one active WAL file (~64MB rotation). Batching amortizes fsync — one fsync per batch covers all segments in that batch.
-- **O_DIRECT for segment file writes.** Predictable fsync latency, no double buffering with page cache. Reads use standard buffered I/O + `POSIX_FADV_DONTNEED` (kernel readahead benefits sequential reads; `FADV_DONTNEED` prevents page cache pollution). WAL uses buffered I/O (write-once-read-never).
+- **Buffered I/O + `POSIX_FADV_DONTNEED` for segment files.** Both reads and writes use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages — no page cache pollution. WAL also uses buffered I/O (write-once-read-never).
 - **Sparse offset index.** One RocksDB entry per batch, not per record. Consumer seeks to nearest indexed offset, scans forward. Rebuilt from segment files on crash — not authoritative.
 - **Per-segment actors.** Each segment owns its cache, checkpoint, and read path. Avoids single-actor bottleneck across all segments on the node.
 - **WAL is source of truth.** Segment files, sparse index, and cache are all derived. Crash recovery replays WAL; runtime failures retry from cache/WAL.
@@ -197,13 +197,13 @@ Metadata nodes (vnode Raft group) and data nodes (segment `replica_set`) are **i
                     |                     |
                     |            ┌────────┼────────┐
                     |            v        |        v
-                    |      WAL (shared)   |   SegmentActor(s)
-                    |      batch + fsync  |   (per-segment tasks)
+                    |      WAL (shared)   |   SegmentCache(s)
+                    |      batch + fsync  |   (lock-free, per segment)
                     |                     |   ┌────┴────┐
                     |                routing   v         v
-                    |              + lifecycle cache  segment files
+                    |              + lifecycle cache  I/O pools
                     |                       + replication + checkpoint
-                    v                       + read serving + sparse index
+                    v                       + cold reads  + sparse index
              MetadataStateMachine
              (Raft consensus,
               RocksDB log store)
@@ -211,12 +211,11 @@ Metadata nodes (vnode Raft group) and data nodes (segment `replica_set`) are **i
   Coordinator ↔ DataPlaneActor (via data_port):
     SealRequest        — DataPlaneActor → Coordinator (on replica failure)
     SealResponse       — Coordinator → DataPlaneActor (new segment info)
-    SegmentAssignment  — Coordinator → DataPlaneActor (spawn SegmentActor)
+    SegmentAssignment  — Coordinator → DataPlaneActor (create SegmentCache)
 
-  Produce write path:  Client → DataPlaneActor (batch → WAL fsync)
-                                    → SegmentActor (cache + replication + ACK)
-  Consume read path:   Client → DataPlaneActor (route)
-                                    → SegmentActor (cache hit or segment file)
+  Produce write path:  Client → DataPlaneActor (batch → WAL fsync → cache publish → ACK)
+  Consume read path:   Client → consumer task (tokio) → SegmentCache (lock-free)
+                       Cache miss → cold_read_pool (segment file + FADV_DONTNEED)
 ```
 
 **Metadata path** — strong consensus via Raft. Total ordering. Low throughput (topic/range lifecycle events). Already built.
@@ -236,14 +235,14 @@ Port layout:
 
 | Phase | Goal | Depends on | Details |
 |---|---|---|---|
-| [D1: Storage Engine](d1_storage_engine.md) | WAL, segment files, sparse index, DataPlaneActor, SegmentActor | Nothing | Single-node storage + actor architecture |
+| [D1: Storage Engine](d1_storage_engine.md) | WAL, segment files, sparse index, DataPlaneActor, lock-free SegmentCache, I/O pools | Nothing | Single-node storage + threading model |
 | [D2: Segment Replication](d2_segment_replication.md) | Primary-backup, seal-on-failure, DataTransportActor | D1 | Multi-node durability |
 | [D3: Segment Roll Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
 | [D4: Consumer Range Tracking](d4_consumer_range_tracking.md) | Follow split/merge/seal transitions | D3 | Consumer discovers range changes |
 | [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
 | [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume protocol, routing, connection management | D4, D5 | Client-facing protocol layer |
 
-D1 defines both the storage primitives (WAL, segment files, sparse index, cache) and the actor architecture that drives them (DataPlaneActor + SegmentActor). The storage state machines follow the same sync-first pattern as `Swim`, `Raft`, and `MetadataStateMachine` — managing cache, offset tracking, and checkpoint decisions synchronously, producing I/O commands as buffered side effects. The actors own async boundaries (channels, timers, I/O) and drain state machine outputs. D2–D5 extend the D1 foundation with replication, metadata integration, consumer tracking, and crash recovery. D6 adds the client-facing protocol layer (produce/consume wire format, connection management, routing) on top of the actors defined in D1.
+D1 defines the storage primitives (WAL, segment files, sparse index) and the threading model that drives them: DataPlaneActor on a dedicated OS thread (WAL + cache publish), lock-free per-segment `SegmentCache` (concurrent consumer reads without locking), and I/O thread pools (checkpoint writes + cold reads). D2–D5 extend the D1 foundation with replication, metadata integration, consumer tracking, and crash recovery. D6 adds the client-facing protocol layer (produce/consume wire format, connection management) — consumer tasks on tokio read directly from `SegmentCache`.
 
 ### Phase Dependency Graph
 
@@ -271,7 +270,7 @@ D6 (Produce/Consume API)
 
 | Existing Component | Data Plane Interaction |
 |---|---|
-| `MetadataStateMachine` | Coordinator (vnode leader) manages segment lifecycle. SegmentActor on broker requests `RollSegment` (via DataPlaneActor) on size threshold or replica failure. |
+| `MetadataStateMachine` | Coordinator (vnode leader) manages segment lifecycle. DataPlaneActor requests `RollSegment` on size threshold or replica failure. |
 | `MultiRaftActor` | Vnode-side only. Commits segment lifecycle changes. Not directly connected to DataPlaneActor — changes propagated via `data_port`. |
 | `Topology` (hash ring) | Determines vnode membership (metadata placement). Segment `replica_set` assigned independently by coordinator based on storage policy. |
 | `SwimActor` | Address resolution (`ResolveAddress`). Node death triggers segment seal (leader and idle segment failures detected here). SWIM gossip stays coarse-grained (membership + shard leaders) — segment state propagated via `data_port`, not gossip. |
@@ -315,7 +314,7 @@ Periodic fsync-and-ack between segment replicas. Catches disk failure on idle se
 | WAL replay on crash | WAL is sequential and CRC-framed. Replay is fast (forward scan). Segment files rebuilt from WAL if needed. |
 | ALL-replica ack latency | Seal-on-failure handles chronic slowness. Batch fsync (10ms window) amortizes per-record overhead. Tail latency spikes bounded by ack timeout. |
 | Frequent segment seals under flaky network | Ack timeout tuned conservatively (500ms–1s). SWIM convergence (~6-7s) handles true node death. Sealed segment count is observable — alert if excessive. |
-| Per-segment actor complexity | O_DIRECT bypasses page cache — each segment actor manages its own cache and read buffers. Write staging + read serving per-segment keeps contention local but adds per-segment memory overhead. |
+| Per-segment cache memory | Each segment's lock-free cache (ring buffer) consumes memory. Node-level cache budget caps total. Under pressure, checkpoint advances eviction frontiers to free slots. |
 | Sparse index RocksDB grows large | Index is sparse (one entry per batch). Segment deletion triggers range-delete in index. Rebuilt from segment files on crash — not authoritative. |
 | Segment leader failover latency | Follower failure on active segments: sub-second (write-path timeout). Leader or idle segment failure: ~6-7s (SWIM detection). |
 | Data transport competing with Raft transport | Separate ports, separate TCP connections, separate actors. Raft heartbeats (1s interval, small packets) unaffected by data throughput. |

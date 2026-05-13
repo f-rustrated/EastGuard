@@ -24,7 +24,7 @@ Segment Leader
    |── insert into cache (in-memory, serves reads immediately)
    |
    v (background, off critical path)
-   |── checkpoint: flush cache → segment file (O_DIRECT)
+   |── checkpoint: flush cache → segment file (buffered I/O + FADV_DONTNEED)
    |── update sparse index
 ```
 
