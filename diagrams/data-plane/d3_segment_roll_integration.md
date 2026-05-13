@@ -10,14 +10,22 @@
 
 | Trigger | Source | Mechanism |
 |---|---|---|
-| Size limit (~1GB) | DataActor monitoring `size_bytes` | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
+| Size limit (~1GB) | SegmentActor monitoring `size_bytes` | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Follower failure | Write-path timeout on `ReplicaAppend` (leader detects) | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` with updated `replica_set` |
-| Time limit (1 hour) | DataActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
+| Time limit (1 hour) | SegmentActor monitoring segment age | Segment leader sends `SealRequest` to coordinator → coordinator proposes `RollSegment` |
 | Node death (leader or follower) | SWIM `NodeDead` event | Coordinator proposes `RollSegment` for all affected active segments (coordinator-initiated, no broker request needed). For leader failure, a surviving follower is promoted to `replica_set[0]`. Write-path timeout and SWIM may race for the same follower failure — `apply_roll_segment()` precondition check makes duplicate proposals no-ops. |
 
 All triggers result in the same Raft command (`RollSegment`). MetadataStateMachine applies it identically regardless of trigger. First three are broker-initiated (via `SealRequest`, which carries `end_offset` — see D2 "Offset Handoff"). Last one is coordinator-initiated (SWIM event processed directly by coordinator — coordinator queries the segment leader for `end_offset` before proposing, or the `HandleNodeDeath` path resolves it from the last known committed offset).
 
-**`size_bytes` tracking:** During normal operation, DataActor tracks `size_bytes` locally — updating `SegmentMeta.size_bytes` via Raft per produce would be prohibitively expensive. `SegmentMeta.size_bytes` in MetadataStateMachine is set once at seal time (final size carried in `SealRequest`/`RollSegment`). DataActor is the authority during the segment's active lifetime; MetadataStateMachine records the final value for sealed segment metadata.
+**Under-replication detection on node death:** MetadataStateMachine maintains a reverse index for fast lookup:
+
+```
+node_active_segment_index: HashMap<NodeId, Vec<(TopicId, RangeId, SegmentId)>>
+```
+
+On `HandleNodeDeath(F)`: look up F in the index → active segments get `RollSegment` (seal, replace F). Sealed segments found by scanning MetadataStateMachine segment metadata, filtering by `replica_set.contains(F)` — O(all sealed segments), but node death is infrequent and the scan takes milliseconds. Sealed segments with F in their `replica_set` are marked under-replicated and queued for repair (see D2 "Sealed Segment Replication").
+
+**`size_bytes` tracking:** During normal operation, SegmentActor tracks `size_bytes` locally — updating `SegmentMeta.size_bytes` via Raft per produce would be prohibitively expensive. `SegmentMeta.size_bytes` in MetadataStateMachine is set once at seal time (final size carried in `SealRequest`/`RollSegment`). SegmentActor is the authority during the segment's active lifetime; MetadataStateMachine records the final value for sealed segment metadata.
 
 ## Data Port Event Propagation
 

@@ -185,25 +185,40 @@ This gives the performance benefit of local data reuse without the complexity of
 Metadata nodes (vnode Raft group) and data nodes (segment `replica_set`) are **independent**. The nodes that run Raft consensus for a topic's metadata are not necessarily the same nodes that store the topic's segment data. Following Northguard's architecture.
 
 ```
-                          Client
-                         /      \
-                        /        \
-            metadata ops          data ops
-            (CreateTopic,         (Produce, Consume)
-             GetShardInfo)              |
-                  |                     |
-                  v                     v
-           Coordinator            Segment Leader
-           (vnode leader           (replica_set[0])
-            for shard group)       or Any Replica (consume)
-                  |                     |
-                  |<--- SealRequest ----|  (failure-triggered seal)
-                  |-- SegmentAssignment-->|  (new segment creation)
-                  |                     |
-                  v                     v
-           MetadataStateMachine   Storage Engine
-           (Raft consensus,       (WAL + segment files + sparse index)
-            RocksDB log store)
+                            Client
+                           /      \
+                          /        \
+              metadata ops          data ops
+              (CreateTopic,         (Produce, Consume)
+               GetShardInfo)              |
+                    |                     |
+                    v                     v
+             Coordinator  <======> DataPlaneActor
+             (vnode leader          (node-level, single entry point
+              for shard group)       for all data plane traffic)
+                    |                     |
+                    |            ┌────────┼────────┐
+                    |            v        |        v
+                    |      WAL (shared)   |   SegmentActor(s)
+                    |      batch + fsync  |   (per-segment tasks)
+                    |                     |   ┌────┴────┐
+                    |                routing   v         v
+                    |              + lifecycle cache  segment files
+                    |                       + replication + checkpoint
+                    v                       + read serving + sparse index
+             MetadataStateMachine
+             (Raft consensus,
+              RocksDB log store)
+
+  Coordinator ↔ DataPlaneActor (via data_port):
+    SealRequest        — DataPlaneActor → Coordinator (on replica failure)
+    SealResponse       — Coordinator → DataPlaneActor (new segment info)
+    SegmentAssignment  — Coordinator → DataPlaneActor (spawn SegmentActor)
+
+  Produce write path:  Client → DataPlaneActor (batch → WAL fsync)
+                                    → SegmentActor (cache + replication + ACK)
+  Consume read path:   Client → DataPlaneActor (route)
+                                    → SegmentActor (cache hit or segment file)
 ```
 
 **Metadata path** — strong consensus via Raft. Total ordering. Low throughput (topic/range lifecycle events). Already built.
@@ -228,9 +243,9 @@ Port layout:
 | [D3: Segment Roll Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
 | [D4: Consumer Range Tracking](d4_consumer_range_tracking.md) | Follow split/merge/seal transitions | D3 | Consumer discovers range changes |
 | [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
-| [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume, DataActor, routing | D4, D5 | Client-facing integration layer |
+| [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume, DataPlaneActor, SegmentActor, routing | D4, D5 | Client-facing integration layer |
 
-Phases D1–D5 produce sync state machines, each unit-testable with deterministic inputs — following the same sync-first pattern as `Swim`, `Raft`, and `MetadataStateMachine`. D6 is the async integration layer (DataActor + client protocol) that wires everything together.
+Phases D1–D5 define sync state machines and I/O specifications, each unit-testable with deterministic inputs — following the same sync-first pattern as `Swim`, `Raft`, and `MetadataStateMachine`. The per-segment state machine (D1) manages cache, offset tracking, and checkpoint decisions synchronously, producing I/O commands (WAL writes, segment file flushes, index updates) as buffered side effects — same pattern as `Raft` producing `OutboundRaftPacket`s. D6 is the async integration layer: DataPlaneActor (node-level, owns WAL + routing + SegmentActor lifecycle) spawns SegmentActors (per-segment, spawned tasks) and exposes the client protocol.
 
 ### Phase Dependency Graph
 
@@ -258,8 +273,8 @@ D6 (Produce/Consume API)
 
 | Existing Component | Data Plane Interaction |
 |---|---|
-| `MetadataStateMachine` | Coordinator (vnode leader) manages segment lifecycle. DataActor on broker requests `RollSegment` on size threshold or replica failure. |
-| `MultiRaftActor` | Vnode-side only. Commits segment lifecycle changes. Not directly connected to DataActor — changes propagated via `data_port`. |
+| `MetadataStateMachine` | Coordinator (vnode leader) manages segment lifecycle. SegmentActor on broker requests `RollSegment` (via DataPlaneActor) on size threshold or replica failure. |
+| `MultiRaftActor` | Vnode-side only. Commits segment lifecycle changes. Not directly connected to DataPlaneActor — changes propagated via `data_port`. |
 | `Topology` (hash ring) | Determines vnode membership (metadata placement). Segment `replica_set` assigned independently by coordinator based on storage policy. |
 | `SwimActor` | Address resolution (`ResolveAddress`). Node death triggers segment seal (leader and idle segment failures detected here). SWIM gossip stays coarse-grained (membership + shard leaders) — segment state propagated via `data_port`, not gossip. |
 | `StoragePolicy` | `replication_factor` determines replica set size. Broker attributes + constraint expressions determine replica placement. `retention_ms` drives future GC. |

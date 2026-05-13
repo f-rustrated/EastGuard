@@ -88,7 +88,7 @@ Follower failure uses `SealRequest` (segment leader → coordinator). Leader fai
 
 ### Offset Handoff: Data Plane → Metadata Plane
 
-MetadataStateMachine does not see individual records (proposing per-produce would be prohibitively expensive). The segment leader (DataActor) is the authoritative offset tracker during normal operation. On seal, the offset is handed off via `SealRequest`:
+MetadataStateMachine does not see individual records (proposing per-produce would be prohibitively expensive). The segment leader (SegmentActor) is the authoritative offset tracker during normal operation. On seal, the offset is handed off via `SealRequest`:
 
 ```
 SealRequest {
@@ -96,7 +96,7 @@ SealRequest {
     range_id,
     segment_id,
     failed_node: NodeId,
-    end_offset: u64,       ← last committed offset, from DataActor
+    end_offset: u64,       ← last committed offset, from SegmentActor
 }
 ```
 
@@ -114,6 +114,22 @@ Separate from Raft TCP transport (`raft_port`) because:
 - Different traffic patterns (high throughput data vs low throughput consensus)
 - Independent backpressure (slow data replication should not delay Raft heartbeats)
 - Can be tuned independently (buffer sizes, TCP_NODELAY, SO_SNDBUF)
+
+## Data Port Message Catalog
+
+All `data_port` wire messages, consolidated across phases:
+
+| Message | Direction | Purpose | Phase |
+|---|---|---|---|
+| `ReplicaAppend` | Segment leader → followers | Replicate records + `commit_offset` | D2 |
+| `ReplicaAck` | Follower → segment leader | Confirm WAL fsync for a batch | D2 |
+| `SealRequest` | Segment leader → coordinator | Request segment seal (carries `end_offset`) | D2 |
+| `SealResponse` | Coordinator → segment leader | New segment ID + replica set | D2 |
+| `SegmentSealed` | Segment leader → old followers | Notify seal, stop accepting writes | D2/D3 |
+| `SegmentAssignment` | Coordinator → new segment leader | Assign new/rolled segment to leader | D3 |
+| `CatchUpRequest` | Replacement node → healthy replica | Request sealed segment data (carries `local_end_offset`) | D2 |
+| `CatchUpResponse` | Healthy replica → replacement node | Stream segment data (delta from `local_end_offset`) | D2 |
+| `Sealed` | Broker → producer | Error + redirect on seal (carries `new_segment_id`, `new_leader`) | D6 |
 
 ## Replication vs Consensus
 
