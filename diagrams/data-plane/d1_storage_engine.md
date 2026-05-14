@@ -83,7 +83,7 @@ Key:   [shard_group_id: 8B][range_id: 8B][segment_id: 8B][offset: 8B]
 Value: [byte_position: 8B]
 ```
 
-One entry per batch (e.g., every ~1000 records or every batch boundary). Consumer seek: RocksDB `seek_for_prev(target_offset)` → nearest indexed offset ≤ target → `pread()` segment file at that position → scan forward to exact offset.
+One entry per batch (e.g., every ~1000 records or every batch boundary). Consumer seek: RocksDB `seek_for_prev(target_offset)` → nearest indexed offset ≤ target → `pread()` segment file at that position → scan forward to exact offset. Batch fetching is native: `pread()` from the indexed position reads all records up to the next `BatchEnd` marker (or the next index entry's byte position if bounded). No per-record index lookup needed — one seek locates the batch, one sequential read returns it.
 
 Sparse index trades one short sequential scan on read for dramatically fewer index writes. Rebuilt from segment files on crash — not a source of truth.
 
@@ -91,78 +91,82 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 
 ## Components
 
-### DataPlane + DataPlaneActor
+### WAL (WalStorage + WalWriter + Lifecycle)
 
-Dedicated OS thread — WAL fsync blocks without affecting the tokio runtime (SWIM, Raft, consumer TCP). Uses `crossbeam::channel` for its mailbox (blocking recv, higher throughput than tokio `mpsc`). No async, no tokio dependency.
-
-Follows the sync-first pattern (see `build-actor` skill): pure sync state machine (`DataPlane`) holds all logic and buffers side effects, actor wrapper (`DataPlaneActor`) owns channels and drains events.
-
-WAL does blocking file I/O (write, fsync, rotate, unlink) — injected via `WalStorage` trait so `DataPlane` can be tested with a mock WAL that records calls without touching disk. Same pattern as `Raft` + `RaftStorage` (see `src/clusters/raft/storage.rs`).
+WAL is the durability foundation — all other components depend on it. `SegmentCache` batches carry WAL LSNs, `DataPlane` writes through the WAL before publishing to cache.
 
 ```rust
-// WAL I/O trait — injected into state machine. Mock in tests, WalWriter in production.
+// WAL I/O trait — injected into DataPlane. Mock in tests, WalWriter in production.
 trait WalStorage {
     fn write_batch(&mut self, records: &[u8]) -> io::Result<u64>;  // returns LSN
     fn fsync(&mut self) -> io::Result<()>;
-    fn rotate(&mut self) -> io::Result<WalFileEntry>;              // seal active, open next
+    fn rotate(&mut self) -> io::Result<()>;                        // seal active, open next
     fn delete_below(&mut self, watermark_lsn: u64);                // unlink eligible files
 }
 
-// State machine — pure sync, no channels. I/O only through injected WalStorage.
-struct DataPlane<W: WalStorage> {
-    wal: W,
-    segment_caches: HashMap<SegmentKey, Arc<SegmentCache>>,
-    accumulation_buffers: HashMap<SegmentKey, Vec<Record>>,
-    segment_checkpoint_lsns: HashMap<SegmentKey, u64>,  // last-checkpointed WAL LSN per segment
-    pending_events: Vec<DataPlaneEvent>,
+// Production implementation of WalStorage trait.
+struct WalWriter {
+    files: VecDeque<WalFileEntry>,  // last entry is active; all preceding are sealed
+    max_file_size: u64,             // ~64MB
+    next_lsn: u64,
+    data_dir: PathBuf,
 }
 
-enum DataPlaneEvent {
-    SubmitCheckpoint(CheckpointJob),
-    ProduceAck { reply: oneshot::Sender<ProduceResult> },
-}
+impl WalStorage for WalWriter { /* blocking file I/O */ }
 
-// Actor wrapper — owns channels, drains state machine events.
-struct DataPlaneActor;
-
-impl DataPlaneActor {
-    fn run(
-        mut state: DataPlane<WalWriter>,
-        mailbox: crossbeam::channel::Receiver<DataPlaneCommand>,
-        checkpoint_tx: crossbeam::channel::Sender<CheckpointJob>,
-    ) {
-        // crossbeam::select! on mailbox + timer, process → flush
-    }
-}
-
-enum DataPlaneCommand {
-    Produce {
-        segment_key: SegmentKey,
-        records: Vec<Record>,
-        reply: oneshot::Sender<ProduceResult>,
-    },
-    SegmentAssignment {
-        segment_key: SegmentKey,
-        replica_set: Vec<NodeId>,
-    },
-    SealSegment {
-        segment_key: SegmentKey,
-    },
-    CheckpointComplete(CheckpointComplete),
+struct WalFileEntry {
+    seq: u64,
+    min_lsn: u64,
+    max_lsn: u64,
+    size: u64,
+    path: PathBuf,
+    file: Option<File>,  // Some only for last entry (active)
 }
 ```
 
-Built from WAL replay + segment directory scan at startup (D5).
+The WAL is a sequence of fixed-size log files, not a single ever-growing file. This makes deletion file-level (`unlink`) rather than truncation (which would require rewriting). `files` is an ordered list — the last entry is always the active file (invariant 1), all preceding entries are sealed. On rotation, the active entry's `file` handle is taken (`Option::take`), and a new entry with `file: Some(...)` is pushed to the back.
 
-**Cache lifecycle:**
-- Created on `SegmentAssignment` from coordinator via `data_port` (D3), or on first produce targeting an unknown segment
-- Stays in HashMap even when idle (lightweight — just ring buffer + atomics, no thread/task)
-- Removed on segment seal: final checkpoint via checkpoint worker, then entry dropped
-- No spawn/stop lifecycle — `SegmentCache` is a data structure, not an actor
+**Rotation:** When the active WAL file reaches the size limit (~64MB), it is sealed (no more writes) and a new file is opened with the next sequence number. Writes always go to exactly one file — the active one.
 
-**Backpressure:** Natural. If WAL fsync is slow, the dedicated thread stalls, the inbound `crossbeam` channel fills, producers block on `send()`. No async flow control needed.
+**LSN (Log Sequence Number):** Each WAL record carries an explicit node-local LSN — a monotonically increasing `u64` assigned by DataPlane during WAL write. LSN is carried by each `SegmentRecordBatch` in the cache, enabling the checkpoint worker to report last-checkpointed LSN back to DataPlaneActor without recomputing from file positions.
 
-**Timer:** `DataPlaneTimer` implements `TTimer`, driven by `crossbeam::channel::select!` with timeout (same tick model as SWIM/Raft scheduling actor, but on the dedicated thread instead of a tokio task). Drives periodic sweep for removing idle `SegmentCache` entries.
+**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum of `segment_checkpoint_lsns` across all active segments. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`. `segment_checkpoint_lsns` is necessary because `eviction_frontier` is a segment-local batch position — it cannot be compared across segments or against WAL LSNs. Deletion is processed lazily in DataPlaneActor's event loop: WAL files do not block writes, batching multiple LSN updates into one watermark recomputation is cheaper, and `unlink()` stays off the critical write path.
+
+**Checkpoint LSN relationships:**
+
+```
+checkpointed_lsn (per-segment)                    — reported by checkpoint worker in CheckpointComplete
+        │                                            "I flushed batches up to this WAL LSN for this segment"
+        ▼
+segment_checkpoint_lsns (DataPlane)                — HashMap<SegmentKey, u64>, accumulates latest
+        │                                            checkpointed_lsn from each segment
+        ▼
+global_checkpoint_watermark                        — min(segment_checkpoint_lsns.values())
+        │                                            "all segments have been checkpointed up to here"
+        ▼
+WAL deletion: unlink files where max_lsn ≤ watermark
+
+eviction_frontier (per-segment, in SegmentCache)   — ring buffer batch position (not an LSN)
+                                                     tracks which cache slots can be reused
+                                                     NOT comparable across segments or to WAL LSNs
+```
+
+```
+WAL file lifecycle:
+
+  wal-000001.log  [active]       → batch writes + fsync
+                  [sealed]       → size limit reached, new file opened
+                  [checkpointing] → cache flushing records to segment files
+                  [deleted]      → all records checkpointed, unlink
+
+Deletion condition for wal-NNNNNN.log:
+  checkpoint_watermark = min(each segment's last-checkpointed LSN)
+  wal_file.max_lsn ≤ checkpoint_watermark
+```
+
+**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D5). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
+
+**Bounded WAL size:** Under normal operation, the lag between WAL write and checkpoint is bounded by checkpoint frequency and cache size. WAL accumulation is bounded by the slowest checkpoint across all active segments on the node. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient).
 
 ### SegmentCache
 
@@ -208,54 +212,74 @@ Internally, `publish` stores via `Arc::into_raw()` (cache slot holds the initial
 
 **Ordering:** Within a segment, record ordering is preserved. Per-segment accumulation buffers are appended in arrival order during the batch window. Cross-segment ordering is not guaranteed (and not needed — event streaming guarantees ordering per-range, not globally).
 
-### WAL (WalStorage + WalWriter + Lifecycle)
+### DataPlane + DataPlaneActor
+
+Dedicated OS thread — WAL fsync blocks without affecting the tokio runtime (SWIM, Raft, consumer TCP). Uses `crossbeam::channel` for its mailbox (blocking recv, higher throughput than tokio `mpsc`). No async, no tokio dependency.
+
+Follows the sync-first pattern (see `build-actor` skill): pure sync state machine (`DataPlane`) holds all logic and buffers side effects, actor wrapper (`DataPlaneActor`) owns channels and drains events.
+
+WAL does blocking file I/O (write, fsync, rotate, unlink) — injected via `WalStorage` trait so `DataPlane` can be tested with a mock WAL that records calls without touching disk. Same pattern as `Raft` + `RaftStorage` (see `src/clusters/raft/storage.rs`).
 
 ```rust
-// Production implementation of WalStorage trait.
-struct WalWriter {
-    active_file: File,
-    active_file_seq: u64,
-    active_file_size: u64,
-    max_file_size: u64,         // ~64MB
-    sealed_files: VecDeque<WalFileEntry>,
-    next_lsn: u64,
-    data_dir: PathBuf,
+// State machine — pure sync, no channels. I/O only through injected WalStorage.
+struct DataPlane<W: WalStorage> {
+    wal: W,
+    segment_caches: HashMap<SegmentKey, Arc<SegmentCache>>,
+    accumulation_buffers: HashMap<SegmentKey, Vec<Record>>,
+    segment_sizes: HashMap<SegmentKey, u64>,            // accumulated data bytes per segment, triggers RollSegment at ~1GB
+    segment_checkpoint_lsns: HashMap<SegmentKey, u64>,  // last-checkpointed WAL LSN per segment
+    pending_events: Vec<DataPlaneEvent>,
 }
 
-impl WalStorage for WalWriter { /* blocking file I/O */ }
+enum DataPlaneEvent {
+    SubmitCheckpoint(CheckpointJob),
+    ProduceAck { reply: oneshot::Sender<ProduceResult> },
+    // ProduceAck is live-path only. WAL replay (D5) calls internal state machine
+    // methods directly (populate buffers, publish to cache) — no DataPlaneCommand,
+    // no oneshot, no ProduceAck event emitted.
+}
 
-struct WalFileEntry {
-    seq: u64,
-    min_lsn: u64,
-    max_lsn: u64,
-    path: PathBuf,
+// Actor wrapper — owns channels, drains state machine events.
+struct DataPlaneActor;
+
+impl DataPlaneActor {
+    fn run(
+        mut state: DataPlane<WalWriter>,
+        mailbox: crossbeam::channel::Receiver<DataPlaneCommand>,
+        checkpoint_tx: crossbeam::channel::Sender<CheckpointJob>,
+    ) {
+        // crossbeam::select! on mailbox + timer, process → flush
+    }
+}
+
+enum DataPlaneCommand {
+    Produce {
+        segment_key: SegmentKey,
+        records: Vec<Record>,
+        reply: oneshot::Sender<ProduceResult>,
+    },
+    SegmentAssignment {
+        segment_key: SegmentKey,
+        replica_set: Vec<NodeId>,
+    },
+    SealSegment {
+        segment_key: SegmentKey,
+    },
+    CheckpointComplete(CheckpointComplete),
 }
 ```
 
-The WAL is a sequence of fixed-size log files, not a single ever-growing file. This makes deletion file-level (`unlink`) rather than truncation (which would require rewriting).
+Built from WAL replay + segment directory scan at startup (D5).
 
-**Rotation:** When the active WAL file reaches the size limit (~64MB), it is sealed (no more writes) and a new file is opened with the next sequence number. Writes always go to exactly one file — the active one.
+**Cache lifecycle:**
+- Created on `SegmentAssignment` from coordinator via `data_port` (D3). Produce targeting an unknown segment is rejected — producer retries after routing refresh
+- Stays in HashMap even when idle (lightweight — just ring buffer + atomics, no thread/task)
+- Removed on segment seal: final checkpoint via checkpoint worker, then entry dropped
+- No spawn/stop lifecycle — `SegmentCache` is a data structure, not an actor
 
-**LSN (Log Sequence Number):** Each WAL record carries an explicit node-local LSN — a monotonically increasing `u64` assigned by DataPlane during WAL write. LSN is carried by each `SegmentRecordBatch` in the cache, enabling the checkpoint worker to report last-checkpointed LSN back to DataPlaneActor without recomputing from file positions.
+**Backpressure:** Natural. If WAL fsync is slow, the dedicated thread stalls, the inbound `crossbeam` channel fills, producers block on `send()`. No async flow control needed.
 
-**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum of `segment_checkpoint_lsns` across all active segments. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`. `segment_checkpoint_lsns` is necessary because `eviction_frontier` is a segment-local batch position — it cannot be compared across segments or against WAL LSNs. Deletion is processed lazily in DataPlaneActor's event loop: WAL files do not block writes, batching multiple LSN updates into one watermark recomputation is cheaper, and `unlink()` stays off the critical write path.
-
-```
-WAL file lifecycle:
-
-  wal-000001.log  [active]       → batch writes + fsync
-                  [sealed]       → size limit reached, new file opened
-                  [checkpointing] → cache flushing records to segment files
-                  [deleted]      → all records checkpointed, unlink
-
-Deletion condition for wal-NNNNNN.log:
-  checkpoint_watermark = min(each segment's last-checkpointed LSN)
-  wal_file.max_lsn ≤ checkpoint_watermark
-```
-
-**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D5). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
-
-**Bounded WAL size:** Under normal operation, the lag between WAL write and checkpoint is bounded by checkpoint frequency and cache size. WAL accumulation is bounded by the slowest checkpoint across all active segments on the node. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient).
+**Timer:** `DataPlaneTimer` implements `TTimer`, driven by `crossbeam::channel::select!` with timeout (same tick model as SWIM/Raft scheduling actor, but on the dedicated thread instead of a tokio task). Drives periodic sweep for removing idle `SegmentCache` entries.
 
 ---
 
@@ -303,7 +327,7 @@ WAL fsync is the sole disk write on the critical path. Cache publish is two atom
 
 ### Checkpoint Worker
 
-Single dedicated OS thread. Sequential pipeline: read batches → write segment file → fsync → update sparse index → advance eviction frontier → report. No protocol logic, no state transitions — just a worker loop. Parallelism wouldn't help — multiple concurrent fsyncs to the same disk add contention, not throughput. No caller waits on the result (fire-and-forget from DataPlaneActor).
+Single dedicated OS thread. Sequential pipeline: read batches → write segment file → fsync → update sparse index → advance eviction frontier → report. No protocol logic, no state transitions — just a worker loop. Parallelism wouldn't help — checkpoint is write-bound (sequential writes to one stream, fsync dominates), and multiple concurrent fsyncs to the same disk add contention, not throughput. Cold read pool (below) uses multiple threads because reads are latency-bound with independent `pread()` calls across different files. No caller waits on the checkpoint result (fire-and-forget from DataPlaneActor).
 
 ```rust
 fn run_checkpoint_worker(
@@ -372,7 +396,7 @@ Segment files are derived from WAL — they exist for cold read performance, not
 
 **Three checkpoint triggers** — checkpoint happens when there's a reason, not on a clock:
 
-1. **Segment size approaching limit.** DataPlaneActor tracks `size_bytes` per segment. When approaching 1GB, submits a checkpoint job — one large, efficient bulk write. After checkpoint, the segment rolls (`RollSegment`).
+1. **Segment size approaching limit.** `DataPlane` tracks `segment_sizes: HashMap<SegmentKey, u64>` — accumulated data bytes per segment, incremented as records are accumulated. When approaching 1GB, submits a checkpoint job — one large, efficient bulk write. After checkpoint, the segment rolls (`RollSegment`).
 2. **Node cache budget pressure.** When total cache memory approaches the node-level budget, DataPlaneActor force-checkpoints the segments with the most uncheckpointed batches to free cache slots.
 3. **WAL retention pressure.** When total WAL size exceeds a threshold (e.g., 2GB), DataPlaneActor checkpoints the segments keeping the oldest WAL files alive. Bounds crash recovery time and WAL disk usage.
 
@@ -468,32 +492,34 @@ check eviction_frontier:
 
 1. **Single active WAL file.** Writes go to exactly one file at any time. Rotation atomically seals the current file and opens the next.
 
-2. **LSN monotonicity.** WAL LSNs are monotonically increasing. Each record's LSN is strictly greater than the previous record's LSN, across all WAL files.
+2. **Active file is last in `files`.** `WalWriter.files.back()` is always the active file (`file: Some(...)`); all preceding entries are sealed (`file: None`). Rotation takes the active entry's `File` handle (`Option::take`) and pushes a new active entry to the back.
 
-3. **Segment file records ordered by logical offset.** Records within a segment file are strictly ordered by `logical_offset`. No gaps, no reordering.
+3. **LSN monotonicity.** WAL LSNs are monotonically increasing. Each record's LSN is strictly greater than the previous record's LSN, across all WAL files.
 
-4. **WAL deletion gated by checkpoint watermark.** A WAL file is deleted only when `global_checkpoint_watermark ≥ wal_file.max_lsn`. The watermark is the minimum last-checkpointed LSN across all active segments.
+4. **Segment file records ordered by logical offset.** Records within a segment file are strictly ordered by `logical_offset`. No gaps, no reordering.
 
-5. **Cache spans eviction frontier to tail; readers bounded by commit_offset.** Batches between `eviction_frontier` and `tail` are always in the ring buffer. Consumer-visible range is positions `eviction_frontier` through `commit_offset - 1`. Batches at positions `commit_offset` through `tail - 1` exist in cache but are not yet visible to consumers. Batches behind `eviction_frontier` may still exist (held by consumer `Arc` refs) but are eligible for slot reuse. Batches at or beyond `tail` do not exist.
+5. **WAL deletion gated by checkpoint watermark.** A WAL file is deleted only when `global_checkpoint_watermark ≥ wal_file.max_lsn`. The watermark is the minimum last-checkpointed LSN across all active segments.
 
-6. **Checkpoint is idempotent.** All three triggers (segment size, cache budget, WAL retention) check `eviction_frontier` against `tail`. No new batches since last checkpoint → no-op.
+6. **Cache spans eviction frontier to tail; readers bounded by commit_offset.** Batches between `eviction_frontier` and `tail` are always in the ring buffer. Consumer-visible range is positions `eviction_frontier` through `commit_offset - 1`. Batches at positions `commit_offset` through `tail - 1` exist in cache but are not yet visible to consumers. Batches behind `eviction_frontier` may still exist (held by consumer `Arc` refs) but are eligible for slot reuse. Batches at or beyond `tail` do not exist.
 
-7. **Segment file I/O uses buffered I/O + `POSIX_FADV_DONTNEED`.** Both checkpoint writes and cold reads use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages from OS page cache.
+7. **Checkpoint is idempotent.** All three triggers (segment size, cache budget, WAL retention) check `eviction_frontier` against `tail`. No new batches since last checkpoint → no-op.
 
-8. **One SegmentCache per segment per node.** `segment_caches` enforces at most one cache per `(shard_group_id, range_id, segment_id)` key.
+8. **Segment file I/O uses buffered I/O + `POSIX_FADV_DONTNEED`.** Both checkpoint writes and cold reads use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages from OS page cache.
 
-9. **Segment file ≤ 1GB.** DataPlaneActor signals `RollSegment` when approaching the limit. Enforced at the write path — never retroactively truncated.
+9. **One SegmentCache per segment per node.** `segment_caches` enforces at most one cache per `(shard_group_id, range_id, segment_id)` key.
 
-10. **WAL fsync is the durability boundary.** Records are durable only after the WAL batch containing them is fsynced. Producer ACK sent after WAL fsync + cache publish + replication. Segment files and sparse index are derived — their absence never means data loss.
+10. **Segment file ≤ 1GB.** DataPlaneActor signals `RollSegment` when approaching the limit. Enforced at the write path — never retroactively truncated.
 
-11. **Node-level cache budget is a hard cap.** Sum of all ring buffer allocations never exceeds the configured budget. Under pressure, force checkpoint to advance eviction frontiers; if all batches are uncheckpointed, backpressure propagates to WAL dispatch.
+11. **WAL fsync is the durability boundary.** Records are durable only after the WAL batch containing them is fsynced. Producer ACK sent after WAL fsync + cache publish + replication. Segment files and sparse index are derived — their absence never means data loss.
 
-12. **Published batches are immutable.** No mutation after `tail` advancement. Writer never modifies data behind `tail`. Readers only access data behind `tail`. This is the SWMR (single-writer, multiple-reader) invariant that eliminates locking.
+12. **Node-level cache budget is a hard cap.** Sum of all ring buffer allocations never exceeds the configured budget. Under pressure, force checkpoint to advance eviction frontiers; if all batches are uncheckpointed, backpressure propagates to WAL dispatch.
 
-13. **Within-segment record ordering preserved.** Per-segment accumulation buffers maintain arrival order. Records in a `SegmentRecordBatch` are ordered by `logical_offset`. Cross-segment ordering is not guaranteed.
+13. **Published batches are immutable.** No mutation after `tail` advancement. Writer never modifies data behind `tail`. Readers only access data behind `tail`. This is the SWMR (single-writer, multiple-reader) invariant that eliminates locking.
 
-14. **`eviction_frontier` ≤ `commit_offset` ≤ `tail` always.** Three monotonically advancing markers partition the ring buffer into zones. In D1 (no replication), `commit_offset == tail` — both advance together on cache publish. In D2+, `commit_offset` lags `tail` by one replication RTT: `tail` advances on cache publish, `commit_offset` advances after all replicas ACK.
+14. **Within-segment record ordering preserved.** Per-segment accumulation buffers maintain arrival order. Records in a `SegmentRecordBatch` are ordered by `logical_offset`. Cross-segment ordering is not guaranteed.
 
-15. **Sealed segment `end_offset` = last committed offset.** On seal, `end_offset` is set to `commit_offset` at seal time, not `tail`. Batches at positions `commit_offset` through `tail - 1` are uncommitted — replayed into the next segment by the leader (see "Uncommitted Tail on Replication Failure").
+15. **`eviction_frontier` ≤ `commit_offset` ≤ `tail` always.** Three monotonically advancing markers partition the ring buffer into zones. In D1 (no replication), `commit_offset == tail` — both advance together on cache publish. In D2+, `commit_offset` lags `tail` by one replication RTT: `tail` advances on cache publish, `commit_offset` advances after all replicas ACK.
 
-16. **Consumer read position determines data source.** A consumer at `position` follows exactly one path: `position < eviction_frontier` → cold read path (cold read pool); `eviction_frontier ≤ position < commit_offset` → hot cache read (clone `Arc` from ring buffer); `position == commit_offset` → tailing (await `notify`). Consumers never read at or beyond `commit_offset` — batches at positions `commit_offset` through `tail - 1` are uncommitted and invisible. This prevents consumers from observing records that may be rolled back on replication failure.
+16. **Sealed segment `end_offset` = last committed offset.** On seal, `end_offset` is set to `commit_offset` at seal time, not `tail`. Batches at positions `commit_offset` through `tail - 1` are uncommitted — replayed into the next segment by the leader (see "Uncommitted Tail on Replication Failure").
+
+17. **Consumer read position determines data source.** A consumer at `position` follows exactly one path: `position < eviction_frontier` → cold read path (cold read pool); `eviction_frontier ≤ position < commit_offset` → hot cache read (clone `Arc` from ring buffer); `position == commit_offset` → tailing (await `notify`). Consumers never read at or beyond `commit_offset` — batches at positions `commit_offset` through `tail - 1` are uncommitted and invisible. This prevents consumers from observing records that may be rolled back on replication failure.
