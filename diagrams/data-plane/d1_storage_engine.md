@@ -234,7 +234,7 @@ Deletion condition for wal-NNNNNN.log:
 
 ### SegmentCache
 
-Lock-free ring buffer of immutable `Arc<SegmentRecordBatch>` batches. Single writer (`DataPlane` calls `publish` + `commit`), multiple readers (consumer tasks on tokio). No locks. Two cursors: `tail` is the write cursor — where the next batch will be stored; `commit_offset` is the read cursor — consumers only see batches behind `commit_offset`. In D1 they advance together; in D2+ `commit_offset` lags by one replication RTT.
+Lock-free ring buffer of immutable `Arc<SegmentRecordBatch>` batches. Single writer (`DataPlane` calls `publish` + `commit`), multiple readers (consumer tasks). No locks. Two cursors: `tail` is the write cursor — where the next batch will be stored; `commit_offset` is the read cursor — consumers only see batches behind `commit_offset`. In D1 they advance together; in D2+ `commit_offset` lags by one replication RTT.
 
 ```rust
 struct SegmentCache {
@@ -251,7 +251,7 @@ impl SegmentCache {
     fn publish(&self, batch: Arc<SegmentRecordBatch>);       // store ptr, advance tail
     fn commit(&self, new_offset: u64);                       // advance commit_offset, notify_waiters()
 
-    // Read path — called by consumer tasks (tokio)
+    // Read path — called by consumer tasks
     fn load_commit_offset(&self) -> u64;                     // Acquire load
     async fn notified(&self);                                // notify.notified().await
     fn read_batch(&self, position: u64) -> Option<Arc<SegmentRecordBatch>>;
@@ -443,7 +443,7 @@ struct ColdReadResult {
 ```
 
 ```
-Consumer task (tokio)                cold_read_pool (dedicated threads)
+Consumer task                        cold_read_pool (dedicated threads)
 ─────────────────────                ──────────────────────────────────
 position < eviction_frontier
 or segment sealed (no cache)
@@ -466,7 +466,7 @@ send ColdReadRequest {
                                       │
                                       ▼
 .await oneshot ◄───────────────── respond_tx.send(ColdReadResult)
-(non-blocking on tokio)
+(non-blocking)
 
 yield records to consumer stream
 check eviction_frontier:
