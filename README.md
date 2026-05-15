@@ -1,171 +1,232 @@
 # EastGuard
 
-EastGuard is a zero-controller messaging system designed for flexible scalability and high operability. This project is significantly inspired by the architecture of LinkedIn's Northguard.
+**A zero-controller messaging system built for the scale that breaks Kafka.**
 
-**Join the community:** [Discord](https://discord.gg/GMdFfeXu)
+Kafka's architecture was revolutionary in 2011. But its monolithic controller, static partitions, and coarse-grained replication units create hard ceilings that no amount of tuning can fix. EastGuard removes those ceilings by separating concerns that Kafka entangles: metadata consensus, failure detection, data storage, and replication are independent subsystems that scale independently.
 
+Inspired by LinkedIn's [Northguard](https://www.linkedin.com/blog/engineering/infrastructure/introducing-northguard-and-xinfra) architecture.
 
+---
 
-## Terms
+## Why EastGuard
 
-- **Control Plane:** A decentralized layer responsible for managing cluster metadata via DS-RSM. It stores topic configurations, range states (active/sealed), segment locations, etc.
-- **Data Plane:** The layer responsible for storing actual application messages.
-- **Consistent Hash Ring:** The topology used to map vNodes to physical brokers. It uses deterministic algorithms to calculate leaders and followers (Clockwise Walk) with constraint filtering (e.g., Rack Awareness).
-- **vNode (Virtual Node):** A logical metadata shard acting as a local controller. It is a fault-tolerant replicated state machine backed by Raft that manages a specific subset of the cluster's metadata.
-- **MetadataStateMachine:** Pure in-memory state machine managing topic/range/segment metadata within a shard group. Applies committed Raft log entries (e.g., CreateTopic, SplitRange, SealSegment deterministically on every replica. No I/O, no replication logic — Raft handles consensus, MetadataStateMachine handles business logic.
-- **SWIM (Scalable Weakly-consistent Infection-style Membership):** A decentralized protocol using Random Probing and Piggybacked Updates to detect failures and disseminate cluster state without the network saturation caused by central heartbeats.
-- **Topic:** A named collection of ranges that covers the full keyspace.
-- **Range:** The logical log abstraction (analogous to Kafka partitions). Unlike static partitions, ranges can dynamically split or merge with their buddy range to adapt to traffic load.
-- **Segment:** The physical unit of replication (approx. 1 GB). These granular chunks naturally distribute across brokers, eliminating resource skew.
+### The Kafka Problem
 
-## How To Start 
+Kafka routes all metadata through a single controller (or KRaft quorum). Every partition reassignment, every leader election, every ISR change funnels through one bottleneck. At hundreds of thousands of partitions, controller failover takes minutes. Rebalancing requires external tooling. A slow broker degrades the entire ISR, and operators must manually intervene.
 
-```shell 
-$ cargo build 
+### How EastGuard Fixes It
 
-$ cargo run --bin server
+| | Kafka | EastGuard |
+|---|---|---|
+| **Metadata** | Single controller / KRaft quorum | Dynamically-sharded Raft groups (DS-RSM) -- metadata throughput scales linearly with brokers |
+| **Partitioning** | Static partitions, manual reassignment | Dynamic ranges that split and merge automatically based on traffic load |
+| **Replication unit** | Entire partition (can be hundreds of GB) | ~1 GB segments dispersed across the cluster -- automatic load balancing, no rebalancing tools |
+| **Failure handling** | ISR shrink/expand + high watermark tracking | Seal the segment, open a new one with healthy replicas -- sealed data is immutable, recovery is just byte-copy |
+| **Failure detection** | Heartbeat-based, centralized | SWIM protocol -- decentralized, O(log N) convergence, no heartbeat storm |
+| **Consumer reads** | Leader-only (unless using follower fetching with lag) | Any replica -- every replica has all committed data |
+
+---
+
+## Metadata: Decentralized Control Plane
+
+EastGuard replaces the monolithic controller with **DS-RSM** (Dynamically-Sharded Replicated State Machines). Metadata is sharded across many small Raft groups distributed over all brokers. Each shard group manages a subset of topics independently.
+
+```mermaid
+graph TB
+    subgraph Node_A["Node A"]
+        A1["Shard #1<br/>(Leader)"]
+        A2["Shard #2<br/>(Follower)"]
+    end
+    subgraph Node_B["Node B"]
+        B1["Shard #1<br/>(Follower)"]
+        B2["Shard #2<br/>(Leader)"]
+    end
+    subgraph Node_C["Node C"]
+        C1["Shard #1<br/>(Follower)"]
+        C2["Shard #2<br/>(Follower)"]
+    end
+
+    A1 <-->|"Raft (TCP)"| B1
+    B1 <-->|"Raft (TCP)"| C1
+    A2 <-->|"Raft (TCP)"| B2
+    B2 <-->|"Raft (TCP)"| C2
+
+    Node_A <-.->|"SWIM (UDP)"| Node_B
+    Node_B <-.->|"SWIM (UDP)"| Node_C
+    Node_A <-.->|"SWIM (UDP)"| Node_C
 ```
 
-### Running Cluster 
+**How it works:**
 
-```shell 
+- A consistent hash ring maps each topic to a shard group. The shard group's Raft leader is the **coordinator** for that topic -- it proposes all metadata changes (create topic, split range, seal segment) via Raft consensus.
+- **SWIM protocol** handles failure detection and leader discovery. No central heartbeats. When a Raft election produces a new leader, SWIM gossips the change across the cluster in O(log N) rounds. Information flows one way: Raft decides leaders, SWIM tells everyone.
+- **Adding a broker scales metadata.** More nodes = more shard groups = more metadata throughput. No single bottleneck to saturate.
+
+**What the coordinator manages:**
+
+| Operation | What Happens |
+|---|---|
+| `CreateTopic` | Creates topic + initial range (full keyspace) + initial segment |
+| `SplitRange` | Seals parent range, creates two child ranges with new segments |
+| `MergeRange` | Seals both source ranges, creates merged range with new segment |
+| `RollSegment` | Seals current segment, creates new one with updated replica set |
+| `DeleteTopic` | Cascades deletion through all ranges and segments |
+
+All mutations are single Raft log entries -- atomic by construction. No two-phase commits. No cross-shard coordination for single-topic operations.
+
+---
+
+## Data Plane: Storage and Replication
+
+Metadata nodes and data nodes are **independent**. The nodes running Raft consensus for a topic's metadata are not necessarily the nodes storing that topic's data.
+
+### Storage Engine
+
+Producer latency is bounded by a single sequential WAL fsync. Everything else happens in the background.
+
+```mermaid
+graph LR
+    subgraph Write["Write Path"]
+        direction LR
+        Batch["Batch Records<br/>(10ms / 20k / 10MB)"]
+        WAL["WAL append<br/>+ fsync"]
+        Cache["Per-segment<br/>cache"]
+        ACK["ACK Producer"]
+        Segment["Segment file<br/>flush"]
+        Index["Sparse index<br/>update"]
+
+        Batch --> WAL
+        WAL -->|"durability point"| Cache
+        Cache --> ACK
+        ACK -.->|background| Segment
+        Segment -.->|background| Index
+    end
+
+    subgraph Read["Read Path"]
+        direction LR
+        Hot["Cache hit"] -->|"zero disk I/O"| Serve["Serve"]
+        Cold["Cache miss"] --> Seek["Sparse index<br/>→ seek segment<br/>→ scan forward"]
+    end
+```
+
+**Key design choices:**
+
+- **Shared WAL per node.** One fsync per batch covers all segments in that batch. Amortizes the cost across hundreds of segments.
+- **Per-segment actors.** Each segment owns its cache, checkpoint, and read path. No single-actor bottleneck.
+- **Lock-free consumer reads.** Consumers read directly from per-segment cache without acquiring locks. Hot tail reads never touch disk.
+
+### Replication: Seal-on-Failure
+
+EastGuard uses primary-backup replication. Not Kafka ISR. Not BookKeeper quorum.
+
+The producer connects to the segment leader. The leader replicates to **all** followers internally, waits for fsync ack from **all** replicas, then ACKs the producer. The producer sees one connection to one node -- no knowledge of replicas.
+
+**When a replica fails, seal the segment and open a new one** with a healthy replica set:
+
+```mermaid
+sequenceDiagram
+    participant D as Segment Leader D
+    participant E as Follower E
+    participant F as Follower F
+    participant A as Coordinator A
+
+    D->>E: ReplicaAppend
+    E-->>D: ✓ ack (fsync)
+    D-xF: ReplicaAppend
+    Note over F: ✗ timeout
+
+    D->>A: SealRequest
+    Note over A: Proposes RollSegment via Raft<br/>Raft commits
+
+    A-->>D: SealResponse<br/>{new_segment, replicas: [D, E, G]}
+
+    Note over D: Opens new segment<br/>resumes produce (~100ms)
+```
+
+**Why this beats ISR:**
+
+- **Simpler invariant.** Active segment has all replicas healthy, or it gets sealed. No ISR set tracking, no shrink/expand protocol, no high watermark management.
+- **Faster recovery.** Sealed segments are immutable. Replication is "read and copy bytes." No divergent state to reconcile.
+- **Faster consumer reads.** Every replica has all committed data. Consumers read from the nearest replica. No watermark lag, no ISR tracking overhead.
+
+### Dynamic Ranges
+
+Unlike Kafka's static partitions, EastGuard ranges **split and merge automatically** based on traffic load. A topic starts with one range covering the full keyspace. As write throughput increases, hot ranges split. As traffic subsides, cold ranges merge back.
+
+Each range produces ~1 GB segments that are individually placed across the cluster. This is **log striping** -- the physical storage units are small and independently movable, eliminating the resource skew that plagues Kafka's large partitions.
+
+### Failure Detection
+
+Two detection paths cover all failure modes:
+
+| Path | Detects | Latency |
+|---|---|---|
+| **Write-path timeout** | Follower crash, disk failure, slow disk, network partition | Sub-second |
+| **SWIM node death** | Leader crash, idle segment failures, node-level failures | ~6-7 seconds |
+
+A slow replica is as bad as a dead replica. If one node's fsync takes 500ms instead of 10ms, every produce to that segment is blocked. Seal and move on.
+
+---
+
+## How To Start
+
+```shell
+cargo build
+cargo run --bin server
+```
+
+### Running a 3-Node Cluster
+
+```shell
 # Terminal 1 (node-1):
 cargo run --bin server -- \
---client-port 3001 \
---cluster-port 13001 \
---advertise-host 127.0.0.1 \
---data-dir /tmp/eg-node1 \
---meta-dir /tmp/eg-node1-meta \
---config-dir /tmp/eg-node1-config \
---join-seed-nodes 127.0.0.1:13002 \
---join-seed-nodes 127.0.0.1:13003 \
---join-initial-delay-ms 500 \
---join-interval-ms 500
+  --client-port 3001 \
+  --cluster-port 13001 \
+  --advertise-host 127.0.0.1 \
+  --data-dir /tmp/eg-node1 \
+  --meta-dir /tmp/eg-node1-meta \
+  --config-dir /tmp/eg-node1-config \
+  --join-seed-nodes 127.0.0.1:13002 \
+  --join-seed-nodes 127.0.0.1:13003 \
+  --join-initial-delay-ms 500 \
+  --join-interval-ms 500
 
 # Terminal 2 (node-2):
 cargo run --bin server -- \
---client-port 3002 \
---cluster-port 13002 \
---advertise-host 127.0.0.1 \
---data-dir /tmp/eg-node2 \
---meta-dir /tmp/eg-node2-meta \
---config-dir /tmp/eg-node2-config \
---join-seed-nodes 127.0.0.1:13001 \
---join-seed-nodes 127.0.0.1:13003 \
---join-initial-delay-ms 500 \
---join-interval-ms 500
+  --client-port 3002 \
+  --cluster-port 13002 \
+  --advertise-host 127.0.0.1 \
+  --data-dir /tmp/eg-node2 \
+  --meta-dir /tmp/eg-node2-meta \
+  --config-dir /tmp/eg-node2-config \
+  --join-seed-nodes 127.0.0.1:13001 \
+  --join-seed-nodes 127.0.0.1:13003 \
+  --join-initial-delay-ms 500 \
+  --join-interval-ms 500
 
 # Terminal 3 (node-3):
 cargo run --bin server -- \
---client-port 3003 \
---cluster-port 13003 \
---advertise-host 127.0.0.1 \
---data-dir /tmp/eg-node3 \
---meta-dir /tmp/eg-node3-meta \
---config-dir /tmp/eg-node3-config \
---join-seed-nodes 127.0.0.1:13001 \
---join-seed-nodes 127.0.0.1:13002 \
---join-initial-delay-ms 500 \
---join-interval-ms 500
+  --client-port 3003 \
+  --cluster-port 13003 \
+  --advertise-host 127.0.0.1 \
+  --data-dir /tmp/eg-node3 \
+  --meta-dir /tmp/eg-node3-meta \
+  --config-dir /tmp/eg-node3-config \
+  --join-seed-nodes 127.0.0.1:13001 \
+  --join-seed-nodes 127.0.0.1:13002 \
+  --join-initial-delay-ms 500 \
+  --join-interval-ms 500
 ```
 
-
-
-## Architecture
-
-EastGuard eliminates the monolithic controller bottleneck found in systems (like Kafka) by separating the Control Plane and Data Plane.
-
-
-- **Storage (Data Plane):** Implements Log Striping. Logical logs are broken into granular Segments dispersed across the cluster, ensuring automatic load balancing without external rebalancing tools.
-
-### Metadata Management 
-Managed via DS-RSM (Dynamically Sharded - Replicated State Machine). Metadata is sharded into vNodes and distributed across the cluster, allowing metadata throughput to scale linearly with the number of brokers.
-
-#### Leader Discovery (SWIM / UDP)
-
-Raft decides who the leader is; SWIM tells the rest of the cluster. When a Raft instance emits `LeaderChange`, the local `MultiRaftActor` forwards it to SWIM via `AnnounceShardLeader`. SWIM stores it in the topology, enqueues it into a dissemination buffer, and piggybacks it on regular protocol packets (Ping, Ack, PingReq) for epidemic spread. Information flows **one way: Raft → SWIM**, never the reverse. SWIM never tells Raft about leadership — it only sends membership events (node join/death) that affect the peer set. Topology's `shard_leaders` map is an eventually-consistent read cache; stale entries are harmless since the next election's higher term overwrites them.
-
-```mermaid
-sequenceDiagram
-    box rgb(30, 40, 60) Node A
-        participant MRA_A as MultiRaftActor<br/>(Manages Rafts)
-        participant Swim_A as SwimActor<br/>(Topo & Gossip)
-    end
-
-    box rgb(60, 40, 40) Node B
-        participant Swim_B as SwimActor<br/>(Topo & Gossip)
-    end
-
-    Note over MRA_A: Step 1: Raft Election
-    MRA_A->>MRA_A: Raft Instance wins election
-
-    Note over MRA_A, Swim_A: Step 2: Local Routing
-    MRA_A->>Swim_A: AnnounceShardLeader
-
-    Note over Swim_A: Step 3: State & Gossip Update
-    Swim_A->>Swim_A: Update Topology<br/>Enqueue to Gossip Buffer
-
-    Note over Swim_A, Swim_B: Step 4: Piggybacked Transport
-    Swim_A->>Swim_B: UDP Ping/Ack + [ShardLeaderInfo]
-
-    Note over Swim_B: Step 5: Receive & Process
-    Swim_B->>Swim_B: Update Topology
-    
-    opt info.term > existing.term
-        Swim_B->>Swim_B: Enqueue to Gossip Buffer
-        Note over Swim_B: Step 6: O(log N) Epidemic Spread<br/>Piggybacks to Nodes C, D, E...
-    end
-
-```
-
-
-#### Leadership Lifecycle (TCP + UDP)
-
-Full picture: election happens over TCP (Raft RPCs), then leadership knowledge spreads over UDP (SWIM gossip). Both paths run concurrently after election — followers learn the leader immediately via AppendEntries (TCP), while the rest of the cluster converges in O(log N) rounds via piggybacked gossip (UDP).
-
-```mermaid
-sequenceDiagram
-    box rgb(30, 40, 60) Node A
-        participant MRA_A as MultiRaftActor<br/>(Raft & Transport)
-        participant Swim_A as SwimActor<br/>(Topo & Gossip)
-    end
-
-    box rgb(60, 40, 40) Node B
-        participant MRA_B as MultiRaftActor<br/>(Raft & Transport)
-        participant Swim_B as SwimActor<br/>(Topo & Gossip)
-    end
-
-    box rgb(40, 60, 40) Node C
-        participant Swim_C as SwimActor<br/>(Topo & Gossip)
-    end
-
-    Note over MRA_A, MRA_B: Phase 1: Raft Election (TCP)
-    MRA_A->>MRA_B: TCP RequestVote
-    MRA_B->>MRA_A: TCP RequestVoteResponse (Granted)
-    MRA_A->>MRA_A: Quorum Reached → Becomes Leader
-
-    Note over MRA_A, Swim_A: Phase 2: Leader Emits Events
-    MRA_A->>Swim_A: AnnounceShardLeader
-
-    par TCP Path — Raft Replication
-        Note over MRA_A, MRA_B: Phase 3a: Heartbeats (TCP)
-        MRA_A->>MRA_B: TCP AppendEntries
-        MRA_B->>MRA_B: Recognizes Leader (A)
-        MRA_B->>MRA_A: TCP AppendEntriesResponse (Success)
-        MRA_A->>MRA_A: Advance Commit Index
-    and UDP Path — Gossip Spread
-        Note over Swim_A, Swim_C: Phase 3b: Epidemic Propagation (UDP)
-        Swim_A->>Swim_B: UDP Ping/Ack + [ShardLeaderInfo]
-        Swim_B->>Swim_B: Update Topology
-        Swim_B->>Swim_C: UDP Piggyback to Node C...<br/>(O(log N) convergence)
-    end
-```
-
-
-
+---
 
 ## References
 
-- [Northguard](https://www.linkedin.com/blog/engineering/infrastructure/introducing-northguard-and-xinfra)
-- [SWIM](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+- [Northguard -- LinkedIn Engineering](https://www.linkedin.com/blog/engineering/infrastructure/introducing-northguard-and-xinfra)
+- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
+---
+
+## Join the Community
+
+[Discord](https://discord.gg/GMdFfeXu)
