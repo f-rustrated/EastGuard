@@ -333,6 +333,8 @@ enum DataPlaneCommand {
 }
 ```
 
+**Channel traffic profiles:** `mailbox` is hot — every `Produce` request flows through it. `checkpoint_tx` and `data_plane_tx` (the return path for `CheckpointComplete`) are occasional — triggered only by checkpoint conditions (segment size, cache budget, WAL retention), not by time or per-batch. The checkpoint worker is a single sequential thread; each cycle includes at least one segment file fsync, so `CheckpointComplete` messages arrive at most low tens per second under sustained throughput.
+
 Built from WAL replay + segment directory scan at startup (D5).
 
 **Cache lifecycle:**
