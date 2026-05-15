@@ -710,8 +710,8 @@ impl Raft {
             ),
         }
         if self.role == Role::Leader {
-            for cmd in self.state_machine.take_pending_proposals() {
-                self.pending_proposals.push(RaftCommand::Metadata(cmd));
+            for pending_cmd in self.state_machine.take_pending_proposals() {
+                self.pending_proposals.push(RaftCommand::Metadata(pending_cmd));
             }
         }
     }
@@ -1888,9 +1888,9 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
 
-        let events = leader_events(&mut raft);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].term, 2);
+        let reelection_events = leader_events(&mut raft);
+        assert_eq!(reelection_events.len(), 1);
+        assert_eq!(reelection_events[0].term, 2);
     }
 
     // -------------------------------------------------------------------

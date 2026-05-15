@@ -77,7 +77,11 @@ impl MetadataStateMachine {
             match range.build_split_proposal(&cmd) {
                 Ok(p) => self.pending_proposals.push(p),
                 Err(e) => {
-                    tracing::debug!("Split proposal skipped for range {:?}: {:?}", cmd.range_id, e)
+                    tracing::debug!(
+                        "Split proposal skipped for range {:?}: {:?}",
+                        cmd.range_id,
+                        e
+                    )
                 }
             }
         }
@@ -501,7 +505,7 @@ mod tests {
             other => panic!("expected TopicCreated, got {:?}", other),
         };
 
-        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+        let split_result = sm.apply(MetadataCommand::SplitRange(SplitRange {
             topic_id: tid,
             range_id: RangeId(0),
             split_point: vec![0x80],
@@ -509,7 +513,7 @@ mod tests {
             left_replica_set: replica_set(),
             right_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(SplitNotAllowed(tid)));
+        assert_eq!(split_result, Err(SplitNotAllowed(tid)));
     }
 
     #[test]
@@ -517,7 +521,7 @@ mod tests {
         let mut sm = MetadataStateMachine::default();
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+        let upper_bound = sm.apply(MetadataCommand::SplitRange(SplitRange {
             topic_id: tid,
             range_id: RangeId(0),
             split_point: vec![0xFF],
@@ -525,9 +529,9 @@ mod tests {
             left_replica_set: replica_set(),
             right_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(InvalidSplitPoint));
+        assert_eq!(upper_bound, Err(InvalidSplitPoint));
 
-        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
+        let lower_bound = sm.apply(MetadataCommand::SplitRange(SplitRange {
             topic_id: tid,
             range_id: RangeId(0),
             split_point: vec![],
@@ -535,7 +539,7 @@ mod tests {
             left_replica_set: replica_set(),
             right_replica_set: replica_set(),
         }));
-        assert_eq!(result, Err(InvalidSplitPoint));
+        assert_eq!(lower_bound, Err(InvalidSplitPoint));
     }
 
     #[test]
