@@ -89,6 +89,72 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 
 ---
 
+## Write Path
+
+```
+records arrive
+    │
+    ▼
+accumulation_buffers[segment_key].push(record)
+    │
+    │ batch trigger fires (10ms / 20k records / 10MB)
+    ▼
+╔════════════════════════════════════════════════════╗
+║ WAL: serialize all buffers with routing headers    ║
+║      → flat interleaved write → fsync              ║
+║      assign LSN to each record                     ║
+╚════════════════════════════╤═══════════════════════╝
+                         │ ◄── durability point
+                         ▼
+   ┌─────────── for each segment_key ────────────┐
+   │ Vec<Record> ──move──▶ SegmentRecordBatch    │
+   │ Arc::new() → store at batches[tail % CAP]   │
+   │ tail.store(tail + 1, Release)               │
+   └─────────────────────┬──────────────────────-┘
+                         │ ◄── in cache, not yet visible
+                         ▼
+   ┌─────────── D2+: replicate ─────────────────┐
+   │ send per-segment batches to all followers  │
+   │ wait ALL replica fsync ACK                 │
+   └─────────────────────┬─────────────────────-┘
+                         │
+                         ▼
+   commit_offset.store(tail, Release)
+   notify.notify_waiters()  ◄── consumers can read
+                         │
+                         ▼
+   ACK producer
+                         │
+                         ▼ (background)
+   checkpoint worker       size_bytes → RollSegment at ~1GB
+```
+
+WAL fsync is the sole disk write on the critical path. Cache publish is two atomic stores — negligible. Replication adds one network RTT. In D1 (no replication), replication is skipped — `commit_offset` advances immediately after `tail`, consumers are notified, and ACK follows.
+
+---
+
+## Read Path
+
+```
+Consume(topic, range, offset)
+    │
+    ▼
+position < eviction_frontier?
+    ├── yes → COLD: dispatch to cold read pool (see below)
+    │
+    ├── no, position < commit_offset?
+    │       └── yes → HOT: cache.read_batch(position) — Arc clone, no lock
+    │
+    └── position == commit_offset?
+            └── yes → TAILING: cache.notified().await — wake on commit_offset advance
+```
+
+Consumer offset tracking: consumers track their read position client-side. Each `Consume(topic, range, offset)` request carries the offset explicitly — the server is stateless with respect to consumer position. Consumer group offset commit and resume semantics are deferred (see roadmap backlog "Consumer Groups").
+
+**Hot/cold transition:** Consumer checks `eviction_frontier` on each iteration. When reading behind the frontier, it dispatches to cold read pool. Once its position catches up to `eviction_frontier`, the next read switches to the hot cache path (direct `Arc` clone from the ring buffer). The transition is seamless — same consumer task, same stream, just a different data source.
+
+---
+
 ## Components
 
 ### WAL (WalStorage + WalWriter + Lifecycle)
@@ -130,7 +196,7 @@ The WAL is a sequence of fixed-size log files, not a single ever-growing file. T
 
 **LSN (Log Sequence Number):** Each WAL record carries an explicit node-local LSN — a monotonically increasing `u64` assigned by DataPlane during WAL write. LSN is carried by each `SegmentRecordBatch` in the cache, enabling the checkpoint worker to report last-checkpointed LSN back to DataPlaneActor without recomputing from file positions.
 
-**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum of `segment_checkpoint_lsns` across all active segments. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`. `segment_checkpoint_lsns` is necessary because `eviction_frontier` is a segment-local batch position — it cannot be compared across segments or against WAL LSNs. Deletion is processed lazily in DataPlaneActor's event loop: WAL files do not block writes, batching multiple LSN updates into one watermark recomputation is cheaper, and `unlink()` stays off the critical write path.
+**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum of `segment_checkpoint_lsns` across all active segments. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`.
 
 **Checkpoint LSN relationships:**
 
@@ -163,8 +229,6 @@ Deletion condition for wal-NNNNNN.log:
   checkpoint_watermark = min(each segment's last-checkpointed LSN)
   wal_file.max_lsn ≤ checkpoint_watermark
 ```
-
-**Crash recovery** scans from the oldest un-deleted WAL file forward (see Phase D5). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
 
 **Bounded WAL size:** Under normal operation, the lag between WAL write and checkpoint is bounded by checkpoint frequency and cache size. WAL accumulation is bounded by the slowest checkpoint across all active segments on the node. Checkpoint frequency balances WAL retention (unflushed records keep WAL files alive) against disk I/O scheduling (larger, less frequent flushes are more efficient).
 
@@ -281,53 +345,9 @@ Built from WAL replay + segment directory scan at startup (D5).
 
 **Timer:** `DataPlaneTimer` implements `TTimer`, driven by `crossbeam::channel::select!` with timeout (same tick model as SWIM/Raft scheduling actor, but on the dedicated thread instead of a tokio task). Drives periodic sweep for removing idle `SegmentCache` entries.
 
----
-
-## Write Path
-
-```
-records arrive
-    │
-    ▼
-accumulation_buffers[segment_key].push(record)
-    │
-    │ batch trigger fires (10ms / 20k records / 10MB)
-    ▼
-╔════════════════════════════════════════════════════╗
-║ WAL: serialize all buffers with routing headers    ║
-║      → flat interleaved write → fsync              ║
-║      assign LSN to each record                     ║
-╚════════════════════════╤═══════════════════════════╝
-                         │ ◄── durability point
-                         ▼
-   ┌─────────── for each segment_key ────────────┐
-   │ Vec<Record> ──move──▶ SegmentRecordBatch    │
-   │ Arc::new() → store at batches[tail % CAP]   │
-   │ tail.store(tail + 1, Release)               │
-   └─────────────────────┬──────────────────────-┘
-                         │ ◄── in cache, not yet visible
-                         ▼
-   ┌─────────── D2+: replicate ─────────────────┐
-   │ send per-segment batches to all followers  │
-   │ wait ALL replica fsync ACK                 │
-   └─────────────────────┬─────────────────────-┘
-                         │
-                         ▼
-   commit_offset.store(tail, Release)
-   notify.notify_waiters()  ◄── consumers can read
-                         │
-                         ▼
-   ACK producer
-                         │
-                         ▼ (background)
-   checkpoint worker       size_bytes → RollSegment at ~1GB
-```
-
-WAL fsync is the sole disk write on the critical path. Cache publish is two atomic stores — negligible. Replication adds one network RTT. In D1 (no replication), replication is skipped — `commit_offset` advances immediately after `tail`, consumers are notified, and ACK follows.
-
 ### Checkpoint Worker
 
-Single dedicated OS thread. Sequential pipeline: read batches → write segment file → fsync → update sparse index → advance eviction frontier → report. No protocol logic, no state transitions — just a worker loop. Parallelism wouldn't help — checkpoint is write-bound (sequential writes to one stream, fsync dominates), and multiple concurrent fsyncs to the same disk add contention, not throughput. Cold read pool (below) uses multiple threads because reads are latency-bound with independent `pread()` calls across different files. No caller waits on the checkpoint result (fire-and-forget from DataPlaneActor).
+Single dedicated OS thread. Sequential pipeline: read batches → write segment file → fsync → update sparse index → advance eviction frontier → report. No protocol logic, no state transitions — just a worker loop. Parallelism wouldn't help — checkpoint is write-bound (sequential writes to one stream, fsync dominates), and multiple concurrent fsyncs to the same disk add contention, not throughput. Cold read pool uses multiple threads because reads are latency-bound with independent `pread()` calls across different files. No caller waits on the checkpoint result (fire-and-forget from DataPlaneActor).
 
 ```rust
 fn run_checkpoint_worker(
@@ -402,36 +422,6 @@ Segment files are derived from WAL — they exist for cold read performance, not
 
 All triggers submit work to checkpoint worker. The `eviction_frontier` is the single source of truth — triggers check it against `tail` to determine what needs flushing. When the ring wraps, the writer overwrites the oldest slot — but only if it's behind the eviction frontier (already checkpointed) and has `Arc::strong_count() == 1` (no active reader). If the oldest slot is still held, checkpoint is forced before advancing.
 
-### Uncommitted Tail on Replication Failure
-
-When replication (D2+) partially fails, records may be in the leader's cache (`tail` advanced) but not yet committed (`commit_offset` not advanced). Two sub-cases:
-
-**Follower fails, leader healthy:** The leader seals the segment with `end_offset = commit_offset` — the last offset ACKed by all replicas. Batches at positions `commit_offset` through `tail - 1` are uncommitted: cached on the leader and fsynced in the leader's WAL, but never ACKed to the producer. The leader drains these uncommitted batches from cache and replays them into the new segment (opened after `RollSegment`), where they will be re-committed with the new replica set. Producers whose records were in the uncommitted window also retry (no ACK received).
-
-**Leader crashes after WAL write:** WAL records beyond the sealed segment's `end_offset` are orphaned. On recovery (D5), WAL replay compares each record's `logical_offset` against the segment's `end_offset` — records past it belong to the old, sealed segment and are skipped. The producer never received an ACK for these records and retries against the new segment leader.
-
-In D1 (no replication, `commit_offset == tail`), this subsection does not apply — there is no replication failure mode. See invariant 15.
-
----
-
-## Read Path
-
-```
-Consume(topic, range, offset)
-    │
-    ▼
-position < eviction_frontier?
-    ├── yes → COLD: dispatch to cold read pool (see below)
-    │
-    ├── no, position < commit_offset?
-    │       └── yes → HOT: cache.read_batch(position) — Arc clone, no lock
-    │
-    └── position == commit_offset?
-            └── yes → TAILING: cache.notified().await — wake on commit_offset advance
-```
-
-Consumer offset tracking: consumers track their read position client-side. Each `Consume(topic, range, offset)` request carries the offset explicitly — the server is stateless with respect to consumer position. Consumer group offset commit and resume semantics are deferred (see roadmap backlog "Consumer Groups").
-
 ### Cold Read Pool
 
 Fixed-size thread pool (e.g., 4 threads). Cold reads are initiated by many independent consumer tasks, each waiting on the result. A single thread would serialize all consumers behind one read. Multiple threads serve concurrent consumers in parallel — each `pread()` is independent (different file positions, different segment files). Consumer-visible latency directly depends on pool capacity.
@@ -484,7 +474,23 @@ check eviction_frontier:
 
 **Why a dedicated pool instead of `tokio::spawn_blocking`:** Bounded concurrency — the pool has a fixed thread count (e.g., 4), preventing a burst of cold reads from saturating the tokio blocking thread pool. Disk I/O isolation — cold reads (seek + pread) do not compete with checkpoint writes or WAL fsyncs for thread resources.
 
-**Hot/cold transition:** Consumer checks `eviction_frontier` on each iteration. When reading behind the frontier, it dispatches to cold read pool. Once its position catches up to `eviction_frontier`, the next read switches to the hot cache path (direct `Arc` clone from the ring buffer). The transition is seamless — same consumer task, same stream, just a different data source.
+---
+
+## Failure Cases
+
+### Crash Recovery
+
+Crash recovery scans from the oldest un-deleted WAL file forward (see Phase D5). The oldest un-deleted file marks the checkpoint boundary — no separate checkpoint file needed.
+
+### Uncommitted Tail on Replication Failure
+
+When replication (D2+) partially fails, records may be in the leader's cache (`tail` advanced) but not yet committed (`commit_offset` not advanced). Two sub-cases:
+
+**Follower fails, leader healthy:** The leader seals the segment with `end_offset = commit_offset` — the last offset ACKed by all replicas. Batches at positions `commit_offset` through `tail - 1` are uncommitted: cached on the leader and fsynced in the leader's WAL, but never ACKed to the producer. The leader drains these uncommitted batches from cache and replays them into the new segment (opened after `RollSegment`), where they will be re-committed with the new replica set. Producers whose records were in the uncommitted window also retry (no ACK received).
+
+**Leader crashes after WAL write:** WAL records beyond the sealed segment's `end_offset` are orphaned. On recovery (D5), WAL replay compares each record's `logical_offset` against the segment's `end_offset` — records past it belong to the old, sealed segment and are skipped. The producer never received an ACK for these records and retries against the new segment leader.
+
+In D1 (no replication, `commit_offset == tail`), this subsection does not apply — there is no replication failure mode. See invariant 15.
 
 ---
 
