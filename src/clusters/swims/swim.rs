@@ -1237,7 +1237,7 @@ mod tests {
             assert_eq!(out.len(), 1);
             assert!(
                 out.iter()
-                    .any(|p| p.target == c_addr && matches!(p.packet(), SwimPacket::Ping { .. }))
+                    .any(|pkt| pkt.target == c_addr && matches!(pkt.packet(), SwimPacket::Ping { .. }))
             );
 
             // handle_incarnation_check ran: sender node-b should be in members
@@ -1317,8 +1317,8 @@ mod tests {
             h.step(b_addr, pingreq(42, "node-b", 1, c_addr, vec![]));
 
             // grab the proxy Ping's seq
-            let out = h.protocol.take_packets();
-            let proxy_seq = match out[0].packet() {
+            let proxy_packets = h.protocol.take_packets();
+            let proxy_seq = match proxy_packets[0].packet() {
                 SwimPacket::Ping(header) => header.seq,
                 _ => panic!("expected proxy Ping"),
             };
@@ -1339,9 +1339,9 @@ mod tests {
             );
 
             // forwarded Ack sent back to node-b with original seq=42
-            let out = h.protocol.take_packets();
+            let ack_packets = h.protocol.take_packets();
             assert!(
-                out.iter().any(|p| p.target == b_addr
+                ack_packets.iter().any(|p| p.target == b_addr
                     && matches!(p.packet(), SwimPacket::Ack(SwimHeader { seq: 42, .. }))),
                 "should forward Ack to original requester with original seq"
             );
@@ -1573,8 +1573,8 @@ mod tests {
                 let _ = h.protocol.take_events();
                 h.step(b_addr, ping(99, "node-b", 1, vec![]));
 
-                let packets = h.protocol.take_packets();
-                let found = packets.iter().any(|p| {
+                let retry_packets = h.protocol.take_packets();
+                let found = retry_packets.iter().any(|p| {
                     p.packet()
                         .shard_leaders()
                         .iter()

@@ -17,11 +17,13 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 thiserror = "2.0.18"
 rocksdb = "0.24.0"
 
-
-[lints.rust]
-unexpected_cfgs = { level = "allow" }
-
 [dev-dependencies]
 tempfile = "3.27.0"
 serial_test = "3.3.1"
 turmoil = { version = "0.7.1", package = "turmoil" }
+
+[lints.clippy]
+shadow_unrelated = "deny"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

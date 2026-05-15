@@ -169,9 +169,9 @@ mod tests {
         h.apply_timer_commands();
 
         // First ping sent immediately during start_join
-        let out = h.protocol.take_packets();
+        let initial = h.protocol.take_packets();
         assert_eq!(
-            count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
+            count_join_pings(&initial, "127.0.0.1:9000".parse().unwrap()),
             1,
             "immediate Ping"
         );
@@ -237,33 +237,33 @@ mod tests {
         h.apply_timer_commands();
 
         // immediate: first Ping
-        let out = h.protocol.take_packets();
+        let initial = h.protocol.take_packets();
         assert_eq!(
-            count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
+            count_join_pings(&initial, "127.0.0.1:9000".parse().unwrap()),
             1,
             "first Ping sent immediately"
         );
 
         // tick 1: no Ping (backoff = 2 ticks)
-        let out = h.tick_n_collect(1);
+        let at_tick1 = h.tick_n_collect(1);
         assert_eq!(
-            count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
+            count_join_pings(&at_tick1, "127.0.0.1:9000".parse().unwrap()),
             0,
             "no Ping at tick 1"
         );
 
         // tick 2: second Ping
-        let out = h.tick_n_collect(1);
+        let at_tick2 = h.tick_n_collect(1);
         assert_eq!(
-            count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
+            count_join_pings(&at_tick2, "127.0.0.1:9000".parse().unwrap()),
             1,
             "second Ping at tick 2"
         );
 
         // ticks 3–8: retries exhausted, no more Pings
-        let out = h.tick_n_collect(6);
+        let after_exhaustion = h.tick_n_collect(6);
         assert_eq!(
-            count_join_pings(&out, "127.0.0.1:9000".parse().unwrap()),
+            count_join_pings(&after_exhaustion, "127.0.0.1:9000".parse().unwrap()),
             0,
             "no Pings after exhaustion"
         );
