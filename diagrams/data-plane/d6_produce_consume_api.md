@@ -1,6 +1,6 @@
 # Phase D6: Produce/Consume Client API
 
-**Goal:** End-to-end path from client produce/consume through to storage engine. Sessionized streaming protocol with pipelining and windowing. DataActor wires together all internal machinery (storage, replication, lifecycle, recovery) behind the client-facing protocol.
+**Goal:** End-to-end path from client produce/consume through to storage engine. Sessionized streaming protocol with pipelining and windowing. DataPlaneActor (node-level) routes client sessions to SegmentActors (per-segment, spawned tasks) that handle storage, replication, and lifecycle.
 
 **Depends on:** Phase D4 (consumer range tracking), Phase D5 (crash recovery).
 
@@ -18,17 +18,42 @@ Sessionized and streaming (following Northguard's approach):
 
 Windowing prevents producer from overwhelming the broker. Broker adjusts window based on backpressure from disk/replication.
 
-## New Actor: DataActor
+## DataPlaneActor and SegmentActor
 
-Follows the existing actor pattern — `DataSender` typed wrapper (like `RaftSender`, `SwimSender`), tokio task, mailbox-driven event loop.
+Two-level architecture (see D1 "Storage Actor Architecture" for full details):
+
+**DataPlaneActor** (one per node) — owns the shared WAL, maintains a segment registry (`HashMap<(ShardGroupId, RangeId, SegmentId), SegmentSender>`), and routes all client and replication traffic to the correct SegmentActor. Spawns/stops SegmentActors based on `SegmentAssignment`, self-authorizing `ReplicaAppend`, and node startup recovery (D5). Follows the existing actor pattern — `DataPlaneSender` typed wrapper, tokio task, mailbox-driven event loop.
+
+**SegmentActor** (one spawned tokio task per segment) — owns cache, checkpoint, read serving, and replication for one segment. Each SegmentActor owns a sync state machine (cache, offset tracking, checkpoint decisions), producing I/O commands as buffered side effects — same pattern as `SwimActor` owning `Swim`. `SegmentSender` typed wrapper for mailbox communication.
 
 ## Produce Routing
+
+DataPlaneActor resolves the target SegmentActor:
 
 1. `hash(topic_name)` → shard group (metadata ownership)
 2. Query MetadataStateMachine: `topic_name_index` → `TopicMeta` → `active_ranges` → find range whose keyspace contains `key`
 3. Range's `active_segment` → `SegmentMeta.replica_set` → segment leader
-4. If this node is segment leader: write locally via `DataActor`
-5. If not: forward to segment leader (1 hop max, same pattern as metadata propose forwarding)
+4. If this node is segment leader: DataPlaneActor routes to local SegmentActor
+5. If not: forward to segment leader's DataPlaneActor (1 hop max, same pattern as metadata propose forwarding)
+
+## Producer Behavior on Seal
+
+When a segment is sealed mid-stream (follower failure, size limit, or time limit), the SegmentActor has pipelined appends in flight. The broker responds with an error + redirect for all pending (un-ACKed) appends:
+
+```
+Sealed {
+    stream_id,
+    failed_ack_seqs: [seq1, seq2, ...],
+    new_segment_id,
+    new_leader: NodeAddress,
+}
+```
+
+**Follower failure (common case):** Segment leader preserved at `replica_set[0]` — producer's TCP connection stays open. Producer retries un-ACKed records against `new_segment_id` over the same connection. Sub-millisecond overhead.
+
+**Leader failure:** TCP connection drops (node is dead). Producer reconnects to any node, discovers new segment leader via metadata query (`GetShardInfo`), retries un-ACKed records. Same reconnection path as any TCP failure.
+
+One retry code path in the producer handles both cases: receive `Sealed` or connection drop → retry un-ACKed records against the current segment leader (same node or rediscovered).
 
 ## Consume
 
@@ -58,9 +83,9 @@ This is NOT a Kafka-style high watermark — no ISR tracking, no watermark advan
 
 ## Metadata Query for Routing
 
-DataActor needs read access to MetadataStateMachine state (topic → range → segment mapping). Two options:
+DataPlaneActor needs read access to MetadataStateMachine state (topic → range → segment mapping) to route produce/consume requests. Two options:
 
-- **Option A:** DataActor queries MultiRaftActor via channel (request-reply, like existing `GetLeader`)
-- **Option B:** MetadataStateMachine state replicated to DataActor via applied-entry events
+- **Option A:** DataPlaneActor queries MultiRaftActor via channel (request-reply, like existing `GetLeader`)
+- **Option B:** MetadataStateMachine state replicated to DataPlaneActor via applied-entry events
 
 Option A is simpler initially. Option B may be needed later for performance (avoid per-produce round-trip to Raft actor).

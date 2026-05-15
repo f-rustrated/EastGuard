@@ -20,9 +20,15 @@
 
 After WAL replay, the node scans its data directory and builds a **local segment inventory**: `(shard_group_id, range_id, segment_id) → local_end_offset`. This is data that persists across restarts even though the node gets a new NodeId. The inventory is used during sealed segment repair — when the node receives a `CatchUpRequest`, it checks the inventory and advertises what it already has, skipping redundant network transfer.
 
+**CRC verification:** Before advertising `local_end_offset` for any segment, the node verifies data integrity by CRC-checking the local segment file. Corrupt local data is discarded — the node falls back to a full copy from a healthy replica rather than advertising a stale `local_end_offset`.
+
 ### Phase 2: Metadata Discovery (requires network)
 
 6. **Query metadata for current segment assignments.** The recovering node (with its new NodeId) queries the vnode leaders to learn its current segment assignments. During downtime, segments this node was in may have been sealed and replaced (seal-on-failure removes the crashed node from the new `replica_set`).
+
+### Phase 2.5: Orphaned Data Cleanup
+
+After metadata discovery, the node compares its local segment inventory against its current segment assignments. Any local segment data not in an active or sealed `replica_set` that includes this node is **orphaned** — the node was replaced while down, or the segment was deleted. Orphaned data is eligible for background GC (file-level `unlink`). Not urgent — orphaned files waste disk but don't affect correctness.
 
 ### Phase 3: Sealed Segment Repair (async, coordinator-driven)
 
@@ -38,7 +44,7 @@ After WAL replay, the node scans its data directory and builds a **local segment
 - Local recovery (Phase 1) is parallelizable per shard group (each group's segments are independent)
 - Local recovery requires no network — purely disk I/O
 - Sparse index is treated as a cache — rebuilt from segment files, not authoritative
-- `DataActor` startup runs local recovery (Phase 1) before accepting produce/consume commands
+- Node data plane startup runs local recovery (Phase 1) before spawning any SegmentActors or accepting produce/consume commands
 - No active segment catch-up exists — seal-on-failure replaces crashed nodes, it does not wait for them
 - Sealed segment repair is coordinator-driven and async — does not block the recovering node from accepting new work
 - Local segment inventory enables data reuse across NodeId changes — reduces repair bandwidth proportionally to locally-available data
