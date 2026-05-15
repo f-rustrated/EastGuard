@@ -196,7 +196,7 @@ The WAL is a sequence of fixed-size log files, not a single ever-growing file. T
 
 **LSN (Log Sequence Number):** Each WAL record carries an explicit node-local LSN — a monotonically increasing `u64` assigned by DataPlane during WAL write. LSN is carried by each `SegmentRecordBatch` in the cache, enabling the checkpoint worker to report last-checkpointed LSN back to DataPlaneActor without recomputing from file positions.
 
-**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum of `segment_checkpoint_lsns` across all active segments. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`.
+**Deletion:** A sealed WAL file is eligible for deletion once ALL records in it have been checkpointed — flushed to their respective segment files and fsynced. Deletion gated by a **checkpoint LSN watermark**: each `WalFileEntry` covers a contiguous LSN range (`min_lsn` to `max_lsn`). The checkpoint worker reports LSN via `CheckpointComplete` to DataPlaneActor; the global checkpoint watermark is the minimum `checkpoint_lsn` across all active `SegmentTracker`s. A WAL file is unlinked when the global checkpoint watermark exceeds its `max_lsn`.
 
 **Checkpoint LSN relationships:**
 
@@ -204,10 +204,10 @@ The WAL is a sequence of fixed-size log files, not a single ever-growing file. T
 checkpointed_lsn (per-segment)                    — reported by checkpoint worker in CheckpointComplete
         │                                            "I flushed batches up to this WAL LSN for this segment"
         ▼
-segment_checkpoint_lsns (DataPlane)                — HashMap<SegmentKey, u64>, accumulates latest
+segments[key].checkpoint_lsn (DataPlane)           — SegmentTracker field, accumulates latest
         │                                            checkpointed_lsn from each segment
         ▼
-global_checkpoint_watermark                        — min(segment_checkpoint_lsns.values())
+global_checkpoint_watermark                        — min(segments.values().map(|t| t.checkpoint_lsn))
         │                                            "all segments have been checkpointed up to here"
         ▼
 WAL deletion: unlink files where max_lsn ≤ watermark
@@ -285,13 +285,17 @@ Follows the sync-first pattern (see `build-actor` skill): pure sync state machin
 WAL does blocking file I/O (write, fsync, rotate, unlink) — injected via `WalStorage` trait so `DataPlane` can be tested with a mock WAL that records calls without touching disk. Same pattern as `Raft` + `RaftStorage` (see `src/clusters/raft/storage.rs`).
 
 ```rust
+struct SegmentTracker {
+    cache: Arc<SegmentCache>,
+    size_bytes: u64,        // accumulated data bytes, triggers RollSegment at ~1GB
+    checkpoint_lsn: u64,    // last-checkpointed WAL LSN
+}
+
 // State machine — pure sync, no channels. I/O only through injected WalStorage.
 struct DataPlane<W: WalStorage> {
     wal: W,
-    segment_caches: HashMap<SegmentKey, Arc<SegmentCache>>,
+    segments: HashMap<SegmentKey, SegmentTracker>,
     accumulation_buffers: HashMap<SegmentKey, Vec<Record>>,
-    segment_sizes: HashMap<SegmentKey, u64>,            // accumulated data bytes per segment, triggers RollSegment at ~1GB
-    segment_checkpoint_lsns: HashMap<SegmentKey, u64>,  // last-checkpointed WAL LSN per segment
     pending_events: Vec<DataPlaneEvent>,
 }
 
@@ -337,11 +341,11 @@ enum DataPlaneCommand {
 
 Built from WAL replay + segment directory scan at startup (D5).
 
-**Cache lifecycle:**
+**Segment tracker lifecycle:**
 - Created on `SegmentAssignment` from coordinator via `data_port` (D3). Produce targeting an unknown segment is rejected — producer retries after routing refresh
 - Stays in HashMap even when idle (lightweight — just ring buffer + atomics, no thread/task)
-- Removed on segment seal: final checkpoint via checkpoint worker, then entry dropped
-- No spawn/stop lifecycle — `SegmentCache` is a data structure, not an actor
+- Removed on segment seal: final checkpoint via checkpoint worker, then `SegmentTracker` entry dropped
+- No spawn/stop lifecycle — `SegmentTracker` and its `SegmentCache` are data structures, not actors
 
 **Backpressure:** Natural. If WAL fsync is slow, the dedicated thread stalls, the inbound `crossbeam` channel fills, producers block on `send()`. No async flow control needed.
 
@@ -403,7 +407,7 @@ submit CheckpointJob {
                                        ▼
                                    send DataPlaneCommand::
 mailbox.recv() ◄─────────────────    CheckpointComplete {
-  segment_checkpoint_lsns[key] = lsn     segment_key,
+  segments[key].checkpoint_lsn = lsn      segment_key,
   watermark = min(all lsns)              checkpointed_lsn
   unlink WAL files ≤ watermark         }
 ```
@@ -418,7 +422,7 @@ Segment files are derived from WAL — they exist for cold read performance, not
 
 **Three checkpoint triggers** — checkpoint happens when there's a reason, not on a clock:
 
-1. **Segment size approaching limit.** `DataPlane` tracks `segment_sizes: HashMap<SegmentKey, u64>` — accumulated data bytes per segment, incremented as records are accumulated. When approaching 1GB, submits a checkpoint job — one large, efficient bulk write. After checkpoint, the segment rolls (`RollSegment`).
+1. **Segment size approaching limit.** `DataPlane` tracks `segments[key].size_bytes` — accumulated data bytes per segment, incremented as records are accumulated. When approaching 1GB, submits a checkpoint job — one large, efficient bulk write. After checkpoint, the segment rolls (`RollSegment`).
 2. **Node cache budget pressure.** When total cache memory approaches the node-level budget, DataPlaneActor force-checkpoints the segments with the most uncheckpointed batches to free cache slots.
 3. **WAL retention pressure.** When total WAL size exceeds a threshold (e.g., 2GB), DataPlaneActor checkpoints the segments keeping the oldest WAL files alive. Bounds crash recovery time and WAL disk usage.
 
@@ -514,7 +518,7 @@ In D1 (no replication, `commit_offset == tail`), this subsection does not apply 
 
 8. **Segment file I/O uses buffered I/O + `POSIX_FADV_DONTNEED`.** Both checkpoint writes and cold reads use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages from OS page cache.
 
-9. **One SegmentCache per segment per node.** `segment_caches` enforces at most one cache per `(shard_group_id, range_id, segment_id)` key.
+9. **One SegmentTracker per segment per node.** `segments` enforces at most one tracker (and its cache) per `(shard_group_id, range_id, segment_id)` key.
 
 10. **Segment file ≤ 1GB.** DataPlaneActor signals `RollSegment` when approaching the limit. Enforced at the write path — never retroactively truncated.
 
