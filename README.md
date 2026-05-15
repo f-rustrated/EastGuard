@@ -229,4 +229,4 @@ cargo run --bin server -- \
 
 ## Join the Community
 
-[Discord](https://discord.gg/GMdFfeXu)
+[Discord](https://discord.gg/qJzSX6A6)
