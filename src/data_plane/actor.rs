@@ -22,7 +22,7 @@ impl DataPlaneActor {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
         thread::Builder::new()
-            .name("data-plane".into())
+            .name("data-plane-worker".into())
             .spawn(move || {
                 let wal = match WalWriter::new(data_dir.clone()) {
                     Ok(w) => w,
