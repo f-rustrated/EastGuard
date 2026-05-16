@@ -25,9 +25,11 @@ where
             TimerCommand::SetSchedule { seq, timer } => {
                 self.timers.insert(seq, timer);
             }
-
             TimerCommand::CancelSchedule { seq } => {
                 self.timers.remove(&seq);
+            }
+            TimerCommand::ResetPeriodic => {
+                self.protocol_elapsed = 0;
             }
         }
     }
