@@ -17,6 +17,7 @@ use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 
 const CLUSTER_PORT: u16 = 19000;
 const RESULT_PORT: u16 = 39000;
@@ -104,7 +105,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     address_map,
                     leader_events_tx,
                 ));
-                tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx));
+                tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx, TICK_PERIOD_100_MS));
                 {
                     let node_id = node_id.clone();
                     let raft_tx = raft_tx.clone();

@@ -9,7 +9,7 @@ use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::swim::Swim;
 use crate::clusters::swims::{Topology, TopologyConfig};
 use crate::clusters::{NodeAddress, NodeId};
-use crate::schedulers::ticker::TICK_PERIOD_MS;
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug, Clone)]
@@ -179,8 +179,8 @@ impl Environment {
             .filter_map(|s| s.parse().ok())
             .map(|addr| JoinAttempt {
                 seed_addr: addr,
-                ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_MS) as u32,
-                backoff_ticks: (self.join_interval_ms / TICK_PERIOD_MS) as u32,
+                ticks_for_wait: (self.join_initial_delay_ms / TICK_PERIOD_100_MS) as u32,
+                backoff_ticks: (self.join_interval_ms / TICK_PERIOD_100_MS) as u32,
                 multiplier: self.join_multiplier,
                 max_attempts: self.join_max_attempts,
                 remaining_attempts: self.join_max_attempts,

@@ -14,7 +14,7 @@ use crate::clusters::swims::{
 
 use crate::schedulers::actor::run_scheduling_actor;
 
-use crate::schedulers::ticker::PROBE_INTERVAL_TICKS;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::{sync::mpsc, time};
@@ -144,7 +144,11 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     let (raft_tx, _raft_rx) = tokio::sync::mpsc::channel(64);
 
-    tokio::spawn(run_scheduling_actor(tx_in.clone(), ticker_rx));
+    tokio::spawn(run_scheduling_actor(
+        tx_in.clone(),
+        ticker_rx,
+        TICK_PERIOD_100_MS,
+    ));
     tokio::spawn(SwimActor::run(
         rx_in,
         swim,
@@ -332,7 +336,10 @@ async fn test_gossip_propagation() {
 fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     SwimNode {
         node_id: name.into(),
-        addr: NodeAddress { cluster_addr: addr, client_addr: addr },
+        addr: NodeAddress {
+            cluster_addr: addr,
+            client_addr: addr,
+        },
         state: SwimNodeState::Alive,
         incarnation: 1,
     }
@@ -369,24 +376,40 @@ async fn test_indirect_ping_trigger() {
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-    harness.tx_in.send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
-        src: peer_1,
-        packet: SwimPacket::Ping(SwimHeader {
-            seq: 1, source_node_id: "node-peer-1".into(), source_incarnation: 1,
-            gossip: vec![make_peer("node-peer-1", peer_1), make_peer("node-peer-2", peer_2)],
-            shard_leaders: vec![],
-        }),
-    })).await.unwrap();
+    harness
+        .tx_in
+        .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
+            src: peer_1,
+            packet: SwimPacket::Ping(SwimHeader {
+                seq: 1,
+                source_node_id: "node-peer-1".into(),
+                source_incarnation: 1,
+                gossip: vec![
+                    make_peer("node-peer-1", peer_1),
+                    make_peer("node-peer-2", peer_2),
+                ],
+                shard_leaders: vec![],
+            }),
+        }))
+        .await
+        .unwrap();
     let _ack = rx_out.recv().await.unwrap();
 
     let target_addr = wait_for_ping(&harness, &mut rx_out).await;
     force_ticks(&harness.ticker_tx, DIRECT_ACK_TIMEOUT_TICKS as usize).await;
 
     let indirect_ping = time::timeout(Duration::from_millis(100), rx_out.recv())
-        .await.expect("Should send indirect ping").unwrap();
+        .await
+        .expect("Should send indirect ping")
+        .unwrap();
     match indirect_ping.packet() {
-        SwimPacket::PingReq { target: req_target, .. } => {
-            assert_eq!(*req_target, target_addr, "PingReq should target the failed node");
+        SwimPacket::PingReq {
+            target: req_target, ..
+        } => {
+            assert_eq!(
+                *req_target, target_addr,
+                "PingReq should target the failed node"
+            );
         }
         _ => panic!("Expected PingReq, got {:?}", indirect_ping.packet()),
     }
