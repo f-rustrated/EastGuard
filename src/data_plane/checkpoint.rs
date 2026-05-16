@@ -15,7 +15,7 @@ pub struct CheckpointWorker;
 
 impl CheckpointWorker {
     pub(crate) fn spawn(
-        sparse_index: Box<dyn SparseIndex>,
+        sparse_index: Arc<dyn SparseIndex>,
         mailbox: Receiver<CheckpointJob>,
         data_plane_tx: Sender<DataPlaneCommand>,
     ) {
