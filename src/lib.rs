@@ -4,6 +4,8 @@ mod config;
 mod connections;
 
 mod clusters;
+#[allow(dead_code)]
+mod data_plane;
 
 mod net;
 pub(crate) mod schedulers;
