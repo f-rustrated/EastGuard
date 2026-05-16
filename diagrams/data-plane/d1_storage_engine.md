@@ -60,7 +60,7 @@ enum RecordType {
     BatchEnd,
 }
 
-struct RoutingHeader {
+struct DataRoutingHeader {
     shard_group_id: ShardGroupId,
     range_id: RangeId,
     segment_id: SegmentId,
