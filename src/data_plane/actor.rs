@@ -4,10 +4,12 @@ use std::thread;
 use crossbeam_channel::Sender;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::data_plane::messages::command::DataPlaneCommand;
+use crate::data_plane::messages::event::DataPlaneEvent;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use super::checkpoint::CheckpointJob;
-use super::state::{DataPlane, DataPlaneCommand, DataPlaneEvent};
+use super::state::DataPlane;
 use super::timer::DataPlaneTimer;
 use super::wal::WalWriter;
 
@@ -53,14 +55,16 @@ impl DataPlaneActor {
         scheduler_tx: &tokio_mpsc::Sender<TickerCommand<DataPlaneTimer>>,
     ) {
         for event in state.take_events() {
+            use DataPlaneEvent::*;
+
             match event {
-                DataPlaneEvent::SubmitCheckpoint(job) => {
+                SubmitCheckpoint(job) => {
                     let _ = checkpoint_tx.send(job);
                 }
-                DataPlaneEvent::ProduceAck { reply, result } => {
+                ProduceAck { reply, result } => {
                     let _ = reply.send(result);
                 }
-                DataPlaneEvent::Timer(cmd) => {
+                Timer(cmd) => {
                     let _ = scheduler_tx.blocking_send(cmd.into());
                 }
             }

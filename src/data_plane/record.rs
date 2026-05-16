@@ -36,7 +36,7 @@ pub struct DataRoutingHeader {
     shard_group_id: ShardGroupId,
     range_id: RangeId,
     segment_id: SegmentId,
-    logical_offset: u64,
+    pub(crate) logical_offset: u64,
 }
 
 impl DataRoutingHeader {
@@ -168,6 +168,28 @@ pub struct SegmentRecordBatch {
     pub start_offset: u64,
     pub end_offset: u64,
     pub lsn: u64,
+}
+
+pub(crate) struct BufferedRecord {
+    pub(crate) user_data: Bytes,
+    header: DataRoutingHeader,
+}
+
+impl BufferedRecord {
+    pub(crate) fn new(payload: Bytes, segment_key: SegmentKey, offset: u64) -> Self {
+        Self {
+            user_data: payload,
+            header: DataRoutingHeader::new(segment_key, offset),
+        }
+    }
+
+    pub(crate) fn logical_offset(&self) -> u64 {
+        self.header.logical_offset
+    }
+
+    pub(crate) fn build_wal_payload(&self) -> Bytes {
+        self.header.build_wal_payload(&self.user_data)
+    }
 }
 
 #[cfg(test)]

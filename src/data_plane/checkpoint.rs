@@ -7,10 +7,9 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 
 use super::cache::SegmentCache;
+use super::messages::*;
 use super::record::{Record, SegmentKey};
 use super::sparse_index::{SparseEntry, SparseIndex};
-use super::state::{CheckpointComplete, DataPlaneCommand};
-
 pub struct CheckpointWorker;
 
 impl CheckpointWorker {
