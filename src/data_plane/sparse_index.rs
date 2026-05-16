@@ -1,13 +1,39 @@
 use std::io;
 
+use crate::data_plane::record::SegmentKey;
+
+pub struct SparseEntry {
+    key: Vec<u8>,
+    byte_position: [u8; 8],
+}
+impl SparseEntry {
+    pub(crate) fn new(
+        segment_key: SegmentKey,
+        logical_offset: u64,
+        byte_position: [u8; 8],
+    ) -> Self {
+        let (shard_group_id, range_id, segment_id) = segment_key;
+        let mut key = Vec::with_capacity(32);
+        key.extend_from_slice(&shard_group_id.0.to_be_bytes());
+        key.extend_from_slice(&range_id.0.to_be_bytes());
+        key.extend_from_slice(&segment_id.0.to_be_bytes());
+        key.extend_from_slice(&logical_offset.to_be_bytes());
+        Self { key, byte_position }
+    }
+}
+
 pub trait SparseIndex: Send + Sync + 'static {
-    fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()>;
+    fn put_batch(&self, entries: Vec<SparseEntry>) -> io::Result<()>;
     fn seek_for_prev(&self, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)>;
 }
 
 impl SparseIndex for rocksdb::DB {
-    fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        rocksdb::DB::put(self, key, value).map_err(io::Error::other)
+    fn put_batch(&self, entries: Vec<SparseEntry>) -> io::Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        for entry in &entries {
+            batch.put(&entry.key, entry.byte_position);
+        }
+        self.write(batch).map_err(io::Error::other)
     }
 
     fn seek_for_prev(&self, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -38,11 +64,11 @@ impl MockSparseIndex {
 
 #[cfg(test)]
 impl SparseIndex for MockSparseIndex {
-    fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(key.to_vec(), value.to_vec());
+    fn put_batch(&self, entries: Vec<SparseEntry>) -> io::Result<()> {
+        let mut map = self.entries.lock().unwrap();
+        for entry in entries {
+            map.insert(entry.key, entry.byte_position.to_vec());
+        }
         Ok(())
     }
 
