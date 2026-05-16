@@ -46,6 +46,7 @@ impl DataPlaneActor {
         tx
     }
 
+    // Doesn't have 'async' color but communication is real
     fn drain_events(
         state: &mut DataPlane<WalWriter>,
         checkpoint_tx: &Sender<CheckpointJob>,
