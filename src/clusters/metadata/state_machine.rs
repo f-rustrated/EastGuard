@@ -1,6 +1,8 @@
 use super::command::*;
 use super::types::*;
 use crate::clusters::metadata::{RangeId, TopicId, error::MetadataError};
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 
 use MetadataError::*;
 use std::collections::HashMap;
@@ -157,41 +159,6 @@ impl MetadataStateMachine {
 
         Ok(())
     }
-
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        self.assert_name_index_sync();
-        self.assert_topic_id_monotonicity();
-        for topic in self.topics.values() {
-            topic.assert_invariants();
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_name_index_sync(&self) {
-        assert_eq!(
-            self.topic_name_index.len(),
-            self.topics
-                .values()
-                .filter(|t| t.state != TopicState::Deleted)
-                .count(),
-            "topic_name_index out of sync with non-deleted topics"
-        );
-        for (name, id) in &self.topic_name_index {
-            let topic = self
-                .topics
-                .get(id)
-                .expect("name index points to missing topic");
-            assert_eq!(&topic.name, name);
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_topic_id_monotonicity(&self) {
-        for id in self.topics.keys() {
-            assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -199,14 +166,43 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use crate::clusters::{
-        NodeId,
-        metadata::{
-            SegmentId,
-            strategy::{PartitionStrategy, StoragePolicy},
+    use crate::{
+        clusters::{
+            NodeId,
+            metadata::{
+                SegmentId,
+                strategy::{PartitionStrategy, StoragePolicy},
+            },
         },
+        test_traits::TAssertInvariant,
     };
 
+    impl TAssertInvariant for MetadataStateMachine {
+        fn assert_invariants(&self) {
+            assert_eq!(
+                self.topic_name_index.len(),
+                self.topics
+                    .values()
+                    .filter(|t| t.state != TopicState::Deleted)
+                    .count(),
+                "topic_name_index out of sync with non-deleted topics"
+            );
+            for (name, id) in &self.topic_name_index {
+                let topic = self
+                    .topics
+                    .get(id)
+                    .expect("name index points to missing topic");
+                assert_eq!(&topic.name, name);
+            }
+
+            for id in self.topics.keys() {
+                assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
+            }
+            for topic in self.topics.values() {
+                topic.assert_invariants();
+            }
+        }
+    }
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
             retention_ms: 3_600_000,

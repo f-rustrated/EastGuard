@@ -5,6 +5,8 @@ use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::net::SocketAddr;
@@ -732,65 +734,69 @@ impl Swim {
             (group, leader)
         })
     }
-
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        assert!(
-            !self.live_node_tracker.contains(&self.node_id),
-            "self ({}) found in live_node_tracker",
-            self.node_id
-        );
-        self.assert_tracker_only_alive();
-        self.assert_suspected_seqs_consistent();
-    }
-
-    #[cfg(test)]
-    fn assert_tracker_only_alive(&self) {
-        for node_id in self.live_node_tracker.iter() {
-            let member = self
-                .members
-                .get(node_id)
-                .expect("live_node_tracker contains unknown node");
-            assert_eq!(
-                member.state,
-                SwimNodeState::Alive,
-                "live_node_tracker contains non-Alive node {:?} (state={:?})",
-                node_id,
-                member.state
-            );
-        }
-        for (node_id, member) in &self.members {
-            if member.state != SwimNodeState::Alive {
-                assert!(
-                    !self.live_node_tracker.contains(node_id),
-                    "Dead/Suspect node {:?} found in live_node_tracker",
-                    node_id
-                );
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_suspected_seqs_consistent(&self) {
-        for node_id in self.last_suspected_seqs.keys() {
-            if let Some(member) = self.members.get(node_id) {
-                assert_eq!(
-                    member.state,
-                    SwimNodeState::Suspect,
-                    "last_suspected_seqs contains non-Suspect node {:?} (state={:?})",
-                    node_id,
-                    member.state
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::swims::common::{TestHarness, make_protocol};
+    use crate::{
+        clusters::swims::common::{TestHarness, make_protocol},
+        test_traits::TAssertInvariant,
+    };
     use std::net::SocketAddr;
+
+    impl TAssertInvariant for Swim {
+        fn assert_invariants(&self) {
+            assert!(
+                !self.live_node_tracker.contains(&self.node_id),
+                "self ({}) found in live_node_tracker",
+                self.node_id
+            );
+            self.assert_tracker_only_alive();
+            self.assert_suspected_seqs_consistent();
+        }
+    }
+
+    impl Swim {
+        fn assert_tracker_only_alive(&self) {
+            for node_id in self.live_node_tracker.iter() {
+                let member = self
+                    .members
+                    .get(node_id)
+                    .expect("live_node_tracker contains unknown node");
+                assert_eq!(
+                    member.state,
+                    SwimNodeState::Alive,
+                    "live_node_tracker contains non-Alive node {:?} (state={:?})",
+                    node_id,
+                    member.state
+                );
+            }
+            for (node_id, member) in &self.members {
+                if member.state != SwimNodeState::Alive {
+                    assert!(
+                        !self.live_node_tracker.contains(node_id),
+                        "Dead/Suspect node {:?} found in live_node_tracker",
+                        node_id
+                    );
+                }
+            }
+        }
+
+        fn assert_suspected_seqs_consistent(&self) {
+            for node_id in self.last_suspected_seqs.keys() {
+                if let Some(member) = self.members.get(node_id) {
+                    assert_eq!(
+                        member.state,
+                        SwimNodeState::Suspect,
+                        "last_suspected_seqs contains non-Suspect node {:?} (state={:?})",
+                        node_id,
+                        member.state
+                    );
+                }
+            }
+        }
+    }
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping(SwimHeader {
@@ -1237,7 +1243,8 @@ mod tests {
             assert_eq!(out.len(), 1);
             assert!(
                 out.iter()
-                    .any(|pkt| pkt.target == c_addr && matches!(pkt.packet(), SwimPacket::Ping { .. }))
+                    .any(|pkt| pkt.target == c_addr
+                        && matches!(pkt.packet(), SwimPacket::Ping { .. }))
             );
 
             // handle_incarnation_check ran: sender node-b should be in members

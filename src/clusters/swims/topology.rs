@@ -5,6 +5,8 @@ use std::io::Cursor;
 
 use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::clusters::{NodeAddress, NodeId, SwimNodeState};
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
 /// virtual node on the consistent hash ring for a given key.
@@ -256,73 +258,6 @@ impl Topology {
     pub fn all_shard_leaders(&self) -> &HashMap<ShardGroupId, ShardLeaderEntry> {
         &self.shard_leaders
     }
-
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        self.assert_reverse_index_consistent();
-        self.assert_groups_consistent();
-        self.assert_vnode_counts();
-    }
-
-    #[cfg(test)]
-    fn assert_reverse_index_consistent(&self) {
-        for (node_id, group_ids) in &self.node_group_ids {
-            for gid in group_ids {
-                let group = self
-                    .groups
-                    .get(gid)
-                    .expect("node_group_ids references missing group");
-                assert!(
-                    group.members.contains(node_id),
-                    "node {:?} in reverse index for group {:?} but not in group members",
-                    node_id,
-                    gid
-                );
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_groups_consistent(&self) {
-        use std::collections::HashSet;
-        for (gid, group) in &self.groups {
-            for member in &group.members {
-                let ids = self
-                    .node_group_ids
-                    .get(member)
-                    .expect("group member missing from node_group_ids");
-                assert!(
-                    ids.contains(gid),
-                    "group {:?} member {:?} missing group in reverse index",
-                    gid,
-                    member
-                );
-            }
-            let unique: HashSet<&NodeId> = group.members.iter().collect();
-            assert_eq!(
-                unique.len(),
-                group.members.len(),
-                "group {:?} has duplicate members",
-                gid
-            );
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_vnode_counts(&self) {
-        for node_id in self.node_group_ids.keys() {
-            let count = self
-                .vnodes
-                .iter()
-                .filter(|t| t.pnode_id == *node_id)
-                .count();
-            assert_eq!(
-                count, self.config.vnodes_per_pnode as usize,
-                "node {:?} has {count} vnodes, expected {}",
-                node_id, self.config.vnodes_per_pnode
-            );
-        }
-    }
 }
 
 fn generate_vnode_token(node_id: &NodeId, replica_index: u64) -> VirtualNodeToken {
@@ -347,8 +282,77 @@ fn hash_stable(key: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_traits::TAssertInvariant;
+
     use super::*;
     use std::net::SocketAddr;
+
+    impl TAssertInvariant for Topology {
+        #[cfg(test)]
+        fn assert_invariants(&self) {
+            self.assert_reverse_index_consistent();
+            self.assert_groups_consistent();
+            self.assert_vnode_counts();
+        }
+    }
+    impl Topology {
+        fn assert_reverse_index_consistent(&self) {
+            for (node_id, group_ids) in &self.node_group_ids {
+                for gid in group_ids {
+                    let group = self
+                        .groups
+                        .get(gid)
+                        .expect("node_group_ids references missing group");
+                    assert!(
+                        group.members.contains(node_id),
+                        "node {:?} in reverse index for group {:?} but not in group members",
+                        node_id,
+                        gid
+                    );
+                }
+            }
+        }
+
+        fn assert_groups_consistent(&self) {
+            use std::collections::HashSet;
+            for (gid, group) in &self.groups {
+                for member in &group.members {
+                    let ids = self
+                        .node_group_ids
+                        .get(member)
+                        .expect("group member missing from node_group_ids");
+                    assert!(
+                        ids.contains(gid),
+                        "group {:?} member {:?} missing group in reverse index",
+                        gid,
+                        member
+                    );
+                }
+                let unique: HashSet<&NodeId> = group.members.iter().collect();
+                assert_eq!(
+                    unique.len(),
+                    group.members.len(),
+                    "group {:?} has duplicate members",
+                    gid
+                );
+            }
+        }
+
+        fn assert_vnode_counts(&self) {
+            for node_id in self.node_group_ids.keys() {
+                let count = self
+                    .vnodes
+                    .iter()
+                    .filter(|t| t.pnode_id == *node_id)
+                    .count();
+                assert_eq!(
+                    count, self.config.vnodes_per_pnode as usize,
+                    "node {:?} has {count} vnodes, expected {}",
+                    node_id, self.config.vnodes_per_pnode
+                );
+            }
+        }
+    }
 
     fn topology_from(nodes: &[&str], config: TopologyConfig) -> Topology {
         let ids = nodes.iter().map(|id| NodeId::new(*id));

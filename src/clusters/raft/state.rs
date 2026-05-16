@@ -9,6 +9,8 @@ use crate::clusters::raft::messages::*;
 use crate::clusters::raft::storage::RaftPersistentState;
 use crate::clusters::swims::ShardGroupId;
 use crate::schedulers::ticker_message::TimerCommand;
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -628,50 +630,6 @@ impl Raft {
         self.apply_committed_entries();
     }
 
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        // last_applied_index <= commit_index <= log length
-        assert!(
-            self.last_applied_index <= self.commit_index,
-            "last_applied ({}) > commit_index ({})",
-            self.last_applied_index,
-            self.commit_index,
-        );
-        assert!(
-            self.commit_index <= self.log_last_index(),
-            "commit_index ({}) > log_last_index ({})",
-            self.commit_index,
-            self.log_last_index(),
-        );
-
-        // Log indices are contiguous and 1-based
-        for (i, entry) in self.log.iter().enumerate() {
-            assert_eq!(
-                entry.index,
-                (i + 1) as u64,
-                "log entry at position {i} has non-contiguous index {}",
-                entry.index,
-            );
-        }
-
-        // Leader must have peer_states for all peers
-        if self.role == Role::Leader {
-            for peer in &self.peers {
-                assert!(
-                    self.peer_states.contains_key(peer),
-                    "leader missing peer_state for {:?}",
-                    peer,
-                );
-            }
-        }
-
-        // Self is never in peers
-        assert!(
-            !self.peers.contains(&self.node_id),
-            "self found in peers set",
-        );
-    }
-
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -711,7 +669,8 @@ impl Raft {
         }
         if self.role == Role::Leader {
             for pending_cmd in self.state_machine.take_pending_proposals() {
-                self.pending_proposals.push(RaftCommand::Metadata(pending_cmd));
+                self.pending_proposals
+                    .push(RaftCommand::Metadata(pending_cmd));
             }
         }
     }
@@ -859,6 +818,51 @@ mod tests {
     }
 
     const TEST_SHARD: ShardGroupId = ShardGroupId(0);
+
+    impl TAssertInvariant for Raft {
+        fn assert_invariants(&self) {
+            // last_applied_index <= commit_index <= log length
+            assert!(
+                self.last_applied_index <= self.commit_index,
+                "last_applied ({}) > commit_index ({})",
+                self.last_applied_index,
+                self.commit_index,
+            );
+            assert!(
+                self.commit_index <= self.log_last_index(),
+                "commit_index ({}) > log_last_index ({})",
+                self.commit_index,
+                self.log_last_index(),
+            );
+
+            // Log indices are contiguous and 1-based
+            for (i, entry) in self.log.iter().enumerate() {
+                assert_eq!(
+                    entry.index,
+                    (i + 1) as u64,
+                    "log entry at position {i} has non-contiguous index {}",
+                    entry.index,
+                );
+            }
+
+            // Leader must have peer_states for all peers
+            if self.role == Role::Leader {
+                for peer in &self.peers {
+                    assert!(
+                        self.peer_states.contains_key(peer),
+                        "leader missing peer_state for {:?}",
+                        peer,
+                    );
+                }
+            }
+
+            // Self is never in peers
+            assert!(
+                !self.peers.contains(&self.node_id),
+                "self found in peers set",
+            );
+        }
+    }
 
     fn packets(raft: &mut Raft) -> Vec<OutboundRaftPacket> {
         raft.take_events()
@@ -1899,6 +1903,7 @@ mod tests {
 
     use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
     use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+    use crate::test_traits::TAssertInvariant;
 
     fn test_create_topic_cmd(name: &str) -> RaftCommand {
         RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {

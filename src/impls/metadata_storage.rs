@@ -7,6 +7,8 @@ use crate::clusters::{
     },
     swims::ShardGroupId,
 };
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 
 /// Key encoder for per-group entries in the default column family.
 /// Layout: `[group_id: u8×8][type_tag: u8]` for fixed-size keys (HardState, AppliedIndex, …)
@@ -210,60 +212,64 @@ impl RaftStorage for MetadataStorage {
         #[cfg(test)]
         self.assert_invariants();
     }
-
-    #[cfg(test)]
-    fn assert_invariants(&self) {
-        let mut prev_key: Option<Vec<u8>> = None;
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item.expect("corrupt RocksDB iterator");
-            let key = key.to_vec();
-
-            // Keys must be in strictly ascending order (RocksDB guarantee,
-            // but validates our encoding doesn't produce duplicates)
-            if let Some(ref prev) = prev_key {
-                assert!(
-                    key > *prev,
-                    "keys not in ascending order: {:?} >= {:?}",
-                    key,
-                    prev,
-                );
-            }
-
-            // Every key must be at least 9 bytes (8-byte group_id + 1-byte type tag)
-            assert!(
-                key.len() >= 9,
-                "key too short ({} bytes): {:?}",
-                key.len(),
-                key,
-            );
-
-            let type_tag = key[8];
-            assert!(
-                (0x01..=0x06).contains(&type_tag),
-                "unknown type tag 0x{:02x} in key {:?}",
-                type_tag,
-                key,
-            );
-
-            // LogEntry keys must be exactly 17 bytes (8 group + 1 tag + 8 index)
-            if type_tag == 0x01 {
-                assert_eq!(
-                    key.len(),
-                    17,
-                    "LogEntry key must be 17 bytes, got {}",
-                    key.len(),
-                );
-            }
-
-            prev_key = Some(key);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::test_traits::TAssertInvariant;
+
     use super::*;
+
+    impl TAssertInvariant for MetadataStorage {
+        #[cfg(test)]
+        fn assert_invariants(&self) {
+            let mut prev_key: Option<Vec<u8>> = None;
+            let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+            for item in iter {
+                let (key, _) = item.expect("corrupt RocksDB iterator");
+                let key = key.to_vec();
+
+                // Keys must be in strictly ascending order (RocksDB guarantee,
+                // but validates our encoding doesn't produce duplicates)
+                if let Some(ref prev) = prev_key {
+                    assert!(
+                        key > *prev,
+                        "keys not in ascending order: {:?} >= {:?}",
+                        key,
+                        prev,
+                    );
+                }
+
+                // Every key must be at least 9 bytes (8-byte group_id + 1-byte type tag)
+                assert!(
+                    key.len() >= 9,
+                    "key too short ({} bytes): {:?}",
+                    key.len(),
+                    key,
+                );
+
+                let type_tag = key[8];
+                assert!(
+                    (0x01..=0x06).contains(&type_tag),
+                    "unknown type tag 0x{:02x} in key {:?}",
+                    type_tag,
+                    key,
+                );
+
+                // LogEntry keys must be exactly 17 bytes (8 group + 1 tag + 8 index)
+                if type_tag == 0x01 {
+                    assert_eq!(
+                        key.len(),
+                        17,
+                        "LogEntry key must be 17 bytes, got {}",
+                        key.len(),
+                    );
+                }
+
+                prev_key = Some(key);
+            }
+        }
+    }
 
     fn temp_db() -> (MetadataStorage, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());

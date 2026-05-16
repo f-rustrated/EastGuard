@@ -11,6 +11,8 @@ use crate::clusters::{
         strategy::{PartitionStrategy, StoragePolicy},
     },
 };
+#[cfg(test)]
+use crate::test_traits::TAssertInvariant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum TopicState {
@@ -360,23 +362,6 @@ impl RangeMeta {
     }
 
     #[cfg(test)]
-    fn assert_invariants(&self) {
-        self.assert_active_segment_state();
-        for sid in self.segments.keys() {
-            assert!(
-                sid.0 < self.next_segment_id,
-                "segment ID >= next_segment_id"
-            );
-        }
-        self.assert_sealed_segments();
-        assert!(
-            self.split_into.is_none() || self.merged_into.is_none(),
-            "range both split and merged"
-        );
-        self.assert_seal_history();
-    }
-
-    #[cfg(test)]
     fn assert_active_segment_state(&self) {
         match self.state {
             RangeState::Active => {
@@ -401,27 +386,6 @@ impl RangeMeta {
                     "sealed/deleting range has active_segment"
                 );
             }
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_sealed_segments(&self) {
-        for seg in self.segments.values() {
-            if seg.state == SegmentState::Sealed {
-                assert!(
-                    seg.end_offset.is_some(),
-                    "sealed segment missing end_offset"
-                );
-                assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_seal_history(&self) {
-        let ts = &self.seal_history.seal_timestamps;
-        for i in 1..ts.len() {
-            assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
         }
     }
 }
@@ -576,66 +540,6 @@ impl TopicMeta {
             range.delete();
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn assert_invariants(&self) {
-        for rid in self.ranges.keys() {
-            assert!(rid.0 < self.next_range_id, "range ID >= next_range_id");
-        }
-        if self.state == TopicState::Active {
-            self.assert_keyspace_coverage();
-        }
-        for range in self.ranges.values() {
-            range.assert_invariants();
-            self.assert_split_children_cooldown(range);
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_keyspace_coverage(&self) {
-        if self.active_ranges.is_empty() {
-            return;
-        }
-        let ranges: Vec<&RangeMeta> = self
-            .active_ranges
-            .iter()
-            .map(|id| &self.ranges[id])
-            .collect();
-        assert_eq!(
-            ranges[0].keyspace_start, KEYSPACE_MIN,
-            "first range must start at MIN"
-        );
-        assert_eq!(
-            ranges.last().unwrap().keyspace_end,
-            KEYSPACE_MAX,
-            "last range must end at MAX"
-        );
-        for w in ranges.windows(2) {
-            assert_eq!(
-                w[0].keyspace_end, w[1].keyspace_start,
-                "keyspace gap between active ranges"
-            );
-        }
-    }
-
-    #[cfg(test)]
-    fn assert_split_children_cooldown(&self, range: &RangeMeta) {
-        let Some([left, right]) = range.split_into else {
-            return;
-        };
-        if let Some(left_range) = self.ranges.get(&left) {
-            assert!(
-                left_range.seal_history.created_by_split_at.is_some(),
-                "split child missing created_by_split_at"
-            );
-        }
-        if let Some(right_range) = self.ranges.get(&right) {
-            assert!(
-                right_range.seal_history.created_by_split_at.is_some(),
-                "split child missing created_by_split_at"
-            );
-        }
-    }
 }
 
 // --- Keyspace Constants ---
@@ -682,5 +586,109 @@ impl RangeSealHistory {
     pub fn recent_seal_count(&self, now: u64) -> usize {
         let cutoff = now.saturating_sub(MEASUREMENT_WINDOW_MS);
         self.seal_timestamps.iter().filter(|&&t| t > cutoff).count()
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    impl TAssertInvariant for TopicMeta {
+        #[cfg(test)]
+        fn assert_invariants(&self) {
+            for rid in self.ranges.keys() {
+                assert!(rid.0 < self.next_range_id, "range ID >= next_range_id");
+            }
+            if self.state == TopicState::Active {
+                self.assert_keyspace_coverage();
+            }
+            for range in self.ranges.values() {
+                range.assert_invariants();
+                self.assert_split_children_cooldown(range);
+            }
+        }
+    }
+
+    impl TopicMeta {
+        fn assert_split_children_cooldown(&self, range: &RangeMeta) {
+            let Some([left, right]) = range.split_into else {
+                return;
+            };
+            if let Some(left_range) = self.ranges.get(&left) {
+                assert!(
+                    left_range.seal_history.created_by_split_at.is_some(),
+                    "split child missing created_by_split_at"
+                );
+            }
+            if let Some(right_range) = self.ranges.get(&right) {
+                assert!(
+                    right_range.seal_history.created_by_split_at.is_some(),
+                    "split child missing created_by_split_at"
+                );
+            }
+        }
+
+        fn assert_keyspace_coverage(&self) {
+            if self.active_ranges.is_empty() {
+                return;
+            }
+            let ranges: Vec<&RangeMeta> = self
+                .active_ranges
+                .iter()
+                .map(|id| &self.ranges[id])
+                .collect();
+            assert_eq!(
+                ranges[0].keyspace_start, KEYSPACE_MIN,
+                "first range must start at MIN"
+            );
+            assert_eq!(
+                ranges.last().unwrap().keyspace_end,
+                KEYSPACE_MAX,
+                "last range must end at MAX"
+            );
+            for w in ranges.windows(2) {
+                assert_eq!(
+                    w[0].keyspace_end, w[1].keyspace_start,
+                    "keyspace gap between active ranges"
+                );
+            }
+        }
+    }
+    impl TAssertInvariant for RangeMeta {
+        fn assert_invariants(&self) {
+            self.assert_active_segment_state();
+            for sid in self.segments.keys() {
+                assert!(
+                    sid.0 < self.next_segment_id,
+                    "segment ID >= next_segment_id"
+                );
+            }
+            self.assert_sealed_segments();
+            assert!(
+                self.split_into.is_none() || self.merged_into.is_none(),
+                "range both split and merged"
+            );
+            self.assert_seal_history();
+        }
+    }
+
+    impl RangeMeta {
+        fn assert_sealed_segments(&self) {
+            for seg in self.segments.values() {
+                if seg.state == SegmentState::Sealed {
+                    assert!(
+                        seg.end_offset.is_some(),
+                        "sealed segment missing end_offset"
+                    );
+                    assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
+                }
+            }
+        }
+        fn assert_seal_history(&self) {
+            let ts = &self.seal_history.seal_timestamps;
+            for i in 1..ts.len() {
+                assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
+            }
+        }
     }
 }
