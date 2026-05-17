@@ -5,40 +5,8 @@ use turmoil::Builder;
 use crate::StartUp;
 use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::clusters::raft::messages::ProposeError;
-use crate::config::Environment;
-use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
-use crate::connections::request::{
-    ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse,
-};
-use crate::net::TcpStream;
-
-fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
-    Environment {
-        config_dir: std::env::temp_dir()
-            .join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .into_owned(),
-        data_dir: std::env::temp_dir()
-            .join(format!("eastguard-data-{}-{}", idx, uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .into_owned(),
-        meta_dir: std::env::temp_dir()
-            .join(format!("eastguard-meta-{}-{}", idx, uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .into_owned(),
-        node_id_prefix: Some(node_id),
-        client_port,
-        cluster_port,
-        host: "0.0.0.0".into(),
-        advertise_host: None,
-        vnodes_per_node: 256,
-        join_seed_nodes: vec![],
-        join_initial_delay_ms: 1000,
-        join_interval_ms: 1000,
-        join_multiplier: 2,
-        join_max_attempts: 5,
-    }
-}
+use crate::connections::request::{ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse};
+use crate::it::helpers::{default_env, send_propose};
 
 fn test_propose_request(name: &str, forwarded: bool) -> ConnectionRequests {
     ConnectionRequests::Propose(ProposeRequest {
@@ -53,15 +21,6 @@ fn test_propose_request(name: &str, forwarded: bool) -> ConnectionRequests {
         },
         forwarded,
     })
-}
-
-async fn send_propose(host: &str, port: u16, req: ConnectionRequests) -> ProposeResponse {
-    let stream = TcpStream::connect((host, port)).await.unwrap();
-    let (read_half, write_half) = stream.into_split();
-    let mut writer = ClientRawWriter::new(write_half);
-    let mut reader = ClientStreamReader::new(read_half);
-    writer.write(&req).await.unwrap();
-    reader.read_request().await.unwrap()
 }
 
 /// Propose with forwarded=true to a follower should return NotLeader
@@ -100,8 +59,6 @@ fn forwarded_request_not_forwarded_again() -> turmoil::Result {
     }
 
     sim.client("test-client", async {
-        // Wait for cluster convergence: retry until at least one node
-        // accepts a (non-forwarded) proposal, proving SWIM + Raft are up.
         let mut converged = false;
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -125,8 +82,6 @@ fn forwarded_request_not_forwarded_again() -> turmoil::Result {
         }
         assert!(converged, "cluster did not converge within timeout");
 
-        // Send forwarded=true to all nodes — followers should return NotLeader
-        // (not attempt forwarding), leader should succeed normally
         let mut not_leader_count = 0;
         for (host, port) in [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)] {
             let req = test_propose_request("test-topic-fwd", true);
@@ -136,14 +91,12 @@ fn forwarded_request_not_forwarded_again() -> turmoil::Result {
                     not_leader_count += 1;
                 }
                 ProposeResponse::Success => {}
-                other => panic!("Unexpected response from {}: {:?}", host, other),
+                other => panic!("unexpected response from {}: {:?}", host, other),
             }
         }
-        // At least 2 of 3 nodes are followers and should return NotLeader
-        // without forwarding (since forwarded=true)
         assert!(
             not_leader_count >= 2,
-            "At least 2 followers should return NotLeader for forwarded=true, got {}",
+            "at least 2 followers should return NotLeader for forwarded=true, got {}",
             not_leader_count
         );
 
