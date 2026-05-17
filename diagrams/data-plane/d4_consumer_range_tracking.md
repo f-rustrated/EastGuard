@@ -35,6 +35,17 @@ Consume response for sealed/split/merged ranges includes enough metadata for the
 - `merged_into: RangeId` — consumer follows to merged range
 - Child ranges start at offset 0 — clean break, no offset mapping
 
+## Follower Read Visibility
+
+Consumers may read from any replica in the segment's `replica_set`, not only the leader. A follower exposes records up to its local `commit_offset` — records past that boundary are physically on disk but not yet visible.
+
+`commit_offset` on a follower advances via two mechanisms (see D2):
+
+1. **Piggybacked on `ReplicaAppend`** — the leader includes the previous batch's `commit_offset` in each replication message. Under continuous produce traffic, the lag is at most one batch interval.
+2. **`CommitNotify`** — sent by the leader to followers before ACKing the producer when no next `ReplicaAppend` is imminent. Ensures `commit_offset` is always current before the topic goes idle.
+
+Because `CommitNotify` is sent before the producer ACK, the guarantee is: *producer ACK ⟹ all followers already have the correct `commit_offset`*. A tailing consumer on a follower is never permanently stuck — once the producer is ACKed, `commit_offset` on every follower is already advanced and the consumer's `notify` fires.
+
 ## Metadata Queries
 
 - `ListActiveRanges { topic }` — returns current write-target ranges with keyspace boundaries
