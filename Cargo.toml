@@ -18,6 +18,7 @@ thiserror = "2.0.18"
 rocksdb = "0.24.0"
 crossbeam-channel = "0.5"
 crc32fast = "1.4"
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

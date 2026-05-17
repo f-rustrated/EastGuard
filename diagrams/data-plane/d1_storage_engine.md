@@ -239,7 +239,7 @@ Lock-free ring buffer of immutable `Arc<SegmentRecordBatch>` batches. Single wri
 ```rust
 struct SegmentCache {
     // All fields private — access only through methods below.
-    batches: [AtomicPtr<SegmentRecordBatch>; CAPACITY],
+    batches: [ArcSwapOption<SegmentRecordBatch>; CAPACITY],
     tail: AtomicU64,
     commit_offset: AtomicU64,
     eviction_frontier: AtomicU64,
@@ -248,7 +248,7 @@ struct SegmentCache {
 
 impl SegmentCache {
     // Write path — called by DataPlane
-    fn publish(&self, batch: Arc<SegmentRecordBatch>);       // store ptr, advance tail
+    fn publish(&self, batch: Arc<SegmentRecordBatch>);       // store into slot, advance tail
     fn commit(&self, new_offset: u64);                       // advance commit_offset, notify_waiters()
 
     // Read path — called by consumer tasks
@@ -258,7 +258,7 @@ impl SegmentCache {
     fn load_eviction_frontier(&self) -> u64;                 // Acquire load
 
     // Checkpoint path — called by checkpoint worker
-    fn read_batches_for_checkpoint(&self, from: u64, to: u64) -> Vec<Arc<SegmentRecordBatch>>;
+    fn drain_for_checkpoint(&self) -> CheckpointBatch;       // reads frontier..tail, returns batches + new_frontier
     fn advance_eviction_frontier(&self, new_frontier: u64);  // Release store
 }
 
@@ -270,7 +270,7 @@ struct SegmentRecordBatch {
 }
 ```
 
-Internally, `publish` stores via `Arc::into_raw()` (cache slot holds the initial strong ref), readers clone via `Arc::increment_strong_count()` + `Arc::from_raw()`. On eviction, cache drops its ref — batch freed when last consumer releases theirs.
+Slots use `arc_swap::ArcSwapOption` — load + refcount increment is atomic, eliminating the dangling-pointer risk that raw `AtomicPtr` + manual `Arc::increment_strong_count` has when a consumer is preempted at the hot/cold boundary. `publish` calls `ArcSwapOption::store()`, readers call `load_full()` which returns `Option<Arc<…>>` with the refcount already incremented. On eviction, the old Arc is dropped when the slot is overwritten — batch freed when last consumer releases theirs.
 
 **Consumer seek:** Each `SegmentRecordBatch` carries `(start_offset, end_offset)`. Binary search over published batches by offset range to find the batch containing the target offset, then linear scan within the batch.
 
