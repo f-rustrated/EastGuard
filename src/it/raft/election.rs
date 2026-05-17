@@ -6,12 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::NodeAddress;
 use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimActorCommand, SwimQueryCommand};
+use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -19,29 +18,8 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
-const CLUSTER_PORT: u16 = 19000;
-const QUERY_PORT: u16 = 29000;
+use super::{mock_swim_handler, CLUSTER_PORT, QUERY_PORT};
 
-/// Mock SWIM handler — only responds to ResolveAddress queries.
-async fn mock_swim_handler(
-    mut rx: mpsc::Receiver<SwimActorCommand>,
-    address_map: HashMap<NodeId, SocketAddr>,
-) {
-    while let Some(cmd) = rx.recv().await {
-        if let SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
-            let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
-                cluster_addr: addr,
-                client_addr: addr,
-            }));
-        }
-    }
-}
-
-/// Starts a full Raft stack on this turmoil host. Uses ForceTick to drive the
-/// ticker deterministically.
-///
-/// After enough ticks for election + heartbeat propagation, queries the elected
-/// leader and serves it to the checker via a TCP endpoint.
 fn build_address_map(
     node_name: &str,
     cluster_port: u16,
@@ -88,6 +66,18 @@ async fn serve_leader(
     Ok(())
 }
 
+async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
+    let addr = turmoil::lookup(host);
+    let stream = TcpStream::connect((addr, port)).await.unwrap();
+    let (mut read, _write) = stream.into_split();
+    let len = read.read_u32().await.unwrap() as usize;
+    let mut buf = vec![0u8; len];
+    read.read_exact(&mut buf).await.unwrap();
+    let (leader, _): (Option<NodeId>, _) =
+        bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
+    leader
+}
+
 async fn run_raft_node(
     node_name: &str,
     cluster_port: u16,
@@ -132,12 +122,7 @@ async fn run_raft_node(
     ));
 
     raft_tx
-        .send(
-            MultiRaftCommand::EnsureGroup {
-                group: group.clone(),
-            }
-            .into(),
-        )
+        .send(MultiRaftCommand::EnsureGroup { group: group.clone() }.into())
         .await
         .unwrap();
     for _ in 0..10 {
@@ -160,25 +145,9 @@ async fn run_raft_node(
     Ok(())
 }
 
-/// Read `Option<NodeId>` from a node's query server.
-async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
-    let addr = turmoil::lookup(host);
-    let stream = TcpStream::connect((addr, port)).await.unwrap();
-    let (mut read, _write) = stream.into_split();
-
-    let len = read.read_u32().await.unwrap() as usize;
-    let mut buf = vec![0u8; len];
-    read.read_exact(&mut buf).await.unwrap();
-
-    let (leader, _): (Option<NodeId>, _) =
-        bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
-    leader
-}
-
 /// 3 turmoil hosts each run a full Raft stack (MultiRaftActor + RaftTransportActor +
 /// Ticker + mock SWIM). After ticking through election + heartbeat propagation,
-/// the checker connects to each node and verifies that all agree on the same
-/// elected leader.
+/// the checker connects to each node and verifies that all agree on the same leader.
 #[test]
 #[serial_test::serial]
 fn three_node_raft_elects_leader() -> turmoil::Result {
@@ -198,76 +167,42 @@ fn three_node_raft_elects_leader() -> turmoil::Result {
         members,
     };
 
-    let g1 = group.clone();
-    sim.host("node-1", move || {
-        let g = g1.clone();
-        async move {
-            run_raft_node(
-                "node-1",
-                CLUSTER_PORT + 1,
-                QUERY_PORT + 1,
-                g,
-                &["node-2", "node-3"],
-            )
-            .await
-        }
-    });
-
-    let g2 = group.clone();
-    sim.host("node-2", move || {
-        let g = g2.clone();
-        async move {
-            run_raft_node(
-                "node-2",
-                CLUSTER_PORT + 2,
-                QUERY_PORT + 2,
-                g,
-                &["node-1", "node-3"],
-            )
-            .await
-        }
-    });
-
-    let g3 = group.clone();
-    sim.host("node-3", move || {
-        let g = g3.clone();
-        async move {
-            run_raft_node(
-                "node-3",
-                CLUSTER_PORT + 3,
-                QUERY_PORT + 3,
-                g,
-                &["node-1", "node-2"],
-            )
-            .await
-        }
-    });
+    for (name, port, peers) in [
+        ("node-1", 1u16, vec!["node-2", "node-3"]),
+        ("node-2", 2, vec!["node-1", "node-3"]),
+        ("node-3", 3, vec!["node-1", "node-2"]),
+    ] {
+        let g = group.clone();
+        sim.host(name, move || {
+            let g = g.clone();
+            let peers = peers.clone();
+            async move {
+                run_raft_node(
+                    name,
+                    CLUSTER_PORT + port,
+                    QUERY_PORT + port,
+                    g,
+                    &peers,
+                )
+                .await
+            }
+        });
+    }
 
     sim.client("checker", async {
-        // Wait for all nodes to complete their tick-driven election
         tokio::time::sleep(Duration::from_secs(15)).await;
 
         let leader1 = read_leader("node-1", QUERY_PORT + 1).await;
         let leader2 = read_leader("node-2", QUERY_PORT + 2).await;
         let leader3 = read_leader("node-3", QUERY_PORT + 3).await;
 
-        // All nodes must have elected a leader
         assert!(leader1.is_some(), "node-1 should know the leader");
         assert!(leader2.is_some(), "node-2 should know the leader");
         assert!(leader3.is_some(), "node-3 should know the leader");
 
-        // All nodes must agree on the same leader
         let leader = leader1.unwrap();
-        assert_eq!(
-            leader2.unwrap(),
-            leader,
-            "node-2 should agree on the leader"
-        );
-        assert_eq!(
-            leader3.unwrap(),
-            leader,
-            "node-3 should agree on the leader"
-        );
+        assert_eq!(leader2.unwrap(), leader, "node-2 should agree on the leader");
+        assert_eq!(leader3.unwrap(), leader, "node-3 should agree on the leader");
 
         tracing::info!("All nodes agree: leader = {:?}", leader);
         Ok(())

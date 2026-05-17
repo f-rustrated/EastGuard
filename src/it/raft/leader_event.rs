@@ -6,26 +6,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::NodeAddress;
 use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::LeaderChange;
-use crate::clusters::raft::messages::MultiRaftCommand;
+use crate::clusters::raft::messages::{LeaderChange, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{
     ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand,
 };
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 
-const CLUSTER_PORT: u16 = 19000;
+use super::CLUSTER_PORT;
+
 const RESULT_PORT: u16 = 39000;
 
-/// Mock SWIM handler that responds to ResolveAddress queries and collects
-/// LeaderChangeEvents for later retrieval.
+/// Responds to ResolveAddress queries and forwards LeaderChange events to a channel.
 async fn swim_handler_with_leader_capture(
     mut rx: mpsc::Receiver<SwimActorCommand>,
     address_map: HashMap<NodeId, SocketAddr>,
@@ -113,18 +111,13 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     TICK_PERIOD_100_MS,
                     PROBE_INTERVAL_TICKS,
                 ));
-                {
-                    let node_id = node_id.clone();
-                    let raft_tx = raft_tx.clone();
-                    let swim_tx = swim_tx.clone();
-                    tokio::spawn(RaftTransportActor::run(
-                        node_id,
-                        listener,
-                        raft_tx,
-                        transport_rx,
-                        swim_tx,
-                    ));
-                }
+                tokio::spawn(RaftTransportActor::run(
+                    node_id.clone(),
+                    listener,
+                    raft_tx.clone(),
+                    transport_rx,
+                    swim_tx.clone(),
+                ));
                 let db = MetadataStorage::open(
                     std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
                 );
@@ -142,10 +135,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     .await
                     .unwrap();
 
-                // Let the scheduler's real interval (100 ms) drive the
-                // election naturally — no ForceTick, no channel pressure.
-                // 15 s = 150 interval ticks, well above the 50-70 tick
-                // election timeout.
                 let mut events = Vec::new();
                 for _ in 0..150 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -158,7 +147,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     }
                 }
 
-                // Serve result to checker via TCP
                 let result_listener =
                     TcpListener::bind(format!("0.0.0.0:{}", RESULT_PORT + port)).await?;
                 let (stream, _) = result_listener.accept().await?;
@@ -169,7 +157,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 write.write_all(&count_len.to_be_bytes()).await?;
                 write.write_all(&count_bytes).await?;
 
-                // If we have events, send first event's leader_node_id
                 if let Some(event) = events.first() {
                     let leader_bytes =
                         bincode::encode_to_vec(Some(event.leader_node_id.clone()), BINCODE_CONFIG)
@@ -193,12 +180,9 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
 
         for (host, port) in [("node-1", 1u16), ("node-2", 2), ("node-3", 3)] {
             let addr = turmoil::lookup(host);
-            let stream = TcpStream::connect((addr, RESULT_PORT + port))
-                .await
-                .unwrap();
+            let stream = TcpStream::connect((addr, RESULT_PORT + port)).await.unwrap();
             let (mut read, _write) = stream.into_split();
 
-            // Read event count
             let len = read.read_u32().await.unwrap() as usize;
             let mut buf = vec![0u8; len];
             read.read_exact(&mut buf).await.unwrap();
@@ -207,7 +191,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
             total_events += count;
 
             if count > 0 {
-                // Read leader_node_id
                 let leader_len = read.read_u32().await.unwrap() as usize;
                 let mut leader_buf = vec![0u8; leader_len];
                 read.read_exact(&mut leader_buf).await.unwrap();
@@ -217,16 +200,11 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
             }
         }
 
-        // Exactly one node should have emitted a leader event
         assert!(
             total_events >= 1,
             "at least one LeaderChangeEvent should be emitted"
         );
-        assert!(
-            leader_node.is_some(),
-            "leader_node_id should be set in the event"
-        );
-
+        assert!(leader_node.is_some(), "leader_node_id should be set");
         tracing::info!(
             "LeaderChangeEvent emitted: leader={:?}, total_events={}",
             leader_node,
