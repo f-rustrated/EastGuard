@@ -20,10 +20,18 @@ pub struct ConnectionRequest {}
 #[derive(Decode, Encode)]
 pub struct SessionRequest {}
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Decode, Encode)]
 pub enum QueryCommand {
     GetMembers,
     GetShardInfo { key: Vec<u8> },
+    GetShardLeader { shard_group_id: u64 },
+    GetTopics,
+}
+
+#[derive(Debug, Decode, Encode)]
+pub struct TopicSummary {
+    pub name: String,
 }
 
 #[derive(Debug, Decode, Encode)]

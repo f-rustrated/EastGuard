@@ -52,6 +52,10 @@ impl MultiRaft {
                 let result = self.propose(shard_group_id, command);
                 self.deferred.push(DeferredReply::Propose(reply, result));
             }
+            MultiRaftActorCommand::GetTopics { reply } => {
+                let topics = self.get_topics();
+                self.deferred.push(DeferredReply::GetTopics(reply, topics));
+            }
         }
     }
 
@@ -62,6 +66,9 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::Propose(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetTopics(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -198,6 +205,13 @@ impl MultiRaft {
         self.groups
             .get(&group_id)
             .and_then(|r| r.current_leader().cloned())
+    }
+
+    fn get_topics(&self) -> Vec<String> {
+        self.groups
+            .values()
+            .flat_map(|raft| raft.topic_names())
+            .collect()
     }
 
     fn remove_node(&mut self, node_id: NodeId) {

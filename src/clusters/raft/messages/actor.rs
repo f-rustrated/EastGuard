@@ -22,6 +22,10 @@ pub enum MultiRaftActorCommand {
         command: RaftCommand,
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
+    /// Query all topic names from all shard groups on this node.
+    GetTopics {
+        reply: oneshot::Sender<Vec<String>>,
+    },
 }
 
 impl From<MultiRaftCommand> for MultiRaftActorCommand {
@@ -39,4 +43,5 @@ impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     Propose(oneshot::Sender<Result<(), ProposeError>>, Result<(), ProposeError>),
+    GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
 }

@@ -8,7 +8,7 @@ use crate::{
         swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
     },
     connections::request::{
-        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse,
+        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse, TopicSummary,
     },
     net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
 };
@@ -60,8 +60,13 @@ impl ClientStreamWriter {
         match query_type {
             QueryCommand::GetMembers => self.handle_get_members().await,
             QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(key).await,
+            QueryCommand::GetShardLeader { shard_group_id } => {
+                self.handle_get_shard_leader(shard_group_id).await
+            }
+            QueryCommand::GetTopics => self.handle_get_topics().await,
         }
     }
+
 
     async fn handle_get_members(&mut self) -> anyhow::Result<()> {
         let (send, recv) = tokio::sync::oneshot::channel();
@@ -70,6 +75,26 @@ impl ClientStreamWriter {
             .await?;
         let result = recv.await?;
         self.write(&result).await
+    }
+
+    async fn handle_get_shard_leader(&mut self, shard_group_id: u64) -> anyhow::Result<()> {
+        let leader = self
+            .raft_sender
+            .get_leader(ShardGroupId(shard_group_id))
+            .await
+            .map(|n| n.to_string());
+        self.write(&leader).await
+    }
+
+    async fn handle_get_topics(&mut self) -> anyhow::Result<()> {
+        let topics: Vec<TopicSummary> = self
+            .raft_sender
+            .get_topics()
+            .await
+            .into_iter()
+            .map(|name| TopicSummary { name })
+            .collect();
+        self.write(&topics).await
     }
 
     async fn handle_get_shard_info(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
