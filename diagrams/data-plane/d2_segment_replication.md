@@ -34,6 +34,27 @@ Followers use the same DataPlaneActor accumulation buffer as the leader. `Replic
 
 **Latency tradeoff:** The follower's accumulation window adds up to the batch trigger threshold to produce latency, because the leader waits for `ReplicaAck` before advancing `commit_offset` and ACKing the producer. Under high throughput the window is sub-millisecond; under low throughput it can reach the full 10ms batch interval.
 
+### CommitNotify
+
+After all `ReplicaAck`s are received, the segment leader advances its own `commit_offset` and sends `CommitNotify { segment_id, commit_offset }` to all followers **before** ACKing the producer:
+
+```
+all ReplicaAcks received
+    → leader advances commit_offset
+    → CommitNotify → followers
+    → ACK producer
+```
+
+This gives a strict guarantee: *producer ACK ⟹ all followers already have the correct `commit_offset`*. Two problems are resolved by this ordering:
+
+1. **Data loss on leader death.** If the leader dies after ACKing a producer, the coordinator can query surviving followers for their `commit_offset` and get the correct `end_offset` to propose in `RollSegment`. Without CommitNotify, followers would show a stale `commit_offset` (1-batch lag from the piggybacked field), and the coordinator would seal at a lower offset — losing ACKed records.
+
+2. **Stuck consumers on idle topics.** Without CommitNotify, a follower's `commit_offset` only advances when the next `ReplicaAppend` arrives. On an idle topic, a tailing consumer on a follower waits indefinitely even though the data is committed and on disk. CommitNotify ensures `commit_offset` is current before the topic goes idle.
+
+**CommitNotify is fire-and-forget — no reply expected.** The leader sends `CommitNotify` and immediately ACKs the producer without waiting for any response from followers. This is safe because `CommitNotify` is not a durability operation — durability was already established in the `ReplicaAck` round. `CommitNotify` is purely a visibility update. TCP guarantees delivery; no application-level ACK is needed. The guarantee that matters is not "followers processed CommitNotify before producer ACK" but "followers processed CommitNotify before the coordinator can act on leader death" — SWIM detection takes ~6–7 seconds, giving TCP more than enough time to deliver a ~100-byte message.
+
+**Why not follower polling?** An alternative is for followers to poll the leader via `QueryCommitOffset` after a timeout. This resolves the stuck consumer problem but not the data loss problem — there is no causal ordering between the producer ACK and a follower's poll, so if the leader dies between ACKing the producer and the poll completing, the follower still shows a stale `commit_offset`. CommitNotify (push, before ACK) is required for the data loss guarantee.
+
 ## Replica Authorization on ReplicaAppend
 
 When a segment leader starts replicating a new segment (e.g., after seal-and-replace), followers may not know about the new segment yet. The first `ReplicaAppend` for a new segment carries the segment metadata — followers validate and act without waiting for any notification:
@@ -78,11 +99,16 @@ When a follower fails to ack within timeout:
 Leader failure is detected via SWIM node death (~6-7s). When the coordinator receives `HandleNodeDeath` for the segment leader, it proposes `RollSegment` for all affected active segments — same mechanism as any SWIM-triggered seal.
 
 1. SWIM detects leader (D) as dead → coordinator receives `HandleNodeDeath(D)`
-2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding D. A surviving follower is promoted to `replica_set[0]` (new segment leader).
-3. Raft commits → MetadataStateMachine seals old segment, creates new segment
-4. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
-5. New segment leader accepts produce. Producer discovers new leader via metadata query.
-6. Sealed old segment queued for under-replication repair (async)
+2. Coordinator sends `QueryCommitOffset { segment_id }` to all surviving followers of affected segments. Takes `max(commit_offset)` from responses as `end_offset`. This is safe because CommitNotify guarantees *producer ACK ⟹ followers already have the correct `commit_offset`* — querying survivors after leader death always yields the true sealed boundary.
+3. Coordinator proposes `RollSegment { end_offset }` via Raft with `new_replica_set` excluding D. A surviving follower is promoted to `replica_set[0]` (new segment leader).
+4. Raft commits → MetadataStateMachine seals old segment, creates new segment
+5. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
+6. New segment leader accepts produce. Producer discovers new leader via metadata query.
+7. Sealed old segment queued for under-replication repair (async)
+
+**Open questions:**
+- If no follower responds to `QueryCommitOffset` (all followers also dead), what is the fallback `end_offset`?
+- What timeout before falling back?
 
 Follower failure uses `SealRequest` (segment leader → coordinator). Leader failure uses the SWIM `HandleNodeDeath` path (coordinator-initiated, no `SealRequest` needed).
 
@@ -123,8 +149,11 @@ All `data_port` wire messages, consolidated across phases:
 
 | Message | Direction | Purpose | Phase |
 |---|---|---|---|
-| `ReplicaAppend` | Segment leader → followers | Replicate records + `commit_offset` | D2 |
+| `ReplicaAppend` | Segment leader → followers | Replicate records + piggybacked `commit_offset` | D2 |
 | `ReplicaAck` | Follower → segment leader | Confirm WAL fsync for a batch | D2 |
+| `CommitNotify` | Segment leader → followers | Advance follower `commit_offset` before producer ACK; sent when no next `ReplicaAppend` is imminent | D2 |
+| `QueryCommitOffset` | Coordinator → followers | Query `commit_offset` after leader death, before proposing `RollSegment` | D2 |
+| `CommitOffsetResponse` | Follower → coordinator | Reply to `QueryCommitOffset` | D2 |
 | `SealRequest` | Segment leader → coordinator | Request segment seal (carries `end_offset`) | D2 |
 | `SealResponse` | Coordinator → segment leader | New segment ID + replica set | D2 |
 | `SegmentSealed` | Segment leader → old followers | Notify seal, stop accepting writes | D2/D3 |
