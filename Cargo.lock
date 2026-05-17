@@ -287,6 +287,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam-channel",
+ "libc",
  "murmur3",
  "rand 0.10.1",
  "rocksdb",
