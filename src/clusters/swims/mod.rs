@@ -25,7 +25,7 @@ pub mod common {
                 swim::Swim,
             },
         },
-        schedulers::ticker::Ticker,
+        schedulers::ticker::{PROBE_INTERVAL_TICKS, Ticker},
     };
 
     pub fn make_protocol(local_id: &str, local_port: u16) -> Swim {
@@ -60,7 +60,7 @@ pub mod common {
         pub fn new(local_id: &str, local_port: u16) -> Self {
             Self {
                 protocol: make_protocol(local_id, local_port),
-                ticker: Ticker::new(),
+                ticker: Ticker::new(PROBE_INTERVAL_TICKS),
             }
         }
 

@@ -51,7 +51,7 @@ mod tests {
     use super::*;
     use crate::clusters::swims::common::{TestHarness, make_protocol};
     use crate::clusters::swims::messages::*;
-    use crate::schedulers::ticker::Ticker;
+    use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, Ticker};
     use std::net::SocketAddr;
 
     fn count_join_pings(packets: &[OutboundPacket], target: SocketAddr) -> usize {
@@ -163,7 +163,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(),
+            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
         };
 
         h.apply_timer_commands();
@@ -196,7 +196,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(),
+            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
         };
 
         h.apply_timer_commands();
@@ -231,7 +231,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(),
+            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
         };
 
         h.apply_timer_commands();
@@ -282,7 +282,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(),
+            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
         };
 
         h.apply_timer_commands();

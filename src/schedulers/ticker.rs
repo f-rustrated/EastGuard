@@ -2,11 +2,14 @@ use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
 pub const TICK_PERIOD_100_MS: u64 = 100;
+#[allow(dead_code)]
+pub const TICK_PERIOD_10_MS: u64 = 10;
 pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
 
 #[derive(Debug)]
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
+    protocol_interval_ticks: u32,
     timers: HashMap<u32, T>,
 }
 
@@ -14,9 +17,10 @@ impl<T> Ticker<T>
 where
     T: TTimer,
 {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(protocol_interval_ticks: u32) -> Self {
         Self {
             protocol_elapsed: 0,
+            protocol_interval_ticks,
             timers: Default::default(),
         }
     }
@@ -52,7 +56,7 @@ where
 
         // 2. Advance the protocol clock
         self.protocol_elapsed += 1;
-        if self.protocol_elapsed >= PROBE_INTERVAL_TICKS {
+        if self.protocol_elapsed >= self.protocol_interval_ticks {
             self.protocol_elapsed = 0;
             events.push(Default::default());
         }
@@ -86,7 +90,7 @@ mod tests {
 
     #[test]
     fn no_protocol_period_before_interval_elapses() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             let events = ticker.advance_clock(0);
             assert!(
@@ -99,7 +103,7 @@ mod tests {
 
     #[test]
     fn protocol_period_fires_at_interval() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         for _ in 0..PROBE_INTERVAL_TICKS - 1 {
             ticker.advance_clock(0);
         }
@@ -113,7 +117,7 @@ mod tests {
 
     #[test]
     fn direct_probe_timeout() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
             timer: SwimTimer::direct_probe("node-b".into()),
@@ -144,7 +148,7 @@ mod tests {
 
     #[test]
     fn indirect_probe_timeout() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         ticker.apply(TimerCommand::SetSchedule {
             seq: 2,
             timer: SwimTimer::indirect_probe("node-c".into()),
@@ -167,7 +171,7 @@ mod tests {
 
     #[test]
     fn cancel_probe_prevents_timeout() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
             timer: SwimTimer::direct_probe("node-b".into()),
@@ -188,7 +192,7 @@ mod tests {
 
     #[test]
     fn suspect_timer_fires_after_timeout() {
-        let mut ticker = Ticker::<SwimTimer>::new();
+        let mut ticker = Ticker::<SwimTimer>::new(PROBE_INTERVAL_TICKS);
         let node_id = "node-b";
         let seq = 1;
         ticker.apply(TimerCommand::SetSchedule {
