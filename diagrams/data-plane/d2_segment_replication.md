@@ -30,7 +30,9 @@ Segment Leader
 
 Local WAL fsync and follower fan-out happen in parallel. Since `network_rtt + remote_fsync > local_fsync` in practice, the local fsync is hidden behind replication latency. Produce latency = `max(local_fsync, max(follower_fsyncs))`.
 
-Followers follow the same path: WAL fsync before ack, then cache insertion, then background checkpoint to segment files.
+Followers use the same DataPlaneActor accumulation buffer as the leader. `ReplicaAppend` records are buffered by segment key and flushed when the global batch trigger fires. One WAL fsync covers all pending segments — the same mechanism as the leader role. `ReplicaAck` is sent to the leader after WAL fsync and cache publish. Background checkpoint to segment files follows the same path as the leader.
+
+**Latency tradeoff:** The follower's accumulation window adds up to the batch trigger threshold to produce latency, because the leader waits for `ReplicaAck` before advancing `commit_offset` and ACKing the producer. Under high throughput the window is sub-millisecond; under low throughput it can reach the full 10ms batch interval.
 
 ## Replica Authorization on ReplicaAppend
 

@@ -91,6 +91,13 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 
 ## Write Path
 
+DataPlaneActor's `accumulation_buffers` receive records from two sources depending on this node's role for each segment:
+
+- **Leader role**: `Produce` records arriving from clients via `data_port`.
+- **Follower role**: `ReplicaAppend` records arriving from the segment leader (see D2).
+
+One global batch trigger fires across all pending segments and covers both roles in a single WAL write + fsync. When acting as follower, `ReplicaAck` is sent to the leader after WAL fsync and cache publish. The follower's accumulation window — up to the batch trigger threshold — adds directly to end-to-end produce latency: sub-millisecond under high throughput, up to 10ms on idle topics.
+
 ```
 records arrive
     │
@@ -325,6 +332,11 @@ enum DataPlaneCommand {
         segment_key: SegmentKey,
         records: Vec<Record>,
         reply: oneshot::Sender<ProduceResult>,
+    },
+    ReplicaWrite {
+        segment_key: SegmentKey,
+        records: Vec<Record>,
+        reply: oneshot::Sender<ReplicaAck>, // sent after WAL fsync + cache publish
     },
     SegmentAssignment {
         segment_key: SegmentKey,
