@@ -10,7 +10,7 @@ pub enum DataPlaneCommand {
     Produce {
         segment_key: SegmentKey,
         records: Vec<Bytes>,
-        reply: oneshot::Sender<ProduceResult>,
+        reply: oneshot::Sender<ProduceAck>,
     },
     SegmentAssignment {
         segment_key: SegmentKey,
@@ -24,10 +24,9 @@ pub enum DataPlaneCommand {
 }
 
 #[derive(Debug)]
-pub enum ProduceResult {
+pub enum ProduceAck {
     Ok,
-    SegmentNotFound,
-    WalError(String),
+    Err(String),
 }
 
 pub struct CheckpointComplete {

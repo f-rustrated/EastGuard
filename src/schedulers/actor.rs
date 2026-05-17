@@ -9,11 +9,12 @@ pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
     mut mailbox: mpsc::Receiver<TickerCommand<T>>,
     tick_period_ms: u64,
+    protocol_interval_ticks: u32,
 ) where
     T: TTimer,
 {
     let mut interval = time::interval(Duration::from_millis(tick_period_ms));
-    let mut ticker = Ticker::<T>::new();
+    let mut ticker = Ticker::<T>::new(protocol_interval_ticks);
 
     loop {
         tokio::select! {

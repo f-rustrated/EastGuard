@@ -1,16 +1,14 @@
 use tokio::sync::oneshot;
 
 use crate::{
-    data_plane::{checkpoint::CheckpointJob, timer::DataPlaneTimer},
+    data_plane::{checkpoint::CheckpointJob, messages::ProduceAck, timer::DataPlaneTimer},
     schedulers::ticker_message::TimerCommand,
 };
 
-use super::command::*;
 pub(crate) enum DataPlaneEvent {
     SubmitCheckpoint(CheckpointJob),
-    ProduceAck {
-        reply: oneshot::Sender<ProduceResult>,
-        result: ProduceResult,
-    },
+    ProducePending(oneshot::Sender<ProduceAck>),
+    WalBatchComplete { lsn: u64 },
+    WalBatchFailed(String),
     Timer(TimerCommand<DataPlaneTimer>),
 }

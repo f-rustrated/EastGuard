@@ -10,12 +10,14 @@ use crate::clusters::raft::actor::MultiRaftActor;
 use crate::clusters::raft::messages::{LeaderChange, MultiRaftCommand};
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand};
-use crate::clusters::{BINCODE_CONFIG, NodeId, NodeAddress};
+use crate::clusters::swims::{
+    ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand,
+};
+use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker::TICK_PERIOD_100_MS;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 
 use super::CLUSTER_PORT;
 
@@ -103,7 +105,12 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     address_map,
                     leader_events_tx,
                 ));
-                tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx, TICK_PERIOD_100_MS));
+                tokio::spawn(run_scheduling_actor(
+                    raft_tx.clone(),
+                    ticker_rx,
+                    TICK_PERIOD_100_MS,
+                    PROBE_INTERVAL_TICKS,
+                ));
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
                     listener,

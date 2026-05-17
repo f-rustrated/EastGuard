@@ -26,7 +26,7 @@ use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker::TICK_PERIOD_100_MS;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
@@ -79,11 +79,13 @@ impl StartUp {
             swim_sender.clone().into(),
             swim_ticker_rx,
             TICK_PERIOD_100_MS,
+            PROBE_INTERVAL_TICKS,
         ));
         tokio::spawn(run_scheduling_actor(
             raft_tx.clone().into(),
             raft_ticker_rx,
             TICK_PERIOD_100_MS,
+            PROBE_INTERVAL_TICKS,
         ));
         tokio::spawn(SwimTransportActor::run(
             udp_socket,

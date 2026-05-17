@@ -3,8 +3,6 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tokio::sync::oneshot;
-
 use crate::data_plane::messages::event::DataPlaneEvent;
 use crate::data_plane::record::BufferedRecord;
 
@@ -54,7 +52,15 @@ impl<W: WalStorage> DataPlane<W> {
                 segment_key,
                 records,
                 reply,
-            } => self.handle_produce(segment_key, records, reply),
+            } => {
+                if !self.segments.contains_key(&segment_key) {
+                    let _ = reply.send(ProduceAck::Err("segment not found".into()));
+                } else {
+                    self.pending_events
+                        .push(DataPlaneEvent::ProducePending(reply));
+                    self.handle_produce(segment_key, records);
+                }
+            }
             DataPlaneCommand::SegmentAssignment {
                 segment_key,
                 replica_set: _,
@@ -74,17 +80,8 @@ impl<W: WalStorage> DataPlane<W> {
         self.assert_invariants();
     }
 
-    fn handle_produce(
-        &mut self,
-        segment_key: SegmentKey,
-        records: Vec<Bytes>,
-        reply: oneshot::Sender<ProduceResult>,
-    ) {
+    pub fn handle_produce(&mut self, segment_key: SegmentKey, records: Vec<Bytes>) {
         let Some(tracker) = self.segments.get_mut(&segment_key) else {
-            self.pending_events.push(DataPlaneEvent::ProduceAck {
-                reply,
-                result: ProduceResult::SegmentNotFound,
-            });
             return;
         };
 
@@ -101,12 +98,6 @@ impl<W: WalStorage> DataPlane<W> {
 
             tracker.size_bytes += len;
         }
-
-        // TODO replication(D2)
-        self.pending_events.push(DataPlaneEvent::ProduceAck {
-            reply,
-            result: ProduceResult::Ok,
-        });
 
         if self.should_flush_by_batch_size() {
             self.flush_batch();
@@ -158,12 +149,16 @@ impl<W: WalStorage> DataPlane<W> {
             Ok(lsn) => lsn,
             Err(e) => {
                 tracing::error!("WAL write failed: {e}");
+                self.pending_events
+                    .push(DataPlaneEvent::WalBatchFailed(e.to_string()));
                 return;
             }
         };
 
         if let Err(e) = self.wal.fsync() {
             tracing::error!("WAL fsync failed: {e}");
+            self.pending_events
+                .push(DataPlaneEvent::WalBatchFailed(e.to_string()));
             return;
         }
 
@@ -194,6 +189,9 @@ impl<W: WalStorage> DataPlane<W> {
                     .push(DataPlaneEvent::SubmitCheckpoint(tracker.checkpoint(key)));
             }
         }
+
+        self.pending_events
+            .push(DataPlaneEvent::WalBatchComplete { lsn });
 
         self.buffer_record_count = 0;
         self.buffer_byte_count = 0;
@@ -273,6 +271,7 @@ mod tests {
     use crate::clusters::metadata::{RangeId, SegmentId};
     use crate::clusters::swims::ShardGroupId;
     use crate::data_plane::wal::WalWriter;
+    use tokio::sync::oneshot;
 
     impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
         fn assert_invariants(&self) {
@@ -321,10 +320,28 @@ mod tests {
     }
 
     #[test]
+    fn has_segment_returns_false_for_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let dp = make_data_plane(&dir);
+        assert!(!dp.segments.contains_key(&test_key()));
+    }
+
+    #[test]
+    fn has_segment_returns_true_after_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.process(DataPlaneCommand::SegmentAssignment {
+            segment_key: test_key(),
+            replica_set: vec![],
+        });
+        assert!(dp.segments.contains_key(&test_key()));
+    }
+
+    #[test]
     fn produce_to_unknown_segment_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        let (tx, _rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
 
         dp.process(DataPlaneCommand::Produce {
             segment_key: test_key(),
@@ -332,14 +349,45 @@ mod tests {
             reply: tx,
         });
 
-        let events = dp.take_events();
-        assert!(events.iter().any(|e| matches!(
-            e,
-            DataPlaneEvent::ProduceAck {
-                result: ProduceResult::SegmentNotFound,
-                ..
-            }
-        )));
+        assert!(!dp.has_buffered_data());
+        let ack = rx.try_recv().unwrap();
+        assert!(matches!(ack, ProduceAck::Err(_)));
+    }
+
+    #[test]
+    fn produce_emits_pending_then_ok_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        dp.process(DataPlaneCommand::SegmentAssignment {
+            segment_key: test_key(),
+            replica_set: vec![],
+        });
+
+        let (tx, _rx) = oneshot::channel();
+        dp.process(DataPlaneCommand::Produce {
+            segment_key: test_key(),
+            records: vec![Bytes::from("data")],
+            reply: tx,
+        });
+
+        let produce_events = dp.take_events();
+        assert!(
+            produce_events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::ProducePending(_)))
+        );
+
+        dp.process(DataPlaneCommand::Timeout(
+            DataPlaneTimeoutCallback::PeriodicTick,
+        ));
+
+        let flush_events = dp.take_events();
+        assert!(
+            flush_events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::WalBatchComplete { .. }))
+        );
     }
 
     #[test]
@@ -352,12 +400,10 @@ mod tests {
             replica_set: vec![],
         });
 
-        let (tx, _) = oneshot::channel();
-        dp.process(DataPlaneCommand::Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("hello"), Bytes::from("world!")], // 5,6
-            reply: tx,
-        });
+        dp.handle_produce(
+            test_key(),
+            vec![Bytes::from("hello"), Bytes::from("world!")],
+        );
 
         let tracker = dp.segments.get(&test_key()).unwrap();
         assert_eq!(
@@ -405,6 +451,14 @@ mod tests {
         ));
 
         assert!(!dp.has_buffered_data());
+
+        let events = dp.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::WalBatchComplete { .. }))
+        );
+
         let cache = dp.segments.get(&test_key()).unwrap().cache();
         assert_eq!(cache.load_commit_offset(), 1);
     }
@@ -463,16 +517,18 @@ mod tests {
             .map(|i| Bytes::from(format!("r{i}")))
             .collect();
 
-        let (tx, _) = oneshot::channel();
-        dp.process(DataPlaneCommand::Produce {
-            segment_key: test_key(),
-            records: big_records,
-            reply: tx,
-        });
+        dp.handle_produce(test_key(), big_records);
 
         assert!(
             !dp.has_buffered_data(),
             "volume trigger should have flushed inline"
+        );
+
+        let events = dp.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::WalBatchComplete { .. }))
         );
     }
 
@@ -489,12 +545,7 @@ mod tests {
             .map(|i| Bytes::from(format!("r{i}")))
             .collect();
 
-        let (tx, _) = oneshot::channel();
-        dp.process(DataPlaneCommand::Produce {
-            segment_key: test_key(),
-            records: big_records,
-            reply: tx,
-        });
+        dp.handle_produce(test_key(), big_records);
 
         let has_reset = dp
             .take_events()
@@ -537,9 +588,6 @@ mod tests {
             segment_key: key2,
             checkpointed_lsn: 5,
         }));
-        // WAL delete_below(5) called — but with only one WAL file and no
-        // writes exceeding its max_lsn, the file stays (never deletes active).
-        // The important thing is no panic and invariants hold.
     }
 
     #[test]

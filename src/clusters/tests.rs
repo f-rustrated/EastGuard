@@ -148,6 +148,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         tx_in.clone(),
         ticker_rx,
         TICK_PERIOD_100_MS,
+        PROBE_INTERVAL_TICKS,
     ));
     tokio::spawn(SwimActor::run(
         rx_in,

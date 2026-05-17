@@ -15,7 +15,7 @@ use crate::clusters::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker::TICK_PERIOD_100_MS;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
 use super::{mock_swim_handler, CLUSTER_PORT, QUERY_PORT};
@@ -57,7 +57,12 @@ async fn start_raft_node(
     let listener = crate::net::TcpListener::bind(bind_addr).await?;
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
-    tokio::spawn(run_scheduling_actor(raft_tx.clone(), ticker_rx, TICK_PERIOD_100_MS));
+    tokio::spawn(run_scheduling_actor(
+        raft_tx.clone(),
+        ticker_rx,
+        TICK_PERIOD_100_MS,
+        PROBE_INTERVAL_TICKS,
+    ));
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,

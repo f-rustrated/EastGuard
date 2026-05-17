@@ -292,6 +292,7 @@ struct SegmentTracker {
 }
 
 // State machine — pure sync, no channels. I/O only through injected WalStorage.
+// Reply channels pass through as events (ProducePending), not held in state.
 struct DataPlane<W: WalStorage> {
     wal: W,
     segments: HashMap<SegmentKey, SegmentTracker>,
@@ -301,30 +302,43 @@ struct DataPlane<W: WalStorage> {
 
 enum DataPlaneEvent {
     SubmitCheckpoint(CheckpointJob),
-    ProduceAck { reply: oneshot::Sender<ProduceResult> },
-    // ProduceAck is live-path only. WAL replay (D5) calls internal state machine
+    ProducePending(oneshot::Sender<ProduceAck>),  // reply channel → actor's pending_replies
+    WalBatchComplete { lsn: u64 },                // WAL fsync succeeded for this LSN
+    WalBatchFailed(String),                        // WAL write or fsync failed
+    Timer(TimerCommand<DataPlaneTimer>),
+    // ProducePending is live-path only. WAL replay (D5) calls internal state machine
     // methods directly (populate buffers, publish to cache) — no DataPlaneCommand,
-    // no oneshot, no ProduceAck event emitted.
+    // no oneshot, no ProducePending event emitted.
+}
+
+// Producer-facing response — Ok or Err. Error reason is opaque string
+// (segment not found, WAL failure, replication failure in D2+).
+enum ProduceAck {
+    Ok,
+    Err(String),
 }
 
 // Actor wrapper — owns channels, drains state machine events.
+// Holds pending_replies: Vec<oneshot::Sender<ProduceAck>> — populated from
+// ProducePending events, drained on WalBatchComplete (D1) or after
+// replication (D2+), failed on WalBatchFailed.
 struct DataPlaneActor;
 
 impl DataPlaneActor {
-    fn run(
-        mut state: DataPlane<WalWriter>,
-        mailbox: crossbeam::channel::Receiver<DataPlaneCommand>,
+    fn spawn(
+        data_dir: PathBuf,
         checkpoint_tx: crossbeam::channel::Sender<CheckpointJob>,
-    ) {
-        // crossbeam::select! on mailbox + timer, process → flush
+        scheduler_tx: tokio::sync::mpsc::Sender<TickerCommand<DataPlaneTimer>>,
+    ) -> crossbeam::channel::Sender<DataPlaneCommand> {
+        // spawns dedicated OS thread, returns sender
     }
 }
 
 enum DataPlaneCommand {
     Produce {
         segment_key: SegmentKey,
-        records: Vec<Record>,
-        reply: oneshot::Sender<ProduceResult>,
+        records: Vec<Bytes>,
+        reply: oneshot::Sender<ProduceAck>,
     },
     SegmentAssignment {
         segment_key: SegmentKey,
@@ -334,8 +348,38 @@ enum DataPlaneCommand {
         segment_key: SegmentKey,
     },
     CheckpointComplete(CheckpointComplete),
+    Timeout(DataPlaneTimeoutCallback),
 }
 ```
+
+**Event flow for produce:**
+
+```
+process(Produce { reply, .. })
+    │
+    ├── segment not found → reply.send(Err("segment not found")) immediately
+    │
+    └── segment exists
+            │
+            ▼
+        emit ProducePending(reply)       ◄── actor pushes to pending_replies
+        handle_produce(key, records)     ◄── buffer records
+            │
+            │ batch trigger fires (10ms / 20k / 10MB)
+            ▼
+        flush_batch()
+            │
+            ├── WAL write/fsync fails → emit WalBatchFailed(err)
+            │       actor drains pending_replies with Err(err)
+            │
+            └── WAL fsync succeeds → emit WalBatchComplete { lsn }
+                    D1: actor drains pending_replies with Ok
+                    D2: actor holds pending_replies, initiates replication
+                        → replication completes → drains with Ok
+                        → replication fails → drains with Err
+```
+
+**D2 batch-reply mapping:** `WalBatchComplete { lsn }` carries the LSN. The actor maps each WAL batch to its pending replies. Multiple batches can be in flight (volume trigger flushes inline, then more produces arrive before drain). The actor maintains `current_batch: Vec<Sender>` (accumulates `ProducePending` replies) and `replicating: VecDeque<(u64, Vec<Sender>)>` (keyed by LSN). `WalBatchComplete { lsn }` moves `current_batch` into `replicating` under that LSN. `ReplicationComplete { lsn }` drains all entries ≤ that LSN.
 
 **Channel traffic profiles:** `mailbox` is hot — every `Produce` request flows through it. `checkpoint_tx` and `data_plane_tx` (the return path for `CheckpointComplete`) are occasional — triggered only by checkpoint conditions (segment size, cache budget, WAL retention), not by time or per-batch. The checkpoint worker is a single sequential thread; each cycle includes at least one segment file fsync, so `CheckpointComplete` messages arrive at most low tens per second under sustained throughput.
 
