@@ -54,8 +54,8 @@ accumulation_buffers[segment_key].push(record)
                          │ ◄── durability point (all replicas)
                          ▼
    per segment, as each completes independently:
-     commit_offset.store(tail, Release)
-     notify.notify_waiters()  ◄── consumers can read
+     commit_offset += 1, notify.notify_waiters()  ◄── leader consumers can read
+     send CommitAdvance { segment_key, commit_offset } to followers
      ACK that segment's producers (drain segment replies with Ok)
                          │
                          ▼ (background)
@@ -84,13 +84,15 @@ DataPlane.process_replica_append()
     │
     ├── SegmentRecordBatch → publish to SegmentCache (tail advances)
     │
-    ├── commit_offset.store(leader_commit_offset, Release)
-    │   notify.notify_waiters()  ◄── follower consumers can read committed data
-    │
     └── emit ReplicaAckReady { leader, segment_key, batch_id }
             │
             ▼
       actor sends ReplicaAck to leader via DataTransportActor
+
+CommitAdvance { segment_key, commit_offset } arrives later from leader
+    │
+    ▼
+    commit_offset += 1, notify.notify_waiters()  ◄── follower consumers can read
 ```
 
 Followers reuse WAL and `SegmentCache` infrastructure from D1. No accumulation buffers — records arrive pre-batched in `ReplicaAppend`. One WAL write + fsync per `ReplicaAppend`. Follower WAL enables uniform crash recovery (D5) and maintains durability guarantees even if SWIM's detection window leaves a follower briefly active after seal.
@@ -104,11 +106,11 @@ The first `ReplicaAppend` for an unknown segment is self-authorizing — no prio
 
 Only the segment leader requires explicit `SegmentAssignment` from the coordinator (D3). Followers learn about new segments from the leader's first `ReplicaAppend` — no gossip or coordinator notification required on the follower data path.
 
-### Commit Offset Piggybacking
+### Commit Notification
 
-Every `ReplicaAppend` carries `leader_commit_offset` — the leader's current `commit_offset` for this segment. Followers use this to advance their own `commit_offset`, enabling follower reads: consumers can read from any replica up to `commit_offset`.
+After the leader advances `commit_offset` (all replicas ACKed), it sends `CommitAdvance { segment_key, commit_offset }` to all followers. Followers advance their own `commit_offset` on receipt — follower consumers can then read the committed batch.
 
-The leader's `commit_offset` always reflects the *previous* committed position — the current batch being replicated is not yet committed. Once all followers ACK, the leader advances `commit_offset` and the next `ReplicaAppend` carries the new value.
+`CommitAdvance` is a lightweight message (`segment_key` + `u64`), sent once per commit per follower. TCP ordering guarantees it arrives before the next `ReplicaAppend`. Follower visibility lags the leader by ~0.5 RTT (one network hop), not by one batch interval.
 
 ---
 
@@ -126,14 +128,14 @@ SegmentTracker (D1 fields unchanged)
 └── committed_end_offset: u64                   ← NEW (logical offset, not ring buffer position)
 ```
 
-**Publish split:** D1's `publish()` auto-commits. D2 splits into `publish_uncommitted()` (advances `tail` only) and `commit(ring_pos, batch_end_offset)` (advances ring buffer `commit_offset`, updates `committed_end_offset` from the batch's logical offset, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
+**Publish split:** D1's `publish()` auto-commits. D2 splits into `publish_uncommitted()` (advances `tail` only) and `commit(batch_end_offset)` (advances ring buffer `commit_offset` by 1, updates `committed_end_offset` from the batch's logical offset, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
 
 **Two offset domains — do not conflate:**
-- `SegmentCache.commit_offset` — ring buffer batch position (e.g., 5 = "5 batches committed")
-- `SegmentTracker.committed_end_offset` — logical record offset within the segment (e.g., 42000 = "records through offset 42000 are committed"). This is the value carried in `SealRequest.end_offset` and feeds MetadataStateMachine invariant 8 (offset continuity).
+- `SegmentCache.commit_offset` — ring buffer batch position (e.g., 5 = "5 batches committed"). Each `flush_batch()` produces exactly one `SegmentRecordBatch` per segment, so commit always advances by exactly 1. No stored ring position needed — `commit()` calls `cache.commit(cache.load_commit_offset() + 1)` internally.
+- `SegmentTracker.committed_end_offset` — logical record offset within the segment (e.g., 42000 = "records through offset 42000 are committed"). Updated from the batch's `end_offset` field on each commit. This is the value carried in `SealRequest.end_offset` and feeds MetadataStateMachine invariant 8 (offset continuity).
 
-- **Leader:** `publish_uncommitted()` during flush → `commit()` after all replicas ACK
-- **Follower:** `publish_uncommitted()` on `ReplicaAppend` → `commit(leader_commit_offset)` from message
+- **Leader:** `publish_uncommitted()` during flush → `commit(batch_end_offset)` after all replicas ACK
+- **Follower:** `publish_uncommitted()` on `ReplicaAppend` → `commit()` on `CommitAdvance` from leader (~0.5 RTT after leader commits)
 
 ### DataPlane State Machine
 
@@ -141,8 +143,8 @@ SegmentTracker (D1 fields unchanged)
 
 **New methods:**
 
-- `process_replica_append()` — follower path. Validates sender, WAL write + fsync, publishes to cache, advances `commit_offset` from leader, emits `ReplicaAckReady`.
-- `commit_segment()` — advances `commit_offset` on a segment's cache, updates `committed_end_offset`. Called by actor when a segment's acks complete within a flight.
+- `process_replica_append()` — follower path. Validates sender, WAL write + fsync, publishes to cache, emits `ReplicaAckReady`. Does NOT advance `commit_offset` — that happens on `CommitAdvance`.
+- `commit_segment(batch_end_offset)` — advances ring buffer `commit_offset` by 1 (always +1, each batch = one ring slot), updates `committed_end_offset` from the logical offset. Called by actor when a segment's acks complete within a flight.
 
 **`ProducePending` change:** D1 emits `ProducePending(reply)`. D2 emits `ProducePending { segment_key, reply }` — the segment_key lets the actor partition replies per-segment for independent ack/failure handling.
 
@@ -153,9 +155,8 @@ D1:  WAL write+fsync → tracker.publish(batch)       ← auto-commits
                       → emit WalBatchComplete
 
 D2:  WAL write+fsync → publish_uncommitted(batch)    ← tail only, no commit
-                      → capture commit_up_to = tail
-                      → emit ReplicateSegmentBatch { followers, batch, commit_up_to }
-                        (skipped if no followers — degrades to D1)
+                      → emit ReplicateSegmentBatch { followers, batch, batch_end_offset }
+                        (skipped if no followers — commit immediately, degrade to D1)
                       → emit WalBatchComplete
 ```
 
@@ -176,7 +177,7 @@ replication_targets: Vec<ReplicationTarget>      ← buffered per ReplicateSegme
 replicating: VecDeque<ReplicationFlight>         ← in-flight replication, keyed by batch_id
 
 ReplicationTarget
-├── segment_key, followers, batch, commit_up_to
+├── segment_key, followers, batch, batch_end_offset
 
 ReplicationFlight
 ├── batch_id
@@ -185,7 +186,7 @@ ReplicationFlight
 SegmentFlight
 ├── replies: Vec<Sender<ProduceAck>>
 ├── pending_acks: HashSet<NodeId>
-└── commit_up_to: u64
+└── batch_end_offset: u64          ← logical offset, for committed_end_offset update
 ```
 
 Each segment's replication completes independently — no cross-segment dependency within a flight. When s1's followers all ack, s1's producers are ACKed immediately even if s2 is still pending.
@@ -199,13 +200,14 @@ ProducePending { segment_key, reply }
                                → push to pending_replies[segment_key] (D2: per-segment)
 ReplicateSegmentBatch { .. }   → buffer in replication_targets (NEW)
 WalBatchComplete { lsn }      → for segments with no followers:
-                                   drain pending_replies[key], send Ok immediately
+                                   commit_segment(batch_end_offset), drain replies, send Ok
                                  for segments with followers:
                                    build SegmentFlight per segment from targets + replies
                                    → fan-out ReplicaAppend via transport
                                    → set ReplicationTimeout per segment
                                    → push ReplicationFlight to replicating queue
 ReplicaAckReady { .. }         → forward ReplicaAck to leader via transport (NEW)
+SendCommitAdvance { .. }       → send CommitAdvance to followers via transport (NEW)
 WalBatchFailed(e)              → drain ALL pending_replies with Err (unchanged)
 ```
 
@@ -216,7 +218,8 @@ ReplicaAck { from, segment_key, batch_id } arrives
     │
     ├── find flight → remove from from segments[segment_key].pending_acks
     ├── cancel ReplicationTimeout if segment fully acked
-    ├── segment complete → commit_segment(segment_key, commit_up_to)
+    ├── segment complete → commit_segment(segment_key, batch_end_offset)
+    │                    → emit SendCommitAdvance to followers
     │                    → drain segment_flight.replies with Ok
     └── flight empty (all segments done) → remove flight from replicating
 ```
@@ -229,16 +232,18 @@ ReplicaAck { from, segment_key, batch_id } arrives
 
 | Variant | Direction | Key fields |
 |---|---|---|
-| `ReplicaAppend` | leader → follower | `from`, `segment_key`, `replica_set`, `records`, `start/end_offset`, `batch_id`, `leader_commit_offset` |
+| `ReplicaAppend` | leader → follower | `from`, `segment_key`, `replica_set`, `records`, `start/end_offset`, `batch_id` |
 | `ReplicaAck` | follower → leader | `from`, `segment_key`, `batch_id` |
+| `CommitAdvance` | leader → followers | `segment_key`, `commit_offset` |
 | `SealResponse` | coordinator → leader | `old_segment_key`, `new_segment_id`, `new_replica_set` |
 
 **DataPlaneEvent additions (D2):**
 
 | Event | Emitted by | Purpose |
 |---|---|---|
-| `ReplicateSegmentBatch` | leader, during `flush_batch()` | carries `segment_key`, `followers`, `batch`, `commit_up_to` |
+| `ReplicateSegmentBatch` | leader, during `flush_batch()` | carries `segment_key`, `followers`, `batch`, `batch_end_offset` |
 | `ReplicaAckReady` | follower, after `process_replica_append()` | carries `leader`, `segment_key`, `batch_id` |
+| `SendCommitAdvance` | leader, after `commit_segment()` | carries `segment_key`, `commit_offset`, `followers` |
 | `SendSealRequest` | leader, on replication timeout | carries `segment_key`, `failed_node`, `end_offset` |
 | `SendSegmentSealed` | leader, after seal completes | carries `segment_key`, `followers` |
 
@@ -314,8 +319,9 @@ All `data_port` wire messages, consolidated across phases:
 
 | Message | Direction | Key fields | Phase |
 |---|---|---|---|
-| `ReplicaAppend` | Leader → followers | `segment_key`, `replica_set`, `records`, `start/end_offset`, `batch_id`, `leader_commit_offset` | D2 |
+| `ReplicaAppend` | Leader → followers | `segment_key`, `replica_set`, `records`, `start/end_offset`, `batch_id` | D2 |
 | `ReplicaAck` | Follower → leader | `segment_key`, `batch_id` | D2 |
+| `CommitAdvance` | Leader → followers | `segment_key`, `commit_offset` | D2 |
 | `SealRequest` | Leader → coordinator | `shard_group_id`, `range_id`, `segment_id`, `failed_node`, `end_offset` | D2 |
 | `SealResponse` | Coordinator → leader | `old_segment_key`, `new_segment_id`, `new_replica_set` | D2/D3 |
 | `SegmentSealed` | Leader → old followers | `segment_key` | D2 |
@@ -510,7 +516,7 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 4. **Single writer per segment.** Only `replica_set[0]` (the segment leader) accepts `Produce` commands and initiates `ReplicaAppend`. Followers reject `Produce` commands for segments where `role == Follower`.
 
-5. **Follower `commit_offset` ≤ leader `commit_offset`.** Followers advance `commit_offset` from `leader_commit_offset` in `ReplicaAppend`, which reflects the leader's *previous* committed position. The follower's committed range is always ≤ the leader's.
+5. **Follower `commit_offset` ≤ leader `commit_offset`.** Followers advance `commit_offset` on `CommitAdvance` from the leader, which arrives ~0.5 RTT after the leader commits. The follower's committed range is always ≤ the leader's.
 
 6. **Replication is per-segment.** Each segment has its own `replica_set`. One WAL batch can produce batches for multiple segments; each segment's batch is replicated independently to that segment's followers. Within a `ReplicationFlight`, each `SegmentFlight` completes independently — commit and producer ACK happen per-segment, not per-flight. No cross-segment dependency.
 
