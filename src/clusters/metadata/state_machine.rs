@@ -26,6 +26,10 @@ impl MetadataStateMachine {
             .and_then(|id| self.topics.get(id))
     }
 
+    pub(crate) fn topic_names(&self) -> Vec<String> {
+        self.topic_name_index.keys().cloned().collect()
+    }
+
     pub(crate) fn topic_count(&self) -> usize {
         self.topics.len()
     }

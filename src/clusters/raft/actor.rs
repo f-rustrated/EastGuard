@@ -121,6 +121,30 @@ impl RaftSender {
             .ok()?;
         recv.await.ok()
     }
+
+    pub(crate) async fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.0
+            .send(MultiRaftActorCommand::GetLeader {
+                group_id,
+                reply: send,
+            })
+            .await
+            .ok()?;
+        recv.await.ok().flatten()
+    }
+
+    pub(crate) async fn get_topics(&self) -> Vec<String> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self.0
+            .send(MultiRaftActorCommand::GetTopics { reply: send })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        recv.await.unwrap_or_default()
+    }
 }
 
 impl From<RaftSender> for mpsc::Sender<MultiRaftActorCommand> {

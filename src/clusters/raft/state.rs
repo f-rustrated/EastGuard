@@ -110,6 +110,10 @@ impl Raft {
         self.timer_seqs.heartbeat
     }
 
+    pub(crate) fn topic_names(&self) -> Vec<String> {
+        self.state_machine.topic_names()
+    }
+
     #[cfg(test)]
     pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
         &self.state_machine
