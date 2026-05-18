@@ -85,6 +85,18 @@ cargo test sim_loop_100 -- --ignored
 cargo test bugbase_regression
 ```
 
+## Data Plane Coverage
+
+The data plane (`DataPlane<W>`, `WalStorage`, `SegmentTracker`, checkpoint, cold read) follows the same sync state-machine pattern as Raft and SWIM, so it is fully simulatable under turmoil. DST can prove correctness in three areas:
+
+| Property | What to assert |
+|---|---|
+| **WAL recovery** | After a node crash + restart, all previously acked `Produce` records survive and are readable. |
+| **Produce/consume round-trip** | After `Produce` is acked, a consumer read against the same segment returns the same records in the same order. |
+| **Segment seal → checkpoint handoff** | When `MetadataStateMachine` commits a `RollSegment`, the data plane checkpoints the sealed segment and the new segment accepts subsequent writes without a gap. |
+
+Cross-node durability (no record lost across leader failure) requires replication (`TODO replication(D2)`) to be wired first. Until then, the three properties above are testable today and cover the highest-risk single-node data plane behaviors.
+
 ## TODO
 
 ### Phase 1 — Unblock the loop + add partitions
