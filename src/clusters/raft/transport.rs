@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::messages::MultiRaftCommand;
@@ -60,6 +61,8 @@ impl RaftReader {
     }
 }
 
+const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Manages peer connections, address resolution, and dead-peer tracking.
 ///
 /// On simultaneous connect, the connection initiated by the **lower `NodeId`**
@@ -76,6 +79,10 @@ struct RaftWriters {
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
     dead_peers: HashSet<NodeId>,
+    /// Tracks when the last connect attempt to a peer failed. Prevents
+    /// rapid reconnect storms to dead/unreachable peers that would block
+    /// the transport's select loop and stall flush_events in MultiRaftActor.
+    connect_backoffs: HashMap<NodeId, Instant>,
 }
 
 impl RaftWriters {
@@ -85,6 +92,7 @@ impl RaftWriters {
             writers: HashMap::new(),
             addr_cache: HashMap::new(),
             dead_peers: HashSet::new(),
+            connect_backoffs: HashMap::new(),
         }
     }
 
@@ -145,13 +153,23 @@ impl RaftWriters {
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
         swim_tx: &SwimSender,
     ) {
+        if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
+            if failed_at.elapsed() < CONNECT_BACKOFF {
+                return;
+            }
+            self.connect_backoffs.remove(&target_id);
+        }
         if self.writers.contains_key(&target_id)
             && self.write_messages_to(&target_id, &msgs).await.is_ok()
         {
             return;
         }
-        self.connect_and_send(target_id, msgs, raft_tx, swim_tx)
-            .await;
+        if !self
+            .connect_and_send(target_id.clone(), msgs, raft_tx, swim_tx)
+            .await
+        {
+            self.connect_backoffs.insert(target_id, Instant::now());
+        }
     }
 
     async fn connect_and_send(
@@ -160,23 +178,32 @@ impl RaftWriters {
         msgs: Vec<WireRaftMessage>,
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
         swim_tx: &SwimSender,
-    ) {
+    ) -> bool {
         let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
             tracing::warn!(
                 "[{}] Cannot resolve address for {:?}",
                 self.node_id,
                 target_id
             );
-            return;
+            return false;
         };
-        let Ok(stream) = TcpStream::connect(node_addr.cluster_addr).await else {
+        // Timeout required: in turmoil (and on dead hosts generally), TcpStream::connect
+        // never returns an error — it hangs forever, stalling the select loop.
+        let Some(stream) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            TcpStream::connect(node_addr.cluster_addr),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        else {
             tracing::warn!(
                 "[{}] Failed to connect to {} ({:?})",
                 self.node_id,
                 node_addr.cluster_addr,
                 target_id
             );
-            return;
+            return false;
         };
         let (read_half, write_half) = stream.into_split();
         self.writers.insert(target_id.clone(), write_half);
@@ -186,7 +213,7 @@ impl RaftWriters {
                 self.node_id,
                 target_id
             );
-            return;
+            return false;
         }
         if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
             tracing::warn!(
@@ -195,9 +222,10 @@ impl RaftWriters {
                 msgs.len(),
                 target_id
             );
-            return;
+            return false;
         }
         tokio::spawn(RaftReader(read_half).run(raft_tx.clone()));
+        true
     }
 
     fn disconnect(&mut self, peer_id: NodeId) {
@@ -209,6 +237,7 @@ impl RaftWriters {
 
     fn cleanup_dead_peers(&mut self) {
         self.dead_peers.clear();
+        self.connect_backoffs.clear();
     }
 
     async fn resolve_address(

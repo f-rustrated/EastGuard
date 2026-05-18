@@ -610,6 +610,9 @@ impl Swim {
                     }));
             }
             SwimNodeState::Dead => {
+                // Node can receive a Dead gossip while still locally Suspect; cancel the
+                // pending suspect timer so it doesn't fire and re-emit a stale Dead event.
+                self.cancel_suspect_timer(node_id);
                 self.pending_events
                     .push(SwimEvent::Membership(MembershipEvent::NodeDead {
                         node_id: node_id.clone(),

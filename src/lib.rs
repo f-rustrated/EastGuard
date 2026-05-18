@@ -62,7 +62,9 @@ impl StartUp {
         // Raft channels
         let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
         let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
-        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 4);
+        // Each vnode can have both an election and heartbeat timer active, so capacity
+        // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
+        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 16);
 
         // Build SWIM state and extract node_id before handing state to the actor
         let state = self.env.swim(self.rng_seed);

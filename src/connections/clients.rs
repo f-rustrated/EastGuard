@@ -8,11 +8,10 @@ use crate::{
         swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
     },
     connections::request::{
-        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse,
+        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse, TopicSummary,
     },
     net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
 };
-use anyhow::bail;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -60,8 +59,13 @@ impl ClientStreamWriter {
         match query_type {
             QueryCommand::GetMembers => self.handle_get_members().await,
             QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(key).await,
+            QueryCommand::GetShardLeader { shard_group_id } => {
+                self.handle_get_shard_leader(shard_group_id).await
+            }
+            QueryCommand::GetTopics => self.handle_get_topics().await,
         }
     }
+
 
     async fn handle_get_members(&mut self) -> anyhow::Result<()> {
         let (send, recv) = tokio::sync::oneshot::channel();
@@ -70,6 +74,26 @@ impl ClientStreamWriter {
             .await?;
         let result = recv.await?;
         self.write(&result).await
+    }
+
+    async fn handle_get_shard_leader(&mut self, shard_group_id: u64) -> anyhow::Result<()> {
+        let leader = self
+            .raft_sender
+            .get_leader(ShardGroupId(shard_group_id))
+            .await
+            .map(|n| n.to_string());
+        self.write(&leader).await
+    }
+
+    async fn handle_get_topics(&mut self) -> anyhow::Result<()> {
+        let topics: Vec<TopicSummary> = self
+            .raft_sender
+            .get_topics()
+            .await
+            .into_iter()
+            .map(|name| TopicSummary { name })
+            .collect();
+        self.write(&topics).await
     }
 
     async fn handle_get_shard_info(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
@@ -81,6 +105,7 @@ impl ClientStreamWriter {
                 shard_group_id: group.id.0,
                 leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
                 leader_addr: leader.map(|e| e.leader_addr),
+                member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
         self.write(&response).await
     }
@@ -178,7 +203,14 @@ impl ClientStreamWriter {
         addr: SocketAddr,
         req: &ProposeRequest,
     ) -> anyhow::Result<ProposeResponse> {
-        let stream = TcpStream::connect(addr).await?;
+        // Bound the forward attempt: a TCP connect to an unreachable host can stall
+        // indefinitely, which would hold the client connection open for no reason.
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect to leader timed out"))??;
         let (read_half, write_half) = stream.into_split();
         let mut writer = ClientRawWriter::new(write_half);
         let mut reader = ClientStreamReader::new(read_half);
@@ -295,12 +327,7 @@ impl ClientStreamReader {
     where
         U: bincode::Decode<()>,
     {
-        let body = self.read_bytes().await;
-        if let Err(err) = body.as_ref() {
-            bail!(err.to_string())
-        }
-
-        let body = body.unwrap();
+        let body = self.read_bytes().await?;
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
         Ok(request)
     }
