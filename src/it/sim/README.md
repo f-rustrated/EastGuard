@@ -85,6 +85,21 @@ cargo test sim_loop_100 -- --ignored
 cargo test bugbase_regression
 ```
 
+## TODO
+
+### Phase 1 — Unblock the loop + add partitions
+- Fix the root cause of `sim_loop_100` failures (topic not visible after startup delay) and remove `#[ignore]`.
+- Implement `FaultKind::PartitionNode` / `HealNode` in `run_for_scenario` using `sim.partition()` / `sim.repair()`. Wire them into `SimScenario::from_seed` so the loop exercises partition faults. This covers split-brain scenarios that node kills cannot reach.
+
+### Phase 3 — Targeted fault sequences
+- Add `FaultKind::PartitionLeader` — resolves the current leader via `GetShardLeader` at fault time, then partitions it. Untargeted partition faults are much weaker.
+- Add `FaultKind::FlappingPartition { node, heal_after_secs }` — partition then heal within the same scenario, forcing SWIM death detection followed by rejoin. The hardest convergence case.
+
+### Phase 4 — Campaign runner
+- Promote the sim loop to a standalone binary (`src/bin/sim.rs`) with subcommands: `run`, `loop --n <N>`, `replay <hash>`, `list`.
+- Add a `--profile` flag to parameterize fault rates and scenario density without code changes.
+- Run `loop --n 500` nightly in CI and post failures to Slack.
+
 ## Constraints
 
 - Use `tokio::time::sleep` — `turmoil` owns the virtual clock; `std::thread::sleep` breaks it.
