@@ -39,6 +39,7 @@ pub struct ShardInfoResponse {
     pub shard_group_id: u64,
     pub leader_node_id: Option<String>,
     pub leader_addr: Option<NodeAddress>,
+    pub member_node_ids: Vec<String>,
 }
 
 #[derive(Decode, Encode, Clone)]

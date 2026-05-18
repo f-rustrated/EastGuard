@@ -12,7 +12,6 @@ use crate::{
     },
     net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
 };
-use anyhow::bail;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -106,6 +105,7 @@ impl ClientStreamWriter {
                 shard_group_id: group.id.0,
                 leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
                 leader_addr: leader.map(|e| e.leader_addr),
+                member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
         self.write(&response).await
     }
@@ -203,7 +203,14 @@ impl ClientStreamWriter {
         addr: SocketAddr,
         req: &ProposeRequest,
     ) -> anyhow::Result<ProposeResponse> {
-        let stream = TcpStream::connect(addr).await?;
+        // Bound the forward attempt: a TCP connect to an unreachable host can stall
+        // indefinitely, which would hold the client connection open for no reason.
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect to leader timed out"))??;
         let (read_half, write_half) = stream.into_split();
         let mut writer = ClientRawWriter::new(write_half);
         let mut reader = ClientStreamReader::new(read_half);
@@ -320,12 +327,7 @@ impl ClientStreamReader {
     where
         U: bincode::Decode<()>,
     {
-        let body = self.read_bytes().await;
-        if let Err(err) = body.as_ref() {
-            bail!(err.to_string())
-        }
-
-        let body = body.unwrap();
+        let body = self.read_bytes().await?;
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
         Ok(request)
     }
