@@ -53,20 +53,16 @@ accumulation_buffers[segment_key].push(record)
    └─────────────────────┬──────────────────────-┘
                          │ ◄── durability point (all replicas)
                          ▼
-   for each segment_key:
+   per segment, as each completes independently:
      commit_offset.store(tail, Release)
      notify.notify_waiters()  ◄── consumers can read
-                         │
-                         ▼
-   ACK producer (drain pending_replies with Ok)
+     ACK that segment's producers (drain segment replies with Ok)
                          │
                          ▼ (background)
    checkpoint worker       size_bytes → RollSegment at ~1GB
 ```
 
 WAL fsync is the sole disk write on the leader's critical path, same as D1. The replication fan-out is network I/O handled by `DataTransportActor` (tokio). Produce latency = `local_fsync + max(follower_fsyncs)` — one local fsync plus one replication RTT in the common case.
-
-**Optimization note:** `local_fsync` and replication fan-out could run in parallel — emit `ReplicateSegmentBatch` before fsync, letting `DataTransportActor` send while the dedicated thread blocks on fsync. Since `network_rtt + remote_fsync > local_fsync` in practice, this hides local fsync behind replication latency. Deferred — serial order is simpler and adds only ~1ms.
 
 **No-follower fast path:** When `tracker.followers()` is empty (replication_factor=1), the flow degrades to D1 behavior — `WalBatchComplete` drains `pending_replies` immediately, no replication tracking needed.
 
@@ -146,7 +142,9 @@ SegmentTracker (D1 fields unchanged)
 **New methods:**
 
 - `process_replica_append()` — follower path. Validates sender, WAL write + fsync, publishes to cache, advances `commit_offset` from leader, emits `ReplicaAckReady`.
-- `commit_segment()` — advances `commit_offset` on a segment's cache. Called by actor when a `ReplicationFlight` completes.
+- `commit_segment()` — advances `commit_offset` on a segment's cache, updates `committed_end_offset`. Called by actor when a segment's acks complete within a flight.
+
+**`ProducePending` change:** D1 emits `ProducePending(reply)`. D2 emits `ProducePending { segment_key, reply }` — the segment_key lets the actor partition replies per-segment for independent ack/failure handling.
 
 **`flush_batch()` changes:**
 
@@ -172,7 +170,7 @@ D2:  WAL write+fsync → publish_uncommitted(batch)    ← tail only, no commit
 **New actor state:**
 
 ```
-pending_replies: Vec<Sender<ProduceAck>>   (D1, unchanged)
+pending_replies: HashMap<SegmentKey, Vec<Sender<ProduceAck>>>   ← D2: per-segment (was flat Vec in D1)
 
 replication_targets: Vec<ReplicationTarget>      ← buffered per ReplicateSegmentBatch
 replicating: VecDeque<ReplicationFlight>         ← in-flight replication, keyed by batch_id
@@ -182,24 +180,33 @@ ReplicationTarget
 
 ReplicationFlight
 ├── batch_id
+└── segments: HashMap<SegmentKey, SegmentFlight>
+
+SegmentFlight
 ├── replies: Vec<Sender<ProduceAck>>
-└── pending_acks: HashMap<SegmentKey, { remaining: HashSet<NodeId>, commit_up_to }>
+├── pending_acks: HashSet<NodeId>
+└── commit_up_to: u64
 ```
+
+Each segment's replication completes independently — no cross-segment dependency within a flight. When s1's followers all ack, s1's producers are ACKed immediately even if s2 is still pending.
 
 **`spawn()` additions:** Two new params — `node_id: NodeId` (passed to `DataPlane::new()`) and `data_transport_tx: tokio_mpsc::Sender<OutboundDataMessage>` (data_port transport).
 
 **Event handling changes:**
 
 ```
-ProducePending(reply)          → push to pending_replies (unchanged)
+ProducePending { segment_key, reply }
+                               → push to pending_replies[segment_key] (D2: per-segment)
 ReplicateSegmentBatch { .. }   → buffer in replication_targets (NEW)
-WalBatchComplete { lsn }      → if no targets: ACK immediately (D1)
-                                 else: build ReplicationFlight from targets + replies
-                                       → fan-out ReplicaAppend via transport
-                                       → set ReplicationTimeout per segment
-                                       → push flight to replicating queue
+WalBatchComplete { lsn }      → for segments with no followers:
+                                   drain pending_replies[key], send Ok immediately
+                                 for segments with followers:
+                                   build SegmentFlight per segment from targets + replies
+                                   → fan-out ReplicaAppend via transport
+                                   → set ReplicationTimeout per segment
+                                   → push ReplicationFlight to replicating queue
 ReplicaAckReady { .. }         → forward ReplicaAck to leader via transport (NEW)
-WalBatchFailed(e)              → drain replies with Err (unchanged)
+WalBatchFailed(e)              → drain ALL pending_replies with Err (unchanged)
 ```
 
 **ReplicaAck processing:**
@@ -207,13 +214,14 @@ WalBatchFailed(e)              → drain replies with Err (unchanged)
 ```
 ReplicaAck { from, segment_key, batch_id } arrives
     │
-    ├── find flight → remove from from pending_acks[segment_key]
+    ├── find flight → remove from from segments[segment_key].pending_acks
     ├── cancel ReplicationTimeout if segment fully acked
     ├── segment complete → commit_segment(segment_key, commit_up_to)
-    └── all segments complete → drain flight.replies with Ok
+    │                    → drain segment_flight.replies with Ok
+    └── flight empty (all segments done) → remove flight from replicating
 ```
 
-**Multiple flights in flight:** Volume triggers can flush a second batch before the first replication completes. Flights complete independently. Drained front-to-back from `replicating` queue.
+**Multiple flights in flight:** Volume triggers can flush a second batch before the first replication completes. Flights complete independently. A flight is removed from `replicating` when all its `SegmentFlight`s are drained.
 
 ### New Commands and Events
 
@@ -324,7 +332,7 @@ All `data_port` wire messages, consolidated across phases:
 When a follower fails to ack within timeout (`DataPlaneTimeoutCallback::ReplicationTimeout`):
 
 1. Segment leader marks the segment as sealing — rejects new `Produce` commands for this segment with `ProduceAck::Err("segment sealing")`
-2. Leader drains all `ReplicationFlight` replies associated with this segment across all in-flight flights with `ProduceAck::Err("replication failed")` — producers retry
+2. Leader drains all `SegmentFlight.replies` for this segment across all in-flight flights with `ProduceAck::Err("replication failed")` — producers retry. Other segments' replies in the same flights are unaffected.
 3. Leader emits `SendSealRequest { segment_key, failed_node, end_offset }` where `end_offset = tracker.committed_end_offset` (logical offset of last record ACKed by all replicas before the failure)
 4. Actor sends `SealRequest` to coordinator via `DataTransportActor`
 5. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding failed node. Previous segment leader preserved at `replica_set[0]` (cache locality, active producer connections)
@@ -504,7 +512,7 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 5. **Follower `commit_offset` ≤ leader `commit_offset`.** Followers advance `commit_offset` from `leader_commit_offset` in `ReplicaAppend`, which reflects the leader's *previous* committed position. The follower's committed range is always ≤ the leader's.
 
-6. **Replication is per-segment.** Each segment has its own `replica_set`. One WAL batch can produce batches for multiple segments; each segment's batch is replicated independently to that segment's followers. A `ReplicationFlight` tracks all segments' acks for a single `batch_id`.
+6. **Replication is per-segment.** Each segment has its own `replica_set`. One WAL batch can produce batches for multiple segments; each segment's batch is replicated independently to that segment's followers. Within a `ReplicationFlight`, each `SegmentFlight` completes independently — commit and producer ACK happen per-segment, not per-flight. No cross-segment dependency.
 
 7. **Self-authorization is sufficient for follower onboarding.** A follower creates a `SegmentTracker` on first `ReplicaAppend` if `self.node_id ∈ replica_set` and `sender == replica_set[0]`. No prior `SegmentAssignment` required.
 
