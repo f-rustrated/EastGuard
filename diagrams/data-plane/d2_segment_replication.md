@@ -231,53 +231,21 @@ pub(crate) enum DataPlaneEvent {
 **Actor dispatch (sketch):**
 
 ```rust
-fn handle_event(event: DataPlaneEvent, state: &mut ReplicationState, /* channels */) {
-    match event {
-        ProducePending { segment_key, reply } => {
-            state.pending_replies.entry(segment_key).or_default().push(reply);
-        }
-        WalBatchComplete { lsn, segment_batches } => {
-            let mut flight_segments = HashMap::new();
-            for (key, followers, batch) in segment_batches {
-                let replies = state.pending_replies.remove(&key).unwrap_or_default();
-                if followers.is_empty() {
-                    // no replicas — commit + ACK immediately
-                    data_plane.commit_segment(key, batch.end_offset);
-                    replies.into_iter().for_each(|r| { let _ = r.send(ProduceAck::Ok); });
-                } else {
-                    // fan-out ReplicaAppend, set ReplicationTimeout
-                    flight_segments.insert(key, SegmentFlight {
-                        replies,
-                        pending_acks: followers.into_iter().collect(),
-                        batch_end_offset: batch.end_offset,
-                    });
-                }
-            }
-            if !flight_segments.is_empty() {
-                state.replicating.push_back(ReplicationFlight { batch_id: lsn, segments: flight_segments });
-            }
-        }
-        WalBatchFailed(e) => {
-            // drain ALL pending_replies with Err
-        }
-        ReplicaAckReady { .. } | SendCommitAdvance { .. } | SendSegmentSealed { .. } => {
-            // forward to DataTransportActor
-        }
-    }
+match event {
+    ProducePending { .. }        => // push reply to pending_replies[segment_key]
+    WalBatchComplete { .. }      => // per segment: no followers → commit + ACK immediately
+                                    //              has followers → build SegmentFlight, fan-out
+                                    //                              ReplicaAppend, set timeout,
+                                    //                              push to replicating
+    WalBatchFailed(..)           => // drain ALL pending_replies with Err
+    ReplicaAckReady { .. }
+    | SendCommitAdvance { .. }
+    | SendSegmentSealed { .. }   => // forward to DataTransportActor
 }
 
-// Inbound command — Replicating → Resolved
-fn handle_replica_ack(ack: ReplicaAck, state: &mut ReplicationState, /* ... */) {
-    let flight = state.find_flight(ack.batch_id);
-    let seg = flight.segments.get_mut(&ack.segment_key);
-    seg.pending_acks.remove(&ack.from);
-    if seg.pending_acks.is_empty() {
-        data_plane.commit_segment(ack.segment_key, seg.batch_end_offset);
-        // emit SendCommitAdvance, drain seg.replies with Ok
-    }
-    if flight.segments.values().all(|s| s.pending_acks.is_empty()) {
-        state.replicating.remove(flight);
-    }
+match command {
+    ReplicaAck { .. }            => // remove ack, segment complete → commit + ACK + CommitAdvance
+                                    // flight empty → remove from replicating
 }
 ```
 
