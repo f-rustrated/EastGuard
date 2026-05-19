@@ -289,15 +289,6 @@ Same as `RaftTransportActor`:
 3. **Disconnect**: On `DisconnectPeer` (SWIM node death), remove writer + addr cache, add to `dead_peers`.
 4. **Cleanup**: Every 300s, clear `dead_peers`.
 
-### Separation from Raft Transport
-
-| Property | `RaftTransportActor` | `DataTransportActor` |
-|---|---|---|
-| Port | `raft_port` (2922 TCP) | `data_port` (2923 TCP) |
-| Traffic | Low throughput (heartbeats, log entries) | High throughput (record batches) |
-| Frame limit | 4MB | 64MB |
-| Backpressure | Must never stall (Raft liveness) | Can stall (produces backpressure to producers) |
-
 ---
 
 ## Data Port Message Catalog
@@ -318,93 +309,96 @@ All `data_port` wire messages, consolidated across phases:
 
 ---
 
-## Failure Response
+## Failure Model
 
-### Follower Failure (detected by segment leader)
+All failures converge to one response: **seal the segment, open a new one.** No retry, no ISR, no reconciliation.
 
-`ReplicationTimeout` fires → actor-internal handling described in event handling above (reject produces, drain replies with Err, emit `SendSealRequest`). Cross-component seal flow:
+**Offset handoff:** `SealRequest` carries `end_offset = tracker.committed_end_offset` (logical offset of last record ACKed by all replicas). The coordinator passes it through `RollSegment` → `apply_roll_segment()` seals with this value, new segment starts at `end_offset + 1`. Maintains MetadataStateMachine invariant 8 (offset continuity).
 
-1. Actor sends `SealRequest` to coordinator via `DataTransportActor`
-2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding failed node. Previous segment leader preserved at `replica_set[0]` (cache locality, active producer connections)
-3. Raft commits → MetadataStateMachine seals old segment (sets `end_offset`), creates new segment (`start_offset = end_offset + 1`)
-4. Coordinator sends `SealResponse` back via `DataTransportActor`
-5. Leader receives `SealResponse` → creates new `SegmentTracker` (Leader, `new_replica_set`), resumes produce
-6. Leader sends `SegmentSealed` → notifies old followers to close the segment
+**Orphaned records:** Records between `commit_offset` and `tail` at seal time are not part of the sealed segment, not replayed into the new segment, and cleaned up by WAL rotation. Producers retry (never received ACK). No duplicates.
 
-**Produce downtime:** ~100ms (one Raft round-trip for `RollSegment`). Producers whose records were in the failed flight retry against the new segment — they never received an ACK.
+**RollSegment idempotency:** Scenarios F1 and F2 may race for the same failure. `apply_roll_segment()` checks preconditions — if already sealed, subsequent proposals are no-ops (DS-RSM invariant 9).
 
-### Leader Failure (detected by SWIM)
+### F1: Follower Failure
 
-Detected via SWIM node death (~6-7s). The coordinator (vnode leader) receives `HandleNodeDeath` and seals all affected active segments.
+Detected by segment leader via `ReplicationTimeout` (~500ms–1s). Leader preserves its position at `replica_set[0]`.
 
-1. SWIM detects leader (D) as dead → coordinator receives `HandleNodeDeath(D)`
-2. Coordinator proposes `RollSegment` via Raft with `new_replica_set` excluding D. A surviving follower is promoted to `replica_set[0]` (new segment leader)
-3. Raft commits → MetadataStateMachine seals old segment, creates new segment
-4. Coordinator sends `SegmentAssignment` to new segment leader via `data_port`
-5. New leader opens segment tracker, ready for produce
-6. Producer discovers new leader via metadata query (D6)
+```
+Leader D         Coordinator A        Raft [A,B,C]       Follower E
+   │                  │                    │                  │
+   │ ReplicationTimeout fires              │                  │
+   │ reject produces, drain replies Err    │                  │
+   │                  │                    │                  │
+   │──SealRequest────►│                    │                  │
+   │  {end_offset}    │──RollSegment──────►│                  │
+   │                  │  {new_rs:[D,E,G]}  │ commit           │
+   │                  │◄───────────────────│                  │
+   │◄─SealResponse────│                    │                  │
+   │  {seg 8,[D,E,G]} │                    │                  │
+   │                  │                    │                  │
+   │ open seg 8 tracker (Leader)           │                  │
+   │ resume produce (~100ms downtime)      │                  │
+   │──SegmentSealed──────────────────────────────────────────►│
+   │                  │                    │          close seg 7
+```
 
-**RollSegment idempotency:** Both paths may fire for the same failure — write-path timeout and SWIM detection can race. `apply_roll_segment()` checks preconditions; if the segment is already sealed, subsequent proposals are no-ops (DS-RSM invariant 9).
+### F2: Leader Failure
 
-### Offset Handoff: Data Plane → Metadata Plane
+Detected by SWIM node death (~6-7s). A surviving follower is promoted to `replica_set[0]`.
 
-MetadataStateMachine does not see individual records. The `DataPlane` state machine is the authoritative offset tracker during normal operation. On seal, the offset is handed off via `SealRequest` — which carries `end_offset` (= `tracker.committed_end_offset`, the logical offset of the last record ACKed by all replicas). The coordinator carries `end_offset` through to the `RollSegment` Raft command. `apply_roll_segment()` uses it to seal the segment and derive the new segment's `start_offset = end_offset + 1`. This maintains MetadataStateMachine invariant 8 (offset continuity) while keeping per-record offset tracking in the data plane.
+```
+SWIM              Coordinator A       Raft [A,B,C]     Follower E (promoted)    Producer
+  │                    │                   │                  │                    │
+  │ Leader D dead      │                   │                  │                    │
+  │──HandleNodeDeath──►│                   │                  │                    │
+  │                    │──RollSegment─────►│                  │                    │
+  │                    │  {new_rs:[E,G]}   │ commit           │                    │
+  │                    │◄──────────────────│                  │                    │
+  │                    │──SegmentAssignment──────────────────►│                    │
+  │                    │  {seg 8,[E,G]}    │       open seg 8 (Leader)             │
+  │                    │                   │                  │◄──metadata query───│
+  │                    │                   │                  │──new leader info──►│
+  │                    │                   │                  │◄──Produce──────────│
+```
 
-### Orphaned Records Past end_offset
+### F3: Sealed Segment Repair
 
-The leader's WAL (and healthy followers' WALs) may contain records past `end_offset` — published to cache (between `commit_offset` and `tail`) and fsynced locally, but never committed because the failed follower never ACKed. These records are:
+After seal, the old segment may be under-replicated. Coordinator assigns a replacement and triggers async repair. Only sealed (immutable) segments need catch-up — active segments never do (seal-on-failure guarantees fresh start).
 
-- **Not part of the sealed segment.** Consumers respect `end_offset` and never read past it.
-- **Not replayed into the new segment.** The leader drops uncommitted batches from cache on seal.
-- **Retried by producers.** Producers whose records were in the uncommitted window never received an ACK and retry against the new segment.
-- **Cleaned up.** WAL rotation eventually deletes the files containing orphaned records. Checkpoint never processes them (they're above `commit_offset`, in the uncommitted zone).
+```
+Coordinator A       Raft [A,B,C]       Healthy E          Replacement H
+   │                    │                  │                    │
+   │──ReassignSegment──►│                  │                    │
+   │  {[D,E,F]→[D,E,H]} │ commit           │                    │
+   │◄───────────────────│                  │                    │
+   │──CatchUpRequest─────────────────────────────────────────►  │
+   │                    │                  │check local inventory
+   │                    │                  │◄───CatchUpRequest──│
+   │                    │                  │ {local_end_offset} │ 
+   │                    │                  │──CatchUpResponse──►│
+   │                    │                  │  stream delta      │
+   │                    │                  │               verify CRC
+   │                    │                  │               repair complete
+```
 
-No duplicate records arise from seal-on-failure — orphaned records are dropped, and producers retry once.
-
----
-
-## Sealed Segment Repair
-
-When a sealed segment is under-replicated (replica count < `replication_factor`), the coordinator assigns a replacement node, updates `replica_set` via Raft (`ReassignSegment`), and triggers repair:
-
-1. Coordinator selects replacement node H (least-loaded, not already in `replica_set`)
-2. Coordinator proposes `ReassignSegment` via Raft: `[D, E, F]` → `[D, E, H]`
-3. After Raft commit, coordinator sends `CatchUpRequest` assignment to H via `data_port`
-4. H checks local segment inventory (see "Local Data Reuse on Recovery" in roadmap). If H has data from a previous lifecycle, it advertises `local_end_offset`
-5. Healthy replica (D or E) streams delta (offsets beyond `local_end_offset`) via `CatchUpResponse`
-6. Once H has all data (verified by offset and CRC), repair is complete
-
-**`CatchUpRequest` is the only catch-up mechanism.** In the seal-on-failure model, active segments never need catch-up — any replica failure seals the segment, and the new segment starts fresh with all replicas in sync from `start_offset`. Only sealed segments, which are immutable, need repair.
-
-Nodes get new NodeIds on restart (UUID regenerated) — from the cluster's perspective, a recovered node is a new member. However, its local disk may still contain segment data from a previous lifecycle. On `CatchUpRequest`, the replacement node checks its local segment inventory and advertises `local_end_offset` — the healthy replica streams only the delta, or nothing if the data is already complete.
-
----
-
-## Replication vs Consensus
-
-| Property | Raft (metadata) | Segment replication (data) |
-|---|---|---|
-| Model | Consensus (leader election, log ordering) | Primary-backup (leader-driven, seal-on-failure) |
-| Ack | Majority quorum | ALL replicas fsync |
-| Failure handling | Re-election, log reconciliation | Seal segment, open new one. No reconciliation. |
-| Ordering | Total order (log index) | Per-segment order (offset) |
-| Transport | `raft_port` (TCP) | `data_port` (TCP) |
-| Actor | `MultiRaftActor` (tokio) | `DataPlaneActor` (dedicated OS thread) |
+Nodes get new NodeIds on restart (UUID regenerated). Local disk may still have data from a previous lifecycle — `CatchUpRequest` advertises `local_end_offset`, healthy replica streams only the delta.
 
 ---
 
 ## Example Scenario: Seal-on-Failure
 
-```
-Metadata group (Raft): vnodes [A, B, C]    ← manage topic "orders" metadata
-Data replicas:         brokers [D, E, F]    ← store segment 7 of range 0
+Metadata group: vnodes [A, B, C]. Data replicas: brokers [D, E, F] for segment 7.
 
-Topic "orders" created via:
-  Client → ProposeRequest(CreateTopic) → vnode leader A
-  A proposes via Raft, commits on [A, B, C]
-  Coordinator assigns replica_set = [D, E, F] (based on storage policy)
-  A sends SegmentAssignment to D via data_port     ← D creates SegmentTracker (Leader)
-  D = replica_set[0] = segment leader
+```
+Client              Coordinator A       Raft [A,B,C]        Broker D
+  │                      │                   │                  │
+  │──CreateTopic────────►│                   │                  │
+  │                      │──propose─────────►│                  │
+  │                      │                   │ commit           │
+  │                      │◄──────────────────│                  │
+  │                      │──SegmentAssignment──────────────────►│
+  │                      │  {seg 7,[D,E,F]}  │       create tracker (Leader)
+  │◄─────────────────────│                   │       D = replica_set[0]
 ```
 
 **Step 1: Normal produce flow**
@@ -450,31 +444,34 @@ D <──(SealResponse)─────────│
       { new_segment_id: 8, new_replica_set: [D, E, G] }
 ```
 
-**Step 4: D resumes, notifies participants via data_port**
+**Step 4: D resumes, notifies participants via data_port (~100ms total downtime)**
 ```
-Broker D: creates SegmentTracker for segment 8 (Leader, [D, E, G])
-          resumes produce on segment 8 (~100ms total downtime)
-
-D notifies via data_port:
-
-Broker E: receives SegmentSealed from D. Closes segment 7 writes.
-           Segment 7 data on E is complete (caught up before seal).
-
-Broker G: receives first ReplicaAppend for segment 8 from D (self-authorizing).
-           Validates replica_set, creates SegmentTracker (Follower), starts accepting.
-
-Broker F: (if recovered, with new NodeId) is a new cluster member.
-           NOT in segment 8's replica_set. Old data on disk from previous lifecycle.
+Broker D              Broker E              Broker G              Broker F (dead)
+   │                     │                     │                     ✗
+   │ open seg 8 (Leader) │                     │
+   │──SegmentSealed─────►│                     │
+   │                  close seg 7              │
+   │                     │                     │
+   │──ReplicaAppend(seg 8)────────────────────►│
+   │                     │          validate replica_set (self-auth)
+   │                     │          create tracker (Follower)
+   │                     │                     │
+   │ resume produce      │                     │
 ```
 
 **Step 5: Sealed segment repair (async)**
 ```
-Coordinator detects: segment 7 under-replicated (F's copy incomplete)
-Assigns replacement: broker H
-
-H → CatchUpRequest to healthy replica E
-E → CatchUpResponse: streams records from 0 to end_offset
-H now has complete copy. Segment 7 fully replicated.
+Coordinator A       Raft [A,B,C]       Broker E           Broker H (replacement)
+   │                    │                  │                    │
+   │ seg 7 under-replicated (F missing)    │                    │
+   │──ReassignSegment──►│                  │                    │
+   │  {[D,E,F]→[D,E,H]}│ commit            │                    │
+   │◄───────────────────│                  │                    │
+   │                    │                  │◄──CatchUpRequest───│
+   │                    │                  │ {local_end_offset} │
+   │                    │                  │──CatchUpResponse──►│
+   │                    │                  │  stream delta      │
+   │                    │                  │              verify + complete
 ```
 
 ### Safety Between Seal and Notification
