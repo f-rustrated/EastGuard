@@ -53,7 +53,7 @@ accumulation_buffers[segment_key].push(record)
    │   notify.notify_waiters()                    │  ◄── leader consumers can read
    │   CommitAdvance to followers                 │
    │   drain segment replies with Ok              │  ◄── ACK producers
-   └─────────────────────┬──────────────────────-┘
+   └─────────────────────┬───────────────────────-┘
                          │
                          ▼ (background)
    checkpoint worker       size_bytes → RollSegment at ~1GB
