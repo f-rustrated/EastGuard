@@ -76,7 +76,7 @@ tracker.write_buffer.push(records)
     │ flush_batch() fires (unified — see below)
     ▼
 ╔═══════════════════════════════════════════════════════╗
-║ WAL: drain each tracker.write_buffer (all segments)    ║
+║ WAL: drain each tracker.write_buffer (all segments)   ║
 ║    → single write → fsync → BatchEnd                  ║
 ╚════════════════════════════╤══════════════════════════╝
                              │ ◄── durability point (all records in this flush)
