@@ -278,18 +278,18 @@ Leader D      Coordinator A     Raft [A,B,C]    Follower E
 Detected by SWIM node death (~6-7s). A surviving follower is promoted to `replica_set[0]`.
 
 ```
-SWIM              Coordinator A       Raft [A,B,C]     Follower E (promoted)    Producer
-  │                    │                   │                  │                    │
-  │ Leader D dead      │                   │                  │                    │
-  │──HandleNodeDeath──►│                   │                  │                    │
-  │                    │──RollSegment─────►│                  │                    │
-  │                    │  {new_rs:[E,G]}   │ commit           │                    │
-  │                    │◄──────────────────│                  │                    │
-  │                    │──SegmentAssignment──────────────────►│                    │
-  │                    │  {seg 8,[E,G]}    │       open seg 8 (Leader)             │
-  │                    │                   │                  │◄──metadata query───│
-  │                    │                   │                  │──new leader info──►│
-  │                    │                   │                  │◄──Produce──────────│
+SWIM        Coordinator A    Raft [A,B,C]   E (promoted)  Producer
+  │              │                │              │              │
+  │ Leader D dead│                │              │              │
+  │─NodeDeath───►│                │              │              │
+  │              │─RollSegment───►│              │              │
+  │              │ {new_rs:[E,G]} │ commit       │              │
+  │              │◄───────────────│              │              │
+  │              │─SegmentAssignment────────────►│              │
+  │              │ {seg 8,[E,G]}  │  open seg 8  │              │
+  │              │                │              │◄─meta query──│
+  │              │                │              │─leader info─►│
+  │              │                │              │◄─Produce─────│
 ```
 
 ### F3: Sealed Segment Repair
@@ -297,19 +297,18 @@ SWIM              Coordinator A       Raft [A,B,C]     Follower E (promoted)    
 After seal, the old segment may be under-replicated. Coordinator assigns a replacement and triggers async repair. Only sealed (immutable) segments need catch-up — active segments never do (seal-on-failure guarantees fresh start).
 
 ```
-Coordinator A       Raft [A,B,C]       Healthy E          Replacement H
-   │                    │                  │                    │
-   │──ReassignSegment──►│                  │                    │
-   │  {[D,E,F]→[D,E,H]} │ commit           │                    │
-   │◄───────────────────│                  │                    │
-   │──CatchUpAssignment───────────────────────────────────────► │
-   │                    │                  │check local inventory
-   │                    │                  │◄───CatchUpRequest──│
-   │                    │                  │ {local_end_offset} │ 
-   │                    │                  │──CatchUpResponse──►│
-   │                    │                  │  stream delta      │
-   │                    │                  │               verify CRC
-   │                    │                  │               repair complete
+Coordinator A    Raft [A,B,C]    Healthy E     Replacement H
+   │                  │              │               │
+   │─ReassignSegment─►│              │               │
+   │ {[D,E,F]→[D,E,H]}│ commit       │               │
+   │◄─────────────────│              │               │
+   │─CatchUpAssignment──────────────────────────────►│
+   │                  │              │  check local  │
+   │                  │              │◄─CatchUpReq───│
+   │                  │              │ {end_offset}  │
+   │                  │              │─CatchUpResp──►│
+   │                  │              │ stream delta  │
+   │                  │              │        verify + complete
 ```
 
 Nodes get new NodeIds on restart (UUID regenerated). Local disk may still have data from a previous lifecycle — `CatchUpRequest` advertises `local_end_offset`, healthy replica streams only the delta.
