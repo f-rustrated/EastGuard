@@ -186,7 +186,17 @@ struct SegmentFlight {
 
 Per-segment completion is independent within a flight — no cross-segment dependency.
 
-**D2 events:** `ProducePending { segment_key, reply }`, `WalBatchComplete { lsn, segment_batches }`, `ReplicaAckReady { leader, segment_key, batch_id }`, `SendCommitAdvance { segment_key, committed_end_offset, followers }`, `SendSealRequest { segment_key, failed_node, end_offset }`, `SendSegmentSealed { segment_key, followers }`.
+### DataPlane Event Catalog
+
+| Event | Role | Key fields |
+|---|---|---|
+| `ProducePending` | Leader | `segment_key`, `reply` |
+| `WalBatchComplete` | Both | `lsn`, `segment_batches` |
+| `WalBatchFailed` | Both | error reason |
+| `ReplicaAckReady` | Follower | `leader`, `segment_key`, `batch_id` |
+| `SendCommitAdvance` | Leader | `segment_key`, `committed_end_offset`, `followers` |
+| `SendSealRequest` | Leader | `segment_key`, `failed_node`, `end_offset` |
+| `SendSegmentSealed` | Leader | `segment_key`, `followers` |
 
 ### DataPlaneTimer
 
@@ -245,22 +255,22 @@ Old WAL records (under the sealed segment's routing headers) are cleaned up by n
 Detected by segment leader via `ReplicationTimeout` (~500ms–1s). Leader preserves its position at `replica_set[0]`.
 
 ```
-Leader D         Coordinator A        Raft [A,B,C]       Follower E
-   │                  │                    │                  │
-   │ ReplicationTimeout fires              │                  │
-   │ stop accepting new produces for seg 7 │                  │
-   │                  │                    │                  │
-   │──SealRequest────►│                    │                  │
-   │  {end_offset}    │──RollSegment──────►│                  │
-   │                  │  {new_rs:[D,E,G]}  │ commit           │
-   │                  │◄───────────────────│                  │
-   │◄─SealResponse────│                    │                  │
-   │  {seg 8,[D,E,G]} │                    │                  │
-   │                  │                    │                  │
-   │ open seg 8 tracker (Leader)           │                  │
-   │ resume produce (~100ms downtime)      │                  │
-   │──SegmentSealed──────────────────────────────────────────►│
-   │                  │                    │          close seg 7
+Leader D      Coordinator A     Raft [A,B,C]    Follower E
+   │               │                 │               │
+   │ ReplicationTimeout fires        │               │
+   │ stop new produces for seg 7     │               │
+   │               │                 │               │
+   │─SealRequest──►│                 │               │
+   │ {end_offset}  │─RollSegment────►│               │
+   │               │ {new_rs:[D,E,G]}│ commit        │
+   │               │◄────────────────│               │
+   │◄SealResponse──│                 │               │
+   │ {seg 8,[D,E,G]}                 │               │
+   │               │                 │               │
+   │ open seg 8, replay uncommitted  │               │
+   │ resume produce (~100ms)         │               │
+   │─SegmentSealed──────────────────────────────────►│
+   │               │                 │        close seg 7
 ```
 
 ### F2: Leader Failure
@@ -292,7 +302,7 @@ Coordinator A       Raft [A,B,C]       Healthy E          Replacement H
    │──ReassignSegment──►│                  │                    │
    │  {[D,E,F]→[D,E,H]} │ commit           │                    │
    │◄───────────────────│                  │                    │
-   │──CatchUpAssignment────────────────────────────────────────► │
+   │──CatchUpAssignment───────────────────────────────────────► │
    │                    │                  │check local inventory
    │                    │                  │◄───CatchUpRequest──│
    │                    │                  │ {local_end_offset} │ 
