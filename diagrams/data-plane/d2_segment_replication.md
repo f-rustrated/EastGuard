@@ -122,83 +122,53 @@ After the leader advances `commit_offset` (all replicas ACKed), it sends `Commit
 
 ### SegmentTracker
 
-D2 adds `role: SegmentRole` (Leader | Follower) and `replica_set: Vec<NodeId>` (`replica_set[0]` = leader).
-
 ```
 SegmentTracker (D1 fields unchanged)
 ├── cache, size_bytes, checkpoint_lsn, segment_file_path
 ├── role: Leader | Follower                     ← NEW
 ├── replica_set: [leader, follower, follower]   ← NEW
-├── committed_end_offset: u64                   ← NEW (logical offset, not ring buffer position)
-└── write_buffer: Vec<Record>                   ← NEW (moved from separate map into tracker)
+├── committed_end_offset: u64                   ← NEW
+└── write_buffer: Vec<Record>                   ← NEW
 ```
 
-**Publish split:** D1's `publish()` auto-commits. D2 splits into `publish_uncommitted()` (advances `tail` only) and `commit(batch_end_offset)` (advances ring buffer `commit_offset` by 1, updates `committed_end_offset` from the batch's logical offset, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
+**Publish split:** D1's `publish()` auto-commits. D2 splits into `publish_uncommitted()` (advances `tail` only) and `commit(batch_end_offset)` (ring buffer `commit_offset` += 1, updates `committed_end_offset`, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
 
 **Two offset domains — do not conflate:**
-- `SegmentCache.commit_offset` — ring buffer batch position (e.g., 5 = "5 batches committed"). Each `flush_batch()` produces exactly one `SegmentRecordBatch` per segment, so commit always advances by exactly 1. No stored ring position needed — `commit()` calls `cache.commit(cache.load_commit_offset() + 1)` internally.
-- `SegmentTracker.committed_end_offset` — logical record offset within the segment (e.g., 42000 = "records through offset 42000 are committed"). Updated from the batch's `end_offset` field on each commit. This is the value carried in `SealRequest.end_offset` and feeds MetadataStateMachine invariant 8 (offset continuity).
-
-- **Leader:** `publish_uncommitted()` during flush → `commit(batch_end_offset)` after all replicas ACK
-- **Follower:** `publish_uncommitted()` on `ReplicaAppend` → `commit()` on `CommitAdvance` from leader (~0.5 RTT after leader commits)
+- `SegmentCache.commit_offset` — ring buffer batch position. Always advances by 1.
+- `SegmentTracker.committed_end_offset` — logical record offset (e.g., 42000). Carried in `SealRequest.end_offset`, `CommitAdvance`, feeds MetadataStateMachine invariant 8.
 
 ### DataPlane State Machine
 
-**New field:** `node_id: NodeId` — needed for role determination and self-authorization.
+**New field:** `node_id: NodeId`
 
 **New methods:**
 
-- `process_replica_append()` — follower path. Validates sender, buffers records in `tracker.write_buffer`, sets `needs_flush`. No WAL write here — deferred to `flush_batch()`. Does NOT advance `commit_offset` — that happens on `CommitAdvance`.
-- `commit_segment(batch_end_offset)` — advances ring buffer `commit_offset` by 1 (always +1, each batch = one ring slot), updates `committed_end_offset` from the logical offset. Called by actor when a segment's acks complete within a flight.
-- `handle_seal_response(old_segment_key, new_segment_id, new_replica_set)` — creates new `SegmentTracker` with `role = Leader` and the new `replica_set`. Reads uncommitted batches from old segment's cache (`commit_offset` to `tail - 1`), injects their records into `the new segment's `tracker.write_buffer``. Emits `SendSegmentSealed` to notify old followers. Old segment's tracker is removed. Reply channels for the replayed records are migrated by the actor (see "Uncommitted tail replay").
+| Method | Role | Effect |
+|---|---|---|
+| `process_replica_append()` | Follower | Validate sender, buffer in `tracker.write_buffer`, set `needs_flush` |
+| `commit_segment(end_offset)` | Both | `commit_offset` += 1, update `committed_end_offset` |
+| `handle_seal_response(...)` | Leader | Create new tracker, replay uncommitted tail, emit `SendSegmentSealed` |
 
-**`ProducePending` change:** D1 emits `ProducePending(reply)`. D2 emits `ProducePending { segment_key, reply }` — the segment_key lets the actor partition replies per-segment for independent ack/failure handling.
+**`flush_batch()` changes (D1 → D2):** Drain each `tracker.write_buffer` → single WAL write+fsync+BatchEnd → per segment: `publish_uncommitted`, then `tracker.role` determines event (Leader → WalBatchComplete, Follower → ReplicaAckReady). Triggers: leader batch trigger (10ms/20k/10MB) OR `needs_flush` after mailbox drain.
 
-**`flush_batch()` changes:**
-
-```
-D1:  WAL write+fsync → tracker.publish(batch)       ← auto-commits
-                      → emit WalBatchComplete
-
-D2:  for each segment, drain tracker.write_buffer
-     → single WAL write+fsync+BatchEnd
-     → per segment: publish_uncommitted(batch)
-       tracker.role == Leader  → collect for WalBatchComplete (replication fan-out)
-       tracker.role == Follower → emit ReplicaAckReady
-     → reset needs_flush
-```
-
-Flush triggers: leader batch trigger (10ms / 20k / 10MB) OR `needs_flush == true` after mailbox drain. Either trigger flushes everything — leader and follower buffers combined.
-
-**`handle_segment_assignment()` changes:** D1 ignores `replica_set`. D2 stores it and sets `role = Leader` if `replica_set[0] == self.node_id`, else `Follower`.
-
-**`process()` dispatch additions:** Two new arms — `ReplicaAppend` dispatches to `process_replica_append()`, `SealResponse` dispatches to `handle_seal_response()`.
-
-**Produce rejection for followers:** If a `Produce` targets a segment where `role == Follower`, reply with `ProduceAck::Err("not leader for segment")`. Stale routing — producer retries after metadata refresh.
+**Other changes:** `handle_segment_assignment()` stores `replica_set`, sets role. `ProducePending` now carries `segment_key`. Followers reject `Produce` with error.
 
 ### DataPlaneActor
 
 **Reply lifecycle:**
 
 ```
-Pending ─────────────────► Replicating ──────────────► Resolved
-  Produce arrives            WalBatchComplete            All acks → drain with Ok
-  → push to                  → build SegmentFlights      Timeout → seal + replay
-    pending_replies            from pending_replies         (replies migrate to new segment)
-                               + segment_batches         WAL fail → drain with Err
+Pending ──────────► Replicating ──────► Resolved
+  Produce            WalBatchComplete    All acks → Ok
+  → pending_replies   → SegmentFlights   Timeout  → seal + replay (replies migrate)
+                                         WAL fail → Err
 ```
-
-Two phases, two transitions. `pending_replies` accumulates pre-flush. `WalBatchComplete` carries the segment batches and moves replies directly into `SegmentFlight`s — no intermediate buffer. On timeout, replies are not drained with Err — they migrate to the new segment via `handle_seal_response()` and resolve with `Ok` after the replayed records commit.
 
 **Actor state:**
 
 ```rust
 struct ReplicationState {
-    // Pending — accumulates between produces, drained on WalBatchComplete
-    // D2: per-segment (was flat Vec in D1)
     pending_replies: HashMap<SegmentKey, Vec<oneshot::Sender<ProduceAck>>>,
-
-    // Replicating — in-flight, built directly from pending_replies + WalBatchComplete
     replicating: VecDeque<ReplicationFlight>,
 }
 
@@ -207,66 +177,20 @@ struct ReplicationFlight {
     segments: HashMap<SegmentKey, SegmentFlight>,
 }
 
-// Per-segment within a flight — completes independently
 struct SegmentFlight {
     replies: Vec<oneshot::Sender<ProduceAck>>,
     pending_acks: HashSet<NodeId>,
-    batch_end_offset: u64,  // extracted from batch.end_offset at construction
+    batch_end_offset: u64,
 }
 ```
 
-Each segment's replication completes independently — no cross-segment dependency within a flight. When s1's followers all ack, s1's producers are ACKed immediately even if s2 is still pending.
+Per-segment completion is independent within a flight — no cross-segment dependency.
 
-**`spawn()` additions:** Two new params — `node_id: NodeId` (passed to `DataPlane::new()`) and `data_transport_tx: tokio_mpsc::Sender<OutboundDataMessage>` (data_port transport).
-
-**D2 event additions:**
-
-```rust
-pub(crate) enum DataPlaneEvent {
-    // ... D1 variants unchanged ...
-
-    ProducePending { segment_key: SegmentKey, reply: oneshot::Sender<ProduceAck> },
-    WalBatchComplete {
-        lsn: u64,
-        segment_batches: Vec<(SegmentKey, Vec<NodeId>, Arc<SegmentRecordBatch>)>,
-    },
-
-    // follower → leader
-    ReplicaAckReady { leader: NodeId, segment_key: SegmentKey, batch_id: u64 },
-    // leader → followers
-    SendCommitAdvance { segment_key: SegmentKey, committed_end_offset: u64, followers: Vec<NodeId> },
-    SendSealRequest { segment_key: SegmentKey, failed_node: NodeId, end_offset: u64 },
-    SendSegmentSealed { segment_key: SegmentKey, followers: Vec<NodeId> },
-}
-```
-
-**Actor dispatch (sketch):**
-
-```rust
-match event {
-    ProducePending { .. }        => // push reply to pending_replies[segment_key]
-    WalBatchComplete { .. }      => // per segment: no followers → commit + ACK immediately
-                                    //              has followers → build SegmentFlight, fan-out
-                                    //                              ReplicaAppend, set timeout,
-                                    //                              push to replicating
-    WalBatchFailed(..)           => // drain ALL pending_replies with Err
-    ReplicaAckReady { .. }
-    | SendCommitAdvance { .. }
-    | SendSegmentSealed { .. }   => // forward to DataTransportActor
-}
-
-match command {
-    ReplicaAck { .. }            => // remove ack, segment complete → commit + ACK
-                                    //   + SendCommitAdvance { committed_end_offset }
-                                    // flight empty → remove from replicating
-}
-```
+**D2 events:** `ProducePending { segment_key, reply }`, `WalBatchComplete { lsn, segment_batches }`, `ReplicaAckReady { leader, segment_key, batch_id }`, `SendCommitAdvance { segment_key, committed_end_offset, followers }`, `SendSealRequest { segment_key, failed_node, end_offset }`, `SendSegmentSealed { segment_key, followers }`.
 
 ### DataPlaneTimer
 
-New variant: `ReplicationTimeout { segment_key, batch_id }`. Set when replication starts for a segment batch. Cancelled when all acks received. If it fires → stop accepting produces for this segment, emit `SendSealRequest`. Reply channels kept alive — migrated to the new segment on `SealResponse` (see "Uncommitted tail replay").
-
-**Timeout tuning:** 500ms–1s. Conservative to avoid seal-on-transient-blip. A slow replica that consistently misses the timeout triggers seal — this is intentional (see roadmap "Performance Implications of ALL-Replica Ack").
+New variant: `ReplicationTimeout { segment_key, batch_id }`. Set on replication start, cancelled on all acks. Fires → stop produces for this segment, emit `SendSealRequest`, reply channels kept alive for replay. Timeout: 500ms–1s.
 
 ---
 
