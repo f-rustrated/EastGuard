@@ -1,0 +1,11 @@
+use crate::clusters::NodeId;
+use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+
+pub(crate) enum DataTransportCommand {
+    Send {
+        targets: Vec<NodeId>,
+        message: DataPlaneInterNodeCommand,
+    },
+    #[allow(dead_code)]
+    DisconnectPeer(NodeId),
+}

@@ -8,4 +8,5 @@ pub(crate) mod sparse_index;
 pub(crate) mod state;
 pub(crate) mod states;
 pub(crate) mod timer;
+pub(crate) mod transport;
 pub(crate) mod wal;
