@@ -196,7 +196,7 @@ Per-segment `VecDeque` — each segment's batches commit in order independently.
 | Command | Source | Key fields |
 |---|---|---|
 | `Produce` | Client | `segment_key`, `records`, `reply` |
-| `SegmentAssignment` | Coordinator (D3) | `segment_key`, `replica_set` |
+| `SegmentAssignment` | Coordinator (D3) | `segment_key`, `replica_set`, `start_offset` |
 | `SealSegment` | Internal | `segment_key` |
 | `CheckpointComplete` | Checkpoint worker | `segment_key`, `checkpointed_lsn` |
 | `Timeout` | Ticker | `DataPlaneTimeoutCallback` |
