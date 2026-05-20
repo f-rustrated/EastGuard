@@ -12,6 +12,18 @@ use crate::clusters::SwimNodeState::Alive;
 pub struct NodeAddress {
     pub cluster_addr: SocketAddr,
     pub client_addr: SocketAddr,
+    pub data_addr: SocketAddr,
+}
+
+impl NodeAddress {
+    #[cfg(test)]
+    pub fn test(cluster_addr: SocketAddr, client_addr: SocketAddr) -> Self {
+        Self {
+            cluster_addr,
+            client_addr,
+            data_addr: SocketAddr::new(cluster_addr.ip(), cluster_addr.port() + 1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]

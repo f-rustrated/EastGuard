@@ -530,6 +530,7 @@ impl Swim {
                 NodeAddress {
                     cluster_addr: addr,
                     client_addr: addr,
+                    data_addr: addr,
                 },
                 SwimNodeState::Alive,
                 remote_inc,
@@ -814,10 +815,10 @@ mod tests {
     fn node(id: &str, port: u16, state: SwimNodeState, inc: u64) -> SwimNode {
         SwimNode {
             node_id: NodeId::new(id),
-            addr: NodeAddress {
-                cluster_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
-                client_addr: format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
-            },
+            addr: NodeAddress::test(
+                format!("127.0.0.1:{}", port).parse().unwrap(),
+                format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
+            ),
             state,
             incarnation: inc,
         }
@@ -1611,10 +1612,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 3,
                 }],
             };
@@ -1644,10 +1642,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 3,
                 }],
             };
@@ -1684,10 +1679,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 5,
                 }],
             };
@@ -1703,10 +1695,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-other"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: "127.0.0.1:9999".parse().unwrap(),
-                        client_addr: "127.0.0.1:9999".parse().unwrap(),
-                    },
+                    leader_addr: NodeAddress::test(
+                        "127.0.0.1:9999".parse().unwrap(),
+                        "127.0.0.1:9999".parse().unwrap(),
+                    ),
                     term: 2,
                 }],
             };
@@ -1799,10 +1791,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(99),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 7,
                 }],
             };

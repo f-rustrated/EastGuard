@@ -655,10 +655,10 @@ mod tests {
         let info = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:7080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:7080".parse().unwrap(),
+            ),
             term: 1,
         };
         assert!(topology.update_shard_leader(&info));
@@ -689,10 +689,10 @@ mod tests {
         let info1 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:8080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ),
             term: 1,
         };
         topology.update_shard_leader(&info1);
@@ -700,10 +700,10 @@ mod tests {
         let info2 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-1"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8081".parse().unwrap(),
-                client_addr: "127.0.0.1:8081".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8081".parse().unwrap(),
+                "127.0.0.1:8081".parse().unwrap(),
+            ),
             term: 3,
         };
         assert!(topology.update_shard_leader(&info2));
@@ -726,10 +726,10 @@ mod tests {
         let info1 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:8080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ),
             term: 5,
         };
         topology.update_shard_leader(&info1);
@@ -737,10 +737,10 @@ mod tests {
         let stale = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-1"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8081".parse().unwrap(),
-                client_addr: "127.0.0.1:8081".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8081".parse().unwrap(),
+                "127.0.0.1:8081".parse().unwrap(),
+            ),
             term: 2,
         };
         assert!(!topology.update_shard_leader(&stale));
@@ -748,10 +748,10 @@ mod tests {
         let equal = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-1"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8081".parse().unwrap(),
-                client_addr: "127.0.0.1:8081".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8081".parse().unwrap(),
+                "127.0.0.1:8081".parse().unwrap(),
+            ),
             term: 5,
         };
         assert!(!topology.update_shard_leader(&equal));
@@ -774,10 +774,10 @@ mod tests {
         let info = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:8080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ),
             term: 1,
         };
         topology.update_shard_leader(&info);
@@ -817,19 +817,19 @@ mod tests {
         let info1 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(10),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:8080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ),
             term: 1,
         };
         let info2 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(20),
             leader_node_id: NodeId::new("node-0"),
-            leader_addr: NodeAddress {
-                cluster_addr: "127.0.0.1:8080".parse().unwrap(),
-                client_addr: "127.0.0.1:8080".parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                "127.0.0.1:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ),
             term: 2,
         };
         topology.update_shard_leader(&info1);

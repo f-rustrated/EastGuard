@@ -40,10 +40,7 @@ pub mod common {
         );
         Swim::new(
             NodeId::new(local_id),
-            NodeAddress {
-                cluster_addr: peer_addr,
-                client_addr,
-            },
+            NodeAddress::test(peer_addr, client_addr),
             topology,
             0,
         )
