@@ -418,10 +418,4 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 10. **Uncommitted tail replayed, not dropped.** Records between `commit_offset` and `tail` at seal time are read from the old segment's cache and injected into the new segment's `tracker.write_buffer`. Pending reply channels migrate with them. Producers receive `Ok` after the replayed records commit in the new segment — no retry, no duplicates from the seal mechanism.
 
-11. **DataTransportActor and RaftTransportActor are independent.** Separate ports, separate connections, separate actors. Data backpressure never stalls Raft heartbeats.
-
-12. **Unified WAL flush across roles.** All segments buffer into `tracker.write_buffer` and share one per-node WAL. `flush_batch()` iterates `segments`, drains each tracker's buffer into a single WAL write + fsync + `BatchEnd`, then uses `tracker.role` for post-flush events. One fsync per flush, not one per role per segment. WAL replay on crash recovery (D5) handles all records uniformly via routing headers.
-
-13. **`ReplicaAck` carries no data.** Only `(segment_key, batch_id)`. `batch_id` is an opaque correlation token (derived from the leader's WAL LSN, but not interpreted as a WAL position by the follower). The leader uses it to match acks to in-flight `ReplicationFlight`s.
-
-14. **Segment leader preserved on follower failure.** `RollSegment` keeps the previous leader at `replica_set[0]` when only a follower failed — preserving cache locality and active producer connections. Only when the leader itself failed does a new node take position 0.
+11. **Segment leader preserved on follower failure.** `RollSegment` keeps the previous leader at `replica_set[0]` when only a follower failed — preserving cache locality and active producer connections. Only when the leader itself failed does a new node take position 0.
