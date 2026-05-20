@@ -32,7 +32,7 @@ tracker.write_buffer.push(record)
    └─────────────────────┬──────────────────────-┘
                          │ ◄── in cache, not yet visible to consumers
                          ▼
-   emit WalBatchComplete { lsn, segment_batches }
+   emit ReplicationReady { lsn, segment_batches }
                          │
                    actor event loop
                          │
@@ -40,7 +40,6 @@ tracker.write_buffer.push(record)
    ┌─────────── fan-out to followers ────────────┐
    │ for each segment with followers:            │
    │   send ReplicaAppend to all followers       │
-   │   via DataTransportActor                    │
    │ set ReplicationTimeout timer per segment    │
    └─────────────────────┬──────────────────────-┘
                          │
@@ -59,9 +58,9 @@ tracker.write_buffer.push(record)
    checkpoint worker       size_bytes → RollSegment at ~1GB
 ```
 
-WAL fsync is the sole disk write on the leader's critical path, same as D1. The replication fan-out is network I/O handled by `DataTransportActor` (tokio). Produce latency = `local_fsync + max(follower_fsyncs)` — one local fsync plus one replication RTT in the common case.
+WAL fsync is the sole disk write on the leader's critical path, same as D1. The replication fan-out is network I/O (async, non-blocking). Produce latency = `local_fsync + max(follower_fsyncs)` — one local fsync plus one replication RTT in the common case.
 
-**No-follower fast path:** When `tracker.followers()` is empty (replication_factor=1), the flow degrades to D1 behavior — `WalBatchComplete` drains `pending_replies` immediately, no replication tracking needed.
+**No-follower fast path:** When `tracker.followers()` is empty (replication_factor=1), the flow degrades to D1 behavior — `ReplicationReady` drains `pending_replies` immediately, no replication tracking needed.
 
 ### Follower Write Path
 
@@ -84,7 +83,7 @@ tracker.write_buffer.push(records)
        per follower segment:
          publish_uncommitted(batch) → ReplicaAck to leader
        per leader segment:
-         publish_uncommitted(batch) → WalBatchComplete (replication fan-out)
+         publish_uncommitted(batch) → ReplicationReady (replication fan-out)
 
 CommitAdvance { committed_end_offset } arrives later from leader
     │
@@ -95,7 +94,7 @@ tracker.committed_end_offset = committed_end_offset
 
 Records arrive pre-batched in `ReplicaAppend` — no accumulation on the follower side. Both leader and follower segments buffer into `tracker.write_buffer`. The unified flush drains all trackers in a single WAL write + fsync + `BatchEnd`, enabling uniform crash recovery (D5).
 
-**Unified WAL Flush.** A node writes to one WAL. All segments buffer into `tracker.write_buffer` — the buffer is embedded in `SegmentTracker`, co-located with `role`, `cache`, and `committed_end_offset`. `flush_batch()` iterates `segments`, drains each tracker's `write_buffer`, and writes everything in a single WAL write + fsync + `BatchEnd`. Post-flush, `tracker.role` determines events: leader → WalBatchComplete (replication fan-out), follower → ReplicaAckReady. Single lookup per segment, no separate buffer map.
+**Unified WAL Flush.** A node writes to one WAL. All segments buffer into `tracker.write_buffer` — the buffer is embedded in `SegmentTracker`, co-located with `role`, `cache`, and `committed_end_offset`. `flush_batch()` iterates `segments`, drains each tracker's `write_buffer`, and writes everything in a single WAL write + fsync + `BatchEnd`. Post-flush, `tracker.role` determines events: leader → ReplicationReady (replication fan-out), follower → ReplicaAckReady. Single lookup per segment, no separate buffer map.
 
 Flush fires when either a leader batch trigger trips (10ms / 20k / 10MB) OR the actor finishes draining the mailbox with `needs_flush == true`. Multiple `ReplicaAppend`s from different leaders that arrive in the same mailbox batch share one fsync. Leader records ride along for free if a follower triggers the flush, and vice versa.
 
@@ -149,7 +148,7 @@ SegmentTracker (D1 fields unchanged)
 | `commit_segment(end_offset)` | Both | `commit_offset` += 1, update `committed_end_offset` |
 | `handle_seal_response(...)` | Leader | Create new tracker, replay uncommitted tail, emit `SendSegmentSealed` |
 
-**`flush_batch()` changes (D1 → D2):** Drain each `tracker.write_buffer` → single WAL write+fsync+BatchEnd → per segment: `publish_uncommitted`, then `tracker.role` determines event (Leader → WalBatchComplete, Follower → ReplicaAckReady). Triggers: leader batch trigger (10ms/20k/10MB) OR `needs_flush` after mailbox drain.
+**`flush_batch()` changes (D1 → D2):** Drain each `tracker.write_buffer` → single WAL write+fsync+BatchEnd → per segment: `publish_uncommitted`, then `tracker.role` determines event (Leader → ReplicationReady, Follower → ReplicaAckReady). Triggers: leader batch trigger (10ms/20k/10MB) OR `needs_flush` after mailbox drain.
 
 **Other changes:** `handle_segment_assignment()` stores `replica_set`, sets role. `ProducePending` now carries `segment_key`. Followers reject `Produce` with error.
 
@@ -159,8 +158,8 @@ SegmentTracker (D1 fields unchanged)
 
 ```
 Pending ──────────► Replicating ──────► Resolved
-  Produce            WalBatchComplete    All acks → Ok
-  → pending_replies   → SegmentFlights   Timeout  → seal + replay (replies migrate)
+  Produce            ReplicationReady    All acks → Ok
+  → pending_replies   → PendingBatch     Timeout  → seal + replay (replies migrate)
                                          WAL fail → Err
 ```
 
@@ -169,29 +168,25 @@ Pending ──────────► Replicating ──────► Reso
 ```rust
 struct ReplicationState {
     pending_replies: HashMap<SegmentKey, Vec<oneshot::Sender<ProduceAck>>>,
-    replicating: VecDeque<ReplicationFlight>,
+    in_flight: HashMap<SegmentKey, VecDeque<PendingBatch>>,
 }
 
-struct ReplicationFlight {
+struct PendingBatch {
     batch_id: u64,
-    segments: HashMap<SegmentKey, SegmentFlight>,
-}
-
-struct SegmentFlight {
     replies: Vec<oneshot::Sender<ProduceAck>>,
     pending_acks: HashSet<NodeId>,
     batch_end_offset: u64,
 }
 ```
 
-Per-segment completion is independent within a flight — no cross-segment dependency.
+Per-segment `VecDeque` — each segment's batches commit in order independently. `batch_id` correlates `ReplicaAck` to the right batch across followers.
 
 ### DataPlane Event Catalog
 
 | Event | Role | Key fields |
 |---|---|---|
 | `ProducePending` | Leader | `segment_key`, `reply` |
-| `WalBatchComplete` | Both | `lsn`, `segment_batches` |
+| `ReplicationReady` | Leader | `lsn`, `segment_batches` |
 | `WalBatchFailed` | Both | error reason |
 | `ReplicaAckReady` | Follower | `leader`, `segment_key`, `batch_id` |
 | `SendCommitAdvance` | Leader | `segment_key`, `committed_end_offset`, `followers` |
