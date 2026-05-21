@@ -19,11 +19,11 @@ impl DataReader {
         Ok(val)
     }
 
-    pub async fn read_node_id(&mut self) -> anyhow::Result<NodeId> {
+    pub(crate) async fn read_node_id(&mut self) -> anyhow::Result<NodeId> {
         self.read_frame(NODE_ID_FRAME_MAX).await
     }
 
-    pub async fn run(mut self, data_plane_tx: crossbeam_channel::Sender<DataPlaneCommand>) {
+    pub(crate) async fn run(mut self, data_plane_tx: crossbeam_channel::Sender<DataPlaneCommand>) {
         loop {
             match self
                 .read_frame::<DataPlaneInterNodeCommand>(DATA_FRAME_MAX)
