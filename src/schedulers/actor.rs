@@ -9,7 +9,7 @@ pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
     mut mailbox: mpsc::Receiver<TickerCommand<T>>,
     tick_period_ms: u64,
-    protocol_interval_ticks: u32,
+    protocol_interval_ticks: Option<u32>,
 ) where
     T: TTimer,
 {

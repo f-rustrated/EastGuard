@@ -11,7 +11,6 @@ pub(crate) enum TickerCommand<T> {
 pub(crate) enum TimerCommand<T> {
     SetSchedule { seq: u32, timer: T },
     CancelSchedule { seq: u32 },
-    ResetPeriodic,
 }
 
 impl<T> Display for TimerCommand<T> {
@@ -22,9 +21,6 @@ impl<T> Display for TimerCommand<T> {
             }
             TimerCommand::CancelSchedule { seq } => {
                 write!(f, "[CancelSchedule] seq: {}", seq)
-            }
-            TimerCommand::ResetPeriodic => {
-                write!(f, "[ResetPeriodic]")
             }
         }
     }

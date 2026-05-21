@@ -5,7 +5,9 @@ use crate::clusters::NodeId;
 use crate::data_plane::record::SegmentKey;
 use crate::schedulers::timer::TTimer;
 
-const REPLICATION_TIMEOUT_TICKS: u32 = 10; // 10 * 100ms = 1s
+// Data plane ticker runs at TICK_PERIOD_10_MS (10ms per tick)
+const REPLICATION_TIMEOUT_TICKS: u32 = 100; // 100 * 10ms = 1s
+const BATCH_FLUSH_DEADLINE_TICKS: u32 = 1; // 1 * 10ms = 10ms
 
 #[derive(Debug)]
 pub struct DataPlaneTimer {
@@ -20,12 +22,19 @@ impl DataPlaneTimer {
             callback: DataPlaneTimeoutCallback::ReplicationTimeout { segment_key },
         }
     }
+
+    pub(crate) fn batch_flush_deadline() -> Self {
+        Self {
+            ticks_remaining: BATCH_FLUSH_DEADLINE_TICKS,
+            callback: DataPlaneTimeoutCallback::BatchFlushDeadline,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub enum DataPlaneTimeoutCallback {
     #[default]
-    PeriodicTick,
+    BatchFlushDeadline,
     ReplicationTimeout {
         segment_key: SegmentKey,
     },
@@ -34,7 +43,7 @@ pub enum DataPlaneTimeoutCallback {
 impl fmt::Display for DataPlaneTimeoutCallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DataPlaneTimeoutCallback::PeriodicTick => write!(f, "PeriodicTick"),
+            DataPlaneTimeoutCallback::BatchFlushDeadline => write!(f, "BatchFlushDeadline"),
             DataPlaneTimeoutCallback::ReplicationTimeout { segment_key } => {
                 write!(f, "ReplicationTimeout({segment_key:?})")
             }

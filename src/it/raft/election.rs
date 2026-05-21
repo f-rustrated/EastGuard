@@ -18,7 +18,7 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
-use super::{mock_swim_handler, CLUSTER_PORT, QUERY_PORT};
+use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
 fn build_address_map(
     node_name: &str,
@@ -102,7 +102,7 @@ async fn run_raft_node(
         raft_tx.clone(),
         ticker_rx,
         TICK_PERIOD_100_MS,
-        PROBE_INTERVAL_TICKS,
+        Some(PROBE_INTERVAL_TICKS),
     ));
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
@@ -122,7 +122,12 @@ async fn run_raft_node(
     ));
 
     raft_tx
-        .send(MultiRaftCommand::EnsureGroup { group: group.clone() }.into())
+        .send(
+            MultiRaftCommand::EnsureGroup {
+                group: group.clone(),
+            }
+            .into(),
+        )
         .await
         .unwrap();
     for _ in 0..10 {
@@ -201,8 +206,16 @@ fn three_node_raft_elects_leader() -> turmoil::Result {
         assert!(leader3.is_some(), "node-3 should know the leader");
 
         let leader = leader1.unwrap();
-        assert_eq!(leader2.unwrap(), leader, "node-2 should agree on the leader");
-        assert_eq!(leader3.unwrap(), leader, "node-3 should agree on the leader");
+        assert_eq!(
+            leader2.unwrap(),
+            leader,
+            "node-2 should agree on the leader"
+        );
+        assert_eq!(
+            leader3.unwrap(),
+            leader,
+            "node-3 should agree on the leader"
+        );
 
         tracing::info!("All nodes agree: leader = {:?}", leader);
         Ok(())

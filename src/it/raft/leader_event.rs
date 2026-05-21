@@ -110,7 +110,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     raft_tx.clone(),
                     ticker_rx,
                     TICK_PERIOD_100_MS,
-                    PROBE_INTERVAL_TICKS,
+                    Some(PROBE_INTERVAL_TICKS),
                 ));
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
