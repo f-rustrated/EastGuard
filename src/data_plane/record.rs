@@ -5,7 +5,39 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crate::clusters::metadata::{RangeId, SegmentId};
 use crate::clusters::swims::ShardGroupId;
 
-pub type SegmentKey = (ShardGroupId, RangeId, SegmentId);
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
+pub struct SegmentKey {
+    pub shard_group_id: ShardGroupId,
+    pub range_id: RangeId,
+    pub segment_id: SegmentId,
+}
+
+impl SegmentKey {
+    pub fn new(shard_group_id: ShardGroupId, range_id: RangeId, segment_id: SegmentId) -> Self {
+        Self {
+            shard_group_id,
+            range_id,
+            segment_id,
+        }
+    }
+
+    pub fn file_path(&self, data_dir: &Path) -> PathBuf {
+        data_dir
+            .join(self.shard_group_id.to_string())
+            .join(self.range_id.to_string())
+            .join(format!("{}.seg", *self.segment_id))
+    }
+
+    pub fn with_segment_id(&self, segment_id: SegmentId) -> Self {
+        Self {
+            shard_group_id: self.shard_group_id,
+            range_id: self.range_id,
+            segment_id,
+        }
+    }
+}
 
 const HEADER_SIZE: usize = 9; // crc32(4) + type(1) + length(4)
 const TRAILING_LENGTH_SIZE: usize = 4;
@@ -40,11 +72,11 @@ pub struct DataRoutingHeader {
 }
 
 impl DataRoutingHeader {
-    pub(super) fn new((shard_group_id, range_id, segment_id): SegmentKey, offset: u64) -> Self {
+    pub(super) fn new(key: SegmentKey, offset: u64) -> Self {
         Self {
-            shard_group_id,
-            range_id,
-            segment_id,
+            shard_group_id: key.shard_group_id,
+            range_id: key.range_id,
+            segment_id: key.segment_id,
             logical_offset: offset,
         }
     }
@@ -78,7 +110,7 @@ impl DataRoutingHeader {
     }
 
     pub(crate) fn segment_key(&self) -> SegmentKey {
-        (self.shard_group_id, self.range_id, self.segment_id)
+        SegmentKey::new(self.shard_group_id, self.range_id, self.segment_id)
     }
 }
 

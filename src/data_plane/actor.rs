@@ -3,24 +3,25 @@ use std::thread;
 
 use crossbeam_channel::Sender;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::sync::oneshot;
-
-use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
-use crate::data_plane::messages::event::DataPlaneEvent;
-use crate::schedulers::ticker_message::TickerCommand;
 
 use super::checkpoint::CheckpointJob;
 use super::state::DataPlane;
 use super::timer::DataPlaneTimer;
 use super::wal::WalWriter;
+use crate::clusters::NodeId;
+use crate::data_plane::messages::command::DataPlaneCommand;
+use crate::data_plane::transport::command::DataTransportCommand;
+use crate::schedulers::ticker_message::TickerCommand;
 
 pub struct DataPlaneActor;
 
 impl DataPlaneActor {
     pub fn spawn(
+        node_id: NodeId,
         data_dir: PathBuf,
         checkpoint_tx: Sender<CheckpointJob>,
         scheduler_tx: tokio_mpsc::Sender<TickerCommand<DataPlaneTimer>>,
+        data_transport_tx: tokio_mpsc::Sender<DataTransportCommand>,
     ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
@@ -34,59 +35,24 @@ impl DataPlaneActor {
                         return;
                     }
                 };
-                let mut state = DataPlane::new(wal, data_dir);
-                let mut pending_replies: Vec<oneshot::Sender<ProduceAck>> = Vec::new();
+                let mut state = DataPlane::new(node_id, wal, data_dir);
 
                 while let Ok(cmd) = mailbox.recv() {
-                    state.process(cmd);
+                    state.handle_command(cmd);
 
                     while let Ok(next) = mailbox.try_recv() {
-                        state.process(next);
+                        state.handle_command(next);
                     }
 
-                    Self::handle_events(
-                        &mut pending_replies,
-                        &checkpoint_tx,
-                        &scheduler_tx,
-                        state.take_events(),
-                    );
+                    if state.should_flush() {
+                        state.flush_batch();
+                    }
+
+                    state.handle_events(&checkpoint_tx, &scheduler_tx, &data_transport_tx);
                 }
             })
             .expect("failed to spawn data-plane thread");
 
         tx
-    }
-
-    fn handle_events(
-        pending_replies: &mut Vec<oneshot::Sender<ProduceAck>>,
-        checkpoint_tx: &Sender<CheckpointJob>,
-        scheduler_tx: &tokio_mpsc::Sender<TickerCommand<DataPlaneTimer>>,
-        events: Vec<DataPlaneEvent>,
-    ) {
-        for event in events {
-            match event {
-                DataPlaneEvent::SubmitCheckpoint(job) => {
-                    let _ = checkpoint_tx.send(job);
-                }
-                DataPlaneEvent::ProducePending(reply) => {
-                    pending_replies.push(reply);
-                    // D2: initiate replication after WalBatchComplete
-                }
-                DataPlaneEvent::WalBatchComplete { lsn: _ } => {
-                    // D1: no replication, ACK immediately
-                    for reply in pending_replies.drain(..) {
-                        let _ = reply.send(ProduceAck::Ok);
-                    }
-                }
-                DataPlaneEvent::WalBatchFailed(e) => {
-                    for reply in pending_replies.drain(..) {
-                        let _ = reply.send(ProduceAck::Err(e.clone()));
-                    }
-                }
-                DataPlaneEvent::Timer(cmd) => {
-                    let _ = scheduler_tx.blocking_send(cmd.into());
-                }
-            }
-        }
     }
 }
