@@ -91,7 +91,7 @@ impl SegmentCache {
         self.commit_offset.load(Ordering::Acquire)
     }
 
-    pub(super) fn load_tail(&self) -> u64 {
+    pub(crate) fn load_tail(&self) -> u64 {
         self.tail.load(Ordering::Acquire)
     }
 
@@ -99,11 +99,25 @@ impl SegmentCache {
         self.notify.notified().await;
     }
 
-    pub(super) fn read_batch(&self, position: u64) -> Option<Arc<SegmentRecordBatch>> {
+    /// Consumer read: only returns committed, non-evicted batches.
+    pub(super) fn read_committed(&self, position: u64) -> Option<Arc<SegmentRecordBatch>> {
         let commit = self.commit_offset.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
         if position >= commit || position < frontier {
+            return None;
+        }
+
+        let idx = self.slot_index(position);
+        self.batches[idx].load_full()
+    }
+
+    /// Internal read: returns any published batch (committed or uncommitted).
+    pub(super) fn load_published(&self, position: u64) -> Option<Arc<SegmentRecordBatch>> {
+        let tail = self.tail.load(Ordering::Acquire);
+        let frontier = self.eviction_frontier.load(Ordering::Acquire);
+
+        if position >= tail || position < frontier {
             return None;
         }
 
@@ -118,17 +132,17 @@ impl SegmentCache {
     // Checkpoint path (called by checkpoint worker)
     pub(crate) fn drain_for_checkpoint(&self) -> CheckpointBatch {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let commit = self.commit_offset.load(Ordering::Acquire);
 
-        if frontier >= tail {
+        if frontier >= commit {
             return CheckpointBatch {
                 batches: Vec::new(),
                 new_frontier: frontier,
             };
         }
 
-        let mut batches = Vec::with_capacity((tail - frontier) as usize);
-        for pos in frontier..tail {
+        let mut batches = Vec::with_capacity((commit - frontier) as usize);
+        for pos in frontier..commit {
             let idx = self.slot_index(pos);
             if let Some(batch) = self.batches[idx].load_full() {
                 batches.push(batch);
@@ -137,7 +151,7 @@ impl SegmentCache {
 
         CheckpointBatch {
             batches,
-            new_frontier: tail,
+            new_frontier: commit,
         }
     }
 
@@ -209,7 +223,7 @@ mod tests {
         cache.publish(batch.clone());
         cache.commit(1);
 
-        let read = cache.read_batch(0).unwrap();
+        let read = cache.read_committed(0).unwrap();
         assert_eq!(read.start_offset, 0);
         assert_eq!(read.end_offset, 10);
     }
@@ -219,7 +233,7 @@ mod tests {
         let cache = SegmentCache::with_capacity(4);
 
         cache.publish(make_batch(0, 10, 1));
-        assert!(cache.read_batch(0).is_none());
+        assert!(cache.read_committed(0).is_none());
     }
 
     #[test]
@@ -230,7 +244,7 @@ mod tests {
         cache.commit(1);
         cache.advance_eviction_frontier(1);
 
-        assert!(cache.read_batch(0).is_none());
+        assert!(cache.read_committed(0).is_none());
     }
 
     #[test]
@@ -243,7 +257,7 @@ mod tests {
         cache.commit(3);
 
         for i in 0..3u64 {
-            let batch = cache.read_batch(i).unwrap();
+            let batch = cache.read_committed(i).unwrap();
             assert_eq!(batch.start_offset, i * 10);
         }
     }
@@ -258,8 +272,8 @@ mod tests {
 
         cache.advance_eviction_frontier(1);
 
-        assert!(cache.read_batch(0).is_none());
-        assert!(cache.read_batch(1).is_some());
+        assert!(cache.read_committed(0).is_none());
+        assert!(cache.read_committed(1).is_some());
     }
 
     #[test]
@@ -269,6 +283,7 @@ mod tests {
         for i in 0..3u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
         }
+        cache.commit(3);
 
         let checkpoint = cache.drain_for_checkpoint();
         assert_eq!(checkpoint.batches.len(), 3);
@@ -287,7 +302,7 @@ mod tests {
         }
         cache.commit(6);
 
-        let batch = cache.read_batch(5).unwrap();
+        let batch = cache.read_committed(5).unwrap();
         assert_eq!(batch.start_offset, 50);
     }
 

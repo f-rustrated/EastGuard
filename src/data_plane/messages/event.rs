@@ -1,14 +1,71 @@
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 
 use crate::{
-    data_plane::{checkpoint::CheckpointJob, messages::ProduceAck, timer::DataPlaneTimer},
+    clusters::NodeId,
+    data_plane::{
+        checkpoint::CheckpointJob,
+        messages::ProduceAck,
+        record::{SegmentKey, SegmentRecordBatch},
+        timer::DataPlaneTimer,
+    },
     schedulers::ticker_message::TimerCommand,
 };
 
+pub(crate) struct SegmentBatchInfo {
+    pub segment_key: SegmentKey,
+    pub batch: Arc<SegmentRecordBatch>,
+    pub replica_set: Vec<NodeId>,
+    pub followers: Vec<NodeId>,
+}
+
 pub(crate) enum DataPlaneEvent {
     SubmitCheckpoint(CheckpointJob),
-    ProducePending(oneshot::Sender<ProduceAck>),
-    WalBatchComplete { lsn: u64 },
+    ProducePending {
+        segment_key: SegmentKey,
+        reply: oneshot::Sender<ProduceAck>,
+    },
+    WalBatchComplete {
+        lsn: u64,
+    },
     WalBatchFailed(String),
     Timer(TimerCommand<DataPlaneTimer>),
+    ReplicationReady {
+        lsn: u64,
+        segment_batches: Vec<SegmentBatchInfo>,
+    },
+    ReplicaAckReady {
+        leader: NodeId,
+        from: NodeId,
+        segment_key: SegmentKey,
+        end_offset: u64,
+    },
+    ReplicaAckReceived {
+        segment_key: SegmentKey,
+        end_offset: u64,
+        from: NodeId,
+    },
+    SendCommitAdvance {
+        segment_key: SegmentKey,
+        committed_end_offset: u64,
+        followers: Vec<NodeId>,
+    },
+    MigrateReplies {
+        old_segment_key: SegmentKey,
+        new_segment_key: SegmentKey,
+    },
+    SendSealRequest {
+        segment_key: SegmentKey,
+        failed_node: NodeId,
+        end_offset: u64,
+    },
+    SendSegmentSealed {
+        segment_key: SegmentKey,
+        followers: Vec<NodeId>,
+    },
+    ReplicationTimedOut {
+        segment_key: SegmentKey,
+        committed_end_offset: u64,
+    },
 }
