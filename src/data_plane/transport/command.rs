@@ -9,3 +9,9 @@ pub(crate) enum DataTransportCommand {
     #[allow(dead_code)]
     DisconnectPeer(NodeId),
 }
+
+impl DataTransportCommand {
+    pub(crate) fn send(targets: Vec<NodeId>, message: DataPlaneInterNodeCommand) -> Self {
+        Self::Send { targets, message }
+    }
+}

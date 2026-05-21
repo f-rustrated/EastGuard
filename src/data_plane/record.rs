@@ -50,7 +50,7 @@ impl DataRoutingHeader {
     }
     pub(super) fn encode(&self, buf: &mut BytesMut) {
         buf.put_u64(self.shard_group_id.0);
-        buf.put_u64(self.range_id.0);
+        buf.put_u64(*self.range_id);
         buf.put_u64(self.segment_id.0);
         buf.put_u64(self.logical_offset);
     }

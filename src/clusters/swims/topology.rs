@@ -5,6 +5,7 @@ use std::io::Cursor;
 
 use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::clusters::{NodeAddress, NodeId, SwimNodeState};
+use crate::smart_pointer;
 #[cfg(test)]
 use crate::test_traits::TAssertInvariant;
 
@@ -20,6 +21,8 @@ impl ShardGroupId {
         Self(hash as u64)
     }
 }
+
+smart_pointer!(ShardGroupId, u64);
 
 /// A shard group: the set of physical nodes responsible for a key range on the ring.
 #[derive(Debug, Clone, PartialEq, Eq)]

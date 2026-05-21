@@ -181,8 +181,8 @@ impl MetadataStorage {
     }
 
     fn delete_range(&self, group_id: ShardGroupId) {
-        let start: &[u8] = &group_id.0.to_be_bytes();
-        let end: &[u8] = &(group_id.0 + 1).to_be_bytes();
+        let start: &[u8] = &group_id.to_be_bytes();
+        let end: &[u8] = &(*group_id + 1).to_be_bytes();
 
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(start, end);

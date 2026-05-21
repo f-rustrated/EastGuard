@@ -14,9 +14,9 @@ impl SparseEntry {
     ) -> Self {
         let (shard_group_id, range_id, segment_id) = segment_key;
         let mut key = Vec::with_capacity(32);
-        key.extend_from_slice(&shard_group_id.0.to_be_bytes());
-        key.extend_from_slice(&range_id.0.to_be_bytes());
-        key.extend_from_slice(&segment_id.0.to_be_bytes());
+        key.extend_from_slice(&shard_group_id.to_be_bytes());
+        key.extend_from_slice(&range_id.to_be_bytes());
+        key.extend_from_slice(&segment_id.to_be_bytes());
         key.extend_from_slice(&logical_offset.to_be_bytes());
         Self { key, byte_position }
     }
@@ -59,9 +59,9 @@ impl SparseIndex for rocksdb::DB {
 fn encode_key(segment_key: SegmentKey, offset: u64) -> Vec<u8> {
     let (shard_group_id, range_id, segment_id) = segment_key;
     let mut key = Vec::with_capacity(32);
-    key.extend_from_slice(&shard_group_id.0.to_be_bytes());
-    key.extend_from_slice(&range_id.0.to_be_bytes());
-    key.extend_from_slice(&segment_id.0.to_be_bytes());
+    key.extend_from_slice(&shard_group_id.to_be_bytes());
+    key.extend_from_slice(&range_id.to_be_bytes());
+    key.extend_from_slice(&segment_id.to_be_bytes());
     key.extend_from_slice(&offset.to_be_bytes());
     key
 }
