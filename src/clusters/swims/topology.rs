@@ -6,7 +6,7 @@ use std::io::Cursor;
 use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::clusters::{NodeAddress, NodeId, SwimNodeState};
 use crate::smart_pointer;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
@@ -107,7 +107,7 @@ impl Topology {
             }
             SwimNodeState::Suspect => {}
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -283,15 +283,10 @@ fn hash_stable(key: &[u8]) -> u32 {
     murmur3_32(&mut cursor, 0).expect("Murmur3 hashing failed")
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::test_traits::TAssertInvariant;
-
+#[cfg(any(test, debug_assertions))]
+pub mod props {
     use super::*;
-    use std::net::SocketAddr;
-
     impl TAssertInvariant for Topology {
-        #[cfg(test)]
         fn assert_invariants(&self) {
             self.assert_reverse_index_consistent();
             self.assert_groups_consistent();
@@ -356,6 +351,12 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
 
     fn topology_from(nodes: &[&str], config: TopologyConfig) -> Topology {
         let ids = nodes.iter().map(|id| NodeId::new(*id));

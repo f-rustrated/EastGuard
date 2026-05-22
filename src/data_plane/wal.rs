@@ -11,7 +11,7 @@ pub trait WalStorage {
     fn maybe_rotate(&mut self) -> io::Result<()>;
     fn delete_below(&mut self, watermark_lsn: u64);
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn assert_invariants(&self);
 }
 
@@ -191,7 +191,7 @@ impl WalStorage for WalWriter {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn assert_invariants(&self) {
         assert!(!self.files.is_empty(), "WAL must have at least one file");
 

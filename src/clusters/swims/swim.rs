@@ -5,7 +5,7 @@ use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -166,7 +166,7 @@ impl Swim {
                 self.handle_timed_out(seq, target_node_id, phase);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -360,7 +360,7 @@ impl Swim {
             term,
         };
         self.apply_shard_leader_update(&info);
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -379,7 +379,7 @@ impl Swim {
             SwimPacket::Ack(header) => self.handle_ack(src, header),
             SwimPacket::PingReq { header, target, .. } => self.handle_ping_req(src, header, target),
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -740,14 +740,9 @@ impl Swim {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, debug_assertions))]
+pub mod props {
     use super::*;
-    use crate::{
-        clusters::swims::common::{TestHarness, make_protocol},
-        test_traits::TAssertInvariant,
-    };
-    use std::net::SocketAddr;
 
     impl TAssertInvariant for Swim {
         fn assert_invariants(&self) {
@@ -801,6 +796,13 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clusters::swims::common::{TestHarness, make_protocol};
+    use std::net::SocketAddr;
 
     fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping(SwimHeader {

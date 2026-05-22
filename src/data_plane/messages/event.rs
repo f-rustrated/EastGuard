@@ -13,7 +13,7 @@ use crate::{
     schedulers::ticker_message::TimerCommand,
 };
 
-pub(crate) struct SegmentBatchInfo {
+pub(crate) struct PendingReplicationBatch {
     pub segment_key: SegmentKey,
     pub batch: Arc<SegmentRecordBatch>,
     pub replica_set: Vec<NodeId>,
@@ -33,7 +33,7 @@ pub(crate) enum DataPlaneEvent {
     Timer(TimerCommand<DataPlaneTimer>),
     ReplicationReady {
         lsn: u64,
-        segment_batches: Vec<SegmentBatchInfo>,
+        segment_batches: Vec<PendingReplicationBatch>,
     },
     ReplicaAckReady {
         leader: NodeId,
@@ -57,7 +57,7 @@ pub(crate) enum DataPlaneEvent {
     },
     SendSealRequest {
         segment_key: SegmentKey,
-        failed_node: NodeId,
+        failed_nodes: Vec<NodeId>,
         end_offset: u64,
     },
     SendSegmentSealed {

@@ -11,9 +11,6 @@ use crate::clusters::{
         strategy::{PartitionStrategy, StoragePolicy},
     },
 };
-#[cfg(test)]
-use crate::test_traits::TAssertInvariant;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum TopicState {
     Active,
@@ -360,34 +357,6 @@ impl RangeMeta {
 
         r1_recent == MERGE_SEAL_THRESHOLD && r2_recent == MERGE_SEAL_THRESHOLD
     }
-
-    #[cfg(test)]
-    fn assert_active_segment_state(&self) {
-        match self.state {
-            RangeState::Active => {
-                assert!(
-                    self.active_segment.is_some(),
-                    "active range missing active_segment"
-                );
-                let seg_id = self.active_segment.unwrap();
-                let seg = self
-                    .segments
-                    .get(&seg_id)
-                    .expect("active_segment points to missing segment");
-                assert_eq!(
-                    seg.state,
-                    SegmentState::Active,
-                    "active_segment not in Active state"
-                );
-            }
-            RangeState::Sealed | RangeState::Deleting => {
-                assert!(
-                    self.active_segment.is_none(),
-                    "sealed/deleting range has active_segment"
-                );
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -589,12 +558,13 @@ impl RangeSealHistory {
     }
 }
 
-#[cfg(test)]
-pub mod tests {
+#[cfg(any(test, debug_assertions))]
+pub mod props {
+    use crate::test_traits::TAssertInvariant;
+
     use super::*;
 
     impl TAssertInvariant for TopicMeta {
-        #[cfg(test)]
         fn assert_invariants(&self) {
             for rid in self.ranges.keys() {
                 assert!(rid.0 < self.next_range_id, "range ID >= next_range_id");
@@ -603,7 +573,7 @@ pub mod tests {
                 self.assert_keyspace_coverage();
             }
             for range in self.ranges.values() {
-                range.assert_invariants();
+                TAssertInvariant::assert_invariants(range);
                 self.assert_split_children_cooldown(range);
             }
         }
@@ -654,6 +624,7 @@ pub mod tests {
             }
         }
     }
+
     impl TAssertInvariant for RangeMeta {
         fn assert_invariants(&self) {
             self.assert_active_segment_state();
@@ -688,6 +659,33 @@ pub mod tests {
             let ts = &self.seal_history.seal_timestamps;
             for i in 1..ts.len() {
                 assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
+            }
+        }
+
+        fn assert_active_segment_state(&self) {
+            match self.state {
+                RangeState::Active => {
+                    assert!(
+                        self.active_segment.is_some(),
+                        "active range missing active_segment"
+                    );
+                    let seg_id = self.active_segment.unwrap();
+                    let seg = self
+                        .segments
+                        .get(&seg_id)
+                        .expect("active_segment points to missing segment");
+                    assert_eq!(
+                        seg.state,
+                        SegmentState::Active,
+                        "active_segment not in Active state"
+                    );
+                }
+                RangeState::Sealed | RangeState::Deleting => {
+                    assert!(
+                        self.active_segment.is_none(),
+                        "sealed/deleting range has active_segment"
+                    );
+                }
             }
         }
     }

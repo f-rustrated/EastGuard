@@ -5,7 +5,7 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 
 use crate::data_plane::record::SegmentRecordBatch;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
 const DEFAULT_CAPACITY: usize = 1024;
@@ -176,7 +176,7 @@ impl CheckpointBatch {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl TAssertInvariant for SegmentCache {
     fn assert_invariants(&self) {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);

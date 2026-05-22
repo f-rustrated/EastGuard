@@ -44,7 +44,7 @@ pub enum DataPlaneInterNodeCommand {
     },
     SealRequest {
         segment_key: SegmentKey,
-        failed_node: NodeId,
+        failed_nodes: Vec<NodeId>,
         end_offset: u64,
     },
     SealResponse {

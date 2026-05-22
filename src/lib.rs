@@ -15,7 +15,7 @@ pub(crate) mod impls;
 mod it;
 pub(crate) mod macros;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 mod test_traits;
 
 use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
