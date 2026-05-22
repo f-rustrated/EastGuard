@@ -1,5 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -83,7 +85,7 @@ impl SegmentRingBuffer {
         self.batches[idx].store(Some(batch));
 
         // ! SAFETY: why not self.tail.fetch_add(1)?
-        // because there is only one writer thread
+        // ! because there is only one writer thread
         self.tail.store(tail + 1, Ordering::Release);
     }
 
