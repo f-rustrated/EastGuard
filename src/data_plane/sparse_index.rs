@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::data_plane::record::SegmentKey;
+use crate::data_plane::SegmentKey;
 
 pub struct SparseEntry {
     key: Vec<u8>,

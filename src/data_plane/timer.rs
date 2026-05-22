@@ -2,7 +2,7 @@ use std::fmt;
 
 #[cfg(test)]
 use crate::clusters::NodeId;
-use crate::data_plane::record::SegmentKey;
+use crate::data_plane::SegmentKey;
 use crate::schedulers::timer::TTimer;
 
 // Data plane ticker runs at TICK_PERIOD_10_MS (10ms per tick)

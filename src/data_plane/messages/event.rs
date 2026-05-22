@@ -5,9 +5,10 @@ use tokio::sync::oneshot;
 use crate::{
     clusters::NodeId,
     data_plane::{
+        SegmentKey,
         checkpoint::CheckpointJob,
         messages::ProduceAck,
-        record::{SegmentKey, SegmentRecordBatch},
+        states::segment::cache::CachedBatch,
         timer::DataPlaneTimer,
     },
     schedulers::ticker_message::TimerCommand,
@@ -15,7 +16,7 @@ use crate::{
 
 pub(crate) struct PendingReplicationBatch {
     pub segment_key: SegmentKey,
-    pub batch: Arc<SegmentRecordBatch>,
+    pub batch: Arc<CachedBatch>,
     pub replica_set: Vec<NodeId>,
     pub followers: Vec<NodeId>,
 }

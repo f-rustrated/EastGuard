@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use crate::{
     clusters::NodeId,
     clusters::metadata::SegmentId,
-    data_plane::{record::SegmentKey, timer::DataPlaneTimeoutCallback},
+    data_plane::{SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
 pub enum DataPlaneCommand {

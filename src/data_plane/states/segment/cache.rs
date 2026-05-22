@@ -2,9 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwapOption;
+use bytes::Bytes;
 use tokio::sync::Notify;
 
-use crate::data_plane::record::SegmentRecordBatch;
+#[derive(Debug, Clone)]
+pub struct CachedBatch {
+    pub records: Vec<Bytes>,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub lsn: u64,
+}
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -30,8 +37,8 @@ const DEFAULT_CAPACITY: usize = 1024;
 //     on the next ring wrap. This is delayed cleanup, not a leak — the slot
 //     is logically evicted (readers rejected by frontier check) but the
 //     memory is reclaimed when the publisher physically reaches that slot.
-pub(crate) struct SegmentCache {
-    batches: Box<[ArcSwapOption<SegmentRecordBatch>]>,
+pub(crate) struct SegmentRingBuffer {
+    batches: Box<[ArcSwapOption<CachedBatch>]>,
     capacity: usize,
     tail: AtomicU64,
     commit_offset: AtomicU64,
@@ -39,7 +46,7 @@ pub(crate) struct SegmentCache {
     notify: Notify,
 }
 
-impl SegmentCache {
+impl SegmentRingBuffer {
     pub(crate) fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
@@ -54,7 +61,7 @@ impl SegmentCache {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        SegmentCache {
+        SegmentRingBuffer {
             batches,
             capacity,
             tail: AtomicU64::new(0),
@@ -70,7 +77,7 @@ impl SegmentCache {
 
     // Write path (called by DataPlane)
 
-    pub(super) fn publish(&self, batch: Arc<SegmentRecordBatch>) {
+    pub(super) fn publish(&self, batch: Arc<CachedBatch>) {
         let tail = self.tail.load(Ordering::Acquire);
         let idx = self.slot_index(tail);
         self.batches[idx].store(Some(batch));
@@ -100,7 +107,7 @@ impl SegmentCache {
     }
 
     /// Consumer read: only returns committed, non-evicted batches.
-    pub(super) fn read_committed(&self, position: u64) -> Option<Arc<SegmentRecordBatch>> {
+    pub(super) fn read_committed(&self, position: u64) -> Option<Arc<CachedBatch>> {
         let commit = self.commit_offset.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
@@ -113,7 +120,7 @@ impl SegmentCache {
     }
 
     /// Internal read: returns any published batch (committed or uncommitted).
-    pub(super) fn load_published(&self, position: u64) -> Option<Arc<SegmentRecordBatch>> {
+    pub(super) fn load_published(&self, position: u64) -> Option<Arc<CachedBatch>> {
         let tail = self.tail.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
@@ -162,7 +169,7 @@ impl SegmentCache {
 }
 
 pub(crate) struct CheckpointBatch {
-    pub batches: Vec<Arc<SegmentRecordBatch>>,
+    pub batches: Vec<Arc<CachedBatch>>,
     pub new_frontier: u64,
 }
 
@@ -177,7 +184,7 @@ impl CheckpointBatch {
 }
 
 #[cfg(any(test, debug_assertions))]
-impl TAssertInvariant for SegmentCache {
+impl TAssertInvariant for SegmentRingBuffer {
     fn assert_invariants(&self) {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
         let commit = self.commit_offset.load(Ordering::Acquire);
@@ -204,11 +211,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::data_plane::record::Record;
-
-    fn make_batch(start: u64, end: u64, lsn: u64) -> Arc<SegmentRecordBatch> {
-        Arc::new(SegmentRecordBatch {
-            records: vec![Record::data(Bytes::from("test"))],
+    fn make_batch(start: u64, end: u64, lsn: u64) -> Arc<CachedBatch> {
+        Arc::new(CachedBatch {
+            records: vec![Bytes::from("test")],
             start_offset: start,
             end_offset: end,
             lsn,
@@ -217,7 +222,7 @@ mod tests {
 
     #[test]
     fn publish_and_read() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         let batch = make_batch(0, 10, 1);
         cache.publish(batch.clone());
@@ -230,7 +235,7 @@ mod tests {
 
     #[test]
     fn read_beyond_commit_returns_none() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         cache.publish(make_batch(0, 10, 1));
         assert!(cache.read_committed(0).is_none());
@@ -238,7 +243,7 @@ mod tests {
 
     #[test]
     fn read_behind_eviction_returns_none() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         cache.publish(make_batch(0, 10, 1));
         cache.commit(1);
@@ -249,7 +254,7 @@ mod tests {
 
     #[test]
     fn multiple_publishes() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..3u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
@@ -264,7 +269,7 @@ mod tests {
 
     #[test]
     fn eviction_frontier_advances() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         cache.publish(make_batch(0, 10, 1));
         cache.publish(make_batch(10, 20, 2));
@@ -278,7 +283,7 @@ mod tests {
 
     #[test]
     fn drain_for_checkpoint() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..3u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
@@ -292,7 +297,7 @@ mod tests {
 
     #[test]
     fn ring_buffer_wraps() {
-        let cache = SegmentCache::with_capacity(4);
+        let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..6u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
@@ -308,7 +313,7 @@ mod tests {
 
     #[test]
     fn cursors_maintain_ordering() {
-        let cache = SegmentCache::with_capacity(8);
+        let cache = SegmentRingBuffer::with_capacity(8);
 
         for i in 0..5u64 {
             cache.publish(make_batch(i, i + 1, i + 1));
