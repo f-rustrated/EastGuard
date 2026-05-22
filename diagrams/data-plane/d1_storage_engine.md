@@ -109,8 +109,8 @@ accumulation_buffers[segment_key].push(record)
    ┌─────────── for each dirty segment ───────────┐
    │ tracker.publish_staged(lsn)                 │
    │   → drain write_buffer → CachedBatch       │
-   │   → Arc::new() → store at batches[tail%CAP]│
-   │   → tail.store(tail + 1, Release)           │
+   │   → Arc::new() → store at batches[write_cursor%CAP]│
+   │   → write_cursor.store(write_cursor + 1, Release)           │
    └─────────────────────┬──────────────────────-┘
                          │ ◄── in cache, not yet visible
                          ▼
@@ -120,7 +120,7 @@ accumulation_buffers[segment_key].push(record)
    └─────────────────────┬─────────────────────-┘
                          │
                          ▼
-   commit_offset.store(tail, Release)
+   read_cursor.store(write_cursor, Release)
    notify.notify_waiters()  ◄── consumers can read
                          │
                          ▼
@@ -130,7 +130,7 @@ accumulation_buffers[segment_key].push(record)
    checkpoint worker       size_bytes → RollSegment at ~1GB
 ```
 
-WAL fsync is the sole disk write on the critical path. Cache publish is two atomic stores — negligible. Replication adds one network RTT. In D1 (no replication), replication is skipped — `commit_offset` advances immediately after `tail`, consumers are notified, and ACK follows.
+WAL fsync is the sole disk write on the critical path. Cache publish is two atomic stores — negligible. Replication adds one network RTT. In D1 (no replication), replication is skipped — `read_cursor` advances immediately after `write_cursor`, consumers are notified, and ACK follows.
 
 ---
 
@@ -143,11 +143,11 @@ Consume(topic, range, offset)
 position < eviction_frontier?
     ├── yes → COLD: dispatch to cold read pool (see below)
     │
-    ├── no, position < commit_offset?
+    ├── no, position < read_cursor?
     │       └── yes → HOT: cache.read_batch(position) — Arc clone, no lock
     │
-    └── position == commit_offset?
-            └── yes → TAILING: cache.notified().await — wake on commit_offset advance
+    └── position == read_cursor?
+            └── yes → TAILING: cache.notified().await — wake on read_cursor advance
 ```
 
 Consumer offset tracking: consumers track their read position client-side. Each `Consume(topic, range, offset)` request carries the offset explicitly — the server is stateless with respect to consumer position. Consumer group offset commit and resume semantics are deferred (see roadmap backlog "Consumer Groups").
@@ -235,32 +235,32 @@ Deletion condition for wal-NNNNNN.log:
 
 ### SegmentRingBuffer
 
-Lock-free ring buffer of immutable `Arc<CachedBatch>` batches. Single writer (`DataPlane` calls `publish` + `commit`), multiple readers (consumer tasks). No locks. Two cursors: `tail` is the write cursor — where the next batch will be stored; `commit_offset` is the read cursor — consumers only see batches behind `commit_offset`. In D1 they advance together; in D2+ `commit_offset` lags by one replication RTT.
+Lock-free ring buffer of immutable `Arc<CachedBatch>` batches. Single writer (`DataPlane` calls `publish` + `commit`), multiple readers (consumer tasks). No locks. Two cursors: `write_cursor` is the write cursor — where the next batch will be stored; `read_cursor` is the read cursor — consumers only see batches behind `read_cursor`. In D1 they advance together; in D2+ `read_cursor` lags by one replication RTT.
 
 ```rust
 struct SegmentRingBuffer {
     // All fields private — access only through methods below.
     batches: [ArcSwapOption<CachedBatch>; CAPACITY],
-    tail: AtomicU64,
-    commit_offset: AtomicU64,
+    write_cursor: AtomicU64,
+    read_cursor: AtomicU64,
     eviction_frontier: AtomicU64,
     notify: tokio::sync::Notify,
 }
 
 impl SegmentRingBuffer {
     // Write path — called by DataPlane via SegmentTracker
-    fn publish(&self, batch: Arc<CachedBatch>);              // store into slot, advance tail
-    fn commit(&self, new_offset: u64);                       // advance commit_offset, notify_waiters()
+    fn publish(&self, batch: Arc<CachedBatch>);              // store into slot, advance write_cursor
+    fn commit(&self, new_offset: u64);                       // advance read_cursor, notify_waiters()
 
     // Read path — called by consumer tasks
-    fn load_commit_offset(&self) -> u64;                     // Acquire load
+    fn load_read_cursor(&self) -> u64;                     // Acquire load
     async fn notified(&self);                                // notify.notified().await
     fn read_committed(&self, position: u64) -> Option<Arc<CachedBatch>>;  // committed only
     fn load_published(&self, position: u64) -> Option<Arc<CachedBatch>>;  // committed + uncommitted
     fn load_eviction_frontier(&self) -> u64;                 // Acquire load
 
     // Checkpoint path — called by checkpoint worker
-    fn drain_for_checkpoint(&self) -> CheckpointBatch;       // reads frontier..commit_offset, returns batches + new_frontier
+    fn drain_for_checkpoint(&self) -> CheckpointBatch;       // reads frontier..read_cursor, returns batches + new_frontier
     fn advance_eviction_frontier(&self, new_frontier: u64);  // Release store
 }
 
@@ -433,7 +433,7 @@ submit CheckpointJob {
                                        │
                                        ▼
                                    read batches from cache
-                                   (read-only, behind tail)
+                                   (read-only, behind write_cursor)
                                        │
                                        ▼
                                    coalesce → write to .seg file
@@ -472,7 +472,7 @@ Segment files are derived from WAL — they exist for cold read performance, not
 2. **Node cache budget pressure.** When total cache memory approaches the node-level budget, DataPlaneActor force-checkpoints the segments with the most uncheckpointed batches to free cache slots.
 3. **WAL retention pressure.** When total WAL size exceeds a threshold (e.g., 2GB), DataPlaneActor checkpoints the segments keeping the oldest WAL files alive. Bounds crash recovery time and WAL disk usage.
 
-All triggers submit work to checkpoint worker. The `eviction_frontier` is the single source of truth — triggers check it against `tail` to determine what needs flushing. When the ring wraps, the writer overwrites the oldest slot — but only if it's behind the eviction frontier (already checkpointed) and has `Arc::strong_count() == 1` (no active reader). If the oldest slot is still held, checkpoint is forced before advancing.
+All triggers submit work to checkpoint worker. The `eviction_frontier` is the single source of truth — triggers check it against `write_cursor` to determine what needs flushing. When the ring wraps, the writer overwrites the oldest slot — but only if it's behind the eviction frontier (already checkpointed) and has `Arc::strong_count() == 1` (no active reader). If the oldest slot is still held, checkpoint is forced before advancing.
 
 ### Cold Read Pool
 
@@ -536,13 +536,13 @@ Crash recovery scans from the oldest un-deleted WAL file forward (see Phase D5).
 
 ### Uncommitted Tail on Replication Failure
 
-When replication (D2+) partially fails, records may be in the leader's cache (`tail` advanced) but not yet committed (`commit_offset` not advanced). Two sub-cases:
+When replication (D2+) partially fails, records may be in the leader's cache (`write_cursor` advanced) but not yet committed (`read_cursor` not advanced). Two sub-cases:
 
-**Follower fails, leader healthy:** The leader seals the segment with `end_offset = commit_offset` — the last offset ACKed by all replicas. Batches at positions `commit_offset` through `tail - 1` are uncommitted: cached on the leader and fsynced in the leader's WAL, but never ACKed to the producer. The leader drains these uncommitted batches from cache and replays them into the new segment (opened after `RollSegment`), where they will be re-committed with the new replica set. Producers whose records were in the uncommitted window also retry (no ACK received).
+**Follower fails, leader healthy:** The leader seals the segment with `end_offset = read_cursor` — the last offset ACKed by all replicas. Batches at positions `read_cursor` through `write_cursor - 1` are uncommitted: cached on the leader and fsynced in the leader's WAL, but never ACKed to the producer. The leader drains these uncommitted batches from cache and replays them into the new segment (opened after `RollSegment`), where they will be re-committed with the new replica set. Producers whose records were in the uncommitted window also retry (no ACK received).
 
 **Leader crashes after WAL write:** WAL records beyond the sealed segment's `end_offset` are orphaned. On recovery (D5), WAL replay compares each record's `logical_offset` against the segment's `end_offset` — records past it belong to the old, sealed segment and are skipped. The producer never received an ACK for these records and retries against the new segment leader.
 
-In D1 (no replication, `commit_offset == tail`), this subsection does not apply — there is no replication failure mode. See invariant 15.
+In D1 (no replication, `read_cursor == write_cursor`), this subsection does not apply — there is no replication failure mode. See invariant 15.
 
 ---
 
@@ -558,9 +558,9 @@ In D1 (no replication, `commit_offset == tail`), this subsection does not apply 
 
 5. **WAL deletion gated by checkpoint watermark.** A WAL file is deleted only when `global_checkpoint_watermark ≥ wal_file.max_lsn`. The watermark is the minimum last-checkpointed LSN across all active segments.
 
-6. **Cache spans eviction frontier to tail; readers bounded by commit_offset.** Batches between `eviction_frontier` and `tail` are always in the ring buffer. Consumer-visible range is positions `eviction_frontier` through `commit_offset - 1`. Batches at positions `commit_offset` through `tail - 1` exist in cache but are not yet visible to consumers. Batches behind `eviction_frontier` may still exist (held by consumer `Arc` refs) but are eligible for slot reuse. Batches at or beyond `tail` do not exist.
+6. **Cache spans eviction frontier to tail; readers bounded by read_cursor.** Batches between `eviction_frontier` and `write_cursor` are always in the ring buffer. Consumer-visible range is positions `eviction_frontier` through `read_cursor - 1`. Batches at positions `read_cursor` through `write_cursor - 1` exist in cache but are not yet visible to consumers. Batches behind `eviction_frontier` may still exist (held by consumer `Arc` refs) but are eligible for slot reuse. Batches at or beyond `write_cursor` do not exist.
 
-7. **Checkpoint is idempotent.** All three triggers (segment size, cache budget, WAL retention) check `eviction_frontier` against `tail`. No new batches since last checkpoint → no-op.
+7. **Checkpoint is idempotent.** All three triggers (segment size, cache budget, WAL retention) check `eviction_frontier` against `write_cursor`. No new batches since last checkpoint → no-op.
 
 8. **Segment file I/O uses buffered I/O + `POSIX_FADV_DONTNEED`.** Both checkpoint writes and cold reads use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages from OS page cache.
 
@@ -572,12 +572,12 @@ In D1 (no replication, `commit_offset == tail`), this subsection does not apply 
 
 12. **Node-level cache budget is a hard cap.** Sum of all ring buffer allocations never exceeds the configured budget. Under pressure, force checkpoint to advance eviction frontiers; if all batches are uncheckpointed, backpressure propagates to WAL dispatch.
 
-13. **Published batches are immutable.** No mutation after `tail` advancement. Writer never modifies data behind `tail`. Readers only access data behind `tail`. This is the SWMR (single-writer, multiple-reader) invariant that eliminates locking.
+13. **Published batches are immutable.** No mutation after `write_cursor` advancement. Writer never modifies data behind `write_cursor`. Readers only access data behind `write_cursor`. This is the SWMR (single-writer, multiple-reader) invariant that eliminates locking.
 
 14. **Within-segment record ordering preserved.** Per-segment accumulation buffers maintain arrival order. Records in a `CachedBatch` are ordered by `logical_offset`. Cross-segment ordering is not guaranteed.
 
-15. **`eviction_frontier` ≤ `commit_offset` ≤ `tail` always.** Three monotonically advancing markers partition the ring buffer into zones. In D1 (no replication), `commit_offset == tail` — both advance together on cache publish. In D2+, `commit_offset` lags `tail` by one replication RTT: `tail` advances on cache publish, `commit_offset` advances after all replicas ACK.
+15. **`eviction_frontier` ≤ `read_cursor` ≤ `write_cursor` always.** Three monotonically advancing markers partition the ring buffer into zones. In D1 (no replication), `read_cursor == write_cursor` — both advance together on cache publish. In D2+, `read_cursor` lags `write_cursor` by one replication RTT: `write_cursor` advances on cache publish, `read_cursor` advances after all replicas ACK.
 
-16. **Sealed segment `end_offset` = last committed offset.** On seal, `end_offset` is set to `commit_offset` at seal time, not `tail`. Batches at positions `commit_offset` through `tail - 1` are uncommitted — replayed into the next segment by the leader (see "Uncommitted Tail on Replication Failure").
+16. **Sealed segment `end_offset` = last committed offset.** On seal, `end_offset` is set to `read_cursor` at seal time, not `write_cursor`. Batches at positions `read_cursor` through `write_cursor - 1` are uncommitted — replayed into the next segment by the leader (see "Uncommitted Tail on Replication Failure").
 
-17. **Consumer read position determines data source.** A consumer at `position` follows exactly one path: `position < eviction_frontier` → cold read path (cold read pool); `eviction_frontier ≤ position < commit_offset` → hot cache read (clone `Arc` from ring buffer); `position == commit_offset` → tailing (await `notify`). Consumers never read at or beyond `commit_offset` — batches at positions `commit_offset` through `tail - 1` are uncommitted and invisible. This prevents consumers from observing records that may be rolled back on replication failure.
+17. **Consumer read position determines data source.** A consumer at `position` follows exactly one path: `position < eviction_frontier` → cold read path (cold read pool); `eviction_frontier ≤ position < read_cursor` → hot cache read (clone `Arc` from ring buffer); `position == read_cursor` → tailing (await `notify`). Consumers never read at or beyond `read_cursor` — batches at positions `read_cursor` through `write_cursor - 1` are uncommitted and invisible. This prevents consumers from observing records that may be rolled back on replication failure.

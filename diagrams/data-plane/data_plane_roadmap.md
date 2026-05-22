@@ -59,7 +59,7 @@ Follows Northguard's replication model. NOT Kafka ISR. NOT BookKeeper quorum.
 
 **3. Segment count growth under sustained failures.** Each failure creates a new segment — more file handles, more offset index entries, more metadata entries. Under sustained instability (e.g., rolling restarts), segment count grows faster than with ISR/majority. Mitigation: retention-based deletion continuously removes old segments. Extra segments from failures are typically short-lived and get GC'd first.
 
-**4. Where ALL-replica wins on performance.** Consumer reads are simpler and faster: ANY replica has ALL committed data. Followers track a `commit_offset` piggybacked on each `ReplicaAppend` — one extra `u64` per replication message. Followers serve reads only up to `commit_offset`, preventing the brief window where a follower has fsynced records that the leader hasn't confirmed committed. No ISR tracking, no watermark advancement protocol. Consumer can read from the nearest/fastest replica.
+**4. Where ALL-replica wins on performance.** Consumer reads are simpler and faster: ANY replica has ALL committed data. Followers track a `read_cursor` piggybacked on each `ReplicaAppend` — one extra `u64` per replication message. Followers serve reads only up to `read_cursor`, preventing the brief window where a follower has fsynced records that the leader hasn't confirmed committed. No ISR tracking, no watermark advancement protocol. Consumer can read from the nearest/fastest replica.
 
 ---
 
