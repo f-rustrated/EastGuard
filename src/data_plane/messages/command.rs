@@ -31,7 +31,6 @@ pub enum DataPlaneInterNodeCommand {
         replica_set: Vec<NodeId>,
         records: Vec<Vec<u8>>,
         start_offset: u64,
-        end_offset: u64,
     },
     ReplicaAck {
         segment_key: SegmentKey,

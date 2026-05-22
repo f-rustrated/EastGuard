@@ -142,17 +142,14 @@ impl SegmentRingBuffer {
     pub(crate) fn drain_for_checkpoint(&self) -> CheckpointBatch {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
         let commit = self.read_cursor.load(Ordering::Acquire);
+        debug_assert!(
+            frontier <= commit,
+            "eviction_frontier ({frontier}) > read_cursor ({commit})"
+        );
 
-        if frontier >= commit {
-            return CheckpointBatch {
-                batches: Vec::new(),
-                new_frontier: frontier,
-            };
-        }
-
-        let mut batches = Vec::with_capacity((commit - frontier) as usize);
+        let mut batches = Vec::new();
         for pos in frontier..commit {
-            let idx = self.slot_index(pos);
+            let idx: usize = self.slot_index(pos);
             if let Some(batch) = self.batches[idx].load_full() {
                 batches.push(batch);
             }
