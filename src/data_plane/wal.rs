@@ -111,6 +111,7 @@ impl WalRecord {
 
 pub trait WalStorage {
     fn buf(&mut self) -> &mut Vec<u8>;
+    fn next_lsn(&self) -> u64;
     fn flush_batch(&mut self) -> io::Result<u64>;
     fn maybe_rotate(&mut self) -> io::Result<()>;
     fn delete_below(&mut self, watermark_lsn: u64);
@@ -248,6 +249,10 @@ impl WalStorage for WalWriter {
         &mut self.batch_buf
     }
 
+    fn next_lsn(&self) -> u64 {
+        self.next_lsn
+    }
+
     fn flush_batch(&mut self) -> io::Result<u64> {
         let lsn = self.next_lsn;
         let batch_len = self.batch_buf.len() as u64;
@@ -369,6 +374,10 @@ pub mod tests {
     impl WalStorage for MockWalStorage {
         fn buf(&mut self) -> &mut Vec<u8> {
             &mut self.batch_buf
+        }
+
+        fn next_lsn(&self) -> u64 {
+            self.next_lsn
         }
 
         fn flush_batch(&mut self) -> io::Result<u64> {

@@ -68,9 +68,9 @@ pub struct Raft {
 }
 
 pub(crate) struct TimerSeqs {
-    pub election: u32,
-    pub heartbeat: u32,
-    pub merge_check: u32,
+    pub election: u64,
+    pub heartbeat: u64,
+    pub merge_check: u64,
 }
 
 impl Raft {
@@ -106,7 +106,7 @@ impl Raft {
         raft
     }
 
-    pub(crate) fn heartbeat_seq(&self) -> u32 {
+    pub(crate) fn heartbeat_seq(&self) -> u64 {
         self.timer_seqs.heartbeat
     }
 

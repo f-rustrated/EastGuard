@@ -59,7 +59,7 @@ impl TTimer for DataPlaneTimer {
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, _seq: u32, _now: u64) -> DataPlaneTimeoutCallback {
+    fn to_timeout_callback(self, _seq: u64, _now: u64) -> DataPlaneTimeoutCallback {
         self.callback
     }
 

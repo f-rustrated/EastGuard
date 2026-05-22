@@ -4,20 +4,20 @@ use std::collections::HashMap;
 pub const TICK_PERIOD_100_MS: u64 = 100;
 #[allow(dead_code)]
 pub const TICK_PERIOD_10_MS: u64 = 10;
-pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
+pub(crate) const PROBE_INTERVAL_TICKS: u64 = 10; // 10 × 100ms = 1s
 
 #[derive(Debug)]
 pub(crate) struct Ticker<T> {
-    protocol_elapsed: u32,
-    protocol_interval_ticks: Option<u32>,
-    timers: HashMap<u32, T>,
+    protocol_elapsed: u64,
+    protocol_interval_ticks: Option<u64>,
+    timers: HashMap<u64, T>,
 }
 
 impl<T> Ticker<T>
 where
     T: TTimer,
 {
-    pub(crate) fn new(protocol_interval_ticks: Option<u32>) -> Self {
+    pub(crate) fn new(protocol_interval_ticks: Option<u64>) -> Self {
         Self {
             protocol_elapsed: 0,
             protocol_interval_ticks,
@@ -27,7 +27,7 @@ where
     pub(crate) fn apply(&mut self, cmd: TimerCommand<T>) {
         match cmd {
             TimerCommand::SetSchedule { seq, timer } => {
-                self.timers.insert(seq, timer);
+                self.timers.entry(seq).or_insert(timer);
             }
             TimerCommand::CancelSchedule { seq } => {
                 self.timers.remove(&seq);
@@ -39,7 +39,7 @@ where
         let mut events = Vec::new();
 
         // 1. Age every in-flight timer
-        let mut timeout_seqs: Vec<u32> = vec![];
+        let mut timeout_seqs: Vec<u64> = vec![];
         for (seq, probe) in self.timers.iter_mut() {
             if probe.tick() == 0 {
                 timeout_seqs.push(*seq);
@@ -64,7 +64,7 @@ where
     }
 
     #[cfg(test)]
-    pub fn probe_seq_for(&self, node_id: &str) -> Option<u32> {
+    pub fn probe_seq_for(&self, node_id: &str) -> Option<u64> {
         self.timers
             .iter()
             .find(|(_, probe)| probe.target_node_id().as_deref() == Some(node_id))
@@ -72,7 +72,7 @@ where
     }
 
     #[cfg(test)]
-    pub fn has_timer(&self, seq: u32) -> bool {
+    pub fn has_timer(&self, seq: u64) -> bool {
         self.timers.contains_key(&seq)
     }
 }

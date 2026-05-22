@@ -9,8 +9,8 @@ pub(crate) enum TickerCommand<T> {
 
 #[derive(Debug)]
 pub(crate) enum TimerCommand<T> {
-    SetSchedule { seq: u32, timer: T },
-    CancelSchedule { seq: u32 },
+    SetSchedule { seq: u64, timer: T },
+    CancelSchedule { seq: u64 },
 }
 
 impl<T> Display for TimerCommand<T> {

@@ -69,12 +69,12 @@ pub struct Swim {
     pub(crate) topology: Topology,
 
     // Sequence
-    seq_counter: u32,
-    last_suspected_seqs: BTreeMap<NodeId, u32>,
+    seq_counter: u64,
+    last_suspected_seqs: BTreeMap<NodeId, u64>,
 
     // Output buffers
     pending_events: Vec<SwimEvent>,
-    pending_indirect_pings: BTreeMap<u32, ProxyPing>,
+    pending_indirect_pings: BTreeMap<u64, ProxyPing>,
 }
 
 impl Swim {
@@ -120,7 +120,7 @@ impl Swim {
         self
     }
 
-    fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
+    fn generate_swim_header(&mut self, seq: u64) -> SwimHeader {
         let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
         let used: usize = gossip.iter().map(|m| m.size()).sum();
         let remaining = MAX_GOSSIP_BYTES.saturating_sub(used);
@@ -170,7 +170,7 @@ impl Swim {
         self.assert_invariants();
     }
 
-    fn handle_timed_out(&mut self, seq: u32, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
+    fn handle_timed_out(&mut self, seq: u64, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
         if let Some(target) = target_node_id {
             self.handle_probe_timeout(seq, target, phase);
         } else {
@@ -178,7 +178,7 @@ impl Swim {
         }
     }
 
-    fn handle_probe_timeout(&mut self, seq: u32, target: NodeId, phase: SwimTimerKind) {
+    fn handle_probe_timeout(&mut self, seq: u64, target: NodeId, phase: SwimTimerKind) {
         match phase {
             SwimTimerKind::DirectProbe => self.start_indirect_probe(target, seq),
             SwimTimerKind::IndirectProbe => self.try_mark_suspect(target),
@@ -187,7 +187,7 @@ impl Swim {
         }
     }
 
-    fn handle_non_probe_timeout(&mut self, seq: u32, phase: SwimTimerKind) {
+    fn handle_non_probe_timeout(&mut self, seq: u64, phase: SwimTimerKind) {
         match phase {
             SwimTimerKind::ProxyPing => {
                 self.pending_indirect_pings.remove(&seq);
@@ -244,7 +244,7 @@ impl Swim {
     // We preserve the previous direct probe's seq so that we can cancel
     // indirect probe timeout when we receive a long-running Ack message
     // from the previous direct probe
-    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
+    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u64) {
         let Some(cluster_addr) = self
             .members
             .get(&target_node_id)
@@ -319,7 +319,7 @@ impl Swim {
         }
     }
 
-    fn try_mark_dead(&mut self, target_node_id: NodeId, registered_seq: u32) {
+    fn try_mark_dead(&mut self, target_node_id: NodeId, registered_seq: u64) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Suspect {
                 return;
@@ -648,7 +648,7 @@ impl Swim {
             .enqueue(info.clone(), self.members.len());
     }
 
-    fn next_seq(&mut self) -> u32 {
+    fn next_seq(&mut self) -> u64 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
     }
@@ -804,7 +804,7 @@ mod tests {
     use crate::clusters::swims::common::{TestHarness, make_protocol};
     use std::net::SocketAddr;
 
-    fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+    fn ping(seq: u64, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
@@ -826,7 +826,7 @@ mod tests {
         }
     }
 
-    fn ack(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+    fn ack(seq: u64, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ack(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
@@ -837,7 +837,7 @@ mod tests {
     }
 
     fn pingreq(
-        seq: u32,
+        seq: u64,
         from_id: &str,
         from_inc: u64,
         target: SocketAddr,

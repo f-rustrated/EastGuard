@@ -94,7 +94,7 @@ pub mod common {
 
         pub fn tick_until<T>(
             &mut self,
-            max_ticks: u32,
+            max_ticks: u64,
             mut f: impl FnMut(&TestHarness<SwimTimer>) -> Option<T>,
         ) -> T {
             for _ in 0..max_ticks {
