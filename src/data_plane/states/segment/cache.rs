@@ -42,8 +42,8 @@ const DEFAULT_CAPACITY: usize = 1024;
 pub(crate) struct SegmentRingBuffer {
     batches: Box<[ArcSwapOption<CachedBatch>]>,
     capacity: usize,
-    tail: AtomicU64,
-    commit_offset: AtomicU64,
+    write_cursor: AtomicU64,
+    read_cursor: AtomicU64,
     eviction_frontier: AtomicU64,
     notify: Notify,
 }
@@ -66,8 +66,8 @@ impl SegmentRingBuffer {
         SegmentRingBuffer {
             batches,
             capacity,
-            tail: AtomicU64::new(0),
-            commit_offset: AtomicU64::new(0),
+            write_cursor: AtomicU64::new(0),
+            read_cursor: AtomicU64::new(0),
             eviction_frontier: AtomicU64::new(0),
             notify: Notify::new(),
         }
@@ -80,28 +80,28 @@ impl SegmentRingBuffer {
     // Write path (called by DataPlane)
 
     pub(super) fn publish(&self, batch: Arc<CachedBatch>) {
-        let tail = self.tail.load(Ordering::Acquire);
+        let tail = self.write_cursor.load(Ordering::Acquire);
         let idx = self.slot_index(tail);
         self.batches[idx].store(Some(batch));
 
-        // ! SAFETY: why not self.tail.fetch_add(1)?
+        // ! SAFETY: why not self.write_cursor.fetch_add(1)?
         // ! because there is only one writer thread
-        self.tail.store(tail + 1, Ordering::Release);
+        self.write_cursor.store(tail + 1, Ordering::Release);
     }
 
-    pub(super) fn commit(&self, new_offset: u64) {
-        self.commit_offset.store(new_offset, Ordering::Release);
+    pub(super) fn advance_read_cursor(&self, new_offset: u64) {
+        self.read_cursor.store(new_offset, Ordering::Release);
         self.notify.notify_waiters();
     }
 
     // Read path (called by consumer tasks)
 
-    pub(crate) fn load_commit_offset(&self) -> u64 {
-        self.commit_offset.load(Ordering::Acquire)
+    pub(crate) fn load_read_cursor(&self) -> u64 {
+        self.read_cursor.load(Ordering::Acquire)
     }
 
-    pub(crate) fn load_tail(&self) -> u64 {
-        self.tail.load(Ordering::Acquire)
+    pub(crate) fn load_write_cursor(&self) -> u64 {
+        self.write_cursor.load(Ordering::Acquire)
     }
 
     pub async fn notified(&self) {
@@ -110,7 +110,7 @@ impl SegmentRingBuffer {
 
     /// Consumer read: only returns committed, non-evicted batches.
     pub(super) fn read_committed(&self, position: u64) -> Option<Arc<CachedBatch>> {
-        let commit = self.commit_offset.load(Ordering::Acquire);
+        let commit = self.read_cursor.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
         if position >= commit || position < frontier {
@@ -123,7 +123,7 @@ impl SegmentRingBuffer {
 
     /// Internal read: returns any published batch (committed or uncommitted).
     pub(super) fn load_published(&self, position: u64) -> Option<Arc<CachedBatch>> {
-        let tail = self.tail.load(Ordering::Acquire);
+        let tail = self.write_cursor.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
         if position >= tail || position < frontier {
@@ -141,7 +141,7 @@ impl SegmentRingBuffer {
     // Checkpoint path (called by checkpoint worker)
     pub(crate) fn drain_for_checkpoint(&self) -> CheckpointBatch {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
-        let commit = self.commit_offset.load(Ordering::Acquire);
+        let commit = self.read_cursor.load(Ordering::Acquire);
 
         if frontier >= commit {
             return CheckpointBatch {
@@ -189,14 +189,14 @@ impl CheckpointBatch {
 impl TAssertInvariant for SegmentRingBuffer {
     fn assert_invariants(&self) {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
-        let commit = self.commit_offset.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let commit = self.read_cursor.load(Ordering::Acquire);
+        let tail = self.write_cursor.load(Ordering::Acquire);
 
         assert!(
             frontier <= commit,
-            "eviction_frontier ({frontier}) > commit_offset ({commit})"
+            "eviction_frontier ({frontier}) > read_cursor ({commit})"
         );
-        assert!(commit <= tail, "commit_offset ({commit}) > tail ({tail})");
+        assert!(commit <= tail, "read_cursor ({commit}) > tail ({tail})");
 
         for pos in frontier..tail {
             let idx = self.slot_index(pos);
@@ -228,7 +228,7 @@ mod tests {
 
         let batch = make_batch(0, 10, 1);
         cache.publish(batch.clone());
-        cache.commit(1);
+        cache.advance_read_cursor(1);
 
         let read = cache.read_committed(0).unwrap();
         assert_eq!(read.start_offset, 0);
@@ -248,7 +248,7 @@ mod tests {
         let cache = SegmentRingBuffer::with_capacity(4);
 
         cache.publish(make_batch(0, 10, 1));
-        cache.commit(1);
+        cache.advance_read_cursor(1);
         cache.advance_eviction_frontier(1);
 
         assert!(cache.read_committed(0).is_none());
@@ -261,7 +261,7 @@ mod tests {
         for i in 0..3u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
         }
-        cache.commit(3);
+        cache.advance_read_cursor(3);
 
         for i in 0..3u64 {
             let batch = cache.read_committed(i).unwrap();
@@ -275,7 +275,7 @@ mod tests {
 
         cache.publish(make_batch(0, 10, 1));
         cache.publish(make_batch(10, 20, 2));
-        cache.commit(2);
+        cache.advance_read_cursor(2);
 
         cache.advance_eviction_frontier(1);
 
@@ -290,7 +290,7 @@ mod tests {
         for i in 0..3u64 {
             cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
         }
-        cache.commit(3);
+        cache.advance_read_cursor(3);
 
         let checkpoint = cache.drain_for_checkpoint();
         assert_eq!(checkpoint.batches.len(), 3);
@@ -307,7 +307,7 @@ mod tests {
                 cache.advance_eviction_frontier(i - 1);
             }
         }
-        cache.commit(6);
+        cache.advance_read_cursor(6);
 
         let batch = cache.read_committed(5).unwrap();
         assert_eq!(batch.start_offset, 50);
@@ -320,12 +320,12 @@ mod tests {
         for i in 0..5u64 {
             cache.publish(make_batch(i, i + 1, i + 1));
         }
-        cache.commit(5);
+        cache.advance_read_cursor(5);
         cache.advance_eviction_frontier(2);
 
         let frontier = cache.load_eviction_frontier();
-        let commit = cache.load_commit_offset();
-        let tail = cache.load_tail();
+        let commit = cache.load_read_cursor();
+        let tail = cache.load_write_cursor();
 
         assert!(frontier <= commit);
         assert!(commit <= tail);
