@@ -95,7 +95,7 @@ Sparse index trades one short sequential scan on read for dramatically fewer ind
 records arrive
     │
     ▼
-accumulation_buffers[segment_key].push(record)
+tracker.staged_records.push(record)
     │
     │ batch trigger fires (10ms / 20k records / 10MB)
     ▼
@@ -108,7 +108,7 @@ accumulation_buffers[segment_key].push(record)
                          ▼
    ┌─────────── for each dirty segment ───────────┐
    │ tracker.publish_staged(lsn)                 │
-   │   → drain write_buffer → CachedBatch       │
+   │   → drain staged_records → CachedBatch      │
    │   → Arc::new() → store at batches[write_cursor%CAP]│
    │   → write_cursor.store(write_cursor + 1, Release)           │
    └─────────────────────┬──────────────────────-┘
@@ -276,7 +276,7 @@ Slots use `arc_swap::ArcSwapOption` — load + refcount increment is atomic, eli
 
 **Consumer seek:** Each `CachedBatch` carries `(start_offset, end_offset)`. Binary search over published batches by offset range to find the batch containing the target offset, then linear scan within the batch.
 
-**Ordering:** Within a segment, record ordering is preserved. Per-segment accumulation buffers are appended in arrival order during the batch window. Cross-segment ordering is not guaranteed (and not needed — event streaming guarantees ordering per-range, not globally).
+**Ordering:** Within a segment, record ordering is preserved. Per-segment `staged_records` are appended in arrival order during the batch window. Cross-segment ordering is not guaranteed (and not needed — event streaming guarantees ordering per-range, not globally).
 
 ### DataPlane + DataPlaneActor
 
@@ -289,28 +289,38 @@ WAL does blocking file I/O (write, fsync, rotate, unlink) — injected via `WalS
 ```rust
 struct SegmentTracker {
     cache: Arc<SegmentRingBuffer>,
-    size_bytes: u64,        // accumulated data bytes, triggers RollSegment at ~1GB
-    checkpoint_lsn: u64,    // last-checkpointed WAL LSN
+    size_bytes: u64,                     // accumulated data bytes, triggers RollSegment at ~1GB
+    checkpoint_lsn: u64,                 // last-checkpointed WAL LSN
+    segment_file_path: PathBuf,
+    role: SegmentRole,                   // Leader | Follower (D2)
+    replica_set: Vec<NodeId>,            // [leader, follower, ...] (D2)
+    committed_end_offset: u64,           // last committed logical offset (D2)
+    next_offset: u64,                    // next logical offset to assign (D2)
+    staged_records: Vec<StagingRecord>,  // per-segment write buffer (D2, replaces accumulation_buffers)
 }
 
 // State machine — pure sync, no channels. I/O only through injected WalStorage.
-// Reply channels pass through as events (ProducePending), not held in state.
+// Reply channels tracked by ReplicationState, not held in state machine events.
 struct DataPlane<W: WalStorage> {
+    node_id: NodeId,
     wal: W,
     segments: HashMap<SegmentKey, SegmentTracker>,
-    accumulation_buffers: HashMap<SegmentKey, Vec<Record>>,
+    dirty_segments: Vec<SegmentKey>,
     pending_events: Vec<DataPlaneEvent>,
+    buffer_record_count: usize,
+    buffer_byte_count: usize,
+    needs_flush: bool,
+    data_dir: PathBuf,
+    replication: ReplicationState,
 }
 
 enum DataPlaneEvent {
-    SubmitCheckpoint(CheckpointJob),
-    ProducePending(oneshot::Sender<ProduceAck>),  // reply channel → actor's pending_replies
-    WalBatchComplete { lsn: u64 },                // WAL fsync succeeded for this LSN
-    WalBatchFailed(String),                        // WAL write or fsync failed
-    Timer(TimerCommand<DataPlaneTimer>),
-    // ProducePending is live-path only. WAL replay (D5) calls internal state machine
-    // methods directly (populate buffers, publish to cache) — no DataPlaneCommand,
-    // no oneshot, no ProducePending event emitted.
+    CheckpointRequired(CheckpointJob),
+    BatchFlushTimerScheduled(TimerCommand<BatchFlushTimer>),
+    BatchPublished(BatchPublished),                // D2: replication fan-out
+    ReplicaAckReceived(ReplicaAckReceived),         // D2: follower ack arrived
+    InterNodeCommandQueued(InterNodeCommandQueued), // D2: send inter-node command
+    ReplicationTimedOut(ReplicationTimedOut),        // D2: replication timeout
 }
 
 // Producer-facing response — Ok or Err. Error reason is opaque string
@@ -321,67 +331,57 @@ enum ProduceAck {
 }
 
 // Actor wrapper — owns channels, drains state machine events.
-// Holds pending_replies: Vec<oneshot::Sender<ProduceAck>> — populated from
-// ProducePending events, drained on WalBatchComplete (D1) or after
-// replication (D2+), failed on WalBatchFailed.
 struct DataPlaneActor;
 
 impl DataPlaneActor {
     fn spawn(
         data_dir: PathBuf,
         checkpoint_tx: crossbeam::channel::Sender<CheckpointJob>,
-        scheduler_tx: tokio::sync::mpsc::Sender<TickerCommand<DataPlaneTimer>>,
+        batch_scheduler: SchedulerSender<BatchFlushTimer>,
+        repl_scheduler: SchedulerSender<ReplicationTimer>,
+        transport_tx: tokio::sync::mpsc::Sender<DataTransportCommand>,
     ) -> crossbeam::channel::Sender<DataPlaneCommand> {
         // spawns dedicated OS thread, returns sender
     }
 }
 
 enum DataPlaneCommand {
-    Produce {
-        segment_key: SegmentKey,
-        records: Vec<Bytes>,
-        reply: oneshot::Sender<ProduceAck>,
-    },
-    SegmentAssignment {
-        segment_key: SegmentKey,
-        replica_set: Vec<NodeId>,
-    },
-    SealSegment {
-        segment_key: SegmentKey,
-    },
+    Produce(Produce),
     CheckpointComplete(CheckpointComplete),
     Timeout(DataPlaneTimeoutCallback),
+    InterNode(DataPlaneInterNodeCommand),  // all inter-node commands via transport
 }
 ```
 
 **Event flow for produce:**
 
 ```
-process(Produce { reply, .. })
+handle_command(Produce { reply, .. })
     │
-    ├── segment not found → reply.send(Err("segment not found")) immediately
+    ├── segment not found or follower → reply.send(Err) immediately
     │
-    └── segment exists
+    └── segment exists, role == Leader
             │
             ▼
-        emit ProducePending(reply)       ◄── actor pushes to pending_replies
-        handle_produce(key, records)     ◄── buffer records
+        replication.enqueue_reply(key, reply)  ◄── reply tracked in ReplicationState
+        tracker.buffer_record(key, data)       ◄── buffer into staged_records
             │
-            │ batch trigger fires (10ms / 20k / 10MB)
+            │ batch trigger fires (10ms / 20k / 10MB / needs_flush)
             ▼
         flush_batch()
             │
-            ├── WAL write/fsync fails → emit WalBatchFailed(err)
-            │       actor drains pending_replies with Err(err)
+            ├── WAL write/fsync fails → replication.fail_all(err)
+            │       drains all pending + in-flight replies with Err
             │
-            └── WAL fsync succeeds → emit WalBatchComplete { lsn }
-                    D1: actor drains pending_replies with Ok
-                    D2: actor holds pending_replies, initiates replication
-                        → replication completes → drains with Ok
-                        → replication fails → drains with Err
+            └── WAL fsync succeeds
+                    publish_staged(lsn) for each dirty segment
+                    │
+                    ├── Leader, no followers → commit_batch, drain pending_replies with Ok
+                    ├── Leader, followers → emit BatchPublished (replication fan-out)
+                    │       dispatch: begin_replication → send ReplicaAppend
+                    │       on all acks → commit_segment → drain replies with Ok
+                    └── Follower → send ReplicaAck to leader via InterNodeCommandQueued
 ```
-
-**D2 batch-reply mapping:** `WalBatchComplete { lsn }` carries the LSN. The actor maps each WAL batch to its pending replies. Multiple batches can be in flight (volume trigger flushes inline, then more produces arrive before drain). The actor maintains `current_batch: Vec<Sender>` (accumulates `ProducePending` replies) and `replicating: VecDeque<(u64, Vec<Sender>)>` (keyed by LSN). `WalBatchComplete { lsn }` moves `current_batch` into `replicating` under that LSN. `ReplicationComplete { lsn }` drains all entries ≤ that LSN.
 
 **Channel traffic profiles:** `mailbox` is hot — every `Produce` request flows through it. `checkpoint_tx` and `data_plane_tx` (the return path for `CheckpointComplete`) are occasional — triggered only by checkpoint conditions (segment size, cache budget, WAL retention), not by time or per-batch. The checkpoint worker is a single sequential thread; each cycle includes at least one segment file fsync, so `CheckpointComplete` messages arrive at most low tens per second under sustained throughput.
 
@@ -395,7 +395,7 @@ Built from WAL replay + segment directory scan at startup (D5).
 
 **Backpressure:** Natural. If WAL fsync is slow, the dedicated thread stalls, the inbound `crossbeam` channel fills, producers block on `send()`. No async flow control needed.
 
-**Timer:** `DataPlaneTimer` implements `TTimer`, driven by `crossbeam::channel::select!` with timeout (same tick model as SWIM/Raft scheduling actor, but on the dedicated thread instead of a tokio task). Drives periodic sweep for removing idle `SegmentRingBuffer` entries.
+**Timer:** Two timer types: `BatchFlushTimer` (10ms batch deadline) and `ReplicationTimer` (1s replication timeout, D2), both implementing `TTimer`. Each has its own `SchedulerSender`. Callbacks arrive as `DataPlaneTimeoutCallback` variants via `DataPlaneCommand::Timeout`.
 
 ### Checkpoint Worker
 

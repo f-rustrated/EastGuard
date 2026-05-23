@@ -14,7 +14,7 @@
 records arrive
     │
     ▼
-tracker.write_buffer.push(record)
+tracker.staged_records.push(record)
     │
     │ batch trigger fires (10ms / 20k records / 10MB)
     ▼
@@ -27,13 +27,13 @@ tracker.write_buffer.push(record)
                          ▼
    ┌─────────── for each dirty segment ──────────────┐
    │ tracker.publish_staged(lsn)                     │
-   │   → drain write_buffer → CachedBatch            │ 
+   │   → drain staged_records → CachedBatch          │ 
    │   → Arc::new() → store at batches[w_cursor%CAP] │
    │   → w_cursor.store(w_cursor+1, Release)         │
    └─────────────────────┬───────────────────────────┘
                          │ ◄── in cache, not yet visible to consumers
                          ▼
-   emit ReplicationReady { lsn, segment_batches }
+   emit BatchPublished { lsn, segment_batches }
                          │
                    actor event loop
                          │
@@ -61,7 +61,7 @@ tracker.write_buffer.push(record)
 
 WAL fsync is the sole disk write on the leader's critical path, same as D1. The replication fan-out is network I/O (async, non-blocking). Produce latency = `local_fsync + max(follower_fsyncs)` — one local fsync plus one replication RTT in the common case.
 
-**No-follower fast path:** When `tracker.followers()` is empty (replication_factor=1), the actor checks `SegmentBatchInfo.followers.is_empty()` in the `ReplicationReady` handler. If true: immediately call `commit_segment`, drain replies with `Ok`, no `ReplicaAppend`, no timer, no `PendingBatch`. Degrades to D1 behavior.
+**No-follower fast path:** When `tracker.followers()` is empty (replication_factor=1), `flush_batch()` checks `tracker.followers().is_empty()` after publish. If true: immediately call `commit_batch`, drain all pending replies with `Ok`, no `ReplicaAppend`, no timer, no `PendingBatch`. Degrades to D1 behavior.
 
 ### Follower Write Path
 
@@ -71,12 +71,12 @@ ReplicaAppend arrives
     ├── segment unknown? validate & create SegmentTracker (see self-authorization)
     │
     ▼
-tracker.write_buffer.push(records)
+tracker.staged_records.push(records)
     │
     │ flush_batch() fires (unified — see below)
     ▼
 ╔═══════════════════════════════════════════════════════╗
-║ WAL: drain each tracker.write_buffer (all segments)   ║
+║ WAL: drain each tracker.staged_records (all segments) ║
 ║    → single write → fsync → BatchEnd                  ║
 ╚════════════════════════════╤══════════════════════════╝
                              │ ◄── durability point (all records in this flush)
@@ -84,7 +84,7 @@ tracker.write_buffer.push(records)
        per follower segment:
          publish_staged(lsn) → ReplicaAck to leader
        per leader segment:
-         publish_staged(lsn) → ReplicationReady (replication fan-out)
+         publish_staged(lsn) → BatchPublished (replication fan-out)
 
 CommitAdvance { committed_end_offset } arrives later from leader
     │
@@ -93,13 +93,13 @@ read_cursor += 1, notify.notify_waiters()    ◄── follower consumers can re
 tracker.committed_end_offset = committed_end_offset
 ```
 
-Records arrive pre-batched in `ReplicaAppend` — no accumulation on the follower side. Both leader and follower segments buffer into `tracker.write_buffer`. The unified flush drains all trackers in a single WAL write + fsync + `BatchEnd`, enabling uniform crash recovery (D5).
+Records arrive pre-batched in `ReplicaAppend` — no accumulation on the follower side. Both leader and follower segments buffer into `tracker.staged_records`. The unified flush drains all trackers in a single WAL write + fsync + `BatchEnd`, enabling uniform crash recovery (D5).
 
-**Unified WAL Flush.** A node writes to one WAL. All segments buffer into `tracker.write_buffer` — the buffer is embedded in `SegmentTracker`, co-located with `role`, `cache`, and `committed_end_offset`. `flush_batch()` iterates `segments`, drains each tracker's `write_buffer`, and writes everything in a single WAL write + fsync + `BatchEnd`. Post-flush, `tracker.role` determines events: leader → ReplicationReady (replication fan-out), follower → ReplicaAckReady. Single lookup per segment, no separate buffer map.
+**Unified WAL Flush.** A node writes to one WAL. All segments buffer into `tracker.staged_records` — the buffer is embedded in `SegmentTracker`, co-located with `role`, `cache`, and `committed_end_offset`. `flush_batch()` iterates dirty segments, drains each tracker's `staged_records`, and writes everything in a single WAL write + fsync + `BatchEnd`. Post-flush, `tracker.role` determines events: leader → `BatchPublished` (replication fan-out), follower → `ReplicaAck` via `InterNodeCommandQueued`. Single lookup per segment, no separate buffer map.
 
 Flush fires when either a leader batch trigger trips (10ms / 20k / 10MB) OR the actor finishes draining the mailbox with `needs_flush == true`. Multiple `ReplicaAppend`s from different leaders that arrive in the same mailbox batch share one fsync. Leader records ride along for free if a follower triggers the flush, and vice versa.
 
-Follower-to-leader promotion (F2) requires no buffer migration: the new segment's `SegmentTracker` is created with `role = Leader` and an empty `write_buffer`. `flush_batch()` handles it like any other leader segment.
+Follower-to-leader promotion (F2) requires no buffer migration: the new segment's `SegmentTracker` is created with `role = Leader` and an empty `staged_records`. `flush_batch()` handles it like any other leader segment.
 
 ### Replica Self-Authorization
 
@@ -114,7 +114,7 @@ Only the segment leader requires explicit `SegmentAssignment` from the coordinat
 
 After the leader advances `read_cursor` (all replicas ACKed), it sends `CommitAdvance { segment_key, committed_end_offset }` to all followers. Followers advance their own `read_cursor` on receipt — follower consumers can then read the committed batch.
 
-`CommitAdvance` carries the **logical record offset** (`committed_end_offset`), not the ring buffer batch position. Follower on receipt: `cache.commit(cache.load_read_cursor() + 1)` (ring buffer always advances by 1), then sets `tracker.committed_end_offset` directly from the message — no batch read needed. Decouples the wire protocol from ring buffer internals. Lightweight message (`segment_key` + `u64`), sent once per commit per follower. TCP ordering guarantees it arrives before the next `ReplicaAppend`. Follower visibility lags the leader by ~0.5 RTT (one network hop), not by one batch interval.
+`CommitAdvance` carries the **logical record offset** (`committed_end_offset`), not the ring buffer batch position. Follower on receipt: `tracker.commit_batch(committed_end_offset)` — internally advances `read_cursor` by 1, sets `committed_end_offset`, and notifies consumers. Decouples the wire protocol from ring buffer internals. Lightweight message (`segment_key` + `u64`), sent once per commit per follower. TCP ordering guarantees it arrives before the next `ReplicaAppend`. Follower visibility lags the leader by ~0.5 RTT (one network hop), not by one batch interval.
 
 **Validation:** `debug_assert!(next_batch.end_offset == received_offset)`. Mismatch indicates a bug (TCP guarantees ordering, so message reordering is impossible). In release: log error, disconnect from leader — follower can't trust subsequent messages. Leader's `ReplicationTimeout` fires and seals.
 
@@ -131,14 +131,14 @@ SegmentTracker (D1 fields unchanged)
 ├── replica_set: [leader, follower, follower]   ← NEW
 ├── committed_end_offset: u64                   ← NEW (init 0)
 ├── next_offset: u64                            ← NEW (decoupled from size_bytes)
-└── write_buffer: Vec<StagingRecord>            ← NEW (moved from DataPlane)
+└── staged_records: Vec<StagingRecord>           ← NEW (moved from DataPlane)
 ```
 
 **`next_offset` vs `size_bytes`:** D1 uses `size_bytes` as both byte counter and logical offset source — these are now decoupled. `next_offset` tracks the logical offset for the next record (initialized from `SegmentAssignment` for normal segments, `old.committed_end_offset + 1` for post-seal). `size_bytes` tracks cumulative bytes for 1GB limit, always starts at 0. `SegmentAssignment` carries `start_offset` (D3 — for initial segments: 0, rolled segments: `prev.end_offset + 1`).
 
-**D1 migration:** D1's `DataPlane.accumulation_buffers: HashMap<SegmentKey, Vec<BufferedRecord>>` is removed. Per-segment buffer moves into `tracker.write_buffer`. Aggregate counters `buffer_record_count` / `buffer_byte_count` stay on `DataPlane` — they track totals across all segments for batch trigger thresholds (20k / 10MB are global). Follower records do not count toward these — followers trigger flush via `needs_flush`. `DataPlane.dirty_segments: Vec<SegmentKey>` tracks which segments have buffered data — `flush_batch()` only visits dirty segments, avoiding O(all_segments) iteration.
+**D1 migration:** D1's `DataPlane.accumulation_buffers: HashMap<SegmentKey, Vec<BufferedRecord>>` is removed. Per-segment buffer moves into `tracker.staged_records`. Aggregate counters `buffer_record_count` / `buffer_byte_count` stay on `DataPlane` — they track totals across all leader segments for batch trigger thresholds (20k / 10MB are global). Follower records do not count toward these — followers trigger flush via `needs_flush`. `DataPlane.dirty_segments: Vec<SegmentKey>` tracks which segments have buffered data — `flush_batch()` only visits dirty segments, avoiding O(all_segments) iteration.
 
-**Two-phase publish:** D1's `publish()` auto-commits. D2 splits into a two-phase lifecycle: `stage_to_wal(wal_buf)` (encodes write_buffer records into WAL buffer without draining) then `publish_staged(lsn)` (drains write_buffer → `CachedBatch` → cache publish, advances `write_cursor`). Commit is separate: `commit_batch(end_offset)` (`read_cursor` += 1, updates `committed_end_offset`, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
+**Two-phase publish:** D1's `publish()` auto-commits. D2 splits into a two-phase lifecycle: `stage_to_wal(wal_buf)` (encodes `staged_records` into WAL buffer without draining) then `publish_staged(lsn)` (drains `staged_records` → `CachedBatch` → cache publish, advances `write_cursor`). Commit is separate: `commit_batch(end_offset)` (`read_cursor` += 1, updates `committed_end_offset`, notifies consumers). Also adds `followers() → &[NodeId]` returning `replica_set[1..]`.
 
 **Record types:** `StagingRecord` (user_data + `RoutingHeader`) lives in `states/segment/record.rs` — the pre-WAL record that knows its routing. `WalRecord` (CRC + type + payload) lives in `wal.rs` — the WAL serialization format. `CachedBatch` (in `cache.rs`) stores `Vec<Bytes>` (just user data, no WAL overhead). WAL owns the serialization buffer (`WalStorage::buf()`); trackers encode into it via `stage_to_wal`.
 
@@ -153,17 +153,18 @@ SegmentTracker (D1 fields unchanged)
 **New fields:**
 - `node_id: NodeId` — role determination and self-authorization
 - `needs_flush: bool` — set by `process_replica_append()` and `handle_seal_response()`, checked by actor after mailbox drain, reset by `flush_batch()`
-- `dirty_segments: Vec<SegmentKey>` — tracks segments with non-empty write_buffers; `flush_batch()` only visits these
+- `dirty_segments: Vec<SegmentKey>` — tracks segments with non-empty `staged_records`; `flush_batch()` only visits these
+- `replication: ReplicationState` — reply tracking and in-flight batch management (see ReplicationState below)
 
 **New methods:**
 
 | Method | Role | Effect |
 |---|---|---|
-| `process_replica_append()` | Follower | Validate sender, buffer in `tracker.write_buffer`, set `needs_flush` |
-| `commit_segment(end_offset)` | Both | `read_cursor` += 1, update `committed_end_offset` |
-| `handle_seal_response(...)` | Leader | Create new tracker (`next_offset = old.committed_end_offset + 1`, `size_bytes = 0`), replay uncommitted tail, emit `MigrateReplies` + `SendSegmentSealed` |
+| `process_replica_append()` | Follower | Validate sender (self-authorization), buffer in `tracker.staged_records`, set `needs_flush` |
+| `commit_segment(key, end_offset)` | Both | `tracker.commit_batch(end_offset)`, send `CommitAdvance` to followers via `InterNodeCommandQueued` |
+| `handle_seal_response(...)` | Leader | Create new tracker (`next_offset = old.committed_end_offset + 1`, `size_bytes = 0`), replay uncommitted tail via `uncommitted_records()`, call `replication.segment_handoff()`, send `SegmentSealed` to old followers via `InterNodeCommandQueued` |
 
-**`flush_batch()` changes (D1 → D2):** Two phases: (1) `stage_to_wal(wal.buf())` for each dirty segment — encodes write_buffer into WAL's internal buffer, (2) `wal.flush_batch()` — single write+fsync, returns LSN, (3) `publish_staged(lsn)` for each dirty segment — drains write_buffer into `CachedBatch`, publishes to ring buffer. Per segment, `tracker.role` determines event (Leader → ReplicationReady, Follower → ReplicaAckReady). Triggers: `BatchFlushDeadline` timer (10ms, set on first buffered record) OR batch size threshold (20k/10MB global counters) OR `needs_flush` after mailbox drain.
+**`flush_batch()` changes (D1 → D2):** Three phases: (1) `stage_to_wal(wal.buf())` for each dirty segment — encodes `staged_records` into WAL's internal buffer, (2) `wal.flush_batch()` — single write+fsync, returns LSN, (3) `publish_staged(lsn)` for each dirty segment — drains `staged_records` into `CachedBatch`, publishes to ring buffer. Per segment, `tracker.role` determines event: Leader with followers → `BatchPublished`, Leader without followers → immediate `commit_batch` (no-follower fast path), Follower → `ReplicaAck` via `InterNodeCommandQueued`. Triggers: `BatchFlushDeadline` timer (10ms, set on first buffered record) OR batch size threshold (20k/10MB global counters) OR `needs_flush` after mailbox drain.
 
 **Other changes:** `handle_segment_assignment()` stores `replica_set`, sets role (leader-only in D2 — followers self-authorize). Followers reject `Produce` with error.
 
@@ -173,17 +174,19 @@ SegmentTracker (D1 fields unchanged)
 
 ```
 Pending ──────────► Replicating ──────► Resolved
-  Produce            ReplicationReady    All acks → Ok
+  Produce            BatchPublished     All acks → Ok
   → pending_replies   → PendingBatch     Timeout  → seal + replay
                                          WAL fail → Err
 ```
 
-**Actor state:**
+**ReplicationState** (lives in `states/replication.rs`, owned by `DataPlane`):
 
 ```rust
 struct ReplicationState {
     pending_replies: HashMap<SegmentKey, Vec<oneshot::Sender<ProduceAck>>>,
     in_flight: HashMap<SegmentKey, VecDeque<PendingBatch>>,
+    timer_seqs: HashMap<SegmentKey, u64>,
+    next_timer_seq: u64,
 }
 
 struct PendingBatch {
@@ -195,22 +198,26 @@ struct PendingBatch {
 
 Per-segment `VecDeque` — each segment's batches commit in order independently. `end_offset` in `ReplicaAck` correlates to `batch_end_offset` — logical offsets are monotonic per segment, no synthetic counter needed. Late acks for sealed segments are silently dropped.
 
+Key methods: `enqueue_reply()` (Pending phase), `begin_replication()` (moves replies to `PendingBatch`, returns timer seq if first in-flight), `process_ack()` (removes node from `pending_acks`, returns `AckCommitted` with replies when all acked), `segment_handoff()` (migrates replies from old to new segment on seal), `fail_all()` (drains all replies with `Err` on WAL failure). Timer seq gating via `is_active_timer()` prevents stale timeout callbacks from firing after a timer has been reset by `process_ack()`.
+
 ### DataPlane Command Catalog
 
-| Command | Source | Key fields |
-|---|---|---|
-| `Produce` | Client | `segment_key`, `records`, `reply` |
-| `SegmentAssignment` | Coordinator (D3) | `segment_key`, `replica_set`, `start_offset` |
-| `SealSegment` | Internal | `segment_key` |
-| `CheckpointComplete` | Checkpoint worker | `segment_key`, `checkpointed_lsn` |
-| `Timeout` | Ticker | `DataPlaneTimeoutCallback` |
-| `ReplicaAppend` | Leader via transport | `segment_key`, `replica_set`, `records`, `start/end_offset` |
-| `ReplicaAck` | Follower via transport | `segment_key`, `end_offset` |
-| `CommitAdvance` | Leader via transport | `segment_key`, `committed_end_offset` |
-| `SealResponse` | Coordinator via transport | `old_segment_key`, `new_segment_id`, `new_replica_set` |
-| `SegmentSealed` | Leader via transport | `segment_key` |
+Top-level `DataPlaneCommand` has four variants. Inter-node commands arrive via `DataTransportActor` as `DataPlaneInterNodeCommand`, wrapped in `DataPlaneCommand::InterNode`.
 
-Top 5: D1 (unchanged). Bottom 5: D2 additions.
+| Command | Variant | Source | Key fields |
+|---|---|---|---|
+| `Produce` | top-level | Client | `segment_key`, `records`, `reply` |
+| `CheckpointComplete` | top-level | Checkpoint worker | `segment_key`, `checkpointed_lsn` |
+| `Timeout` | top-level | Ticker | `DataPlaneTimeoutCallback` |
+| `SegmentAssignment` | inter-node | Coordinator (D3) | `segment_key`, `replica_set`, `start_offset` |
+| `ReplicaAppend` | inter-node | Leader via transport | `segment_key`, `replica_set`, `records`, `start_offset` |
+| `ReplicaAck` | inter-node | Follower via transport | `segment_key`, `end_offset`, `from` |
+| `CommitAdvance` | inter-node | Leader via transport | `segment_key`, `committed_end_offset` |
+| `SealRequest` | inter-node | Leader via transport | `segment_key`, `failed_nodes`, `end_offset` |
+| `SealResponse` | inter-node | Coordinator via transport | `old_segment_key`, `new_segment_id`, `new_replica_set` |
+| `SegmentSealed` | inter-node | Leader via transport | `segment_key` |
+
+`ReplicaAppend` carries `start_offset` only — `end_offset` is derived from `start_offset + records.len() - 1` at the receiver. `ReplicaAck` includes `from: NodeId` so the leader can identify which follower acked. `SealRequest` routing to coordinator is deferred to D3 (currently placeholder).
 
 **SegmentSealed follower handling:** Submit final checkpoint, then drop `SegmentTracker`. No further `ReplicaAppend` accepted for that segment.
 
@@ -218,31 +225,33 @@ Top 5: D1 (unchanged). Bottom 5: D2 additions.
 
 | Event | Role | Key fields |
 |---|---|---|
-| `ProducePending` | Leader | `segment_key`, `reply` |
-| `ReplicationReady` | Leader | `lsn`, `segment_batches: Vec<PendingReplicationBatch>` |
-| `WalBatchFailed` | Both | error reason |
-| `ReplicaAckReady` | Follower | `leader`, `segment_key`, `end_offset` |
-| `SendCommitAdvance` | Leader | `segment_key`, `committed_end_offset`, `followers` |
-| `MigrateReplies` | Leader | `old_segment_key`, `new_segment_key` |
-| `SendSealRequest` | Leader | `segment_key`, `failed_nodes: Vec<NodeId>`, `end_offset` |
-| `SendSegmentSealed` | Leader | `segment_key`, `followers` |
+| `CheckpointRequired` | Both | `CheckpointJob` |
+| `BatchFlushTimerScheduled` | Leader | `TimerCommand<BatchFlushTimer>` |
+| `BatchPublished` | Leader | `lsn`, `segment_batches: Vec<PendingReplicationBatch>` |
+| `ReplicaAckReceived` | Leader | `segment_key`, `end_offset`, `from` |
+| `InterNodeCommandQueued` | Both | `targets: Vec<NodeId>`, `message: DataPlaneInterNodeCommand` |
+| `ReplicationTimedOut` | Leader | `segment_key`, `committed_end_offset` |
 
-`PendingReplicationBatch = (SegmentKey, Arc<CachedBatch>, replica_set: Vec<NodeId>, followers: Vec<NodeId>)` — batch data carries `start/end_offset` and records.
+`PendingReplicationBatch` is a struct: `{ segment_key, batch: Arc<CachedBatch>, replica_set: Vec<NodeId>, followers: Vec<NodeId> }`. Provides `into_replica_append()` to convert into `(targets, ReplicaAppend)` for transport dispatch.
 
-**Follower WAL failure:** `WalBatchFailed` emitted for both roles. Leader segments: drain pending replies with `Err`. Follower segments: no `ReplicaAck` sent — leader's `ReplicationTimeout` fires and seals.
+`InterNodeCommandQueued` is a generic wrapper for all outbound inter-node messages (replaces individual `Send*` events from the original design). Used for `CommitAdvance`, `ReplicaAck`, `SealRequest`, and `SegmentSealed` — all dispatched uniformly through `DataTransportCommand::send()`.
+
+Reply lifecycle events (`enqueue_reply`, `begin_replication`, `process_ack`, `segment_handoff`, `fail_all`) are handled directly by `ReplicationState` methods, not as `DataPlaneEvent` variants.
+
+**WAL failure:** On `wal.flush_batch()` error, `replication.fail_all()` drains all pending and in-flight replies with `Err`. Leader segments lose their buffered records. Follower segments send no `ReplicaAck` — leader's `ReplicationTimeout` fires and seals.
 
 ### DataPlaneTimer
 
-D2 uses on-demand timers via rolling seq counter (like SWIM). No periodic tick — batch flush is timer-driven via `BatchFlushDeadline`.
+D2 uses two separate timer types, each implementing `TTimer`. No single `DataPlaneTimer` — the two types have different callback semantics and run on separate ticker instances. Both use rolling seq counters (like SWIM). `DataPlaneTimeoutCallback` is the unified callback enum that both convert into.
 
-| Callback | Trigger | Effect |
-|---|---|---|
-| `BatchFlushDeadline` | 10ms after first buffered record | Flush inline in `handle_timeout` |
-| `ReplicationTimeout { segment_key }` | Per-segment, first in-flight batch | Seal + replay |
+| Timer type | Callback | Trigger | Effect |
+|---|---|---|---|
+| `BatchFlushTimer` | `BatchFlushDeadline` | 10ms (1 tick) after first buffered record | Flush inline in `handle_timeout` |
+| `ReplicationTimer` | `ReplicationTimeout { seq, segment_key }` | Per-segment, first in-flight batch | Seal + replay |
 
-`BatchFlushDeadline`: set when the first record is buffered (leader produce), cancelled on flush. Fires once — not periodic. Ensures bounded produce latency even under low throughput.
+`BatchFlushDeadline`: set when the first record is buffered (leader produce). Uses WAL's `next_lsn` as seq — ticker rejects duplicate seqs, so re-registering before a flush is a no-op. After flush, `next_lsn` advances and the next produce registers a new timer. Fires once — not periodic. Ensures bounded produce latency even under low throughput.
 
-`ReplicationTimeout`: one timer per segment. Set when the first `PendingBatch` enters `in_flight`, cancelled when `in_flight[segment_key]` is empty. Not reset on subsequent batches — if any batch exceeds the window, the segment is sealed regardless of which one. In-flight state is intentionally NOT cleared on timeout — a late ack may still commit the batch while `SealRequest` is in transit. Safe because `apply_roll_segment()` is idempotent (DS-RSM invariant 9). Timeout: 500ms–1s.
+`ReplicationTimeout`: one timer per segment. Set when the first `PendingBatch` enters `in_flight` via `begin_replication()`. Timer seq allocated from `ReplicationState.next_timer_seq` (wrapping counter). On `process_ack()` commit, if more batches remain in-flight, a new seq is allocated and old is invalidated — stale firings silently dropped via `is_active_timer()`. In-flight state is intentionally NOT cleared on timeout — a late ack may still commit the batch while `SealRequest` is in transit. Safe because `apply_roll_segment()` is idempotent (DS-RSM invariant 9). Timeout: 1s (100 ticks × 10ms).
 
 ---
 
@@ -268,8 +277,8 @@ All `data_port` wire messages, consolidated across phases:
 
 | Message | Direction | Key fields | Phase |
 |---|---|---|---|
-| `ReplicaAppend` | Leader → followers | `segment_key`, `replica_set`, `records`, `start/end_offset` | D2 |
-| `ReplicaAck` | Follower → leader | `segment_key`, `end_offset` | D2 |
+| `ReplicaAppend` | Leader → followers | `segment_key`, `replica_set`, `records`, `start_offset` | D2 |
+| `ReplicaAck` | Follower → leader | `segment_key`, `end_offset`, `from` | D2 |
 | `CommitAdvance` | Leader → followers | `segment_key`, `committed_end_offset` | D2 |
 | `SealRequest` | Leader → coordinator | `segment_key`, `failed_nodes: Vec<NodeId>`, `end_offset` | D2 |
 | `SealResponse` | Coordinator → leader | `old_segment_key`, `new_segment_id`, `new_replica_set` | D2/D3 |
@@ -289,7 +298,7 @@ All failures converge to one response: **seal the segment, open a new one.** No 
 
 **Offset handoff:** `SealRequest` carries `end_offset = tracker.committed_end_offset` (logical offset of last record ACKed by all replicas). The coordinator passes it through `RollSegment` → `apply_roll_segment()` seals with this value, new segment starts at `end_offset + 1`. Maintains MetadataStateMachine invariant 8 (offset continuity).
 
-**Uncommitted tail replay:** Records between `read_cursor` and `tail` at seal time are not part of the sealed segment — but they are not dropped. On `SealResponse`, the leader reads uncommitted batches from the old segment's cache, injects their records into `the new segment's `tracker.write_buffer`` (re-WAL'd with new routing headers on next `flush_batch()`), and migrates the pending reply channels to the new segment. When the replayed records are committed in the new segment with the new replica set, the original producers receive `Ok` — they never see a failure, just higher latency (~50-100ms seal overhead). No producer retry, no duplicates from the seal mechanism itself.
+**Uncommitted tail replay:** Records between `read_cursor` and `write_cursor` at seal time are not part of the sealed segment — but they are not dropped. On `SealResponse`, the leader reads uncommitted batches from the old segment's cache via `tracker.uncommitted_records()`, injects their records into the new segment's `tracker.staged_records` (re-WAL'd with new routing headers on next `flush_batch()`), and migrates the pending reply channels via `replication.segment_handoff()`. When the replayed records are committed in the new segment with the new replica set, the original producers receive `Ok` — they never see a failure, just higher latency (~50-100ms seal overhead). No producer retry, no duplicates from the seal mechanism itself.
 
 Old WAL records (under the sealed segment's routing headers) are cleaned up by normal WAL file deletion once the checkpoint watermark advances past them.
 
@@ -398,7 +407,7 @@ Broker D              Broker E              Broker G              Broker F (dead
    │                     │                     │                     ✗
    │ open seg 8 (Leader) │                     │
    │ read uncommitted batches from seg 7 cache │
-   │ inject records into seg 8 tracker.write_buffer
+   │ inject records into seg 8 tracker.staged_records
    │ migrate pending reply channels to seg 8   │
    │──SegmentSealed─────►│                     │
    │                  close seg 7              │
@@ -461,7 +470,7 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 9. **Seal is leader-initiated for follower failures, coordinator-initiated for leader failures.** The segment leader detects follower failure (timeout) and sends `SealRequest`. The coordinator detects leader failure via SWIM `HandleNodeDeath` and proposes `RollSegment` directly.
 
-10. **Uncommitted tail replayed, not dropped.** Records between `read_cursor` and `write_cursor` at seal time are read from the old segment's cache and injected into the new segment's `tracker.write_buffer`. Pending reply channels migrate with them. Producers receive `Ok` after the replayed records commit in the new segment — no retry, no duplicates from the seal mechanism.
+10. **Uncommitted tail replayed, not dropped.** Records between `read_cursor` and `write_cursor` at seal time are read from the old segment's cache via `uncommitted_records()` and injected into the new segment's `tracker.staged_records`. Pending reply channels migrate via `replication.segment_handoff()`. Producers receive `Ok` after the replayed records commit in the new segment — no retry, no duplicates from the seal mechanism.
 
 11. **Segment leader preserved on follower failure.** `RollSegment` keeps the previous leader at `replica_set[0]` when only a follower failed — preserving cache locality and active producer connections. Only when the leader itself failed does a new node take position 0.
 
