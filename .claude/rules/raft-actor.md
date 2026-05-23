@@ -112,9 +112,9 @@ RaftTransportActor              (TCP I/O)
 
 **Key points:**
 
-- `Raft::peers` is `BTreeSet<NodeId>` — no addresses. State machine produces `OutboundRaftPacket { target: NodeId, rpc }`. Actor/transport layer resolves `NodeId → SocketAddr → Connection`.
+- `Raft::peers` is `HashSet<NodeId>` — no addresses. State machine produces `OutboundRaftPacket { target: NodeId, rpc }`. Actor/transport layer resolves `NodeId → SocketAddr → Connection`.
 
-- Connection pool (`BTreeMap<NodeId, RaftWriter>`) lives in `RaftTransportActor`. Connections persistent and bidirectional — one TCP connection per peer pair, split into `RaftReader`/`RaftWriter` halves.
+- Connection pool (`HashMap<NodeId, RaftWriter>`) lives in `RaftTransportActor`. Connections persistent and bidirectional — one TCP connection per peer pair, split into `RaftReader`/`RaftWriter` halves.
 
 - **Handshake**: On connect, initiator sends its `NodeId` (length-prefixed bincode). Acceptor reads it to key write half. Happens before any Raft RPCs.
 

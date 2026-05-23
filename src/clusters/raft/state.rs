@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{BTreeSet, BTreeMap};
+use std::collections::{HashMap, HashSet};
 
 use crate::clusters::NodeId;
 use crate::clusters::metadata::state_machine::MetadataStateMachine;
@@ -45,7 +45,7 @@ pub struct Raft {
     // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
-    peers: BTreeSet<NodeId>,
+    peers: HashSet<NodeId>,
 
     current_term: u64,
     voted_for: Option<NodeId>,
@@ -60,7 +60,7 @@ pub struct Raft {
     /// or when a valid `AppendEntries` is received from a leader.
     current_leader: Option<NodeId>,
     // LEADER-ONLY volatile state
-    peer_states: BTreeMap<NodeId, PeerState>,
+    peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
     pending_proposals: Vec<RaftCommand>,
     election_jitter: u32,
@@ -76,7 +76,7 @@ pub(crate) struct TimerSeqs {
 impl Raft {
     pub(crate) fn new(
         node_id: NodeId,
-        peers: BTreeSet<NodeId>,
+        peers: HashSet<NodeId>,
         persistent: RaftPersistentState,
         election_jitter: u32,
         shard_group_id: ShardGroupId,
@@ -98,7 +98,7 @@ impl Raft {
             current_leader: None,
             state_machine: MetadataStateMachine::default(),
             pending_proposals: Vec::new(),
-            peer_states: BTreeMap::new(),
+            peer_states: HashMap::new(),
             election_jitter,
             timer_seqs,
         };
@@ -903,7 +903,7 @@ mod tests {
     fn single_node_raft() -> Raft {
         Raft::new(
             node("node-1"),
-            BTreeSet::new(),
+            HashSet::new(),
             RaftPersistentState::default(),
             0,
             TEST_SHARD,
@@ -913,7 +913,7 @@ mod tests {
 
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
-        let peers: BTreeSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
+        let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
         Raft::new(
             node(id),
             peers,
@@ -1634,7 +1634,7 @@ mod tests {
 
         for (total, want) in expected {
             let peer_count = total - 1;
-            let peers: BTreeSet<NodeId> = (0..peer_count)
+            let peers: HashSet<NodeId> = (0..peer_count)
                 .map(|i| NodeId::new(format!("peer-{i}")))
                 .collect();
             let raft = Raft::new(
@@ -2078,7 +2078,7 @@ mod tests {
         let merge_seq = seqs.merge_check;
         let mut raft = Raft::new(
             node("node-1"),
-            BTreeSet::new(),
+            HashSet::new(),
             RaftPersistentState::default(),
             0,
             TEST_SHARD,

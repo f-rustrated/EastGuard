@@ -9,9 +9,9 @@
 ```
 Topology
 ├── vnodes: BTreeSet<VirtualNodeToken>           (hash ring positions)
-├── groups: BTreeMap<ShardGroupId, ShardGroup>    (canonical shard group definitions)
-├── node_group_ids: BTreeMap<NodeId, Vec<ShardGroupId>>  (reverse index)
-└── shard_leaders: BTreeMap<ShardGroupId, ShardLeaderEntry>  (leader map)
+├── groups: HashMap<ShardGroupId, ShardGroup>    (canonical shard group definitions)
+├── node_group_ids: HashMap<NodeId, Vec<ShardGroupId>>  (reverse index)
+└── shard_leaders: HashMap<ShardGroupId, ShardLeaderEntry>  (leader map)
 ```
 
 `VirtualNodeToken` sorted by `(hash, pnode_id, replica_index)` — deterministic tiebreaker on hash collision.

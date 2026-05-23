@@ -24,14 +24,14 @@ StoragePolicy { retention_ms, replication_factor }
 TopicMeta {
     topic_id, name, state, storage_policy,
     active_ranges: Vec<RangeId>,              // keyspace coverage for write routing
-    ranges: BTreeMap<RangeId, RangeMeta>,      // all ranges including sealed
+    ranges: HashMap<RangeId, RangeMeta>,      // all ranges including sealed
     next_range_id: u64,
 }
 
 RangeMeta {
     range_id, keyspace: [start, end),
     state, active_segment,
-    segments: BTreeMap<SegmentId, SegmentMeta>,
+    segments: HashMap<SegmentId, SegmentMeta>,
     next_segment_id: u64,
     next_offset: u64,
     split_into, merged_into, merged_from
@@ -51,8 +51,8 @@ ID counters scoped to parent: `next_range_id` in TopicMeta, `next_segment_id` in
 
 ```rust
 struct MetadataStateMachine {
-    topics:           BTreeMap<TopicId, TopicMeta>,
-    topic_name_index: BTreeMap<String, TopicId>,
+    topics:           HashMap<TopicId, TopicMeta>,
+    topic_name_index: HashMap<String, TopicId>,
     next_topic_id:    u64,
 }
 ```
@@ -213,7 +213,7 @@ fn propose(&mut self, resource_key: &[u8], command: RaftCommand) -> Result<(), P
 ```
 
 **Why MultiRaftActor routes, not a separate layer:**
-- Already has `BTreeMap<ShardGroupId, Raft>` — checks `is_leader()` directly
+- Already has `HashMap<ShardGroupId, Raft>` — checks `is_leader()` directly
 - `ShardGroupId::new(key)` is a pure hash — no topology query needed
 - Avoids async round-trip to SWIM for routing
 - Client handler in `lib.rs` stays thin
@@ -259,7 +259,7 @@ Current `raft.propose()` returns `Ok(())` on log append — does NOT wait for co
 
 ```rust
 // In MultiRaft:
-pending_proposals: BTreeMap<(ShardGroupId, u64 /* log_index */), oneshot::Sender<ProposeResult>>,
+pending_proposals: HashMap<(ShardGroupId, u64 /* log_index */), oneshot::Sender<ProposeResult>>,
 ```
 
 On `propose()`: store `(shard_id, log_index) → reply`.

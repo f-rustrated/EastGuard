@@ -233,10 +233,10 @@ If actor manages multiple state machine instances (e.g., one per shard), extract
 /// Encapsulates multiplexed state machines and their bookkeeping.
 struct YourGroups {
     node_id: NodeId,
-    groups: BTreeMap<GroupId, YourStateMachine>,
+    groups: HashMap<GroupId, YourStateMachine>,
     seq_counter: u32,
-    shard_tokens: BTreeMap<ShardToken, u32>,
-    dirty: BTreeSet<GroupId>,
+    shard_tokens: HashMap<ShardToken, u32>,
+    dirty: HashSet<GroupId>,
 }
 
 impl YourGroups {

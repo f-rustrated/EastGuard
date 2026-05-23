@@ -9,21 +9,21 @@
 ```
 MetadataStateMachine (one per shard group)
 │
-├── topics: BTreeMap<TopicId, TopicMeta>
+├── topics: HashMap<TopicId, TopicMeta>
 │   └── TopicMeta
 │       ├── active_ranges: Vec<RangeId>     (write routing, sorted by keyspace_start)
-│       ├── ranges: BTreeMap<RangeId, RangeMeta>  (all ranges including sealed)
+│       ├── ranges: HashMap<RangeId, RangeMeta>  (all ranges including sealed)
 │       └── next_range_id: u64
 │
 │   RangeMeta (nested inside TopicMeta)
 │       ├── active_segment: Option<SegmentId>
-│       ├── segments: BTreeMap<SegmentId, SegmentMeta>
+│       ├── segments: HashMap<SegmentId, SegmentMeta>
 │       ├── next_segment_id: u64
 │       └── next_offset: u64
 │
 │   SegmentMeta (nested inside RangeMeta)
 │
-└── topic_name_index: BTreeMap<String, TopicId>
+└── topic_name_index: HashMap<String, TopicId>
 ```
 
 Ownership expressed by nesting — no back-references. Parent always known from traversal context.

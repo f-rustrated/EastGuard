@@ -8,7 +8,7 @@ Functions taking `&self`, `&mut self`, or a reference to a struct as their first
 
 Prefer `Result<T, E>` over `Option<T>` when `None` represents a failure condition that an operator or developer would want to diagnose. Silent `None` returns hide *why* something didn't happen — use `Result` so the error is observable via logging or propagation.
 
-Legitimate `Option` uses: simple lookups where "not found" is the only possible reason (e.g., `BTreeMap::get`, `Vec::first`).
+Legitimate `Option` uses: simple lookups where "not found" is the only possible reason (e.g., `HashMap::get`, `Vec::first`).
 
 ## Propagate errors, don't swallow them
 

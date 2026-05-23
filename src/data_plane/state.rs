@@ -1,6 +1,6 @@
 use super::messages::*;
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::data_plane::messages::event::DataPlaneEvent;
@@ -21,8 +21,8 @@ const SEGMENT_SIZE_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 
 pub struct DataPlane<W: WalStorage> {
     wal: W,
-    segments: BTreeMap<SegmentKey, SegmentTracker>,
-    accumulation_buffers: BTreeMap<SegmentKey, Vec<BufferedRecord>>,
+    segments: HashMap<SegmentKey, SegmentTracker>,
+    accumulation_buffers: HashMap<SegmentKey, Vec<BufferedRecord>>,
     pending_events: Vec<DataPlaneEvent>,
     buffer_record_count: usize,
     buffer_byte_count: usize,
@@ -33,8 +33,8 @@ impl<W: WalStorage> DataPlane<W> {
     pub fn new(wal: W, data_dir: PathBuf) -> Self {
         DataPlane {
             wal,
-            segments: BTreeMap::new(),
-            accumulation_buffers: BTreeMap::new(),
+            segments: HashMap::new(),
+            accumulation_buffers: HashMap::new(),
             pending_events: Vec::new(),
             buffer_record_count: 0,
             buffer_byte_count: 0,
@@ -128,9 +128,9 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         let mut wal_buf = Vec::new();
-        let mut per_segment: BTreeMap<SegmentKey, Vec<(u64, Bytes)>> = BTreeMap::new();
+        let mut per_segment: HashMap<SegmentKey, Vec<(u64, Bytes)>> = HashMap::new();
 
-        for (key, records) in std::mem::take(&mut self.accumulation_buffers) {
+        for (key, records) in self.accumulation_buffers.drain() {
             for rec in records {
                 let wal_record = { Record::data(rec.build_wal_payload()) };
                 let _ = wal_record.encode_to(&mut wal_buf);

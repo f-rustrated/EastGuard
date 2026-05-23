@@ -458,7 +458,7 @@ changes (range split, merge).
 
 ```rust
 pub struct TopicRoutingCache {
-    inner: Arc<RwLock<BTreeMap<String, Arc<TopicRouting>>>>,
+    inner: Arc<RwLock<HashMap<String, Arc<TopicRouting>>>>,
 }
 
 pub struct TopicRouting {
@@ -467,7 +467,7 @@ pub struct TopicRouting {
     // Active ranges sorted by keyspace_start — linear scanned on Produce.
     pub active_ranges: Vec<RangeRouting>,
     // All ranges (active + sealed) keyed by range_id — used by Fetch.
-    pub all_ranges: BTreeMap<RangeId, RangeRouting>,
+    pub all_ranges: HashMap<RangeId, RangeRouting>,
 }
 
 pub struct RangeRouting {
@@ -653,9 +653,9 @@ pub struct ConsumerGroupMeta {
     pub topic_id: TopicId,
     pub generation_id: u32,
     // member_id -> assigned range IDs
-    pub members: BTreeMap<String, Vec<RangeId>>,
+    pub members: HashMap<String, Vec<RangeId>>,
     // committed offset per range (group-level, not per-member)
-    pub committed_offsets: BTreeMap<RangeId, u64>,
+    pub committed_offsets: HashMap<RangeId, u64>,
 }
 ```
 
@@ -677,7 +677,7 @@ member_id: String,
 AssignRanges {
 group_id:      String,
 topic_id:      TopicId,
-assignments:   BTreeMap<String, Vec<RangeId> >,  // member_id -> ranges
+assignments:   HashMap<String, Vec<RangeId> >,  // member_id -> ranges
 generation_id: u32,
 }
 
@@ -799,7 +799,7 @@ Committed offsets are Raft-replicated via `MetadataCommand::CommitConsumerOffset
 - Offsets survive coordinator (Raft leader) failover — the new leader picks up from persisted state.
 - `CommitOffset` latency = Raft round-trip (~1s typical at the current heartbeat interval).
   For high-throughput consumers, batch offset commits (commit every N records or every T ms).
-- The `MetadataStateMachine` stores `committed_offsets: BTreeMap<RangeId, u64>` inside
+- The `MetadataStateMachine` stores `committed_offsets: HashMap<RangeId, u64>` inside
   `ConsumerGroupMeta`. The offset is per-group per-range (not per-member) — when a range is
   reassigned, the new owner picks up from the group's last committed position.
 
@@ -823,7 +823,7 @@ Clients connect to any seed node. The server handles redirect via `NotLeader { l
 
 **Client-side routing cache**
 
-- `BTreeMap<TopicName, TopicPartitionInfo>` is populated from `DescribeTopic` responses.
+- `HashMap<TopicName, TopicPartitionInfo>` is populated from `DescribeTopic` responses.
 - Invalidates on `NotLeader` for that topic → fresh `DescribeTopic` before retry.
 - Retry policy: up to 3 attempts, 50ms base backoff, 2x multiplier, ±20% jitter.
   If all 3 fail, surface error to caller.

@@ -1,6 +1,6 @@
 use bincode::{Decode, Encode};
 use murmur3::murmur3_32;
-use std::collections::{BTreeSet, BTreeMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 use crate::clusters::swims::messages::dissemination_buffer::ShardLeaderInfo;
@@ -60,14 +60,14 @@ pub struct Topology {
 
     /// Reverse index: for each physical node, the shard group IDs it participates in.
     /// Rebuilt after every ring mutation. Makes `shard_groups_for_node()` O(1).
-    node_group_ids: BTreeMap<NodeId, Vec<ShardGroupId>>,
+    node_group_ids: HashMap<NodeId, Vec<ShardGroupId>>,
 
     /// Canonical shard group definitions, keyed by ShardGroupId (= nearest vnode's token hash).
     /// Each group maps a ring position to the RF physical nodes responsible for it.
-    groups: BTreeMap<ShardGroupId, ShardGroup>,
+    groups: HashMap<ShardGroupId, ShardGroup>,
     /// Shard leader map: tracks current leader for each shard group.
     /// NOT auto-cleared on node death — Raft re-election gossips new leader with higher term.
-    shard_leaders: BTreeMap<ShardGroupId, ShardLeaderEntry>,
+    shard_leaders: HashMap<ShardGroupId, ShardLeaderEntry>,
 }
 
 impl Topology {
@@ -75,9 +75,9 @@ impl Topology {
         let mut topology = Self {
             config,
             vnodes: BTreeSet::new(),
-            groups: BTreeMap::new(),
-            node_group_ids: BTreeMap::new(),
-            shard_leaders: BTreeMap::new(),
+            groups: HashMap::new(),
+            node_group_ids: HashMap::new(),
+            shard_leaders: HashMap::new(),
         };
         for pnode_id in nodes {
             topology.add_pnode(pnode_id);
@@ -178,7 +178,7 @@ impl Topology {
     fn rebuild_reverse_index(&mut self) {
         self.groups.clear();
         self.node_group_ids.clear();
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
 
         for token in &self.vnodes {
             let id = ShardGroupId::from_vnode_hash(token.hash);
@@ -255,7 +255,7 @@ impl Topology {
     }
 
     #[allow(dead_code)]
-    pub fn all_shard_leaders(&self) -> &BTreeMap<ShardGroupId, ShardLeaderEntry> {
+    pub fn all_shard_leaders(&self) -> &HashMap<ShardGroupId, ShardLeaderEntry> {
         &self.shard_leaders
     }
 }
@@ -314,7 +314,7 @@ mod tests {
         }
 
         fn assert_groups_consistent(&self) {
-            use std::collections::BTreeSet;
+            use std::collections::HashSet;
             for (gid, group) in &self.groups {
                 for member in &group.members {
                     let ids = self
@@ -328,7 +328,7 @@ mod tests {
                         member
                     );
                 }
-                let unique: BTreeSet<&NodeId> = group.members.iter().collect();
+                let unique: HashSet<&NodeId> = group.members.iter().collect();
                 assert_eq!(
                     unique.len(),
                     group.members.len(),
@@ -444,7 +444,7 @@ mod tests {
 
         let multiple_owner = topology.token_owners_for(b"hello", 3);
         assert_eq!(multiple_owner.len(), 3);
-        let physical_node_ids: BTreeSet<&NodeId> = multiple_owner.into_iter().collect();
+        let physical_node_ids: HashSet<&NodeId> = multiple_owner.into_iter().collect();
         assert_eq!(physical_node_ids.len(), 3);
     }
 
@@ -500,7 +500,7 @@ mod tests {
         let group = topology.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(group.members.len(), 3);
 
-        let unique: BTreeSet<_> = group.members.iter().collect();
+        let unique: HashSet<_> = group.members.iter().collect();
         assert_eq!(unique.len(), 3);
     }
 
