@@ -5,9 +5,6 @@ This spec defines two client-facing planes:
 - Control Plane: topic lifecycle and cluster metadata (create topic, describe topic, list cluster members)
 - Data Plane: message produce and consume (write a record, read records by offset, commit consumer position)
 
-The goal is Kafka-style produce/consume over an Eastguard-native binary protocol. Kafka wire protocol
-compatibility is deliberately out of scope for now but might be supported in the future.
-
 Topics and their ranges/segments live in the **Raft-managed control plane** (`MetadataStateMachine`).
 Consumer group state (membership, assignments, committed offsets) also goes there via new `MetadataCommand`
 variants. The data plane (`DataPlaneActor`, WAL, segment files) stores only message payloads.
