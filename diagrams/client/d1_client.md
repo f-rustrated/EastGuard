@@ -20,9 +20,9 @@ Consumers carry their own read position. Every `Fetch` request includes an expli
 The server is stateless with respect to consumer position. In scope:
 
 - Wire protocol (framing, `request_id`, out-of-order responses)
-- Control Plane: `CreateTopic`, `DeleteTopic`, `ListTopics`, `DescribeTopic`
+- Control Plane: `CreateTopic`, `DeleteTopic`, `ListHostedTopics`, `DescribeTopic`
 - Data Plane: `Produce`, `Fetch`, `ListOffsets`
-- Admin: `DescribeCluster`, `ListTopicsWithStats`, `SplitRange`
+- Admin: `DescribeCluster`, `ListHostedTopicsWithStats`, `SplitRange`
 - `TopicRoutingCache`, `NotLeader` redirect, `ClientHandler` dispatch
 
 **Phase 2 — Server-side offset tracking (deferred)**
@@ -73,23 +73,44 @@ ClientRequest:
   Admin(AdminRequest)                 -- Phase 1
 ```
 
-Common error response variants (any handler can return these):
+Error responses are split by plane:
+
+**Control plane errors** — routing is handled server-side; clients never see `NotLeader` or
+`ShardNotLocal`. The receiving node resolves the correct leader internally and forwards the request
+once (`ProposeRequest { forwarded: true }`). If forwarding fails, `InternalError` is returned.
+
+**Data plane errors** — routing is the client's responsibility via `TopicRoutingCache`.
 
 ```
-NotLeader { leader_addr: Option<SocketAddr>, retry_after_ms: Option<u64> }
-  <- leader_addr: the current leader's client-facing address (if known)
-  <- retry_after_ms: hint for election in progress. Not populated in v1 — client always
-     applies exponential backoff regardless.
+-- Data plane only --
 
-StaleGeneration
+NotLeader { leader_addr: Option<SocketAddr> }
+  <- This node is not the segment leader (Produce) or not in the replica_set (Fetch).
+     leader_addr: the segment leader's address if known. Client reconnects and retries.
+
+ShardNotLocal { hint_node: SocketAddr }
+  <- This node does not host the shard group for the requested topic.
+     hint_node: one live shard group member resolved from the local Topology (hash ring).
+     Distinct from TopicNotFound: the topic may exist, just not on this node.
+     The node distinguishes the two via Topology: hash(topic_name) → ShardGroupId →
+     if this node is a member and the topic is absent → TopicNotFound (truly does not exist);
+     if this node is not a member → ShardNotLocal.
+
+-- All planes --
+
+StaleGeneration      (Phase 2)
 InternalError(String)
 ```
 
 Client retry policy on `NotLeader`:
 
 - Reconnect to `leader_addr` if provided; otherwise retry current node.
-- Exponential backoff: base 50ms, multiplier 2x, jitter ±20%, configurable max timeout.
-  Default max: 5 000ms.
+- Exponential backoff: base 50ms, multiplier 2x, jitter ±20%, max 5 000ms.
+
+Client retry policy on `ShardNotLocal`:
+
+- Reconnect to `hint_node` and retry once. If `hint_node` also returns `ShardNotLocal`
+  (stale Topology), apply same exponential backoff as `NotLeader`.
 
 ## Server-Side Dispatch Architecture
 
@@ -136,12 +157,22 @@ Each request variant dispatches to the appropriate sender:
 
 ## Control Plane
 
-All writes go through Raft consensus. The node receiving the request forwards it to `MultiRaftActor`
-as a `Propose`. If this node is not the shard leader, it returns `NotLeader { leader_addr }` and the
-client reconnects.
+All writes go through Raft consensus. Routing is handled **server-side** — the client never sees
+`NotLeader` or `ShardNotLocal` for control plane operations.
 
-Read-only queries (`ListTopics`, `DescribeTopic`) are served from local `MetadataStateMachine` state —
-no Raft proposal. Reads may be stale on followers; this is acceptable for the initial implementation.
+The receiving node resolves the correct shard group leader using the local Topology + `MultiRaft`,
+then forwards the request once via `ProposeRequest { forwarded: true }`. Max 1 forwarding hop
+(DS-RSM invariant #8). If the forwarded-to node is also not the leader, it returns `InternalError`
+rather than forwarding again.
+
+Read-only queries (`ListHostedTopics`, `DescribeTopic`) are served from local `MetadataStateMachine`
+state — no Raft proposal. Reads may be stale on followers; this is acceptable for the initial
+implementation. Read forwarding routes to any live shard group member (no leader required).
+
+**Implementation note — DRY handover.** The handover pattern recurs across every control plane
+handler: compute `ShardGroupId`, check local membership, resolve target (leader for writes, any
+member for reads), forward once, handle failure. This logic must be extracted into a shared
+helper (e.g. `ControlPlaneRouter`) rather than duplicated per handler.
 
 ### Protocols
 
@@ -149,27 +180,75 @@ no Raft proposal. Reads may be stale on followers; this is acceptable for the in
 
 ```
 Request:  { name: String, retention_ms: u64, replication_factor: u8 }
-Response: Ok | AlreadyExists | NotLeader
+Response: Ok | AlreadyExists | InternalError
 ```
 
-- Calling twice with the same topic name returns `AlreadyExists` (idempotent).
+Flow:
+
+1. **Leader resolution (server-side).** Compute `ShardGroupId::new(hash(name))`. Query `MultiRaft`:
+   - This node is the leader → continue to step 2.
+   - This node hosts the shard group but is a follower → resolve leader via
+     `MultiRaft::current_leader`, forward with `ProposeRequest { forwarded: true }`.
+   - This node does not host the shard group → pick a live shard group member from local
+     Topology, forward with `ProposeRequest { forwarded: true }`.
+   - Forwarding fails (no leader known, election in progress) → return `InternalError`.
+
+2. **Duplicate check.** Query `MetadataStateMachine::topic_name_index` for `name`.
+   - Found → return `AlreadyExists` (no proposal needed, idempotent).
+
+3. **Propose.** Send `RaftCommand::Metadata(MetadataCommand::CreateTopic { name, retention_ms,
+   replication_factor })` to `MultiRaftActor` via oneshot. Await commit.
+   - Committed → `MetadataStateMachine` creates topic + initial full-keyspace range + initial
+     segment → return `Ok`.
+   - `ProposeError::NotLeader` (lost leadership between step 1 and commit) → return `InternalError`.
 
 **DeleteTopic**
 
 ```
 Request:  { name: String }
-Response: Ok | TopicNotFound | NotLeader
+Response: Ok | TopicNotFound | InternalError
 ```
 
-**ListTopics**
+Flow:
+
+1. **Leader resolution (server-side).** Compute `ShardGroupId::new(hash(name))`. Query `MultiRaft`:
+   - This node is the leader → continue.
+   - This node hosts the shard group but is a follower → forward to leader via
+     `ProposeRequest { forwarded: true }`.
+   - This node does not host the shard group → pick a live shard group member from Topology,
+     forward with `ProposeRequest { forwarded: true }`.
+   - Forwarding fails → return `InternalError`.
+
+2. **Existence check.** Query `MetadataStateMachine::topic_name_index` for `name`.
+   - Not found → return `TopicNotFound`.
+
+3. **Propose.** Send `RaftCommand::Metadata(MetadataCommand::DeleteTopic { name })` to
+   `MultiRaftActor`. Await commit.
+   - Committed → `MetadataStateMachine` cascades `Deleting` state to all ranges and segments
+     → return `Ok`.
+   - `ProposeError::NotLeader` (lost leadership mid-flight) → return `InternalError`.
+
+**ListHostedTopics**
 
 ```
 Request:  {}
 Response: { topics: Vec<TopicSummary { name: String, range_count: u32, state: TopicState }> }
 ```
 
-- Returns only topics whose shard group is hosted on this node. No scatter-gather.
-  A client wanting a cluster-wide view must query all nodes.
+Flow:
+
+1. **Local read.** Query local `MetadataStateMachine` for all topics in all hosted shard groups.
+   No Raft proposal. May be stale on followers — acceptable for the initial implementation.
+2. Return summaries directly. No forwarding, no leader check.
+
+Note: returns only topics whose shard group is hosted on this node. No scatter-gather.
+A client wanting a cluster-wide view must query all nodes.
+
+**ListAllTopics** *(deferred — post Phase 1)*
+
+Scatter-gather across all SWIM-known nodes. Deferred: fan-out, partial failure handling, and
+timeout semantics add complexity not needed for Phase 1 producers and consumers. Clients requiring
+a cluster-wide view can fan out `ListHostedTopics` themselves using the SWIM membership list.
 
 **DescribeTopic**
 
@@ -187,6 +266,21 @@ Response: TopicDetail {
 } | TopicNotFound
 ```
 
+Flow:
+
+1. **Shard group check.** Compute `ShardGroupId::new(hash(name))`. Check if this node hosts the
+   shard group via `MultiRaft`.
+   - Not hosted → pick a live shard group member from Topology, forward request.
+     Any member can serve the read — no leader required.
+     If forwarding fails → return `InternalError`.
+
+2. **Local read.** Query `MetadataStateMachine::topic_name_index` for `name`.
+   - Not found → return `TopicNotFound` (topic genuinely does not exist).
+
+3. **Build response.** Traverse ranges, collect `range_id`, `keyspace_start`, `keyspace_end`,
+   `active_segment_id`, `state` for each range. Return `TopicDetail`. No Raft proposal.
+   May be stale on followers.
+
 ## Data Plane
 
 Data plane writes go to `DataPlaneActor` — an append-only WAL + segment file engine on the local disk.
@@ -197,18 +291,22 @@ No Raft involvement for message data.
 - The **Raft leader** for a shard group manages topic metadata.
 - The **segment leader** (`replica_set[0]` in `SegmentMeta`) handles writes for a specific segment.
 
-For `Produce`: the receiving node must be the segment leader. If not, it returns
-`NotLeader { leader_addr: segment_leader_addr }` where `leader_addr` is resolved from the topic
-routing cache → `replica_set[0]` → SWIM address lookup.
+In all data plane operations, if this node does not host the shard group for the topic at all,
+it returns `ShardNotLocal { hint_node }` before any further routing logic runs (see Common Errors).
 
-For `Fetch`: any node in `replica_set` can serve reads (followers track `commit_offset` piggybacked
-on each `ReplicaAppend` and only serve up to it). If the receiving node is NOT in the `replica_set`,
-it returns `NotLeader { leader_addr: replica_set[0] }`.
+For `Produce`: the receiving node must be the segment leader. If it hosts the shard group but is
+not the segment leader, it returns `NotLeader { leader_addr: segment_leader_addr }` where
+`leader_addr` is resolved from the topic routing cache → `replica_set[0]` → SWIM address lookup.
+
+For `Fetch`: any node in `replica_set` can serve reads — followers are valid targets. Followers
+track `commit_offset` piggybacked on each `ReplicaAppend` and serve records only up to that
+committed position. If the receiving node hosts the shard group but is not in the `replica_set`
+for the requested range, it returns `NotLeader { leader_addr: replica_set[0] }`.
 
 ### Topic Routing Snapshot Cache
 
 See "Topic Routing Cache" section for the concrete type. Used by all `DataPlane` and `ConsumerGroup`
-handlers to resolve `topic_name + partition_key → range → segment → replica_set` without crossing
+handlers to resolve `topic_name + routing_key → range → segment → replica_set` without crossing
 the actor boundary on every request.
 
 ### Protocols
@@ -216,21 +314,44 @@ the actor boundary on every request.
 **Produce**
 
 ```
-Request:  { topic_name: String, partition_key: Vec<u8>, value: Vec<u8>,
+Request:  { topic_name: String, routing_key: Vec<u8>, value: Vec<u8>,
             producer_id: u64, sequence_no: u64 }
-Response: { offset: u64 } | NotLeader | TopicNotFound | RangeSplitting { ... }
+Response: { offset: u64 } | NotLeader | ShardNotLocal | TopicNotFound | RangeSplitting { ... }
 ```
 
-`RangeSplitting { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> }`:
-The target range has been sealed by a split. The response includes the child range IDs and the
-`split_point` so the client can immediately route without a metadata round-trip:
+`routing_key` is treated as opaque bytes by the server — it is used solely to locate the target
+range via `keyspace_start <= routing_key < keyspace_end`. The client owns partitioning strategy:
 
-- `partition_key < split_point` → retry with `left_range_id`
-- `partition_key >= split_point` → retry with `right_range_id`
+- **Key-based:** pass `hash(key)` — even distribution across ranges.
+- **Sticky:** pass the same fixed bytes per session — all records land in one range.
+- **Round-robin / random:** pass a random byte sequence per record.
+- **Explicit:** pass a value known to fall in a specific range's keyspace.
 
-If the child range's active segment is not yet assigned, the client applies exponential backoff
-(configurable: base 50ms, 2x multiplier, configurable max). The max retry timeout defaults to
-`produce_split_redirect_timeout_ms` (default: 5 000ms).
+No protocol changes are needed to introduce new strategies — the server never inspects the
+partitioning intent.
+
+Flow:
+
+1. **Cache lookup.** Look up `topic_name` in `TopicRoutingCache`.
+   - Cache miss → send `MultiRaftActorCommand::GetTopicRouting { topic_name }` to resolve from
+     local `MetadataStateMachine`. If the shard group is not hosted on this node →
+     return `ShardNotLocal { hint_node }` (resolved from Topology).
+   - Topic absent from `MetadataStateMachine` on the owning node → return `TopicNotFound`.
+
+2. **Range resolution.** Linear scan `TopicRouting::active_ranges` (sorted by `keyspace_start`,
+   at most ~100 entries) for the first range where `routing_key < keyspace_end`. Retrieve
+   `active_segment_id` and `replica_set`.
+
+3. **Segment leader check.** `replica_set[0]` is the segment leader.
+   - This node is the segment leader → continue.
+   - Not the segment leader → return `NotLeader { leader_addr: replica_set[0] address }`.
+
+4. **Write.** Send append request to `DataPlaneActor`. Await the assigned offset.
+   - Active segment sealed (range split in progress) → invalidate cache entry, return
+     `RangeSplitting { left_range_id, right_range_id, split_point }`. Client routes to the
+     correct child range:
+     `routing_key < split_point` → `left_range_id`, otherwise → `right_range_id`.
+   - Committed → return `{ offset }`.
 
 `(producer_id, sequence_no)` is an application-level idempotency key embedded in every record.
 The broker does **not** deduplicate — this is an app-level primitive for exactly-once semantics.
@@ -239,25 +360,73 @@ The broker does **not** deduplicate — this is an app-level primitive for exact
 
 ```
 Request:  { topic_name: String, range_id: u64, offset: u64, max_bytes: u32 }
-Response: { records: Vec<Record>, high_watermark: u64,
-            sealed: bool, end_offset: Option<u64>,
-            split_into: Option<[u64; 2]>, merged_into: Option<u64> }
-         | NotLeader | OffsetOutOfRange
+Response: { records: Vec<Record>, range_status: RangeStatus }
+        | NotLeader | ShardNotLocal | OffsetOutOfRange
+
+RangeStatus:
+  Active
+  Sealed { end_offset: u64, transition: RangeTransition }
+
+RangeTransition:
+  Split { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> }
+  Merged { merged_range_id: u64 }
 ```
 
-Reads from the segment file/cache starting at `offset`, up to `max_bytes`.
-`high_watermark`: next offset to be written (one past the last available committed record).
-If `offset == high_watermark`, `records` is empty — consumer polls again after a wait.
+`high_watermark` is intentionally absent from the response — the client polls when `records` is
+empty regardless. Use `ListOffsets` for consumer lag monitoring.
 
-`sealed`, `end_offset`, `split_into`, `merged_into`: non-null when the range has been sealed.
-Consumer uses these to navigate range transitions without a separate metadata query (see D4).
+Flow:
+
+1. **Cache lookup.** Look up `topic_name` in `TopicRoutingCache`. Same miss path as `Produce`
+   (`ShardNotLocal` or `TopicNotFound`).
+
+2. **Range lookup.** Retrieve `RangeRouting` by `range_id` from `TopicRouting::all_ranges`
+   (covers both active and sealed ranges). Get `replica_set`.
+
+3. **Replica check.** Any node in `replica_set` may serve reads.
+   - This node is in `replica_set` → continue.
+   - Not in `replica_set` → return `NotLeader { leader_addr: replica_set[0] address }`.
+
+4. **Read.** Read from segment cache/file starting at `offset`, up to `max_bytes`. Serve only
+   up to `commit_offset` (followers track this via piggybacked `ReplicaAppend`).
+   - `offset > commit_offset` → return `OffsetOutOfRange`.
+   - Range is sealed → populate `Sealed { end_offset, transition }` from `MetadataStateMachine`.
+   - Otherwise → return `records` with `range_status: Active`.
+
+**Client transition logic:**
+
+*Split* — consumer receives `Sealed { end_offset: E, Split { left: L, right: RR, split_point: SP } }`:
+1. Drain range R to `end_offset` E (may require additional Fetch calls if `max_bytes` was small).
+2. Open two new Fetch streams: `Fetch(L, offset=0)` and `Fetch(RR, offset=0)`.
+3. Process L and RR independently.
+
+*Merge* — consumer tracks both source ranges L and RR. Each eventually returns
+`Sealed { end_offset, Merged { merged_range_id: M } }`:
+1. Drain L to its `end_offset`. Mark L done.
+2. Drain RR to its `end_offset`. Mark RR done.
+3. Only after both are done → open one new Fetch stream from M at offset 0.
+
+The consumer naturally sees both sealed events because it tracks all active ranges of a topic.
+No extra metadata query is needed to coordinate the merge.
 
 **ListOffsets**
 
 ```
 Request:  { topic_name: String, range_id: u64 }
-Response: { start_offset: u64, high_watermark: u64 } | NotLeader
+Response: { start_offset: u64, commit_offset: u64 } | NotLeader | ShardNotLocal
 ```
+
+`commit_offset`: one past the last replicated and committed record — the next offset to be
+written. Matches `SegmentCache::commit_offset` in the implementation. Consumers use
+`commit_offset - current_offset` to calculate lag.
+
+Flow:
+
+1. **Cache lookup.** Same miss path as `Fetch` step 1 (`ShardNotLocal` or `TopicNotFound`).
+2. **Replica check.** Any node in `replica_set` may serve — same check as `Fetch` step 3.
+   - Not in `replica_set` → return `NotLeader { leader_addr: replica_set[0] address }`.
+3. **Read.** Return `start_offset` (first offset of the range) and `commit_offset` from local
+   segment state. No disk I/O needed.
 
 **CommitOffset** *(Phase 2)*
 
@@ -267,8 +436,10 @@ Request:  { consumer_group: String, topic_name: String, range_id: u64,
 Response: Ok | StaleGeneration | NotLeader
 ```
 
-Offset is Raft-proposed via `MetadataCommand::CommitConsumerOffset`. The receiving node must be the
-Raft leader for the shard group that owns the topic. If not, returns `NotLeader`.
+Offset is written to the dedicated offset log (DataPlaneActor segment) by the coordinator.
+The coordinator (Raft leader for the shard group) validates `generation_id` before writing.
+Non-coordinators return `NotLeader { leader_addr: coordinator_addr }`. See Phase 2 offset
+log design — committed offsets are NOT Raft-proposed; they go directly to the offset log segment.
 
 **FetchCommittedOffset** *(Phase 2)*
 
@@ -277,8 +448,9 @@ Request:  { consumer_group: String, topic_name: String, range_id: u64 }
 Response: { offset: Option<u64> } | NotLeader
 ```
 
-Read-only query against local `MetadataStateMachine`. Returns `None` if no offset has been committed
-for this group/range yet.
+Read-only query against the coordinator's in-memory offset map (rebuilt from the offset log on
+failover). Must route to the coordinator (Raft leader) — followers do not maintain this map.
+Returns `None` if no offset has been committed for this group/range yet.
 
 ## Topic Routing Cache
 
@@ -293,7 +465,7 @@ pub struct TopicRoutingCache {
 pub struct TopicRouting {
     pub topic_id: TopicId,
     pub shard_group_id: ShardGroupId,
-    // Active ranges sorted by keyspace_start — binary searched on Produce.
+    // Active ranges sorted by keyspace_start — linear scanned on Produce.
     pub active_ranges: Vec<RangeRouting>,
     // All ranges (active + sealed) keyed by range_id — used by Fetch.
     pub all_ranges: HashMap<RangeId, RangeRouting>,
@@ -331,9 +503,15 @@ Response: { nodes: Vec<NodeInfo { node_id: String, addr: SocketAddr, state: Node
 NodeState: Alive | Suspect | Dead
 ```
 
-Sourced from SWIM membership table. `state` reflects the local SWIM view of each node.
+Flow:
 
-**ListTopicsWithStats**
+1. **Query SWIM.** Send `SwimQueryCommand` to `swim_sender` to retrieve the current membership
+   table.
+2. **Build response.** Map each known node to `NodeInfo { node_id, addr, state }`. `state`
+   reflects this node's local SWIM view — may differ from other nodes' views during a partition.
+   Return directly. No Raft proposal, no forwarding, no leader check.
+
+**ListHostedTopicsWithStats**
 
 ```
 Request:  {}
@@ -341,14 +519,39 @@ Response: { topics: Vec<TopicStats { name: String, range_count: u32,
                                      total_records: u64, total_bytes: u64 }> }
 ```
 
-- `total_records` / `total_bytes`: summed from `SegmentMeta` on the local shard groups only.
+Flow:
+
+1. **Local read.** Query local `MetadataStateMachine` for all topics across all hosted shard groups.
+2. **Aggregate stats.** For each topic, iterate all `SegmentMeta` entries and sum `size_bytes`
+   and record counts. Local shard groups only — no scatter-gather.
+3. **Return.** No Raft proposal, no forwarding, no leader check.
 
 **SplitRange**
 
 ```
 Request:  { topic_name: String, range_id: u64, split_point: Vec<u8> }
-Response: Ok | NotLeader | InvalidSplitPoint
+Response: Ok | InvalidSplitPoint | InternalError
 ```
+
+Implementation note: `MetadataCommand::SplitRange` and `MetadataStateMachine::split_range()` are
+fully implemented (`src/clusters/metadata/command.rs`, `state_machine.rs`). The handler only
+needs to wire up to the existing logic — no new state machine code required. `InvalidSplitPoint`
+is already returned by `split_range()` for boundary violations.
+
+Flow:
+
+1. **Leader resolution (server-side).** Compute `ShardGroupId::new(hash(topic_name))`. Same
+   forwarding logic as `CreateTopic` — resolve leader via Topology + `MultiRaft`, forward once
+   with `ProposeRequest { forwarded: true }`. Forwarding failure → return `InternalError`.
+
+2. **Validate split point.** Check `split_point` is strictly interior to the range's keyspace:
+   `keyspace_start < split_point < keyspace_end`. If not → return `InvalidSplitPoint`.
+
+3. **Propose.** Send `RaftCommand::Metadata(MetadataCommand::SplitRange { topic_name, range_id,
+   split_point })` to `MultiRaftActor`. Await commit.
+   - Committed → `MetadataStateMachine::split_range()` seals parent range, creates two child
+     ranges → return `Ok`.
+   - `ProposeError::NotLeader` (lost leadership mid-flight) → return `InternalError`.
 
 ## Consumer Group *(Phase 2)*
 
@@ -377,6 +580,25 @@ the consumer's current `generation_id`. If it doesn't match the group's current 
 The consumer then calls `JoinGroup` again to get a fresh `generation_id` and updated assignments.
 This prevents split-brain: a consumer that missed a rebalance cannot commit offsets for ranges it
 no longer owns.
+
+### Client Connection Model (Phase 2)
+
+Consumers maintain two logical connections to different nodes:
+
+```
+Consumer
+  ├── read connection  → any replica in replica_set  (Fetch, ListOffsets)
+  └── commit connection → coordinator (Raft leader)  (CommitOffset, FetchCommittedOffset,
+                                                       JoinGroup, Heartbeat, LeaveGroup)
+```
+
+`CommitOffset` and `FetchCommittedOffset` sent to a non-coordinator node return
+`NotLeader { leader_addr: coordinator_addr }`. The consumer reconnects and retries on the
+commit connection. The read connection to a follower is unaffected.
+
+Consumer group state is co-located with the topic's metadata shard group. `hash(topic_name)`
+routes all consumer group operations to the same shard leader that owns the topic — no
+cross-shard coordination is needed.
 
 ### Coordinator
 
