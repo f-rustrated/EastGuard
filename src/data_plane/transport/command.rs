@@ -11,7 +11,13 @@ pub(crate) enum DataTransportCommand {
 }
 
 impl DataTransportCommand {
-    pub(crate) fn send(targets: Vec<NodeId>, message: DataPlaneInterNodeCommand) -> Self {
-        Self::Send { targets, message }
+    pub(crate) fn send(
+        targets: Vec<NodeId>,
+        message: impl Into<DataPlaneInterNodeCommand>,
+    ) -> Self {
+        Self::Send {
+            targets,
+            message: message.into(),
+        }
     }
 }
