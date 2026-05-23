@@ -68,6 +68,30 @@ pub async fn assert_membership_converged(
     Ok(())
 }
 
+/// Polls `GetShardLeader` across `nodes` until any reports a leader for `shard_group_id`.
+/// Returns the elected leader's node ID.
+pub async fn wait_for_shard_leader(
+    nodes: &[(&str, u16)],
+    shard_group_id: u64,
+    max_attempts: u32,
+    tick: Duration,
+) -> turmoil::Result<String> {
+    for attempt in 0..max_attempts {
+        for &(host, port) in nodes {
+            if let Ok(Some(leader)) = query_shard_leader(host, port, shard_group_id).await {
+                return Ok(leader);
+            }
+        }
+        if attempt < max_attempts - 1 {
+            tokio::time::sleep(tick).await;
+        }
+    }
+    panic!(
+        "no leader elected for shard group {} after {} attempts",
+        shard_group_id, max_attempts
+    );
+}
+
 /// Queries `GetShardLeader` for the given shard group from every node and asserts
 /// all non-None answers name the same leader.
 pub async fn assert_single_leader(

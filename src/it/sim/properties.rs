@@ -6,15 +6,16 @@ use crate::StartUp;
 use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
 use crate::it::sim::invariants::{
     assert_membership_converged, assert_single_leader, assert_topic_visible, query_shard_info,
-    query_shard_leader,
+    query_shard_leader, wait_for_shard_leader,
 };
 use crate::it::sim::scenario::{
     client_port, cluster_port, make_create_topic_req, node_name, try_propose,
 };
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 
 fn three_node_sim(simulation_secs: u64) -> turmoil::Sim<'static> {
     Builder::new()
-        .tick_duration(Duration::from_millis(100))
+        .tick_duration(Duration::from_millis(TICK_PERIOD_100_MS))
         .simulation_duration(Duration::from_secs(simulation_secs))
         .tcp_capacity(4096)
         .build()
@@ -52,28 +53,36 @@ fn metadata_visible() -> turmoil::Result {
     }
 
     sim.client("checker", async {
-        // Retry until a leader is elected and the propose is acked (up to 30s).
+        let nodes: &[(&str, u16)] = &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+
+        // Phase 1: all 3 nodes form a cluster.
+        assert_membership_converged(nodes, 30, Duration::from_secs(1)).await?;
+
+        // Phase 2: wait for leader election on the shard that will own "visible-test".
+        let shard_info = query_shard_info("node-1", 8081, b"visible-test")
+            .await?
+            .expect("shard info not found after membership convergence");
+        wait_for_shard_leader(nodes, shard_info.shard_group_id, 30, Duration::from_millis(500))
+            .await?;
+
+        // Phase 3: propose — any node forwards to the leader.
+        // Retry a few times: the TCP path to the leader may need one round-trip to establish.
         let req = make_create_topic_req("visible-test");
         let mut acked = false;
-        for _ in 0..30u32 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            for i in 1..=3u8 {
-                if let Some(crate::connections::request::ProposeResponse::Success) =
-                    try_propose(&node_name(i), client_port(i), &req).await
-                {
-                    acked = true;
-                    break;
-                }
-            }
-            if acked {
+        for _ in 0..5u32 {
+            if let Some(crate::connections::request::ProposeResponse::Success) =
+                try_propose("node-1", 8081, &req).await
+            {
+                acked = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        assert!(acked, "CreateTopic was not acked by any node within 30s");
+        assert!(acked, "CreateTopic failed after leader was elected");
 
-        let nodes: &[(&str, u16)] =
-            &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
-        assert_topic_visible(nodes, "visible-test", 60, Duration::from_millis(100)).await?;
+        // Followers apply the committed entry on the next heartbeat (≤1s).
+        // Budget = 2× heartbeat interval = 2s.
+        assert_topic_visible(nodes, "visible-test", 20, Duration::from_millis(TICK_PERIOD_100_MS)).await?;
         Ok(())
     });
 
@@ -128,7 +137,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
                 elected = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(TICK_PERIOD_100_MS)).await;
         }
         assert!(elected, "no new leader elected within 30s after killing node-1");
 

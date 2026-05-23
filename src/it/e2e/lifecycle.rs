@@ -4,6 +4,7 @@ use turmoil::Builder;
 
 use crate::StartUp;
 use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 
 /// Full-stack E2E: SWIM cluster formation with MultiRaftActor wired in.
 ///
@@ -16,7 +17,7 @@ use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env
 #[serial_test::serial]
 fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
     let mut sim = Builder::new()
-        .tick_duration(Duration::from_millis(100))
+        .tick_duration(Duration::from_millis(TICK_PERIOD_100_MS))
         .simulation_duration(Duration::from_secs(120))
         .tcp_capacity(4096)
         .build();

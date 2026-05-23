@@ -12,9 +12,9 @@ Separate from SWIM's UDP transport (`SwimTransportActor` on `cluster_port`). Raf
 RaftTransportActor
 ├── listener: TcpListener           (accepts inbound connections on raft_port)
 ├── RaftWriters
-│   ├── writers: HashMap<NodeId, OwnedWriteHalf>  (one per connected peer)
-│   ├── addr_cache: HashMap<NodeId, NodeAddress>   (resolved addresses)
-│   └── dead_peers: HashSet<NodeId>                (explicitly disconnected)
+│   ├── writers: BTreeMap<NodeId, OwnedWriteHalf>  (one per connected peer)
+│   ├── addr_cache: BTreeMap<NodeId, NodeAddress>   (resolved addresses)
+│   └── dead_peers: BTreeSet<NodeId>                (explicitly disconnected)
 └── cleanup_interval: 300s          (periodic dead_peers clear)
 ```
 
@@ -42,7 +42,7 @@ Size guards: NodeId frames capped at 1KB, message frames at 4MB.
 
 3. **SWIM is authoritative for address resolution.** `NodeId → SocketAddr` resolved via `SwimQueryCommand::ResolveAddress`. Address cached locally in `addr_cache`. Cache cleared on `DisconnectPeer`.
 
-4. **One writer per peer.** `writers` map is `HashMap<NodeId, OwnedWriteHalf>` — at most one write half per peer. On write failure, writer removed from map (next send triggers reconnect).
+4. **One writer per peer.** `writers` map is `BTreeMap<NodeId, OwnedWriteHalf>` — at most one write half per peer. On write failure, writer removed from map (next send triggers reconnect).
 
 5. **Reader tasks are fire-and-forget.** Each accepted or established connection spawns a `RaftReader::run()` tokio task. Reader feeds received messages into `raft_tx` channel. On read failure or EOF, task exits silently — no reconnection from reader side.
 

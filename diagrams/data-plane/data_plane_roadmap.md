@@ -155,7 +155,7 @@ After sealing, the old segment may be under-replicated — e.g., segment 7 had `
 
 Reverse index in MetadataStateMachine (active segments only):
 ```
-node_active_segment_index: HashMap<NodeId, Vec<(TopicId, RangeId, SegmentId)>>
+node_active_segment_index: BTreeMap<NodeId, Vec<(TopicId, RangeId, SegmentId)>>
 ```
 
 On `HandleNodeDeath(F)`: look up F in the index → active segments get `RollSegment` (seal, replace F). Sealed segments found by scanning MetadataStateMachine segment metadata, filtering by `replica_set.contains(F)` — O(all sealed segments), but node death is infrequent and the scan takes milliseconds. Mark under-replicated, assign new broker, trigger repair.

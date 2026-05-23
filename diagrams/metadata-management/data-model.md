@@ -9,7 +9,7 @@ How Topic, Range, and Segment relate, transition, and cascade through the `Metad
 ```
 MetadataStateMachine (one per shard group)
 │
-├── topics: HashMap<TopicId, TopicMeta>
+├── topics: BTreeMap<TopicId, TopicMeta>
 │   │
 │   └── TopicMeta
 │       ├── topic_id:       TopicId
@@ -17,7 +17,7 @@ MetadataStateMachine (one per shard group)
 │       ├── state:          TopicState
 │       ├── storage_policy: StoragePolicy { retention_ms, replication_factor, partition_strategy }
 │       ├── active_ranges:  Vec<RangeId>     (ordered by keyspace_start — write routing)
-│       ├── ranges:         HashMap<RangeId, RangeMeta>  (all ranges including sealed)
+│       ├── ranges:         BTreeMap<RangeId, RangeMeta>  (all ranges including sealed)
 │       └── next_range_id:  u64              (monotonic counter, scoped to this topic)
 │
 │   RangeMeta (nested inside TopicMeta)
@@ -25,7 +25,7 @@ MetadataStateMachine (one per shard group)
 │       ├── keyspace:        [start, end)    (byte range, never gaps/overlaps)
 │       ├── state:           RangeState
 │       ├── active_segment:  Option<SegmentId> (at most one — the write head)
-│       ├── segments:        HashMap<SegmentId, SegmentMeta>  (all segments in this range)
+│       ├── segments:        BTreeMap<SegmentId, SegmentMeta>  (all segments in this range)
 │       ├── next_segment_id: u64             (monotonic counter, scoped to this range)
 │       ├── next_offset:     u64             (next write position, monotonic within range)
 │       ├── split_into:      Option<[RangeId; 2]>
@@ -42,7 +42,7 @@ MetadataStateMachine (one per shard group)
 │       ├── created_at:    u64              (monotonic timestamp)
 │       └── sealed_at:     Option<u64>
 │
-└── topic_name_index: HashMap<String, TopicId>
+└── topic_name_index: BTreeMap<String, TopicId>
 ```
 
 ### PartitionStrategy
@@ -73,7 +73,7 @@ Ownership expressed by nesting — `TopicMeta` contains its `RangeMeta`s, each `
 `TopicMeta` has two range references serving different purposes:
 
 - **`active_ranges: Vec<RangeId>`** — ordered keyspace coverage for write routing. Only Active ranges. Updated on split (remove parent, insert children) and merge (remove sources, insert merged). Used by write path to find `key K ∈ [start, end)`.
-- **`ranges: HashMap<RangeId, RangeMeta>`** — all ranges ever created for this topic, including Sealed and Deleting. Used for reads (consumers traverse sealed ranges), lineage tracking, and GC.
+- **`ranges: BTreeMap<RangeId, RangeMeta>`** — all ranges ever created for this topic, including Sealed and Deleting. Used for reads (consumers traverse sealed ranges), lineage tracking, and GC.
 
 ### How Range ID and Keyspace Are Determined
 
@@ -519,7 +519,7 @@ Counters are part of the replicated state — they advance deterministically on 
 For efficient lookup, the state machine maintains:
 
 ```
-topic_name_index: HashMap<String, TopicId>
+topic_name_index: BTreeMap<String, TopicId>
 ```
 
 Needed for: duplicate name detection on `CreateTopic`, lookup by name from client queries.
@@ -527,7 +527,7 @@ Needed for: duplicate name detection on `CreateTopic`, lookup by name from clien
 Built from forward data (topics map). Rebuilt from snapshot on recovery. Maintained incrementally on apply.
 
 Future indexes (when needed):
-- `segments_by_node: HashMap<NodeId, HashSet<(TopicId, RangeId, SegmentId)>>` — for node failure handling (ReassignSegment). Composite key because SegmentId is scoped to its parent range.
+- `segments_by_node: BTreeMap<NodeId, BTreeSet<(TopicId, RangeId, SegmentId)>>` — for node failure handling (ReassignSegment). Composite key because SegmentId is scoped to its parent range.
 
 ---
 
@@ -572,7 +572,7 @@ No `AssignRange` — ranges are created implicitly by `CreateTopic` (initial ful
 
 Each `apply_*` method:
 1. Validates preconditions (correct state, entity exists)
-2. Mutates internal HashMaps
+2. Mutates internal BTreeMaps
 3. Returns `Result<ApplyResult, ApplyError>`
 
 Precondition failures in `apply_*` are logged but not fatal — they indicate a bug in the proposal logic, not in the state machine. The state machine is deterministic: given the same log, every replica produces the same state.
@@ -603,7 +603,7 @@ Client                    MultiRaftActor                    Raft
 ```
 
 **Why MultiRaftActor, not a separate routing layer:**
-- Already has `HashMap<ShardGroupId, Raft>` — can check `is_leader()` directly
+- Already has `BTreeMap<ShardGroupId, Raft>` — can check `is_leader()` directly
 - `ShardGroupId::new(key)` is a pure hash — no topology query needed
 - Avoids async round-trip to SWIM for routing info
 - Internal proposals (AddPeer/RemovePeer from SWIM events) already go through `MultiRaft` directly via `HandleNodeDeath`/`HandleNodeJoin`
@@ -632,7 +632,7 @@ For InstallSnapshot (leader → lagging follower), the entire state machine seri
 
 ```rust
 struct SnapshotData {
-    topics:        HashMap<TopicId, TopicMeta>,
+    topics:        BTreeMap<TopicId, TopicMeta>,
     next_topic_id: u64,
 }
 ```

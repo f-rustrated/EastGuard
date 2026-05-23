@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -73,26 +73,26 @@ const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// outbound connect), the tie is broken by NodeId ordering.
 struct RaftWriters {
     node_id: NodeId,
-    writers: HashMap<NodeId, OwnedWriteHalf>,
-    addr_cache: HashMap<NodeId, NodeAddress>,
+    writers: BTreeMap<NodeId, OwnedWriteHalf>,
+    addr_cache: BTreeMap<NodeId, NodeAddress>,
     /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
-    dead_peers: HashSet<NodeId>,
+    dead_peers: BTreeSet<NodeId>,
     /// Tracks when the last connect attempt to a peer failed. Prevents
     /// rapid reconnect storms to dead/unreachable peers that would block
     /// the transport's select loop and stall flush_events in MultiRaftActor.
-    connect_backoffs: HashMap<NodeId, Instant>,
+    connect_backoffs: BTreeMap<NodeId, Instant>,
 }
 
 impl RaftWriters {
     fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
-            writers: HashMap::new(),
-            addr_cache: HashMap::new(),
-            dead_peers: HashSet::new(),
-            connect_backoffs: HashMap::new(),
+            writers: BTreeMap::new(),
+            addr_cache: BTreeMap::new(),
+            dead_peers: BTreeSet::new(),
+            connect_backoffs: BTreeMap::new(),
         }
     }
 
@@ -128,8 +128,8 @@ impl RaftWriters {
     fn group_packets(
         &self,
         packets: Vec<OutboundRaftPacket>,
-    ) -> HashMap<NodeId, Vec<WireRaftMessage>> {
-        let mut by_target: HashMap<NodeId, Vec<WireRaftMessage>> = HashMap::new();
+    ) -> BTreeMap<NodeId, Vec<WireRaftMessage>> {
+        let mut by_target: BTreeMap<NodeId, Vec<WireRaftMessage>> = BTreeMap::new();
         for pkt in packets {
             if self.dead_peers.contains(&pkt.target) {
                 continue;

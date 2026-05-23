@@ -14,11 +14,11 @@ pub(crate) use types::*;
 
 #[allow(unused_imports)]
 pub(crate) use command::*;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Encode, Decode)]
 pub struct TopicId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Encode, Decode)]
 pub struct RangeId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Encode, Decode)]
 pub struct SegmentId(pub u64);

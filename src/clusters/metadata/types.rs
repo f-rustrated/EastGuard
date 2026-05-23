@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bincode::{Decode, Encode};
 
@@ -86,7 +86,7 @@ pub struct RangeMeta {
     pub keyspace_end: Vec<u8>,
     pub state: RangeState,
     pub active_segment: Option<SegmentId>,
-    pub segments: HashMap<SegmentId, SegmentMeta>,
+    pub segments: BTreeMap<SegmentId, SegmentMeta>,
     pub next_segment_id: u64,
     pub next_offset: u64,
     pub split_into: Option<[RangeId; 2]>,
@@ -112,7 +112,7 @@ impl RangeMeta {
             keyspace_end,
             state: RangeState::Active,
             active_segment: Some(segment_id),
-            segments: HashMap::from([(segment_id, segment)]),
+            segments: BTreeMap::from([(segment_id, segment)]),
             next_segment_id: 1,
             next_offset: 0,
             split_into: None,
@@ -397,7 +397,7 @@ pub struct TopicMeta {
     pub state: TopicState,
     pub storage_policy: StoragePolicy,
     pub active_ranges: Vec<RangeId>,
-    pub ranges: HashMap<RangeId, RangeMeta>,
+    pub ranges: BTreeMap<RangeId, RangeMeta>,
     pub next_range_id: u64,
 }
 impl TopicMeta {
@@ -423,7 +423,7 @@ impl TopicMeta {
             state: TopicState::Active,
             storage_policy,
             active_ranges: vec![range_id],
-            ranges: HashMap::from([(range_id, range)]),
+            ranges: BTreeMap::from([(range_id, range)]),
             next_range_id: 1,
         }
     }
@@ -432,16 +432,19 @@ impl TopicMeta {
         &mut self,
         ranges: [&RangeId; N],
     ) -> Result<[&mut RangeMeta; N], MetadataError> {
-        let options = self.ranges.get_disjoint_mut(ranges);
+        for key in &ranges {
+            if !self.ranges.contains_key(key) {
+                return Err(MetadataError::RangeNotFound);
+            }
+        }
 
-        let vec_ranges: Vec<&mut RangeMeta> = options
-            .into_iter()
-            .map(|opt| opt.ok_or(MetadataError::RangeNotFound)) // Bubble up the error
-            .collect::<Result<Vec<_>, _>>()?;
+        let unique: BTreeSet<_> = ranges.iter().copied().collect();
+        if unique.len() != N {
+            return Err(MetadataError::RangeNotFound);
+        }
 
-        // ! SAFETY: We can safely unwrap() here because we know the Vec was built
-        // ! from an array of exactly size N, so it will never fail.
-        Ok(vec_ranges.try_into().unwrap())
+        let ptr: *mut BTreeMap<RangeId, RangeMeta> = &mut self.ranges;
+        Ok(ranges.map(|key| unsafe { (*ptr).get_mut(key).unwrap() }))
     }
 
     pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {

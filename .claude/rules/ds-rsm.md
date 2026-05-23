@@ -56,7 +56,7 @@ Membership drives consensus: SWIM detects node join/death → tells MultiRaftAct
 | Component | Owns | Driven By |
 |---|---|---|
 | `SwimActor` | `Swim` state machine | UDP packets, timer callbacks |
-| `MultiRaftActor` | `MultiRaft` → `HashMap<ShardGroupId, Raft>` | TCP packets, timer callbacks, SWIM membership events |
+| `MultiRaftActor` | `MultiRaft` → `BTreeMap<ShardGroupId, Raft>` | TCP packets, timer callbacks, SWIM membership events |
 | `Raft` | `MetadataStateMachine` (per shard group) | Committed log entries |
 | `Topology` | Consistent hash ring + shard leader map | SWIM membership events |
 | `Ticker<T>` | Timer state for either SWIM or Raft | Real-time interval ticks |
@@ -82,7 +82,7 @@ is_leader()? → propose(command) → replicate → commit → apply to Metadata
 
 2. **SWIM is sole membership authority.** Group lifecycle (create, remove) and peer changes (add, remove) are driven by SWIM membership events. `MultiRaftActor` does not decide when to create or remove groups — only responds to commands from `SwimActor`.
 
-3. **Raft is transport-agnostic.** `Raft::peers` is `HashSet<NodeId>` — no addresses. State machine produces `OutboundRaftPacket { target: NodeId, rpc }`. Actor/transport layer resolves `NodeId → SocketAddr → Connection`.
+3. **Raft is transport-agnostic.** `Raft::peers` is `BTreeSet<NodeId>` — no addresses. State machine produces `OutboundRaftPacket { target: NodeId, rpc }`. Actor/transport layer resolves `NodeId → SocketAddr → Connection`.
 
 4. **Sync-first design.** All protocol logic (`Swim`, `Raft`, `MetadataStateMachine`, `Ticker`, `GossipBuffer`, `Topology`) is purely synchronous. No async, no I/O, no channels. Side effects buffered internally and drained by owning actor after each event.
 

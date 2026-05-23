@@ -12,6 +12,7 @@ use crate::connections::request::{
 };
 use crate::it::helpers::default_env;
 use crate::it::sim::invariants::{assert_membership_converged, assert_topic_visible, query_shard_info};
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 use crate::net::TcpStream;
 
 pub(super) fn node_name(i: u8) -> String {
@@ -180,7 +181,7 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
 
     let total_secs = scenario.simulation_secs + 60;
     let mut sim = Builder::new()
-        .tick_duration(Duration::from_millis(100))
+        .tick_duration(Duration::from_millis(TICK_PERIOD_100_MS))
         .simulation_duration(Duration::from_secs(total_secs))
         .tcp_capacity(4096)
         .build();

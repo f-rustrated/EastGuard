@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ async fn start_raft_node(
 > {
     let node_id = NodeId::new(node_name);
 
-    let mut address_map = HashMap::new();
+    let mut address_map = BTreeMap::new();
     address_map.insert(
         node_id.clone(),
         SocketAddr::new(turmoil::lookup(node_name), cluster_port),
