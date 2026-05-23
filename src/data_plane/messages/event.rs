@@ -1,13 +1,10 @@
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
-
 use crate::{
     clusters::NodeId,
     data_plane::{
         SegmentKey,
         checkpoint::CheckpointJob,
-        messages::ProduceAck,
         states::segment::cache::CachedBatch,
         timer::DataPlaneTimer,
     },
@@ -23,14 +20,6 @@ pub(crate) struct PendingReplicationBatch {
 
 pub(crate) enum DataPlaneEvent {
     SubmitCheckpoint(CheckpointJob),
-    ProducePending {
-        segment_key: SegmentKey,
-        reply: oneshot::Sender<ProduceAck>,
-    },
-    WalBatchComplete {
-        lsn: u64,
-    },
-    WalBatchFailed(String),
     Timer(TimerCommand<DataPlaneTimer>),
     ReplicationReady {
         lsn: u64,
@@ -51,10 +40,6 @@ pub(crate) enum DataPlaneEvent {
         segment_key: SegmentKey,
         committed_end_offset: u64,
         followers: Vec<NodeId>,
-    },
-    MigrateReplies {
-        old_segment_key: SegmentKey,
-        new_segment_key: SegmentKey,
     },
     SendSealRequest {
         segment_key: SegmentKey,
