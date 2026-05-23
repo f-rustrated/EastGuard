@@ -4,6 +4,7 @@ use turmoil::Builder;
 
 use crate::StartUp;
 use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 use crate::clusters::raft::messages::ProposeError;
 use crate::connections::request::{ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse};
 use crate::it::helpers::{default_env, send_propose};
@@ -29,7 +30,7 @@ fn test_propose_request(name: &str, forwarded: bool) -> ConnectionRequests {
 #[serial_test::serial]
 fn forwarded_request_not_forwarded_again() -> turmoil::Result {
     let mut sim = Builder::new()
-        .tick_duration(Duration::from_millis(100))
+        .tick_duration(Duration::from_millis(TICK_PERIOD_100_MS))
         .simulation_duration(Duration::from_secs(60))
         .tcp_capacity(4096)
         .build();

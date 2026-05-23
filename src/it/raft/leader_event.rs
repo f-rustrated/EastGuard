@@ -137,7 +137,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
 
                 let mut events = Vec::new();
                 for _ in 0..150 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(TICK_PERIOD_100_MS)).await;
                     tokio::task::yield_now().await;
                     while let Ok(event) = leader_events_rx.try_recv() {
                         events.push(event);
