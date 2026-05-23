@@ -6,12 +6,12 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::checkpoint::CheckpointJob;
 use super::state::DataPlane;
-use super::timer::DataPlaneTimer;
+use super::timer::{BatchFlushTimer, ReplicationTimer};
 use super::wal::WalWriter;
 use crate::clusters::NodeId;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::SchedulerSender;
 
 pub struct DataPlaneActor;
 
@@ -20,7 +20,8 @@ impl DataPlaneActor {
         node_id: NodeId,
         data_dir: PathBuf,
         checkpoint_tx: Sender<CheckpointJob>,
-        scheduler_tx: tokio_mpsc::Sender<TickerCommand<DataPlaneTimer>>,
+        batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
+        repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
         data_transport_tx: tokio_mpsc::Sender<DataTransportCommand>,
     ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
@@ -44,7 +45,12 @@ impl DataPlaneActor {
                         state.handle_command(next);
                     }
 
-                    state.flush_and_dispatch(&checkpoint_tx, &scheduler_tx, &data_transport_tx);
+                    state.flush_and_dispatch(
+                        &checkpoint_tx,
+                        &batch_scheduler_tx,
+                        &repl_scheduler_tx,
+                        &data_transport_tx,
+                    );
                 }
             })
             .expect("failed to spawn data-plane thread");

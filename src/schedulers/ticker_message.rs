@@ -1,10 +1,36 @@
 use std::fmt::{Display, Formatter};
 
+use tokio::sync::mpsc as tokio_mpsc;
+
 #[derive(Debug)]
 pub(crate) enum TickerCommand<T> {
     Schedule(TimerCommand<T>),
     #[cfg(test)]
     ForceTick,
+}
+
+pub(crate) struct SchedulerSender<T>(tokio_mpsc::Sender<TickerCommand<T>>);
+
+impl<T> From<tokio_mpsc::Sender<TickerCommand<T>>> for SchedulerSender<T> {
+    fn from(tx: tokio_mpsc::Sender<TickerCommand<T>>) -> Self {
+        Self(tx)
+    }
+}
+
+impl<T> SchedulerSender<T> {
+    pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
+        let _ = self.0.blocking_send(
+            TimerCommand::SetSchedule {
+                seq,
+                timer: timer.into(),
+            }
+            .into(),
+        );
+    }
+
+    pub(crate) fn send(&self, cmd: TimerCommand<T>) {
+        let _ = self.0.blocking_send(cmd.into());
+    }
 }
 
 #[derive(Debug)]
