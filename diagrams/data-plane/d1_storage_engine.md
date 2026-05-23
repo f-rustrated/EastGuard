@@ -297,8 +297,8 @@ struct SegmentTracker {
 // Reply channels pass through as events (ProducePending), not held in state.
 struct DataPlane<W: WalStorage> {
     wal: W,
-    segments: BTreeMap<SegmentKey, SegmentTracker>,
-    accumulation_buffers: BTreeMap<SegmentKey, Vec<Record>>,
+    segments: HashMap<SegmentKey, SegmentTracker>,
+    accumulation_buffers: HashMap<SegmentKey, Vec<Record>>,
     pending_events: Vec<DataPlaneEvent>,
 }
 
@@ -389,7 +389,7 @@ Built from WAL replay + segment directory scan at startup (D5).
 
 **Segment tracker lifecycle:**
 - Created on `SegmentAssignment` from coordinator via `data_port` (D3). Produce targeting an unknown segment is rejected — producer retries after routing refresh
-- Stays in BTreeMap even when idle (lightweight — just ring buffer + atomics, no thread/task)
+- Stays in HashMap even when idle (lightweight — just ring buffer + atomics, no thread/task)
 - Removed on segment seal: final checkpoint via checkpoint worker, then `SegmentTracker` entry dropped
 - No spawn/stop lifecycle — `SegmentTracker` and its `SegmentRingBuffer` are data structures, not actors
 

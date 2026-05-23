@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ const RESULT_PORT: u16 = 39000;
 /// Responds to ResolveAddress queries and forwards LeaderChange events to a channel.
 async fn swim_handler_with_leader_capture(
     mut rx: mpsc::Receiver<SwimActorCommand>,
-    address_map: BTreeMap<NodeId, SocketAddr>,
+    address_map: HashMap<NodeId, SocketAddr>,
     leader_events_tx: mpsc::Sender<LeaderChange>,
 ) {
     while let Some(cmd) = rx.recv().await {
@@ -77,7 +77,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
             async move {
                 let node_id = NodeId::new(name);
 
-                let mut address_map = BTreeMap::new();
+                let mut address_map = HashMap::new();
                 address_map.insert(
                     node_id.clone(),
                     SocketAddr::new(turmoil::lookup(name), CLUSTER_PORT + port),
@@ -137,7 +137,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
 
                 let mut events = Vec::new();
                 for _ in 0..150 {
-                    tokio::time::sleep(Duration::from_millis(TICK_PERIOD_100_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     tokio::task::yield_now().await;
                     while let Ok(event) = leader_events_rx.try_recv() {
                         events.push(event);

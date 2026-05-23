@@ -5,12 +5,12 @@ use crate::clusters::metadata::{RangeId, TopicId, error::MetadataError};
 use crate::test_traits::TAssertInvariant;
 
 use MetadataError::*;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct MetadataStateMachine {
-    topics: BTreeMap<TopicId, TopicMeta>,
-    topic_name_index: BTreeMap<String, TopicId>,
+    topics: HashMap<TopicId, TopicMeta>,
+    topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
     pending_proposals: Vec<MetadataCommand>,
 }

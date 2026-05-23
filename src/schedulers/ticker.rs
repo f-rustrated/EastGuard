@@ -1,5 +1,5 @@
 use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub const TICK_PERIOD_100_MS: u64 = 100;
 #[allow(dead_code)]
@@ -10,7 +10,7 @@ pub(crate) const PROBE_INTERVAL_TICKS: u32 = 10; // 10 × 100ms = 1s
 pub(crate) struct Ticker<T> {
     protocol_elapsed: u32,
     protocol_interval_ticks: u32,
-    timers: BTreeMap<u32, T>,
+    timers: HashMap<u32, T>,
 }
 
 impl<T> Ticker<T>
