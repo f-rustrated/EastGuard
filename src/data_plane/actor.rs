@@ -44,11 +44,7 @@ impl DataPlaneActor {
                         state.handle_command(next);
                     }
 
-                    if state.should_flush() {
-                        state.flush_batch();
-                    }
-
-                    state.handle_events(&checkpoint_tx, &scheduler_tx, &data_transport_tx);
+                    state.flush_and_dispatch(&checkpoint_tx, &scheduler_tx, &data_transport_tx);
                 }
             })
             .expect("failed to spawn data-plane thread");
