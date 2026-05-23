@@ -71,6 +71,8 @@ pub(crate) enum DataPlaneEvent {
 
 impl_from_variant!(
     DataPlaneEvent,
+    SubmitCheckpoint(CheckpointJob),
+    Timer(TimerCommand<DataPlaneTimer>),
     ReplicationReady,
     ReplicaAckReady,
     ReplicaAckReceived,

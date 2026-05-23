@@ -1,15 +1,27 @@
 #[macro_export]
 macro_rules! impl_from_variant {
-    // Matches the enum name, followed by a comma-separated list of variants
-    ($enum_name:ident, $($variant:ident),* $(,)?) => {
-        $(
-            impl From<$variant> for $enum_name {
-                fn from(val: $variant) -> Self {
-                    $enum_name::$variant(val)
-                }
+    // Internal: variant name = type name
+    (@single $enum_name:ident, $variant:ident) => {
+        impl From<$variant> for $enum_name {
+            fn from(val: $variant) -> Self {
+                $enum_name::$variant(val)
             }
+        }
+    };
+    // Internal: variant name differs from type (e.g., Timer(TimerCommand<T>))
+    (@single $enum_name:ident, $variant:ident, $type:ty) => {
+        impl From<$type> for $enum_name {
+            fn from(val: $type) -> Self {
+                $enum_name::$variant(val)
+            }
+        }
+    };
+    // Entry: comma-separated list of VariantName or VariantName(Type)
+    ($enum_name:ident, $($variant:ident $(($type:ty))?),* $(,)?) => {
+        $(
+            impl_from_variant!(@single $enum_name, $variant $(, $type)?);
         )*
-    }
+    };
 }
 
 #[macro_export]

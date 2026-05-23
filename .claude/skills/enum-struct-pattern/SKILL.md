@@ -38,15 +38,26 @@ impl_from_variant!(
 );
 ```
 
-The macro lives in `src/macros/mod.rs` and expands to:
+When the variant name differs from the type (e.g., wrapping a generic), use the `VariantName(Type)` form:
 ```rust
-impl From<CreateTopic> for MetadataCommand {
-    fn from(val: CreateTopic) -> Self {
-        MetadataCommand::CreateTopic(val)
-    }
+pub enum DataPlaneEvent {
+    Timer(TimerCommand<DataPlaneTimer>),
+    SubmitCheckpoint(CheckpointJob),
+    ReplicationReady(ReplicationReady),
+    // ...
 }
-// ... for each variant
+
+impl_from_variant!(
+    DataPlaneEvent,
+    Timer(TimerCommand<DataPlaneTimer>),   // variant ≠ type
+    SubmitCheckpoint(CheckpointJob),        // variant ≠ type
+    ReplicationReady,                       // variant = type
+);
 ```
+
+The macro lives in `src/macros/mod.rs` and supports both forms:
+- `VariantName` — variant name equals type name, generates `From<VariantName>`
+- `VariantName(SomeType<T>)` — variant name differs from type, generates `From<SomeType<T>>`
 
 Import the macro with `use crate::impl_from_variant;`.
 
@@ -69,11 +80,15 @@ fn raise_event(&mut self, event: impl Into<DataPlaneEvent>) {
     self.pending_events.push(event.into());
 }
 
-// Usage — no .into() needed at call site
+// Named structs — no wrapper, no .into() at call site
 self.raise_event(event::ReplicationTimedOut {
     segment_key,
     committed_end_offset,
 });
+
+// Foreign types with VariantName(Type) form — also no wrapper
+self.raise_event(TimerCommand::SetSchedule { seq, timer });
+self.raise_event(tracker.checkpoint(key));  // CheckpointJob
 ```
 
 ## Dispatch
@@ -101,13 +116,9 @@ DataPlaneEvent::ReplicaAckReceived(evt) => {
 }
 ```
 
-## When to use inline fields instead
+## When NOT to use a named struct
 
-Not every variant needs a struct. Keep inline fields for:
-- Single-field wrappers: `Timer(TimerCommand<T>)`, `SubmitCheckpoint(CheckpointJob)`
-- Variants that are simple forwarding without a dedicated handler
-
-The pattern is for variants with 2+ fields that have dedicated handling logic.
+The only case where you skip defining a struct is when the variant already wraps an existing type (e.g., `Timer(TimerCommand<T>)`). Use the `VariantName(Type)` form in `impl_from_variant!` so `.into()` still works. Every variant should participate in `impl_from_variant!` — no exceptions.
 
 ## Existing examples
 
