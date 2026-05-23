@@ -357,7 +357,7 @@ The broker does **not** deduplicate — this is an app-level primitive for exact
 
 ```
 Request:  { topic_name: String, range_id: u64, offset: u64, max_bytes: u32 }
-Response: { records: Vec<Record>, range_status: RangeStatus }
+Response: { records: Vec<Record>, next_offset: u64, range_status: RangeStatus }
         | NotLeader | ShardNotLocal | OffsetOutOfRange
 
 RangeStatus:
@@ -389,6 +389,8 @@ Flow:
    - `offset > commit_offset` → return `OffsetOutOfRange`.
    - Range is sealed → populate `Sealed { end_offset, transition }` from `MetadataStateMachine`.
    - Otherwise → return `records` with `range_status: Active`.
+   - `next_offset`: if `records` is non-empty, `last_record.offset + 1`; if empty, the requested
+     `offset` unchanged. Only present on success — `OffsetOutOfRange` carries no `next_offset`.
 
 **Client transition logic:**
 
