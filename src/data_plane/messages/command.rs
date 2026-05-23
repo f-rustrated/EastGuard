@@ -10,14 +10,16 @@ use crate::{
 };
 
 pub enum DataPlaneCommand {
-    Produce {
-        segment_key: SegmentKey,
-        records: Vec<Bytes>,
-        reply: oneshot::Sender<ProduceAck>,
-    },
+    Produce(Produce),
     CheckpointComplete(CheckpointComplete),
     Timeout(DataPlaneTimeoutCallback),
     InterNode(DataPlaneInterNodeCommand),
+}
+
+pub struct Produce {
+    pub segment_key: SegmentKey,
+    pub records: Vec<Bytes>,
+    pub reply: oneshot::Sender<ProduceAck>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -100,14 +102,10 @@ pub struct CheckpointComplete {
     pub checkpointed_lsn: u64,
 }
 
-impl From<DataPlaneTimeoutCallback> for DataPlaneCommand {
-    fn from(cb: DataPlaneTimeoutCallback) -> Self {
-        DataPlaneCommand::Timeout(cb)
-    }
-}
-
-impl From<DataPlaneInterNodeCommand> for DataPlaneCommand {
-    fn from(cmd: DataPlaneInterNodeCommand) -> Self {
-        DataPlaneCommand::InterNode(cmd)
-    }
-}
+impl_from_variant!(
+    DataPlaneCommand,
+    Produce,
+    CheckpointComplete,
+    Timeout(DataPlaneTimeoutCallback),
+    InterNode(DataPlaneInterNodeCommand),
+);
