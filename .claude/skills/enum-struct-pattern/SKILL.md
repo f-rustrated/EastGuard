@@ -11,6 +11,13 @@ This codebase uses a consistent pattern for defining command and event enums: ea
 
 Inline-field enum variants (`Variant { field1, field2 }`) force destructuring at every dispatch and construction site. As variants grow, this creates noisy boilerplate. Named structs give each variant a type identity — handlers accept the struct directly, construction uses `.into()`, and the enum becomes a thin routing layer.
 
+## Naming conventions
+
+- **Commands** — imperative: `Produce`, `SegmentAssignment`, `SealRequest`
+- **Events** — past tense, describing what happened: `BatchPublished`, `ReplicaAckReceived`, `ReplicationTimedOut`, `CheckpointRequired`, `InterNodeCommandQueued`
+
+Events should read as "this thing occurred" — not as instructions to do something.
+
 ## Structure
 
 ```rust
@@ -38,20 +45,20 @@ impl_from_variant!(
 );
 ```
 
-When the variant name differs from the type (e.g., wrapping a generic), use the `VariantName(Type)` form:
+When the variant name differs from the type (e.g., wrapping a generic or existing type), use the `VariantName(Type)` form:
 ```rust
 pub enum DataPlaneEvent {
-    Timer(TimerCommand<DataPlaneTimer>),
-    SubmitCheckpoint(CheckpointJob),
-    ReplicationReady(ReplicationReady),
+    TimerScheduled(TimerCommand<DataPlaneTimer>),
+    CheckpointRequired(CheckpointJob),
+    BatchPublished(BatchPublished),
     // ...
 }
 
 impl_from_variant!(
     DataPlaneEvent,
-    Timer(TimerCommand<DataPlaneTimer>),   // variant ≠ type
-    SubmitCheckpoint(CheckpointJob),        // variant ≠ type
-    ReplicationReady,                       // variant = type
+    TimerScheduled(TimerCommand<DataPlaneTimer>),  // variant ≠ type
+    CheckpointRequired(CheckpointJob),              // variant ≠ type
+    BatchPublished,                                 // variant = type
 );
 ```
 
@@ -91,6 +98,29 @@ self.raise_event(TimerCommand::SetSchedule { seq, timer });
 self.raise_event(tracker.checkpoint(key));  // CheckpointJob
 ```
 
+## Collapsing similar events
+
+When multiple event variants share the same dispatch pattern (e.g., "send a message to targets"), collapse them into a single variant carrying the pre-built payload:
+
+```rust
+// Instead of separate SendCommitAdvance, SendSealRequest, SendSegmentSealed...
+pub struct InterNodeCommandQueued {
+    pub targets: Vec<NodeId>,
+    pub message: DataPlaneInterNodeCommand,
+}
+
+// Dispatch becomes one arm:
+E::InterNodeCommandQueued(evt) => {
+    transport_tx.send(DataTransportCommand::send(evt.targets, evt.message));
+}
+
+// Construction builds the command inline:
+self.raise_event(event::InterNodeCommandQueued {
+    targets: followers,
+    message: CommitAdvance { segment_key, committed_end_offset }.into(),
+});
+```
+
 ## Dispatch
 
 Handlers accept the struct directly. The dispatch match becomes one-liners:
@@ -118,10 +148,11 @@ DataPlaneEvent::ReplicaAckReceived(evt) => {
 
 ## When NOT to use a named struct
 
-The only case where you skip defining a struct is when the variant already wraps an existing type (e.g., `Timer(TimerCommand<T>)`). Use the `VariantName(Type)` form in `impl_from_variant!` so `.into()` still works. Every variant should participate in `impl_from_variant!` — no exceptions.
+The only case where you skip defining a struct is when the variant already wraps an existing type (e.g., `CheckpointRequired(CheckpointJob)`). Use the `VariantName(Type)` form in `impl_from_variant!` so `.into()` still works. Every variant should participate in `impl_from_variant!` — no exceptions.
 
 ## Existing examples
 
+- `DataPlaneCommand` in `src/data_plane/messages/command.rs` — local + inter-node commands, accepts `impl Into`
 - `DataPlaneInterNodeCommand` in `src/data_plane/messages/command.rs` — wire format commands
-- `DataPlaneEvent` in `src/data_plane/messages/event.rs` — internal state machine events
+- `DataPlaneEvent` in `src/data_plane/messages/event.rs` — internal state machine events (past tense naming)
 - `DataTransportCommand::send()` in `src/data_plane/transport/command.rs` — `impl Into` helper
