@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -24,8 +24,8 @@ fn build_address_map(
     node_name: &str,
     cluster_port: u16,
     peer_names: &[&str],
-) -> HashMap<NodeId, SocketAddr> {
-    let mut address_map = HashMap::new();
+) -> BTreeMap<NodeId, SocketAddr> {
+    let mut address_map = BTreeMap::new();
     address_map.insert(
         NodeId::new(node_name),
         SocketAddr::new(turmoil::lookup(node_name), cluster_port),

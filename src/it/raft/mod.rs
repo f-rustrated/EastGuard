@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
@@ -11,7 +11,7 @@ pub(super) const QUERY_PORT: u16 = 29000;
 
 pub(super) async fn mock_swim_handler(
     mut rx: mpsc::Receiver<SwimActorCommand>,
-    address_map: HashMap<NodeId, SocketAddr>,
+    address_map: BTreeMap<NodeId, SocketAddr>,
 ) {
     while let Some(cmd) = rx.recv().await {
         if let SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {

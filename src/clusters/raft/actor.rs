@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::*;
@@ -52,7 +52,7 @@ impl MultiRaftActor {
         scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
         swim_tx: &SwimSender,
     ) {
-        let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
+        let mut packets_by_target: BTreeMap<NodeId, Vec<OutboundRaftPacket>> = BTreeMap::new();
         for event in store.flush() {
             Self::route_event(
                 event,
@@ -68,7 +68,7 @@ impl MultiRaftActor {
 
     async fn route_event(
         event: RaftEvent,
-        packets: &mut HashMap<NodeId, Vec<OutboundRaftPacket>>,
+        packets: &mut BTreeMap<NodeId, Vec<OutboundRaftPacket>>,
         transport_tx: &mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
         swim_tx: &SwimSender,
@@ -92,7 +92,7 @@ impl MultiRaftActor {
     }
 
     async fn send_batched_packets(
-        packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
+        packets_by_target: BTreeMap<NodeId, Vec<OutboundRaftPacket>>,
         transport_tx: &mpsc::Sender<RaftTransportCommand>,
     ) {
         for packets in packets_by_target.into_values() {

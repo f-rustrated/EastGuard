@@ -38,7 +38,7 @@ loop {
 
 ## Timer Lifecycle
 
-1. **SetSchedule { seq, timer }** — inserts timer into `Ticker`'s `HashMap<u32, T>` keyed by sequence number.
+1. **SetSchedule { seq, timer }** — inserts timer into `Ticker`'s `BTreeMap<u32, T>` keyed by sequence number.
 2. **Each tick** — `timer.tick()` called, decrementing timer's internal counter, returning remaining ticks.
 3. **Expiry (remaining == 0)** — `to_timeout_callback(seq)` called, callback collected, timer removed from map.
 4. **CancelSchedule { seq }** — removes timer early, preventing future callback.
