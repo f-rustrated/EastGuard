@@ -9,7 +9,7 @@ use super::dissemination_buffer::ShardLeaderInfo;
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct SwimHeader {
-    pub seq: u32,
+    pub seq: u64,
     pub source_node_id: NodeId,
     pub source_incarnation: u64,
     pub gossip: Vec<SwimNode>,

@@ -135,7 +135,7 @@ impl MultiRaft {
         let jitter = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.node_id.hash(&mut hasher);
-            group.id.0.hash(&mut hasher);
+            group.id.hash(&mut hasher);
             (hasher.finish() % 20) as u32
         };
 
@@ -319,9 +319,9 @@ impl MultiRaft {
 }
 
 #[derive(Debug, Default)]
-struct RaftTimerTokenGenerator(u32);
+struct RaftTimerTokenGenerator(u64);
 impl RaftTimerTokenGenerator {
-    fn generate(&mut self) -> u32 {
+    fn generate(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(1);
         self.0
     }
@@ -354,7 +354,7 @@ mod tests {
         }
     }
 
-    fn timer_seqs(events: &[RaftEvent]) -> Vec<u32> {
+    fn timer_seqs(events: &[RaftEvent]) -> Vec<u64> {
         events
             .iter()
             .filter_map(|e| match e {
@@ -385,7 +385,7 @@ mod tests {
 
         let events = store.flush();
         let seqs = timer_seqs(&events);
-        let unique: HashSet<u32> = seqs.iter().cloned().collect();
+        let unique: HashSet<u64> = seqs.iter().cloned().collect();
         assert_eq!(seqs.len(), unique.len());
     }
 

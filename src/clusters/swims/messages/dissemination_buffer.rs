@@ -164,10 +164,7 @@ mod tests {
     fn member(port: u16, state: SwimNodeState, incarnation: u64) -> SwimNode {
         SwimNode {
             node_id: NodeId::new(port.to_string()),
-            addr: NodeAddress {
-                cluster_addr: addr(port),
-                client_addr: addr(port),
-            },
+            addr: NodeAddress::test(addr(port), addr(port)),
             state,
             incarnation,
         }
@@ -322,10 +319,10 @@ mod tests {
         ShardLeaderInfo {
             shard_group_id: ShardGroupId(group),
             leader_node_id: NodeId::new(leader),
-            leader_addr: NodeAddress {
-                cluster_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
-                client_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
-            },
+            leader_addr: NodeAddress::test(
+                format!("127.0.0.1:{}", port).parse().unwrap(),
+                format!("127.0.0.1:{}", port).parse().unwrap(),
+            ),
             term,
         }
     }

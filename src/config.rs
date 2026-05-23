@@ -42,6 +42,9 @@ pub struct Environment {
     #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
+    #[arg(long, env = "EASTGUARD_DATA_PORT", default_value_t = 2923)]
+    pub data_port: u16,
+
     #[arg(long, env = "EASTGUARD_HOST", default_value = "0.0.0.0")]
     pub host: String,
 
@@ -195,12 +198,20 @@ impl Environment {
             .expect("Invalid advertise client address")
     }
 
+    pub(crate) fn advertise_data_addr(&self) -> std::net::SocketAddr {
+        let host = self.advertise_host.as_deref().unwrap_or(&self.host);
+        format!("{}:{}", host, self.data_port)
+            .parse()
+            .expect("Invalid advertise data address")
+    }
+
     pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
             NodeAddress {
                 cluster_addr: self.advertise_peer_addr(),
                 client_addr: self.advertise_client_addr(),
+                data_addr: self.advertise_data_addr(),
             },
             Topology::new(
                 std::iter::empty(),
@@ -230,6 +241,7 @@ mod tests {
             node_id_prefix: None,
             client_port: 2921,
             cluster_port: 2922,
+            data_port: 2923,
             host: "127.0.0.1".into(),
             advertise_host: None,
             vnodes_per_node: 256,

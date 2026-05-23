@@ -74,7 +74,6 @@ const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 struct RaftWriters {
     node_id: NodeId,
     writers: HashMap<NodeId, OwnedWriteHalf>,
-    addr_cache: HashMap<NodeId, NodeAddress>,
     /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
@@ -90,7 +89,6 @@ impl RaftWriters {
         Self {
             node_id,
             writers: HashMap::new(),
-            addr_cache: HashMap::new(),
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
         }
@@ -195,8 +193,7 @@ impl RaftWriters {
         )
         .await
         .ok()
-        .and_then(|r| r.ok())
-        else {
+        .and_then(|r| r.ok()) else {
             tracing::warn!(
                 "[{}] Failed to connect to {} ({:?})",
                 self.node_id,
@@ -230,7 +227,6 @@ impl RaftWriters {
 
     fn disconnect(&mut self, peer_id: NodeId) {
         self.writers.remove(&peer_id);
-        self.addr_cache.remove(&peer_id);
         tracing::info!("[{}] Disconnected dead peer {:?}", self.node_id, peer_id);
         self.dead_peers.insert(peer_id);
     }
@@ -240,20 +236,9 @@ impl RaftWriters {
         self.connect_backoffs.clear();
     }
 
-    async fn resolve_address(
-        &mut self,
-        node_id: &NodeId,
-        swim_tx: &SwimSender,
-    ) -> Option<NodeAddress> {
-        if let Some(&addr) = self.addr_cache.get(node_id) {
-            return Some(addr);
-        }
+    async fn resolve_address(&self, node_id: &NodeId, swim_tx: &SwimSender) -> Option<NodeAddress> {
         match swim_tx.resolve_address(node_id.clone()).await {
-            Ok(Some(node_addr)) => {
-                self.addr_cache.insert(node_id.clone(), node_addr);
-                Some(node_addr)
-            }
-            Ok(None) => None,
+            Ok(addr) => addr,
             Err(e) => {
                 tracing::debug!("Resolve address for {:?} failed: {e}", node_id);
                 None

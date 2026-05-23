@@ -127,10 +127,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     let swim = Swim::new(
         NodeId::new(format!("node-local-{}", port).as_str()),
-        NodeAddress {
-            cluster_addr: peer_addr,
-            client_addr,
-        },
+        NodeAddress::test(peer_addr, client_addr),
         Topology::new(
             std::iter::empty(),
             TopologyConfig {
@@ -148,7 +145,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
         tx_in.clone(),
         ticker_rx,
         TICK_PERIOD_100_MS,
-        PROBE_INTERVAL_TICKS,
+        Some(PROBE_INTERVAL_TICKS),
     ));
     tokio::spawn(SwimActor::run(
         rx_in,
@@ -215,10 +212,7 @@ async fn test_refutation_mechanism() {
     // The actor starts at Incarnation 0. We send Suspect with Incarnation 0.
     let lie = SwimNode {
         node_id: "node-local-8000".into(),
-        addr: NodeAddress {
-            cluster_addr: harness.local_addr,
-            client_addr: harness.local_addr,
-        },
+        addr: NodeAddress::test(harness.local_addr, harness.local_addr),
         state: SwimNodeState::Suspect,
         incarnation: 0,
     };
@@ -268,10 +262,7 @@ async fn test_gossip_propagation() {
     // 1. Tell the actor that "Node 9999" is DEAD via gossip
     let gossip_msg = SwimNode {
         node_id: "node-dead".into(),
-        addr: NodeAddress {
-            cluster_addr: dead_node,
-            client_addr: dead_node,
-        },
+        addr: NodeAddress::test(dead_node, dead_node),
         state: SwimNodeState::Dead,
         incarnation: 5,
     };
@@ -337,10 +328,7 @@ async fn test_gossip_propagation() {
 fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     SwimNode {
         node_id: name.into(),
-        addr: NodeAddress {
-            cluster_addr: addr,
-            client_addr: addr,
-        },
+        addr: NodeAddress::test(addr, addr),
         state: SwimNodeState::Alive,
         incarnation: 1,
     }
@@ -443,10 +431,7 @@ async fn test_alive_gossip_adds_node_to_topology() {
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
                     node_id: "node-new".into(),
-                    addr: NodeAddress {
-                        cluster_addr: new_node,
-                        client_addr: new_node,
-                    },
+                    addr: NodeAddress::test(new_node, new_node),
                     state: SwimNodeState::Alive,
                     incarnation: 1,
                 }],
@@ -479,10 +464,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                     source_incarnation: 1,
                     gossip: vec![SwimNode {
                         node_id: "node-target".into(),
-                        addr: NodeAddress {
-                            cluster_addr: node,
-                            client_addr: node,
-                        },
+                        addr: NodeAddress::test(node, node),
                         state: SwimNodeState::Alive,
                         incarnation: 1,
                     }],
@@ -508,10 +490,7 @@ async fn test_dead_gossip_removes_node_from_topology() {
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
                     node_id: "node-target".into(),
-                    addr: NodeAddress {
-                        cluster_addr: node,
-                        client_addr: node,
-                    },
+                    addr: NodeAddress::test(node, node),
                     state: SwimNodeState::Dead,
                     incarnation: 2,
                 }],

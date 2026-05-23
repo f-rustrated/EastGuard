@@ -163,7 +163,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
+            ticker: Ticker::new(Some(PROBE_INTERVAL_TICKS)),
         };
 
         h.apply_timer_commands();
@@ -196,7 +196,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
+            ticker: Ticker::new(Some(PROBE_INTERVAL_TICKS)),
         };
 
         h.apply_timer_commands();
@@ -231,7 +231,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
+            ticker: Ticker::new(Some(PROBE_INTERVAL_TICKS)),
         };
 
         h.apply_timer_commands();
@@ -282,7 +282,7 @@ mod tests {
         };
         let mut h = TestHarness {
             protocol: make_protocol("node-local", 8000).bootstrap(config.tries()),
-            ticker: Ticker::new(PROBE_INTERVAL_TICKS),
+            ticker: Ticker::new(Some(PROBE_INTERVAL_TICKS)),
         };
 
         h.apply_timer_commands();

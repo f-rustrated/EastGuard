@@ -23,7 +23,7 @@ impl TTimer for SwimTimer {
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, seq: u32, _now: u64) -> SwimTimeOutCallback {
+    fn to_timeout_callback(self, seq: u64, _now: u64) -> SwimTimeOutCallback {
         SwimTimeOutCallback::TimedOut {
             seq,
             target_node_id: self.target_node_id,
@@ -82,5 +82,5 @@ impl SwimTimer {
 #[derive(Debug)]
 pub(crate) struct ProxyPing {
     pub(crate) requester_addr: std::net::SocketAddr,
-    pub(crate) request_seq: u32,
+    pub(crate) request_seq: u64,
 }

@@ -5,7 +5,7 @@ use crate::clusters::swims::topology::Topology;
 
 use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 use crate::schedulers::ticker_message::TimerCommand;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -69,12 +69,12 @@ pub struct Swim {
     pub(crate) topology: Topology,
 
     // Sequence
-    seq_counter: u32,
-    last_suspected_seqs: BTreeMap<NodeId, u32>,
+    seq_counter: u64,
+    last_suspected_seqs: BTreeMap<NodeId, u64>,
 
     // Output buffers
     pending_events: Vec<SwimEvent>,
-    pending_indirect_pings: BTreeMap<u32, ProxyPing>,
+    pending_indirect_pings: BTreeMap<u64, ProxyPing>,
 }
 
 impl Swim {
@@ -120,7 +120,7 @@ impl Swim {
         self
     }
 
-    fn generate_swim_header(&mut self, seq: u32) -> SwimHeader {
+    fn generate_swim_header(&mut self, seq: u64) -> SwimHeader {
         let gossip = self.gossip_buffer.collect(MAX_GOSSIP_BYTES);
         let used: usize = gossip.iter().map(|m| m.size()).sum();
         let remaining = MAX_GOSSIP_BYTES.saturating_sub(used);
@@ -166,11 +166,11 @@ impl Swim {
                 self.handle_timed_out(seq, target_node_id, phase);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
-    fn handle_timed_out(&mut self, seq: u32, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
+    fn handle_timed_out(&mut self, seq: u64, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
         if let Some(target) = target_node_id {
             self.handle_probe_timeout(seq, target, phase);
         } else {
@@ -178,7 +178,7 @@ impl Swim {
         }
     }
 
-    fn handle_probe_timeout(&mut self, seq: u32, target: NodeId, phase: SwimTimerKind) {
+    fn handle_probe_timeout(&mut self, seq: u64, target: NodeId, phase: SwimTimerKind) {
         match phase {
             SwimTimerKind::DirectProbe => self.start_indirect_probe(target, seq),
             SwimTimerKind::IndirectProbe => self.try_mark_suspect(target),
@@ -187,7 +187,7 @@ impl Swim {
         }
     }
 
-    fn handle_non_probe_timeout(&mut self, seq: u32, phase: SwimTimerKind) {
+    fn handle_non_probe_timeout(&mut self, seq: u64, phase: SwimTimerKind) {
         match phase {
             SwimTimerKind::ProxyPing => {
                 self.pending_indirect_pings.remove(&seq);
@@ -244,7 +244,7 @@ impl Swim {
     // We preserve the previous direct probe's seq so that we can cancel
     // indirect probe timeout when we receive a long-running Ack message
     // from the previous direct probe
-    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u32) {
+    fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u64) {
         let Some(cluster_addr) = self
             .members
             .get(&target_node_id)
@@ -319,7 +319,7 @@ impl Swim {
         }
     }
 
-    fn try_mark_dead(&mut self, target_node_id: NodeId, registered_seq: u32) {
+    fn try_mark_dead(&mut self, target_node_id: NodeId, registered_seq: u64) {
         if let Some(member) = self.members.get(&target_node_id) {
             if member.state != SwimNodeState::Suspect {
                 return;
@@ -360,7 +360,7 @@ impl Swim {
             term,
         };
         self.apply_shard_leader_update(&info);
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -379,7 +379,7 @@ impl Swim {
             SwimPacket::Ack(header) => self.handle_ack(src, header),
             SwimPacket::PingReq { header, target, .. } => self.handle_ping_req(src, header, target),
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
@@ -530,6 +530,7 @@ impl Swim {
                 NodeAddress {
                     cluster_addr: addr,
                     client_addr: addr,
+                    data_addr: addr,
                 },
                 SwimNodeState::Alive,
                 remote_inc,
@@ -647,7 +648,7 @@ impl Swim {
             .enqueue(info.clone(), self.members.len());
     }
 
-    fn next_seq(&mut self) -> u32 {
+    fn next_seq(&mut self) -> u64 {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
     }
@@ -739,14 +740,9 @@ impl Swim {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, debug_assertions))]
+pub mod props {
     use super::*;
-    use crate::{
-        clusters::swims::common::{TestHarness, make_protocol},
-        test_traits::TAssertInvariant,
-    };
-    use std::net::SocketAddr;
 
     impl TAssertInvariant for Swim {
         fn assert_invariants(&self) {
@@ -800,8 +796,15 @@ mod tests {
             }
         }
     }
+}
 
-    fn ping(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clusters::swims::common::{TestHarness, make_protocol};
+    use std::net::SocketAddr;
+
+    fn ping(seq: u64, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ping(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
@@ -814,16 +817,16 @@ mod tests {
     fn node(id: &str, port: u16, state: SwimNodeState, inc: u64) -> SwimNode {
         SwimNode {
             node_id: NodeId::new(id),
-            addr: NodeAddress {
-                cluster_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
-                client_addr: format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
-            },
+            addr: NodeAddress::test(
+                format!("127.0.0.1:{}", port).parse().unwrap(),
+                format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
+            ),
             state,
             incarnation: inc,
         }
     }
 
-    fn ack(seq: u32, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
+    fn ack(seq: u64, from_id: &str, from_inc: u64, gossip: Vec<SwimNode>) -> SwimPacket {
         SwimPacket::Ack(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
@@ -834,7 +837,7 @@ mod tests {
     }
 
     fn pingreq(
-        seq: u32,
+        seq: u64,
         from_id: &str,
         from_inc: u64,
         target: SocketAddr,
@@ -1611,10 +1614,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 3,
                 }],
             };
@@ -1644,10 +1644,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 3,
                 }],
             };
@@ -1684,10 +1681,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 5,
                 }],
             };
@@ -1703,10 +1697,10 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(42),
                     leader_node_id: NodeId::new("node-other"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: "127.0.0.1:9999".parse().unwrap(),
-                        client_addr: "127.0.0.1:9999".parse().unwrap(),
-                    },
+                    leader_addr: NodeAddress::test(
+                        "127.0.0.1:9999".parse().unwrap(),
+                        "127.0.0.1:9999".parse().unwrap(),
+                    ),
                     term: 2,
                 }],
             };
@@ -1799,10 +1793,7 @@ mod tests {
                 shard_leaders: vec![ShardLeaderInfo {
                     shard_group_id: ShardGroupId(99),
                     leader_node_id: NodeId::new("node-b"),
-                    leader_addr: NodeAddress {
-                        cluster_addr: b_addr,
-                        client_addr: b_addr,
-                    },
+                    leader_addr: NodeAddress::test(b_addr, b_addr),
                     term: 7,
                 }],
             };

@@ -15,10 +15,11 @@ pub(super) async fn mock_swim_handler(
 ) {
     while let Some(cmd) = rx.recv().await {
         if let SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
-            let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
-                cluster_addr: addr,
-                client_addr: addr,
-            }));
+            let _ = reply.send(
+                address_map
+                    .get(&node_id)
+                    .map(|&addr| NodeAddress::test(addr, addr)),
+            );
         }
     }
 }

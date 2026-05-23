@@ -1,5 +1,7 @@
 use std::fmt::{Display, Formatter};
 
+use tokio::sync::mpsc as tokio_mpsc;
+
 #[derive(Debug)]
 pub(crate) enum TickerCommand<T> {
     Schedule(TimerCommand<T>),
@@ -7,11 +9,34 @@ pub(crate) enum TickerCommand<T> {
     ForceTick,
 }
 
+pub(crate) struct SchedulerSender<T>(tokio_mpsc::Sender<TickerCommand<T>>);
+
+impl<T> From<tokio_mpsc::Sender<TickerCommand<T>>> for SchedulerSender<T> {
+    fn from(tx: tokio_mpsc::Sender<TickerCommand<T>>) -> Self {
+        Self(tx)
+    }
+}
+
+impl<T> SchedulerSender<T> {
+    pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
+        let _ = self.0.blocking_send(
+            TimerCommand::SetSchedule {
+                seq,
+                timer: timer.into(),
+            }
+            .into(),
+        );
+    }
+
+    pub(crate) fn send(&self, cmd: TimerCommand<T>) {
+        let _ = self.0.blocking_send(cmd.into());
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum TimerCommand<T> {
-    SetSchedule { seq: u32, timer: T },
-    CancelSchedule { seq: u32 },
-    ResetPeriodic,
+    SetSchedule { seq: u64, timer: T },
+    CancelSchedule { seq: u64 },
 }
 
 impl<T> Display for TimerCommand<T> {
@@ -22,9 +47,6 @@ impl<T> Display for TimerCommand<T> {
             }
             TimerCommand::CancelSchedule { seq } => {
                 write!(f, "[CancelSchedule] seq: {}", seq)
-            }
-            TimerCommand::ResetPeriodic => {
-                write!(f, "[ResetPeriodic]")
             }
         }
     }

@@ -13,7 +13,6 @@ RaftTransportActor
 ├── listener: TcpListener           (accepts inbound connections on raft_port)
 ├── RaftWriters
 │   ├── writers: HashMap<NodeId, OwnedWriteHalf>  (one per connected peer)
-│   ├── addr_cache: HashMap<NodeId, NodeAddress>   (resolved addresses)
 │   └── dead_peers: HashSet<NodeId>                (explicitly disconnected)
 └── cleanup_interval: 300s          (periodic dead_peers clear)
 ```
@@ -40,7 +39,7 @@ Size guards: NodeId frames capped at 1KB, message frames at 4MB.
 
 2. **Dead peers silently dropped.** Outbound RPCs to nodes in `dead_peers` set are silently skipped (no error, no retry). Cleared periodically (300s) as GC — restarted peers already connect with a new NodeId (UUID regenerated on every start) and bypass the set entirely.
 
-3. **SWIM is authoritative for address resolution.** `NodeId → SocketAddr` resolved via `SwimQueryCommand::ResolveAddress`. Address cached locally in `addr_cache`. Cache cleared on `DisconnectPeer`.
+3. **SWIM is authoritative for address resolution.** `NodeId → SocketAddr` resolved via `SwimQueryCommand::ResolveAddress` on every connect attempt. No local caching — SWIM's membership table is the single source of truth for peer addresses.
 
 4. **One writer per peer.** `writers` map is `HashMap<NodeId, OwnedWriteHalf>` — at most one write half per peer. On write failure, writer removed from map (next send triggers reconnect).
 

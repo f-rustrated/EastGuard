@@ -15,7 +15,7 @@ pub(crate) mod impls;
 mod it;
 pub(crate) mod macros;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 mod test_traits;
 
 use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
@@ -81,13 +81,13 @@ impl StartUp {
             swim_sender.clone().into(),
             swim_ticker_rx,
             TICK_PERIOD_100_MS,
-            PROBE_INTERVAL_TICKS,
+            Some(PROBE_INTERVAL_TICKS),
         ));
         tokio::spawn(run_scheduling_actor(
             raft_tx.clone().into(),
             raft_ticker_rx,
             TICK_PERIOD_100_MS,
-            PROBE_INTERVAL_TICKS,
+            Some(PROBE_INTERVAL_TICKS),
         ));
         tokio::spawn(SwimTransportActor::run(
             udp_socket,

@@ -30,6 +30,7 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
         join_interval_ms: 1000,
         join_multiplier: 2,
         join_max_attempts: 5,
+        data_port: 2923,
     }
 }
 
@@ -50,8 +51,7 @@ pub async fn check_alive_count(host: &str, port: u16, expected: usize) -> turmoi
         .filter(|m| m.state == SwimNodeState::Alive)
         .count();
     assert_eq!(
-        alive_count,
-        expected,
+        alive_count, expected,
         "{host} should have {expected} alive nodes, got {:?}",
         members
     );

@@ -43,7 +43,7 @@ impl TTimer for RaftTimer {
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, _seq: u32, now: u64) -> RaftTimeoutCallback {
+    fn to_timeout_callback(self, _seq: u64, now: u64) -> RaftTimeoutCallback {
         match self.kind {
             RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: self.shard_group_id,

@@ -40,10 +40,7 @@ pub mod common {
         );
         Swim::new(
             NodeId::new(local_id),
-            NodeAddress {
-                cluster_addr: peer_addr,
-                client_addr,
-            },
+            NodeAddress::test(peer_addr, client_addr),
             topology,
             0,
         )
@@ -60,7 +57,7 @@ pub mod common {
         pub fn new(local_id: &str, local_port: u16) -> Self {
             Self {
                 protocol: make_protocol(local_id, local_port),
-                ticker: Ticker::new(PROBE_INTERVAL_TICKS),
+                ticker: Ticker::new(Some(PROBE_INTERVAL_TICKS)),
             }
         }
 
@@ -97,7 +94,7 @@ pub mod common {
 
         pub fn tick_until<T>(
             &mut self,
-            max_ticks: u32,
+            max_ticks: u64,
             mut f: impl FnMut(&TestHarness<SwimTimer>) -> Option<T>,
         ) -> T {
             for _ in 0..max_ticks {

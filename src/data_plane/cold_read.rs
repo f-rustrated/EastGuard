@@ -7,7 +7,8 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
-use super::record::{Record, RecordType, SegmentKey};
+use super::SegmentKey;
+use super::wal::{WalRecord, WalRecordType};
 use super::sparse_index::SparseIndex;
 
 const DEFAULT_POOL_SIZE: usize = 4;
@@ -29,7 +30,7 @@ pub(crate) struct ColdReadRequest {
 }
 
 pub(crate) struct ColdReadRecords {
-    pub(crate) records: Vec<Record>,
+    pub(crate) records: Vec<bytes::Bytes>,
     pub(crate) next_offset: u64,
 }
 
@@ -93,7 +94,7 @@ impl ColdReadPool {
                 break;
             }
 
-            let Ok(record) = Record::decode_from(&mut reader) else {
+            let Ok(record) = WalRecord::decode_from(&mut reader) else {
                 break;
             };
 
@@ -101,10 +102,10 @@ impl ColdReadPool {
             bytes_read += pos_after - pos_before;
 
             match record.record_type {
-                RecordType::BatchEnd => break,
-                RecordType::Data => {
+                WalRecordType::BatchEnd => break,
+                WalRecordType::Data => {
                     current_offset += 1;
-                    records.push(record);
+                    records.push(record.payload);
                 }
             }
         }

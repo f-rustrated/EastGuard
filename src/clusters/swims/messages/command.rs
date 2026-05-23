@@ -28,7 +28,7 @@ pub(crate) enum SwimTimeOutCallback {
     #[default]
     ProtocolPeriodElapsed,
     TimedOut {
-        seq: u32,
+        seq: u64,
         target_node_id: Option<NodeId>,
         phase: SwimTimerKind,
     },

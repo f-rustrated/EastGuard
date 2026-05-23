@@ -32,10 +32,11 @@ async fn swim_handler_with_leader_capture(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) => {
-                let _ = reply.send(address_map.get(&node_id).map(|&addr| NodeAddress {
-                    cluster_addr: addr,
-                    client_addr: addr,
-                }));
+                let _ = reply.send(
+                    address_map
+                        .get(&node_id)
+                        .map(|&addr| NodeAddress::test(addr, addr)),
+                );
             }
             SwimActorCommand::Protocol(SwimCommand::AnnounceShardLeader(event)) => {
                 let _ = leader_events_tx.send(event).await;
@@ -109,7 +110,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     raft_tx.clone(),
                     ticker_rx,
                     TICK_PERIOD_100_MS,
-                    PROBE_INTERVAL_TICKS,
+                    Some(PROBE_INTERVAL_TICKS),
                 ));
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
@@ -180,7 +181,9 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
 
         for (host, port) in [("node-1", 1u16), ("node-2", 2), ("node-3", 3)] {
             let addr = turmoil::lookup(host);
-            let stream = TcpStream::connect((addr, RESULT_PORT + port)).await.unwrap();
+            let stream = TcpStream::connect((addr, RESULT_PORT + port))
+                .await
+                .unwrap();
             let (mut read, _write) = stream.into_split();
 
             let len = read.read_u32().await.unwrap() as usize;

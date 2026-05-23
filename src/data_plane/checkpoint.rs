@@ -6,11 +6,12 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::data_plane::states::segment::cache::SegmentCache;
+use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 
+use super::SegmentKey;
 use super::messages::*;
-use super::record::{Record, SegmentKey};
 use super::sparse_index::{SparseEntry, SparseIndex};
+use super::wal::WalRecord;
 pub struct CheckpointWorker;
 
 impl CheckpointWorker {
@@ -51,12 +52,13 @@ impl CheckpointWorker {
         for batch in &checkpoint.batches {
             let batch_start_position = byte_position;
 
-            for record in &batch.records {
+            for user_data in &batch.records {
+                let record = WalRecord::data(user_data.clone());
                 record.encode_to(&mut writer)?;
                 byte_position += record.encoded_size() as u64;
             }
 
-            let end_record = Record::batch_end();
+            let end_record = WalRecord::batch_end();
             end_record.encode_to(&mut writer)?;
             byte_position += end_record.encoded_size() as u64;
 
@@ -93,7 +95,7 @@ impl CheckpointWorker {
 
 pub struct CheckpointJob {
     pub segment_key: SegmentKey,
-    pub cache: Arc<SegmentCache>,
+    pub cache: Arc<SegmentRingBuffer>,
     pub segment_file_path: PathBuf,
 }
 impl CheckpointJob {

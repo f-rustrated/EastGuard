@@ -18,7 +18,7 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
-use super::{mock_swim_handler, CLUSTER_PORT, QUERY_PORT};
+use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
 async fn start_raft_node(
     node_name: &str,
@@ -61,7 +61,7 @@ async fn start_raft_node(
         raft_tx.clone(),
         ticker_rx,
         TICK_PERIOD_100_MS,
-        PROBE_INTERVAL_TICKS,
+        Some(PROBE_INTERVAL_TICKS),
     ));
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),

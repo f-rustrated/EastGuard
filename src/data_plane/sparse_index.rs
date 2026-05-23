@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::data_plane::record::SegmentKey;
+use crate::data_plane::SegmentKey;
 
 pub struct SparseEntry {
     key: Vec<u8>,
@@ -12,11 +12,10 @@ impl SparseEntry {
         logical_offset: u64,
         byte_position: [u8; 8],
     ) -> Self {
-        let (shard_group_id, range_id, segment_id) = segment_key;
         let mut key = Vec::with_capacity(32);
-        key.extend_from_slice(&shard_group_id.0.to_be_bytes());
-        key.extend_from_slice(&range_id.0.to_be_bytes());
-        key.extend_from_slice(&segment_id.0.to_be_bytes());
+        key.extend_from_slice(&segment_key.shard_group_id.to_be_bytes());
+        key.extend_from_slice(&segment_key.range_id.to_be_bytes());
+        key.extend_from_slice(&segment_key.segment_id.to_be_bytes());
         key.extend_from_slice(&logical_offset.to_be_bytes());
         Self { key, byte_position }
     }
@@ -57,11 +56,10 @@ impl SparseIndex for rocksdb::DB {
 
 #[inline]
 fn encode_key(segment_key: SegmentKey, offset: u64) -> Vec<u8> {
-    let (shard_group_id, range_id, segment_id) = segment_key;
     let mut key = Vec::with_capacity(32);
-    key.extend_from_slice(&shard_group_id.0.to_be_bytes());
-    key.extend_from_slice(&range_id.0.to_be_bytes());
-    key.extend_from_slice(&segment_id.0.to_be_bytes());
+    key.extend_from_slice(&segment_key.shard_group_id.to_be_bytes());
+    key.extend_from_slice(&segment_key.range_id.to_be_bytes());
+    key.extend_from_slice(&segment_key.segment_id.to_be_bytes());
     key.extend_from_slice(&offset.to_be_bytes());
     key
 }
