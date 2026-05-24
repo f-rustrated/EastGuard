@@ -81,7 +81,7 @@ Segment leader (broker D)                    Coordinator (vnode leader A)
    |                                              |
    D ──(SealRequest RPC)─────────────────────────> A
    |    { shard_group_id, range_id, segment_id,   |
-   |      failed_node: F, end_offset }            |
+   |      failed_nodes: [F], end_entry_id }        |
    |                                              A proposes RollSegment via Raft
    |                                              Raft commits on [A, B, C]
    |                                              |
@@ -164,7 +164,7 @@ On `HandleNodeDeath(F)`: look up F in the index → active segments get `RollSeg
 
 Nodes get new NodeIds on restart (UUID regenerated). From the cluster's perspective, a recovered node is a new member — no zombie confusion, no stale identity problems. However, its local disk still contains valid WAL files, segment files, and sparse index from its previous lifecycle.
 
-On startup, the node scans its data directory and builds a **local segment inventory**: `(shard_group_id, range_id, segment_id) → local_end_offset`. This inventory is not advertised to the cluster proactively — the node is just a new member.
+On startup, the node scans its data directory and builds a **local segment inventory**: `(topic_id, range_id, segment_id) → local_end_offset`. This inventory is not advertised to the cluster proactively — the node is just a new member.
 
 When the coordinator assigns this node to a sealed segment's `replica_set` (as a replacement or via least-loaded placement), and the node receives a `CatchUpRequest`, it checks its local inventory:
 

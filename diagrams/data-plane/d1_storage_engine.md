@@ -31,12 +31,12 @@ Each `Produce` command carries an opaque `EntryPayload` — one pre-serialized b
     wal-000001.log                       # sealed, eligible for deletion
     wal-000002.log                       # sealed, eligible for deletion
     wal-000003.log                       # active, being appended to
-  {shard_group_id}/
+  {topic_id}/
     {range_id}/
       {segment_id}.seg                   # append-only, ≤1GB
 ```
 
-WAL is per-node (single sequential write point), split into fixed-size log files (e.g., 64MB each). When the active file reaches the size limit, it is sealed and a new file is opened. Old WAL files are deleted once all their entries have been durably written to their respective segment files (see WAL Lifecycle below). Segment files organized by ownership hierarchy. Removing a shard group = `rm -rf {data_dir}/{shard_group_id}/`.
+WAL is per-node (single sequential write point), split into fixed-size log files (e.g., 64MB each). When the active file reaches the size limit, it is sealed and a new file is opened. Old WAL files are deleted once all their entries have been durably written to their respective segment files (see WAL Lifecycle below). Segment files organized by ownership hierarchy. Removing a topic's data = `rm -rf {data_dir}/{topic_id}/`.
 
 ### Record Format
 
@@ -57,8 +57,8 @@ An entry lives inside the base record wrapper — CRC, trailing length, and back
 ```
 WAL Data record payload layout:
 
-[shard_group_id: 8B][range_id: 8B][segment_id: 8B][entry_id: 8B][record_count: 4B]
- └──────────────────── routing header (36B, WAL-only) ──────────────────────────────┘
+[topic_id: 8B][range_id: 8B][segment_id: 8B][entry_id: 8B][record_count: 4B]
+ └──────────────────── routing header (36B, WAL-only) ─────────────────────────┘
 [opaque payload: remaining bytes]   ← compressed record data (broker-opaque)
 ```
 
@@ -101,7 +101,7 @@ Consumer: receive blob → decompress → parse records by record_index
 **Segment file I/O:** Both reads and writes use standard buffered I/O + `posix_fadvise(POSIX_FADV_DONTNEED)`. `FADV_DONTNEED` after each write and read evicts pages so segment file I/O doesn't pollute the OS page cache. No alignment constraints, no padding, same I/O model for reads and writes. WAL also uses standard buffered I/O + fsync (write-once-read-never in normal path).
 
 ```rust
-type SegmentKey = (ShardGroupId, RangeId, SegmentId);
+type SegmentKey = (TopicId, RangeId, SegmentId);
 
 enum RecordType {
     Data,
@@ -109,7 +109,7 @@ enum RecordType {
 }
 
 struct RoutingHeader {
-    shard_group_id: ShardGroupId,
+    topic_id: TopicId,
     range_id: RangeId,
     segment_id: SegmentId,
     entry_id: u64,
@@ -133,7 +133,7 @@ struct Record {
 Separate RocksDB instance (not the metadata RocksDB). Sparse — one entry per `entry_id`:
 
 ```
-Key:   [shard_group_id: 8B][range_id: 8B][segment_id: 8B][entry_id: 8B]
+Key:   [topic_id: 8B][range_id: 8B][segment_id: 8B][entry_id: 8B]
 Value: [byte_position: 8B]
 ```
 
@@ -630,7 +630,7 @@ In D1 (no replication, `read_cursor == write_cursor`), this subsection does not 
 
 8. **Segment file I/O uses buffered I/O + `POSIX_FADV_DONTNEED`.** Both checkpoint writes and cold reads use standard buffered I/O. `FADV_DONTNEED` after each operation evicts pages from OS page cache.
 
-9. **One SegmentTracker per segment per node.** `segments` enforces at most one tracker (and its cache) per `(shard_group_id, range_id, segment_id)` key.
+9. **One SegmentTracker per segment per node.** `segments` enforces at most one tracker (and its cache) per `(topic_id, range_id, segment_id)` key.
 
 10. **Segment file ≤ 1GB.** DataPlaneActor signals `RollSegment` when approaching the limit. Enforced at the write path — never retroactively truncated.
 

@@ -548,13 +548,13 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::metadata::{RangeId, SegmentId};
+    use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
     use crate::clusters::swims::ShardGroupId;
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
 
     fn test_key() -> SegmentKey {
-        SegmentKey::new(ShardGroupId(1), RangeId(0), SegmentId(0))
+        SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
     }
 
     fn test_node_id() -> NodeId {
@@ -577,6 +577,7 @@ mod tests {
         DataPlaneCommand::InterNode(
             SegmentAssignment {
                 segment_key: key,
+                shard_group_id: ShardGroupId(1),
                 replica_set,
                 start_entry_id: 0,
             }
@@ -796,8 +797,8 @@ mod tests {
     fn checkpoint_complete_advances_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        let key1 = SegmentKey::new(ShardGroupId(1), RangeId(0), SegmentId(0));
-        let key2 = SegmentKey::new(ShardGroupId(2), RangeId(0), SegmentId(0));
+        let key1 = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        let key2 = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
 
         dp.handle_command(assign_segment(key1, vec![]));
         dp.handle_command(assign_segment(key2, vec![]));

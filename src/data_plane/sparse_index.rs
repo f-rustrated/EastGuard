@@ -9,7 +9,7 @@ pub struct SparseEntry {
 impl SparseEntry {
     pub(crate) fn new(segment_key: SegmentKey, entry_id: u64, byte_position: [u8; 8]) -> Self {
         let mut key = Vec::with_capacity(32);
-        key.extend_from_slice(&segment_key.shard_group_id.to_be_bytes());
+        key.extend_from_slice(&segment_key.topic_id.to_be_bytes());
         key.extend_from_slice(&segment_key.range_id.to_be_bytes());
         key.extend_from_slice(&segment_key.segment_id.to_be_bytes());
         key.extend_from_slice(&entry_id.to_be_bytes());
@@ -53,7 +53,7 @@ impl SparseIndex for rocksdb::DB {
 #[inline]
 fn encode_key(segment_key: SegmentKey, offset: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(32);
-    key.extend_from_slice(&segment_key.shard_group_id.to_be_bytes());
+    key.extend_from_slice(&segment_key.topic_id.to_be_bytes());
     key.extend_from_slice(&segment_key.range_id.to_be_bytes());
     key.extend_from_slice(&segment_key.segment_id.to_be_bytes());
     key.extend_from_slice(&offset.to_be_bytes());

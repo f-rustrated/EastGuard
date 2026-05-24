@@ -17,7 +17,7 @@ pub(crate) use command::*;
 
 use crate::smart_pointer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct TopicId(u64);
+pub struct TopicId(pub(crate) u64);
 
 smart_pointer!(TopicId, u64);
 

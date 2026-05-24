@@ -175,13 +175,12 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::clusters::metadata::{RangeId, SegmentId};
-    use crate::clusters::swims::ShardGroupId;
+    use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::EntryPayload;
     use crate::data_plane::states::segment::cache::CachedEntry;
 
     fn key(seg: u64) -> SegmentKey {
-        SegmentKey::new(ShardGroupId(1), RangeId(0), SegmentId(seg))
+        SegmentKey::new(TopicId(1), RangeId(0), SegmentId(seg))
     }
 
     fn node(id: &str) -> NodeId {

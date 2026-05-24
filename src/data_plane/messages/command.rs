@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 use crate::{
     clusters::NodeId,
     clusters::metadata::SegmentId,
+    clusters::swims::ShardGroupId,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
@@ -25,6 +26,7 @@ pub struct Produce {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SegmentAssignment {
     pub segment_key: SegmentKey,
+    pub shard_group_id: ShardGroupId,
     pub replica_set: Vec<NodeId>,
     pub start_entry_id: u64,
 }

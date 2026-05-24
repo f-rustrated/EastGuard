@@ -193,7 +193,7 @@ pub mod tests {
 
     use super::*;
     use crate::clusters::metadata::{RangeId, SegmentId};
-    use crate::clusters::swims::ShardGroupId;
+    use crate::clusters::metadata::TopicId;
     use crate::test_traits::TAssertInvariant;
     use bytes::Bytes;
     use std::sync::Arc;
@@ -257,7 +257,7 @@ pub mod tests {
     }
 
     fn test_key() -> SegmentKey {
-        SegmentKey::new(ShardGroupId(1), RangeId(0), SegmentId(0))
+        SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
     }
 
     fn make_tracker(role: SegmentRole) -> SegmentTracker {
