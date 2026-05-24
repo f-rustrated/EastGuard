@@ -15,7 +15,10 @@ pub enum RaftCommand {
 #[derive(Debug, PartialEq, Eq, Decode, Encode)]
 pub enum ProposeError {
     NotLeader(Option<NodeId>),
+    /// No Raft group for this shard ID exists on this node — stale routing.
     ShardNotFound,
+    /// The group existed but was dissolved by a membership change.
+    ShardGroupRemoved,
 }
 
 #[allow(dead_code)]

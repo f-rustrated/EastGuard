@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use tokio::sync::oneshot;
+
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
     DeferredReply, LogMutation, MultiRaftActorCommand, MultiRaftCommand, MultiRaftReply,
@@ -20,6 +22,8 @@ pub(crate) struct MultiRaft {
     dirty: HashSet<ShardGroupId>,
     pending_events: Vec<RaftEvent>,
     deferred: Vec<DeferredReply>,
+    /// Senders waiting for a specific (shard, log index) to be committed and applied.
+    pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposeError>>>,
 }
 
 impl MultiRaft {
@@ -32,6 +36,7 @@ impl MultiRaft {
             dirty: HashSet::new(),
             pending_events: Vec::new(),
             deferred: Vec::new(),
+            pending_proposes: BTreeMap::new(),
         }
     }
 
@@ -48,10 +53,14 @@ impl MultiRaft {
                 shard_group_id,
                 command,
                 reply,
-            } => {
-                let result = self.propose(shard_group_id, command);
-                self.deferred.push(DeferredReply::Propose(reply, result));
-            }
+            } => match self.propose(shard_group_id, command) {
+                Ok(index) => {
+                    self.pending_proposes.insert((shard_group_id, index), reply);
+                }
+                Err(e) => {
+                    self.deferred.push(DeferredReply::Propose(reply, Err(e)));
+                }
+            },
             MultiRaftActorCommand::GetTopics { reply } => {
                 let topics = self.get_topics();
                 self.deferred.push(DeferredReply::GetTopics(reply, topics));
@@ -102,7 +111,7 @@ impl MultiRaft {
             Propose {
                 shard_group_id,
                 command,
-            } => MultiRaftReply::Propose(self.propose(shard_group_id, command)),
+            } => MultiRaftReply::Propose(self.propose(shard_group_id, command).map(|_| ())),
             HandleNodeDeath { dead_node_id } => {
                 self.remove_node(dead_node_id);
                 MultiRaftReply::None
@@ -175,6 +184,18 @@ impl MultiRaft {
         };
         raft.cancel_all_timers();
         self.pending_events.extend(raft.take_events());
+
+        let pending_keys: Vec<_> = self
+            .pending_proposes
+            .keys()
+            .filter(|(gid, _)| *gid == group_id)
+            .cloned()
+            .collect();
+        for key in pending_keys {
+            if let Some(sender) = self.pending_proposes.remove(&key) {
+                let _ = sender.send(Err(ProposeError::ShardGroupRemoved));
+            }
+        }
 
         self.storage.delete_group(group_id);
 
@@ -250,7 +271,7 @@ impl MultiRaft {
         &mut self,
         shard_id: ShardGroupId,
         command: RaftCommand,
-    ) -> Result<(), ProposeError> {
+    ) -> Result<u64, ProposeError> {
         match self.groups.get_mut(&shard_id) {
             Some(raft) => {
                 let result = raft.propose(command);
@@ -266,6 +287,7 @@ impl MultiRaft {
         self.flush_auto_proposals(&dirty);
         let (mutations, last_indices) = self.collect_mutations(&dirty);
         self.persist_and_advance(mutations, last_indices);
+        self.resolve_pending_proposes(&dirty);
         std::mem::take(&mut self.pending_events)
     }
 
@@ -299,6 +321,43 @@ impl MultiRaft {
             self.pending_events.extend(raft.take_events());
         }
         (mutations, last_indices)
+    }
+
+    fn resolve_pending_proposes(&mut self, dirty: &[ShardGroupId]) {
+        for id in dirty {
+            let Some(raft) = self.groups.get(id) else {
+                continue;
+            };
+            let last_applied = raft.last_applied_index();
+            let is_leader = raft.is_leader(); // NLL: borrow of `raft` ends here
+
+            let to_fire: Vec<_> = self
+                .pending_proposes
+                .range((*id, 0)..=(*id, last_applied))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in to_fire {
+                if let Some(sender) = self.pending_proposes.remove(&key) {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+
+            // Reject senders for entries that will never be applied because
+            // this node is no longer the leader.
+            if !is_leader {
+                let to_reject: Vec<_> = self
+                    .pending_proposes
+                    .range((*id, last_applied.saturating_add(1))..)
+                    .take_while(|(k, _)| k.0 == *id)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in to_reject {
+                    if let Some(sender) = self.pending_proposes.remove(&key) {
+                        let _ = sender.send(Err(ProposeError::NotLeader(None)));
+                    }
+                }
+            }
+        }
     }
 
     fn persist_and_advance(

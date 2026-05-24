@@ -131,6 +131,10 @@ impl Raft {
         std::mem::take(&mut self.pending_proposals)
     }
 
+    pub(crate) fn last_applied_index(&self) -> u64 {
+        self.last_applied_index
+    }
+
     // -------------------------------------------------------------------
     // In-memory log helpers (1-based indexing; index 0 means "before log")
     // -------------------------------------------------------------------
@@ -723,12 +727,14 @@ impl Raft {
     // -> Replicated to shard #45's followers
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
-    pub fn propose(&mut self, command: RaftCommand) -> Result<(), ProposeError> {
+    /// Returns the log index at which the command was appended on success.
+    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader(self.current_leader.clone()));
         }
 
         self.add_new_entry(command);
+        let index = self.log_last_index();
 
         // Immediately replicate to all peers.
         let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
@@ -743,7 +749,7 @@ impl Raft {
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
-        Ok(())
+        Ok(index)
     }
 
     fn reset_election_timer(&mut self) {
@@ -1294,7 +1300,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
             raft.propose(RaftCommand::Noop),
-            Err(ProposeError::NotLeader(None))
+            Err::<u64, _>(ProposeError::NotLeader(None))
         );
     }
 
@@ -1317,7 +1323,7 @@ mod tests {
 
         assert_eq!(
             raft.propose(RaftCommand::Noop),
-            Err(ProposeError::NotLeader(Some(node("node-1"))))
+            Err::<u64, _>(ProposeError::NotLeader(Some(node("node-1"))))
         );
     }
 
