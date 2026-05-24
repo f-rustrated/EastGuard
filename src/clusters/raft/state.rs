@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
 use crate::clusters::metadata::state_machine::MetadataStateMachine;
@@ -11,6 +12,27 @@ use crate::clusters::swims::ShardGroupId;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
+
+const ELECTION_JITTER_RANGE: u32 = 20;
+
+struct ElectionJitter {
+    seed: u64,
+    counter: u64,
+}
+
+impl ElectionJitter {
+    fn new(seed: u64) -> Self {
+        Self { seed, counter: 0 }
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.seed.hash(&mut hasher);
+        self.counter.hash(&mut hasher);
+        self.counter += 1;
+        (hasher.finish() % ELECTION_JITTER_RANGE as u64) as u32
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -63,7 +85,7 @@ pub struct Raft {
     peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
     pending_proposals: Vec<RaftCommand>,
-    election_jitter: u32,
+    election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
 }
 
@@ -78,7 +100,7 @@ impl Raft {
         node_id: NodeId,
         peers: HashSet<NodeId>,
         persistent: RaftPersistentState,
-        election_jitter: u32,
+        election_jitter_seed: u64,
         shard_group_id: ShardGroupId,
         timer_seqs: TimerSeqs,
     ) -> Self {
@@ -99,7 +121,7 @@ impl Raft {
             state_machine: MetadataStateMachine::default(),
             pending_proposals: Vec::new(),
             peer_states: HashMap::new(),
-            election_jitter,
+            election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
         };
         raft.reset_election_timer();
@@ -751,10 +773,11 @@ impl Raft {
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.election,
             }));
+        let jitter = self.election_jitter.next();
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
                 seq: self.timer_seqs.election,
-                timer: RaftTimer::election(self.election_jitter, self.shard_group_id),
+                timer: RaftTimer::election(jitter, self.shard_group_id),
             }));
     }
 

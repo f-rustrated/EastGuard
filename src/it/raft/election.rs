@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -112,8 +113,14 @@ async fn run_raft_node(
         swim_tx.clone(),
     ));
     let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
+    let election_jitter_seed = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        node_id.hash(&mut h);
+        h.finish()
+    };
     tokio::spawn(MultiRaftActor::run(
         node_id,
+        election_jitter_seed,
         Box::new(db),
         raft_mailbox,
         transport_tx,

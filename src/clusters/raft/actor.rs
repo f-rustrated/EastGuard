@@ -24,13 +24,14 @@ impl MultiRaftActor {
 
     pub async fn run(
         node_id: NodeId,
+        election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         transport_tx: mpsc::Sender<RaftTransportCommand>,
         scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
         swim_tx: SwimSender,
     ) {
-        let mut store = MultiRaft::new(node_id, storage);
+        let mut store = MultiRaft::new(node_id, election_jitter_seed, storage);
         let mut buf = Vec::with_capacity(64);
 
         loop {
