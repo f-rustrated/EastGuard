@@ -6,7 +6,7 @@ use crate::{
         SegmentKey,
         checkpoint::CheckpointJob,
         messages::command::{DataPlaneInterNodeCommand, ReplicaAppend},
-        states::segment::cache::CachedBatch,
+        states::segment::cache::CachedEntry,
         timer::BatchFlushTimer,
     },
     impl_from_variant,
@@ -15,7 +15,7 @@ use crate::{
 
 pub(crate) struct PendingReplicationBatch {
     pub segment_key: SegmentKey,
-    pub batch: Arc<CachedBatch>,
+    pub entry: Arc<CachedEntry>,
     pub replica_set: Vec<NodeId>,
     pub followers: Vec<NodeId>,
 }
@@ -26,8 +26,9 @@ impl PendingReplicationBatch {
         let message = ReplicaAppend {
             segment_key: self.segment_key,
             replica_set: self.replica_set,
-            records: self.batch.records.iter().map(|r| r.to_vec()).collect(),
-            start_offset: self.batch.start_offset,
+            data: self.entry.data.clone(),
+            record_count: self.entry.record_count,
+            entry_id: self.entry.entry_id,
         };
         (targets, message)
     }
@@ -40,7 +41,7 @@ pub(crate) struct BatchPublished {
 
 pub(crate) struct ReplicaAckReceived {
     pub segment_key: SegmentKey,
-    pub end_offset: u64,
+    pub entry_id: u64,
     pub from: NodeId,
 }
 
@@ -59,7 +60,7 @@ impl InterNodeCommandQueued {
 
 pub(crate) struct ReplicationTimedOut {
     pub segment_key: SegmentKey,
-    pub committed_end_offset: u64,
+    pub committed_entry_id: u64,
 }
 
 pub(crate) enum DataPlaneEvent {

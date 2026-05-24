@@ -1,13 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
-use bytes::Bytes;
-
 use crate::clusters::NodeId;
-use crate::data_plane::{SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
+use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
-use super::cache::CachedBatch;
+use super::cache::CachedEntry;
 
-use super::record::StagingRecord;
+use super::record::{RoutingHeader, StagedEntry};
 
 use super::*;
 
@@ -26,9 +24,9 @@ pub(crate) struct SegmentTracker {
     segment_file_path: PathBuf,
     role: SegmentRole,
     replica_set: Vec<NodeId>,
-    committed_end_offset: u64,
-    next_offset: u64,
-    staged_records: Vec<StagingRecord>,
+    committed_entry_id: u64,
+    next_entry_id: u64,
+    staged_entries: Vec<StagedEntry>,
 }
 
 impl SegmentTracker {
@@ -40,20 +38,20 @@ impl SegmentTracker {
             segment_file_path: path,
             role,
             replica_set,
-            committed_end_offset: 0,
-            next_offset: 0,
-            staged_records: Vec::new(),
+            committed_entry_id: 0,
+            next_entry_id: 0,
+            staged_entries: Vec::new(),
         }
     }
-    pub(crate) fn new_with_offset(
+    pub(crate) fn new_with_start_entry_id(
         path: PathBuf,
         role: SegmentRole,
         replica_set: Vec<NodeId>,
-        start_offset: u64,
+        start_entry_id: u64,
     ) -> Self {
-        let mut segmnet = Self::new(path, role, replica_set);
-        segmnet.next_offset = start_offset;
-        segmnet
+        let mut tracker = Self::new(path, role, replica_set);
+        tracker.next_entry_id = start_entry_id;
+        tracker
     }
     pub(crate) fn replica_set(&self) -> Vec<NodeId> {
         self.replica_set.clone()
@@ -78,53 +76,43 @@ impl SegmentTracker {
         self.cache.load_write_cursor() - self.cache.load_eviction_frontier()
     }
 
-    /// Encodes staged_records contents into the shared WAL buffer.
-    /// Records stay in staged_records until publish_staged drains them.
     pub(crate) fn stage_to_wal(&mut self, wal_buf: &mut Vec<u8>) {
-        for rec in &self.staged_records {
-            let _ = WalRecord::data(rec.build_wal_payload()).encode_to(wal_buf);
+        for (i, staged) in self.staged_entries.iter().enumerate() {
+            let entry_id = self.next_entry_id + i as u64;
+            let header = RoutingHeader::new(staged.segment_key, entry_id, staged.record_count);
+            let _ = WalRecord::data(header.build_wal_payload(&staged.data)).encode_to(wal_buf);
         }
     }
 
     pub(crate) fn has_staged(&self) -> bool {
-        !self.staged_records.is_empty()
+        !self.staged_entries.is_empty()
     }
 
-    /// Drains staged_records into a CachedBatch and publishes to cache.
-    pub(crate) fn publish_staged(&mut self, lsn: u64) -> Arc<CachedBatch> {
-        let start_offset = self
-            .staged_records
-            .first()
-            .map(|r| r.logical_offset())
-            .unwrap_or(0);
-        let end_offset = self
-            .staged_records
-            .last()
-            .map(|r| r.logical_offset())
-            .unwrap_or(0);
-        let records: Vec<Bytes> = std::mem::take(&mut self.staged_records)
-            .into_iter()
-            .map(|r| r.user_data)
-            .collect();
-
-        let batch = Arc::new(CachedBatch {
-            records,
-            start_offset,
-            end_offset,
-            lsn,
-        });
-        self.cache.publish(batch.clone());
-        batch
+    pub(crate) fn publish_staged(&mut self, lsn: u64) -> Vec<Arc<CachedEntry>> {
+        self.staged_entries
+            .drain(..)
+            .map(|s| {
+                let entry_id = self.next_entry_id;
+                self.next_entry_id += 1;
+                let entry = Arc::new(CachedEntry {
+                    data: s.data,
+                    record_count: s.record_count,
+                    entry_id,
+                    lsn,
+                });
+                self.cache.publish(entry.clone());
+                entry
+            })
+            .collect()
     }
 
-    pub(crate) fn uncommitted_records(&self) -> impl Iterator<Item = Bytes> + '_ {
+    pub(crate) fn uncommitted_entries(&self) -> impl Iterator<Item = (EntryPayload, u32)> + '_ {
         let commit = self.cache.load_read_cursor();
         let tail = self.cache.load_write_cursor();
-        (commit..tail).flat_map(|pos| {
+        (commit..tail).filter_map(|pos| {
             self.cache
                 .load_published(pos)
-                .into_iter()
-                .flat_map(|batch| batch.records.clone())
+                .map(|entry| (entry.data.clone(), entry.record_count))
         })
     }
 
@@ -136,19 +124,19 @@ impl SegmentTracker {
         }
     }
 
-    pub(crate) fn commit_batch(&mut self, batch_end_offset: u64) {
+    pub(crate) fn commit_entry(&mut self, entry_id: u64) {
         let commit = self.cache.load_read_cursor();
 
         #[cfg(debug_assertions)]
-        if let Some(batch) = self.cache.load_published(commit) {
+        if let Some(entry) = self.cache.load_published(commit) {
             assert_eq!(
-                batch.end_offset, batch_end_offset,
-                "commit end_offset mismatch: batch has {}, caller passed {}",
-                batch.end_offset, batch_end_offset
+                entry.entry_id, entry_id,
+                "commit entry_id mismatch: cached entry has {}, caller passed {}",
+                entry.entry_id, entry_id
             );
         }
         self.cache.advance_read_cursor(commit + 1);
-        self.committed_end_offset = batch_end_offset;
+        self.committed_entry_id = entry_id;
     }
 
     pub(crate) fn advance_checkpoint(&mut self, checkpointed_lsn: u64) {
@@ -159,34 +147,39 @@ impl SegmentTracker {
         self.checkpoint_lsn
     }
 
-    pub(crate) fn committed_end_offset(&self) -> u64 {
-        self.committed_end_offset
+    pub(crate) fn committed_entry_id(&self) -> u64 {
+        self.committed_entry_id
     }
 
-    pub(crate) fn buffer_record(&mut self, segment_key: SegmentKey, user_data: Bytes) {
-        self.size_bytes += user_data.len() as u64;
-        self.staged_records
-            .push(StagingRecord::new(user_data, segment_key, self.next_offset));
-        self.next_offset += 1;
-    }
-
-    pub(crate) fn buffer_record_in_bulk(
+    pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,
-        user_data: Vec<Vec<u8>>,
-        start_offset: u64,
+        data: EntryPayload,
+        record_count: u32,
     ) {
-        if start_offset < self.next_offset {
+        self.size_bytes += data.len() as u64;
+        self.staged_entries
+            .push(StagedEntry::new(data, record_count, segment_key));
+    }
+
+    pub(crate) fn stage_entry_from_replica(
+        &mut self,
+        segment_key: SegmentKey,
+        data: EntryPayload,
+        record_count: u32,
+        entry_id: u64,
+    ) {
+        let expected = self.next_entry_id + self.staged_entries.len() as u64;
+        if entry_id < expected {
             return;
         }
         debug_assert_eq!(
-            start_offset, self.next_offset,
-            "offset gap: expected {}, got {start_offset}",
-            self.next_offset
+            entry_id, expected,
+            "entry_id gap: expected {expected}, got {entry_id}",
         );
-        for data in user_data {
-            self.buffer_record(segment_key, Bytes::from(data));
-        }
+        self.size_bytes += data.len() as u64;
+        self.staged_entries
+            .push(StagedEntry::new(data, record_count, segment_key));
     }
 
     pub(crate) fn size_limit_reached(&self) -> bool {
@@ -195,75 +188,58 @@ impl SegmentTracker {
 }
 
 #[cfg(any(test, debug_assertions))]
-impl crate::test_traits::TAssertInvariant for SegmentTracker {
-    fn assert_invariants(&self) {
-        crate::test_traits::TAssertInvariant::assert_invariants(&*self.cache);
-
-        let frontier = self.cache.load_eviction_frontier();
-        let tail = self.cache.load_write_cursor();
-
-        if frontier == tail && tail > 0 {
-            assert!(
-                self.checkpoint_lsn > 0,
-                "all batches evicted but checkpoint_lsn is 0 — \
-                 eviction happened without reporting checkpoint"
-            );
-        }
-
-        // Cached batches must be offset-contiguous
-        let read = self.cache.load_read_cursor();
-        for pos in frontier..read.saturating_sub(1) {
-            if let (Some(curr), Some(next)) = (
-                self.cache.load_published(pos),
-                self.cache.load_published(pos + 1),
-            ) {
-                assert_eq!(
-                    curr.end_offset + 1,
-                    next.start_offset,
-                    "batch offset gap: batch at pos {pos} ends at {}, \
-                     batch at pos {} starts at {}",
-                    curr.end_offset,
-                    pos + 1,
-                    next.start_offset
-                );
-            }
-        }
-
-        // Staged records must be offset-contiguous with each other and with the last cached batch
-        let buf_len = self.staged_records.len() as u64;
-        for (i, rec) in self.staged_records.iter().enumerate() {
-            let expected = self.next_offset - buf_len + i as u64;
-            assert_eq!(
-                rec.logical_offset(),
-                expected,
-                "staged_records[{i}] offset {} != expected {expected}",
-                rec.logical_offset()
-            );
-        }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-impl SegmentTracker {
-    pub fn staged_records(&self) -> &Vec<StagingRecord> {
-        &self.staged_records
-    }
-}
-
-#[cfg(test)]
 pub mod tests {
+    #![allow(unused)]
+
     use super::*;
     use crate::clusters::metadata::{RangeId, SegmentId};
     use crate::clusters::swims::ShardGroupId;
     use crate::test_traits::TAssertInvariant;
+    use bytes::Bytes;
     use std::sync::Arc;
+
+    impl crate::test_traits::TAssertInvariant for SegmentTracker {
+        fn assert_invariants(&self) {
+            crate::test_traits::TAssertInvariant::assert_invariants(&*self.cache);
+
+            let frontier = self.cache.load_eviction_frontier();
+            let tail = self.cache.load_write_cursor();
+
+            if frontier == tail && tail > 0 {
+                assert!(
+                    self.checkpoint_lsn > 0,
+                    "all entries evicted but checkpoint_lsn is 0 — \
+                 eviction happened without reporting checkpoint"
+                );
+            }
+
+            // Cached entries must have contiguous entry_ids
+            let read = self.cache.load_read_cursor();
+            for pos in frontier..read.saturating_sub(1) {
+                if let (Some(curr), Some(next)) = (
+                    self.cache.load_published(pos),
+                    self.cache.load_published(pos + 1),
+                ) {
+                    assert_eq!(
+                        curr.entry_id + 1,
+                        next.entry_id,
+                        "entry_id gap: entry at pos {pos} has id {}, \
+                     entry at pos {} has id {}",
+                        curr.entry_id,
+                        pos + 1,
+                        next.entry_id
+                    );
+                }
+            }
+        }
+    }
 
     impl SegmentTracker {
         pub fn cache(&self) -> Arc<SegmentRingBuffer> {
             self.cache.clone()
         }
-        pub fn next_offset(&self) -> u64 {
-            self.next_offset
+        pub fn next_entry_id(&self) -> u64 {
+            self.next_entry_id
         }
 
         pub fn cache_write_cursor(&self) -> u64 {
@@ -274,6 +250,9 @@ pub mod tests {
         }
         pub fn size_bytes(&self) -> u64 {
             self.size_bytes
+        }
+        pub fn staged_entries(&self) -> &[StagedEntry] {
+            &self.staged_entries
         }
     }
 
@@ -289,56 +268,36 @@ pub mod tests {
         )
     }
 
-    fn make_batch(start: u64, end: u64, lsn: u64) -> CachedBatch {
-        CachedBatch {
-            records: vec![],
-            start_offset: start,
-            end_offset: end,
-            lsn,
-        }
-    }
-
     #[test]
-    fn buffer_record_tracks_offset_and_size_independently() {
+    fn stage_entry_tracks_size() {
         let mut t = make_tracker(SegmentRole::Leader);
-        t.buffer_record(test_key(), Bytes::from("abc"));
-        t.buffer_record(test_key(), Bytes::from("de"));
+        t.stage_entry(test_key(), Bytes::from("abcde").into(), 2);
 
-        assert_eq!(t.next_offset, 2);
         assert_eq!(t.size_bytes, 5);
+        assert!(t.has_staged());
         t.assert_invariants();
     }
 
     #[test]
-    fn buffer_record_in_bulk_continues_from_tracker_offset() {
-        let mut t = SegmentTracker::new_with_offset(
+    fn stage_from_replica_skips_duplicate() {
+        let mut t = SegmentTracker::new_with_start_entry_id(
             PathBuf::from("/tmp/test.seg"),
             SegmentRole::Follower,
             vec![NodeId::new("leader"), NodeId::new("follower")],
-            100,
+            5,
         );
-        t.buffer_record_in_bulk(test_key(), vec![b"a".to_vec(), b"b".to_vec()], 100);
+        t.stage_entry_from_replica(test_key(), Bytes::from("data").into(), 1, 5);
+        assert!(t.has_staged());
 
-        assert_eq!(t.next_offset, 102);
-        assert_eq!(t.size_bytes, 2);
-        t.assert_invariants();
-    }
+        // Publish to advance next_entry_id
+        let mut wal_buf = Vec::new();
+        t.stage_to_wal(&mut wal_buf);
+        t.publish_staged(1);
 
-    #[test]
-    fn buffer_record_in_bulk_skips_duplicate_offsets() {
-        let mut t = SegmentTracker::new_with_offset(
-            PathBuf::from("/tmp/test.seg"),
-            SegmentRole::Follower,
-            vec![NodeId::new("leader"), NodeId::new("follower")],
-            100,
-        );
-        t.buffer_record_in_bulk(test_key(), vec![b"a".to_vec(), b"b".to_vec()], 100);
-        assert_eq!(t.next_offset, 102);
-
-        // Duplicate batch — should be no-op
-        t.buffer_record_in_bulk(test_key(), vec![b"a".to_vec(), b"b".to_vec()], 100);
-        assert_eq!(t.next_offset, 102);
-        assert_eq!(t.size_bytes, 2);
+        // Duplicate entry_id (5) should be skipped since next is now 6
+        t.stage_entry_from_replica(test_key(), Bytes::from("dup").into(), 1, 5);
+        assert!(!t.has_staged());
+        assert_eq!(t.next_entry_id, 6);
         t.assert_invariants();
     }
 
@@ -348,7 +307,7 @@ pub mod tests {
         let mut wal_buf = Vec::new();
 
         for i in 0..3u64 {
-            t.buffer_record(test_key(), Bytes::from(format!("rec-{i}")));
+            t.stage_entry(test_key(), Bytes::from(format!("entry-{i}")).into(), 1);
             t.stage_to_wal(&mut wal_buf);
             t.publish_staged(i + 1);
         }
@@ -357,30 +316,30 @@ pub mod tests {
         assert_eq!(t.cache_read_cursor(), 0);
 
         for i in 0..3u64 {
-            t.commit_batch(i);
+            t.commit_entry(i);
             assert_eq!(t.cache_read_cursor(), i + 1);
-            assert_eq!(t.committed_end_offset(), i);
+            assert_eq!(t.committed_entry_id(), i);
         }
         t.assert_invariants();
     }
 
     #[test]
-    fn stage_then_publish_drains_buffer() {
+    fn stage_then_publish_drains() {
         let mut t = make_tracker(SegmentRole::Leader);
         let mut wal_buf = Vec::new();
-        t.buffer_record(test_key(), Bytes::from("a"));
-        t.buffer_record(test_key(), Bytes::from("b"));
+        t.stage_entry(test_key(), Bytes::from("payload").into(), 3);
         t.stage_to_wal(&mut wal_buf);
 
         assert!(!wal_buf.is_empty());
         assert!(t.has_staged());
-        assert_eq!(t.next_offset, 2);
+        assert_eq!(t.next_entry_id, 0);
 
-        let batch = t.publish_staged(1);
-        assert_eq!(batch.start_offset, 0);
-        assert_eq!(batch.end_offset, 1);
-        assert!(t.staged_records.is_empty());
+        let entries = t.publish_staged(1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_id, 0);
+        assert_eq!(entries[0].record_count, 3);
         assert!(!t.has_staged());
+        assert_eq!(t.next_entry_id, 1);
         t.assert_invariants();
     }
 

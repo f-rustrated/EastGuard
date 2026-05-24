@@ -7,16 +7,12 @@ pub struct SparseEntry {
     byte_position: [u8; 8],
 }
 impl SparseEntry {
-    pub(crate) fn new(
-        segment_key: SegmentKey,
-        logical_offset: u64,
-        byte_position: [u8; 8],
-    ) -> Self {
+    pub(crate) fn new(segment_key: SegmentKey, entry_id: u64, byte_position: [u8; 8]) -> Self {
         let mut key = Vec::with_capacity(32);
         key.extend_from_slice(&segment_key.shard_group_id.to_be_bytes());
         key.extend_from_slice(&segment_key.range_id.to_be_bytes());
         key.extend_from_slice(&segment_key.segment_id.to_be_bytes());
-        key.extend_from_slice(&logical_offset.to_be_bytes());
+        key.extend_from_slice(&entry_id.to_be_bytes());
         Self { key, byte_position }
     }
 }

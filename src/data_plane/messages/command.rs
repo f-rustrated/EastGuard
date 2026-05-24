@@ -1,12 +1,11 @@
 use crate::impl_from_variant;
 use bincode::{Decode, Encode};
-use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::{
     clusters::NodeId,
     clusters::metadata::SegmentId,
-    data_plane::{SegmentKey, timer::DataPlaneTimeoutCallback},
+    data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
 pub enum DataPlaneCommand {
@@ -18,7 +17,8 @@ pub enum DataPlaneCommand {
 
 pub struct Produce {
     pub segment_key: SegmentKey,
-    pub records: Vec<Bytes>,
+    pub data: EntryPayload,
+    pub record_count: u32,
     pub reply: oneshot::Sender<ProduceAck>,
 }
 
@@ -26,35 +26,36 @@ pub struct Produce {
 pub struct SegmentAssignment {
     pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
-    pub start_offset: u64,
+    pub start_entry_id: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ReplicaAppend {
     pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
-    pub records: Vec<Vec<u8>>,
-    pub start_offset: u64,
+    pub data: EntryPayload,
+    pub record_count: u32,
+    pub entry_id: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct ReplicaAck {
     pub segment_key: SegmentKey,
-    pub end_offset: u64,
+    pub entry_id: u64,
     pub from: NodeId,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CommitAdvance {
     pub segment_key: SegmentKey,
-    pub committed_end_offset: u64,
+    pub committed_entry_id: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SealRequest {
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
-    pub end_offset: u64,
+    pub end_entry_id: u64,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
