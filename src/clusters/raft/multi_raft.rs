@@ -147,12 +147,7 @@ impl MultiRaft {
             .cloned()
             .collect();
 
-        let election_jitter_seed = {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.election_jitter_seed.hash(&mut hasher);
-            group.id.hash(&mut hasher);
-            hasher.finish()
-        };
+        let election_jitter_seed = self.create_election_jitter_seed(&group);
 
         let election_seq = self.seq_counter.generate();
         let heartbeat_seq = self.seq_counter.generate();
@@ -182,6 +177,13 @@ impl MultiRaft {
 
         self.groups.insert(group.id, raft);
         self.dirty.insert(group.id);
+    }
+
+    fn create_election_jitter_seed(&mut self, group: &ShardGroup) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.election_jitter_seed.hash(&mut hasher);
+        group.id.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn remove_group(&mut self, group_id: ShardGroupId) {
@@ -313,7 +315,10 @@ impl MultiRaft {
     fn collect_mutations(
         &mut self,
         dirty: &[ShardGroupId],
-    ) -> (Vec<(ShardGroupId, LogMutation)>, BTreeMap<ShardGroupId, u64>) {
+    ) -> (
+        Vec<(ShardGroupId, LogMutation)>,
+        BTreeMap<ShardGroupId, u64>,
+    ) {
         let mut mutations = vec![];
         let mut last_indices = BTreeMap::new();
         for id in dirty {
