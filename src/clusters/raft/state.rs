@@ -131,6 +131,10 @@ impl Raft {
         std::mem::take(&mut self.pending_proposals)
     }
 
+    pub(crate) fn last_applied_index(&self) -> u64 {
+        self.last_applied_index
+    }
+
     // -------------------------------------------------------------------
     // In-memory log helpers (1-based indexing; index 0 means "before log")
     // -------------------------------------------------------------------
@@ -545,12 +549,6 @@ impl Raft {
                 peer_state.match_index = resp.last_log_index;
                 peer_state.next_index = resp.last_log_index + 1;
                 self.try_advance_commit_index();
-                // TODO: In practice, commit means applying the command to the state machine. The flow
-                //  1. Leader receives propose(CreateTopic("blue"))
-                //  2. Leader appends to log: [term=3, index=7, cmd=CreateTopic("blue")]
-                //  3. Leader replicates to peers via AppendEntries
-                //  4. Majority acknowledge → commit_index advances to 7
-                //  5. Apply: the state machine executes CreateTopic("blue")  ← this is the real "commit"
             } else {
                 // Decrement next_index and retry.
                 peer_state.next_index = peer_state.next_index.saturating_sub(1).max(1);
@@ -723,12 +721,14 @@ impl Raft {
     // -> Replicated to shard #45's followers
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
-    pub fn propose(&mut self, command: RaftCommand) -> Result<(), ProposeError> {
+    /// Returns the log index at which the command was appended on success.
+    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader(self.current_leader.clone()));
         }
 
         self.add_new_entry(command);
+        let index = self.log_last_index();
 
         // Immediately replicate to all peers.
         let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
@@ -743,7 +743,7 @@ impl Raft {
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
-        Ok(())
+        Ok(index)
     }
 
     fn reset_election_timer(&mut self) {
@@ -1294,7 +1294,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
             raft.propose(RaftCommand::Noop),
-            Err(ProposeError::NotLeader(None))
+            Err::<u64, _>(ProposeError::NotLeader(None))
         );
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
 
         assert_eq!(
             raft.propose(RaftCommand::Noop),
-            Err(ProposeError::NotLeader(Some(node("node-1"))))
+            Err::<u64, _>(ProposeError::NotLeader(Some(node("node-1"))))
         );
     }
 

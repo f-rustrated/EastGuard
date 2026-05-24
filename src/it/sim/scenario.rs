@@ -11,7 +11,7 @@ use crate::connections::request::{
     ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse,
 };
 use crate::it::helpers::default_env;
-use crate::it::sim::invariants::{assert_membership_converged, assert_topic_visible, query_shard_info};
+use crate::it::sim::invariants::{assert_membership_converged, assert_topic_visible_on_quorum, query_shard_info};
 use crate::net::TcpStream;
 
 pub(super) fn node_name(i: u8) -> String {
@@ -268,7 +268,7 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
         for (topic, member_addrs) in &created_topics {
             let refs: Vec<(&str, u16)> =
                 member_addrs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
-            assert_topic_visible(&refs, topic, 20, Duration::from_secs(1)).await?;
+            assert_topic_visible_on_quorum(&refs, topic, 20, Duration::from_secs(1)).await?;
         }
         Ok(())
     });
