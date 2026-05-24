@@ -827,3 +827,100 @@ Clients connect to any seed node. The server handles redirect via `NotLeader { l
 - Invalidates on `NotLeader` for that topic → fresh `DescribeTopic` before retry.
 - Retry policy: up to 3 attempts, 50ms base backoff, 2x multiplier, ±20% jitter.
   If all 3 fail, surface error to caller.
+
+---
+
+## Implementation Plan (Phase 1)
+
+### PR 1 — Wire Protocol + Server Dispatch Scaffold
+
+Foundation. All subsequent PRs depend on this.
+
+- [ ] Extend frame format: `[len: u32][request_id: u64][payload: N bytes]` for both request and response
+- [ ] Define `ClientRequest` enum: `ControlPlane(ControlPlaneRequest)`, `DataPlane(DataPlaneRequest)`, `Admin(AdminRequest)`
+- [ ] Define `ClientResponse` enum: `ControlPlane(ControlPlaneResponse)`, `DataPlane(DataPlaneResponse)`, `Admin(AdminResponse)` + shared error variants (`InternalError`, `NotLeader`, `ShardNotLocal`)
+- [ ] Split connection handler into reader task + writer task connected by `mpsc::Sender<(u64, ClientResponse)>`
+  - Reader task: reads `(request_id, ClientRequest)` frames, spawns one handler task per request
+  - Writer task: reads `(request_id, ClientResponse)` from channel, encodes and writes frames
+- [ ] Introduce `ClientHandler` struct (cloned into each handler task):
+  ```rust
+  struct ClientHandler {
+      node_id: NodeId,
+      swim_sender: SwimSender,
+      raft_sender: RaftSender,
+      data_plane_sender: DataPlaneSender,
+      routing_cache: Arc<TopicRoutingCache>,
+      writer_tx: mpsc::Sender<(u64, ClientResponse)>,
+  }
+  ```
+- [ ] Replace `ConnectionRequests` / `ClientStreamWriter::dispatch()` with new `ClientHandler::dispatch(request_id, ClientRequest)`
+- [ ] Stub all request variants with `todo!()` so it compiles; remove stubs as PRs 2–5 land
+
+### PR 2 — Admin API
+
+Read-only handlers. No routing cache, no Raft proposals. Validates the dispatch pattern from PR 1.
+
+- [ ] `Admin::DescribeCluster` — query SWIM membership table, map to `Vec<NodeInfo { node_id, addr, state }>`
+- [ ] `Admin::ListHostedTopicsWithStats` — read all topics from local `MetadataStateMachine`, aggregate `size_bytes` and record counts per topic
+- [ ] `Admin::SplitRange` — wire `ControlPlaneRouter` leader resolution to existing `MetadataCommand::SplitRange` (already implemented in `state_machine.rs`)
+
+### PR 3 — Control Plane + `ControlPlaneRouter`
+
+Writes through Raft. Introduces the DRY server-side routing helper.
+
+- [ ] Implement `ControlPlaneRouter` helper:
+  - Compute `ShardGroupId::new(hash(name))`
+  - If this node is leader → return `Local`
+  - If this node hosts the shard group but is follower → resolve leader via `MultiRaft::current_leader`, forward once with `ProposeRequest { forwarded: true }`
+  - If this node does not host the shard group → pick a live member from local `Topology`, forward once
+  - If forwarding fails → `InternalError`
+- [ ] `ControlPlane::CreateTopic` — duplicate check via `topic_name_index`, then propose `MetadataCommand::CreateTopic`; return `Ok | AlreadyExists | InternalError`
+- [ ] `ControlPlane::DeleteTopic` — existence check, then propose `MetadataCommand::DeleteTopic`; return `Ok | TopicNotFound | InternalError`
+- [ ] `ControlPlane::ListHostedTopics` — local read from `MetadataStateMachine`, no leader check; return `Vec<TopicSummary>`
+- [ ] `ControlPlane::DescribeTopic` — shard group check (forward to any member if not hosted), local read; return `TopicDetail | TopicNotFound`
+
+### PR 4 — `TopicRoutingCache` + `MetadataStateMachineObserver`
+
+Infrastructure required by the Data Plane. No I/O handlers.
+
+- [ ] Define `MetadataStateMachineObserver` trait:
+  ```rust
+  pub trait MetadataStateMachineObserver: Send + Sync {
+      fn on_applied(&self, shard_group_id: ShardGroupId, event: &MetadataApplyEvent);
+  }
+  ```
+- [ ] Define `MetadataApplyEvent` enum: `TopicCreated`, `TopicDeleted`, `RangeSplit`, `RangeMerged`, `SegmentRolled`
+- [ ] Wire observer call into `MultiRaft::apply_committed_entries()` — emit event after each applied entry
+- [ ] Add `Option<Arc<dyn MetadataStateMachineObserver>>` to `MultiRaft`; set once at node startup
+- [ ] Implement `TopicRoutingCache`:
+  ```rust
+  pub struct TopicRoutingCache {
+      inner: Arc<RwLock<HashMap<String, Arc<TopicRouting>>>>,
+  }
+  ```
+  - `get_or_fetch(topic_name)` — cache hit returns `Arc<TopicRouting>`; miss sends `GetTopicRouting` to `MultiRaft` and inserts result
+  - `invalidate(topic_name)` — removes entry; triggered by `RangeSplit` / `RangeMerged` observer events
+- [ ] Add `MultiRaftActorCommand::GetTopicRouting { topic_name, reply: oneshot::Sender<Option<TopicRouting>> }` — read-only query against local `MetadataStateMachine`, no Raft proposal
+- [ ] Wire `TopicRoutingCache` as the `MetadataStateMachineObserver` (invalidates on `RangeSplit` / `RangeMerged`)
+
+### PR 5 — Data Plane
+
+Builds on routing cache from PR 4.
+
+- [ ] `DataPlane::Produce`:
+  - Cache lookup → `ShardNotLocal` or `TopicNotFound` on miss
+  - Range resolution: linear scan `active_ranges` by `routing_key`
+  - Segment leader check: `replica_set[0]` must be this node, else `NotLeader { leader_addr }`
+  - Write to `DataPlaneActor`; on sealed segment → invalidate cache, return `RangeSplitting { left_range_id, right_range_id, split_point }`
+  - Return `{ offset }` on success
+- [ ] `DataPlane::Fetch`:
+  - Cache lookup → `ShardNotLocal` or `TopicNotFound` on miss
+  - Range lookup by `range_id` from `all_ranges` (covers sealed ranges)
+  - Replica check: this node must be in `replica_set`, else `NotLeader { leader_addr: replica_set[0] }`
+  - Read up to `commit_offset`; `offset > commit_offset` → `OffsetOutOfRange`
+  - If range sealed → populate `Sealed { end_offset, transition }` from `MetadataStateMachine`
+  - Return `{ records, next_offset, range_status }`
+- [ ] `DataPlane::ListOffsets`:
+  - Cache lookup → same miss path as `Fetch`
+  - Replica check (any `replica_set` member may serve)
+  - Return `{ start_offset, commit_offset }` from local segment state; no disk I/O
