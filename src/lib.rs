@@ -110,8 +110,15 @@ impl StartUp {
             raft_tx.clone().into(),
         ));
         let raft_db = MetadataStorage::open(self.env.raft_db_path());
+        let election_jitter_seed = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&self.env.node_id_prefix, &mut hasher);
+            std::hash::Hash::hash(&self.rng_seed, &mut hasher);
+            std::hash::Hasher::finish(&hasher)
+        };
         tokio::spawn(MultiRaftActor::run(
             node_id,
+            election_jitter_seed,
             Box::new(raft_db),
             raft_mailbox,
             raft_transport_tx,

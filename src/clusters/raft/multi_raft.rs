@@ -16,6 +16,7 @@ use crate::clusters::swims::{ShardGroup, ShardGroupId};
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
     node_id: NodeId,
+    election_jitter_seed: u64,
     storage: Box<dyn RaftStorage>,
     groups: BTreeMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
@@ -27,9 +28,14 @@ pub(crate) struct MultiRaft {
 }
 
 impl MultiRaft {
-    pub(crate) fn new(node_id: NodeId, storage: Box<dyn RaftStorage>) -> Self {
+    pub(crate) fn new(
+        node_id: NodeId,
+        election_jitter_seed: u64,
+        storage: Box<dyn RaftStorage>,
+    ) -> Self {
         Self {
             node_id,
+            election_jitter_seed,
             storage,
             groups: BTreeMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
@@ -141,11 +147,11 @@ impl MultiRaft {
             .cloned()
             .collect();
 
-        let jitter = {
+        let election_jitter_seed = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.node_id.hash(&mut hasher);
+            self.election_jitter_seed.hash(&mut hasher);
             group.id.hash(&mut hasher);
-            (hasher.finish() % 20) as u32
+            hasher.finish()
         };
 
         let election_seq = self.seq_counter.generate();
@@ -158,7 +164,7 @@ impl MultiRaft {
             self.node_id.clone(),
             peers,
             persistent,
-            jitter,
+            election_jitter_seed,
             group.id,
             TimerSeqs {
                 election: election_seq,
@@ -430,7 +436,7 @@ mod tests {
     }
 
     fn new_store(node_id: NodeId, storage: Box<dyn RaftStorage>) -> MultiRaft {
-        MultiRaft::new(node_id, storage)
+        MultiRaft::new(node_id, 0, storage)
     }
 
     #[test]
