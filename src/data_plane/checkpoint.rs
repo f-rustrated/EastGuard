@@ -49,14 +49,12 @@ impl CheckpointWorker {
         let mut writer = job.get_writer()?;
         let mut index_entries = Vec::with_capacity(checkpoint.batches.len());
 
-        for batch in &checkpoint.batches {
-            let batch_start_position = byte_position;
+        for entry in &checkpoint.batches {
+            let entry_start_position = byte_position;
 
-            for user_data in &batch.records {
-                let record = WalRecord::data(user_data.clone());
-                record.encode_to(&mut writer)?;
-                byte_position += record.encoded_size() as u64;
-            }
+            let record = WalRecord::data((*entry.data).clone());
+            record.encode_to(&mut writer)?;
+            byte_position += record.encoded_size() as u64;
 
             let end_record = WalRecord::batch_end();
             end_record.encode_to(&mut writer)?;
@@ -64,8 +62,8 @@ impl CheckpointWorker {
 
             index_entries.push(SparseEntry::new(
                 job.segment_key,
-                batch.start_offset,
-                batch_start_position.to_be_bytes(),
+                entry.entry_id,
+                entry_start_position.to_be_bytes(),
             ));
         }
 

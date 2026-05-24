@@ -4,14 +4,15 @@ use std::sync::{
 };
 
 use arc_swap::ArcSwapOption;
-use bytes::Bytes;
 use tokio::sync::Notify;
 
+use crate::data_plane::EntryPayload;
+
 #[derive(Debug, Clone)]
-pub struct CachedBatch {
-    pub records: Vec<Bytes>,
-    pub start_offset: u64,
-    pub end_offset: u64,
+pub struct CachedEntry {
+    pub data: EntryPayload,
+    pub record_count: u32,
+    pub entry_id: u64,
     pub lsn: u64,
 }
 #[cfg(any(test, debug_assertions))]
@@ -40,7 +41,7 @@ const DEFAULT_CAPACITY: usize = 1024;
 //     is logically evicted (readers rejected by frontier check) but the
 //     memory is reclaimed when the publisher physically reaches that slot.
 pub(crate) struct SegmentRingBuffer {
-    batches: Box<[ArcSwapOption<CachedBatch>]>,
+    batches: Box<[ArcSwapOption<CachedEntry>]>,
     capacity: usize,
     write_cursor: AtomicU64,
     read_cursor: AtomicU64,
@@ -79,10 +80,10 @@ impl SegmentRingBuffer {
 
     // Write path (called by DataPlane)
 
-    pub(super) fn publish(&self, batch: Arc<CachedBatch>) {
+    pub(super) fn publish(&self, entry: Arc<CachedEntry>) {
         let tail = self.write_cursor.load(Ordering::Acquire);
         let idx = self.slot_index(tail);
-        self.batches[idx].store(Some(batch));
+        self.batches[idx].store(Some(entry));
 
         // ! SAFETY: why not self.write_cursor.fetch_add(1)?
         // ! because there is only one writer thread
@@ -108,8 +109,8 @@ impl SegmentRingBuffer {
         self.notify.notified().await;
     }
 
-    /// Consumer read: only returns committed, non-evicted batches.
-    pub(super) fn read_committed(&self, position: u64) -> Option<Arc<CachedBatch>> {
+    /// Consumer read: only returns committed, non-evicted entries.
+    pub(super) fn read_committed(&self, position: u64) -> Option<Arc<CachedEntry>> {
         let commit = self.read_cursor.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
@@ -121,8 +122,8 @@ impl SegmentRingBuffer {
         self.batches[idx].load_full()
     }
 
-    /// Internal read: returns any published batch (committed or uncommitted).
-    pub(super) fn load_published(&self, position: u64) -> Option<Arc<CachedBatch>> {
+    /// Internal read: returns any published entry (committed or uncommitted).
+    pub(super) fn load_published(&self, position: u64) -> Option<Arc<CachedEntry>> {
         let tail = self.write_cursor.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
 
@@ -168,7 +169,7 @@ impl SegmentRingBuffer {
 }
 
 pub(crate) struct CheckpointBatch {
-    pub batches: Vec<Arc<CachedBatch>>,
+    pub batches: Vec<Arc<CachedEntry>>,
     pub new_frontier: u64,
 }
 
@@ -207,14 +208,15 @@ impl TAssertInvariant for SegmentRingBuffer {
 
 #[cfg(test)]
 mod tests {
+    use crate::data_plane::EntryPayload;
     use bytes::Bytes;
 
     use super::*;
-    fn make_batch(start: u64, end: u64, lsn: u64) -> Arc<CachedBatch> {
-        Arc::new(CachedBatch {
-            records: vec![Bytes::from("test")],
-            start_offset: start,
-            end_offset: end,
+    fn make_entry(entry_id: u64, lsn: u64) -> Arc<CachedEntry> {
+        Arc::new(CachedEntry {
+            data: EntryPayload::from(Bytes::from("test")),
+            record_count: 1,
+            entry_id,
             lsn,
         })
     }
@@ -223,20 +225,19 @@ mod tests {
     fn publish_and_read() {
         let cache = SegmentRingBuffer::with_capacity(4);
 
-        let batch = make_batch(0, 10, 1);
-        cache.publish(batch.clone());
+        let entry = make_entry(0, 1);
+        cache.publish(entry.clone());
         cache.advance_read_cursor(1);
 
         let read = cache.read_committed(0).unwrap();
-        assert_eq!(read.start_offset, 0);
-        assert_eq!(read.end_offset, 10);
+        assert_eq!(read.entry_id, 0);
     }
 
     #[test]
     fn read_beyond_commit_returns_none() {
         let cache = SegmentRingBuffer::with_capacity(4);
 
-        cache.publish(make_batch(0, 10, 1));
+        cache.publish(make_entry(0, 1));
         assert!(cache.read_committed(0).is_none());
     }
 
@@ -244,7 +245,7 @@ mod tests {
     fn read_behind_eviction_returns_none() {
         let cache = SegmentRingBuffer::with_capacity(4);
 
-        cache.publish(make_batch(0, 10, 1));
+        cache.publish(make_entry(0, 1));
         cache.advance_read_cursor(1);
         cache.advance_eviction_frontier(1);
 
@@ -256,13 +257,13 @@ mod tests {
         let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..3u64 {
-            cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
+            cache.publish(make_entry(i, i + 1));
         }
         cache.advance_read_cursor(3);
 
         for i in 0..3u64 {
-            let batch = cache.read_committed(i).unwrap();
-            assert_eq!(batch.start_offset, i * 10);
+            let entry = cache.read_committed(i).unwrap();
+            assert_eq!(entry.entry_id, i);
         }
     }
 
@@ -270,8 +271,8 @@ mod tests {
     fn eviction_frontier_advances() {
         let cache = SegmentRingBuffer::with_capacity(4);
 
-        cache.publish(make_batch(0, 10, 1));
-        cache.publish(make_batch(10, 20, 2));
+        cache.publish(make_entry(0, 1));
+        cache.publish(make_entry(1, 2));
         cache.advance_read_cursor(2);
 
         cache.advance_eviction_frontier(1);
@@ -285,7 +286,7 @@ mod tests {
         let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..3u64 {
-            cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
+            cache.publish(make_entry(i, i + 1));
         }
         cache.advance_read_cursor(3);
 
@@ -299,15 +300,15 @@ mod tests {
         let cache = SegmentRingBuffer::with_capacity(4);
 
         for i in 0..6u64 {
-            cache.publish(make_batch(i * 10, (i + 1) * 10, i + 1));
+            cache.publish(make_entry(i, i + 1));
             if i >= 1 {
                 cache.advance_eviction_frontier(i - 1);
             }
         }
         cache.advance_read_cursor(6);
 
-        let batch = cache.read_committed(5).unwrap();
-        assert_eq!(batch.start_offset, 50);
+        let entry = cache.read_committed(5).unwrap();
+        assert_eq!(entry.entry_id, 5);
     }
 
     #[test]
@@ -315,7 +316,7 @@ mod tests {
         let cache = SegmentRingBuffer::with_capacity(8);
 
         for i in 0..5u64 {
-            cache.publish(make_batch(i, i + 1, i + 1));
+            cache.publish(make_entry(i, i + 1));
         }
         cache.advance_read_cursor(5);
         cache.advance_eviction_frontier(2);

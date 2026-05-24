@@ -23,7 +23,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
-const BATCH_MAX_RECORDS: usize = 20_000;
 const BATCH_MAX_BYTES: usize = 10 * 1024 * 1024; // 10MB
 
 pub struct DataPlane<W: WalStorage> {
@@ -32,11 +31,8 @@ pub struct DataPlane<W: WalStorage> {
     segments: HashMap<SegmentKey, SegmentTracker>,
     dirty_segments: Vec<SegmentKey>,
     pending_events: Vec<DataPlaneEvent>,
-    buffer_record_count: usize,
     buffer_byte_count: usize,
 
-    //  `needs_flush` means "flush immediately after this mailbox drain, don't wait for the timer." It exists because follower records
-    // (process_replica_append) and seal replays (handle_seal_response) need immediate flush — they can't wait 10ms for BatchFlushDeadline.
     needs_flush: bool,
     data_dir: PathBuf,
     replication: ReplicationState,
@@ -50,7 +46,6 @@ impl<W: WalStorage> DataPlane<W> {
             segments: HashMap::new(),
             dirty_segments: Vec::new(),
             pending_events: Vec::new(),
-            buffer_record_count: 0,
             buffer_byte_count: 0,
             needs_flush: false,
             data_dir,
@@ -90,7 +85,6 @@ impl<W: WalStorage> DataPlane<W> {
         self.dispatch_events(checkpoint_tx, batch_scheduler, repl_scheduler, transport_tx);
     }
 
-    // --- Command handlers (called from handle_command) ---
     fn handle_produce(&mut self, cmd: Produce) {
         let reject = match self.segments.get(&cmd.segment_key) {
             Some(t) if t.role() == SegmentRole::Follower => Some("not leader"),
@@ -108,16 +102,10 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         };
 
-        for user_data in cmd.records {
-            self.buffer_byte_count += user_data.len();
-            self.buffer_record_count += 1;
-            tracker.buffer_record(cmd.segment_key, user_data);
-        }
+        self.buffer_byte_count += cmd.data.len();
+        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count);
         self.dirty_segments.push(cmd.segment_key);
 
-        // Ticker rejects duplicate seqs, so this is a no-op if a flush timer
-        // is already registered for the current LSN. After a flush, next_lsn
-        // advances and the next produce registers a new timer.
         self.raise_event(TimerCommand::SetSchedule {
             seq: self.wal.next_lsn(),
             timer: BatchFlushTimer::deadline(),
@@ -145,15 +133,15 @@ impl<W: WalStorage> DataPlane<W> {
                     return;
                 }
 
-                let committed_end_offset = self
+                let committed_entry_id = self
                     .segments
                     .get(&segment_key)
-                    .map(|t| t.committed_end_offset())
+                    .map(|t| t.committed_entry_id())
                     .unwrap_or(0);
 
                 self.raise_event(event::ReplicationTimedOut {
                     segment_key,
-                    committed_end_offset,
+                    committed_entry_id,
                 });
             }
         }
@@ -167,7 +155,7 @@ impl<W: WalStorage> DataPlane<W> {
             C::ReplicaAck(cmd) => {
                 self.raise_event(event::ReplicaAckReceived {
                     segment_key: cmd.segment_key,
-                    end_offset: cmd.end_offset,
+                    entry_id: cmd.entry_id,
                     from: cmd.from,
                 });
             }
@@ -180,17 +168,16 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    // --- Inter-node handlers (called from process_inter_node) ---
     fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
         if self.segments.contains_key(&cmd.segment_key) {
             return;
         }
 
-        let tracker = SegmentTracker::new_with_offset(
+        let tracker = SegmentTracker::new_with_start_entry_id(
             cmd.segment_key.file_path(&self.data_dir),
             SegmentRole::Leader,
             cmd.replica_set,
-            cmd.start_offset,
+            cmd.start_entry_id,
         );
 
         self.segments.insert(cmd.segment_key, tracker);
@@ -213,11 +200,11 @@ impl<W: WalStorage> DataPlane<W> {
 
             self.segments.insert(
                 cmd.segment_key,
-                SegmentTracker::new_with_offset(
+                SegmentTracker::new_with_start_entry_id(
                     cmd.segment_key.file_path(&self.data_dir),
                     SegmentRole::Follower,
                     cmd.replica_set,
-                    cmd.start_offset,
+                    cmd.entry_id,
                 ),
             );
         }
@@ -226,19 +213,17 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         };
 
-        tracker.buffer_record_in_bulk(cmd.segment_key, cmd.records, cmd.start_offset);
+        tracker.stage_entry_from_replica(cmd.segment_key, cmd.data, cmd.record_count, cmd.entry_id);
         self.dirty_segments.push(cmd.segment_key);
 
         self.needs_flush = true;
     }
 
-    /// Leader -> follower: advance read_cursor after all replicas ACKed.
     fn handle_commit_advance(&mut self, cmd: CommitAdvance) {
         let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
             return;
         };
 
-        // Defensive. In practice, it should never fire.
         if tracker.role() != SegmentRole::Follower {
             tracing::warn!(
                 "CommitAdvance received by non-follower: {:?}",
@@ -246,10 +231,9 @@ impl<W: WalStorage> DataPlane<W> {
             );
             return;
         }
-        tracker.commit_batch(cmd.committed_end_offset);
+        tracker.commit_entry(cmd.committed_entry_id);
     }
 
-    /// Coordinator -> leader: seal approved. Create new segment, replay uncommitted tail.
     fn handle_seal_response(&mut self, cmd: SealResponse) {
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
@@ -257,11 +241,11 @@ impl<W: WalStorage> DataPlane<W> {
 
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
 
-        let mut new_tracker = SegmentTracker::new_with_offset(
+        let mut new_tracker = SegmentTracker::new_with_start_entry_id(
             new_segment_key.file_path(&self.data_dir),
             SegmentRole::Leader,
             cmd.new_replica_set,
-            old_tracker.committed_end_offset() + 1,
+            old_tracker.committed_entry_id() + 1,
         );
 
         // Replay uncommitted records into the new tracker's staged_records.
@@ -272,8 +256,8 @@ impl<W: WalStorage> DataPlane<W> {
         // D5 crash recovery: duplicate WAL data is safe. Old entries route to the sealed
         // segment (bounded by metadata end_offset), new entries route to the new segment.
         // Metadata-first recovery (Raft log before WAL) provides the seal boundary.
-        for payload in old_tracker.uncommitted_records() {
-            new_tracker.buffer_record(new_segment_key, payload);
+        for (data, record_count) in old_tracker.uncommitted_entries() {
+            new_tracker.stage_entry(new_segment_key, data, record_count);
         }
 
         self.replication
@@ -293,20 +277,18 @@ impl<W: WalStorage> DataPlane<W> {
         self.needs_flush = true;
     }
 
-    /// Leader -> follower: segment is sealed. Submit final checkpoint and drop tracker.
     fn handle_segment_sealed(&mut self, segment_key: SegmentKey) {
         if let Some(tracker) = self.segments.remove(&segment_key) {
             self.raise_event(tracker.checkpoint(segment_key));
         }
     }
 
-    // --- Replication ---
-    fn commit_segment(&mut self, segment_key: SegmentKey, end_offset: u64) {
+    fn commit_segment(&mut self, segment_key: SegmentKey, entry_id: u64) {
         let Some(tracker) = self.segments.get_mut(&segment_key) else {
             return;
         };
 
-        tracker.commit_batch(end_offset);
+        tracker.commit_entry(entry_id);
 
         let followers = tracker.followers().to_vec();
         if !followers.is_empty() {
@@ -314,16 +296,14 @@ impl<W: WalStorage> DataPlane<W> {
                 followers,
                 CommitAdvance {
                     segment_key,
-                    committed_end_offset: end_offset,
+                    committed_entry_id: entry_id,
                 },
             ));
         }
     }
 
     fn should_flush(&self) -> bool {
-        self.needs_flush
-            || self.buffer_record_count >= BATCH_MAX_RECORDS
-            || self.buffer_byte_count >= BATCH_MAX_BYTES
+        self.needs_flush || self.buffer_byte_count >= BATCH_MAX_BYTES
     }
 
     fn flush_batch(&mut self) {
@@ -349,9 +329,6 @@ impl<W: WalStorage> DataPlane<W> {
         let lsn = match self.wal.flush_batch() {
             Ok(lsn) => lsn,
             Err(e) => {
-                // staged_records are NOT cleared — they remain in each tracker
-                // and will be re-encoded on the next flush attempt. Duplicate WAL
-                // entries are safe: D5 replay deduplicates by logical_offset per segment.
                 tracing::error!("WAL flush failed: {e}");
                 self.replication.fail_all(e.to_string());
                 self.needs_flush = false;
@@ -359,7 +336,6 @@ impl<W: WalStorage> DataPlane<W> {
             }
         };
 
-        // -- Post flush
         let mut segment_batches: Vec<event::PendingReplicationBatch> = Vec::new();
 
         for key in dirty {
@@ -370,33 +346,35 @@ impl<W: WalStorage> DataPlane<W> {
                 continue;
             }
 
-            let batch = tracker.publish_staged(lsn);
-            let end_offset = batch.end_offset;
+            let entries = tracker.publish_staged(lsn);
 
-            match tracker.role() {
-                SegmentRole::Leader if tracker.followers().is_empty() => {
-                    tracker.commit_batch(end_offset);
-                }
-                SegmentRole::Leader => {
-                    segment_batches.push(event::PendingReplicationBatch {
-                        segment_key: key,
-                        batch,
-                        replica_set: tracker.replica_set(),
-                        followers: tracker.followers().to_vec(),
-                    });
-                }
-                SegmentRole::Follower => {
-                    self.pending_events.push(
-                        event::InterNodeCommandQueued::new(
-                            vec![tracker.leader_node()],
-                            ReplicaAck {
-                                segment_key: key,
-                                end_offset,
-                                from: self.node_id.clone(),
-                            },
-                        )
-                        .into(),
-                    );
+            for entry in entries {
+                let entry_id = entry.entry_id;
+                match tracker.role() {
+                    SegmentRole::Leader if tracker.followers().is_empty() => {
+                        tracker.commit_entry(entry_id);
+                    }
+                    SegmentRole::Leader => {
+                        segment_batches.push(event::PendingReplicationBatch {
+                            segment_key: key,
+                            entry,
+                            replica_set: tracker.replica_set(),
+                            followers: tracker.followers().to_vec(),
+                        });
+                    }
+                    SegmentRole::Follower => {
+                        self.pending_events.push(
+                            event::InterNodeCommandQueued::new(
+                                vec![tracker.leader_node()],
+                                ReplicaAck {
+                                    segment_key: key,
+                                    entry_id,
+                                    from: self.node_id.clone(),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
                 }
             }
 
@@ -418,12 +396,9 @@ impl<W: WalStorage> DataPlane<W> {
             let _ = reply.send(ProduceAck::Ok);
         }
 
-        self.buffer_record_count = 0;
         self.buffer_byte_count = 0;
         self.needs_flush = false;
     }
-
-    // --- Checkpoint ---
 
     fn compute_checkpoint_watermark(&self) -> u64 {
         self.segments
@@ -433,9 +408,7 @@ impl<W: WalStorage> DataPlane<W> {
             .unwrap_or(0)
     }
 
-    // Sort segments by most uncheckpointed batches, pick the top one, submit a checkpoint for it.
-    // uncheckpointed() is used to sort candidates and segment with the most uncheckpointed batches gets checkpointed first to relieve cache pressure
-    // TODO not wired up yet
+    #[allow(dead_code)]
     fn submit_checkpoint_for_pressure(&mut self) {
         let mut candidates: Vec<(SegmentKey, u64)> = self
             .segments
@@ -451,8 +424,6 @@ impl<W: WalStorage> DataPlane<W> {
             self.raise_event(tracker.checkpoint(*key));
         }
     }
-
-    // --- Event dispatch (called from flush_and_dispatch) ---
 
     fn dispatch_events(
         &mut self,
@@ -496,7 +467,7 @@ impl<W: WalStorage> DataPlane<W> {
                             continue;
                         };
 
-                        self.commit_segment(evt.segment_key, committed.batch_end_offset);
+                        self.commit_segment(evt.segment_key, committed.entry_id);
 
                         for reply in committed.replies {
                             let _ = reply.send(ProduceAck::Ok);
@@ -524,7 +495,7 @@ impl<W: WalStorage> DataPlane<W> {
                             SealRequest {
                                 segment_key: evt.segment_key,
                                 failed_nodes: nodes,
-                                end_offset: evt.committed_end_offset,
+                                end_entry_id: evt.committed_entry_id,
                             },
                         ));
                     }
@@ -536,8 +507,6 @@ impl<W: WalStorage> DataPlane<W> {
         self.assert_invariants();
     }
 
-    // --- Internal utilities ---
-
     fn raise_event(&mut self, event: impl Into<DataPlaneEvent>) {
         self.pending_events.push(event.into());
     }
@@ -548,7 +517,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     #[cfg(test)]
     fn has_buffered_data(&self) -> bool {
-        self.buffer_record_count > 0
+        self.buffer_byte_count > 0
     }
 }
 
@@ -561,28 +530,16 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
             tracker.assert_invariants();
         }
 
-        let actual_record_count: usize = self
-            .segments
-            .values()
-            .filter(|t| t.role() == SegmentRole::Leader)
-            .map(|t| t.staged_records().len())
-            .sum();
-        assert_eq!(
-            self.buffer_record_count, actual_record_count,
-            "buffer_record_count ({}) != actual leader accumulated records ({actual_record_count})",
-            self.buffer_record_count
-        );
-
         let actual_byte_count: usize = self
             .segments
             .values()
             .filter(|t| t.role() == SegmentRole::Leader)
-            .flat_map(|t| t.staged_records().iter())
-            .map(|r| r.user_data.len())
+            .flat_map(|t| t.staged_entries())
+            .map(|e| e.byte_len())
             .sum();
         assert_eq!(
             self.buffer_byte_count, actual_byte_count,
-            "buffer_byte_count ({}) != actual leader buffered bytes ({actual_byte_count})",
+            "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count})",
             self.buffer_byte_count
         );
     }
@@ -621,10 +578,21 @@ mod tests {
             SegmentAssignment {
                 segment_key: key,
                 replica_set,
-                start_offset: 0,
+                start_entry_id: 0,
             }
             .into(),
         )
+    }
+
+    fn produce(key: SegmentKey) -> (DataPlaneCommand, oneshot::Receiver<ProduceAck>) {
+        let (tx, rx) = oneshot::channel();
+        let cmd = Produce {
+            segment_key: key,
+            data: Bytes::from("data").into(),
+            record_count: 1,
+            reply: tx,
+        };
+        (cmd.into(), rx)
     }
 
     #[test]
@@ -646,13 +614,9 @@ mod tests {
     fn produce_to_unknown_segment_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        let (tx, mut rx) = oneshot::channel();
+        let (cmd, mut rx) = produce(test_key());
 
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("hello")],
-            reply: tx,
-        });
+        dp.handle_command(cmd);
 
         assert!(!dp.has_buffered_data());
         let ack = rx.try_recv().unwrap();
@@ -666,12 +630,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, rx) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
@@ -689,32 +649,24 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        dp.handle_produce(Produce {
+        let (tx, _) = oneshot::channel();
+        dp.handle_command(Produce {
             segment_key: test_key(),
-            records: vec![Bytes::from("hello"), Bytes::from("world!")],
-            reply: oneshot::channel().0,
+            data: Bytes::from("hello world!").into(),
+            record_count: 2,
+            reply: tx,
         });
 
         let tracker = dp.segments.get(&test_key()).unwrap();
-        assert_eq!(
-            tracker.size_bytes(),
-            5 + 6,
-            "size_bytes should track actual data bytes"
-        );
-        assert_eq!(
-            tracker.next_offset(),
-            2,
-            "next_offset should track logical record count"
-        );
+        assert_eq!(tracker.size_bytes(), 12);
+        assert_eq!(tracker.next_entry_id(), 0);
     }
 
     #[test]
     fn segment_assignment_creates_tracker() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-
         dp.handle_command(assign_segment(test_key(), vec![]));
-
         assert!(dp.segments.contains_key(&test_key()));
     }
 
@@ -725,12 +677,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, _) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         assert!(dp.has_buffered_data());
@@ -753,12 +701,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, _) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _) = produce(test_key());
+        dp.handle_command(cmd);
 
         let events = dp.take_events();
         let has_set_schedule = events.iter().any(|e| {
@@ -767,10 +711,7 @@ mod tests {
                 DataPlaneEvent::BatchFlushTimerScheduled(TimerCommand::SetSchedule { .. })
             )
         });
-        assert!(
-            has_set_schedule,
-            "first produce should schedule flush timer"
-        );
+        assert!(has_set_schedule);
     }
 
     #[test]
@@ -780,26 +721,17 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, _) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
-        // Flush via size trigger (not the timer)
         dp.flush_batch();
         dp.take_events();
 
-        // Stale timer fires — should be a no-op (no WAL write)
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
-        assert!(
-            !dp.has_buffered_data(),
-            "stale flush timer should not buffer anything"
-        );
+        assert!(!dp.has_buffered_data());
     }
 
     #[test]
@@ -809,22 +741,15 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, _) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
 
-        assert!(
-            !dp.has_buffered_data(),
-            "BatchFlushDeadline should flush immediately"
-        );
+        assert!(!dp.has_buffered_data());
     }
 
     #[test]
@@ -833,24 +758,16 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let big_records: Vec<Bytes> = (0..BATCH_MAX_RECORDS)
-            .map(|i| Bytes::from(format!("r{i}")))
-            .collect();
-
-        dp.handle_produce(Produce {
+        dp.handle_command(Produce {
             segment_key: test_key(),
-            records: big_records,
+            data: Bytes::from(vec![0u8; BATCH_MAX_BYTES]).into(),
+            record_count: 1,
             reply: oneshot::channel().0,
         });
 
-        assert!(
-            dp.buffer_record_count >= BATCH_MAX_RECORDS,
-            "buffer_record_count ({}) should exceed threshold ({})",
-            dp.buffer_record_count,
-            BATCH_MAX_RECORDS
-        );
+        assert!(dp.buffer_byte_count >= BATCH_MAX_BYTES);
         dp.flush_batch();
-        assert!(!dp.has_buffered_data(), "flush should drain all records");
+        assert!(!dp.has_buffered_data());
     }
 
     #[test]
@@ -859,27 +776,20 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let big_records: Vec<Bytes> = (0..BATCH_MAX_RECORDS)
-            .map(|i| Bytes::from(format!("r{i}")))
-            .collect();
-
-        dp.handle_produce(Produce {
+        dp.handle_command(Produce {
             segment_key: test_key(),
-            records: big_records,
+            data: Bytes::from(vec![0u8; BATCH_MAX_BYTES]).into(),
+            record_count: 1,
             reply: oneshot::channel().0,
         });
-        assert!(dp.buffer_record_count >= BATCH_MAX_RECORDS);
+        assert!(dp.buffer_byte_count >= BATCH_MAX_BYTES);
         dp.flush_batch();
         dp.take_events();
 
-        // Stale timer fires — no-op because buffer is empty
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
-        assert!(
-            !dp.has_buffered_data(),
-            "stale flush timer after volume flush should be no-op"
-        );
+        assert!(!dp.has_buffered_data());
     }
 
     #[test]
@@ -900,11 +810,7 @@ mod tests {
             segment_key: key1,
             checkpointed_lsn: 10,
         }));
-        assert_eq!(
-            wal_file_count(),
-            initial_count,
-            "no WAL deletion yet (key2 not checkpointed)"
-        );
+        assert_eq!(wal_file_count(), initial_count);
 
         dp.handle_command(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
             segment_key: key2,
@@ -916,15 +822,48 @@ mod tests {
     fn duplicate_segment_assignment_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        let key = test_key();
 
-        dp.handle_command(assign_segment(key, vec![]));
-        dp.handle_command(assign_segment(key, vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![]));
 
         assert_eq!(dp.segments.len(), 1);
     }
 
-    // ---- D2 replication tests ----
+    #[test]
+    fn multiple_produces_accumulate_in_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        let (cmd1, _rx1) = produce(test_key());
+        let (cmd2, _rx2) = produce(test_key());
+        let (cmd3, _rx3) = produce(test_key());
+        dp.handle_command(cmd1);
+        dp.take_events();
+        dp.handle_command(cmd2);
+        dp.take_events();
+        dp.handle_command(cmd3);
+        dp.take_events();
+
+        assert!(dp.has_buffered_data());
+        assert!(!dp.should_flush());
+
+        {
+            let t = dp.segments.get(&test_key()).unwrap();
+            assert_eq!(t.staged_entries().len(), 3);
+            assert_eq!(t.cache_write_cursor(), 0);
+            assert_eq!(t.next_entry_id(), 0);
+        }
+
+        dp.flush_batch();
+
+        let t = dp.segments.get(&test_key()).unwrap();
+        assert!(t.staged_entries().is_empty());
+        assert_eq!(t.cache_write_cursor(), 3);
+        assert_eq!(t.next_entry_id(), 3);
+        assert_eq!(t.cache_read_cursor(), 3);
+    }
 
     #[test]
     fn produce_with_followers_creates_replication_gap() {
@@ -934,12 +873,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
-        let (tx, _rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         process_and_flush(
@@ -949,16 +884,8 @@ mod tests {
 
         let tracker = dp.segments.get(&test_key()).unwrap();
         let cache = tracker.cache();
-        assert_eq!(
-            cache.load_write_cursor(),
-            1,
-            "tail should advance after publish"
-        );
-        assert_eq!(
-            cache.load_read_cursor(),
-            0,
-            "commit should NOT advance — waiting for replication"
-        );
+        assert_eq!(cache.load_write_cursor(), 1);
+        assert_eq!(cache.load_read_cursor(), 0);
     }
 
     #[test]
@@ -968,12 +895,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![]));
 
-        let (tx, _rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         process_and_flush(
@@ -983,15 +906,11 @@ mod tests {
 
         let cache = dp.segments.get(&test_key()).unwrap().cache();
         assert_eq!(cache.load_write_cursor(), 1);
-        assert_eq!(
-            cache.load_read_cursor(),
-            1,
-            "no followers = immediate commit"
-        );
+        assert_eq!(cache.load_read_cursor(), 1);
     }
 
     #[test]
-    fn flush_emits_replication_ready_for_replicated_segments() {
+    fn flush_emits_batch_published_for_replicated_segments() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
@@ -1001,12 +920,8 @@ mod tests {
             vec![test_node_id(), follower.clone()],
         ));
 
-        let (tx, _rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
 
         process_and_flush(
@@ -1015,12 +930,10 @@ mod tests {
         );
 
         let events = dp.take_events();
-        let has_replication_ready = events
-            .iter()
-            .any(|e| matches!(e, DataPlaneEvent::BatchPublished(..)));
         assert!(
-            has_replication_ready,
-            "should emit ReplicationReady for replicated segment"
+            events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::BatchPublished(..)))
         );
     }
 
@@ -1032,12 +945,8 @@ mod tests {
 
         dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
-        let (tx, _rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
         dp.take_events();
         process_and_flush(
             &mut dp,
@@ -1048,17 +957,14 @@ mod tests {
         dp.commit_segment(test_key(), 0);
 
         let cache = dp.segments.get(&test_key()).unwrap().cache();
-        assert_eq!(
-            cache.load_read_cursor(),
-            1,
-            "commit should advance after all replicas ACK"
-        );
+        assert_eq!(cache.load_read_cursor(), 1);
 
         let events = dp.take_events();
-        let has_commit_advance = events
-            .iter()
-            .any(|e| matches!(e, DataPlaneEvent::InterNodeCommandQueued(..)));
-        assert!(has_commit_advance, "should emit SendInterNode after commit");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DataPlaneEvent::InterNodeCommandQueued(..)))
+        );
     }
 
     #[test]
@@ -1071,8 +977,9 @@ mod tests {
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader, test_node_id()],
-                records: vec![b"setup".to_vec()],
-                start_offset: 0,
+                data: b"setup".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
             }
             .into(),
         ));
@@ -1080,18 +987,11 @@ mod tests {
         dp.flush_batch();
         dp.take_events();
 
-        let (tx, rx) = oneshot::channel();
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: tx,
-        });
+        let (cmd, rx) = produce(test_key());
+        dp.handle_command(cmd);
 
         let ack = rx.blocking_recv().unwrap();
-        assert!(
-            matches!(ack, ProduceAck::Err(_)),
-            "follower should reject produce"
-        );
+        assert!(matches!(ack, ProduceAck::Err(_)));
     }
 
     #[test]
@@ -1104,18 +1004,18 @@ mod tests {
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader.clone(), test_node_id()],
-                records: vec![b"data".to_vec()],
-                start_offset: 0,
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
             }
             .into(),
         ));
 
-        assert!(
-            dp.segments.contains_key(&test_key()),
-            "self-authorization should create tracker"
+        assert!(dp.segments.contains_key(&test_key()));
+        assert_eq!(
+            dp.segments.get(&test_key()).unwrap().role(),
+            SegmentRole::Follower
         );
-        let tracker = dp.segments.get(&test_key()).unwrap();
-        assert_eq!(tracker.role(), SegmentRole::Follower);
     }
 
     #[test]
@@ -1127,16 +1027,14 @@ mod tests {
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![NodeId::new("other-leader"), NodeId::new("other-follower")],
-                records: vec![b"data".to_vec()],
-                start_offset: 0,
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
             }
             .into(),
         ));
 
-        assert!(
-            !dp.segments.contains_key(&test_key()),
-            "should reject — not in replica_set"
-        );
+        assert!(!dp.segments.contains_key(&test_key()));
     }
 
     #[test]
@@ -1149,8 +1047,9 @@ mod tests {
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader.clone(), test_node_id()],
-                records: vec![b"data".to_vec()],
-                start_offset: 0,
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
             }
             .into(),
         ));
@@ -1161,13 +1060,13 @@ mod tests {
         dp.handle_command(DataPlaneCommand::InterNode(
             CommitAdvance {
                 segment_key: test_key(),
-                committed_end_offset: 0,
+                committed_entry_id: 0,
             }
             .into(),
         ));
 
         let tracker = dp.segments.get(&test_key()).unwrap();
-        assert_eq!(tracker.committed_end_offset(), 0);
+        assert_eq!(tracker.committed_entry_id(), 0);
         assert_eq!(tracker.cache().load_read_cursor(), 1);
     }
 
@@ -1206,13 +1105,14 @@ mod tests {
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader, test_node_id()],
-                records: vec![b"data".to_vec()],
-                start_offset: 0,
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
             }
             .into(),
         ));
 
-        assert!(dp.needs_flush, "replica_append should set needs_flush");
+        assert!(dp.needs_flush);
     }
 
     #[test]
@@ -1225,19 +1125,14 @@ mod tests {
         process_and_flush(&mut dp, assign_segment(test_key(), rs.clone()));
         dp.take_events();
 
-        // Produce + flush + commit so read_cursor == write_cursor
-        dp.handle_command(Produce {
-            segment_key: test_key(),
-            records: vec![Bytes::from("data")],
-            reply: oneshot::channel().0,
-        });
+        let (cmd, _) = produce(test_key());
+        dp.handle_command(cmd);
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
         dp.take_events();
-        dp.segments.get_mut(&test_key()).unwrap().commit_batch(0);
+        dp.segments.get_mut(&test_key()).unwrap().commit_entry(0);
 
-        // SealResponse with no uncommitted records to replay
         dp.handle_command(DataPlaneCommand::InterNode(
             SealResponse {
                 old_segment_key: test_key(),
@@ -1247,17 +1142,13 @@ mod tests {
             .into(),
         ));
 
-        assert!(dp.needs_flush, "seal_response always sets needs_flush");
+        assert!(dp.needs_flush);
 
         let new_key = test_key().with_segment_id(SegmentId(1));
         let new_tracker = dp.segments.get(&new_key).unwrap();
-        assert!(
-            new_tracker.staged_records().is_empty(),
-            "no uncommitted records to replay"
-        );
+        assert!(new_tracker.staged_entries().is_empty());
 
-        // flush_batch should be a no-op (no staged records)
         dp.flush_batch();
-        assert!(!dp.needs_flush, "needs_flush cleared after flush");
+        assert!(!dp.needs_flush);
     }
 }

@@ -4,25 +4,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::clusters::metadata::{RangeId, SegmentId};
 use crate::clusters::swims::ShardGroupId;
-use crate::data_plane::SegmentKey;
+use crate::data_plane::{EntryPayload, SegmentKey};
 
-const ROUTING_HEADER_SIZE: usize = 32;
+const ROUTING_HEADER_SIZE: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RoutingHeader {
+pub(crate) struct RoutingHeader {
     shard_group_id: ShardGroupId,
     range_id: RangeId,
     segment_id: SegmentId,
-    pub(crate) logical_offset: u64,
+    pub(crate) entry_id: u64,
+    pub(crate) record_count: u32,
 }
 
 impl RoutingHeader {
-    fn new(key: SegmentKey, offset: u64) -> Self {
+    pub(crate) fn new(key: SegmentKey, entry_id: u64, record_count: u32) -> Self {
         Self {
             shard_group_id: key.shard_group_id,
             range_id: key.range_id,
             segment_id: key.segment_id,
-            logical_offset: offset,
+            entry_id,
+            record_count,
         }
     }
 
@@ -30,17 +32,18 @@ impl RoutingHeader {
         buf.put_u64(self.shard_group_id.0);
         buf.put_u64(*self.range_id);
         buf.put_u64(self.segment_id.0);
-        buf.put_u64(self.logical_offset);
+        buf.put_u64(self.entry_id);
+        buf.put_u32(self.record_count);
     }
 
-    fn build_wal_payload(&self, user_data: &[u8]) -> Bytes {
-        let mut buf = BytesMut::with_capacity(ROUTING_HEADER_SIZE + user_data.len());
+    pub(crate) fn build_wal_payload(&self, entry_data: &[u8]) -> Bytes {
+        let mut buf = BytesMut::with_capacity(ROUTING_HEADER_SIZE + entry_data.len());
         self.encode(&mut buf);
-        buf.put_slice(user_data);
+        buf.put_slice(entry_data);
         buf.freeze()
     }
 
-    fn decode(data: &[u8]) -> io::Result<Self> {
+    pub(crate) fn decode(data: &[u8]) -> io::Result<Self> {
         if data.len() < ROUTING_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -51,30 +54,29 @@ impl RoutingHeader {
             shard_group_id: ShardGroupId(u64::from_be_bytes(data[0..8].try_into().unwrap())),
             range_id: RangeId(u64::from_be_bytes(data[8..16].try_into().unwrap())),
             segment_id: SegmentId(u64::from_be_bytes(data[16..24].try_into().unwrap())),
-            logical_offset: u64::from_be_bytes(data[24..32].try_into().unwrap()),
+            entry_id: u64::from_be_bytes(data[24..32].try_into().unwrap()),
+            record_count: u32::from_be_bytes(data[32..36].try_into().unwrap()),
         })
     }
 }
 
-pub(crate) struct StagingRecord {
-    pub(crate) user_data: Bytes,
-    header: RoutingHeader,
+pub(crate) struct StagedEntry {
+    pub(crate) data: EntryPayload,
+    pub(crate) record_count: u32,
+    pub(crate) segment_key: SegmentKey,
 }
 
-impl StagingRecord {
-    pub(crate) fn new(payload: Bytes, segment_key: SegmentKey, offset: u64) -> Self {
+impl StagedEntry {
+    pub(crate) fn new(data: EntryPayload, record_count: u32, segment_key: SegmentKey) -> Self {
         Self {
-            user_data: payload,
-            header: RoutingHeader::new(segment_key, offset),
+            data,
+            record_count,
+            segment_key,
         }
     }
 
-    pub(crate) fn logical_offset(&self) -> u64 {
-        self.header.logical_offset
-    }
-
-    pub(crate) fn build_wal_payload(&self) -> Bytes {
-        self.header.build_wal_payload(&self.user_data)
+    pub(crate) fn byte_len(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -88,10 +90,12 @@ mod tests {
             shard_group_id: ShardGroupId(42),
             range_id: RangeId(7),
             segment_id: SegmentId(3),
-            logical_offset: 999,
+            entry_id: 999,
+            record_count: 50,
         };
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
+        assert_eq!(buf.len(), ROUTING_HEADER_SIZE);
         let decoded = RoutingHeader::decode(&buf).unwrap();
         assert_eq!(header, decoded);
     }
@@ -102,15 +106,16 @@ mod tests {
             shard_group_id: ShardGroupId(1),
             range_id: RangeId(2),
             segment_id: SegmentId(3),
-            logical_offset: 100,
+            entry_id: 100,
+            record_count: 5,
         };
-        let user_data = b"user payload";
-        let payload = header.build_wal_payload(user_data);
+        let entry_data = b"opaque entry payload";
+        let payload = header.build_wal_payload(entry_data);
 
         let decoded_header = RoutingHeader::decode(&payload).expect("valid routing header");
         let decoded_data = payload.slice(ROUTING_HEADER_SIZE..);
 
         assert_eq!(header, decoded_header);
-        assert_eq!(&decoded_data[..], user_data);
+        assert_eq!(&decoded_data[..], entry_data);
     }
 }
