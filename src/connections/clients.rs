@@ -1,4 +1,21 @@
-use std::{io::ErrorKind, net::SocketAddr};
+/// # Client ↔ Server request_id protocol
+///
+/// 1. **Client assigns** — before sending each request, the client obtains a
+///    monotonically increasing ID from a per-connection `u64` counter.
+/// 2. **Client tracks** — the ID is stored in a `HashMap<u64, oneshot::Sender<Response>>`
+///    of in-flight requests, keyed by `request_id`.
+/// 3. **Server echoes** — the server reads `request_id` from the incoming frame and
+///    writes it back unchanged in the response frame. The server is stateless with
+///    respect to `request_id`.
+/// 4. **Client matches** — on receiving a response frame, the client looks up
+///    `request_id` in the in-flight map and delivers the response to the right waiter.
+///
+/// This allows multiple requests to be in-flight on a single connection simultaneously,
+/// with responses arriving in any order.
+use std::{io::ErrorKind, mem::size_of, net::SocketAddr};
+
+const LEN_PREFIX_SIZE: usize = size_of::<u32>();
+const REQUEST_ID_SIZE: usize = size_of::<u64>();
 
 use crate::{
     clusters::{
@@ -36,10 +53,18 @@ impl ClientStreamWriter {
         }
     }
 
-    pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+    pub(crate) async fn write<T: bincode::Encode>(
+        &mut self,
+        request_id: u64,
+        data: &T,
+    ) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
-        let len = (encoded.len() as u32).to_be_bytes();
-        self.stream.write_all(&len).await.expect("write len failed");
+        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
+        self.stream.write_all(&len.to_be_bytes()).await.expect("write len failed");
+        self.stream
+            .write_all(&request_id.to_be_bytes())
+            .await
+            .expect("write request_id failed");
         self.stream
             .write_all(&encoded)
             .await
@@ -47,45 +72,56 @@ impl ClientStreamWriter {
         Ok(())
     }
 
-    pub(crate) async fn dispatch(&mut self, request: ConnectionRequests) -> anyhow::Result<()> {
+    pub(crate) async fn dispatch(
+        &mut self,
+        request_id: u64,
+        request: ConnectionRequests,
+    ) -> anyhow::Result<()> {
         match request {
             ConnectionRequests::Connection(_) => Ok(()),
-            ConnectionRequests::Query(q) => self.handle_query(q).await,
-            ConnectionRequests::Propose(req) => self.handle_propose(req).await,
+            ConnectionRequests::Query(q) => self.handle_query(request_id, q).await,
+            ConnectionRequests::Propose(req) => self.handle_propose(request_id, req).await,
         }
     }
 
-    async fn handle_query(&mut self, query_type: QueryCommand) -> anyhow::Result<()> {
+    async fn handle_query(
+        &mut self,
+        request_id: u64,
+        query_type: QueryCommand,
+    ) -> anyhow::Result<()> {
         match query_type {
-            QueryCommand::GetMembers => self.handle_get_members().await,
-            QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(key).await,
+            QueryCommand::GetMembers => self.handle_get_members(request_id).await,
+            QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(request_id, key).await,
             QueryCommand::GetShardLeader { shard_group_id } => {
-                self.handle_get_shard_leader(shard_group_id).await
+                self.handle_get_shard_leader(request_id, shard_group_id).await
             }
-            QueryCommand::GetTopics => self.handle_get_topics().await,
+            QueryCommand::GetTopics => self.handle_get_topics(request_id).await,
         }
     }
 
-
-    async fn handle_get_members(&mut self) -> anyhow::Result<()> {
+    async fn handle_get_members(&mut self, request_id: u64) -> anyhow::Result<()> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.swim_sender
             .send(SwimQueryCommand::GetMembers { reply: send })
             .await?;
         let result = recv.await?;
-        self.write(&result).await
+        self.write(request_id, &result).await
     }
 
-    async fn handle_get_shard_leader(&mut self, shard_group_id: u64) -> anyhow::Result<()> {
+    async fn handle_get_shard_leader(
+        &mut self,
+        request_id: u64,
+        shard_group_id: u64,
+    ) -> anyhow::Result<()> {
         let leader = self
             .raft_sender
             .get_leader(ShardGroupId(shard_group_id))
             .await
             .map(|n| n.to_string());
-        self.write(&leader).await
+        self.write(request_id, &leader).await
     }
 
-    async fn handle_get_topics(&mut self) -> anyhow::Result<()> {
+    async fn handle_get_topics(&mut self, request_id: u64) -> anyhow::Result<()> {
         let topics: Vec<TopicSummary> = self
             .raft_sender
             .get_topics()
@@ -93,10 +129,10 @@ impl ClientStreamWriter {
             .into_iter()
             .map(|name| TopicSummary { name })
             .collect();
-        self.write(&topics).await
+        self.write(request_id, &topics).await
     }
 
-    async fn handle_get_shard_info(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
+    async fn handle_get_shard_info(&mut self, request_id: u64, key: Vec<u8>) -> anyhow::Result<()> {
         let response = self
             .swim_sender
             .get_shard_info(key)
@@ -107,12 +143,12 @@ impl ClientStreamWriter {
                 leader_addr: leader.map(|e| e.leader_addr),
                 member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
-        self.write(&response).await
+        self.write(request_id, &response).await
     }
 
-    async fn handle_propose(&mut self, req: ProposeRequest) -> anyhow::Result<()> {
+    async fn handle_propose(&mut self, request_id: u64, req: ProposeRequest) -> anyhow::Result<()> {
         let response = self.execute_propose(req).await?;
-        self.write(&response).await?;
+        self.write(request_id, &response).await?;
         Ok(())
     }
 
@@ -219,8 +255,10 @@ impl ClientStreamWriter {
             forwarded: true,
             ..req.clone()
         });
-        writer.write(&forwarded_req).await?;
-        reader.read_request().await
+        // request_id = 0: forwarded hop is internal; the response request_id is discarded.
+        writer.write(0, &forwarded_req).await?;
+        let (_, response) = reader.read_request().await?;
+        Ok(response)
     }
 }
 
@@ -232,10 +270,19 @@ impl ClientRawWriter {
     pub fn new(write_half: OwnedWriteHalf) -> Self {
         Self { stream: write_half }
     }
-    pub async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+
+    pub async fn write<T: bincode::Encode>(
+        &mut self,
+        request_id: u64,
+        data: &T,
+    ) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
-        let len = (encoded.len() as u32).to_be_bytes();
-        self.stream.write_all(&len).await.expect("write len failed");
+        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
+        self.stream.write_all(&len.to_be_bytes()).await.expect("write len failed");
+        self.stream
+            .write_all(&request_id.to_be_bytes())
+            .await
+            .expect("write request_id failed");
         self.stream
             .write_all(&encoded)
             .await
@@ -258,7 +305,7 @@ impl ClientStreamReader {
             buffer: BytesMut::with_capacity(1024),
         }
     }
-    pub async fn read_bytes(&mut self) -> Result<BytesMut, std::io::Error> {
+    pub async fn read_bytes(&mut self) -> Result<(u64, BytesMut), std::io::Error> {
         loop {
             if let Some(msg) = self.parse_frame()? {
                 return Ok(msg);
@@ -280,22 +327,23 @@ impl ClientStreamReader {
         Ok(())
     }
 
-    /// Tries to split off a full message from the internal buffer.
-    /// Returns Ok(None) if we need more data.
-    pub fn parse_frame(&mut self) -> Result<Option<BytesMut>, std::io::Error> {
+    /// Tries to split off a full frame from the internal buffer.
+    /// Frame layout: `[len: u32][request_id: u64][payload: len-REQUEST_ID_SIZE bytes]`
+    /// Returns `Ok(None)` if more data is needed.
+    pub fn parse_frame(&mut self) -> Result<Option<(u64, BytesMut)>, std::io::Error> {
         const MAX_MSG_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
-        // 1. Do we have enough for the length prefix (4bytes)?
-        if self.buffer.len() < 4 {
+        // 1. Do we have enough for the length prefix?
+        if self.buffer.len() < LEN_PREFIX_SIZE {
             return Ok(None);
         }
 
-        // 2. Peek the length integer (without consuming bytes yet)
-        // Use a slice so we don't consume the bytes from self.buffer yet.
-        let mut len_bytes = &self.buffer[..4];
+        // 2. Peek the length integer (without consuming bytes yet).
+        //    len covers request_id + payload.
+        let mut len_bytes = &self.buffer[..LEN_PREFIX_SIZE];
         let len = len_bytes.get_u32() as usize;
 
-        // 3. Security check: prevent massive allocations from malicious clients
+        // 3. Security check: prevent massive allocations from malicious clients.
         if len > MAX_MSG_SIZE {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
@@ -303,32 +351,37 @@ impl ClientStreamReader {
             ));
         }
 
-        // 4. Do we have the full message body in the buffer?
-        let total_frame_len = 4 + len;
-        if self.buffer.len() < total_frame_len {
-            if self.buffer.capacity() < total_frame_len {
-                // Exact fit: "I know 1MB is coming, reserve exactly 1MB right now."
-                self.buffer.reserve(total_frame_len - self.buffer.len());
-            }
-            return Ok(None); // Not enough data yet, go back to reading
+        // 4. len must cover at least the request_id field.
+        if len < REQUEST_ID_SIZE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Frame too small: len={len}, minimum is {REQUEST_ID_SIZE} (request_id field)"),
+            ));
         }
 
-        // 5. Consume header and split off the body
-        self.buffer.advance(4); // Discard the length prefix
+        // 5. Do we have the full frame in the buffer?
+        let total_frame_len = LEN_PREFIX_SIZE + len;
+        if self.buffer.len() < total_frame_len {
+            if self.buffer.capacity() < total_frame_len {
+                self.buffer.reserve(total_frame_len - self.buffer.len());
+            }
+            return Ok(None);
+        }
 
-        // 'split-to' is Zero-Copy-ish, it just grabs the pointer to the existing memory
-        let msg = self.buffer.split_to(len);
+        // 6. Consume length prefix, extract request_id, then split off payload.
+        self.buffer.advance(LEN_PREFIX_SIZE);
+        let request_id = self.buffer.get_u64();
+        let payload = self.buffer.split_to(len - REQUEST_ID_SIZE);
 
-        // Whatever is left in self.buffer stays there for the next call.
-        Ok(Some(msg))
+        Ok(Some((request_id, payload)))
     }
 
-    pub async fn read_request<U>(&mut self) -> anyhow::Result<U>
+    pub async fn read_request<U>(&mut self) -> anyhow::Result<(u64, U)>
     where
         U: bincode::Decode<()>,
     {
-        let body = self.read_bytes().await?;
+        let (request_id, body) = self.read_bytes().await?;
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
-        Ok(request)
+        Ok((request_id, request))
     }
 }

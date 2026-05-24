@@ -147,11 +147,12 @@ pub(super) async fn try_propose(
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(req).await.ok()?;
+    writer.write(0, req).await.ok()?;
     tokio::time::timeout(Duration::from_secs(5), reader.read_request())
         .await
         .ok()
         .and_then(|r| r.ok())
+        .map(|(_, response)| response)
 }
 
 pub(super) fn make_create_topic_req(name: &str) -> ConnectionRequests {

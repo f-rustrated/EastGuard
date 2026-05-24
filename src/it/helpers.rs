@@ -39,8 +39,9 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(&ConnectionRequests::Query(GetMembers)).await?;
-    Ok(reader.read_request().await?)
+    writer.write(0, &ConnectionRequests::Query(GetMembers)).await?;
+    let (_, members) = reader.read_request().await?;
+    Ok(members)
 }
 
 pub async fn check_alive_count(host: &str, port: u16, expected: usize) -> turmoil::Result {
@@ -91,6 +92,7 @@ pub async fn send_propose(host: &str, port: u16, req: ConnectionRequests) -> Pro
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(&req).await.unwrap();
-    reader.read_request().await.unwrap()
+    writer.write(0, &req).await.unwrap();
+    let (_, response) = reader.read_request().await.unwrap();
+    response
 }

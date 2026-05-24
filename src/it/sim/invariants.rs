@@ -145,11 +145,12 @@ pub(super) async fn query_shard_leader(
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetShardLeader {
+        .write(0, &ConnectionRequests::Query(QueryCommand::GetShardLeader {
             shard_group_id,
         }))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response) = tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    Ok(response)
 }
 
 pub(super) async fn query_shard_info(
@@ -166,11 +167,12 @@ pub(super) async fn query_shard_info(
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetShardInfo {
+        .write(0, &ConnectionRequests::Query(QueryCommand::GetShardInfo {
             key: key.to_vec(),
         }))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response) = tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    Ok(response)
 }
 
 pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<TopicSummary>> {
@@ -183,7 +185,8 @@ pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<T
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetTopics))
+        .write(0, &ConnectionRequests::Query(QueryCommand::GetTopics))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response) = tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    Ok(response)
 }

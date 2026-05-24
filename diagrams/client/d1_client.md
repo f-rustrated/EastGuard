@@ -836,7 +836,7 @@ Clients connect to any seed node. The server handles redirect via `NotLeader { l
 
 Foundation. All subsequent PRs depend on this.
 
-- [ ] Extend frame format: `[len: u32][request_id: u64][payload: N bytes]` for both request and response
+- [x] Extend frame format: `[len: u32][request_id: u64][payload: N bytes]` for both request and response
 - [ ] Define `ClientRequest` enum: `ControlPlane(ControlPlaneRequest)`, `DataPlane(DataPlaneRequest)`, `Admin(AdminRequest)`
 - [ ] Define `ClientResponse` enum: `ControlPlane(ControlPlaneResponse)`, `DataPlane(DataPlaneResponse)`, `Admin(AdminResponse)` + shared error variants (`InternalError`, `NotLeader`, `ShardNotLocal`)
 - [ ] Split connection handler into reader task + writer task connected by `mpsc::Sender<(u64, ClientResponse)>`
