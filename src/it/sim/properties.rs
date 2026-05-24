@@ -5,8 +5,8 @@ use turmoil::Builder;
 use crate::StartUp;
 use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
 use crate::it::sim::invariants::{
-    assert_membership_converged, assert_single_leader, assert_topic_visible, query_shard_info,
-    query_shard_leader,
+    assert_membership_converged, assert_single_leader, assert_topic_visible_on_quorum,
+    query_shard_info, query_shard_leader,
 };
 use crate::it::sim::scenario::{
     client_port, cluster_port, make_create_topic_req, node_name, try_propose,
@@ -73,7 +73,7 @@ fn metadata_visible() -> turmoil::Result {
 
         let nodes: &[(&str, u16)] =
             &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
-        assert_topic_visible(nodes, "visible-test", 60, Duration::from_millis(100)).await?;
+        assert_topic_visible_on_quorum(nodes, "visible-test", 60, Duration::from_millis(100)).await?;
         Ok(())
     });
 

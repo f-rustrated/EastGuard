@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use tokio::sync::oneshot;
@@ -17,9 +17,9 @@ use crate::clusters::swims::{ShardGroup, ShardGroupId};
 pub(crate) struct MultiRaft {
     node_id: NodeId,
     storage: Box<dyn RaftStorage>,
-    groups: HashMap<ShardGroupId, Raft>,
+    groups: BTreeMap<ShardGroupId, Raft>,
     seq_counter: RaftTimerTokenGenerator,
-    dirty: HashSet<ShardGroupId>,
+    dirty: BTreeSet<ShardGroupId>,
     pending_events: Vec<RaftEvent>,
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
@@ -31,9 +31,9 @@ impl MultiRaft {
         Self {
             node_id,
             storage,
-            groups: HashMap::new(),
+            groups: BTreeMap::new(),
             seq_counter: RaftTimerTokenGenerator::default(),
-            dirty: HashSet::new(),
+            dirty: BTreeSet::new(),
             pending_events: Vec::new(),
             deferred: Vec::new(),
             pending_proposes: BTreeMap::new(),
@@ -134,7 +134,7 @@ impl MultiRaft {
             return;
         }
 
-        let peers: HashSet<NodeId> = group
+        let peers: std::collections::HashSet<NodeId> = group
             .members
             .iter()
             .filter(|id| *id != &self.node_id)
@@ -307,9 +307,9 @@ impl MultiRaft {
     fn collect_mutations(
         &mut self,
         dirty: &[ShardGroupId],
-    ) -> (Vec<(ShardGroupId, LogMutation)>, HashMap<ShardGroupId, u64>) {
+    ) -> (Vec<(ShardGroupId, LogMutation)>, BTreeMap<ShardGroupId, u64>) {
         let mut mutations = vec![];
-        let mut last_indices = HashMap::new();
+        let mut last_indices = BTreeMap::new();
         for id in dirty {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
@@ -363,7 +363,7 @@ impl MultiRaft {
     fn persist_and_advance(
         &mut self,
         mutations: Vec<(ShardGroupId, LogMutation)>,
-        last_indices: HashMap<ShardGroupId, u64>,
+        last_indices: BTreeMap<ShardGroupId, u64>,
     ) {
         if mutations.is_empty() {
             return;
@@ -400,7 +400,7 @@ mod tests {
     use crate::clusters::raft::storage::RaftPersistentState;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
@@ -444,7 +444,7 @@ mod tests {
 
         let events = store.flush();
         let seqs = timer_seqs(&events);
-        let unique: HashSet<u64> = seqs.iter().cloned().collect();
+        let unique: BTreeSet<u64> = seqs.iter().cloned().collect();
         assert_eq!(seqs.len(), unique.len());
     }
 

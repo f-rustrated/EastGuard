@@ -95,27 +95,30 @@ pub async fn assert_single_leader(
     Ok(())
 }
 
-/// After `CreateTopic` has been acked, retries `GetTopics` across all alive nodes
-/// until all report the topic or `max_attempts` is exhausted.
-pub async fn assert_topic_visible(
+/// After `CreateTopic` has been acked, retries `GetTopics` across alive nodes until
+/// a quorum (majority) report the topic or `max_attempts` is exhausted.
+///
+/// Raft guarantees the entry is durable on a quorum; the remaining nodes apply it
+/// on the next heartbeat and are not required to be visible at response time.
+pub async fn assert_topic_visible_on_quorum(
     nodes: &[(&str, u16)],
     topic_name: &str,
     max_attempts: u32,
     tick: Duration,
 ) -> turmoil::Result {
+    let quorum = nodes.len() / 2 + 1;
     for attempt in 0..max_attempts {
-        let mut all_visible = true;
+        let mut visible_count = 0;
         for &(host, port) in nodes {
             let visible = query_topics(host, port)
                 .await
                 .map(|topics| topics.iter().any(|t| t.name == topic_name))
                 .unwrap_or(false);
-            if !visible {
-                all_visible = false;
-                break;
+            if visible {
+                visible_count += 1;
             }
         }
-        if all_visible {
+        if visible_count >= quorum {
             return Ok(());
         }
         if attempt < max_attempts - 1 {
@@ -123,7 +126,7 @@ pub async fn assert_topic_visible(
         }
     }
     panic!(
-        "topic '{}' not visible on all nodes after {} attempts",
+        "topic '{}' not visible on quorum of nodes after {} attempts",
         topic_name, max_attempts
     );
 }

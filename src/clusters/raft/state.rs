@@ -549,12 +549,6 @@ impl Raft {
                 peer_state.match_index = resp.last_log_index;
                 peer_state.next_index = resp.last_log_index + 1;
                 self.try_advance_commit_index();
-                // TODO: In practice, commit means applying the command to the state machine. The flow
-                //  1. Leader receives propose(CreateTopic("blue"))
-                //  2. Leader appends to log: [term=3, index=7, cmd=CreateTopic("blue")]
-                //  3. Leader replicates to peers via AppendEntries
-                //  4. Majority acknowledge → commit_index advances to 7
-                //  5. Apply: the state machine executes CreateTopic("blue")  ← this is the real "commit"
             } else {
                 // Decrement next_index and retry.
                 peer_state.next_index = peer_state.next_index.saturating_sub(1).max(1);

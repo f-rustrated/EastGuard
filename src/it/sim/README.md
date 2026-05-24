@@ -31,7 +31,7 @@ Reusable async functions that talk to live node APIs through the virtual network
 |---|---|
 | `assert_membership_converged` | All alive nodes return the same sorted set of `Alive` member IDs. Retries up to N times. |
 | `assert_single_leader` | All nodes that know a leader for a given shard group agree on the same one (no split-brain). |
-| `assert_topic_visible` | After a `CreateTopic` ack, all alive nodes eventually return the topic via `GetTopics`. |
+| `assert_topic_visible_on_quorum` | After a `CreateTopic` ack, all alive nodes eventually return the topic via `GetTopics`. |
 
 ### `properties.rs` — Concrete Property Tests
 
@@ -65,7 +65,7 @@ run_for_scenario(&scenario)          ← scenario.rs
         └── checker client task
                 ├── try_propose(...)                ← scenario.rs
                 ├── assert_membership_converged     ← invariants.rs
-                └── assert_topic_visible            ← invariants.rs
+                └── assert_topic_visible_on_quorum            ← invariants.rs
 
 on Err ──► shrink_scenario(failing)  ← bugbase.rs
                 └── record_failure → bugbase/<hash>.json
