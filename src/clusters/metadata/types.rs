@@ -172,12 +172,38 @@ impl RangeMeta {
         self.seal_history.should_split(sealed_at)
     }
 
-    pub(crate) fn validate_active_segment(&self, expected: SegmentId) -> Result<(), MetadataError> {
+    pub(crate) fn is_active_segment(&self, expected: SegmentId) -> Result<bool, MetadataError> {
         let active_seg_id = self.validate_active()?;
-        if active_seg_id != expected {
-            return Err(MetadataError::StaleSegment);
+        Ok(active_seg_id == expected)
+    }
+
+    pub(crate) fn correct_end_offset(
+        &mut self,
+        segment_id: SegmentId,
+        end_entry_id: u64,
+    ) -> Option<SegmentId> {
+        // Coordinator doesn't know the actual last committed entry. Only the segment leader knows as it tracks committed_entry_id locally.
+        // When SWIM detects node death, the coordinator proposes RollSegment directly without ever hearing from
+        // the segment leader. It has no choice but to use 0 as a placeholder.
+        //
+        // A death-triggered RollSegment has end_entry_id = 0. If that arrives for an already-sealed segment, there's nothing to correct
+        // the placeholder is already there (or a real value was already set). Either way, it's a duplicate of work already
+        // done. StaleSegment means "this segment was already rolled, your request is outdated."
+        if end_entry_id == 0 {
+            return None;
         }
-        Ok(())
+        let active_seg_id = self.active_segment?;
+        let seg = self.segments.get_mut(&segment_id)?;
+        if seg.state != SegmentState::Sealed || seg.end_offset != Some(0) {
+            return None;
+        }
+        seg.end_offset = Some(end_entry_id);
+        self.next_offset = end_entry_id + 1;
+
+        if let Some(active_seg) = self.segments.get_mut(&active_seg_id) {
+            active_seg.start_offset = end_entry_id + 1;
+        }
+        Some(active_seg_id)
     }
 
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
@@ -202,31 +228,25 @@ impl RangeMeta {
         }))
     }
 
-    pub(crate) fn roll_segment(
-        &mut self,
-        segment_to_seal: SegmentId,
-        replica_set: Vec<NodeId>,
-        requested_at: u64,
-        end_entry_id: u64,
-    ) -> Result<SegmentId, MetadataError> {
+    pub(crate) fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentId, MetadataError> {
         let segment = self
             .segments
-            .get_mut(&segment_to_seal)
+            .get_mut(&cmd.segment_id)
             .ok_or(MetadataError::SegmentNotFound)?;
-        segment.seal(end_entry_id, requested_at)?;
+        segment.seal(cmd.end_entry_id, cmd.sealed_at)?;
 
-        let start_offset = end_entry_id + 1;
+        let start_offset = cmd.end_entry_id + 1;
         let new_segment_id = SegmentId(self.next_segment_id);
         let new_segment = SegmentMeta::new(
             new_segment_id,
-            replica_set.clone(),
+            cmd.new_replica_set,
             start_offset,
-            requested_at,
+            cmd.sealed_at,
         );
 
         self.segments.insert(new_segment_id, new_segment);
         self.active_segment = Some(new_segment_id);
-        self.seal_history.record_seal(requested_at);
+        self.seal_history.record_seal(cmd.sealed_at);
         self.next_segment_id += 1;
         self.next_offset = start_offset;
 

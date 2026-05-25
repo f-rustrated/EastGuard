@@ -94,4 +94,5 @@ pub enum ApplyResult {
         replica_set: Vec<NodeId>,
     },
     TopicDeleted,
+    Noop,
 }
