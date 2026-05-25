@@ -21,7 +21,7 @@ mod test_traits;
 use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
 use crate::clusters::raft::transport::RaftTransportActor;
 
-use crate::clusters::raft::messages::RaftTimer;
+use crate::clusters::raft::messages::{RaftTimer, RaftTransportCommand};
 use crate::clusters::swims::OutboundPacket;
 use crate::clusters::swims::SwimTimer;
 use crate::clusters::swims::actor::SwimSender;
@@ -65,7 +65,7 @@ impl StartUp {
 
         // Raft channels
         let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
-        let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
+        let (raft_transport_tx, raft_transport_rx) = mpsc::channel::<Box<[RaftTransportCommand]>>(100);
         // Each vnode can have both an election and heartbeat timer active, so capacity
         // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
         let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel::<Box<[TickerCommand<RaftTimer>]>>(self.env.vnodes_per_node as usize * 16);

@@ -27,7 +27,7 @@ impl MultiRaftActor {
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
-        transport_tx: mpsc::Sender<RaftTransportCommand>,
+        transport_tx: mpsc::Sender<Box<[RaftTransportCommand]>>,
         scheduler_tx: mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>,
         swim_tx: SwimSender,
     ) {
@@ -49,12 +49,13 @@ impl MultiRaftActor {
 
     async fn flush_events(
         store: &mut MultiRaft,
-        transport_tx: &mpsc::Sender<RaftTransportCommand>,
+        transport_tx: &mpsc::Sender<Box<[RaftTransportCommand]>>,
         scheduler_tx: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>,
         swim_tx: &SwimSender,
     ) {
         let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
         let mut timer_cmds = Vec::new();
+        let mut transport_cmds = Vec::new();
         for event in store.flush() {
             match event {
                 RaftEvent::OutboundRaftPacket(pkt) => {
@@ -68,15 +69,16 @@ impl MultiRaftActor {
                     let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
                 }
                 RaftEvent::DisconnectPeer(node_id) => {
-                    let _ = transport_tx
-                        .send(RaftTransportCommand::DisconnectPeer(node_id))
-                        .await;
+                    transport_cmds.push(RaftTransportCommand::DisconnectPeer(node_id));
                 }
             }
         }
         for packets in packets_by_target.into_values() {
+            transport_cmds.push(RaftTransportCommand::Send(packets));
+        }
+        if !transport_cmds.is_empty() {
             let _ = transport_tx
-                .send(RaftTransportCommand::Send(packets))
+                .send(transport_cmds.into_boxed_slice())
                 .await;
         }
         if !timer_cmds.is_empty() {

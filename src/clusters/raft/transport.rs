@@ -302,7 +302,7 @@ impl RaftTransportActor {
         node_id: NodeId,
         listener: TcpListener,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
-        mut from_actor: mpsc::Receiver<RaftTransportCommand>,
+        mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
     ) {
         let mut state = RaftWriters::new(node_id);
@@ -314,13 +314,15 @@ impl RaftTransportActor {
                 Ok((stream, _)) = listener.accept() => {
                     state.accept(stream, &raft_tx).await;
                 }
-                Some(cmd) = from_actor.recv() => {
-                    match cmd {
-                        RaftTransportCommand::Send(packets) => {
-                            state.send(packets, &raft_tx, &swim_tx).await;
-                        }
-                        RaftTransportCommand::DisconnectPeer(peer_id) => {
-                            state.disconnect(peer_id);
+                Some(batch) = from_actor.recv() => {
+                    for cmd in batch {
+                        match cmd {
+                            RaftTransportCommand::Send(packets) => {
+                                state.send(packets, &raft_tx, &swim_tx).await;
+                            }
+                            RaftTransportCommand::DisconnectPeer(peer_id) => {
+                                state.disconnect(peer_id);
+                            }
                         }
                     }
                 }
