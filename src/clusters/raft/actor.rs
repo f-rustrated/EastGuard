@@ -71,6 +71,9 @@ impl MultiRaftActor {
                 RaftEvent::DisconnectPeer(node_id) => {
                     transport_cmds.push(RaftTransportCommand::DisconnectPeer(node_id));
                 }
+                RaftEvent::MetadataApplied { .. } => {
+                    // D3: Dispatched in Batch 2 (MultiRaft event dispatch)
+                }
             }
         }
         for packets in packets_by_target.into_values() {
