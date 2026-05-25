@@ -58,7 +58,7 @@ fn metadata_visible() -> turmoil::Result {
         for _ in 0..30u32 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             for i in 1..=3u8 {
-                if let Some(crate::connections::request::ProposeResponse::Success) =
+                if let Some(crate::connections::protocol::ControlPlaneResponse::TopicCreated) =
                     try_propose(&node_name(i), client_port(i), &req).await
                 {
                     acked = true;
@@ -100,7 +100,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
         for _ in 0..30u32 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             for i in 1..=3u8 {
-                if let Some(crate::connections::request::ProposeResponse::Success) =
+                if let Some(crate::connections::protocol::ControlPlaneResponse::TopicCreated) =
                     try_propose(&node_name(i), client_port(i), &req).await
                 {
                     break;

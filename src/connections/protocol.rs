@@ -6,14 +6,14 @@ use bincode::{Decode, Encode};
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
-#[derive(Encode, Decode)]
+#[derive(Clone, Encode, Decode)]
 pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(DataPlaneRequest),
     Admin(AdminRequest),
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum ClientResponse {
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),
@@ -26,7 +26,7 @@ pub enum ClientResponse {
 // at most once. Clients never need to retry on a different node — on forwarding
 // failure a generic error is returned.
 
-#[derive(Encode, Decode)]
+#[derive(Clone, Encode, Decode)]
 pub enum ControlPlaneRequest {
     CreateTopic { name: String, retention_ms: u64, replication_factor: u8 },
     DeleteTopic { name: String },
@@ -34,7 +34,7 @@ pub enum ControlPlaneRequest {
     DescribeTopic { name: String },
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum ControlPlaneResponse {
     // CreateTopic
     TopicCreated,
@@ -50,26 +50,26 @@ pub enum ControlPlaneResponse {
     InternalError(String),
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub struct TopicSummary {
     pub name: String,
     pub range_count: u32,
     pub state: TopicState,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum TopicState {
     Active,
     Deleting,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub struct TopicDetail {
     pub name: String,
     pub ranges: Vec<RangeDetail>,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub struct RangeDetail {
     pub range_id: u64,
     pub keyspace_start: Vec<u8>,
@@ -78,7 +78,7 @@ pub struct RangeDetail {
     pub state: RangeState,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum RangeState {
     Active,
     Sealed,
@@ -91,7 +91,7 @@ pub enum RangeState {
 // routing cache. When this node is not the right destination, a redirect error
 // is returned so the client can reconnect and retry.
 
-#[derive(Encode, Decode)]
+#[derive(Clone, Encode, Decode)]
 pub enum DataPlaneRequest {
     Produce {
         topic_name: String,
@@ -116,7 +116,7 @@ pub enum DataPlaneRequest {
     },
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum DataPlaneResponse {
     // Produce
     Produced { entry_id: u64 },
@@ -136,20 +136,20 @@ pub enum DataPlaneResponse {
 /// A single entry as served to the consumer.
 /// The broker never parses `data` — it is stored and replicated opaque.
 /// Consumers decompress and parse records from `data` using `record_count`.
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub struct Entry {
     pub entry_id: u64,
     pub data: Vec<u8>,
     pub record_count: u32,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum RangeStatus {
     Active,
     Sealed { end_offset: u64, transition: RangeTransition },
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum RangeTransition {
     Split { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> },
     Merged { merged_range_id: u64 },
@@ -157,14 +157,17 @@ pub enum RangeTransition {
 
 // ── Admin ──────────────────────────────────────────────────────────────────
 
-#[derive(Encode, Decode)]
+#[derive(Clone, Encode, Decode)]
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,
     SplitRange { topic_name: String, range_id: u64, split_point: Vec<u8> },
+    // Internal/debug queries — also used by integration test helpers.
+    GetShardInfo { key: Vec<u8> },
+    GetShardLeader { shard_group_id: u64 },
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum AdminResponse {
     // DescribeCluster
     ClusterInfo { nodes: Vec<NodeInfo> },
@@ -173,27 +176,39 @@ pub enum AdminResponse {
     // SplitRange
     RangeSplit,
     InvalidSplitPoint,
+    // GetShardInfo
+    ShardInfo { detail: Option<ShardDetail> },
+    // GetShardLeader
+    ShardLeader { leader: Option<String> },
+    // All admin operations
     InternalError(String),
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
+pub struct ShardDetail {
+    pub shard_group_id: u64,
+    pub leader_node_id: Option<String>,
+    pub leader_addr: Option<SocketAddr>,
+    pub member_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Encode, Decode)]
 pub struct NodeInfo {
     pub node_id: String,
     pub addr: SocketAddr,
     pub state: NodeState,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub enum NodeState {
     Alive,
     Suspect,
     Dead,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Debug, Encode, Decode)]
 pub struct TopicStats {
     pub name: String,
     pub range_count: u32,
-    pub total_records: u64,
     pub total_bytes: u64,
 }

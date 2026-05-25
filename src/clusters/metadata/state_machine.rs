@@ -34,6 +34,25 @@ impl MetadataStateMachine {
         self.topics.len()
     }
 
+    /// Returns `(name, range_count, total_bytes, entry_count)` for each topic on this node.
+    /// `entry_count` is the sum of `range.next_offset` across all ranges — it counts
+    /// entries (Produce calls), not individual records within a batch.
+    pub(crate) fn topic_stats(&self) -> Vec<(String, u32, u64)> {
+        self.topics
+            .values()
+            .map(|topic| {
+                let range_count = topic.ranges.len() as u32;
+                let total_bytes: u64 = topic
+                    .ranges
+                    .values()
+                    .flat_map(|r| r.segments.values())
+                    .map(|s| s.size_bytes)
+                    .sum();
+                (topic.name.clone(), range_count, total_bytes)
+            })
+            .collect()
+    }
+
     pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
         std::mem::take(&mut self.pending_proposals)
     }

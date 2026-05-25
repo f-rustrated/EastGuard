@@ -5,8 +5,8 @@ use tokio::sync::oneshot;
 
 use crate::clusters::NodeId;
 use crate::clusters::raft::messages::{
-    DeferredReply, LogMutation, MultiRaftActorCommand, MultiRaftCommand, MultiRaftReply,
-    ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
+    DeferredReply, LocalTopicStats, LogMutation, MultiRaftActorCommand, MultiRaftCommand,
+    MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::{Raft, TimerSeqs};
 
@@ -71,6 +71,10 @@ impl MultiRaft {
                 let topics = self.get_topics();
                 self.deferred.push(DeferredReply::GetTopics(reply, topics));
             }
+            MultiRaftActorCommand::GetTopicStats { reply } => {
+                let stats = self.get_topic_stats();
+                self.deferred.push(DeferredReply::GetTopicStats(reply, stats));
+            }
         }
     }
 
@@ -84,6 +88,9 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopics(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetTopicStats(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -240,6 +247,18 @@ impl MultiRaft {
         self.groups
             .values()
             .flat_map(|raft| raft.topic_names())
+            .collect()
+    }
+
+    fn get_topic_stats(&self) -> Vec<LocalTopicStats> {
+        self.groups
+            .values()
+            .flat_map(|raft| raft.topic_stats())
+            .map(|(name, range_count, total_bytes)| LocalTopicStats {
+                name,
+                range_count,
+                total_bytes,
+            })
             .collect()
     }
 

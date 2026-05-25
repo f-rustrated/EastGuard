@@ -26,6 +26,10 @@ pub enum MultiRaftActorCommand {
     GetTopics {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Query per-topic stats from all shard groups on this node.
+    GetTopicStats {
+        reply: oneshot::Sender<Vec<LocalTopicStats>>,
+    },
 }
 
 impl From<MultiRaftCommand> for MultiRaftActorCommand {
@@ -44,4 +48,11 @@ pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     Propose(oneshot::Sender<Result<(), ProposeError>>, Result<(), ProposeError>),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
+    GetTopicStats(oneshot::Sender<Vec<LocalTopicStats>>, Vec<LocalTopicStats>),
+}
+
+pub struct LocalTopicStats {
+    pub name: String,
+    pub range_count: u32,
+    pub total_bytes: u64,
 }
