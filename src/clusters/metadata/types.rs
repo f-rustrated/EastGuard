@@ -206,18 +206,20 @@ impl RangeMeta {
         segment_to_seal: SegmentId,
         replica_set: Vec<NodeId>,
         requested_at: u64,
-    ) -> Result<(), MetadataError> {
+        end_entry_id: u64,
+    ) -> Result<SegmentId, MetadataError> {
         let segment = self
             .segments
             .get_mut(&segment_to_seal)
             .ok_or(MetadataError::SegmentNotFound)?;
-        segment.seal(self.next_offset.saturating_sub(1), requested_at)?;
+        segment.seal(end_entry_id, requested_at)?;
 
+        let start_offset = end_entry_id + 1;
         let new_segment_id = SegmentId(self.next_segment_id);
         let new_segment = SegmentMeta::new(
             new_segment_id,
             replica_set.clone(),
-            self.next_offset,
+            start_offset,
             requested_at,
         );
 
@@ -225,8 +227,9 @@ impl RangeMeta {
         self.active_segment = Some(new_segment_id);
         self.seal_history.record_seal(requested_at);
         self.next_segment_id += 1;
+        self.next_offset = start_offset;
 
-        Ok(())
+        Ok(new_segment_id)
     }
 
     pub(crate) fn merge(
