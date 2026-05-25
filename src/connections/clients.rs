@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneRequest, NodeInfo, NodeState, ShardDetail, TopicStats,
+    ControlPlaneResponse, DataPlaneRequest, DataPlaneResponse, NodeInfo, NodeState, ShardDetail, TopicStats,
     TopicSummary,
 };
 use crate::{
@@ -42,10 +42,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::SERDE_CONFIG;
 
+#[allow(dead_code)]
 pub struct ClientRawWriter {
     stream: OwnedWriteHalf,
 }
 
+#[allow(dead_code)]
 impl ClientRawWriter {
     pub fn new(write_half: OwnedWriteHalf) -> Self {
         Self { stream: write_half }
@@ -168,6 +170,13 @@ impl ClientStreamReader {
 
 // ── Client handler ─────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug)]
+enum RequestDomain {
+    ControlPlane,
+    DataPlane,
+    Admin,
+}
+
 /// Pure request-to-response converter for one persistent client connection.
 ///
 /// Shared across connections (wrappable in `Arc`) — holds no per-connection
@@ -200,13 +209,34 @@ impl ClientHandler {
                     let handler = self.clone();
                     let tx = writer_tx.clone();
                     tokio::spawn(async move {
+                        let domain = match &request {
+                            ClientRequest::ControlPlane(_) => RequestDomain::ControlPlane,
+                            ClientRequest::DataPlane(_) => RequestDomain::DataPlane,
+                            ClientRequest::Admin(_) => RequestDomain::Admin,
+                        };
                         match handler.dispatch(request).await {
                             Ok(response) => {
                                 if tx.send((request_id, response)).await.is_err() {
                                     tracing::debug!("client writer closed");
                                 }
                             }
-                            Err(e) => tracing::error!("client dispatch error: {e}"),
+                            Err(e) => {
+                                tracing::error!("client dispatch error: {e}");
+                                let err_resp = match domain {
+                                    RequestDomain::ControlPlane => ClientResponse::ControlPlane(
+                                        ControlPlaneResponse::InternalError(e.to_string()),
+                                    ),
+                                    RequestDomain::DataPlane => ClientResponse::DataPlane(
+                                        DataPlaneResponse::InternalError(e.to_string()),
+                                    ),
+                                    RequestDomain::Admin => ClientResponse::Admin(
+                                        AdminResponse::InternalError(e.to_string()),
+                                    ),
+                                };
+                                if tx.send((request_id, err_resp)).await.is_err() {
+                                    tracing::debug!("client writer closed");
+                                }
+                            }
                         }
                     });
                 }
