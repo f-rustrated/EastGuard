@@ -967,6 +967,39 @@ Writes through Raft. Introduces the DRY server-side routing helper.
   Note: PR 1 handlers propose directly and return `InternalError` for non-leader cases without
   forwarding. `ControlPlaneRouter` will replace that pattern to give the client a clean retry path.
 
+  **E2e test update required after this PR.** The current tests in `src/it/e2e/client_protocol.rs`
+  compensate for the missing router with an `'outer` retry loop that tries every node until one
+  acks. Once `ControlPlaneRouter` is in place, any node will forward internally and respond with
+  the real result.
+
+  *Write operations* (`CreateTopic`, `DeleteTopic`) — replace the retry-all loop with a single
+  request to any node:
+
+  ```rust
+  // Before (PR 1 workaround — retry all nodes until leader acks)
+  'outer: for _ in 0..20 {
+      tokio::time::sleep(Duration::from_secs(2)).await;
+      for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
+          match send_request(host, port, req.clone()).await {
+              ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated) => break 'outer,
+              _ => {}
+          }
+      }
+  }
+
+  // After (PR 3 — router forwards internally, any node works)
+  tokio::time::sleep(Duration::from_secs(4)).await; // wait for leader election only
+  let resp = send_request("node-1", 8081, req).await;
+  assert!(matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)));
+  ```
+
+  *Read operations* (`ListHostedTopics`, `DescribeCluster`) — querying all nodes remains correct
+  and desirable to verify cluster-wide visibility. Keep the propagation wait before asserting on
+  all nodes: `CreateTopic` is acked when committed on a quorum (2/3), but the third follower may
+  not have applied the entry yet. The polling loop in `delete_topic` (10 × 500ms) handles this
+  correctly and should be preserved — it is not a router workaround, it is replication lag
+  tolerance.
+
 - [x] `ControlPlane::CreateTopic` — propose `MetadataCommand::CreateTopic`; return `Ok | InternalError` *(shipped in PR 1, no `AlreadyExists` guard yet — duplicate names reach the state machine)*
 - [x] `ControlPlane::DeleteTopic` — propose `MetadataCommand::DeleteTopic`; return `Ok | TopicNotFound | InternalError` *(shipped in PR 1)*
 - [x] `ControlPlane::ListHostedTopics` — local read from `MetadataStateMachine`, no leader check; return `Vec<TopicSummary>` *(shipped in PR 1)*
