@@ -42,11 +42,11 @@ fn build_address_map(
 }
 
 async fn drive_ticks(
-    ticker: &mpsc::Sender<TickerCommand<crate::clusters::raft::messages::RaftTimer>>,
+    ticker: &mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
     count: usize,
 ) {
     for _ in 0..count {
-        let _ = ticker.send(TickerCommand::ForceTick).await;
+        let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;

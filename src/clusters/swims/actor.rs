@@ -25,7 +25,7 @@ impl SwimActor {
         mut mailbox: mpsc::Receiver<SwimActorCommand>,
         mut state: Swim,
         transport_tx: mpsc::Sender<Box<[OutboundPacket]>>,
-        scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+        scheduler_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {
         tracing::info!("[{}] SwimActor started.", state.node_id);
@@ -46,16 +46,15 @@ impl SwimActor {
     async fn flush_events(
         state: &mut Swim,
         transport_tx: &mpsc::Sender<Box<[OutboundPacket]>>,
-        scheduler_tx: &mpsc::Sender<TickerCommand<SwimTimer>>,
+        scheduler_tx: &mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
     ) {
         let mut packets = Vec::new();
+        let mut timer_cmds = Vec::new();
         for event in state.take_events() {
             match event {
                 SwimEvent::Packet(pkt) => packets.push(pkt),
-                SwimEvent::Timer(cmd) => {
-                    let _ = scheduler_tx.send(cmd.into()).await;
-                }
+                SwimEvent::Timer(cmd) => timer_cmds.push(cmd.into()),
                 SwimEvent::Membership(m) => {
                     if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
                         let _ = raft_tx.send(cmd).await;
@@ -65,6 +64,9 @@ impl SwimActor {
         }
         if !packets.is_empty() {
             let _ = transport_tx.send(packets.into_boxed_slice()).await;
+        }
+        if !timer_cmds.is_empty() {
+            let _ = scheduler_tx.send(timer_cmds.into_boxed_slice()).await;
         }
     }
 }

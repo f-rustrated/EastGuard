@@ -7,7 +7,7 @@ use tokio::time;
 
 pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
-    mut mailbox: mpsc::Receiver<TickerCommand<T>>,
+    mut mailbox: mpsc::Receiver<Box<[TickerCommand<T>]>>,
     tick_period_ms: u64,
     protocol_interval_ticks: Option<u64>,
 ) where
@@ -25,16 +25,18 @@ pub async fn run_scheduling_actor<T>(
                 }
             }
 
-            Some(cmd) = mailbox.recv() => {
-                match cmd {
-                    #[cfg(test)]
-                    TickerCommand::ForceTick => {
-                        for event in ticker.advance_clock(now_ms()) {
-                            let _ = sender.send(event.into()).await;
+            Some(batch) = mailbox.recv() => {
+                for cmd in batch {
+                    match cmd {
+                        #[cfg(test)]
+                        TickerCommand::ForceTick => {
+                            for event in ticker.advance_clock(now_ms()) {
+                                let _ = sender.send(event.into()).await;
+                            }
                         }
-                    }
-                    TickerCommand::Schedule(probe_cmd)=>{
-                        ticker.apply(probe_cmd);
+                        TickerCommand::Schedule(probe_cmd)=>{
+                            ticker.apply(probe_cmd);
+                        }
                     }
                 }
             }

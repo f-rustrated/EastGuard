@@ -50,7 +50,7 @@ struct TestHarness {
     pub tx_in: mpsc::Sender<SwimActorCommand>,
     pub tx_out: mpsc::Sender<Box<[OutboundPacket]>>,
     pub rx_out: Option<mpsc::Receiver<Box<[OutboundPacket]>>>,
-    pub ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+    pub ticker_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
     pub local_addr: SocketAddr,
     pub config: JoinConfig,
 }
@@ -360,9 +360,12 @@ fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     }
 }
 
-async fn force_ticks(ticker_tx: &mpsc::Sender<TickerCommand<SwimTimer>>, count: usize) {
+async fn force_ticks(ticker_tx: &mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>, count: usize) {
     for _ in 0..count {
-        ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        ticker_tx
+            .send(Box::new([TickerCommand::ForceTick]))
+            .await
+            .unwrap();
     }
 }
 
@@ -560,9 +563,9 @@ async fn cluster_formation_using_join() {
     let _ = h3.query_topology_count().await;
 
     for _ in 0..PROBE_INTERVAL_TICKS * 2 {
-        h1.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
-        h2.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
-        h3.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        h1.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
+        h2.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
+        h3.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
     }
 
     assert_eq!(h1.query_topology_count().await, 3);
