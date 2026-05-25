@@ -76,6 +76,9 @@ impl MultiRaft {
                 let stats = self.get_topic_stats();
                 self.deferred.push(DeferredReply::GetTopicStats(reply, stats));
             }
+            MultiRaftActorCommand::Coordinator(_cmd) => {
+                // D3: SealRequest handling implemented in Batch 2
+            }
         }
     }
 
