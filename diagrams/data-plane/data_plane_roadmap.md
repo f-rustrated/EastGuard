@@ -237,7 +237,7 @@ Port layout:
 |---|---|---|---|
 | [D1: Storage Engine](d1_storage_engine.md) | WAL, segment files, sparse index, DataPlaneActor, lock-free SegmentRingBuffer, I/O pools | Nothing | Single-node storage + threading model |
 | [D2: Segment Replication](d2_segment_replication.md) | Primary-backup, seal-on-failure, DataTransportActor | D1 | Multi-node durability |
-| [D3: Segment Roll Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
+| [D3: Segment Lifecycle Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
 | [D4: Consumer Range Tracking](d4_consumer_range_tracking.md) | Follow split/merge/seal transitions | D3 | Consumer discovers range changes |
 | [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
 | [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume protocol, routing, connection management | D4, D5 | Client-facing protocol layer |

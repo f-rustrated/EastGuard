@@ -21,6 +21,7 @@ mod test_traits;
 use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
 use crate::clusters::raft::transport::RaftTransportActor;
 
+use crate::clusters::swims::OutboundPacket;
 use crate::clusters::swims::actor::SwimSender;
 use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
@@ -56,7 +57,7 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         // SWIM channels
         let (swim_sender, swim_mailbox) = SwimActor::channel(100);
-        let (tx_outbound, rx_outbound) = mpsc::channel(100);
+        let (tx_outbound, rx_outbound) = mpsc::channel::<Box<[OutboundPacket]>>(100);
         let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
 
         // Raft channels

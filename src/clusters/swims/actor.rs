@@ -24,7 +24,7 @@ impl SwimActor {
     pub async fn run(
         mut mailbox: mpsc::Receiver<SwimActorCommand>,
         mut state: Swim,
-        transport_tx: mpsc::Sender<OutboundPacket>,
+        transport_tx: mpsc::Sender<Box<[OutboundPacket]>>,
         scheduler_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {
@@ -45,34 +45,26 @@ impl SwimActor {
 
     async fn flush_events(
         state: &mut Swim,
-        transport_tx: &mpsc::Sender<OutboundPacket>,
+        transport_tx: &mpsc::Sender<Box<[OutboundPacket]>>,
         scheduler_tx: &mpsc::Sender<TickerCommand<SwimTimer>>,
         raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
     ) {
+        let mut packets = Vec::new();
         for event in state.take_events() {
-            Self::route_swim_event(state, event, transport_tx, scheduler_tx, raft_tx).await;
-        }
-    }
-
-    async fn route_swim_event(
-        state: &mut Swim,
-        event: SwimEvent,
-        transport_tx: &mpsc::Sender<OutboundPacket>,
-        scheduler_tx: &mpsc::Sender<TickerCommand<SwimTimer>>,
-        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
-    ) {
-        match event {
-            SwimEvent::Packet(pkt) => {
-                let _ = transport_tx.send(pkt).await;
-            }
-            SwimEvent::Timer(cmd) => {
-                let _ = scheduler_tx.send(cmd.into()).await;
-            }
-            SwimEvent::Membership(m) => {
-                if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
-                    let _ = raft_tx.send(cmd).await;
+            match event {
+                SwimEvent::Packet(pkt) => packets.push(pkt),
+                SwimEvent::Timer(cmd) => {
+                    let _ = scheduler_tx.send(cmd.into()).await;
+                }
+                SwimEvent::Membership(m) => {
+                    if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
+                        let _ = raft_tx.send(cmd).await;
+                    }
                 }
             }
+        }
+        if !packets.is_empty() {
+            let _ = transport_tx.send(packets.into_boxed_slice()).await;
         }
     }
 }

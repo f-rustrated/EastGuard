@@ -24,6 +24,12 @@ Don't pass `bool` parameters to control method behavior. Instead, have the calle
 
 Never use wildcard `_ => {}` or `_ => unreachable!()` in match arms for enum dispatch. List all variants explicitly so the compiler catches new variants at compile time. When splitting a match across sub-functions, the "already handled" arms should be listed explicitly (e.g., `VariantA { .. } | VariantB { .. } => {}`).
 
+## Batch channel messages with Box\<[T]\>
+
+Cross-actor channels should send `Box<[T]>` rather than individual `T` messages. The sender accumulates into a `Vec<T>` during its event loop iteration, then calls `.into_boxed_slice()` before sending — sheds unused capacity so only exact-size allocation crosses the channel. Benefits: fewer send operations (less channel contention), lower probability of a bounded channel being full, no wasted memory on the receiver side, and natural alignment with the flush-based actor pattern where side effects are drained after each event.
+
+For bounded channels using `try_send`, batching is especially important — one send per batch instead of per item means fewer opportunities for a full-channel drop.
+
 ## Temporal coupling in error propagation
 
 When a method performs mutation followed by a fallible read-only operation, consider that propagating the read-only error with `?` implies the entire operation failed — but the mutation already happened.
