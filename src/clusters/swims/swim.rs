@@ -723,6 +723,12 @@ impl Swim {
             SwimQueryCommand::GetShardInfo { key, reply } => {
                 let _ = reply.send(self.get_shard_info(&key));
             }
+            SwimQueryCommand::ResolveShardLeader {
+                shard_group_id,
+                reply,
+            } => {
+                let _ = reply.send(self.topology.shard_leader(shard_group_id).cloned());
+            }
         }
     }
 

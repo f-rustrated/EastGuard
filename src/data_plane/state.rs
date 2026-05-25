@@ -449,16 +449,19 @@ impl<W: WalStorage> DataPlane<W> {
                                 );
                             }
                             let (targets, message) = pending_repl.into_replica_append();
-                            let _ = transport_tx
-                                .blocking_send(DataTransportCommand::send(targets, message));
+                            let _ = transport_tx.blocking_send(
+                                DataTransportCommand::send_to_targets(targets, message),
+                            );
                         }
                     }
                     E::BatchFlushTimerScheduled(cmd) => {
                         batch_scheduler.send(cmd);
                     }
                     E::InterNodeCommandQueued(evt) => {
-                        let _ = transport_tx
-                            .blocking_send(DataTransportCommand::send(evt.targets, evt.message));
+                        let _ = transport_tx.blocking_send(DataTransportCommand::send_to_targets(
+                            evt.targets,
+                            evt.message,
+                        ));
                     }
                     E::ReplicaAckReceived(evt) => {
                         let Some(committed) =
@@ -488,11 +491,12 @@ impl<W: WalStorage> DataPlane<W> {
                             continue;
                         };
 
-                        // ! Locate Coordinator
+                        // D3: Coordinator routing implemented in Batch 3
                         let targets = vec![];
-                        let _ = transport_tx.blocking_send(DataTransportCommand::send(
+                        let _ = transport_tx.blocking_send(DataTransportCommand::send_to_targets(
                             targets,
                             SealRequest {
+                                from: self.node_id.clone(),
                                 segment_key: evt.segment_key,
                                 failed_nodes: nodes,
                                 end_entry_id: evt.committed_entry_id,

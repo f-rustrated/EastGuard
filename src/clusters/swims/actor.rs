@@ -123,6 +123,19 @@ impl SwimSender {
         .await?;
         Ok(recv.await?)
     }
+
+    pub(crate) async fn resolve_shard_leader(
+        &self,
+        shard_group_id: ShardGroupId,
+    ) -> anyhow::Result<Option<ShardLeaderEntry>> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::ResolveShardLeader {
+            shard_group_id,
+            reply: send,
+        })
+        .await?;
+        Ok(recv.await?)
+    }
 }
 
 impl From<SwimSender> for mpsc::Sender<SwimActorCommand> {

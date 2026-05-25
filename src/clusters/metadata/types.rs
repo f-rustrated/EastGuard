@@ -3,14 +3,15 @@ use std::collections::{HashMap, VecDeque};
 use bincode::{Decode, Encode};
 
 use crate::clusters::{
-    metadata::{
-        command::{MergeRange, MetadataCommand, RollSegment}, error::MetadataError, strategy::{PartitionStrategy, StoragePolicy}, RangeId,
-        SegmentId,
-        SplitRange,
-        TopicId,
-    },
     NodeId,
+    metadata::{
+        RangeId, SegmentId, SplitRange, TopicId,
+        command::{MergeRange, MetadataCommand, RollSegment},
+        error::MetadataError,
+        strategy::{PartitionStrategy, StoragePolicy},
+    },
 };
+use crate::data_plane::SegmentKey;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum TopicState {
     Active,
@@ -427,6 +428,44 @@ impl TopicMeta {
 
     pub(crate) fn can_split(&self) -> bool {
         self.storage_policy.partition_strategy != PartitionStrategy::Fixed
+    }
+
+    pub(crate) fn active_segments_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
+        if self.state != TopicState::Active {
+            return Vec::new();
+        }
+        self.active_ranges
+            .iter()
+            .filter_map(|range_id| {
+                let range = self.ranges.get(range_id)?;
+                let seg_id = range.active_segment?;
+                let seg = range.segments.get(&seg_id)?;
+                seg.replica_set.contains(node_id).then(|| {
+                    (
+                        SegmentKey::new(self.id, *range_id, seg_id),
+                        seg.replica_set.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn stats(&self) -> TopicStats {
+        let range_count = self.ranges.len() as u32;
+        let total_bytes: u64 = self
+            .ranges
+            .values()
+            .flat_map(|r| r.segments.values())
+            .map(|s| s.size_bytes)
+            .sum();
+        TopicStats {
+            name: self.name.clone(),
+            range_count,
+            total_bytes,
+        }
     }
 
     pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {

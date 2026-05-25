@@ -31,8 +31,15 @@ impl DataTransportActor {
                 biased;
                 Some(cmd) = from_actor.recv() => {
                     match cmd {
-                        DataTransportCommand::Send { targets, message } => {
-                            state.send(&targets, &message, &swim_tx, &data_plane_tx).await;
+                        DataTransportCommand::SendToTargets(cmd) => {
+                            state.send(&cmd.targets, &cmd.message, &swim_tx, &data_plane_tx).await;
+                        }
+                        DataTransportCommand::SendToCoordinator(cmd) => {
+                            let Ok(Some(entry)) = swim_tx.resolve_shard_leader(cmd.shard_group_id).await else {
+                                tracing::debug!("No shard leader for {:?}, SealRequest will retry via timeout", cmd.shard_group_id);
+                                continue;
+                            };
+                            state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx).await;
                         }
                         DataTransportCommand::DisconnectPeer(peer_id) => {
                             state.disconnect(peer_id);

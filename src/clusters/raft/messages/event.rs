@@ -23,6 +23,15 @@ pub struct SealContext {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
+pub struct MetadataApplied {
+    pub shard_group_id: ShardGroupId,
+    pub result: ApplyResult,
+    pub log_index: u64,
+    pub seal_context: Option<SealContext>,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LogMutation {
     Append(LogEntry),
@@ -41,12 +50,7 @@ pub enum RaftEvent {
     LeaderChange(LeaderChange),
     DisconnectPeer(NodeId),
     #[allow(dead_code)]
-    MetadataApplied {
-        shard_group_id: ShardGroupId,
-        result: ApplyResult,
-        log_index: u64,
-        seal_context: Option<SealContext>,
-    },
+    MetadataApplied(MetadataApplied),
 }
 
-impl_from_variant!(RaftEvent, LeaderChange, OutboundRaftPacket);
+impl_from_variant!(RaftEvent, LeaderChange, OutboundRaftPacket, MetadataApplied);

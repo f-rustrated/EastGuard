@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
+use crate::clusters::metadata::MetadataCommand;
 use crate::clusters::metadata::state_machine::MetadataStateMachine;
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::*;
@@ -138,6 +139,13 @@ impl Raft {
 
     pub(crate) fn topic_stats(&self) -> Vec<crate::clusters::metadata::TopicStats> {
         self.state_machine.topic_stats()
+    }
+
+    pub(crate) fn active_segments_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Vec<(crate::data_plane::SegmentKey, Vec<NodeId>)> {
+        self.state_machine.active_segments_for_node(node_id)
     }
 
     #[cfg(test)]
@@ -676,18 +684,25 @@ impl Raft {
         }
     }
 
-    fn apply_metadata_entry(
-        &mut self,
-        cmd: crate::clusters::metadata::command::MetadataCommand,
-        index: u64,
-    ) {
+    fn apply_metadata_entry(&mut self, cmd: MetadataCommand, index: u64) {
         match self.state_machine.apply(cmd) {
-            Ok(result) => tracing::debug!(
-                "[{}] Applied metadata at index {}: {:?}",
-                self.node_id,
-                index,
-                result
-            ),
+            Ok(result) => {
+                tracing::debug!(
+                    "[{}] Applied metadata at index {}: {:?}",
+                    self.node_id,
+                    index,
+                    result
+                );
+                self.events.push(
+                    MetadataApplied {
+                        shard_group_id: self.shard_group_id,
+                        result,
+                        log_index: index,
+                        seal_context: None,
+                    }
+                    .into(),
+                );
+            }
             Err(e) => tracing::error!(
                 "[{}] Metadata apply error at index {}: {:?}",
                 self.node_id,

@@ -5,6 +5,7 @@ use crate::clusters::metadata::command::MetadataCommand;
 use crate::clusters::raft::messages::rpc::{OutboundRaftPacket, RaftRpc};
 use crate::clusters::raft::messages::timer::RaftTimeoutCallback;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
+use crate::data_plane::SegmentKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
@@ -63,4 +64,18 @@ pub(crate) enum MultiRaftReply {
 pub enum RaftTransportCommand {
     Send(Vec<OutboundRaftPacket>),
     DisconnectPeer(NodeId),
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct CoordinatorSealRequest {
+    pub requester: NodeId,
+    pub segment_key: SegmentKey,
+    pub failed_nodes: Vec<NodeId>,
+    pub end_entry_id: u64,
+}
+
+#[derive(Debug)]
+pub enum CoordinatorCommand {
+    SealRequest(CoordinatorSealRequest),
 }

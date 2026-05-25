@@ -55,6 +55,7 @@ pub struct CommitAdvance {
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SealRequest {
+    pub from: NodeId,
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
     pub end_entry_id: u64,

@@ -1,5 +1,5 @@
 use crate::clusters::swims::topology::ShardLeaderEntry;
-use crate::clusters::swims::ShardGroup;
+use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::clusters::{NodeAddress, NodeId, SwimNode};
 
 use super::command::{SwimCommand, SwimTimeOutCallback};
@@ -27,6 +27,10 @@ pub enum SwimQueryCommand {
     GetShardInfo {
         key: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Option<(ShardGroup, Option<ShardLeaderEntry>)>>,
+    },
+    ResolveShardLeader {
+        shard_group_id: ShardGroupId,
+        reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
     },
 }
 

@@ -30,6 +30,10 @@ Cross-actor channels should send `Box<[T]>` rather than individual `T` messages.
 
 For bounded channels using `try_send`, batching is especially important — one send per batch instead of per item means fewer opportunities for a full-channel drop.
 
+## Place methods on the struct that owns the data
+
+When adding a method, put it on the struct whose fields it reads or computes over — not on a parent that happens to hold a reference. If `MetadataStateMachine::topic_stats()` just iterates `self.topics` and calls per-topic logic, that per-topic logic belongs on `TopicMeta`, not inlined in the iterator. This keeps methods close to the fields they touch, makes them independently testable, and prevents parent structs from accumulating pass-through logic.
+
 ## Temporal coupling in error propagation
 
 When a method performs mutation followed by a fallible read-only operation, consider that propagating the read-only error with `?` implies the entire operation failed — but the mutation already happened.
