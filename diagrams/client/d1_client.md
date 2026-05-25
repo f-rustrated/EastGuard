@@ -33,6 +33,52 @@ Adds consumer group coordination and durable offset commits. In scope:
 
 Phase 1 clients remain wire-compatible with Phase 2 servers — the protocol is additive.
 
+## Design Decisions
+
+### Why replace `ConnectionRequests` with `ClientRequest` / `ClientResponse`
+
+`ConnectionRequests` (in `src/connections/request.rs`) was the original type used for both integration
+tests and inter-node communication. It was never intended to be an external client API. Replacing it
+with `ClientRequest` / `ClientResponse` was driven by four concrete problems:
+
+**1. Leaks server internals to the client.**
+`ProposeRequest` exposes `resource_key` (a consistent hash ring routing key), `forwarded: bool`
+(a server-internal 1-hop forwarding flag), and `ClientCommand::into_raft_command()` — all
+Raft-layer implementation details. A real producer or consumer should never need to know about
+Raft proposals or shard group IDs. The forwarding flag is particularly harmful: if the server's
+forwarding strategy changes, the wire protocol must change too.
+
+**2. Responses are untyped and ad-hoc.**
+Each handler encodes a different type directly — `Vec<SwimNode>` for `GetMembers`,
+`Option<ShardInfoResponse>` for `GetShardInfo`, `ProposeResponse` for Propose. There is no shared
+response envelope. A client cannot distinguish `TopicNotFound` from `NotLeader` without knowing
+which specific handler produced the bytes it received.
+
+**3. No data plane.**
+`ConnectionRequests` only covers control-plane writes (create/delete topic) and internal queries
+(cluster membership, shard leader). `Produce`, `Fetch`, and `ListOffsets` do not exist.
+Bolting the data plane onto `ConnectionRequests` would mean adding more internal RPC types to a
+client-facing wire format, deepening the coupling.
+
+**4. Mixed abstraction levels.**
+`Connection`, `Query`, and `Propose` are three different layers collapsed into one flat enum.
+`Query(GetShardLeader { shard_group_id: u64 })` exposes shard group IDs — consistent hash ring
+positions — directly to clients writing to a topic.
+
+The new design resolves each problem:
+
+| Problem | Resolution |
+|---|---|
+| Internal concepts in wire format | `ControlPlane`, `DataPlane`, `Admin` map to user-facing concepts; `forwarded` flag is server-internal and invisible to clients |
+| Untyped responses | Every response variant is named and structured: `NotLeader { leader_addr }`, `TopicNotFound`, `Produced { entry_id }` |
+| No data plane | `DataPlaneRequest` / `DataPlaneResponse` are first-class variants from day one |
+| Mixed abstraction levels | Three planes reflect the user's mental model; no Raft or shard group concepts in the client API |
+
+The rule of thumb: `ConnectionRequests` was "the API needed to test the internals."
+`ClientRequest` / `ClientResponse` is "the API a producer or consumer actually calls."
+
+---
+
 ## Connection Model
 
 Connections are persistent. One TCP connection carries many request/response cycles for the lifetime of the
@@ -849,10 +895,10 @@ Foundation. All subsequent PRs depend on this.
 - [x] Extend frame format: `[len: u32][request_id: u64][payload: N bytes]` for both request and response
 - [x] Define `ClientRequest` enum: `ControlPlane(ControlPlaneRequest)`, `DataPlane(DataPlaneRequest)`, `Admin(AdminRequest)`
 - [x] Define `ClientResponse` enum: `ControlPlane(ControlPlaneResponse)`, `DataPlane(DataPlaneResponse)`, `Admin(AdminResponse)` + shared error variants (`InternalError`, `NotLeader`, `ShardNotLocal`)
-- [ ] Split connection handler into reader task + writer task connected by `mpsc::Sender<(u64, ClientResponse)>`
+- [x] Split connection handler into reader task + writer task connected by `mpsc::Sender<(u64, ClientResponse)>`
   - Reader task: reads `(request_id, ClientRequest)` frames, spawns one handler task per request
   - Writer task: reads `(request_id, ClientResponse)` from channel, encodes and writes frames
-- [ ] Introduce `ClientHandler` struct (cloned into each handler task):
+- [x] Introduce `ClientHandler` struct (cloned into each handler task):
   ```rust
   struct ClientHandler {
       node_id: NodeId,
@@ -863,8 +909,9 @@ Foundation. All subsequent PRs depend on this.
       writer_tx: mpsc::Sender<(u64, ClientResponse)>,
   }
   ```
-- [ ] Replace `ConnectionRequests` / `ClientStreamWriter::dispatch()` with new `ClientHandler::dispatch(request_id, ClientRequest)`
-- [ ] Stub all request variants with `todo!()` so it compiles; remove stubs as PRs 2–5 land
+  Note: `node_id`, `data_plane_sender`, `routing_cache` will be added in PRs 4–5 once the types exist.
+- [ ] Replace `ConnectionRequests` / `ClientStreamWriter::dispatch()` with `ClientHandler` in `handle_client_stream` — deferred to PR 2 (requires Admin handlers so IT tests don't regress)
+- [x] Stub all request variants with `todo!()` so it compiles; remove stubs as PRs 2–5 land
 
 ### PR 2 — Admin API
 

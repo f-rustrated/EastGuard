@@ -17,6 +17,11 @@ use std::{io::ErrorKind, mem::size_of, net::SocketAddr};
 const LEN_PREFIX_SIZE: usize = size_of::<u32>();
 const REQUEST_ID_SIZE: usize = size_of::<u64>();
 
+use tokio::sync::mpsc;
+
+use crate::connections::protocol::{
+    AdminRequest, ClientRequest, ClientResponse, ControlPlaneRequest, DataPlaneRequest,
+};
 use crate::{
     clusters::{
         NodeId,
@@ -384,4 +389,135 @@ impl ClientStreamReader {
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
         Ok((request_id, request))
     }
+}
+
+// ── Client handler (new dispatch scaffold) ─────────────────────────────────
+
+/// Drives one persistent client connection.
+///
+/// The reader half runs a loop that reads `(request_id, ClientRequest)` frames
+/// and spawns one tokio task per request. Each task calls `dispatch` and sends
+/// `(request_id, ClientResponse)` to the shared writer channel.
+///
+/// The writer half (`run_client_writer`) owns the TCP write half and drains the
+/// channel, encoding and flushing response frames in arrival order.
+///
+/// `node_id`, `data_plane_sender`, and `routing_cache` will be added as fields
+/// in PRs 4–5 once the corresponding types exist.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ClientHandler {
+    swim_sender: SwimSender,
+    raft_sender: RaftSender,
+    /// Sends encoded responses back to the writer task on this connection.
+    writer_tx: mpsc::Sender<(u64, ClientResponse)>,
+}
+
+#[allow(dead_code)]
+impl ClientHandler {
+    pub fn new(
+        swim_sender: SwimSender,
+        raft_sender: RaftSender,
+        writer_tx: mpsc::Sender<(u64, ClientResponse)>,
+    ) -> Self {
+        Self { swim_sender, raft_sender, writer_tx }
+    }
+
+    /// Reads frames in a loop, spawning one handler task per request.
+    pub async fn run(&self, mut reader: ClientStreamReader) {
+        loop {
+            match reader.read_request::<ClientRequest>().await {
+                Ok((request_id, request)) => {
+                    let handler = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handler.dispatch(request_id, request).await {
+                            tracing::error!("client dispatch error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!("client connection closed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Routes a single request to the appropriate sub-handler.
+    ///
+    /// All sub-handlers are stubbed with `todo!()` and will be replaced as PRs 2–5 land.
+    async fn dispatch(&self, request_id: u64, request: ClientRequest) -> anyhow::Result<()> {
+        match request {
+            ClientRequest::ControlPlane(cp) => self.handle_control_plane(request_id, cp).await,
+            ClientRequest::DataPlane(dp) => self.handle_data_plane(request_id, dp).await,
+            ClientRequest::Admin(admin) => self.handle_admin(request_id, admin).await,
+        }
+    }
+
+    async fn handle_control_plane(
+        &self,
+        _request_id: u64,
+        request: ControlPlaneRequest,
+    ) -> anyhow::Result<()> {
+        match request {
+            ControlPlaneRequest::CreateTopic { .. } => todo!(),
+            ControlPlaneRequest::DeleteTopic { .. } => todo!(),
+            ControlPlaneRequest::ListHostedTopics => todo!(),
+            ControlPlaneRequest::DescribeTopic { .. } => todo!(),
+        }
+    }
+
+    async fn handle_data_plane(
+        &self,
+        _request_id: u64,
+        request: DataPlaneRequest,
+    ) -> anyhow::Result<()> {
+        match request {
+            DataPlaneRequest::Produce { .. } => todo!(),
+            DataPlaneRequest::Fetch { .. } => todo!(),
+            DataPlaneRequest::ListOffsets { .. } => todo!(),
+        }
+    }
+
+    async fn handle_admin(
+        &self,
+        _request_id: u64,
+        request: AdminRequest,
+    ) -> anyhow::Result<()> {
+        match request {
+            AdminRequest::DescribeCluster => todo!(),
+            AdminRequest::ListHostedTopicsWithStats => todo!(),
+            AdminRequest::SplitRange { .. } => todo!(),
+        }
+    }
+
+    async fn send_response(
+        &self,
+        request_id: u64,
+        response: ClientResponse,
+    ) -> anyhow::Result<()> {
+        self.writer_tx
+            .send((request_id, response))
+            .await
+            .map_err(|_| anyhow::anyhow!("client writer closed"))
+    }
+}
+
+/// Writer task for a single client connection.
+///
+/// Drains `rx` and writes length-prefixed response frames to `write_half`.
+/// Exits when the sender side of `rx` is dropped (connection closed).
+#[allow(dead_code)]
+pub async fn run_client_writer(
+    mut write_half: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<(u64, ClientResponse)>,
+) -> anyhow::Result<()> {
+    while let Some((request_id, response)) = rx.recv().await {
+        let encoded = bincode::encode_to_vec(&response, SERDE_CONFIG)?;
+        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
+        write_half.write_all(&len.to_be_bytes()).await?;
+        write_half.write_all(&request_id.to_be_bytes()).await?;
+        write_half.write_all(&encoded).await?;
+    }
+    Ok(())
 }
