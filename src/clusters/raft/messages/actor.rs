@@ -4,7 +4,7 @@ use crate::clusters::NodeId;
 use crate::clusters::metadata::types::TopicStats;
 use crate::clusters::swims::ShardGroupId;
 
-use super::command::{MultiRaftCommand, ProposeError, RaftCommand};
+use super::command::{CoordinatorCommand, MultiRaftCommand, ProposeError, RaftCommand};
 use super::timer::RaftTimeoutCallback;
 
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
@@ -31,6 +31,8 @@ pub enum MultiRaftActorCommand {
     GetTopicStats {
         reply: oneshot::Sender<Vec<TopicStats>>,
     },
+    /// Data plane SealRequest forwarded to coordinator for Raft proposal.
+    Coordinator(CoordinatorCommand),
 }
 
 impl From<MultiRaftCommand> for MultiRaftActorCommand {
