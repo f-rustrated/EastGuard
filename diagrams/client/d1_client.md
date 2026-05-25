@@ -180,21 +180,23 @@ TcpListener::accept()
 `ClientHandler` — shared state cloned into each handler task:
 
 ```rust
+// PR 1 implementation. writer_tx is passed to run() rather than stored as a field,
+// making ClientHandler stateless and Arc-shareable across connections.
+// node_id, data_plane_sender, routing_cache will be added in PRs 4–5.
 struct ClientHandler {
-    node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: RaftSender,
-    data_plane_sender: DataPlaneSender,
-    routing_cache: Arc<TopicRoutingCache>,   // per-node, shared across all connections
-    writer_tx: mpsc::Sender<(u64, ClientResponse)>,
 }
 ```
+
+`run(&self, reader: ClientStreamReader, writer_tx: mpsc::Sender<(u64, ClientResponse)>)` owns the
+per-connection writer channel. Each spawned handler task clones `writer_tx` to send its response.
 
 Each request variant dispatches to the appropriate sender:
 
 - `ControlPlane` → `raft_sender` (Raft propose or metadata query)
-- `DataPlane::Produce` → `routing_cache` lookup → `data_plane_sender`
-- `DataPlane::Fetch` / `ListOffsets` → `data_plane_sender`
+- `DataPlane::Produce` → `routing_cache` lookup → `data_plane_sender` *(PR 5)*
+- `DataPlane::Fetch` / `ListOffsets` → `data_plane_sender` *(PR 5)*
 - `ConsumerGroup` → `raft_sender` (coordinator propose) + `routing_cache` *(Phase 2)*
 - `Admin` → `swim_sender` + `raft_sender`
 
@@ -570,8 +572,7 @@ Flow:
 
 ```
 Request:  {}
-Response: { topics: Vec<TopicStats { name: String, range_count: u32,
-                                     total_records: u64, total_bytes: u64 }> }
+Response: { topics: Vec<TopicStats { name: String, range_count: u32, total_bytes: u64 }> }
 ```
 
 Flow:
@@ -580,6 +581,42 @@ Flow:
 2. **Aggregate stats.** For each topic, iterate all `SegmentMeta` entries and sum `size_bytes`
    and record counts. Local shard groups only — no scatter-gather.
 3. **Return.** No Raft proposal, no forwarding, no leader check.
+
+**GetShardInfo**
+
+```
+Request:  { key: Vec<u8> }
+Response: { detail: Option<ShardDetail> }
+
+ShardDetail {
+    shard_group_id:  u64,
+    leader_node_id:  Option<String>,
+    leader_addr:     Option<SocketAddr>,
+    member_node_ids: Vec<String>,
+}
+```
+
+Flow:
+
+1. **Query SWIM.** Send `SwimQueryCommand::GetShardInfo { key }` to `swim_sender`. SWIM resolves
+   the shard group from the local consistent hash ring and returns the group definition plus the
+   cached shard leader entry (if one is known from gossip).
+2. **Map result.** `Some((group, leader))` → populate `ShardDetail`. `None` → `detail: None`.
+   No Raft proposal, no forwarding, no leader check. Used primarily by integration tests and
+   debug tooling.
+
+**GetShardLeader**
+
+```
+Request:  { shard_group_id: u64 }
+Response: { leader: Option<String> }
+```
+
+Flow:
+
+1. **Query MultiRaft.** Send `MultiRaftActorCommand::GetLeader { group_id }` to `raft_sender`.
+2. **Return.** Map `Option<NodeId>` to `Option<String>` (node ID as string). Returns `None` if
+   this node does not host the group or no leader is currently known.
 
 **SplitRange**
 
@@ -900,25 +937,20 @@ Foundation. All subsequent PRs depend on this.
   - Writer task: reads `(request_id, ClientResponse)` from channel, encodes and writes frames
 - [x] Introduce `ClientHandler` struct (cloned into each handler task):
   ```rust
-  struct ClientHandler {
-      node_id: NodeId,
-      swim_sender: SwimSender,
-      raft_sender: RaftSender,
-      data_plane_sender: DataPlaneSender,
-      routing_cache: Arc<TopicRoutingCache>,
-      writer_tx: mpsc::Sender<(u64, ClientResponse)>,
-  }
+  // writer_tx moved to run() param; node_id/data_plane_sender/routing_cache deferred to PRs 4–5
+  struct ClientHandler { swim_sender: SwimSender, raft_sender: RaftSender }
   ```
-  Note: `node_id`, `data_plane_sender`, `routing_cache` will be added in PRs 4–5 once the types exist.
-- [ ] Replace `ConnectionRequests` / `ClientStreamWriter::dispatch()` with `ClientHandler` in `handle_client_stream` — deferred to PR 2 (requires Admin handlers so IT tests don't regress)
-- [x] Stub all request variants with `todo!()` so it compiles; remove stubs as PRs 2–5 land
+- [x] Replace `ConnectionRequests` / `ClientStreamWriter::dispatch()` with `ClientHandler` in `handle_client_stream`
+- [x] Stub all unimplemented request variants with `todo!()`; Admin and ControlPlane handlers shipped in this PR (see PRs 2–3 below)
 
 ### PR 2 — Admin API
 
 Read-only handlers. No routing cache, no Raft proposals. Validates the dispatch pattern from PR 1.
 
-- [ ] `Admin::DescribeCluster` — query SWIM membership table, map to `Vec<NodeInfo { node_id, addr, state }>`
-- [ ] `Admin::ListHostedTopicsWithStats` — read all topics from local `MetadataStateMachine`, aggregate `size_bytes` and record counts per topic
+- [x] `Admin::DescribeCluster` — query SWIM membership table, map to `Vec<NodeInfo { node_id, addr, state }>` *(shipped in PR 1)*
+- [x] `Admin::GetShardInfo` — query SWIM hash ring + leader cache, return `Option<ShardDetail>` *(shipped in PR 1)*
+- [x] `Admin::GetShardLeader` — query `MultiRaft::current_leader`, return `Option<String>` *(shipped in PR 1)*
+- [x] `Admin::ListHostedTopicsWithStats` — read all topics from local `MetadataStateMachine`, aggregate `size_bytes` per topic *(shipped in PR 1)*
 - [ ] `Admin::SplitRange` — wire `ControlPlaneRouter` leader resolution to existing `MetadataCommand::SplitRange` (already implemented in `state_machine.rs`)
 
 ### PR 3 — Control Plane + `ControlPlaneRouter`
@@ -931,9 +963,13 @@ Writes through Raft. Introduces the DRY server-side routing helper.
   - If this node hosts the shard group but is follower → resolve leader via `MultiRaft::current_leader`, forward once with `ProposeRequest { forwarded: true }`
   - If this node does not host the shard group → pick a live member from local `Topology`, forward once
   - If forwarding fails → `InternalError`
-- [ ] `ControlPlane::CreateTopic` — duplicate check via `topic_name_index`, then propose `MetadataCommand::CreateTopic`; return `Ok | AlreadyExists | InternalError`
-- [ ] `ControlPlane::DeleteTopic` — existence check, then propose `MetadataCommand::DeleteTopic`; return `Ok | TopicNotFound | InternalError`
-- [ ] `ControlPlane::ListHostedTopics` — local read from `MetadataStateMachine`, no leader check; return `Vec<TopicSummary>`
+
+  Note: PR 1 handlers propose directly and return `InternalError` for non-leader cases without
+  forwarding. `ControlPlaneRouter` will replace that pattern to give the client a clean retry path.
+
+- [x] `ControlPlane::CreateTopic` — propose `MetadataCommand::CreateTopic`; return `Ok | InternalError` *(shipped in PR 1, no `AlreadyExists` guard yet — duplicate names reach the state machine)*
+- [x] `ControlPlane::DeleteTopic` — propose `MetadataCommand::DeleteTopic`; return `Ok | TopicNotFound | InternalError` *(shipped in PR 1)*
+- [x] `ControlPlane::ListHostedTopics` — local read from `MetadataStateMachine`, no leader check; return `Vec<TopicSummary>` *(shipped in PR 1)*
 - [ ] `ControlPlane::DescribeTopic` — shard group check (forward to any member if not hosted), local read; return `TopicDetail | TopicNotFound`
 
 ### PR 4 — `TopicRoutingCache` + `MetadataStateMachineObserver`
