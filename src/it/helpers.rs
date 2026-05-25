@@ -1,8 +1,8 @@
-use crate::clusters::{SwimNode, SwimNodeState};
+use crate::clusters::SwimNode;
+use crate::clusters::SwimNodeState;
 use crate::config::Environment;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
-use crate::connections::request::QueryCommand::GetMembers;
-use crate::connections::request::{ConnectionRequests, ProposeResponse};
+use crate::connections::protocol::{AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState};
 use crate::net::TcpStream;
 
 pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
@@ -39,8 +39,33 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(&ConnectionRequests::Query(GetMembers)).await?;
-    Ok(reader.read_request().await?)
+    writer.write(0, &ClientRequest::Admin(AdminRequest::DescribeCluster)).await?;
+    let (_, response): (_, ClientResponse) = reader.read_request().await?;
+    let nodes = match response {
+        ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }) => nodes,
+        other => return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected response: {:?}", std::mem::discriminant(&other)),
+        ).into()),
+    };
+    let members = nodes
+        .into_iter()
+        .map(|n| SwimNode {
+            node_id: crate::clusters::NodeId::new(&n.node_id),
+            addr: crate::clusters::NodeAddress {
+                cluster_addr: n.addr,
+                client_addr: n.addr,
+                data_addr: n.addr,
+            },
+            state: match n.state {
+                NodeState::Alive => SwimNodeState::Alive,
+                NodeState::Suspect => SwimNodeState::Suspect,
+                NodeState::Dead => SwimNodeState::Dead,
+            },
+            incarnation: 0,
+        })
+        .collect();
+    Ok(members)
 }
 
 pub async fn check_alive_count(host: &str, port: u16, expected: usize) -> turmoil::Result {
@@ -86,11 +111,13 @@ pub async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> boo
     }
 }
 
-pub async fn send_propose(host: &str, port: u16, req: ConnectionRequests) -> ProposeResponse {
+/// Sends a `ClientRequest` to a node and returns the raw `ClientResponse`.
+pub async fn send_request(host: &str, port: u16, req: ClientRequest) -> ClientResponse {
     let stream = TcpStream::connect((host, port)).await.unwrap();
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(&req).await.unwrap();
-    reader.read_request().await.unwrap()
+    writer.write(0, &req).await.unwrap();
+    let (_, response) = reader.read_request().await.unwrap();
+    response
 }

@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use turmoil::Builder;
 
 use crate::StartUp;
-use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
-use crate::connections::request::{
-    ClientCommand, ConnectionRequests, ProposeRequest, ProposeResponse,
+use crate::connections::protocol::{
+    ClientRequest, ClientResponse, ControlPlaneRequest, ControlPlaneResponse,
 };
 use crate::it::helpers::default_env;
 use crate::it::sim::invariants::{assert_membership_converged, assert_topic_visible_on_quorum, query_shard_info};
@@ -131,12 +130,13 @@ impl SimScenario {
     }
 }
 
-/// Attempt a propose to one node. Returns None on any network or decode error.
+/// Attempt a CreateTopic to one node. Returns `Some(true)` on success, `None` on
+/// network/decode error or when the node is not the leader.
 pub(super) async fn try_propose(
     host: &str,
     port: u16,
-    req: &ConnectionRequests,
-) -> Option<ProposeResponse> {
+    req: &ClientRequest,
+) -> Option<ControlPlaneResponse> {
     let stream = tokio::time::timeout(
         Duration::from_secs(2),
         TcpStream::connect((host, port)),
@@ -147,25 +147,23 @@ pub(super) async fn try_propose(
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(req).await.ok()?;
-    tokio::time::timeout(Duration::from_secs(5), reader.read_request())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
+    writer.write(0, req).await.ok()?;
+    let (_, response): (_, ClientResponse) =
+        tokio::time::timeout(Duration::from_secs(5), reader.read_request())
+            .await
+            .ok()
+            .and_then(|r| r.ok())?;
+    match response {
+        ClientResponse::ControlPlane(cp) => Some(cp),
+        _ => None,
+    }
 }
 
-pub(super) fn make_create_topic_req(name: &str) -> ConnectionRequests {
-    ConnectionRequests::Propose(ProposeRequest {
-        resource_key: name.as_bytes().to_vec(),
-        command: ClientCommand::CreateTopic {
-            name: name.to_string(),
-            storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
-                replication_factor: 3,
-                partition_strategy: PartitionStrategy::AutoSplit,
-            },
-        },
-        forwarded: false,
+pub(super) fn make_create_topic_req(name: &str) -> ClientRequest {
+    ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+        name: name.to_string(),
+        retention_ms: 3_600_000,
+        replication_factor: 3,
     })
 }
 
@@ -227,7 +225,7 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
             if let CommandKind::CreateTopic { name } = &cmd.kind {
                 let req = make_create_topic_req(name);
                 'try_nodes: for j in 1..=node_count {
-                    if let Some(ProposeResponse::Success) =
+                    if let Some(ControlPlaneResponse::TopicCreated) =
                         try_propose(&node_name(j), client_port(j), &req).await
                     {
                         // Identify which alive nodes host this topic's shard group.

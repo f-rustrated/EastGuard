@@ -30,7 +30,7 @@ use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
-    connections::clients::{ClientStreamReader, ClientStreamWriter},
+    connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -159,8 +159,9 @@ async fn handle_client_stream(
     raft_sender: RaftSender,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
-    let mut stream_reader = ClientStreamReader::new(read_half);
-    let mut stream_writer = ClientStreamWriter::new(write_half, swim_sender, raft_sender);
-    let request = stream_reader.read_request().await?;
-    stream_writer.dispatch(request).await
+    let (writer_tx, writer_rx) = mpsc::channel(128);
+    let handler = ClientHandler::new(swim_sender, raft_sender);
+    tokio::spawn(run_client_writer(write_half, writer_rx));
+    handler.run(ClientStreamReader::new(read_half), writer_tx).await;
+    Ok(())
 }

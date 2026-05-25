@@ -1,6 +1,6 @@
 use super::command::*;
 use super::types::*;
-use crate::clusters::metadata::{RangeId, TopicId, error::MetadataError};
+use crate::clusters::metadata::{error::MetadataError, RangeId, TopicId};
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -32,6 +32,22 @@ impl MetadataStateMachine {
 
     pub(crate) fn topic_count(&self) -> usize {
         self.topics.len()
+    }
+
+    pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
+        self.topics
+            .values()
+            .map(|topic| {
+                let range_count = topic.ranges.len() as u32;
+                let total_bytes: u64 = topic
+                    .ranges
+                    .values()
+                    .flat_map(|r| r.segments.values())
+                    .map(|s| s.size_bytes)
+                    .sum();
+                TopicStats { name: topic.name.clone(), range_count, total_bytes }
+            })
+            .collect()
     }
 
     pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
@@ -199,11 +215,11 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::clusters::{
-        NodeId,
         metadata::{
-            SegmentId,
             strategy::{PartitionStrategy, StoragePolicy},
+            SegmentId,
         },
+        NodeId,
     };
 
     fn default_policy() -> StoragePolicy {

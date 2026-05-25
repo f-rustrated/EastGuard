@@ -1,241 +1,70 @@
-use std::{io::ErrorKind, net::SocketAddr};
+/// # Client ↔ Server request_id protocol
+///
+/// 1. **Client assigns** — before sending each request, the client obtains a
+///    monotonically increasing ID from a per-connection `u64` counter.
+/// 2. **Client tracks** — the ID is stored in a `HashMap<u64, oneshot::Sender<Response>>`
+///    of in-flight requests, keyed by `request_id`.
+/// 3. **Server echoes** — the server reads `request_id` from the incoming frame and
+///    writes it back unchanged in the response frame. The server is stateless with
+///    respect to `request_id`.
+/// 4. **Client matches** — on receiving a response frame, the client looks up
+///    `request_id` in the in-flight map and delivers the response to the right waiter.
+///
+/// This allows multiple requests to be in-flight on a single connection simultaneously,
+/// with responses arriving in any order.
+use std::{io::ErrorKind, mem::size_of};
 
+const LEN_PREFIX_SIZE: usize = size_of::<u32>();
+const REQUEST_ID_SIZE: usize = size_of::<u64>();
+
+use tokio::sync::mpsc;
+
+use crate::connections::protocol::{
+    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
+    ControlPlaneResponse, DataPlaneRequest, NodeInfo, NodeState, ShardDetail, TopicStats,
+    TopicSummary,
+};
 use crate::{
     clusters::{
-        NodeId,
+        SwimNodeState,
+        metadata::{
+            command::{CreateTopic, DeleteTopic, MetadataCommand},
+            strategy::{PartitionStrategy, StoragePolicy},
+        },
         raft::actor::RaftSender,
-        raft::messages::ProposeError,
-        swims::{ShardGroupId, SwimQueryCommand, actor::SwimSender},
+        raft::messages::{ProposeError, RaftCommand},
+        swims::{ShardGroupId, actor::SwimSender},
     },
-    connections::request::{
-        ConnectionRequests, ProposeRequest, ProposeResponse, QueryCommand, ShardInfoResponse, TopicSummary,
-    },
-    net::{OwnedReadHalf, OwnedWriteHalf, TcpStream},
+    net::{OwnedReadHalf, OwnedWriteHalf},
 };
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::SERDE_CONFIG;
 
-pub struct ClientStreamWriter {
-    pub(crate) stream: OwnedWriteHalf,
-    swim_sender: SwimSender,
-    raft_sender: RaftSender,
-}
-
-impl ClientStreamWriter {
-    pub(crate) fn new(
-        write_half: OwnedWriteHalf,
-        swim_sender: SwimSender,
-        raft_sender: RaftSender,
-    ) -> Self {
-        Self {
-            stream: write_half,
-            swim_sender,
-            raft_sender,
-        }
-    }
-
-    pub(crate) async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
-        let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
-        let len = (encoded.len() as u32).to_be_bytes();
-        self.stream.write_all(&len).await.expect("write len failed");
-        self.stream
-            .write_all(&encoded)
-            .await
-            .expect("write encoded failed");
-        Ok(())
-    }
-
-    pub(crate) async fn dispatch(&mut self, request: ConnectionRequests) -> anyhow::Result<()> {
-        match request {
-            ConnectionRequests::Connection(_) => Ok(()),
-            ConnectionRequests::Query(q) => self.handle_query(q).await,
-            ConnectionRequests::Propose(req) => self.handle_propose(req).await,
-        }
-    }
-
-    async fn handle_query(&mut self, query_type: QueryCommand) -> anyhow::Result<()> {
-        match query_type {
-            QueryCommand::GetMembers => self.handle_get_members().await,
-            QueryCommand::GetShardInfo { key } => self.handle_get_shard_info(key).await,
-            QueryCommand::GetShardLeader { shard_group_id } => {
-                self.handle_get_shard_leader(shard_group_id).await
-            }
-            QueryCommand::GetTopics => self.handle_get_topics().await,
-        }
-    }
-
-
-    async fn handle_get_members(&mut self) -> anyhow::Result<()> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        self.swim_sender
-            .send(SwimQueryCommand::GetMembers { reply: send })
-            .await?;
-        let result = recv.await?;
-        self.write(&result).await
-    }
-
-    async fn handle_get_shard_leader(&mut self, shard_group_id: u64) -> anyhow::Result<()> {
-        let leader = self
-            .raft_sender
-            .get_leader(ShardGroupId(shard_group_id))
-            .await
-            .map(|n| n.to_string());
-        self.write(&leader).await
-    }
-
-    async fn handle_get_topics(&mut self) -> anyhow::Result<()> {
-        let topics: Vec<TopicSummary> = self
-            .raft_sender
-            .get_topics()
-            .await
-            .into_iter()
-            .map(|name| TopicSummary { name })
-            .collect();
-        self.write(&topics).await
-    }
-
-    async fn handle_get_shard_info(&mut self, key: Vec<u8>) -> anyhow::Result<()> {
-        let response = self
-            .swim_sender
-            .get_shard_info(key)
-            .await?
-            .map(|(group, leader)| ShardInfoResponse {
-                shard_group_id: group.id.0,
-                leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
-                leader_addr: leader.map(|e| e.leader_addr),
-                member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
-            });
-        self.write(&response).await
-    }
-
-    async fn handle_propose(&mut self, req: ProposeRequest) -> anyhow::Result<()> {
-        let response = self.execute_propose(req).await?;
-        self.write(&response).await?;
-        Ok(())
-    }
-
-    async fn execute_propose(&self, req: ProposeRequest) -> anyhow::Result<ProposeResponse> {
-        let Some(shard_group) = self
-            .swim_sender
-            .resolve_shard_group(req.resource_key.clone())
-            .await?
-        else {
-            return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
-        };
-        let raft_cmd = req.command.clone().into_raft_command(shard_group.members);
-        let Some(result) = self.raft_sender.propose(shard_group.id, raft_cmd).await else {
-            return Ok(ProposeResponse::Error(ProposeError::ShardNotFound));
-        };
-        let response = match result {
-            Ok(()) => ProposeResponse::Success,
-            Err(ProposeError::NotLeader(ref hint)) if !req.forwarded => {
-                self.try_forward(hint.clone(), shard_group.id, req).await
-            }
-            Err(err) => ProposeResponse::Error(err),
-        };
-        Ok(response)
-    }
-
-    async fn try_forward(
-        &self,
-        leader_hint: Option<NodeId>,
-        shard_group_id: ShardGroupId,
-        req: ProposeRequest,
-    ) -> ProposeResponse {
-        if let Some(resp) = self.try_forward_via_hint(&leader_hint, &req).await {
-            return resp;
-        }
-        if let Some(resp) = self.try_forward_via_gossip(shard_group_id, &req).await {
-            return resp;
-        }
-        ProposeResponse::Error(ProposeError::NotLeader(leader_hint))
-    }
-
-    async fn try_forward_via_hint(
-        &self,
-        leader_hint: &Option<NodeId>,
-        req: &ProposeRequest,
-    ) -> Option<ProposeResponse> {
-        let leader_id = leader_hint.as_ref()?;
-        let node_addr = self
-            .swim_sender
-            .resolve_address(leader_id.clone())
-            .await
-            .inspect_err(|e| tracing::debug!("Resolve address for {} failed: {e}", leader_id))
-            .ok()
-            .flatten()?;
-        Self::forward_to_leader(node_addr.client_addr, req)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!("Forward via hint to {} failed: {e}", node_addr.client_addr)
-            })
-            .ok()
-    }
-
-    async fn try_forward_via_gossip(
-        &self,
-        shard_group_id: ShardGroupId,
-        req: &ProposeRequest,
-    ) -> Option<ProposeResponse> {
-        let entry = self
-            .swim_sender
-            .resolve_shard_leader(shard_group_id)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!("Resolve shard leader for {:?} failed: {e}", shard_group_id)
-            })
-            .ok()
-            .flatten()?;
-        Self::forward_to_leader(entry.leader_addr.client_addr, req)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(
-                    "Forward via gossip to {} failed: {e}",
-                    entry.leader_addr.client_addr
-                )
-            })
-            .ok()
-    }
-
-    async fn forward_to_leader(
-        addr: SocketAddr,
-        req: &ProposeRequest,
-    ) -> anyhow::Result<ProposeResponse> {
-        // Bound the forward attempt: a TCP connect to an unreachable host can stall
-        // indefinitely, which would hold the client connection open for no reason.
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("connect to leader timed out"))??;
-        let (read_half, write_half) = stream.into_split();
-        let mut writer = ClientRawWriter::new(write_half);
-        let mut reader = ClientStreamReader::new(read_half);
-
-        let forwarded_req = ConnectionRequests::Propose(ProposeRequest {
-            forwarded: true,
-            ..req.clone()
-        });
-        writer.write(&forwarded_req).await?;
-        reader.read_request().await
-    }
-}
-
+#[allow(dead_code)]
 pub struct ClientRawWriter {
     stream: OwnedWriteHalf,
 }
 
+#[allow(dead_code)]
 impl ClientRawWriter {
     pub fn new(write_half: OwnedWriteHalf) -> Self {
         Self { stream: write_half }
     }
-    pub async fn write<T: bincode::Encode>(&mut self, data: &T) -> anyhow::Result<()> {
+
+    pub async fn write<T: bincode::Encode>(
+        &mut self,
+        request_id: u64,
+        data: &T,
+    ) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
-        let len = (encoded.len() as u32).to_be_bytes();
-        self.stream.write_all(&len).await.expect("write len failed");
+        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
+        self.stream.write_all(&len.to_be_bytes()).await.expect("write len failed");
+        self.stream
+            .write_all(&request_id.to_be_bytes())
+            .await
+            .expect("write request_id failed");
         self.stream
             .write_all(&encoded)
             .await
@@ -258,7 +87,7 @@ impl ClientStreamReader {
             buffer: BytesMut::with_capacity(1024),
         }
     }
-    pub async fn read_bytes(&mut self) -> Result<BytesMut, std::io::Error> {
+    pub async fn read_bytes(&mut self) -> Result<(u64, BytesMut), std::io::Error> {
         loop {
             if let Some(msg) = self.parse_frame()? {
                 return Ok(msg);
@@ -280,22 +109,23 @@ impl ClientStreamReader {
         Ok(())
     }
 
-    /// Tries to split off a full message from the internal buffer.
-    /// Returns Ok(None) if we need more data.
-    pub fn parse_frame(&mut self) -> Result<Option<BytesMut>, std::io::Error> {
+    /// Tries to split off a full frame from the internal buffer.
+    /// Frame layout: `[len: u32][request_id: u64][payload: len-REQUEST_ID_SIZE bytes]`
+    /// Returns `Ok(None)` if more data is needed.
+    pub fn parse_frame(&mut self) -> Result<Option<(u64, BytesMut)>, std::io::Error> {
         const MAX_MSG_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
-        // 1. Do we have enough for the length prefix (4bytes)?
-        if self.buffer.len() < 4 {
+        // 1. Do we have enough for the length prefix?
+        if self.buffer.len() < LEN_PREFIX_SIZE {
             return Ok(None);
         }
 
-        // 2. Peek the length integer (without consuming bytes yet)
-        // Use a slice so we don't consume the bytes from self.buffer yet.
-        let mut len_bytes = &self.buffer[..4];
+        // 2. Peek the length integer (without consuming bytes yet).
+        //    len covers request_id + payload.
+        let mut len_bytes = &self.buffer[..LEN_PREFIX_SIZE];
         let len = len_bytes.get_u32() as usize;
 
-        // 3. Security check: prevent massive allocations from malicious clients
+        // 3. Security check: prevent massive allocations from malicious clients.
         if len > MAX_MSG_SIZE {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
@@ -303,32 +133,533 @@ impl ClientStreamReader {
             ));
         }
 
-        // 4. Do we have the full message body in the buffer?
-        let total_frame_len = 4 + len;
-        if self.buffer.len() < total_frame_len {
-            if self.buffer.capacity() < total_frame_len {
-                // Exact fit: "I know 1MB is coming, reserve exactly 1MB right now."
-                self.buffer.reserve(total_frame_len - self.buffer.len());
-            }
-            return Ok(None); // Not enough data yet, go back to reading
+        // 4. len must cover at least the request_id field.
+        if len < REQUEST_ID_SIZE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Frame too small: len={len}, minimum is {REQUEST_ID_SIZE} (request_id field)"),
+            ));
         }
 
-        // 5. Consume header and split off the body
-        self.buffer.advance(4); // Discard the length prefix
+        // 5. Do we have the full frame in the buffer?
+        let total_frame_len = LEN_PREFIX_SIZE + len;
+        if self.buffer.len() < total_frame_len {
+            if self.buffer.capacity() < total_frame_len {
+                self.buffer.reserve(total_frame_len - self.buffer.len());
+            }
+            return Ok(None);
+        }
 
-        // 'split-to' is Zero-Copy-ish, it just grabs the pointer to the existing memory
-        let msg = self.buffer.split_to(len);
+        // 6. Consume length prefix, extract request_id, then split off payload.
+        self.buffer.advance(LEN_PREFIX_SIZE);
+        let request_id = self.buffer.get_u64();
+        let payload = self.buffer.split_to(len - REQUEST_ID_SIZE);
 
-        // Whatever is left in self.buffer stays there for the next call.
-        Ok(Some(msg))
+        Ok(Some((request_id, payload)))
     }
 
-    pub async fn read_request<U>(&mut self) -> anyhow::Result<U>
+    pub async fn read_request<U>(&mut self) -> anyhow::Result<(u64, U)>
     where
         U: bincode::Decode<()>,
     {
-        let body = self.read_bytes().await?;
+        let (request_id, body) = self.read_bytes().await?;
         let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
-        Ok(request)
+        Ok((request_id, request))
+    }
+}
+
+// ── Client handler ─────────────────────────────────────────────────────────
+
+/// Pure request-to-response converter for one persistent client connection.
+///
+/// Shared across connections (wrappable in `Arc`) — holds no per-connection
+/// state. The caller owns the writer channel and passes it into `run`.
+///
+/// `node_id`, `data_plane_sender`, and `routing_cache` will be added as fields
+/// in PRs 4–5 once the corresponding types exist.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ClientHandler {
+    swim_sender: SwimSender,
+    raft_sender: RaftSender,
+}
+
+#[allow(dead_code)]
+impl ClientHandler {
+    pub fn new(swim_sender: SwimSender, raft_sender: RaftSender) -> Self {
+        Self { swim_sender, raft_sender }
+    }
+
+    /// Reads frames in a loop, spawning one handler task per request.
+    pub async fn run(
+        &self,
+        mut reader: ClientStreamReader,
+        writer_tx: mpsc::Sender<(u64, ClientResponse)>,
+    ) {
+        loop {
+            match reader.read_request::<ClientRequest>().await {
+                Ok((request_id, request)) => {
+                    let handler = self.clone();
+                    let tx = writer_tx.clone();
+                    tokio::spawn(async move {
+                        let response = handler.dispatch(request).await;
+                        if tx.send((request_id, response)).await.is_err() {
+                            tracing::debug!("client writer closed");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!("client connection closed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    pub async fn dispatch(&self, request: ClientRequest) -> ClientResponse {
+        match request {
+            ClientRequest::ControlPlane(cp) => self.handle_control_plane(cp).await,
+            ClientRequest::DataPlane(dp) => self.handle_data_plane(dp).await,
+            ClientRequest::Admin(admin) => self.handle_admin(admin).await,
+        }
+    }
+
+    async fn handle_control_plane(&self, request: ControlPlaneRequest) -> ClientResponse {
+        let res = match request {
+            ControlPlaneRequest::CreateTopic { name, retention_ms, replication_factor } => {
+                self.handle_create_topic(name, retention_ms, replication_factor).await
+            }
+            ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
+            ControlPlaneRequest::ListHostedTopics => self.handle_list_hosted_topics().await,
+            ControlPlaneRequest::DescribeTopic { .. } => todo!(),
+        };
+        match res {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("client control plane dispatch error: {e}");
+                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(e.to_string()))
+            }
+        }
+    }
+
+    async fn handle_create_topic(
+        &self,
+        name: String,
+        retention_ms: u64,
+        replication_factor: u8,
+    ) -> anyhow::Result<ClientResponse> {
+        let Some(shard_group) = self.swim_sender.resolve_shard_group(name.as_bytes().to_vec()).await? else {
+            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )));
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+            name: name.clone(),
+            storage_policy: StoragePolicy {
+                retention_ms,
+                replication_factor: replication_factor as u64,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
+            replica_set: shard_group.members,
+            created_at: now_ms,
+        }));
+        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
+            Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
+            Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(
+                ControlPlaneResponse::InternalError(
+                    "not the leader for this shard group — retry on another node".into(),
+                ),
+            ),
+            Some(Err(e)) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                format!("{e:?}"),
+            )),
+            None => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )),
+        })
+    }
+
+    async fn handle_delete_topic(&self, name: String) -> anyhow::Result<ClientResponse> {
+        let Some(shard_group) = self.swim_sender.resolve_shard_group(name.as_bytes().to_vec()).await? else {
+            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )));
+        };
+        let cmd = RaftCommand::Metadata(MetadataCommand::DeleteTopic(DeleteTopic { name }));
+        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
+            Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
+            Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(
+                ControlPlaneResponse::InternalError(
+                    "not the leader for this shard group — retry on another node".into(),
+                ),
+            ),
+            Some(Err(e)) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                format!("{e:?}"),
+            )),
+            None => ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound),
+        })
+    }
+
+    async fn handle_list_hosted_topics(&self) -> anyhow::Result<ClientResponse> {
+        let topics = self
+            .raft_sender
+            .get_topics()
+            .await
+            .into_iter()
+            .map(|name| TopicSummary {
+                name,
+                range_count: 0,
+                state: crate::connections::protocol::TopicState::Active,
+            })
+            .collect();
+        Ok(ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }))
+    }
+
+    async fn handle_data_plane(&self, request: DataPlaneRequest) -> ClientResponse {
+        match request {
+            DataPlaneRequest::Produce { .. } => todo!(),
+            DataPlaneRequest::Fetch { .. } => todo!(),
+            DataPlaneRequest::ListOffsets { .. } => todo!(),
+        }
+    }
+
+    async fn handle_admin(&self, request: AdminRequest) -> ClientResponse {
+        let res = match request {
+            AdminRequest::DescribeCluster => self.handle_describe_cluster().await,
+            AdminRequest::ListHostedTopicsWithStats => {
+                self.handle_list_hosted_topics_with_stats().await
+            }
+            AdminRequest::SplitRange { .. } => todo!(),
+            AdminRequest::GetShardInfo { key } => self.handle_get_shard_info(key).await,
+            AdminRequest::GetShardLeader { shard_group_id } => {
+                self.handle_get_shard_leader(shard_group_id).await
+            }
+        };
+        res.unwrap_or_else(|e| {
+            tracing::error!("client admin dispatch error: {e}");
+            ClientResponse::Admin(AdminResponse::InternalError(e.to_string()))
+        })
+    }
+
+    async fn handle_describe_cluster(&self) -> anyhow::Result<ClientResponse> {
+        let members = self.swim_sender.get_members().await?;
+        let nodes = members
+            .into_iter()
+            .map(|m| NodeInfo {
+                node_id: m.node_id.to_string(),
+                addr: m.addr.client_addr,
+                state: match m.state {
+                    SwimNodeState::Alive => NodeState::Alive,
+                    SwimNodeState::Suspect => NodeState::Suspect,
+                    SwimNodeState::Dead => NodeState::Dead,
+                },
+            })
+            .collect();
+        Ok(ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }))
+    }
+
+    async fn handle_list_hosted_topics_with_stats(&self) -> anyhow::Result<ClientResponse> {
+        let topics = self
+            .raft_sender
+            .get_topic_stats()
+            .await
+            .into_iter()
+            .map(|s| TopicStats {
+                name: s.name,
+                range_count: s.range_count,
+                total_bytes: s.total_bytes,
+            })
+            .collect();
+        Ok(ClientResponse::Admin(AdminResponse::TopicStats { topics }))
+    }
+
+    async fn handle_get_shard_info(&self, key: Vec<u8>) -> anyhow::Result<ClientResponse> {
+        let detail = self
+            .swim_sender
+            .get_shard_info(key)
+            .await?
+            .map(|(group, leader)| ShardDetail {
+                shard_group_id: group.id.0,
+                leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
+                leader_addr: leader.map(|e| e.leader_addr.client_addr),
+                member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
+            });
+        Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
+    }
+
+    async fn handle_get_shard_leader(&self, shard_group_id: u64) -> anyhow::Result<ClientResponse> {
+        let leader = self
+            .raft_sender
+            .get_leader(ShardGroupId(shard_group_id))
+            .await
+            .map(|n| n.to_string());
+        Ok(ClientResponse::Admin(AdminResponse::ShardLeader { leader }))
+    }
+}
+
+/// Writer task for a single client connection.
+///
+/// Drains `rx` and writes length-prefixed response frames to `write_half`.
+/// Exits when the sender side of `rx` is dropped (connection closed).
+#[allow(dead_code)]
+pub async fn run_client_writer(
+    mut write_half: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<(u64, ClientResponse)>,
+) -> anyhow::Result<()> {
+    while let Some((request_id, response)) = rx.recv().await {
+        let encoded = bincode::encode_to_vec(&response, SERDE_CONFIG)?;
+        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
+        write_half.write_all(&len.to_be_bytes()).await?;
+        write_half.write_all(&request_id.to_be_bytes()).await?;
+        write_half.write_all(&encoded).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use crate::clusters::raft::actor::MultiRaftActor;
+    use crate::clusters::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::clusters::raft::messages::MultiRaftActorCommand;
+    use crate::clusters::swims::actor::SwimActor;
+    use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand};
+    use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
+    use crate::connections::protocol::{
+        AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
+        ControlPlaneResponse, NodeState,
+    };
+
+    use super::ClientHandler;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    fn node_id(s: &str) -> NodeId {
+        NodeId::new(s)
+    }
+
+    fn test_shard_group() -> ShardGroup {
+        ShardGroup { id: ShardGroupId(42), members: vec![node_id("node-1")] }
+    }
+
+    fn swim_sender_with(
+        handler: impl Fn(SwimActorCommand) + Send + 'static,
+    ) -> crate::clusters::swims::actor::SwimSender {
+        let (tx, mut rx) = SwimActor::channel(16);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                handler(cmd);
+            }
+        });
+        tx
+    }
+
+    fn raft_sender_with(
+        handler: impl Fn(MultiRaftActorCommand) + Send + 'static,
+    ) -> crate::clusters::raft::actor::RaftSender {
+        let (tx, mut rx) = MultiRaftActor::channel(16);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                handler(cmd);
+            }
+        });
+        tx
+    }
+
+    #[tokio::test]
+    async fn create_topic_ok() {
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(test_shard_group()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        let resp = ClientHandler::new(swim, raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                retention_ms: 3_600_000,
+                replication_factor: 1,
+            }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)),
+            "expected TopicCreated, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_topic_shard_not_found() {
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(None);
+            }
+        });
+        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                retention_ms: 3_600_000,
+                replication_factor: 1,
+            }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(_))),
+            "expected InternalError, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_topic_ok() {
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(test_shard_group()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        let resp = ClientHandler::new(swim, raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::DeleteTopic {
+                name: "t1".into(),
+            }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)),
+            "expected TopicDeleted, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_hosted_topics() {
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::GetTopics { reply } = cmd {
+                let _ = reply.send(vec!["alpha".into(), "beta".into()]);
+            }
+        });
+        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics))
+            .await;
+        let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) = resp else {
+            panic!("expected TopicList, got {resp:?}");
+        };
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].name, "alpha");
+        assert_eq!(topics[1].name, "beta");
+    }
+
+    #[tokio::test]
+    async fn describe_cluster_maps_node_states() {
+        let node_addr = NodeAddress::test(addr(18001), addr(8081));
+        let nodes = vec![
+            SwimNode { node_id: node_id("n1"), addr: node_addr, state: SwimNodeState::Alive, incarnation: 0 },
+            SwimNode { node_id: node_id("n2"), addr: node_addr, state: SwimNodeState::Dead,  incarnation: 1 },
+        ];
+        let swim = {
+            let nodes = nodes.clone();
+            swim_sender_with(move |cmd| {
+                if let SwimActorCommand::Query(SwimQueryCommand::GetMembers { reply }) = cmd {
+                    let _ = reply.send(nodes.clone());
+                }
+            })
+        };
+        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+            .dispatch(ClientRequest::Admin(AdminRequest::DescribeCluster))
+            .await;
+        let ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: info }) = resp else {
+            panic!("expected ClusterInfo, got {resp:?}");
+        };
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].node_id, "n1");
+        assert!(matches!(info[0].state, NodeState::Alive));
+        assert!(matches!(info[1].state, NodeState::Dead));
+    }
+
+    #[tokio::test]
+    async fn get_shard_info_present() {
+        let node_addr = NodeAddress::test(addr(18001), addr(8081));
+        let group = test_shard_group();
+        let leader = ShardLeaderEntry { leader_node_id: node_id("n1"), leader_addr: node_addr, term: 3 };
+        let swim = {
+            let group = group.clone();
+            let leader = leader.clone();
+            swim_sender_with(move |cmd| {
+                if let SwimActorCommand::Query(SwimQueryCommand::GetShardInfo { reply, .. }) = cmd {
+                    let _ = reply.send(Some((group.clone(), Some(leader.clone()))));
+                }
+            })
+        };
+        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo { key: b"any".to_vec() }))
+            .await;
+        let ClientResponse::Admin(AdminResponse::ShardInfo { detail: Some(d) }) = resp else {
+            panic!("expected ShardInfo with detail, got {resp:?}");
+        };
+        assert_eq!(d.shard_group_id, 42);
+        assert_eq!(d.leader_node_id.as_deref(), Some("n1"));
+        assert_eq!(d.leader_addr, Some(addr(8081)));
+        assert_eq!(d.member_node_ids, vec!["node-1"]);
+    }
+
+    #[tokio::test]
+    async fn get_shard_info_absent() {
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(SwimQueryCommand::GetShardInfo { reply, .. }) = cmd {
+                let _ = reply.send(None);
+            }
+        });
+        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo { key: b"x".to_vec() }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::Admin(AdminResponse::ShardInfo { detail: None })),
+            "expected ShardInfo{{None}}, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_shard_leader() {
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::GetLeader { reply, .. } = cmd {
+                let _ = reply.send(Some(node_id("n1")));
+            }
+        });
+        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader { shard_group_id: 42 }))
+            .await;
+        let ClientResponse::Admin(AdminResponse::ShardLeader { leader }) = resp else {
+            panic!("expected ShardLeader, got {resp:?}");
+        };
+        assert_eq!(leader.as_deref(), Some("n1"));
+    }
+
+    #[tokio::test]
+    async fn list_topic_stats() {
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::GetTopicStats { reply } = cmd {
+                let _ = reply.send(vec![MetadataTopicStats { name: "t1".into(), range_count: 2, total_bytes: 1024 }]);
+            }
+        });
+        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+            .dispatch(ClientRequest::Admin(AdminRequest::ListHostedTopicsWithStats))
+            .await;
+        let ClientResponse::Admin(AdminResponse::TopicStats { topics }) = resp else {
+            panic!("expected TopicStats, got {resp:?}");
+        };
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].name, "t1");
+        assert_eq!(topics[0].range_count, 2);
+        assert_eq!(topics[0].total_bytes, 1024);
     }
 }

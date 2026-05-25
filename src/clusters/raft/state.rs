@@ -136,6 +136,10 @@ impl Raft {
         self.state_machine.topic_names()
     }
 
+    pub(crate) fn topic_stats(&self) -> Vec<crate::clusters::metadata::TopicStats> {
+        self.state_machine.topic_stats()
+    }
+
     #[cfg(test)]
     pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
         &self.state_machine

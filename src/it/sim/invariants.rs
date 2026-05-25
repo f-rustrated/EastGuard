@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use crate::clusters::SwimNodeState;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
-use crate::connections::request::{ConnectionRequests, QueryCommand, ShardInfoResponse, TopicSummary};
+use crate::connections::protocol::{
+    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
+    ControlPlaneResponse, ShardDetail, TopicSummary,
+};
 use crate::it::helpers::get_members;
 use crate::net::TcpStream;
 
@@ -145,18 +148,21 @@ pub(super) async fn query_shard_leader(
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetShardLeader {
-            shard_group_id,
-        }))
+        .write(0, &ClientRequest::Admin(AdminRequest::GetShardLeader { shard_group_id }))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response): (_, ClientResponse) =
+        tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    match response {
+        ClientResponse::Admin(AdminResponse::ShardLeader { leader }) => Ok(leader),
+        _ => Ok(None),
+    }
 }
 
 pub(super) async fn query_shard_info(
     host: &str,
     port: u16,
     key: &[u8],
-) -> turmoil::Result<Option<ShardInfoResponse>> {
+) -> turmoil::Result<Option<ShardDetail>> {
     let stream = tokio::time::timeout(
         Duration::from_secs(2),
         TcpStream::connect((host, port)),
@@ -166,11 +172,14 @@ pub(super) async fn query_shard_info(
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetShardInfo {
-            key: key.to_vec(),
-        }))
+        .write(0, &ClientRequest::Admin(AdminRequest::GetShardInfo { key: key.to_vec() }))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response): (_, ClientResponse) =
+        tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    match response {
+        ClientResponse::Admin(AdminResponse::ShardInfo { detail }) => Ok(detail),
+        _ => Ok(None),
+    }
 }
 
 pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<TopicSummary>> {
@@ -183,7 +192,12 @@ pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<T
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(&ConnectionRequests::Query(QueryCommand::GetTopics))
+        .write(0, &ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics))
         .await?;
-    Ok(tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??)
+    let (_, response): (_, ClientResponse) =
+        tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
+    match response {
+        ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),
+        _ => Ok(vec![]),
+    }
 }

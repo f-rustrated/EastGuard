@@ -146,6 +146,18 @@ impl RaftSender {
         }
         recv.await.unwrap_or_default()
     }
+
+    pub(crate) async fn get_topic_stats(&self) -> Vec<crate::clusters::metadata::TopicStats> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self.0
+            .send(MultiRaftActorCommand::GetTopicStats { reply: send })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        recv.await.unwrap_or_default()
+    }
 }
 
 impl From<RaftSender> for mpsc::Sender<MultiRaftActorCommand> {

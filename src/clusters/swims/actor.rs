@@ -101,19 +101,6 @@ impl SwimSender {
         Ok(recv.await?)
     }
 
-    pub(crate) async fn resolve_shard_leader(
-        &self,
-        shard_group_id: ShardGroupId,
-    ) -> anyhow::Result<Option<ShardLeaderEntry>> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveShardLeader {
-            shard_group_id,
-            reply: send,
-        })
-        .await?;
-        Ok(recv.await?)
-    }
-
     pub(crate) async fn get_shard_info(
         &self,
         key: Vec<u8>,
@@ -121,6 +108,12 @@ impl SwimSender {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(SwimQueryCommand::GetShardInfo { key, reply: send })
             .await?;
+        Ok(recv.await?)
+    }
+
+    pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<crate::clusters::SwimNode>> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.send(SwimQueryCommand::GetMembers { reply: send }).await?;
         Ok(recv.await?)
     }
 
