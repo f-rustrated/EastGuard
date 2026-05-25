@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::clusters::NodeId;
-use crate::clusters::metadata::MetadataCommand;
 use crate::clusters::metadata::state_machine::MetadataStateMachine;
+use crate::clusters::metadata::{MetadataCommand, TopicStats};
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::*;
 use crate::clusters::raft::storage::RaftPersistentState;
 use crate::clusters::swims::ShardGroupId;
+use crate::data_plane::SegmentKey;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -137,15 +138,26 @@ impl Raft {
         self.state_machine.topic_names()
     }
 
-    pub(crate) fn topic_stats(&self) -> Vec<crate::clusters::metadata::TopicStats> {
+    pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
         self.state_machine.topic_stats()
     }
 
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(crate::data_plane::SegmentKey, Vec<NodeId>)> {
+    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
         self.state_machine.active_segments_for_node(node_id)
+    }
+
+    pub(crate) fn has_topic(&self, topic_id: &crate::clusters::metadata::TopicId) -> bool {
+        self.state_machine.get_topic(topic_id).is_some()
+    }
+
+    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<Vec<NodeId>> {
+        let topic = self.state_machine.get_topic(&key.topic_id)?;
+        let range = topic.ranges.get(&key.range_id)?;
+        let seg = range.segments.get(&key.segment_id)?;
+        Some(seg.replica_set.clone())
     }
 
     #[cfg(test)]

@@ -120,6 +120,9 @@ impl StartUp {
             std::hash::Hash::hash(&self.rng_seed, &mut hasher);
             std::hash::Hasher::finish(&hasher)
         };
+        // D3: data_transport_tx wired to DataTransportActor in Batch 3.
+        // For now, create a channel whose receiver is dropped — sends are no-ops.
+        let (data_transport_tx, _) = mpsc::channel(1);
         tokio::spawn(MultiRaftActor::run(
             node_id,
             election_jitter_seed,
@@ -128,6 +131,7 @@ impl StartUp {
             raft_transport_tx,
             raft_ticker_tx,
             swim_sender.clone(),
+            data_transport_tx,
         ));
 
         // Client handler

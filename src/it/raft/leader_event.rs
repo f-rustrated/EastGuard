@@ -128,6 +128,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     node_id.hash(&mut h);
                     h.finish()
                 };
+                let (data_tx, _) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(MultiRaftActor::run(
                     node_id,
                     election_jitter_seed,
@@ -136,6 +137,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     transport_tx,
                     ticker_tx,
                     swim_tx,
+                    data_tx,
                 ));
 
                 raft_tx

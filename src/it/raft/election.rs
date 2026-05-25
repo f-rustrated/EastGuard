@@ -118,6 +118,7 @@ async fn run_raft_node(
         node_id.hash(&mut h);
         h.finish()
     };
+    let (data_tx, _) = tokio::sync::mpsc::channel(1);
     tokio::spawn(MultiRaftActor::run(
         node_id,
         election_jitter_seed,
@@ -126,6 +127,7 @@ async fn run_raft_node(
         transport_tx,
         ticker_tx,
         swim_tx,
+        data_tx,
     ));
 
     raft_tx
