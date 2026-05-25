@@ -311,10 +311,14 @@ the actor boundary on every request.
 **Produce**
 
 ```
-Request:  { topic_name: String, routing_key: Vec<u8>, value: Vec<u8>,
-            producer_id: u64, sequence_no: u64 }
-Response: { offset: u64 } | NotLeader | ShardNotLocal | TopicNotFound | RangeSplitting { ... }
+Request:  { topic_name: String, routing_key: Vec<u8>, data: Vec<u8>, record_count: u32 }
+Response: { entry_id: u64 } | NotLeader | ShardNotLocal | TopicNotFound | RangeSplitting { ... }
 ```
+
+`data` is a pre-serialized, optionally compressed blob produced by the client. The broker stamps
+an `entry_id` and stores, replicates, and serves this payload opaque — it never parses or
+re-serializes record contents. `record_count` tells consumers how many records are inside the
+blob; the broker forwards it alongside the payload without inspecting it.
 
 `routing_key` is treated as opaque bytes by the server — it is used solely to locate the target
 range via `keyspace_start <= routing_key < keyspace_end`. The client owns partitioning strategy:
@@ -329,13 +333,12 @@ partitioning intent.
 
 Flow:
 
-1. **Cache lookup.** Look up `topic_name` in `TopicRoutingCache`.
-   - Cache miss → send `MultiRaftActorCommand::GetTopicRouting { topic_name }` to resolve from
-     local `MetadataStateMachine`. If the shard group is not hosted on this node →
-     return `ShardNotLocal { hint_node }` (resolved from Topology).
-   - Topic absent from `MetadataStateMachine` on the owning node → return `TopicNotFound`.
+1. **Cache lookup.** Look up `topic_name` in the local routing cache.
+   - Cache miss → resolve from local metadata state. If the shard group is not hosted on this
+     node → return `ShardNotLocal { hint_node }`.
+   - Topic absent on the owning node → return `TopicNotFound`.
 
-2. **Range resolution.** Linear scan `TopicRouting::active_ranges` (sorted by `keyspace_start`,
+2. **Range resolution.** Linear scan active ranges (sorted by `keyspace_start`,
    at most ~100 entries) for the first range where `routing_key < keyspace_end`. Retrieve
    `active_segment_id` and `replica_set`.
 
@@ -343,67 +346,74 @@ Flow:
    - This node is the segment leader → continue.
    - Not the segment leader → return `NotLeader { leader_addr: replica_set[0] address }`.
 
-4. **Write.** Send append request to `DataPlaneActor`. Await the assigned offset.
+4. **Write.** Send append request to the data plane. Await the assigned `entry_id`.
    - Active segment sealed (range split in progress) → invalidate cache entry, return
      `RangeSplitting { left_range_id, right_range_id, split_point }`. Client routes to the
      correct child range:
      `routing_key < split_point` → `left_range_id`, otherwise → `right_range_id`.
-   - Committed → return `{ offset }`.
+   - Committed → return `{ entry_id }`.
 
-`(producer_id, sequence_no)` is an application-level idempotency key embedded in every record.
-The broker does **not** deduplicate — this is an app-level primitive for exactly-once semantics.
+Application-level idempotency keys (`producer_id`, `sequence_no`) are embedded inside `data`
+by the producer client. The broker does **not** deduplicate — this is an app-level primitive
+for exactly-once semantics.
 
 **Fetch**
 
 ```
-Request:  { topic_name: String, range_id: u64, offset: u64, max_bytes: u32 }
-Response: { records: Vec<Record>, next_offset: u64, range_status: RangeStatus }
-        | NotLeader | ShardNotLocal | OffsetOutOfRange
+Request:  { topic_name: String, range_id: u64, entry_id: u64, record_index: u32, max_bytes: u32 }
+Response: { entries: Vec<Entry>, next_entry_id: u64, range_status: RangeStatus }
+        | NotLeader | ShardNotLocal | EntryIdOutOfRange
+
+Entry:    { entry_id: u64, data: Vec<u8>, record_count: u32 }
 
 RangeStatus:
   Active
-  Sealed { end_offset: u64, transition: RangeTransition }
+  Sealed { end_entry_id: u64, transition: RangeTransition }
 
 RangeTransition:
   Split { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> }
   Merged { merged_range_id: u64 }
 ```
 
-`high_watermark` is intentionally absent from the response — the client polls when `records` is
+`entry_id` and `record_index` together identify the consumer's read position. `record_index` is
+the index of the first record to return within that entry (0 = start of entry). The consumer
+tracks position as `(entry_id, record_index)` client-side.
+
+`high_watermark` is intentionally absent from the response — the client polls when `entries` is
 empty regardless. Use `ListOffsets` for consumer lag monitoring.
 
 Flow:
 
-1. **Cache lookup.** Look up `topic_name` in `TopicRoutingCache`. Same miss path as `Produce`
+1. **Cache lookup.** Look up `topic_name` in the local routing cache. Same miss path as `Produce`
    (`ShardNotLocal` or `TopicNotFound`).
 
-2. **Range lookup.** Retrieve `RangeRouting` by `range_id` from `TopicRouting::all_ranges`
-   (covers both active and sealed ranges). Get `replica_set`.
+2. **Range lookup.** Retrieve range routing by `range_id` (covers both active and sealed ranges).
+   Get `replica_set`.
 
 3. **Replica check.** Any node in `replica_set` may serve reads.
    - This node is in `replica_set` → continue.
    - Not in `replica_set` → return `NotLeader { leader_addr: replica_set[0] address }`.
 
-4. **Read.** Read from segment cache/file starting at `offset`, up to `max_bytes`. Serve only
-   up to `commit_offset` (followers track this via piggybacked `ReplicaAppend`).
-   - `offset > commit_offset` → return `OffsetOutOfRange`.
-   - Range is sealed → populate `Sealed { end_offset, transition }` from `MetadataStateMachine`.
-   - Otherwise → return `records` with `range_status: Active`.
-   - `next_offset`: if `records` is non-empty, `last_record.offset + 1`; if empty, the requested
-     `offset` unchanged. Only present on success — `OffsetOutOfRange` carries no `next_offset`.
+4. **Read.** Read entries from segment cache/file starting at `entry_id`, up to `max_bytes`. Serve
+   only up to `committed_entry_id` (followers track this via piggybacked replication messages).
+   - `entry_id > committed_entry_id` → return `EntryIdOutOfRange`.
+   - Range is sealed → populate `Sealed { end_entry_id, transition }`.
+   - Otherwise → return `entries` with `range_status: Active`.
+   - `next_entry_id`: if `entries` is non-empty, `last_entry.entry_id + 1`; if empty, the
+     requested `entry_id` unchanged. Only present on success.
 
 **Client transition logic:**
 
-*Split* — consumer receives `Sealed { end_offset: E, Split { left: L, right: RR, split_point: SP } }`:
-1. Drain range R to `end_offset` E (may require additional Fetch calls if `max_bytes` was small).
-2. Open two new Fetch streams: `Fetch(L, offset=0)` and `Fetch(RR, offset=0)`.
+*Split* — consumer receives `Sealed { end_entry_id: E, Split { left: L, right: RR, split_point: SP } }`:
+1. Drain range R to `end_entry_id` E (may require additional Fetch calls if `max_bytes` was small).
+2. Open two new Fetch streams: `Fetch(L, entry_id=0, record_index=0)` and `Fetch(RR, entry_id=0, record_index=0)`.
 3. Process L and RR independently.
 
 *Merge* — consumer tracks both source ranges L and RR. Each eventually returns
-`Sealed { end_offset, Merged { merged_range_id: M } }`:
-1. Drain L to its `end_offset`. Mark L done.
-2. Drain RR to its `end_offset`. Mark RR done.
-3. Only after both are done → open one new Fetch stream from M at offset 0.
+`Sealed { end_entry_id, Merged { merged_range_id: M } }`:
+1. Drain L to its `end_entry_id`. Mark L done.
+2. Drain RR to its `end_entry_id`. Mark RR done.
+3. Only after both are done → open one new Fetch stream from M at `entry_id=0, record_index=0`.
 
 The consumer naturally sees both sealed events because it tracks all active ranges of a topic.
 No extra metadata query is needed to coordinate the merge.
@@ -412,44 +422,44 @@ No extra metadata query is needed to coordinate the merge.
 
 ```
 Request:  { topic_name: String, range_id: u64 }
-Response: { start_offset: u64, commit_offset: u64 } | NotLeader | ShardNotLocal
+Response: { start_entry_id: u64, committed_entry_id: u64 } | NotLeader | ShardNotLocal
 ```
 
-`commit_offset`: one past the last replicated and committed record — the next offset to be
-written. Matches `SegmentCache::commit_offset` in the implementation. Consumers use
-`commit_offset - current_offset` to calculate lag.
+`committed_entry_id`: the `entry_id` of the last entry replicated and committed — one past this
+is the next entry to be written. Consumers use `committed_entry_id - current_entry_id` to
+calculate lag.
 
 Flow:
 
 1. **Cache lookup.** Same miss path as `Fetch` step 1 (`ShardNotLocal` or `TopicNotFound`).
 2. **Replica check.** Any node in `replica_set` may serve — same check as `Fetch` step 3.
    - Not in `replica_set` → return `NotLeader { leader_addr: replica_set[0] address }`.
-3. **Read.** Return `start_offset` (first offset of the range) and `commit_offset` from local
-   segment state. No disk I/O needed.
+3. **Read.** Return `start_entry_id` (first entry of the range) and `committed_entry_id` from
+   local segment state. No disk I/O needed.
 
 **CommitOffset** *(Phase 2)*
 
 ```
 Request:  { consumer_group: String, topic_name: String, range_id: u64,
-            offset: u64, generation_id: u32 }
+            entry_id: u64, record_index: u32, generation_id: u32 }
 Response: Ok | StaleGeneration | NotLeader
 ```
 
-Offset is written to the dedicated offset log (DataPlaneActor segment) by the coordinator.
-The coordinator (Raft leader for the shard group) validates `generation_id` before writing.
-Non-coordinators return `NotLeader { leader_addr: coordinator_addr }`. See Phase 2 offset
-log design — committed offsets are NOT Raft-proposed; they go directly to the offset log segment.
+Consumer position `(entry_id, record_index)` is written to the dedicated offset log by the
+coordinator. The coordinator validates `generation_id` before writing. Non-coordinators return
+`NotLeader { leader_addr: coordinator_addr }`. Committed offsets are NOT Raft-proposed — they
+go directly to the offset log segment.
 
 **FetchCommittedOffset** *(Phase 2)*
 
 ```
 Request:  { consumer_group: String, topic_name: String, range_id: u64 }
-Response: { offset: Option<u64> } | NotLeader
+Response: { entry_id: Option<u64>, record_index: Option<u32> } | NotLeader
 ```
 
 Read-only query against the coordinator's in-memory offset map (rebuilt from the offset log on
 failover). Must route to the coordinator (Raft leader) — followers do not maintain this map.
-Returns `None` if no offset has been committed for this group/range yet.
+Returns `None` fields if no offset has been committed for this group/range yet.
 
 ## Topic Routing Cache
 
@@ -785,37 +795,37 @@ new impl, no protocol changes.
 
 Delivery is at-least-once. When a range moves from consumer A to consumer B:
 
-- B starts from A's last committed offset
-- Records A fetched but did not commit are re-delivered to B
+- B starts from A's last committed position
+- Entries A fetched but did not commit are re-delivered to B
 - `generation_id` fencing ensures A cannot commit after losing the range
 
-Applications requiring exactly-once deduplicate using `record_id = (producer_id, sequence_no)`
-embedded in every record. The broker does not deduplicate.
+Applications requiring exactly-once deduplicate using idempotency keys embedded inside the entry
+payload by the producer client. The broker does not deduplicate.
 
 ## Consumer Offset Storage *(Phase 2)*
 
-Committed offsets are Raft-replicated via `MetadataCommand::CommitConsumerOffset`. This means:
+Committed positions are Raft-replicated via `MetadataCommand::CommitConsumerOffset`. This means:
 
-- Offsets survive coordinator (Raft leader) failover — the new leader picks up from persisted state.
+- Positions survive coordinator (Raft leader) failover — the new leader picks up from persisted state.
 - `CommitOffset` latency = Raft round-trip (~1s typical at the current heartbeat interval).
-  For high-throughput consumers, batch offset commits (commit every N records or every T ms).
-- The `MetadataStateMachine` stores `committed_offsets: HashMap<RangeId, u64>` inside
-  `ConsumerGroupMeta`. The offset is per-group per-range (not per-member) — when a range is
+  For high-throughput consumers, batch position commits (commit every N entries or every T ms).
+- The `MetadataStateMachine` stores `committed_positions: HashMap<RangeId, (entry_id, record_index)>`
+  inside `ConsumerGroupMeta`. The position is per-group per-range (not per-member) — when a range is
   reassigned, the new owner picks up from the group's last committed position.
 
 **Commit flow**:
 
 ```
-Consumer → CommitOffset(group, topic, range, offset, generation_id)
+Consumer → CommitOffset(group, topic, range, entry_id, record_index, generation_id)
     → Server: validate generation_id matches ConsumerGroupMeta.generation_id
     → Server: Raft propose CommitConsumerOffset
-    → On commit: MetadataStateMachine updates committed_offsets[range_id] = offset
+    → On commit: MetadataStateMachine updates committed_positions[range_id] = (entry_id, record_index)
     → Server: respond Ok
 ```
 
 **Fetch committed offset**: read-only query against local `MetadataStateMachine`. Any node can serve
-it (may be stale on followers, acceptable for consumer recovery). Returns `None` if no offset has
-been committed for this group/range.
+it (may be stale on followers, acceptable for consumer recovery). Returns `None` fields if no
+position has been committed for this group/range.
 
 ## Client Routing
 
@@ -837,8 +847,8 @@ Clients connect to any seed node. The server handles redirect via `NotLeader { l
 Foundation. All subsequent PRs depend on this.
 
 - [x] Extend frame format: `[len: u32][request_id: u64][payload: N bytes]` for both request and response
-- [ ] Define `ClientRequest` enum: `ControlPlane(ControlPlaneRequest)`, `DataPlane(DataPlaneRequest)`, `Admin(AdminRequest)`
-- [ ] Define `ClientResponse` enum: `ControlPlane(ControlPlaneResponse)`, `DataPlane(DataPlaneResponse)`, `Admin(AdminResponse)` + shared error variants (`InternalError`, `NotLeader`, `ShardNotLocal`)
+- [x] Define `ClientRequest` enum: `ControlPlane(ControlPlaneRequest)`, `DataPlane(DataPlaneRequest)`, `Admin(AdminRequest)`
+- [x] Define `ClientResponse` enum: `ControlPlane(ControlPlaneResponse)`, `DataPlane(DataPlaneResponse)`, `Admin(AdminResponse)` + shared error variants (`InternalError`, `NotLeader`, `ShardNotLocal`)
 - [ ] Split connection handler into reader task + writer task connected by `mpsc::Sender<(u64, ClientResponse)>`
   - Reader task: reads `(request_id, ClientRequest)` frames, spawns one handler task per request
   - Writer task: reads `(request_id, ClientResponse)` from channel, encodes and writes frames

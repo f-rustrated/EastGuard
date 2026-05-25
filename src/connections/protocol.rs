@@ -1,0 +1,199 @@
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+
+use bincode::{Decode, Encode};
+
+// ── Top-level dispatch ─────────────────────────────────────────────────────
+
+#[derive(Encode, Decode)]
+pub enum ClientRequest {
+    ControlPlane(ControlPlaneRequest),
+    DataPlane(DataPlaneRequest),
+    Admin(AdminRequest),
+}
+
+#[derive(Encode, Decode)]
+pub enum ClientResponse {
+    ControlPlane(ControlPlaneResponse),
+    DataPlane(DataPlaneResponse),
+    Admin(AdminResponse),
+}
+
+// ── Control Plane ──────────────────────────────────────────────────────────
+//
+// The server resolves the correct destination internally and forwards the request
+// at most once. Clients never need to retry on a different node — on forwarding
+// failure a generic error is returned.
+
+#[derive(Encode, Decode)]
+pub enum ControlPlaneRequest {
+    CreateTopic { name: String, retention_ms: u64, replication_factor: u8 },
+    DeleteTopic { name: String },
+    ListHostedTopics,
+    DescribeTopic { name: String },
+}
+
+#[derive(Encode, Decode)]
+pub enum ControlPlaneResponse {
+    // CreateTopic
+    TopicCreated,
+    AlreadyExists,
+    // DeleteTopic
+    TopicDeleted,
+    TopicNotFound,
+    // ListHostedTopics
+    TopicList { topics: Vec<TopicSummary> },
+    // DescribeTopic
+    TopicDetail(TopicDetail),
+    // All control plane operations
+    InternalError(String),
+}
+
+#[derive(Encode, Decode)]
+pub struct TopicSummary {
+    pub name: String,
+    pub range_count: u32,
+    pub state: TopicState,
+}
+
+#[derive(Encode, Decode)]
+pub enum TopicState {
+    Active,
+    Deleting,
+}
+
+#[derive(Encode, Decode)]
+pub struct TopicDetail {
+    pub name: String,
+    pub ranges: Vec<RangeDetail>,
+}
+
+#[derive(Encode, Decode)]
+pub struct RangeDetail {
+    pub range_id: u64,
+    pub keyspace_start: Vec<u8>,
+    pub keyspace_end: Vec<u8>,
+    pub active_segment_id: Option<u64>,
+    pub state: RangeState,
+}
+
+#[derive(Encode, Decode)]
+pub enum RangeState {
+    Active,
+    Sealed,
+    Deleting,
+}
+
+// ── Data Plane ─────────────────────────────────────────────────────────────
+//
+// The client is responsible for routing to the correct node using its local
+// routing cache. When this node is not the right destination, a redirect error
+// is returned so the client can reconnect and retry.
+
+#[derive(Encode, Decode)]
+pub enum DataPlaneRequest {
+    Produce {
+        topic_name: String,
+        // Used by the server to locate the target range; never stored.
+        routing_key: Vec<u8>,
+        // Pre-serialized and optionally compressed blob produced by the client.
+        // The broker stamps an entry_id and stores/replicates this opaque payload as-is.
+        data: Vec<u8>,
+        record_count: u32,
+    },
+    Fetch {
+        topic_name: String,
+        range_id: u64,
+        entry_id: u64,
+        // Position within the entry to start from; 0 means the first record.
+        record_index: u32,
+        max_bytes: u32,
+    },
+    ListOffsets {
+        topic_name: String,
+        range_id: u64,
+    },
+}
+
+#[derive(Encode, Decode)]
+pub enum DataPlaneResponse {
+    // Produce
+    Produced { entry_id: u64 },
+    RangeSplitting { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> },
+    // Fetch
+    Fetched { entries: Vec<Entry>, next_entry_id: u64, range_status: RangeStatus },
+    EntryIdOutOfRange,
+    // ListOffsets
+    Offsets { start_entry_id: u64, committed_entry_id: u64 },
+    // Redirect errors — client reconnects and retries on the indicated node
+    NotLeader { leader_addr: Option<SocketAddr> },
+    ShardNotLocal { hint_node: SocketAddr },
+    TopicNotFound,
+    InternalError(String),
+}
+
+/// A single entry as served to the consumer.
+/// The broker never parses `data` — it is stored and replicated opaque.
+/// Consumers decompress and parse records from `data` using `record_count`.
+#[derive(Encode, Decode)]
+pub struct Entry {
+    pub entry_id: u64,
+    pub data: Vec<u8>,
+    pub record_count: u32,
+}
+
+#[derive(Encode, Decode)]
+pub enum RangeStatus {
+    Active,
+    Sealed { end_offset: u64, transition: RangeTransition },
+}
+
+#[derive(Encode, Decode)]
+pub enum RangeTransition {
+    Split { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> },
+    Merged { merged_range_id: u64 },
+}
+
+// ── Admin ──────────────────────────────────────────────────────────────────
+
+#[derive(Encode, Decode)]
+pub enum AdminRequest {
+    DescribeCluster,
+    ListHostedTopicsWithStats,
+    SplitRange { topic_name: String, range_id: u64, split_point: Vec<u8> },
+}
+
+#[derive(Encode, Decode)]
+pub enum AdminResponse {
+    // DescribeCluster
+    ClusterInfo { nodes: Vec<NodeInfo> },
+    // ListHostedTopicsWithStats
+    TopicStats { topics: Vec<TopicStats> },
+    // SplitRange
+    RangeSplit,
+    InvalidSplitPoint,
+    InternalError(String),
+}
+
+#[derive(Encode, Decode)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub addr: SocketAddr,
+    pub state: NodeState,
+}
+
+#[derive(Encode, Decode)]
+pub enum NodeState {
+    Alive,
+    Suspect,
+    Dead,
+}
+
+#[derive(Encode, Decode)]
+pub struct TopicStats {
+    pub name: String,
+    pub range_count: u32,
+    pub total_records: u64,
+    pub total_bytes: u64,
+}
