@@ -539,6 +539,18 @@ impl TopicMeta {
         Ok((left_id, right_id))
     }
 
+    pub(crate) fn execute_merge(&mut self, cmd: MergeRange) -> Result<RangeId, MetadataError> {
+        let merged_id = RangeId(self.next_range_id);
+        let [r1, r2] = self.get_ranges_mut([&cmd.range_id_1, &cmd.range_id_2])?;
+        let merged = r1.merge(r2, merged_id, cmd.merged_replica_set, cmd.created_at)?;
+        self.ranges.insert(merged_id, merged);
+        self.active_ranges
+            .retain(|id| *id != cmd.range_id_1 && *id != cmd.range_id_2);
+        self.insert_range_sorted(merged_id);
+        self.next_range_id += 1;
+        Ok(merged_id)
+    }
+
     pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
         let start = &self.ranges[&range_id].keyspace_start;
         let pos = self
