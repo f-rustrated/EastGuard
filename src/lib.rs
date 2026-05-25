@@ -21,7 +21,11 @@ mod test_traits;
 use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
 use crate::clusters::raft::transport::RaftTransportActor;
 
+use crate::clusters::raft::messages::{RaftTimer, RaftTransportCommand};
+use crate::clusters::swims::OutboundPacket;
+use crate::clusters::swims::SwimTimer;
 use crate::clusters::swims::actor::SwimSender;
+use crate::schedulers::ticker_message::TickerCommand;
 use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -56,15 +60,15 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         // SWIM channels
         let (swim_sender, swim_mailbox) = SwimActor::channel(100);
-        let (tx_outbound, rx_outbound) = mpsc::channel(100);
-        let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel(64);
+        let (tx_outbound, rx_outbound) = mpsc::channel::<Box<[OutboundPacket]>>(100);
+        let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel::<Box<[TickerCommand<SwimTimer>]>>(64);
 
         // Raft channels
         let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
-        let (raft_transport_tx, raft_transport_rx) = mpsc::channel(100);
+        let (raft_transport_tx, raft_transport_rx) = mpsc::channel::<Box<[RaftTransportCommand]>>(100);
         // Each vnode can have both an election and heartbeat timer active, so capacity
         // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
-        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel(self.env.vnodes_per_node as usize * 16);
+        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel::<Box<[TickerCommand<RaftTimer>]>>(self.env.vnodes_per_node as usize * 16);
 
         // Build SWIM state and extract node_id before handing state to the actor
         let state = self.env.swim(self.rng_seed);

@@ -27,8 +27,8 @@ impl MultiRaftActor {
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
-        transport_tx: mpsc::Sender<RaftTransportCommand>,
-        scheduler_tx: mpsc::Sender<TickerCommand<RaftTimer>>,
+        transport_tx: mpsc::Sender<Box<[RaftTransportCommand]>>,
+        scheduler_tx: mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>,
         swim_tx: SwimSender,
     ) {
         let mut store = MultiRaft::new(node_id, election_jitter_seed, storage);
@@ -49,55 +49,42 @@ impl MultiRaftActor {
 
     async fn flush_events(
         store: &mut MultiRaft,
-        transport_tx: &mpsc::Sender<RaftTransportCommand>,
-        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
+        transport_tx: &mpsc::Sender<Box<[RaftTransportCommand]>>,
+        scheduler_tx: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>,
         swim_tx: &SwimSender,
     ) {
         let mut packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>> = HashMap::new();
+        let mut timer_cmds = Vec::new();
+        let mut transport_cmds = Vec::new();
         for event in store.flush() {
-            Self::route_event(
-                event,
-                &mut packets_by_target,
-                transport_tx,
-                scheduler_tx,
-                swim_tx,
-            )
-            .await;
-        }
-        Self::send_batched_packets(packets_by_target, transport_tx).await;
-    }
-
-    async fn route_event(
-        event: RaftEvent,
-        packets: &mut HashMap<NodeId, Vec<OutboundRaftPacket>>,
-        transport_tx: &mpsc::Sender<RaftTransportCommand>,
-        scheduler_tx: &mpsc::Sender<TickerCommand<RaftTimer>>,
-        swim_tx: &SwimSender,
-    ) {
-        match event {
-            RaftEvent::OutboundRaftPacket(pkt) => {
-                packets.entry(pkt.target.clone()).or_default().push(pkt);
-            }
-            RaftEvent::Timer(cmd) => {
-                let _ = scheduler_tx.send(cmd.into()).await;
-            }
-            RaftEvent::LeaderChange(lc) => {
-                let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
-            }
-            RaftEvent::DisconnectPeer(node_id) => {
-                let _ = transport_tx
-                    .send(RaftTransportCommand::DisconnectPeer(node_id))
-                    .await;
+            match event {
+                RaftEvent::OutboundRaftPacket(pkt) => {
+                    packets_by_target
+                        .entry(pkt.target.clone())
+                        .or_default()
+                        .push(pkt);
+                }
+                RaftEvent::Timer(cmd) => timer_cmds.push(cmd.into()),
+                RaftEvent::LeaderChange(lc) => {
+                    let _ = swim_tx.send(SwimCommand::AnnounceShardLeader(lc)).await;
+                }
+                RaftEvent::DisconnectPeer(node_id) => {
+                    transport_cmds.push(RaftTransportCommand::DisconnectPeer(node_id));
+                }
             }
         }
-    }
-
-    async fn send_batched_packets(
-        packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
-        transport_tx: &mpsc::Sender<RaftTransportCommand>,
-    ) {
         for packets in packets_by_target.into_values() {
-            let _ = transport_tx.send(RaftTransportCommand::Send(packets)).await;
+            transport_cmds.push(RaftTransportCommand::Send(packets));
+        }
+        if !transport_cmds.is_empty() {
+            let _ = transport_tx
+                .send(transport_cmds.into_boxed_slice())
+                .await;
+        }
+        if !timer_cmds.is_empty() {
+            let _ = scheduler_tx
+                .send(timer_cmds.into_boxed_slice())
+                .await;
         }
     }
 }

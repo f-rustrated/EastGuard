@@ -17,16 +17,40 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 
+use std::collections::VecDeque;
 use tokio::{sync::mpsc, time};
 
 use super::*;
 
+struct PacketReceiver {
+    rx: mpsc::Receiver<Box<[OutboundPacket]>>,
+    buf: VecDeque<OutboundPacket>,
+}
+
+impl PacketReceiver {
+    fn new(rx: mpsc::Receiver<Box<[OutboundPacket]>>) -> Self {
+        Self {
+            rx,
+            buf: VecDeque::new(),
+        }
+    }
+
+    async fn recv(&mut self) -> Option<OutboundPacket> {
+        if let Some(pkt) = self.buf.pop_front() {
+            return Some(pkt);
+        }
+        let batch = self.rx.recv().await?;
+        self.buf.extend(batch);
+        self.buf.pop_front()
+    }
+}
+
 #[allow(dead_code)]
 struct TestHarness {
     pub tx_in: mpsc::Sender<SwimActorCommand>,
-    pub tx_out: mpsc::Sender<OutboundPacket>,
-    pub rx_out: Option<mpsc::Receiver<OutboundPacket>>,
-    pub ticker_tx: mpsc::Sender<TickerCommand<SwimTimer>>,
+    pub tx_out: mpsc::Sender<Box<[OutboundPacket]>>,
+    pub rx_out: Option<mpsc::Receiver<Box<[OutboundPacket]>>>,
+    pub ticker_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
     pub local_addr: SocketAddr,
     pub config: JoinConfig,
 }
@@ -64,7 +88,7 @@ impl TestHarness {
 /// Call `add()` for every harness, then `spawn()` to start routing.
 struct NetworkBridge {
     routes: HashMap<SocketAddr, mpsc::Sender<SwimActorCommand>>,
-    inbounds: Vec<(SocketAddr, mpsc::Receiver<OutboundPacket>)>,
+    inbounds: Vec<(SocketAddr, mpsc::Receiver<Box<[OutboundPacket]>>)>,
 }
 
 impl NetworkBridge {
@@ -87,14 +111,16 @@ impl NetworkBridge {
         for (sender_addr, mut rx) in self.inbounds {
             let routes = Arc::clone(&routes);
             tokio::spawn(async move {
-                while let Some(pkt) = rx.recv().await {
-                    if let Some(tx) = routes.get(&pkt.target) {
-                        let _ = tx
-                            .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
-                                src: sender_addr,
-                                packet: pkt.packet().clone(),
-                            }))
-                            .await;
+                while let Some(batch) = rx.recv().await {
+                    for pkt in batch {
+                        if let Some(tx) = routes.get(&pkt.target) {
+                            let _ = tx
+                                .send(SwimActorCommand::Protocol(SwimCommand::PacketReceived {
+                                    src: sender_addr,
+                                    packet: pkt.packet().clone(),
+                                }))
+                                .await;
+                        }
                     }
                 }
             });
@@ -168,7 +194,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 #[tokio::test]
 async fn test_ping_response() {
     let mut harness = setup_single().await;
-    let mut rx_out = harness.rx_out.take().unwrap();
+    let mut rx_out = PacketReceiver::new(harness.rx_out.take().unwrap());
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
@@ -205,7 +231,7 @@ async fn test_ping_response() {
 #[tokio::test]
 async fn test_refutation_mechanism() {
     let mut harness = setup_single().await;
-    let mut rx_out = harness.rx_out.take().unwrap();
+    let mut rx_out = PacketReceiver::new(harness.rx_out.take().unwrap());
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
@@ -254,7 +280,7 @@ async fn test_refutation_mechanism() {
 #[tokio::test]
 async fn test_gossip_propagation() {
     let mut harness = setup_single().await;
-    let mut rx_out = harness.rx_out.take().unwrap();
+    let mut rx_out = PacketReceiver::new(harness.rx_out.take().unwrap());
     let sender_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
     let dead_node: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     let probe_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
@@ -334,15 +360,18 @@ fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     }
 }
 
-async fn force_ticks(ticker_tx: &mpsc::Sender<TickerCommand<SwimTimer>>, count: usize) {
+async fn force_ticks(ticker_tx: &mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>, count: usize) {
     for _ in 0..count {
-        ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        ticker_tx
+            .send(Box::new([TickerCommand::ForceTick]))
+            .await
+            .unwrap();
     }
 }
 
 async fn wait_for_ping(
     harness: &TestHarness,
-    rx_out: &mut mpsc::Receiver<OutboundPacket>,
+    rx_out: &mut PacketReceiver,
 ) -> SocketAddr {
     let mut target_addr = None;
     for _ in 0..3 {
@@ -361,7 +390,7 @@ async fn wait_for_ping(
 #[tokio::test]
 async fn test_indirect_ping_trigger() {
     let mut harness = setup_single().await;
-    let mut rx_out = harness.rx_out.take().unwrap();
+    let mut rx_out = PacketReceiver::new(harness.rx_out.take().unwrap());
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
@@ -534,9 +563,9 @@ async fn cluster_formation_using_join() {
     let _ = h3.query_topology_count().await;
 
     for _ in 0..PROBE_INTERVAL_TICKS * 2 {
-        h1.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
-        h2.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
-        h3.ticker_tx.send(TickerCommand::ForceTick).await.unwrap();
+        h1.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
+        h2.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
+        h3.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
     }
 
     assert_eq!(h1.query_topology_count().await, 3);

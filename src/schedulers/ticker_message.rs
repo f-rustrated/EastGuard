@@ -9,27 +9,26 @@ pub(crate) enum TickerCommand<T> {
     ForceTick,
 }
 
-pub(crate) struct SchedulerSender<T>(tokio_mpsc::Sender<TickerCommand<T>>);
+pub(crate) struct SchedulerSender<T>(tokio_mpsc::Sender<Box<[TickerCommand<T>]>>);
 
-impl<T> From<tokio_mpsc::Sender<TickerCommand<T>>> for SchedulerSender<T> {
-    fn from(tx: tokio_mpsc::Sender<TickerCommand<T>>) -> Self {
+impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T> {
+    fn from(tx: tokio_mpsc::Sender<Box<[TickerCommand<T>]>>) -> Self {
         Self(tx)
     }
 }
 
 impl<T> SchedulerSender<T> {
     pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
-        let _ = self.0.blocking_send(
-            TimerCommand::SetSchedule {
-                seq,
-                timer: timer.into(),
-            }
-            .into(),
-        );
+        let cmd: TickerCommand<T> = TimerCommand::SetSchedule {
+            seq,
+            timer: timer.into(),
+        }
+        .into();
+        let _ = self.0.blocking_send(Box::new([cmd]));
     }
 
     pub(crate) fn send(&self, cmd: TimerCommand<T>) {
-        let _ = self.0.blocking_send(cmd.into());
+        let _ = self.0.blocking_send(Box::new([cmd.into()]));
     }
 }
 

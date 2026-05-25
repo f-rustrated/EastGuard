@@ -29,7 +29,7 @@ async fn start_raft_node(
 ) -> Result<
     (
         mpsc::Sender<MultiRaftActorCommand>,
-        mpsc::Sender<TickerCommand<crate::clusters::raft::messages::RaftTimer>>,
+        mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -95,7 +95,7 @@ async fn start_raft_node(
         tokio::task::yield_now().await;
     }
     for _ in 0..200 {
-        let _ = ticker_force.send(TickerCommand::ForceTick).await;
+        let _ = ticker_force.send(Box::new([TickerCommand::ForceTick])).await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -105,11 +105,11 @@ async fn start_raft_node(
 }
 
 async fn tick_n(
-    ticker: &mpsc::Sender<TickerCommand<crate::clusters::raft::messages::RaftTimer>>,
+    ticker: &mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
     n: usize,
 ) {
     for _ in 0..n {
-        let _ = ticker.send(TickerCommand::ForceTick).await;
+        let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;

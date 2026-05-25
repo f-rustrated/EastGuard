@@ -13,7 +13,7 @@ impl SwimTransportActor {
     pub async fn run(
         socket: UdpSocket,
         to_actor: SwimSender,
-        mut from_actor: mpsc::Receiver<OutboundPacket>,
+        mut from_actor: mpsc::Receiver<Box<[OutboundPacket]>>,
     ) {
         tracing::info!(
             "Transport Layer listening on {}",
@@ -35,12 +35,14 @@ impl SwimTransportActor {
                 }
 
                 // OUTGOING: Actor -> Encode -> Socket
-                Some(msg) = from_actor.recv() => {
-                    match bincode::encode_to_vec(msg.packet(), BINCODE_CONFIG) {
-                        Ok(bytes) => {
-                            let _ = socket.send_to(&bytes, msg.target).await;
+                Some(batch) = from_actor.recv() => {
+                    for msg in batch {
+                        match bincode::encode_to_vec(msg.packet(), BINCODE_CONFIG) {
+                            Ok(bytes) => {
+                                let _ = socket.send_to(&bytes, msg.target).await;
+                            }
+                            Err(e) => tracing::error!("Failed to encode packet: {}", e),
                         }
-                        Err(e) => tracing::error!("Failed to encode packet: {}", e),
                     }
                 }
             }
