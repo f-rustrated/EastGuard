@@ -1,8 +1,10 @@
 use crate::clusters::NodeId;
+use crate::clusters::metadata::command::ApplyResult;
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::rpc::OutboundRaftPacket;
 use crate::clusters::raft::messages::timer::RaftTimer;
 use crate::clusters::swims::ShardGroupId;
+use crate::data_plane::SegmentKey;
 use crate::impl_from_variant;
 use crate::schedulers::ticker_message::TimerCommand;
 
@@ -11,6 +13,13 @@ pub struct LeaderChange {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
     pub term: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SealContext {
+    pub requester: NodeId,
+    pub old_segment_key: SegmentKey,
 }
 
 #[allow(dead_code)]
@@ -31,6 +40,13 @@ pub enum RaftEvent {
     Timer(TimerCommand<RaftTimer>),
     LeaderChange(LeaderChange),
     DisconnectPeer(NodeId),
+    #[allow(dead_code)]
+    MetadataApplied {
+        shard_group_id: ShardGroupId,
+        result: ApplyResult,
+        log_index: u64,
+        seal_context: Option<SealContext>,
+    },
 }
 
 impl_from_variant!(RaftEvent, LeaderChange, OutboundRaftPacket);
