@@ -1,6 +1,6 @@
 use super::command::*;
 use super::types::*;
-use crate::clusters::metadata::{RangeId, TopicId, error::MetadataError};
+use crate::clusters::metadata::{error::MetadataError, RangeId, TopicId};
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -34,10 +34,7 @@ impl MetadataStateMachine {
         self.topics.len()
     }
 
-    /// Returns `(name, range_count, total_bytes, entry_count)` for each topic on this node.
-    /// `entry_count` is the sum of `range.next_offset` across all ranges — it counts
-    /// entries (Produce calls), not individual records within a batch.
-    pub(crate) fn topic_stats(&self) -> Vec<(String, u32, u64)> {
+    pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
         self.topics
             .values()
             .map(|topic| {
@@ -48,7 +45,7 @@ impl MetadataStateMachine {
                     .flat_map(|r| r.segments.values())
                     .map(|s| s.size_bytes)
                     .sum();
-                (topic.name.clone(), range_count, total_bytes)
+                TopicStats { name: topic.name.clone(), range_count, total_bytes }
             })
             .collect()
     }
@@ -218,11 +215,11 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::clusters::{
-        NodeId,
         metadata::{
-            SegmentId,
             strategy::{PartitionStrategy, StoragePolicy},
+            SegmentId,
         },
+        NodeId,
     };
 
     fn default_policy() -> StoragePolicy {

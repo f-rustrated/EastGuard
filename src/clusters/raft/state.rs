@@ -136,7 +136,7 @@ impl Raft {
         self.state_machine.topic_names()
     }
 
-    pub(crate) fn topic_stats(&self) -> Vec<(String, u32, u64)> {
+    pub(crate) fn topic_stats(&self) -> Vec<crate::clusters::metadata::TopicStats> {
         self.state_machine.topic_stats()
     }
 

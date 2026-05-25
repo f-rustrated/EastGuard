@@ -425,7 +425,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use crate::clusters::raft::actor::MultiRaftActor;
-    use crate::clusters::raft::messages::{LocalTopicStats, MultiRaftActorCommand};
+    use crate::clusters::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::clusters::raft::messages::MultiRaftActorCommand;
     use crate::clusters::swims::actor::SwimActor;
     use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand};
     use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
@@ -647,7 +648,7 @@ mod tests {
     async fn list_topic_stats() {
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::GetTopicStats { reply } = cmd {
-                let _ = reply.send(vec![LocalTopicStats { name: "t1".into(), range_count: 2, total_bytes: 1024 }]);
+                let _ = reply.send(vec![MetadataTopicStats { name: "t1".into(), range_count: 2, total_bytes: 1024 }]);
             }
         });
         let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)

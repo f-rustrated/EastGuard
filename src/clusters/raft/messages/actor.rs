@@ -1,6 +1,7 @@
 use tokio::sync::oneshot;
 
 use crate::clusters::NodeId;
+use crate::clusters::metadata::types::TopicStats;
 use crate::clusters::swims::ShardGroupId;
 
 use super::command::{MultiRaftCommand, ProposeError, RaftCommand};
@@ -28,7 +29,7 @@ pub enum MultiRaftActorCommand {
     },
     /// Query per-topic stats from all shard groups on this node.
     GetTopicStats {
-        reply: oneshot::Sender<Vec<LocalTopicStats>>,
+        reply: oneshot::Sender<Vec<TopicStats>>,
     },
 }
 
@@ -48,11 +49,5 @@ pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     Propose(oneshot::Sender<Result<(), ProposeError>>, Result<(), ProposeError>),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
-    GetTopicStats(oneshot::Sender<Vec<LocalTopicStats>>, Vec<LocalTopicStats>),
-}
-
-pub struct LocalTopicStats {
-    pub name: String,
-    pub range_count: u32,
-    pub total_bytes: u64,
+    GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
 }

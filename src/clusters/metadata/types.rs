@@ -3,13 +3,13 @@ use std::collections::{HashMap, VecDeque};
 use bincode::{Decode, Encode};
 
 use crate::clusters::{
-    NodeId,
     metadata::{
-        RangeId, SegmentId, SplitRange, TopicId,
-        command::{MergeRange, MetadataCommand, RollSegment},
-        error::MetadataError,
-        strategy::{PartitionStrategy, StoragePolicy},
+        command::{MergeRange, MetadataCommand, RollSegment}, error::MetadataError, strategy::{PartitionStrategy, StoragePolicy}, RangeId,
+        SegmentId,
+        SplitRange,
+        TopicId,
     },
+    NodeId,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum TopicState {
@@ -689,4 +689,10 @@ pub mod props {
             }
         }
     }
+}
+
+pub struct TopicStats {
+    pub name: String,
+    pub range_count: u32,
+    pub total_bytes: u64,
 }

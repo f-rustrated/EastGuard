@@ -180,12 +180,11 @@ fn delete_topic() -> turmoil::Result {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut still_present = false;
             for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) =
+                if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics: listed }) =
                     send_request(h, p, ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics)).await
+                    && listed.iter().any(|t| t.name == "del-test")
                 {
-                    if topics.iter().any(|t| t.name == "del-test") {
-                        still_present = true;
-                    }
+                    still_present = true;
                 }
             }
             if !still_present {
@@ -194,11 +193,11 @@ fn delete_topic() -> turmoil::Result {
         }
 
         for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-            if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) =
+            if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics: listed }) =
                 send_request(h, p, ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics)).await
             {
                 assert!(
-                    !topics.iter().any(|t| t.name == "del-test"),
+                    !listed.iter().any(|t| t.name == "del-test"),
                     "{h} still lists del-test after deletion"
                 );
             }
@@ -275,11 +274,10 @@ fn list_topic_stats_after_create() -> turmoil::Result {
                 ClientRequest::Admin(AdminRequest::ListHostedTopicsWithStats),
             )
             .await
+            && topics.iter().any(|t| t.name == "stats-test")
             {
-                if topics.iter().any(|t| t.name == "stats-test") {
-                    found = true;
-                    break;
-                }
+                found = true;
+                break;
             }
         }
         assert!(found, "stats-test not found in ListHostedTopicsWithStats on any node");

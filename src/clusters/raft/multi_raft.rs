@@ -4,8 +4,9 @@ use std::hash::{Hash, Hasher};
 use tokio::sync::oneshot;
 
 use crate::clusters::NodeId;
+use crate::clusters::metadata::types::TopicStats;
 use crate::clusters::raft::messages::{
-    DeferredReply, LocalTopicStats, LogMutation, MultiRaftActorCommand, MultiRaftCommand,
+    DeferredReply, LogMutation, MultiRaftActorCommand, MultiRaftCommand,
     MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
 };
 use crate::clusters::raft::state::{Raft, TimerSeqs};
@@ -250,16 +251,8 @@ impl MultiRaft {
             .collect()
     }
 
-    fn get_topic_stats(&self) -> Vec<LocalTopicStats> {
-        self.groups
-            .values()
-            .flat_map(|raft| raft.topic_stats())
-            .map(|(name, range_count, total_bytes)| LocalTopicStats {
-                name,
-                range_count,
-                total_bytes,
-            })
-            .collect()
+    fn get_topic_stats(&self) -> Vec<TopicStats> {
+        self.groups.values().flat_map(|raft| raft.topic_stats()).collect()
     }
 
     fn remove_node(&mut self, node_id: NodeId) {
