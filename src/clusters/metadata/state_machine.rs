@@ -291,7 +291,7 @@ mod tests {
             segment_id,
             sealed_at,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
         assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled { .. }));
     }
@@ -447,7 +447,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
         assert_eq!(result, Err(TopicNotFound(TopicId(99))));
     }
@@ -463,7 +463,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
         assert_eq!(result, Err(RangeNotFound));
     }
@@ -479,7 +479,7 @@ mod tests {
             segment_id: SegmentId(99),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
 
@@ -768,7 +768,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 3000,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
 
@@ -1015,14 +1015,14 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 42000,
+            end_entry_id: Some(42000),
         }));
 
         let result = result.unwrap();
         assert!(matches!(
             result,
             ApplyResult::SegmentRolled {
-                end_entry_id: 42000,
+                end_entry_id: Some(42000),
                 ..
             }
         ));
@@ -1048,12 +1048,12 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 0,
+            end_entry_id: None,
         }));
 
         assert_eq!(
             sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_offset,
-            Some(0)
+            None
         );
 
         // Segment leader's RollSegment arrives with correct end_entry_id
@@ -1063,7 +1063,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2500,
             new_replica_set: replica_set(),
-            end_entry_id: 42000,
+            end_entry_id: Some(42000),
         }));
         assert!(result.is_ok());
 
@@ -1084,7 +1084,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: 1000,
+            end_entry_id: Some(1000),
         }));
 
         // Duplicate roll is rejected (end_offset already set)
@@ -1094,7 +1094,7 @@ mod tests {
             segment_id: SegmentId(0),
             sealed_at: 2500,
             new_replica_set: replica_set(),
-            end_entry_id: 42000,
+            end_entry_id: Some(42000),
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
     }

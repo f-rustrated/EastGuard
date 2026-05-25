@@ -64,13 +64,17 @@ impl SegmentMeta {
             sealed_at: None,
         }
     }
-    pub(crate) fn seal(&mut self, end_offset: u64, sealed_at: u64) -> Result<(), MetadataError> {
+    pub(crate) fn seal(
+        &mut self,
+        end_offset: Option<u64>,
+        sealed_at: u64,
+    ) -> Result<(), MetadataError> {
         if self.state != SegmentState::Active {
             return Err(MetadataError::SegmentNotActive);
         }
 
         self.state = SegmentState::Sealed;
-        self.end_offset = Some(end_offset);
+        self.end_offset = end_offset;
         self.sealed_at = Some(sealed_at);
 
         Ok(())
@@ -180,30 +184,25 @@ impl RangeMeta {
     pub(crate) fn correct_end_offset(
         &mut self,
         segment_id: SegmentId,
-        end_entry_id: u64,
-    ) -> Option<SegmentId> {
-        // Coordinator doesn't know the actual last committed entry. Only the segment leader knows as it tracks committed_entry_id locally.
-        // When SWIM detects node death, the coordinator proposes RollSegment directly without ever hearing from
-        // the segment leader. It has no choice but to use 0 as a placeholder.
-        //
-        // A death-triggered RollSegment has end_entry_id = 0. If that arrives for an already-sealed segment, there's nothing to correct
-        // the placeholder is already there (or a real value was already set). Either way, it's a duplicate of work already
-        // done. StaleSegment means "this segment was already rolled, your request is outdated."
-        if end_entry_id == 0 {
-            return None;
-        }
-        let active_seg_id = self.active_segment?;
-        let seg = self.segments.get_mut(&segment_id)?;
-        if seg.state != SegmentState::Sealed || seg.end_offset != Some(0) {
-            return None;
+        end_entry_id: Option<u64>,
+    ) {
+        let Some(end_entry_id) = end_entry_id else {
+            return;
+        };
+        let Some(active_seg_id) = self.active_segment else {
+            return;
+        };
+        let Some(seg) = self.segments.get_mut(&segment_id) else {
+            return;
+        };
+        if seg.state != SegmentState::Sealed || seg.end_offset.is_some() {
+            return;
         }
         seg.end_offset = Some(end_entry_id);
         self.next_offset = end_entry_id + 1;
-
         if let Some(active_seg) = self.segments.get_mut(&active_seg_id) {
             active_seg.start_offset = end_entry_id + 1;
         }
-        Some(active_seg_id)
     }
 
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
@@ -235,7 +234,7 @@ impl RangeMeta {
             .ok_or(MetadataError::SegmentNotFound)?;
         segment.seal(cmd.end_entry_id, cmd.sealed_at)?;
 
-        let start_offset = cmd.end_entry_id + 1;
+        let start_offset = cmd.end_entry_id.map_or(0, |id| id + 1);
         let new_segment_id = SegmentId(self.next_segment_id);
         let new_segment = SegmentMeta::new(
             new_segment_id,
@@ -332,7 +331,7 @@ impl RangeMeta {
         if let Some(seg_id) = self.active_segment
             && let Some(seg) = self.segments.get_mut(&seg_id)
         {
-            seg.seal(self.next_offset.saturating_sub(1), created_at)?;
+            seg.seal(Some(self.next_offset.saturating_sub(1)), created_at)?;
         }
         self.state = RangeState::Sealed;
         self.active_segment = None;
@@ -721,10 +720,6 @@ pub mod props {
         fn assert_sealed_segments(&self) {
             for seg in self.segments.values() {
                 if seg.state == SegmentState::Sealed {
-                    assert!(
-                        seg.end_offset.is_some(),
-                        "sealed segment missing end_offset"
-                    );
                     assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
                 }
             }

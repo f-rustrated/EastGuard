@@ -23,7 +23,10 @@ pub struct RollSegment {
     pub segment_id: SegmentId,
     pub sealed_at: u64,
     pub new_replica_set: Vec<NodeId>,
-    pub end_entry_id: u64,
+    /// None for SWIM-death-triggered seals — the coordinator doesn't know
+    /// the actual committed offset. Corrected later via `correct_end_offset`
+    /// or D5 sealed segment repair.
+    pub end_entry_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -81,7 +84,7 @@ pub enum ApplyResult {
         range_id: RangeId,
         new_segment_id: SegmentId,
         new_replica_set: Vec<NodeId>,
-        end_entry_id: u64,
+        end_entry_id: Option<u64>,
     },
     RangeSplit {
         topic_id: TopicId,

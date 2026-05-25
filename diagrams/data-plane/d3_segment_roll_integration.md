@@ -143,7 +143,7 @@ pub struct RollSegment {
     pub segment_id: SegmentId,
     pub sealed_at: u64,
     pub new_replica_set: Vec<NodeId>,
-    pub end_entry_id: u64,             // from SealRequest.end_entry_id; 0 for node-death seals
+    pub end_entry_id: Option<u64>,     // Some(id) from SealRequest; None for node-death seals
 }
 
 // Stored on propose, resolved on commit
@@ -209,13 +209,13 @@ on CoordinatorCommand::SealRequest { requester, segment_key, failed_nodes, end_e
 
 Seals the active segment with `end_offset = cmd.end_entry_id`, creates the new segment with `start_offset = cmd.end_entry_id + 1`. This aligns the metadata view with the actual data boundary reported by the segment leader.
 
-**`end_entry_id = 0` for node-death seals:** Placeholder — corrected during sealed segment repair (D5). Temporarily violates MetadataStateMachine invariant 8 (offset continuity) — holds after D5 repair.
+**`end_entry_id = None` for node-death seals:** The coordinator doesn't know the actual committed offset. Sealed segment's `end_offset` and new segment's `start_offset` remain unset until corrected via `correct_end_offset` (if the segment leader is alive) or D5 sealed segment repair.
 
 ### RollSegment Idempotency
 
 Both write-path timeout (D2) and SWIM node death may fire for the same failure. This is safe: `apply_roll_segment()` checks that the segment is still active. If already sealed, the duplicate returns `Err(StaleSegment)` — a no-op (DS-RSM invariant 9).
 
-**Exception: end_offset correction.** If a death-triggered `RollSegment` (with `end_entry_id = 0`) commits first, and the segment leader's `SealRequest` arrives later with the correct `end_entry_id`, `apply_roll_segment()` does not return `StaleSegment`. Instead, it updates the sealed segment's `end_offset` from 0 to the correct value. Guard: only when current `end_offset == 0` and new `end_entry_id > 0`.
+**Exception: end_offset correction.** If a death-triggered `RollSegment` (with `end_entry_id = None`) commits first, and the segment leader's `SealRequest` arrives later with the correct `end_entry_id`, `correct_end_offset()` updates the sealed segment's `end_offset` and the new segment's `start_offset`. Guard: only when current `end_offset` is `None` and new `end_entry_id` is `Some`. The `apply()` returns `Noop` — no duplicate `SegmentAssignment` sent.
 
 ---
 
@@ -245,7 +245,7 @@ enum ApplyResult {
         range_id: RangeId,
         new_segment_id: SegmentId,
         new_replica_set: Vec<NodeId>,
-        end_entry_id: u64,
+        end_entry_id: Option<u64>,
     },
     RangeSplit {
         children: [(RangeId, SegmentId, Vec<NodeId>); 2],
@@ -328,7 +328,7 @@ remove_node(dead_node_id):
         if !raft.is_leader(): continue
         for each active segment where dead_node_id ∈ replica_set:
             new_replica_set = replace dead_node_id with healthy node
-            propose RollSegment { ..., end_entry_id: 0 }  // unknown — resolved in D5
+            propose RollSegment { ..., end_entry_id: None }  // unknown — resolved by correction or D5
 ```
 
 **Segment leader preservation:** When a follower dies, the coordinator keeps the existing leader at `replica_set[0]`. When the leader itself dies, a surviving follower is promoted. Replacement nodes selected from healthy cluster members not already in the set, tie-breaking by node ID.
@@ -406,7 +406,7 @@ Broker D (segment leader)       Coordinator A        Raft [A,B,C]
 
 6. **`end_entry_id` handoff is exact for segment-leader-initiated seals.** Equals `tracker.committed_entry_id`. Carried through `RollSegment` → `SegmentMeta.end_offset`. New segment starts at `end_entry_id + 1`.
 
-7. **`end_entry_id = 0` is a placeholder for node-death seals.** Corrected during sealed segment repair (D5). Temporarily violates MetadataStateMachine invariant 8 (offset continuity) — holds after D5 repair. A subsequent SealRequest with the correct `end_entry_id` updates `end_offset` from 0 (see RollSegment Idempotency).
+7. **`end_entry_id = None` for node-death seals.** The coordinator doesn't know the actual offset. Corrected via `correct_end_offset` (if segment leader is alive and sends SealRequest with `Some(id)`) or D5 sealed segment repair. Temporarily violates MetadataStateMachine invariant 8 (offset continuity) — holds after correction.
 
 8. **Size-based and age-based seals reuse the failure path.** Same flow, `failed_nodes` empty, replica set preserved.
 
