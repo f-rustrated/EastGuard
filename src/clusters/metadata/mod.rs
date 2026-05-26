@@ -1,5 +1,6 @@
 pub(crate) mod command;
 pub mod error;
+pub(crate) mod event;
 #[allow(dead_code)]
 pub(crate) mod state_machine;
 pub mod strategy;
@@ -8,12 +9,13 @@ pub(crate) mod types;
 
 use bincode::{Decode, Encode};
 #[allow(unused_imports)]
+pub(crate) use command::*;
+#[allow(unused_imports)]
+pub(crate) use event::*;
+#[allow(unused_imports)]
 pub(crate) use state_machine::*;
 #[allow(unused_imports)]
 pub(crate) use types::*;
-
-#[allow(unused_imports)]
-pub(crate) use command::*;
 
 use crate::smart_pointer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]

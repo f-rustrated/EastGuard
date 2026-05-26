@@ -1,5 +1,5 @@
 use crate::clusters::NodeId;
-use crate::clusters::metadata::command::ApplyResult;
+use crate::clusters::metadata::event::ApplyResult;
 use crate::clusters::raft::log::LogEntry;
 use crate::clusters::raft::messages::rpc::OutboundRaftPacket;
 use crate::clusters::raft::messages::timer::RaftTimer;

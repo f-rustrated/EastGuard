@@ -70,32 +70,3 @@ impl_from_variant!(
     MergeRange,
     DeleteTopic
 );
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApplyResult {
-    TopicCreated {
-        topic_id: TopicId,
-        range_id: RangeId,
-        segment_id: SegmentId,
-        replica_set: Vec<NodeId>,
-    },
-    SegmentRolled {
-        topic_id: TopicId,
-        range_id: RangeId,
-        new_segment_id: SegmentId,
-        new_replica_set: Vec<NodeId>,
-        end_entry_id: Option<u64>,
-    },
-    RangeSplit {
-        topic_id: TopicId,
-        children: [(RangeId, SegmentId, Vec<NodeId>); 2],
-    },
-    RangeMerged {
-        topic_id: TopicId,
-        merged_range_id: RangeId,
-        segment_id: SegmentId,
-        replica_set: Vec<NodeId>,
-    },
-    TopicDeleted,
-    Noop,
-}
