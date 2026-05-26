@@ -30,6 +30,12 @@ impl<T> SchedulerSender<T> {
     pub(crate) fn send(&self, cmd: TimerCommand<T>) {
         let _ = self.0.blocking_send(Box::new([cmd.into()]));
     }
+
+    pub(crate) async fn send_batch(&self, cmds: Vec<TickerCommand<T>>) {
+        if !cmds.is_empty() {
+            let _ = self.0.send(cmds.into_boxed_slice()).await;
+        }
+    }
 }
 
 #[derive(Debug)]

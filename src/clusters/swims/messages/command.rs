@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
 use crate::clusters::NodeId;
-use crate::clusters::raft::messages::{LeaderChange, MultiRaftActorCommand, MultiRaftCommand};
+use crate::clusters::raft::messages::{
+    HandleNodeDeath, HandleNodeJoin, LeaderChange, MultiRaftActorCommand,
+};
 use crate::clusters::swims::peer_discovery::JoinAttempt;
 use crate::clusters::swims::topology::Topology;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -80,7 +82,7 @@ impl MembershipEvent {
         }
         match self {
             MembershipEvent::NodeDead { node_id } => Some(
-                MultiRaftCommand::HandleNodeDeath {
+                HandleNodeDeath {
                     dead_node_id: node_id,
                 }
                 .into(),
@@ -95,7 +97,7 @@ impl MembershipEvent {
                     return None;
                 }
                 Some(
-                    MultiRaftCommand::HandleNodeJoin {
+                    HandleNodeJoin {
                         new_node_id: node_id,
                         affected_groups,
                     }

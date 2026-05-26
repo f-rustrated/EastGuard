@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use turmoil::Builder;
 
 use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{LeaderChange, MultiRaftCommand};
+use crate::clusters::raft::messages::*;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{
@@ -92,7 +92,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     );
                 }
 
-                let (raft_tx, raft_mailbox) = mpsc::channel(100);
+                let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
                 let (transport_tx, transport_rx) = mpsc::channel(100);
                 let (ticker_tx, ticker_rx) = mpsc::channel(64);
                 let (swim_tx, swim_rx) = SwimActor::channel(64);
@@ -108,7 +108,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     leader_events_tx,
                 ));
                 tokio::spawn(run_scheduling_actor(
-                    raft_tx.clone(),
+                    raft_tx.clone().into(),
                     ticker_rx,
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
@@ -135,13 +135,13 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     Box::new(db),
                     raft_mailbox,
                     transport_tx,
-                    ticker_tx,
+                    ticker_tx.into(),
                     swim_tx,
                     data_tx,
                 ));
 
                 raft_tx
-                    .send(MultiRaftCommand::EnsureGroup { group: g }.into())
+                    .send(EnsureGroup { group: g })
                     .await
                     .unwrap();
 

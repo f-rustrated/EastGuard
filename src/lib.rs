@@ -25,12 +25,12 @@ use crate::clusters::raft::messages::{RaftTimer, RaftTransportCommand};
 use crate::clusters::swims::OutboundPacket;
 use crate::clusters::swims::SwimTimer;
 use crate::clusters::swims::actor::SwimSender;
-use crate::schedulers::ticker_message::TickerCommand;
 use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
+use crate::schedulers::ticker_message::TickerCommand;
 use crate::{
     clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
@@ -65,10 +65,13 @@ impl StartUp {
 
         // Raft channels
         let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
-        let (raft_transport_tx, raft_transport_rx) = mpsc::channel::<Box<[RaftTransportCommand]>>(100);
+        let (raft_transport_tx, raft_transport_rx) =
+            mpsc::channel::<Box<[RaftTransportCommand]>>(100);
         // Each vnode can have both an election and heartbeat timer active, so capacity
         // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
-        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel::<Box<[TickerCommand<RaftTimer>]>>(self.env.vnodes_per_node as usize * 16);
+        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel::<Box<[TickerCommand<RaftTimer>]>>(
+            self.env.vnodes_per_node as usize * 16,
+        );
 
         // Build SWIM state and extract node_id before handing state to the actor
         let state = self.env.swim(self.rng_seed);
@@ -101,7 +104,7 @@ impl StartUp {
         tokio::spawn(RaftTransportActor::run(
             node_id.clone(),
             tcp_listener,
-            raft_tx.clone().into(),
+            raft_tx.clone(),
             raft_transport_rx,
             swim_sender.clone(),
         ));
@@ -129,7 +132,7 @@ impl StartUp {
             Box::new(raft_db),
             raft_mailbox,
             raft_transport_tx,
-            raft_ticker_tx,
+            raft_ticker_tx.into(),
             swim_sender.clone(),
             data_transport_tx,
         ));
@@ -170,6 +173,8 @@ async fn handle_client_stream(
     let (writer_tx, writer_rx) = mpsc::channel(128);
     let handler = ClientHandler::new(swim_sender, raft_sender);
     tokio::spawn(run_client_writer(write_half, writer_rx));
-    handler.run(ClientStreamReader::new(read_half), writer_tx).await;
+    handler
+        .run(ClientStreamReader::new(read_half), writer_tx)
+        .await;
     Ok(())
 }

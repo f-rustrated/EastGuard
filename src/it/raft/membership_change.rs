@@ -4,11 +4,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
+use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
+use crate::clusters::raft::messages::*;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -28,7 +28,7 @@ async fn start_raft_node(
     peer_names: &[&str],
 ) -> Result<
     (
-        mpsc::Sender<MultiRaftActorCommand>,
+        RaftSender,
         mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
     ),
     Box<dyn std::error::Error>,
@@ -48,7 +48,7 @@ async fn start_raft_node(
         );
     }
 
-    let (raft_tx, raft_mailbox) = mpsc::channel(100);
+    let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(64);
     let (swim_tx, swim_rx) = SwimActor::channel(64);
@@ -59,7 +59,7 @@ async fn start_raft_node(
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(
-        raft_tx.clone(),
+        raft_tx.clone().into(),
         ticker_rx,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
@@ -84,20 +84,19 @@ async fn start_raft_node(
         Box::new(db),
         raft_mailbox,
         transport_tx,
-        ticker_tx,
+        ticker_tx.into(),
         swim_tx,
         data_tx,
     ));
 
-    raft_tx
-        .send(MultiRaftCommand::EnsureGroup { group }.into())
-        .await
-        .unwrap();
+    raft_tx.send(EnsureGroup { group }).await.unwrap();
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
     for _ in 0..200 {
-        let _ = ticker_force.send(Box::new([TickerCommand::ForceTick])).await;
+        let _ = ticker_force
+            .send(Box::new([TickerCommand::ForceTick]))
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -119,19 +118,11 @@ async fn tick_n(
 }
 
 async fn serve_leader(
-    raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+    raft_tx: &RaftSender,
     group_id: ShardGroupId,
     query_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    raft_tx
-        .send(MultiRaftActorCommand::GetLeader {
-            group_id,
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let leader = reply_rx.await.unwrap();
+    let leader = raft_tx.get_leader(group_id).await;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
     let (stream, _) = listener.accept().await?;
@@ -189,12 +180,9 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, g.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(
-                        MultiRaftCommand::HandleNodeDeath {
-                            dead_node_id: NodeId::new("node-3"),
-                        }
-                        .into(),
-                    )
+                    .send(HandleNodeDeath {
+                        dead_node_id: NodeId::new("node-3"),
+                    })
                     .await;
 
                 if name == "node-3" {
@@ -268,13 +256,10 @@ fn node_join_triggers_add_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, ig.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(
-                        MultiRaftCommand::HandleNodeJoin {
-                            new_node_id: NodeId::new("node-3"),
-                            affected_groups: vec![eg],
-                        }
-                        .into(),
-                    )
+                    .send(HandleNodeJoin {
+                        new_node_id: NodeId::new("node-3"),
+                        affected_groups: vec![eg],
+                    })
                     .await;
 
                 tick_n(&ticker, 100).await;

@@ -4,8 +4,12 @@ use crate::clusters::NodeId;
 use crate::clusters::metadata::types::TopicStats;
 use crate::clusters::swims::ShardGroupId;
 
-use super::command::{CoordinatorCommand, MultiRaftCommand, ProposeError, RaftCommand};
+use super::command::{
+    CoordinatorCommand, EnsureGroup, HandleNodeDeath, HandleNodeJoin, MultiRaftCommand,
+    PacketReceived, ProposeError, RaftCommand, RaftPropose, RemoveGroup,
+};
 use super::timer::RaftTimeoutCallback;
+use crate::impl_from_variant_via;
 
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
 #[allow(dead_code)]
@@ -24,9 +28,7 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
     /// Query all topic names from all shard groups on this node.
-    GetTopics {
-        reply: oneshot::Sender<Vec<String>>,
-    },
+    GetTopics { reply: oneshot::Sender<Vec<String>> },
     /// Query per-topic stats from all shard groups on this node.
     GetTopicStats {
         reply: oneshot::Sender<Vec<TopicStats>>,
@@ -47,9 +49,23 @@ impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
     }
 }
 
+impl_from_variant_via!(
+    MultiRaftActorCommand,
+    MultiRaftCommand,
+    PacketReceived,
+    EnsureGroup,
+    RemoveGroup,
+    RaftPropose,
+    HandleNodeDeath,
+    HandleNodeJoin,
+);
+
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
-    Propose(oneshot::Sender<Result<(), ProposeError>>, Result<(), ProposeError>),
+    Propose(
+        oneshot::Sender<Result<(), ProposeError>>,
+        Result<(), ProposeError>,
+    ),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
     GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
 }

@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
 use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
+use crate::clusters::raft::messages::MultiRaftActorCommand;
 use crate::clusters::raft::transport::RaftTransportActor;
 use crate::clusters::swims::actor::SwimActor;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
@@ -89,7 +89,7 @@ async fn run_raft_node(
     let node_id = NodeId::new(node_name);
     let address_map = build_address_map(node_name, cluster_port, peer_names);
 
-    let (raft_tx, raft_mailbox) = mpsc::channel(100);
+    let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(64);
     let (swim_tx, swim_rx) = SwimActor::channel(64);
@@ -100,7 +100,7 @@ async fn run_raft_node(
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(
-        raft_tx.clone(),
+        raft_tx.clone().into(),
         ticker_rx,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
@@ -125,18 +125,15 @@ async fn run_raft_node(
         Box::new(db),
         raft_mailbox,
         transport_tx,
-        ticker_tx,
+        ticker_tx.into(),
         swim_tx,
         data_tx,
     ));
 
     raft_tx
-        .send(
-            MultiRaftCommand::EnsureGroup {
-                group: group.clone(),
-            }
-            .into(),
-        )
+        .send(crate::clusters::raft::messages::EnsureGroup {
+            group: group.clone(),
+        })
         .await
         .unwrap();
     for _ in 0..10 {

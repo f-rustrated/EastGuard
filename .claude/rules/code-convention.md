@@ -4,6 +4,10 @@
 
 Functions taking `&self`, `&mut self`, or a reference to a struct as their first argument must be methods on that struct. Free functions with `&SomeStruct` as first arg are never acceptable — add them as `impl SomeStruct` methods instead.
 
+## Enum struct pattern
+
+Enum variants that carry data must use the tuple-variant + named-struct pattern. Never use inline fields on enum variants. See `/.claude/skills/enum-struct-pattern/SKILL.md` for the full pattern including `impl_from_variant!` usage.
+
 ## Result over Option for observability
 
 Prefer `Result<T, E>` over `Option<T>` when `None` represents a failure condition that an operator or developer would want to diagnose. Silent `None` returns hide *why* something didn't happen — use `Result` so the error is observable via logging or propagation.

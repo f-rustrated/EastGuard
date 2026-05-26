@@ -22,7 +22,7 @@ impl DataPlaneActor {
         checkpoint_tx: Sender<CheckpointJob>,
         batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
         repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
-        data_transport_tx: tokio_mpsc::Sender<DataTransportCommand>,
+        data_transport_tx: tokio_mpsc::Sender<Box<[DataTransportCommand]>>,
     ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 

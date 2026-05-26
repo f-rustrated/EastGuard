@@ -6,6 +6,7 @@ use crate::clusters::raft::messages::rpc::{OutboundRaftPacket, RaftRpc};
 use crate::clusters::raft::messages::timer::RaftTimeoutCallback;
 use crate::clusters::swims::{ShardGroup, ShardGroupId};
 use crate::data_plane::SegmentKey;
+use crate::impl_from_variant;
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RaftCommand {
@@ -16,41 +17,59 @@ pub enum RaftCommand {
 #[derive(Debug, PartialEq, Eq, Decode, Encode)]
 pub enum ProposeError {
     NotLeader(Option<NodeId>),
-    /// No Raft group for this shard ID exists on this node — stale routing.
     ShardNotFound,
-    /// The group existed but was dissolved by a membership change.
     ShardGroupRemoved,
+}
+
+pub struct PacketReceived {
+    pub shard_group_id: ShardGroupId,
+    pub from: NodeId,
+    pub rpc: RaftRpc,
+}
+
+pub struct EnsureGroup {
+    pub group: ShardGroup,
+}
+
+pub struct RemoveGroup {
+    pub group_id: ShardGroupId,
+}
+
+pub struct RaftPropose {
+    pub shard_group_id: ShardGroupId,
+    pub command: RaftCommand,
+}
+
+pub struct HandleNodeDeath {
+    pub dead_node_id: NodeId,
+}
+
+pub struct HandleNodeJoin {
+    pub new_node_id: NodeId,
+    pub affected_groups: Vec<ShardGroup>,
 }
 
 #[allow(dead_code)]
 pub enum MultiRaftCommand {
-    PacketReceived {
-        shard_group_id: ShardGroupId,
-        from: NodeId,
-        rpc: RaftRpc,
-    },
+    PacketReceived(PacketReceived),
     Timeout(RaftTimeoutCallback),
-    EnsureGroup {
-        group: ShardGroup,
-    },
-    RemoveGroup {
-        group_id: ShardGroupId,
-    },
-    GetLeader {
-        group_id: ShardGroupId,
-    },
-    Propose {
-        shard_group_id: ShardGroupId,
-        command: RaftCommand,
-    },
-    HandleNodeDeath {
-        dead_node_id: NodeId,
-    },
-    HandleNodeJoin {
-        new_node_id: NodeId,
-        affected_groups: Vec<ShardGroup>,
-    },
+    EnsureGroup(EnsureGroup),
+    RemoveGroup(RemoveGroup),
+    Propose(RaftPropose),
+    HandleNodeDeath(HandleNodeDeath),
+    HandleNodeJoin(HandleNodeJoin),
 }
+
+impl_from_variant!(
+    MultiRaftCommand,
+    PacketReceived,
+    Timeout(RaftTimeoutCallback),
+    EnsureGroup,
+    RemoveGroup,
+    Propose(RaftPropose),
+    HandleNodeDeath,
+    HandleNodeJoin
+);
 
 #[allow(dead_code)]
 pub(crate) enum MultiRaftReply {

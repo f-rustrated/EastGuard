@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::clusters::raft::messages::MultiRaftActorCommand;
-use crate::clusters::raft::messages::MultiRaftCommand;
+use crate::clusters::raft::actor::RaftSender;
+use crate::clusters::raft::messages::PacketReceived;
 use crate::clusters::raft::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::clusters::swims::actor::SwimSender;
 use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
@@ -37,19 +37,16 @@ impl RaftReader {
         Ok(msg)
     }
 
-    async fn run(mut self, tx: mpsc::Sender<MultiRaftActorCommand>) {
+    async fn run(mut self, tx: RaftSender) {
         loop {
             match self.read_message().await {
                 Ok(msg) => {
                     let _ = tx
-                        .send(
-                            MultiRaftCommand::PacketReceived {
-                                shard_group_id: msg.shard_group_id,
-                                from: msg.sender,
-                                rpc: msg.rpc,
-                            }
-                            .into(),
-                        )
+                        .send(PacketReceived {
+                            shard_group_id: msg.shard_group_id,
+                            from: msg.sender,
+                            rpc: msg.rpc,
+                        })
                         .await;
                 }
                 Err(e) => {
@@ -94,7 +91,7 @@ impl RaftWriters {
         }
     }
 
-    async fn accept(&mut self, stream: TcpStream, raft_tx: &mpsc::Sender<MultiRaftActorCommand>) {
+    async fn accept(&mut self, stream: TcpStream, raft_tx: &RaftSender) {
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftReader(read_half);
 
@@ -114,7 +111,7 @@ impl RaftWriters {
     async fn send(
         &mut self,
         packets: Vec<OutboundRaftPacket>,
-        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+        raft_tx: &RaftSender,
         swim_tx: &SwimSender,
     ) {
         let by_target = self.group_packets(packets);
@@ -148,7 +145,7 @@ impl RaftWriters {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+        raft_tx: &RaftSender,
         swim_tx: &SwimSender,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
@@ -174,7 +171,7 @@ impl RaftWriters {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+        raft_tx: &RaftSender,
         swim_tx: &SwimSender,
     ) -> bool {
         let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
@@ -301,7 +298,7 @@ impl RaftTransportActor {
     pub async fn run(
         node_id: NodeId,
         listener: TcpListener,
-        raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+        raft_tx: RaftSender,
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
     ) {
@@ -442,7 +439,7 @@ mod tests {
             .build();
 
         sim.host("acceptor", || async {
-            let (raft_tx, _raft_rx) = mpsc::channel(16);
+            let (raft_tx, _raft_rx) = crate::clusters::raft::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let mut state = RaftWriters::new(NodeId::new("node-b"));
 
@@ -478,7 +475,7 @@ mod tests {
             .build();
 
         sim.host("node-b", || async {
-            let (raft_tx, _raft_rx) = mpsc::channel(16);
+            let (raft_tx, _raft_rx) = crate::clusters::raft::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
             let mut state = RaftWriters::new(NodeId::new("node-b"));
