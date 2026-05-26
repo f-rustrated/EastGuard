@@ -2,7 +2,7 @@ use std::io;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::{EntryPayload, SegmentKey};
 
 const ROUTING_HEADER_SIZE: usize = 36;

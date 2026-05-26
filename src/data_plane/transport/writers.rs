@@ -4,8 +4,8 @@ use anyhow::Context;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
-use crate::clusters::swims::actor::SwimSender;
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::membership::actor::SwimSender;
+use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::{OwnedWriteHalf, TcpStream};
 

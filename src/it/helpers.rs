@@ -1,5 +1,5 @@
-use crate::clusters::SwimNode;
-use crate::clusters::SwimNodeState;
+use crate::control_plane::SwimNode;
+use crate::control_plane::SwimNodeState;
 use crate::config::Environment;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState};
@@ -51,8 +51,8 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
     let members = nodes
         .into_iter()
         .map(|n| SwimNode {
-            node_id: crate::clusters::NodeId::new(&n.node_id),
-            addr: crate::clusters::NodeAddress {
+            node_id: crate::control_plane::NodeId::new(&n.node_id),
+            addr: crate::control_plane::NodeAddress {
                 cluster_addr: n.addr,
                 client_addr: n.addr,
                 data_addr: n.addr,

@@ -4,8 +4,8 @@ mod writers;
 
 use tokio::sync::mpsc;
 
-use crate::clusters::NodeId;
-use crate::clusters::swims::actor::SwimSender;
+use crate::control_plane::NodeId;
+use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::net::TcpListener;
 

@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[cfg(test)]
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 use crate::data_plane::SegmentKey;
 use crate::schedulers::timer::TTimer;
 

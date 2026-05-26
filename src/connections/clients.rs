@@ -25,15 +25,15 @@ use crate::connections::protocol::{
     TopicSummary,
 };
 use crate::{
-    clusters::{
+    control_plane::{
         SwimNodeState,
         metadata::{
             command::{CreateTopic, DeleteTopic, MetadataCommand},
             strategy::{PartitionStrategy, StoragePolicy},
         },
-        raft::actor::RaftSender,
-        raft::messages::{ProposeError, RaftCommand},
-        swims::{ShardGroupId, actor::SwimSender},
+        consensus::actor::RaftSender,
+        consensus::messages::{ProposeError, RaftCommand},
+        membership::{ShardGroupId, actor::SwimSender},
     },
     net::{OwnedReadHalf, OwnedWriteHalf},
 };
@@ -424,12 +424,12 @@ pub async fn run_client_writer(
 mod tests {
     use std::net::SocketAddr;
 
-    use crate::clusters::raft::actor::MultiRaftActor;
-    use crate::clusters::metadata::types::TopicStats as MetadataTopicStats;
-    use crate::clusters::raft::messages::MultiRaftActorCommand;
-    use crate::clusters::swims::actor::SwimActor;
-    use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand};
-    use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
+    use crate::control_plane::consensus::actor::MultiRaftActor;
+    use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+    use crate::control_plane::membership::actor::SwimActor;
+    use crate::control_plane::membership::{ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand};
+    use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
         ControlPlaneResponse, NodeState,
@@ -451,7 +451,7 @@ mod tests {
 
     fn swim_sender_with(
         handler: impl Fn(SwimActorCommand) + Send + 'static,
-    ) -> crate::clusters::swims::actor::SwimSender {
+    ) -> crate::control_plane::membership::actor::SwimSender {
         let (tx, mut rx) = SwimActor::channel(16);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
@@ -463,7 +463,7 @@ mod tests {
 
     fn raft_sender_with(
         handler: impl Fn(MultiRaftActorCommand) + Send + 'static,
-    ) -> crate::clusters::raft::actor::RaftSender {
+    ) -> crate::control_plane::consensus::actor::RaftSender {
         let (tx, mut rx) = MultiRaftActor::channel(16);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {

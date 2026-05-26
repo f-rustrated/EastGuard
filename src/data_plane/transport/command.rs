@@ -1,5 +1,5 @@
-use crate::clusters::NodeId;
-use crate::clusters::swims::ShardGroupId;
+use crate::control_plane::NodeId;
+use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
 
 pub(crate) struct DataTransportSendToTargets {

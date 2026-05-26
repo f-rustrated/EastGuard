@@ -3,7 +3,7 @@
 mod config;
 mod connections;
 
-mod clusters;
+mod control_plane;
 #[allow(dead_code)]
 mod data_plane;
 
@@ -18,13 +18,13 @@ pub(crate) mod macros;
 #[cfg(any(test, debug_assertions))]
 mod test_traits;
 
-use crate::clusters::raft::actor::{MultiRaftActor, RaftSender};
-use crate::clusters::raft::transport::RaftTransportActor;
+use crate::control_plane::consensus::actor::{MultiRaftActor, RaftSender};
+use crate::control_plane::consensus::transport::RaftTransportActor;
 
-use crate::clusters::raft::messages::{RaftTimer, RaftTransportCommand};
-use crate::clusters::swims::OutboundPacket;
-use crate::clusters::swims::SwimTimer;
-use crate::clusters::swims::actor::SwimSender;
+use crate::control_plane::consensus::messages::{RaftTimer, RaftTransportCommand};
+use crate::control_plane::membership::OutboundPacket;
+use crate::control_plane::membership::SwimTimer;
+use crate::control_plane::membership::actor::SwimSender;
 use crate::config::Environment;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -32,7 +32,7 @@ use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 use crate::{
-    clusters::{swims::actor::SwimActor, transport::SwimTransportActor},
+    control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
 };

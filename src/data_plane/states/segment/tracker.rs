@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
@@ -192,8 +192,8 @@ pub mod tests {
     #![allow(unused)]
 
     use super::*;
-    use crate::clusters::metadata::{RangeId, SegmentId};
-    use crate::clusters::metadata::TopicId;
+    use crate::control_plane::metadata::{RangeId, SegmentId};
+    use crate::control_plane::metadata::TopicId;
     use crate::test_traits::TAssertInvariant;
     use bytes::Bytes;
     use std::sync::Arc;

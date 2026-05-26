@@ -1,11 +1,11 @@
-use crate::clusters::{
+use crate::control_plane::{
     BINCODE_CONFIG, NodeId,
-    raft::{
+    consensus::raft::{
         log::LogEntry,
-        messages::LogMutation,
         storage::{RaftPersistentState, RaftStorage},
     },
-    swims::ShardGroupId,
+    consensus::messages::LogMutation,
+    membership::ShardGroupId,
 };
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -279,7 +279,7 @@ mod tests {
         LogEntry {
             term,
             index,
-            command: crate::clusters::raft::messages::RaftCommand::Noop,
+            command: crate::control_plane::consensus::messages::RaftCommand::Noop,
         }
     }
 

@@ -8,7 +8,7 @@ use super::checkpoint::CheckpointJob;
 use super::state::DataPlane;
 use super::timer::{BatchFlushTimer, ReplicationTimer};
 use super::wal::WalWriter;
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::SchedulerSender;

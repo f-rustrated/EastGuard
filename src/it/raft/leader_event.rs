@@ -7,14 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::*;
-use crate::clusters::raft::transport::RaftTransportActor;
-use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{
+use crate::control_plane::consensus::actor::MultiRaftActor;
+use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::membership::actor::SwimActor;
+use crate::control_plane::membership::{
     ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand,
 };
-use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
+use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;

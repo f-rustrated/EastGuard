@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    clusters::NodeId,
+    control_plane::NodeId,
     data_plane::{
         SegmentKey,
         checkpoint::CheckpointJob,

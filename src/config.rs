@@ -5,10 +5,10 @@ use std::fs::{self, OpenOptions};
 use clap::Parser;
 use uuid::Uuid;
 
-use crate::clusters::swims::peer_discovery::JoinAttempt;
-use crate::clusters::swims::swim::Swim;
-use crate::clusters::swims::{Topology, TopologyConfig};
-use crate::clusters::{NodeAddress, NodeId};
+use crate::control_plane::membership::peer_discovery::JoinAttempt;
+use crate::control_plane::membership::swim::Swim;
+use crate::control_plane::membership::{Topology, TopologyConfig};
+use crate::control_plane::{NodeAddress, NodeId};
 use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 

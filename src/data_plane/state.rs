@@ -7,7 +7,7 @@ use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 use crate::data_plane::checkpoint::CheckpointJob;
 use crate::data_plane::messages::event::DataPlaneEvent;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
@@ -545,8 +545,8 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
-    use crate::clusters::swims::ShardGroupId;
+    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::membership::ShardGroupId;
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
 

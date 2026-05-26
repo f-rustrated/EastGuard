@@ -3,9 +3,9 @@ use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
 use crate::{
-    clusters::NodeId,
-    clusters::metadata::SegmentId,
-    clusters::swims::ShardGroupId,
+    control_plane::NodeId,
+    control_plane::metadata::SegmentId,
+    control_plane::membership::ShardGroupId,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 

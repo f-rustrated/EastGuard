@@ -7,12 +7,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::MultiRaftActorCommand;
-use crate::clusters::raft::transport::RaftTransportActor;
-use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::consensus::actor::MultiRaftActor;
+use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::membership::actor::SwimActor;
+use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -42,7 +42,7 @@ fn build_address_map(
 }
 
 async fn drive_ticks(
-    ticker: &mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
+    ticker: &mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
     count: usize,
 ) {
     for _ in 0..count {
@@ -131,7 +131,7 @@ async fn run_raft_node(
     ));
 
     raft_tx
-        .send(crate::clusters::raft::messages::EnsureGroup {
+        .send(crate::control_plane::consensus::messages::EnsureGroup {
             group: group.clone(),
         })
         .await

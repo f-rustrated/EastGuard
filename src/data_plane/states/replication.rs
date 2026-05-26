@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tokio::sync::oneshot;
 
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::ProduceAck;
 use crate::data_plane::messages::event::PendingReplicationBatch;
@@ -175,7 +175,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::EntryPayload;
     use crate::data_plane::states::segment::cache::CachedEntry;
 

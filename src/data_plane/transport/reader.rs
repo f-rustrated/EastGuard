@@ -1,6 +1,6 @@
 use tokio::io::AsyncReadExt;
 
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::OwnedReadHalf;
 
