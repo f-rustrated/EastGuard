@@ -4,12 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::control_plane::NodeId;
-use crate::control_plane::metadata::state_machine::MetadataStateMachine;
-use crate::control_plane::metadata::{MetadataCommand, TopicStats};
-use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::state_machine::MetadataStateMachine;
+use crate::control_plane::metadata::{MetadataCommand, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -706,7 +706,7 @@ impl Raft {
                     result
                 );
                 self.events.push(
-                    MetadataApplied {
+                    MetadataCommitted {
                         shard_group_id: self.shard_group_id,
                         result,
                         log_index: index,

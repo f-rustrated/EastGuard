@@ -1,5 +1,6 @@
 #![deny(clippy::disallowed_types)]
 
+pub(crate) mod channels;
 mod config;
 mod connections;
 

@@ -7,6 +7,7 @@ use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
+use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
 use crate::data_plane::checkpoint::CheckpointJob;
 use crate::data_plane::messages::event::DataPlaneEvent;
@@ -18,8 +19,6 @@ use bytes::Bytes;
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::mpsc as tokio_mpsc;
-
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -77,7 +76,7 @@ impl<W: WalStorage> DataPlane<W> {
         checkpoint_tx: &Sender<CheckpointJob>,
         batch_scheduler: &SchedulerSender<BatchFlushTimer>,
         repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &tokio_mpsc::Sender<Box<[DataTransportCommand]>>,
+        transport_tx: &BatchSender<DataTransportCommand>,
     ) {
         if self.should_flush() {
             self.flush_batch();
@@ -431,7 +430,7 @@ impl<W: WalStorage> DataPlane<W> {
         checkpoint_tx: &Sender<CheckpointJob>,
         batch_scheduler: &SchedulerSender<BatchFlushTimer>,
         repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &tokio_mpsc::Sender<Box<[DataTransportCommand]>>,
+        transport_tx: &BatchSender<DataTransportCommand>,
     ) {
         use DataPlaneEvent as E;
         let mut transport_cmds = Vec::new();
@@ -495,9 +494,7 @@ impl<W: WalStorage> DataPlane<W> {
                 }
             }
         }
-        if !transport_cmds.is_empty() {
-            let _ = transport_tx.blocking_send(transport_cmds.into_boxed_slice());
-        }
+        transport_tx.blocking_send_batch(transport_cmds);
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();

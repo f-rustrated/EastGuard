@@ -4,6 +4,7 @@ use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
+use crate::channels::BatchSender;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::sync::mpsc;
@@ -13,7 +14,15 @@ use tokio::sync::mpsc::error::SendError;
 // PROTOCOL LAYER (SWIM Actor)
 // ==========================================
 
-pub struct SwimActor;
+pub struct SwimActor {
+    state: Swim,
+    transport_tx: BatchSender<OutboundPacket>,
+    scheduler_tx: BatchSender<TickerCommand<SwimTimer>>,
+    raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+
+    packets: Vec<OutboundPacket>,
+    timer_cmds: Vec<TickerCommand<SwimTimer>>,
+}
 
 impl SwimActor {
     pub fn channel(buffer: usize) -> (SwimSender, mpsc::Receiver<SwimActorCommand>) {
@@ -23,51 +32,55 @@ impl SwimActor {
 
     pub async fn run(
         mut mailbox: mpsc::Receiver<SwimActorCommand>,
-        mut state: Swim,
+        state: Swim,
         transport_tx: mpsc::Sender<Box<[OutboundPacket]>>,
         scheduler_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {
-        tracing::info!("[{}] SwimActor started.", state.node_id);
+        let mut actor = Self {
+            state,
+            transport_tx: transport_tx.into(),
+            scheduler_tx: scheduler_tx.into(),
+            raft_tx,
+            packets: Vec::new(),
+            timer_cmds: Vec::new(),
+        };
+
+        tracing::info!("[{}] SwimActor started.", actor.state.node_id);
 
         let mut buf = Vec::with_capacity(64);
         loop {
-            Self::flush_events(&mut state, &transport_tx, &scheduler_tx, &raft_tx).await;
+            actor.flush().await;
 
             if mailbox.recv_many(&mut buf, 64).await == 0 {
                 break;
             }
             for event in buf.drain(..) {
-                state.dispatch(event);
+                actor.state.dispatch(event);
             }
         }
     }
 
-    async fn flush_events(
-        state: &mut Swim,
-        transport_tx: &mpsc::Sender<Box<[OutboundPacket]>>,
-        scheduler_tx: &mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
-        raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
-    ) {
-        let mut packets = Vec::new();
-        let mut timer_cmds = Vec::new();
-        for event in state.take_events() {
+    async fn flush(&mut self) {
+        for event in self.state.take_events() {
             match event {
-                SwimEvent::Packet(pkt) => packets.push(pkt),
-                SwimEvent::Timer(cmd) => timer_cmds.push(cmd.into()),
+                SwimEvent::Packet(pkt) => self.packets.push(pkt),
+                SwimEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
                 SwimEvent::Membership(m) => {
-                    if let Some(cmd) = m.into_raft_command(&state.node_id, &state.topology) {
-                        let _ = raft_tx.send(cmd).await;
+                    if let Some(cmd) =
+                        m.into_raft_command(&self.state.node_id, &self.state.topology)
+                    {
+                        let _ = self.raft_tx.send(cmd).await;
                     }
                 }
             }
         }
-        if !packets.is_empty() {
-            let _ = transport_tx.send(packets.into_boxed_slice()).await;
-        }
-        if !timer_cmds.is_empty() {
-            let _ = scheduler_tx.send(timer_cmds.into_boxed_slice()).await;
-        }
+        tokio::join!(
+            self.transport_tx
+                .send_batch(std::mem::take(&mut self.packets)),
+            self.scheduler_tx
+                .send_batch(std::mem::take(&mut self.timer_cmds)),
+        );
     }
 }
 
