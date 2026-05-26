@@ -1,20 +1,17 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+use crate::data_plane::SegmentKey;
 use crate::impl_from_variant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicCreated {
-    pub topic_id: TopicId,
-    pub range_id: RangeId,
-    pub segment_id: SegmentId,
+    pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentRolled {
-    pub topic_id: TopicId,
-    pub range_id: RangeId,
-    pub new_segment_id: SegmentId,
+    pub new_segment_key: SegmentKey,
     pub new_replica_set: Vec<NodeId>,
     pub end_entry_id: Option<u64>,
 }
@@ -27,9 +24,7 @@ pub struct RangeSplit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeMerged {
-    pub topic_id: TopicId,
-    pub merged_range_id: RangeId,
-    pub segment_id: SegmentId,
+    pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
 }
 

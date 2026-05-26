@@ -64,7 +64,7 @@ impl MetadataCommitted {
                 vec![DataTransportCommand::send_to_targets(
                     vec![target],
                     SegmentAssignment {
-                        segment_key: SegmentKey::new(tc.topic_id, tc.range_id, tc.segment_id),
+                        segment_key: tc.segment_key,
                         shard_group_id: sgid,
                         replica_set: tc.replica_set,
                         start_entry_id: 0,
@@ -77,7 +77,7 @@ impl MetadataCommitted {
                 let mut cmds = vec![DataTransportCommand::send_to_targets(
                     vec![target],
                     SegmentAssignment {
-                        segment_key: SegmentKey::new(sr.topic_id, sr.range_id, sr.new_segment_id),
+                        segment_key: sr.new_segment_key,
                         shard_group_id: sgid,
                         replica_set: sr.new_replica_set.clone(),
                         start_entry_id: start,
@@ -88,7 +88,7 @@ impl MetadataCommitted {
                         vec![ctx.requester],
                         SealResponse {
                             old_segment_key: ctx.old_segment_key,
-                            new_segment_id: sr.new_segment_id,
+                            new_segment_id: sr.new_segment_key.segment_id,
                             new_replica_set: sr.new_replica_set,
                         },
                     ));
@@ -116,11 +116,7 @@ impl MetadataCommitted {
                 vec![DataTransportCommand::send_to_targets(
                     vec![target],
                     SegmentAssignment {
-                        segment_key: SegmentKey::new(
-                            rm.topic_id,
-                            rm.merged_range_id,
-                            rm.segment_id,
-                        ),
+                        segment_key: rm.segment_key,
                         shard_group_id: sgid,
                         replica_set: rm.replica_set,
                         start_entry_id: 0,

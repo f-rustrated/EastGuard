@@ -181,11 +181,7 @@ impl RangeMeta {
         Ok(active_seg_id == expected)
     }
 
-    pub(crate) fn correct_end_offset(
-        &mut self,
-        segment_id: SegmentId,
-        end_entry_id: Option<u64>,
-    ) {
+    pub(crate) fn correct_end_offset(&mut self, segment_id: SegmentId, end_entry_id: Option<u64>) {
         let Some(end_entry_id) = end_entry_id else {
             return;
         };
@@ -218,8 +214,8 @@ impl RangeMeta {
             return Err(MetadataError::InvalidSplitPoint);
         }
         Ok(MetadataCommand::SplitRange(SplitRange {
-            topic_id: cmd.topic_id,
-            range_id: cmd.range_id,
+            topic_id: cmd.segment_key.topic_id,
+            range_id: cmd.segment_key.range_id,
             split_point: mid,
             created_at: cmd.sealed_at,
             left_replica_set: cmd.new_replica_set.clone(),
@@ -230,7 +226,7 @@ impl RangeMeta {
     pub(crate) fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentId, MetadataError> {
         let segment = self
             .segments
-            .get_mut(&cmd.segment_id)
+            .get_mut(&cmd.segment_key.segment_id)
             .ok_or(MetadataError::SegmentNotFound)?;
         segment.seal(cmd.end_entry_id, cmd.sealed_at)?;
 

@@ -1,12 +1,12 @@
 use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
-use crate::control_plane::metadata::types::TopicStats;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::types::TopicStats;
 
 use super::command::{
     CoordinatorCommand, EnsureGroup, HandleNodeDeath, HandleNodeJoin, MultiRaftCommand,
-    PacketReceived, ProposeError, RaftCommand, RaftPropose, RemoveGroup,
+    PacketReceived, ProposeError, RaftPropose, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
@@ -23,8 +23,7 @@ pub enum MultiRaftActorCommand {
     },
     /// Propose a command to a shard group's Raft log. Leader-only.
     Propose {
-        shard_group_id: ShardGroupId,
-        command: RaftCommand,
+        propose: RaftPropose,
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
     /// Query all topic names from all shard groups on this node.

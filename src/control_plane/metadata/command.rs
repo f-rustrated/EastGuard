@@ -3,8 +3,9 @@ use bincode::{Decode, Encode};
 use crate::{
     control_plane::{
         NodeId,
-        metadata::{RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+        metadata::{RangeId, TopicId, strategy::StoragePolicy},
     },
+    data_plane::SegmentKey,
     impl_from_variant,
 };
 
@@ -18,9 +19,7 @@ pub struct CreateTopic {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RollSegment {
-    pub topic_id: TopicId,
-    pub range_id: RangeId,
-    pub segment_id: SegmentId,
+    pub segment_key: SegmentKey,
     pub sealed_at: u64,
     pub new_replica_set: Vec<NodeId>,
     /// None for SWIM-death-triggered seals — the coordinator doesn't know

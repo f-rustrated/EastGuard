@@ -61,13 +61,13 @@ impl MetadataStateMachine {
             CreateTopic(cmd) => self.create_topic(cmd)?.into(),
             RollSegment(cmd) => {
                 let range = self
-                    .get_active_topic_mut(cmd.topic_id)?
+                    .get_active_topic_mut(cmd.segment_key.topic_id)?
                     .ranges
-                    .get_mut(&cmd.range_id)
+                    .get_mut(&cmd.segment_key.range_id)
                     .ok_or(RangeNotFound)?;
 
-                if !range.is_active_segment(cmd.segment_id)? {
-                    range.correct_end_offset(cmd.segment_id, cmd.end_entry_id);
+                if !range.is_active_segment(cmd.segment_key.segment_id)? {
+                    range.correct_end_offset(cmd.segment_key.segment_id, cmd.end_entry_id);
                     ApplyResult::Noop
                 } else {
                     self.roll_segment(cmd)?.into()
@@ -99,17 +99,18 @@ impl MetadataStateMachine {
         self.topics.insert(topic.id, topic);
         self.next_topic_id += 1;
         Ok(TopicCreated {
-            topic_id,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(topic_id, RangeId(0), SegmentId(0)),
             replica_set,
         })
     }
 
     fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentRolled, MetadataError> {
-        let topic = self.get_active_topic_mut(cmd.topic_id)?;
+        let topic = self.get_active_topic_mut(cmd.segment_key.topic_id)?;
         let can_split = topic.can_split();
-        let range = topic.ranges.get_mut(&cmd.range_id).ok_or(RangeNotFound)?;
+        let range = topic
+            .ranges
+            .get_mut(&cmd.segment_key.range_id)
+            .ok_or(RangeNotFound)?;
 
         let new_segment_id = range.roll_segment(cmd.clone())?;
 
@@ -119,16 +120,14 @@ impl MetadataStateMachine {
                 Err(e) => {
                     tracing::debug!(
                         "Split proposal skipped for range {:?}: {:?}",
-                        cmd.range_id,
+                        cmd.segment_key.range_id,
                         e
                     )
                 }
             }
         }
         Ok(SegmentRolled {
-            topic_id: cmd.topic_id,
-            range_id: cmd.range_id,
-            new_segment_id,
+            new_segment_key: cmd.segment_key.with_segment_id(new_segment_id),
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
         })
@@ -169,9 +168,7 @@ impl MetadataStateMachine {
         topic.validate_active()?;
         let merged_id = topic.execute_merge(cmd)?;
         Ok(RangeMerged {
-            topic_id,
-            merged_range_id: merged_id,
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(topic_id, merged_id, SegmentId(0)),
             replica_set,
         })
     }
@@ -282,7 +279,7 @@ mod tests {
             created_at: 1000,
         }));
         match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.topic_id,
+            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         }
     }
@@ -295,9 +292,7 @@ mod tests {
         sealed_at: u64,
     ) {
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id,
-            range_id,
-            segment_id,
+            segment_key: SegmentKey::new(topic_id, range_id, segment_id),
             sealed_at,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -341,7 +336,7 @@ mod tests {
             merged_replica_set: replica_set(),
         }));
         match result.unwrap() {
-            ApplyResult::RangeMerged(rm) => rm.merged_range_id,
+            ApplyResult::RangeMerged(rm) => rm.segment_key.range_id,
             other => panic!("expected RangeMerged, got {:?}", other),
         }
     }
@@ -446,9 +441,7 @@ mod tests {
     fn roll_segment_bad_topic() {
         let mut sm = MetadataStateMachine::default();
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: TopicId(99),
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(TopicId(99), RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -462,9 +455,7 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(99),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(99), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -478,9 +469,7 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(99),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(99)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -548,7 +537,7 @@ mod tests {
             created_at: 1000,
         }));
         let tid = match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.topic_id,
+            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         };
 
@@ -767,9 +756,7 @@ mod tests {
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 3000,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -896,7 +883,7 @@ mod tests {
             created_at: 1000,
         }));
         let tid = match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.topic_id,
+            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         };
 
@@ -1014,9 +1001,7 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: Some(42000),
@@ -1047,9 +1032,7 @@ mod tests {
 
         // Death-triggered roll with end_entry_id=0 (placeholder)
         let _ = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
@@ -1062,9 +1045,7 @@ mod tests {
 
         // Segment leader's RollSegment arrives with correct end_entry_id
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2500,
             new_replica_set: replica_set(),
             end_entry_id: Some(42000),
@@ -1083,9 +1064,7 @@ mod tests {
 
         // Normal roll with actual end_entry_id
         let _ = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: Some(1000),
@@ -1093,9 +1072,7 @@ mod tests {
 
         // Duplicate roll is rejected (end_offset already set)
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            topic_id: tid,
-            range_id: RangeId(0),
-            segment_id: SegmentId(0),
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2500,
             new_replica_set: replica_set(),
             end_entry_id: Some(42000),

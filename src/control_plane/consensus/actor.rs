@@ -129,8 +129,10 @@ impl RaftSender {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.0
             .send(MultiRaftActorCommand::Propose {
-                shard_group_id,
-                command,
+                propose: RaftPropose {
+                    shard_group_id,
+                    command,
+                },
                 reply: send,
             })
             .await

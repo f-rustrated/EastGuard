@@ -1,10 +1,10 @@
 use bincode::{Decode, Encode};
 
 use crate::control_plane::NodeId;
-use crate::control_plane::metadata::command::MetadataCommand;
 use crate::control_plane::consensus::messages::rpc::{OutboundRaftPacket, RaftRpc};
 use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::control_plane::metadata::command::MetadataCommand;
 use crate::data_plane::SegmentKey;
 use crate::impl_from_variant;
 
