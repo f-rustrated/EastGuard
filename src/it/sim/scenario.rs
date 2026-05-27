@@ -9,8 +9,11 @@ use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{
     ClientRequest, ClientResponse, ControlPlaneRequest, ControlPlaneResponse,
 };
+use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::default_env;
-use crate::it::sim::invariants::{assert_membership_converged, assert_topic_visible_on_quorum, query_shard_info};
+use crate::it::sim::invariants::{
+    assert_membership_converged, assert_topic_visible_on_quorum, query_shard_info,
+};
 use crate::net::TcpStream;
 
 pub(super) fn node_name(i: u8) -> String {
@@ -85,13 +88,14 @@ impl SimScenario {
         let mut faults = Vec::new();
         let mut killed: Vec<u8> = Vec::new();
         for _ in 0..fault_count {
-            let available: Vec<u8> = (1..=node_count)
-                .filter(|n| !killed.contains(n))
-                .collect();
+            let available: Vec<u8> = (1..=node_count).filter(|n| !killed.contains(n)).collect();
             let node_num = *available.choose(&mut rng).unwrap();
             let window_end = simulation_secs.saturating_sub(20).max(11);
             let at_secs = pick_u64(&mut rng, 10, window_end);
-            faults.push(FaultEvent { at_secs, kind: FaultKind::KillNode(node_num) });
+            faults.push(FaultEvent {
+                at_secs,
+                kind: FaultKind::KillNode(node_num),
+            });
             killed.push(node_num);
         }
         faults.sort_by_key(|f| f.at_secs);
@@ -110,7 +114,13 @@ impl SimScenario {
         }
         commands.sort_by_key(|c| c.at_secs);
 
-        SimScenario { seed, node_count, simulation_secs, faults, commands }
+        SimScenario {
+            seed,
+            node_count,
+            simulation_secs,
+            faults,
+            commands,
+        }
     }
 
     /// Node numbers not killed by any KillNode fault — expected alive at simulation end.
@@ -126,7 +136,9 @@ impl SimScenario {
                 }
             })
             .collect();
-        (1..=self.node_count).filter(|n| !killed.contains(n)).collect()
+        (1..=self.node_count)
+            .filter(|n| !killed.contains(n))
+            .collect()
     }
 }
 
@@ -137,13 +149,10 @@ pub(super) async fn try_propose(
     port: u16,
     req: &ClientRequest,
 ) -> Option<ControlPlaneResponse> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((host, port)),
-    )
-    .await
-    .ok()
-    .and_then(|r| r.ok())?;
+    let stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port)))
+        .await
+        .ok()
+        .and_then(|r| r.ok())?;
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
@@ -162,8 +171,11 @@ pub(super) async fn try_propose(
 pub(super) fn make_create_topic_req(name: &str) -> ClientRequest {
     ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
         name: name.to_string(),
-        retention_ms: 3_600_000,
-        replication_factor: 3,
+        storage_policy: StoragePolicy {
+            retention_ms: 3_600_000,
+            replication_factor: 3,
+            partition_strategy: PartitionStrategy::AutoSplit,
+        },
     })
 }
 
@@ -193,7 +205,13 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
             let me = turmoil::lookup(name.as_str());
             let seeds: Vec<String> = (1..=node_count)
                 .filter(|&j| j != i)
-                .map(|j| format!("{}:{}", turmoil::lookup(node_name(j).as_str()), cluster_port(j)))
+                .map(|j| {
+                    format!(
+                        "{}:{}",
+                        turmoil::lookup(node_name(j).as_str()),
+                        cluster_port(j)
+                    )
+                })
                 .collect();
             let mut env = default_env(i as u32, name.clone(), cp, rp);
             env.advertise_host = Some(me.to_string());
@@ -206,8 +224,10 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
 
     let commands = scenario.commands.clone();
     let alive_at_end = scenario.alive_at_end();
-    let alive_addrs: Vec<(String, u16)> =
-        alive_at_end.iter().map(|&i| (node_name(i), client_port(i))).collect();
+    let alive_addrs: Vec<(String, u16)> = alive_at_end
+        .iter()
+        .map(|&i| (node_name(i), client_port(i)))
+        .collect();
     let simulation_secs = scenario.simulation_secs;
 
     sim.client("checker", async move {
@@ -235,7 +255,9 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
                             alive_addrs
                                 .iter()
                                 .filter(|(n, _)| {
-                                    info.member_node_ids.iter().any(|m| m.starts_with(n.as_str()))
+                                    info.member_node_ids
+                                        .iter()
+                                        .any(|m| m.starts_with(n.as_str()))
                                 })
                                 .cloned()
                                 .collect()

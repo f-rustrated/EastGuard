@@ -7,6 +7,7 @@ use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
     ControlPlaneResponse,
 };
+use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::{default_env, send_request};
 
 /// CreateTopic eventually succeeds when tried across all nodes (exactly one is the leader),
@@ -48,8 +49,11 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
         // Wait for leader election then create a topic by trying all nodes.
         let req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "test-topic".to_string(),
-            retention_ms: 3_600_000,
-            replication_factor: 3,
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
         });
         let mut created = false;
         'outer: for _ in 0..20 {
@@ -128,8 +132,11 @@ fn delete_topic() -> turmoil::Result {
     sim.client("test-client", async {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "del-test".to_string(),
-            retention_ms: 3_600_000,
-            replication_factor: 3,
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
         });
 
         let mut acked: Option<(&str, u16)> = None;
@@ -159,7 +166,10 @@ fn delete_topic() -> turmoil::Result {
         else {
             panic!("expected TopicList, got {list_resp:?}");
         };
-        assert!(topics.iter().any(|t| t.name == "del-test"), "del-test not listed before delete");
+        assert!(
+            topics.iter().any(|t| t.name == "del-test"),
+            "del-test not listed before delete"
+        );
 
         // Delete the topic (same node is the leader for the shard group).
         let del_resp = send_request(
@@ -171,7 +181,10 @@ fn delete_topic() -> turmoil::Result {
         )
         .await;
         assert!(
-            matches!(del_resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)),
+            matches!(
+                del_resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)
+            ),
             "expected TopicDeleted, got {del_resp:?}"
         );
 
@@ -180,8 +193,14 @@ fn delete_topic() -> turmoil::Result {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut still_present = false;
             for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics: listed }) =
-                    send_request(h, p, ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics)).await
+                if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList {
+                    topics: listed,
+                }) = send_request(
+                    h,
+                    p,
+                    ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
+                )
+                .await
                     && listed.iter().any(|t| t.name == "del-test")
                 {
                     still_present = true;
@@ -193,8 +212,14 @@ fn delete_topic() -> turmoil::Result {
         }
 
         for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-            if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics: listed }) =
-                send_request(h, p, ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics)).await
+            if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList {
+                topics: listed,
+            }) = send_request(
+                h,
+                p,
+                ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
+            )
+            .await
             {
                 assert!(
                     !listed.iter().any(|t| t.name == "del-test"),
@@ -245,8 +270,11 @@ fn list_topic_stats_after_create() -> turmoil::Result {
     sim.client("test-client", async {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "stats-test".to_string(),
-            retention_ms: 3_600_000,
-            replication_factor: 3,
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
         });
 
         let mut created = false;
@@ -274,13 +302,16 @@ fn list_topic_stats_after_create() -> turmoil::Result {
                 ClientRequest::Admin(AdminRequest::ListHostedTopicsWithStats),
             )
             .await
-            && topics.iter().any(|t| t.name == "stats-test")
+                && topics.iter().any(|t| t.name == "stats-test")
             {
                 found = true;
                 break;
             }
         }
-        assert!(found, "stats-test not found in ListHostedTopicsWithStats on any node");
+        assert!(
+            found,
+            "stats-test not found in ListHostedTopicsWithStats on any node"
+        );
 
         Ok(())
     });

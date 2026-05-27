@@ -8,9 +8,9 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::MetadataCommand;
 use crate::control_plane::membership::SwimCommand;
 use crate::control_plane::membership::actor::SwimSender;
+use crate::control_plane::metadata::MetadataCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
