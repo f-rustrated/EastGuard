@@ -235,6 +235,10 @@ impl Topology {
         self.node_group_ids.len()
     }
 
+    pub fn live_nodes(&self) -> Vec<NodeId> {
+        self.node_group_ids.keys().cloned().collect()
+    }
+
     pub fn update_shard_leader(&mut self, info: &ShardLeaderInfo) -> bool {
         if let Some(existing) = self.shard_leaders.get(&info.shard_group_id)
             && info.term <= existing.term

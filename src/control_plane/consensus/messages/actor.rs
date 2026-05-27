@@ -1,12 +1,12 @@
 use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
-use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::membership::{NodeDead, ShardGroupId};
 use crate::control_plane::metadata::types::TopicStats;
 
 use super::command::{
-    ConsensusCommand, CoordinatorCommand, EnsureGroup, HandleNodeDeath, HandleNodeJoin,
-    PacketReceived, ProposeError, RaftPropose, RemoveGroup,
+    ConsensusCommand, CoordinatorCommand, EnsureGroup, HandleNodeJoin, PacketReceived,
+    ProposeError, RaftPropose, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
@@ -54,7 +54,7 @@ impl_from_variant_via!(
     PacketReceived,
     EnsureGroup,
     RemoveGroup,
-    HandleNodeDeath,
+    NodeDead,
     HandleNodeJoin,
 );
 

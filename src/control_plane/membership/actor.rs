@@ -1,10 +1,10 @@
 use super::*;
 
+use crate::channels::BatchSender;
 use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
-use crate::channels::BatchSender;
 use crate::schedulers::ticker_message::TickerCommand;
 
 use tokio::sync::mpsc;
@@ -66,7 +66,7 @@ impl SwimActor {
             match event {
                 SwimEvent::Packet(pkt) => self.packets.push(pkt),
                 SwimEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
-                SwimEvent::Membership(m) => {
+                SwimEvent::MembershipEvent(m) => {
                     if let Some(cmd) =
                         m.into_raft_command(&self.state.node_id, &self.state.topology)
                     {
@@ -120,7 +120,8 @@ impl SwimSender {
 
     pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<crate::control_plane::SwimNode>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::GetMembers { reply: send }).await?;
+        self.send(SwimQueryCommand::GetMembers { reply: send })
+            .await?;
         Ok(recv.await?)
     }
 

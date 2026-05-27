@@ -604,20 +604,20 @@ impl Swim {
         match member.state {
             SwimNodeState::Alive => {
                 self.cancel_suspect_timer(node_id);
-                self.pending_events
-                    .push(SwimEvent::Membership(MembershipEvent::NodeAlive {
+                self.pending_events.push(
+                    NodeAlive {
                         node_id: node_id.clone(),
                         addr: member.addr.cluster_addr,
-                    }));
+                    }
+                    .into(),
+                );
             }
             SwimNodeState::Dead => {
                 // Node can receive a Dead gossip while still locally Suspect; cancel the
                 // pending suspect timer so it doesn't fire and re-emit a stale Dead event.
                 self.cancel_suspect_timer(node_id);
                 self.pending_events
-                    .push(SwimEvent::Membership(MembershipEvent::NodeDead {
-                        node_id: node_id.clone(),
-                    }));
+                    .push(NodeDead::new(node_id.clone(), self.topology.live_nodes()).into());
             }
             SwimNodeState::Suspect => {
                 let seq = self.next_seq();
@@ -655,41 +655,6 @@ impl Swim {
 
     pub(crate) fn take_events(&mut self) -> Vec<SwimEvent> {
         std::mem::take(&mut self.pending_events)
-    }
-
-    /// Push an event back into the buffer. Used by TestHarness to
-    /// selectively drain timers while preserving other events.
-    #[cfg(test)]
-    pub(crate) fn re_buffer(&mut self, event: SwimEvent) {
-        self.pending_events.push(event);
-    }
-
-    /// Drain only outbound packets. Test convenience.
-    #[cfg(test)]
-    pub(crate) fn take_packets(&mut self) -> Vec<OutboundPacket> {
-        let events = self.take_events();
-        let mut packets = Vec::new();
-        for event in events {
-            match event {
-                SwimEvent::Packet(p) => packets.push(p),
-                other => self.pending_events.push(other),
-            }
-        }
-        packets
-    }
-
-    /// Drain only membership events. Test convenience.
-    #[cfg(test)]
-    pub(crate) fn take_membership_events(&mut self) -> Vec<MembershipEvent> {
-        let events = self.take_events();
-        let mut membership = Vec::new();
-        for event in events {
-            match event {
-                SwimEvent::Membership(m) => membership.push(m),
-                other => self.pending_events.push(other),
-            }
-        }
-        membership
     }
 
     pub(crate) fn dispatch(&mut self, event: SwimActorCommand) {
@@ -794,6 +759,41 @@ pub mod props {
                     );
                 }
             }
+        }
+
+        /// Push an event back into the buffer. Used by TestHarness to
+        /// selectively drain timers while preserving other events.
+        #[cfg(test)]
+        pub(crate) fn re_buffer(&mut self, event: SwimEvent) {
+            self.pending_events.push(event);
+        }
+
+        /// Drain only outbound packets. Test convenience.
+        #[cfg(test)]
+        pub(crate) fn take_packets(&mut self) -> Vec<OutboundPacket> {
+            let events = self.take_events();
+            let mut packets = Vec::new();
+            for event in events {
+                match event {
+                    SwimEvent::Packet(p) => packets.push(p),
+                    other => self.pending_events.push(other),
+                }
+            }
+            packets
+        }
+
+        /// Drain only membership events. Test convenience.
+        #[cfg(test)]
+        pub(crate) fn take_membership_events(&mut self) -> Vec<MembershipEvent> {
+            let events = self.take_events();
+            let mut membership = Vec::new();
+            for event in events {
+                match event {
+                    SwimEvent::MembershipEvent(m) => membership.push(m),
+                    other => self.pending_events.push(other),
+                }
+            }
+            membership
         }
     }
 }
@@ -1466,7 +1466,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            MembershipEvent::NodeAlive { node_id, .. } if *node_id == NodeId::new("node-remote")
+            MembershipEvent::NodeAlive(NodeAlive { node_id, .. }) if *node_id == NodeId::new("node-remote")
         ));
     }
 
@@ -1504,10 +1504,10 @@ mod tests {
         // 2 events: NodeAlive for sender "node-other" + NodeDead for "node-remote"
         assert!(events
             .iter()
-            .any(|e| matches!(e, MembershipEvent::NodeDead { node_id } if *node_id == NodeId::new("node-remote"))));
+            .any(|e| matches!(e, MembershipEvent::NodeDead(NodeDead{dead_node_id,..}) if *dead_node_id == NodeId::new("node-remote"))));
         assert!(events
             .iter()
-            .any(|e| matches!(e, MembershipEvent::NodeAlive { node_id, .. } if *node_id == NodeId::new("node-other"))));
+            .any(|e| matches!(e, MembershipEvent::NodeAlive(NodeAlive { node_id, .. } )if *node_id == NodeId::new("node-other"))));
     }
 
     #[test]
