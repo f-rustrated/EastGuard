@@ -32,7 +32,7 @@ use crate::{
             strategy::{PartitionStrategy, StoragePolicy},
         },
         consensus::actor::RaftSender,
-        consensus::messages::{ProposeError, RaftCommand},
+        consensus::messages::ProposeError,
         membership::{ShardGroupId, actor::SwimSender},
     },
     net::{OwnedReadHalf, OwnedWriteHalf},
@@ -257,7 +257,7 @@ impl ClientHandler {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+        let cmd = MetadataCommand::CreateTopic(CreateTopic {
             name: name.clone(),
             storage_policy: StoragePolicy {
                 retention_ms,
@@ -266,7 +266,7 @@ impl ClientHandler {
             },
             replica_set: shard_group.members,
             created_at: now_ms,
-        }));
+        });
         Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
             Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
             Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(
@@ -289,7 +289,7 @@ impl ClientHandler {
                 "shard group not found".into(),
             )));
         };
-        let cmd = RaftCommand::Metadata(MetadataCommand::DeleteTopic(DeleteTopic { name }));
+        let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
         Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
             Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
             Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(

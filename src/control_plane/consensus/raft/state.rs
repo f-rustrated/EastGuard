@@ -86,7 +86,7 @@ pub struct Raft {
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
-    pending_proposals: Vec<RaftCommand>,
+    pending_proposals: Vec<MetadataCommand>,
     election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
 }
@@ -173,7 +173,7 @@ impl Raft {
         std::mem::take(&mut self.pending_log_mutations)
     }
 
-    pub(crate) fn take_pending_proposals(&mut self) -> Vec<RaftCommand> {
+    pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
         std::mem::take(&mut self.pending_proposals)
     }
 
@@ -451,7 +451,7 @@ impl Raft {
         // preceding entries from earlier terms can be committed.
         // Without this, old-term entries remain in limbo until a real
         // client proposal arrives.
-        self.add_new_entry(RaftCommand::Noop);
+        self.add_new_entry(None);
 
         // Send AppendEntries (with the Noop) to all peers.
         self.send_heartbeats();
@@ -672,12 +672,6 @@ impl Raft {
         self.stabled_index = self.stabled_index.max(value);
     }
 
-    #[cfg(test)]
-    pub(crate) fn simulate_flush(&mut self) {
-        self.advance_stabled_index(self.log_last_index());
-        self.apply_committed_entries();
-    }
-
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -690,8 +684,8 @@ impl Raft {
                 break;
             };
             match entry.command {
-                RaftCommand::Noop => {}
-                RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
+                None => {}
+                Some(cmd) => self.apply_metadata_entry(cmd, entry.index),
             }
         }
     }
@@ -724,8 +718,7 @@ impl Raft {
         }
         if self.role == Role::Leader {
             for pending_cmd in self.state_machine.take_pending_proposals() {
-                self.pending_proposals
-                    .push(RaftCommand::Metadata(pending_cmd));
+                self.pending_proposals.push(pending_cmd);
             }
         }
     }
@@ -756,7 +749,7 @@ impl Raft {
         self.events.push(RaftEvent::DisconnectPeer(node_id.clone()));
     }
 
-    fn add_new_entry(&mut self, command: RaftCommand) {
+    fn add_new_entry(&mut self, command: Option<MetadataCommand>) {
         let entry = LogEntry {
             term: self.current_term,
             index: self.log_last_index() + 1,
@@ -775,12 +768,12 @@ impl Raft {
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
     /// Returns the log index at which the command was appended on success.
-    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposeError> {
+    pub fn propose(&mut self, command: MetadataCommand) -> Result<u64, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader(self.current_leader.clone()));
         }
 
-        self.add_new_entry(command);
+        self.add_new_entry(Some(command));
         let index = self.log_last_index();
 
         // Immediately replicate to all peers.
@@ -835,7 +828,7 @@ impl Raft {
 
         let merge_proposals = self.state_machine.evaluate_merges(now);
         for cmd in merge_proposals {
-            self.pending_proposals.push(RaftCommand::Metadata(cmd));
+            self.pending_proposals.push(cmd);
         }
 
         self.schedule_merge_check_timer();
@@ -917,6 +910,26 @@ impl crate::test_traits::TAssertInvariant for Raft {
 mod tests {
     use super::*;
 
+    impl Raft {
+        pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposeError> {
+            if self.role != Role::Leader {
+                return Err(ProposeError::NotLeader(self.current_leader.clone()));
+            }
+            self.add_new_entry(None);
+            let index = self.log_last_index();
+            let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
+            for peer_id in peers {
+                self.send_append_entries(peer_id);
+            }
+            self.try_advance_commit_index();
+            Ok(index)
+        }
+
+        pub(crate) fn simulate_flush(&mut self) {
+            self.advance_stabled_index(self.log_last_index());
+            self.apply_committed_entries();
+        }
+    }
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
     }
@@ -1140,7 +1153,7 @@ mod tests {
         raft.log_append(LogEntry {
             term: 2,
             index: 1,
-            command: RaftCommand::Noop,
+            command: None,
         });
 
         // node-1 requests vote with older log (term 1)
@@ -1190,7 +1203,7 @@ mod tests {
                 panic!("expected AppendEntries")
             };
             assert_eq!(ae.entries.len(), 1, "initial AE should carry noop");
-            assert_eq!(ae.entries[0].command, RaftCommand::Noop);
+            assert_eq!(ae.entries[0].command, None);
             assert_eq!(ae.entries[0].term, 1);
         }
 
@@ -1235,7 +1248,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                command: RaftCommand::Noop,
+                command: None,
             }],
             leader_commit: 0,
         };
@@ -1290,7 +1303,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 2,
-                command: RaftCommand::Noop,
+                command: None,
             }],
             leader_commit: 0,
         };
@@ -1325,7 +1338,7 @@ mod tests {
         drain(&mut raft);
 
         // Noop is at index 1 (appended on election). Propose adds at index 2.
-        raft.propose(RaftCommand::Noop).unwrap();
+        raft.propose_noop().unwrap();
         drain(&mut raft);
         assert_eq!(raft.log_last_index(), 2);
         assert_eq!(raft.commit_index, 0);
@@ -1347,7 +1360,7 @@ mod tests {
     fn follower_cannot_propose() {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
-            raft.propose(RaftCommand::Noop),
+            raft.propose_noop(),
             Err::<u64, _>(ProposeError::NotLeader(None))
         );
     }
@@ -1370,7 +1383,7 @@ mod tests {
         assert_eq!(raft.current_leader(), Some(&node("node-1")));
 
         assert_eq!(
-            raft.propose(RaftCommand::Noop),
+            raft.propose_noop(),
             Err::<u64, _>(ProposeError::NotLeader(Some(node("node-1"))))
         );
     }
@@ -1392,7 +1405,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                command: RaftCommand::Noop,
+                command: None,
             }],
             leader_commit: 1,
         };
@@ -1426,7 +1439,7 @@ mod tests {
         drain(&mut raft);
 
         // Add some entries
-        raft.propose(RaftCommand::Noop).unwrap();
+        raft.propose_noop().unwrap();
         drain(&mut raft);
 
         // node-2 rejects (log mismatch)
@@ -1839,7 +1852,7 @@ mod tests {
         });
         drain(&mut raft);
 
-        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+        let cmd = MetadataCommand::CreateTopic(CreateTopic {
             name: "blue".to_string(),
             storage_policy: StoragePolicy {
                 retention_ms: 3_600_000,
@@ -1848,7 +1861,7 @@ mod tests {
             },
             replica_set: vec![node("node-1"), node("node-2"), node("node-3")],
             created_at: 1000,
-        }));
+        });
 
         let result = raft.propose(cmd);
         assert!(result.is_ok());
@@ -1963,8 +1976,8 @@ mod tests {
     use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 
-    fn test_create_topic_cmd(name: &str) -> RaftCommand {
-        RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+    fn test_create_topic_cmd(name: &str) -> MetadataCommand {
+        MetadataCommand::CreateTopic(CreateTopic {
             name: name.to_string(),
             storage_policy: StoragePolicy {
                 retention_ms: 3_600_000,
@@ -1973,7 +1986,7 @@ mod tests {
             },
             replica_set: vec![node("n1"), node("n2"), node("n3")],
             created_at: 1000,
-        }))
+        })
     }
 
     #[test]
@@ -2000,7 +2013,7 @@ mod tests {
         drain(&mut raft);
         raft.simulate_flush();
 
-        raft.propose(RaftCommand::Noop).unwrap();
+        raft.propose_noop().unwrap();
         raft.simulate_flush();
 
         assert_eq!(raft.state_machine().topic_count(), 0);
@@ -2064,7 +2077,7 @@ mod tests {
                 entries: vec![LogEntry {
                     term: 1,
                     index: 1,
-                    command: RaftCommand::Noop,
+                    command: None,
                 }],
                 leader_commit: 0,
             }),

@@ -8,6 +8,7 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::MetadataCommand;
 use crate::control_plane::membership::SwimCommand;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -124,7 +125,7 @@ impl RaftSender {
     pub(crate) async fn propose(
         &self,
         shard_group_id: ShardGroupId,
-        command: RaftCommand,
+        command: MetadataCommand,
     ) -> Option<Result<(), ProposeError>> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.0

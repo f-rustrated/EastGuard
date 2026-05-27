@@ -279,7 +279,7 @@ mod tests {
         LogEntry {
             term,
             index,
-            command: crate::control_plane::consensus::messages::RaftCommand::Noop,
+            command: None,
         }
     }
 

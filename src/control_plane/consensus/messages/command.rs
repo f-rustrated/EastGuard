@@ -8,12 +8,6 @@ use crate::control_plane::metadata::command::MetadataCommand;
 use crate::data_plane::SegmentKey;
 use crate::impl_from_variant;
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub enum RaftCommand {
-    Noop,
-    Metadata(MetadataCommand),
-}
-
 #[derive(Debug, PartialEq, Eq, Decode, Encode)]
 pub enum ProposeError {
     NotLeader(Option<NodeId>),
@@ -37,7 +31,7 @@ pub struct RemoveGroup {
 
 pub struct RaftPropose {
     pub shard_group_id: ShardGroupId,
-    pub command: RaftCommand,
+    pub command: MetadataCommand,
 }
 
 pub struct HandleNodeDeath {
