@@ -54,7 +54,6 @@ impl_from_variant_via!(
     PacketReceived,
     EnsureGroup,
     RemoveGroup,
-    RaftPropose,
     HandleNodeDeath,
     HandleNodeJoin,
 );

@@ -55,7 +55,6 @@ pub enum MultiRaftCommand {
     Timeout(RaftTimeoutCallback),
     EnsureGroup(EnsureGroup),
     RemoveGroup(RemoveGroup),
-    Propose(RaftPropose),
     HandleNodeDeath(HandleNodeDeath),
     HandleNodeJoin(HandleNodeJoin),
 }
@@ -66,7 +65,6 @@ impl_from_variant!(
     Timeout(RaftTimeoutCallback),
     EnsureGroup,
     RemoveGroup,
-    Propose(RaftPropose),
     HandleNodeDeath,
     HandleNodeJoin
 );
@@ -75,7 +73,6 @@ impl_from_variant!(
 pub(crate) enum MultiRaftReply {
     None,
     GetLeader(Option<NodeId>),
-    Propose(Result<(), ProposeError>),
 }
 
 /// Commands sent from MultiRaftActor to RaftTransportActor.
