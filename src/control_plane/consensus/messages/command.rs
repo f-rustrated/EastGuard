@@ -44,7 +44,7 @@ pub struct HandleNodeJoin {
 }
 
 #[allow(dead_code)]
-pub enum MultiRaftCommand {
+pub enum ConsensusCommand {
     PacketReceived(PacketReceived),
     Timeout(RaftTimeoutCallback),
     EnsureGroup(EnsureGroup),
@@ -54,7 +54,7 @@ pub enum MultiRaftCommand {
 }
 
 impl_from_variant!(
-    MultiRaftCommand,
+    ConsensusCommand,
     PacketReceived,
     Timeout(RaftTimeoutCallback),
     EnsureGroup,

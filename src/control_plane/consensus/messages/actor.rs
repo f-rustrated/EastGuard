@@ -5,7 +5,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::types::TopicStats;
 
 use super::command::{
-    CoordinatorCommand, EnsureGroup, HandleNodeDeath, HandleNodeJoin, MultiRaftCommand,
+    ConsensusCommand, CoordinatorCommand, EnsureGroup, HandleNodeDeath, HandleNodeJoin,
     PacketReceived, ProposeError, RaftPropose, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
@@ -15,7 +15,7 @@ use crate::impl_from_variant_via;
 #[allow(dead_code)]
 pub enum MultiRaftActorCommand {
     /// Fire-and-forget: no reply channel needed.
-    Command(MultiRaftCommand),
+    ConsensusCommand(ConsensusCommand),
     /// Query the current leader of a shard group.
     GetLeader {
         group_id: ShardGroupId,
@@ -36,21 +36,21 @@ pub enum MultiRaftActorCommand {
     Coordinator(CoordinatorCommand),
 }
 
-impl From<MultiRaftCommand> for MultiRaftActorCommand {
-    fn from(cmd: MultiRaftCommand) -> Self {
-        MultiRaftActorCommand::Command(cmd)
+impl From<ConsensusCommand> for MultiRaftActorCommand {
+    fn from(cmd: ConsensusCommand) -> Self {
+        MultiRaftActorCommand::ConsensusCommand(cmd)
     }
 }
 
 impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
     fn from(cb: RaftTimeoutCallback) -> Self {
-        MultiRaftActorCommand::Command(MultiRaftCommand::Timeout(cb))
+        MultiRaftActorCommand::ConsensusCommand(ConsensusCommand::Timeout(cb))
     }
 }
 
 impl_from_variant_via!(
     MultiRaftActorCommand,
-    MultiRaftCommand,
+    ConsensusCommand,
     PacketReceived,
     EnsureGroup,
     RemoveGroup,
