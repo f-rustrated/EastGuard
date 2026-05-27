@@ -5,7 +5,6 @@ use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::event::ApplyResult;
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{SealResponse, SegmentAssignment};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -60,68 +59,12 @@ impl MetadataCommitted {
         let sgid = self.shard_group_id;
         match self.result {
             ApplyResult::TopicCreated(tc) => {
-                let target = tc.replica_set[0].clone();
-                vec![DataTransportCommand::send_to_targets(
-                    vec![target],
-                    SegmentAssignment {
-                        segment_key: tc.segment_key,
-                        shard_group_id: sgid,
-                        replica_set: tc.replica_set,
-                        start_entry_id: 0,
-                    },
-                )]
+                vec![tc.into_command(sgid)]
             }
-            ApplyResult::SegmentRolled(sr) => {
-                let target = sr.new_replica_set[0].clone();
-                let start = sr.end_entry_id.map_or(0, |id| id + 1);
-                let mut cmds = vec![DataTransportCommand::send_to_targets(
-                    vec![target],
-                    SegmentAssignment {
-                        segment_key: sr.new_segment_key,
-                        shard_group_id: sgid,
-                        replica_set: sr.new_replica_set.clone(),
-                        start_entry_id: start,
-                    },
-                )];
-                if let Some(ctx) = self.seal_context {
-                    cmds.push(DataTransportCommand::send_to_targets(
-                        vec![ctx.requester],
-                        SealResponse {
-                            old_segment_key: ctx.old_segment_key,
-                            new_segment_id: sr.new_segment_key.segment_id,
-                            new_replica_set: sr.new_replica_set,
-                        },
-                    ));
-                }
-                cmds
-            }
-            ApplyResult::RangeSplit(rs) => rs
-                .children
-                .into_iter()
-                .map(|(range_id, segment_id, replica_set)| {
-                    let target = replica_set[0].clone();
-                    DataTransportCommand::send_to_targets(
-                        vec![target],
-                        SegmentAssignment {
-                            segment_key: SegmentKey::new(rs.topic_id, range_id, segment_id),
-                            shard_group_id: sgid,
-                            replica_set,
-                            start_entry_id: 0,
-                        },
-                    )
-                })
-                .collect(),
+            ApplyResult::SegmentRolled(sr) => sr.into_command(self.seal_context, sgid),
+            ApplyResult::RangeSplit(rs) => rs.into_command(sgid),
             ApplyResult::RangeMerged(rm) => {
-                let target = rm.replica_set[0].clone();
-                vec![DataTransportCommand::send_to_targets(
-                    vec![target],
-                    SegmentAssignment {
-                        segment_key: rm.segment_key,
-                        shard_group_id: sgid,
-                        replica_set: rm.replica_set,
-                        start_entry_id: 0,
-                    },
-                )]
+                vec![rm.into_command(sgid)]
             }
             ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
         }

@@ -11,6 +11,7 @@ pub struct NodeDead {
     pub live_nodes: Vec<NodeId>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct NodeAlive {
     pub node_id: NodeId,

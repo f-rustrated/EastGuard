@@ -4,8 +4,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     control_plane::NodeId,
-    control_plane::metadata::SegmentId,
     control_plane::membership::ShardGroupId,
+    control_plane::metadata::SegmentId,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 

@@ -11,7 +11,7 @@ use crate::control_plane::consensus::actor::{MultiRaftActor, RaftSender};
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
-use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -105,10 +105,7 @@ async fn start_raft_node(
     Ok((raft_tx, ticker_force))
 }
 
-async fn tick_n(
-    ticker: &mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
-    n: usize,
-) {
+async fn tick_n(ticker: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>, n: usize) {
     for _ in 0..n {
         let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
         tokio::task::yield_now().await;
@@ -180,8 +177,9 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, g.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(HandleNodeDeath {
+                    .send(NodeDead {
                         dead_node_id: NodeId::new("node-3"),
+                        live_nodes: vec!["node-1".into(), "node-2".into()],
                     })
                     .await;
 
