@@ -63,12 +63,6 @@ impl_from_variant!(
     HandleNodeJoin
 );
 
-#[allow(dead_code)]
-pub(crate) enum MultiRaftReply {
-    None,
-    GetLeader(Option<NodeId>),
-}
-
 /// Commands sent from MultiRaftActor to RaftTransportActor.
 #[derive(Debug)]
 pub enum RaftTransportCommand {
