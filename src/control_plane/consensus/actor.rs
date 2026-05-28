@@ -64,6 +64,7 @@ impl MultiRaftActor {
                 break;
             }
             for cmd in buf.drain(..) {
+                let cmd = enrich_command(cmd, &actor.swim_tx).await;
                 actor.store.process(cmd);
             }
             actor.flush().await;
@@ -115,6 +116,22 @@ impl MultiRaftActor {
                     .extend(committed.into_data_transport_cmds());
             }
         }
+    }
+}
+
+async fn enrich_command(cmd: MultiRaftActorCommand, swim_tx: &SwimSender) -> MultiRaftActorCommand {
+    match cmd {
+        MultiRaftActorCommand::Coordinator(CoordinatorCommand::SealRequest(mut req)) => {
+            if let Ok(members) = swim_tx.get_members().await {
+                req.live_nodes = members
+                    .into_iter()
+                    .filter(|m| m.state == crate::control_plane::SwimNodeState::Alive)
+                    .map(|m| m.node_id)
+                    .collect();
+            }
+            MultiRaftActorCommand::Coordinator(CoordinatorCommand::SealRequest(req))
+        }
+        other => other,
     }
 }
 

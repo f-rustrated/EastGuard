@@ -73,6 +73,7 @@ pub struct CoordinatorSealRequest {
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
     pub end_entry_id: u64,
+    pub live_nodes: Vec<NodeId>,
 }
 
 #[derive(Debug)]

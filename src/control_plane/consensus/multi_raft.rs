@@ -1,18 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use tokio::sync::oneshot;
 
-use crate::clusters::NodeId;
-use crate::clusters::metadata::types::TopicStats;
-use crate::clusters::raft::messages::{
-    DeferredReply, LogMutation, MultiRaftActorCommand, MultiRaftCommand,
-    MultiRaftReply, ProposeError, RaftCommand, RaftEvent, RaftRpc, RaftTimeoutCallback,
+use crate::control_plane::NodeId;
+use crate::control_plane::consensus::messages::{
+    ConsensusCommand, CoordinatorCommand, CoordinatorSealRequest, DeferredReply, LogMutation,
+    MetadataCommitted, MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
+    RaftTimeoutCallback, SealContext,
 };
-use crate::clusters::raft::state::{Raft, TimerSeqs};
+use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
+use crate::control_plane::metadata::TopicId;
+use crate::control_plane::metadata::command::RollSegment;
+use crate::control_plane::metadata::types::TopicStats;
 
-use crate::clusters::raft::storage::RaftStorage;
-use crate::clusters::swims::{ShardGroup, ShardGroupId};
+use crate::control_plane::consensus::raft::storage::RaftStorage;
+use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::data_plane::SegmentKey;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -26,6 +30,44 @@ pub(crate) struct MultiRaft {
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
     pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposeError>>>,
+    pending_seals: PendingSealTracker,
+}
+
+#[derive(Default)]
+struct PendingSealTracker {
+    by_index: HashMap<(ShardGroupId, u64), PendingSeal>,
+    by_key: HashSet<SegmentKey>,
+}
+
+impl PendingSealTracker {
+    fn contains(&self, key: &SegmentKey) -> bool {
+        self.by_key.contains(key)
+    }
+
+    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, seal: PendingSeal) {
+        self.by_key.insert(seal.segment_key);
+        self.by_index.insert((group_id, log_index), seal);
+    }
+
+    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<PendingSeal> {
+        let seal = self.by_index.remove(&(group_id, log_index))?;
+        self.by_key.remove(&seal.segment_key);
+        Some(seal)
+    }
+
+    fn attach_seal_context(&mut self, group_id: ShardGroupId, committed: &mut MetadataCommitted) {
+        if let Some(seal) = self.remove(group_id, committed.log_index) {
+            committed.seal_context = Some(SealContext {
+                requester: seal.requester,
+                old_segment_key: seal.segment_key,
+            });
+        }
+    }
+}
+
+struct PendingSeal {
+    requester: NodeId,
+    segment_key: SegmentKey,
 }
 
 impl MultiRaft {
@@ -44,41 +86,35 @@ impl MultiRaft {
             pending_events: Vec::new(),
             deferred: Vec::new(),
             pending_proposes: BTreeMap::new(),
+            pending_seals: PendingSealTracker::default(),
         }
     }
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
         match cmd {
-            MultiRaftActorCommand::Command(c) => {
+            MultiRaftActorCommand::ConsensusCommand(c) => {
                 self.handle_command(c);
             }
             MultiRaftActorCommand::GetLeader { group_id, reply } => {
                 let result = self.get_leader(group_id);
                 self.deferred.push(DeferredReply::GetLeader(reply, result));
             }
-            MultiRaftActorCommand::Propose {
-                shard_group_id,
-                command,
-                reply,
-            } => match self.propose(shard_group_id, command) {
-                Ok(index) => {
-                    self.pending_proposes.insert((shard_group_id, index), reply);
-                }
-                Err(e) => {
-                    self.deferred.push(DeferredReply::Propose(reply, Err(e)));
-                }
-            },
+            MultiRaftActorCommand::Propose { propose, reply } => {
+                self.propose(propose, reply);
+            }
+
             MultiRaftActorCommand::GetTopics { reply } => {
                 let topics = self.get_topics();
                 self.deferred.push(DeferredReply::GetTopics(reply, topics));
             }
             MultiRaftActorCommand::GetTopicStats { reply } => {
                 let stats = self.get_topic_stats();
-                self.deferred.push(DeferredReply::GetTopicStats(reply, stats));
+                self.deferred
+                    .push(DeferredReply::GetTopicStats(reply, stats));
             }
-            MultiRaftActorCommand::Coordinator(_cmd) => {
-                // D3: SealRequest handling implemented in Batch 2
-            }
+            MultiRaftActorCommand::Coordinator(cmd) => match cmd {
+                CoordinatorCommand::SealRequest(req) => self.handle_seal_request(req),
+            },
         }
     }
 
@@ -101,44 +137,17 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, cmd: MultiRaftCommand) -> MultiRaftReply {
-        use MultiRaftCommand::*;
-        match cmd {
-            PacketReceived {
-                shard_group_id,
-                from,
-                rpc,
-            } => {
-                self.step(shard_group_id, from, rpc);
-                MultiRaftReply::None
+    pub(crate) fn handle_command(&mut self, cmd: impl Into<ConsensusCommand>) {
+        match cmd.into() {
+            ConsensusCommand::PacketReceived(cmd) => self.step(cmd),
+            ConsensusCommand::Timeout(cb) => self.handle_timeout(cb),
+            ConsensusCommand::EnsureGroup(cmd) => self.add_group(cmd.group),
+            ConsensusCommand::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
+            ConsensusCommand::HandleNodeDeath(cmd) => {
+                self.handle_node_death(cmd.dead_node_id, cmd.live_nodes)
             }
-            Timeout(cb) => {
-                self.handle_timeout(cb);
-                MultiRaftReply::None
-            }
-            EnsureGroup { group } => {
-                self.add_group(group);
-                MultiRaftReply::None
-            }
-            RemoveGroup { group_id } => {
-                self.remove_group(group_id);
-                MultiRaftReply::None
-            }
-            GetLeader { group_id } => MultiRaftReply::GetLeader(self.get_leader(group_id)),
-            Propose {
-                shard_group_id,
-                command,
-            } => MultiRaftReply::Propose(self.propose(shard_group_id, command).map(|_| ())),
-            HandleNodeDeath { dead_node_id } => {
-                self.remove_node(dead_node_id);
-                MultiRaftReply::None
-            }
-            HandleNodeJoin {
-                new_node_id,
-                affected_groups,
-            } => {
-                self.add_node(new_node_id, affected_groups);
-                MultiRaftReply::None
+            ConsensusCommand::HandleNodeJoin(cmd) => {
+                self.add_node(cmd.new_node_id, cmd.affected_groups)
             }
         }
     }
@@ -151,7 +160,7 @@ impl MultiRaft {
             return;
         }
 
-        let peers: std::collections::HashSet<NodeId> = group
+        let peers: HashSet<NodeId> = group
             .members
             .iter()
             .filter(|id| *id != &self.node_id)
@@ -160,11 +169,13 @@ impl MultiRaft {
 
         let election_jitter_seed = self.create_election_jitter_seed(&group);
 
-        let election_seq = self.seq_counter.generate();
-        let heartbeat_seq = self.seq_counter.generate();
-        let merge_check_seq = self.seq_counter.generate();
-
         let persistent = self.storage.load_state(group.id.0);
+
+        let timer_seqs = TimerSeqs {
+            election: self.seq_counter.generate(),
+            heartbeat: self.seq_counter.generate(),
+            merge_check: self.seq_counter.generate(),
+        };
 
         let raft = Raft::new(
             self.node_id.clone(),
@@ -172,11 +183,7 @@ impl MultiRaft {
             persistent,
             election_jitter_seed,
             group.id,
-            TimerSeqs {
-                election: election_seq,
-                heartbeat: heartbeat_seq,
-                merge_check: merge_check_seq,
-            },
+            timer_seqs,
         );
 
         tracing::info!(
@@ -221,10 +228,10 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    fn step(&mut self, shard_id: ShardGroupId, from: NodeId, rpc: RaftRpc) {
-        if let Some(raft) = self.groups.get_mut(&shard_id) {
-            raft.step(from, rpc);
-            self.dirty.insert(shard_id);
+    fn step(&mut self, cmd: PacketReceived) {
+        if let Some(raft) = self.groups.get_mut(&cmd.shard_group_id) {
+            raft.step(cmd.from, cmd.rpc);
+            self.dirty.insert(cmd.shard_group_id);
         }
     }
 
@@ -255,16 +262,105 @@ impl MultiRaft {
     }
 
     fn get_topic_stats(&self) -> Vec<TopicStats> {
-        self.groups.values().flat_map(|raft| raft.topic_stats()).collect()
+        self.groups
+            .values()
+            .flat_map(|raft| raft.topic_stats())
+            .collect()
     }
 
-    fn remove_node(&mut self, node_id: NodeId) {
+    // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)
+    // and the scan is O(groups) with cheap has_peer/is_leader checks.
+    fn handle_node_death(&mut self, dead_node_id: NodeId, live_nodes: Vec<NodeId>) {
         for (group_id, raft) in self.groups.iter_mut() {
-            if raft.has_peer(&node_id) {
-                raft.remove_peer(&node_id);
+            if raft.has_peer(&dead_node_id) {
+                raft.remove_peer(&dead_node_id);
                 self.dirty.insert(*group_id);
             }
+
+            if !raft.is_leader() {
+                continue;
+            }
+
+            // ? how does this work when we have 3 nodes while replication factor is being three?
+            for (segment_key, old_replica_set) in raft.active_segments_for_node(&dead_node_id) {
+                let new_replica_set = compute_replacement_replica_set(
+                    &old_replica_set,
+                    std::slice::from_ref(&dead_node_id),
+                    &live_nodes,
+                );
+                let cmd = RollSegment {
+                    segment_key,
+                    sealed_at: now_ms(),
+                    new_replica_set,
+                    end_entry_id: None,
+                };
+
+                // ! Consider retry logic as for leader's this is only path
+                if let Err(e) = raft.propose(cmd.into()) {
+                    tracing::warn!(
+                        "Death-triggered RollSegment for {:?} failed: {:?}",
+                        segment_key,
+                        e
+                    );
+                }
+            }
         }
+    }
+
+    fn handle_seal_request(&mut self, req: CoordinatorSealRequest) {
+        if self.pending_seals.contains(&req.segment_key) {
+            return;
+        }
+
+        let Some(group_id) = self.find_group_for_topic(&req.segment_key.topic_id) else {
+            tracing::warn!(
+                "SealRequest for unknown topic {:?}",
+                req.segment_key.topic_id
+            );
+            return;
+        };
+        let Some(raft) = self.groups.get_mut(&group_id) else {
+            return;
+        };
+
+        let segment_meta = raft.get_replica_set(&req.segment_key);
+        let Some(old_replica_set) = segment_meta else {
+            tracing::warn!("SealRequest for unknown segment {:?}", req.segment_key);
+            return;
+        };
+
+        let new_replica_set =
+            compute_replacement_replica_set(&old_replica_set, &req.failed_nodes, &req.live_nodes);
+
+        let cmd = RollSegment {
+            segment_key: req.segment_key,
+            sealed_at: now_ms(),
+            new_replica_set,
+            end_entry_id: Some(req.end_entry_id),
+        };
+
+        match raft.propose(cmd.into()) {
+            Ok(log_index) => {
+                self.pending_seals.insert(
+                    group_id,
+                    log_index,
+                    PendingSeal {
+                        requester: req.requester,
+                        segment_key: req.segment_key,
+                    },
+                );
+                self.dirty.insert(group_id);
+            }
+            Err(e) => {
+                tracing::debug!("SealRequest proposal rejected: {:?}", e);
+            }
+        }
+    }
+
+    fn find_group_for_topic(&self, topic_id: &TopicId) -> Option<ShardGroupId> {
+        self.groups
+            .iter()
+            .find_map(|(gid, raft)| raft.has_topic(topic_id).then_some(*gid))
     }
 
     fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
@@ -290,18 +386,26 @@ impl MultiRaft {
         }
     }
 
-    fn propose(
-        &mut self,
-        shard_id: ShardGroupId,
-        command: RaftCommand,
-    ) -> Result<u64, ProposeError> {
-        match self.groups.get_mut(&shard_id) {
+    fn propose(&mut self, cmd: RaftPropose, reply: oneshot::Sender<Result<(), ProposeError>>) {
+        let gid = cmd.shard_group_id;
+        match self.propose_internal(cmd) {
+            Ok(index) => {
+                self.pending_proposes.insert((gid, index), reply);
+            }
+            Err(e) => {
+                self.deferred.push(DeferredReply::Propose(reply, Err(e)));
+            }
+        }
+    }
+
+    fn propose_internal(&mut self, cmd: RaftPropose) -> Result<u64, ProposeError> {
+        match self.groups.get_mut(&cmd.shard_group_id) {
             Some(raft) => {
-                let result = raft.propose(command);
-                self.dirty.insert(shard_id);
+                let result = raft.propose(cmd.command);
+                self.dirty.insert(cmd.shard_group_id);
                 result
             }
-            None => Err(ProposeError::NotLeader(None)),
+            None => Err(ProposeError::ShardNotFound),
         }
     }
 
@@ -340,11 +444,22 @@ impl MultiRaft {
             let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
+
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
                 mutations.push((*id, log));
             }
-            self.pending_events.extend(raft.take_events());
+            for event in raft.take_events() {
+                match event {
+                    RaftEvent::MetadataCommitted(_) if !raft.is_leader() => {}
+                    RaftEvent::MetadataCommitted(mut committed) => {
+                        self.pending_seals.attach_seal_context(*id, &mut committed);
+                        self.pending_events
+                            .push(RaftEvent::MetadataCommitted(committed));
+                    }
+                    other => self.pending_events.push(other),
+                }
+            }
         }
         (mutations, last_indices)
     }
@@ -412,6 +527,38 @@ impl RaftTimerTokenGenerator {
     }
 }
 
+fn compute_replacement_replica_set(
+    old: &[NodeId],
+    dead_nodes: &[NodeId],
+    live_nodes: &[NodeId],
+) -> Vec<NodeId> {
+    let rf = old.len();
+    let mut new_set: Vec<NodeId> = old
+        .iter()
+        .filter(|n| !dead_nodes.contains(n))
+        .cloned()
+        .collect();
+    for candidate in live_nodes {
+        if new_set.len() >= rf {
+            break;
+        }
+        if !new_set.contains(candidate) && !dead_nodes.contains(candidate) {
+            new_set.push(candidate.clone());
+        }
+    }
+    if new_set.is_empty() {
+        tracing::error!("All replicas dead for segment — empty replica set");
+    }
+    new_set
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 impl MultiRaft {
     fn stabled_for(&self, id: ShardGroupId) -> u64 {
@@ -423,7 +570,7 @@ impl MultiRaft {
 mod tests {
     use super::*;
 
-    use crate::clusters::raft::storage::RaftPersistentState;
+    use crate::control_plane::consensus::raft::storage::RaftPersistentState;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
     use std::collections::BTreeSet;
@@ -492,7 +639,7 @@ mod tests {
         let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![me.clone()]));
-        store.handle_command(MultiRaftCommand::Timeout(
+        store.handle_command(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
             },
@@ -525,12 +672,12 @@ mod tests {
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(1, vec![me.clone()]));
             store.add_group(shard(2, vec![me.clone()]));
-            store.handle_command(MultiRaftCommand::Timeout(
+            store.handle_command(ConsensusCommand::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
                 },
             ));
-            store.handle_command(MultiRaftCommand::Timeout(
+            store.handle_command(ConsensusCommand::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(2),
                 },
@@ -547,26 +694,25 @@ mod tests {
     // Unit 2 — flush() writes to RocksDB
     // -----------------------------------------------------------------------
 
-    use crate::clusters::raft::log::LogEntry;
-    use crate::clusters::raft::messages::{AppendEntries, RaftRpc};
+    use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
+    use crate::control_plane::consensus::raft::log::LogEntry;
 
     const TEST_GROUP_ID: ShardGroupId = ShardGroupId(42);
 
     /// Elect n1 as leader of a single-node shard group. Single-node clusters
     /// become leader immediately on ElectionTimeout (no peers to wait for).
     fn elect_leader(store: &mut MultiRaft) {
-        store.handle_command(MultiRaftCommand::Timeout(
+        store.handle_command(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: TEST_GROUP_ID,
             },
         ));
     }
 
-    fn propose_noop(store: &mut MultiRaft) -> MultiRaftReply {
-        store.handle_command(MultiRaftCommand::Propose {
-            shard_group_id: TEST_GROUP_ID,
-            command: RaftCommand::Noop,
-        })
+    fn propose_noop(store: &mut MultiRaft) {
+        let raft = store.groups.get_mut(&TEST_GROUP_ID).unwrap();
+        raft.propose_noop().expect("propose_noop failed");
+        store.dirty.insert(TEST_GROUP_ID);
     }
 
     fn read_entry(store: &MultiRaft, index: u64) -> Option<LogEntry> {
@@ -656,7 +802,7 @@ mod tests {
         store.flush(); // consume add_group dirty
 
         // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
-        store.handle_command(MultiRaftCommand::PacketReceived {
+        store.handle_command(PacketReceived {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -668,12 +814,12 @@ mod tests {
                     LogEntry {
                         term: 1,
                         index: 1,
-                        command: RaftCommand::Noop,
+                        command: None,
                     },
                     LogEntry {
                         term: 1,
                         index: 2,
-                        command: RaftCommand::Noop,
+                        command: None,
                     },
                 ],
                 leader_commit: 0,
@@ -691,7 +837,7 @@ mod tests {
 
         // n2 re-sends from index 1 at term 2, conflicting with the existing term-1 entries.
         // Raft truncates from index 1 and replaces with the new entry.
-        store.handle_command(MultiRaftCommand::PacketReceived {
+        store.handle_command(PacketReceived {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -702,7 +848,7 @@ mod tests {
                 entries: vec![LogEntry {
                     term: 2,
                     index: 1,
-                    command: RaftCommand::Noop,
+                    command: None,
                 }],
                 leader_commit: 0,
             }),
@@ -773,8 +919,8 @@ mod tests {
 
     #[test]
     fn propose_metadata_command_via_multi_raft() {
-        use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
-        use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+        use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
+        use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 
         let (storage, _) = temp_storage();
         let me = node("n1");
@@ -784,7 +930,7 @@ mod tests {
         elect_leader(&mut store);
         store.flush();
 
-        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+        let cmd = MetadataCommand::CreateTopic(CreateTopic {
             name: "test-topic".to_string(),
             storage_policy: StoragePolicy {
                 retention_ms: 3_600_000,
@@ -793,13 +939,14 @@ mod tests {
             },
             replica_set: vec![node("n1"), node("n2"), node("n3")],
             created_at: 1000,
-        }));
-
-        let reply = store.handle_command(MultiRaftCommand::Propose {
-            shard_group_id: TEST_GROUP_ID,
-            command: cmd,
         });
-        assert!(matches!(reply, MultiRaftReply::Propose(Ok(()))));
+
+        store
+            .propose_internal(RaftPropose {
+                shard_group_id: TEST_GROUP_ID,
+                command: cmd,
+            })
+            .expect("metadata propose failed");
         store.flush();
 
         let entry = read_entry(&store, 2).expect("metadata command entry must be persisted");
@@ -818,18 +965,17 @@ mod tests {
         store.flush();
 
         // Elect leader in group 1 only
-        store.handle_command(MultiRaftCommand::Timeout(
+        store.handle_command(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(1),
             },
         ));
         store.flush();
 
-        // Propose to group 1
-        store.handle_command(MultiRaftCommand::Propose {
-            shard_group_id: ShardGroupId(1),
-            command: RaftCommand::Noop,
-        });
+        // Propose noop to group 1
+        let raft = store.groups.get_mut(&ShardGroupId(1)).unwrap();
+        raft.propose_noop().unwrap();
+        store.dirty.insert(ShardGroupId(1));
         store.flush();
 
         let g1 = store.groups.get(&ShardGroupId(1)).unwrap();
@@ -843,8 +989,8 @@ mod tests {
 
     #[test]
     fn stale_metadata_proposal_rejected_gracefully() {
-        use crate::clusters::metadata::command::{CreateTopic, MetadataCommand};
-        use crate::clusters::metadata::strategy::{PartitionStrategy, StoragePolicy};
+        use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
+        use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 
         let (storage, _) = temp_storage();
         let me = node("n1");
@@ -855,7 +1001,7 @@ mod tests {
         store.flush();
 
         let make_cmd = || {
-            RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
+            MetadataCommand::CreateTopic(CreateTopic {
                 name: "blue".to_string(),
                 storage_policy: StoragePolicy {
                     retention_ms: 3_600_000,
@@ -864,18 +1010,18 @@ mod tests {
                 },
                 replica_set: vec![node("n1"), node("n2"), node("n3")],
                 created_at: 1000,
-            }))
+            })
         };
 
         // First proposal succeeds
-        store.handle_command(MultiRaftCommand::Propose {
+        let _ = store.propose_internal(RaftPropose {
             shard_group_id: TEST_GROUP_ID,
             command: make_cmd(),
         });
         store.flush();
 
         // Duplicate proposal: must not panic, state machine rejects at apply
-        store.handle_command(MultiRaftCommand::Propose {
+        let _ = store.propose_internal(RaftPropose {
             shard_group_id: TEST_GROUP_ID,
             command: make_cmd(),
         });
