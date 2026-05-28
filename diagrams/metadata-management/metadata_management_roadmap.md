@@ -74,14 +74,18 @@ See `diagrams/metadata-management/data-model.md` for full entity relationships, 
 
 ### File: `src/clusters/raft/messages/command.rs`
 
-**`RaftCommand` wraps `MetadataCommand`:**
+**`RaftCommand` is the outer log payload — wraps `MetadataCommand` and carries consensus-layer membership variants:**
 
 ```rust
 enum RaftCommand {
     Noop,
     Metadata(MetadataCommand),
+    AddPeer(NodeId),
+    RemovePeer(NodeId),
 }
 ```
+
+`Metadata(..)` carries application state changes; `AddPeer` / `RemovePeer` carry peer-set changes. Both kinds are log entries — the peer set is part of the replicated state machine, mutated only when entries apply, on every replica, deterministically. Direct mutation outside the log is forbidden because divergent peer sets across replicas break Raft's quorum math (see Phase 3d).
 
 `MetadataCommand` is a separate enum in `src/clusters/metadata/command.rs` with typed structs per variant:
 
@@ -148,6 +152,8 @@ fn apply_committed_entries(&mut self) {
                     Err(e)      => tracing::error!("Apply error: {:?}", e),
                 }
             }
+            RaftCommand::AddPeer(node_id)    => self.apply_add_peer(node_id),
+            RaftCommand::RemovePeer(node_id) => self.apply_remove_peer(node_id),
         }
     }
 }
@@ -155,7 +161,7 @@ fn apply_committed_entries(&mut self) {
 
 No buffer-drain pattern. No `take_applied_entries()`. Apply happens at consensus boundary, inside `Raft`, guarded by `commit_index.min(stabled_index)`.
 
-Membership changes (`AddPeer`/`RemovePeer`) are handled separately via `MultiRaft` — SWIM is membership authority, not the Raft log.
+`apply_add_peer` / `apply_remove_peer` mutate `self.peers` and (when leader) `self.peer_states`. These are private apply-time helpers — they are **never** called outside `apply_committed_entries()`. The old `Raft::add_peer` / `Raft::remove_peer` public methods that mutated state directly are gone.
 
 ### 3c. Read-only accessor
 
@@ -166,6 +172,46 @@ pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
 ```
 
 For tests to query applied state.
+
+### 3d. Membership Changes via the Log
+
+**Rule:** every change to a Raft group's peer set is a log entry. SWIM detects node up/down; the shard group leader observes the SWIM event and proposes `AddPeer` / `RemovePeer`; followers learn the change when the entry commits and applies.
+
+See `diagrams/metadata-management/membership-change-via-log.mmd` for the full sequence diagram.
+
+**Flow:**
+
+```
+SwimActor                 MultiRaftActor             Raft (leader)        Raft (followers)
+    │                            │                         │                      │
+    │── HandleNodeDeath(n3) ────▶│                         │                      │
+    │                            │  for each group where   │                      │
+    │                            │  n3 ∈ peers && leader:  │                      │
+    │                            │     propose(RemovePeer  │                      │
+    │                            │              (n3)) ────▶│                      │
+    │                            │                         │── AppendEntries ────▶│
+    │                            │                         │◀───── ack ───────────│
+    │                            │                         │  commit              │
+    │                            │                         │  apply_remove_peer:  │
+    │                            │                         │   peers -= {n3}      │
+    │                            │                         │── CommitAdvance ────▶│
+    │                            │                         │                      │  apply_remove_peer:
+    │                            │                         │                      │   peers -= {n3}
+```
+
+`HandleNodeJoin` is symmetric: leader proposes `AddPeer(new)` for each group where this node should add the new peer. Initial group formation (`EnsureGroup`) uses the seeded members list and does not go through `AddPeer` — the group is created with its initial peer set already populated.
+
+**Why not direct mutation (the rejected alternative):**
+
+The peer set determines quorum size at every log index. If two replicas disagree on `peers.len()` at the same index, they compute different majority thresholds and may both believe they have quorum on conflicting entries — i.e., split-brain commit. SWIM-driven direct mutation creates exactly this window during gossip convergence (~hundreds of ms). The Raft paper §6 and CockroachDB's joint-consensus paper both treat membership-in-the-log as required for the safety theorem. Production systems that pair SWIM with Raft (Consul/Serf, etcd, CockroachDB, TiKV) all funnel membership through the log for this reason.
+
+**Leader-election reconciliation:**
+
+A node may become leader while its `peers` set contains nodes SWIM already considers dead (e.g., the previous leader died before proposing `RemovePeer` for them). On `LeaderChange → self`, the new leader queries SWIM (`get_members`) and proposes `RemovePeer` for any peer not in the live set. This closes the only gap where direct mutation seems tempting.
+
+**Pending-entry cleanup:**
+
+A leader that proposes `RemovePeer` but loses leadership before commit must drop its in-memory `pending_*` bookkeeping for that entry — the new leader may truncate it. `MultiRaft` clears pending proposal contexts on `LeaderChange → away` and on log truncation. Same mechanism already covers `pending_proposals` and `pending_seals`.
 
 ---
 
@@ -522,3 +568,5 @@ Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counter
 | Bincode format change on new `RaftCommand` variants | RocksDB persists entries now; version byte on `LogEntry` when format changes needed |
 | Midpoint split doesn't balance skewed workloads | Acceptable for Phase 6 — percentile-based split in backlog |
 | Seal tracker grows unbounded for long-lived ranges | Sliding window bounded; entries removed on range seal/delete |
+| Two leaders coexisting briefly (partition heal) with divergent peer sets | `AddPeer`/`RemovePeer` go through the Raft log — quorum size advances deterministically with the log index. A leader cannot commit under one peer set while a future leader applies under a different one for the same index. See Phase 3d. |
+| New leader inherits dead peers (predecessor died before proposing `RemovePeer`) | On `LeaderChange → self`, reconcile `peers` against SWIM's live set and propose `RemovePeer` for stragglers. See Phase 3d "Leader-election reconciliation". |

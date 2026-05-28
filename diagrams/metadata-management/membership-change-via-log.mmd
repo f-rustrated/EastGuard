@@ -1,0 +1,42 @@
+sequenceDiagram
+    participant SWIM as SwimActor<br/>(any live node)
+    participant MR as MultiRaftActor<br/>(on shard group's leader)
+    participant L as Raft Leader<br/>(state machine)
+    participant F1 as Raft Follower 1
+    participant F2 as Raft Follower 2
+
+    Note over SWIM,F2: Node n3 dies. SWIM detects after ~6-7s (probe + suspect + confirm).
+
+    SWIM->>MR: HandleNodeDeath { dead: n3, live: [n1, n2] }
+
+    Note over MR: For each group where<br/>n3 ∈ peers && raft.is_leader():
+
+    MR->>L: propose(RaftCommand::RemovePeer(n3))
+    L->>L: append log[k] = RemovePeer(n3)<br/>peers UNCHANGED until apply
+
+    par replicate
+        L->>F1: AppendEntries { entries: [log[k]] }
+        F1->>F1: append log[k]<br/>peers UNCHANGED
+        F1-->>L: ack k
+    and
+        L->>F2: AppendEntries { entries: [log[k]] }
+        F2->>F2: append log[k]<br/>peers UNCHANGED
+        F2-->>L: ack k
+    end
+
+    Note over L: majority ack → commit_index = k
+    L->>L: apply_remove_peer(n3):<br/>peers -= {n3}<br/>peer_states -= {n3}
+
+    par commit advance
+        L->>F1: AppendEntries (heartbeat, commit=k)
+        F1->>F1: apply_remove_peer(n3):<br/>peers -= {n3}
+    and
+        L->>F2: AppendEntries (heartbeat, commit=k)
+        F2->>F2: apply_remove_peer(n3):<br/>peers -= {n3}
+    end
+
+    Note over L,F2: All replicas now agree on peer set<br/>at log index k. Quorum math safe.
+
+    Note over SWIM,F2: HandleNodeJoin is symmetric:<br/>leader proposes AddPeer(new_node);<br/>followers apply on commit.
+
+    Note over SWIM,F2: Leader-election reconciliation:<br/>on becoming leader, scan peers vs SWIM live set,<br/>propose RemovePeer for any peer SWIM considers dead.
