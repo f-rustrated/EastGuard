@@ -4,13 +4,14 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::channels::BatchSender;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum TickerCommand<T> {
     Schedule(TimerCommand<T>),
     #[cfg(test)]
     ForceTick,
 }
 
+#[derive(Clone)]
 pub(crate) struct SchedulerSender<T>(BatchSender<TickerCommand<T>>);
 
 impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T> {
@@ -19,7 +20,6 @@ impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T>
     }
 }
 
-#[allow(dead_code)]
 impl<T> SchedulerSender<T> {
     pub(crate) fn channel(
         capacity: usize,
@@ -31,18 +31,6 @@ impl<T> SchedulerSender<T> {
 
         (tx.into(), rx)
     }
-    pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
-        let cmd: TickerCommand<T> = TimerCommand::SetSchedule {
-            seq,
-            timer: timer.into(),
-        }
-        .into();
-        self.0.blocking_send(Box::new([cmd]));
-    }
-
-    pub(crate) fn send(&self, cmd: TimerCommand<T>) {
-        self.0.blocking_send(Box::new([cmd.into()]));
-    }
 
     pub(crate) async fn send_batch(&self, cmds: Vec<TickerCommand<T>>) {
         self.0.send_batch(cmds).await;
@@ -52,9 +40,14 @@ impl<T> SchedulerSender<T> {
         let ticker_cmds: Vec<TickerCommand<T>> = cmds.into_iter().map(Into::into).collect();
         self.0.blocking_send_batch(ticker_cmds);
     }
+
+    #[cfg(test)]
+    pub(crate) async fn force_tick(&self) {
+        self.0.send_batch(vec![TickerCommand::ForceTick]).await;
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TimerCommand<T> {
     SetSchedule { seq: u64, timer: T },
     CancelSchedule { seq: u64 },

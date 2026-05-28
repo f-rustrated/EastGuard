@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct JoinAttempt {
     pub(crate) seed_addr: SocketAddr,
     pub(crate) ticks_for_wait: u32,

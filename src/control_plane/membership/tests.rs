@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::peer_discovery::JoinConfig;
 use crate::control_plane::membership::swim::Swim;
@@ -11,11 +10,12 @@ use crate::control_plane::membership::{
     DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, SwimActorCommand, SwimCommand, SwimHeader,
     SwimPacket, SwimQueryCommand, SwimTimer, Topology, TopologyConfig,
 };
+use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 
 use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::ticker_message::SchedulerSender;
 
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::schedulers::ticker_message::TickerCommand;
 
 use std::collections::VecDeque;
 use tokio::{sync::mpsc, time};
@@ -48,7 +48,7 @@ struct TestHarness {
     pub tx_in: mpsc::Sender<SwimActorCommand>,
     pub tx_out: mpsc::Sender<Box<[OutboundPacket]>>,
     pub rx_out: Option<mpsc::Receiver<Box<[OutboundPacket]>>>,
-    pub ticker_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
+    pub ticker_tx: SchedulerSender<SwimTimer>,
     pub local_addr: SocketAddr,
     pub config: JoinConfig,
 }
@@ -144,7 +144,7 @@ async fn setup_single() -> TestHarness {
 async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
-    let (ticker_tx, ticker_rx) = mpsc::channel(100);
+    let (ticker_tx, ticker_rx) = SchedulerSender::<SwimTimer>::channel(100);
 
     let peer_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let client_addr: SocketAddr = format!("127.0.0.1:{}", port + 1000).parse().unwrap();
@@ -358,19 +358,13 @@ fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     }
 }
 
-async fn force_ticks(ticker_tx: &mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>, count: usize) {
+async fn force_ticks(ticker_tx: &SchedulerSender<SwimTimer>, count: usize) {
     for _ in 0..count {
-        ticker_tx
-            .send(Box::new([TickerCommand::ForceTick]))
-            .await
-            .unwrap();
+        ticker_tx.force_tick().await;
     }
 }
 
-async fn wait_for_ping(
-    harness: &TestHarness,
-    rx_out: &mut PacketReceiver,
-) -> SocketAddr {
+async fn wait_for_ping(harness: &TestHarness, rx_out: &mut PacketReceiver) -> SocketAddr {
     let mut target_addr = None;
     for _ in 0..3 {
         force_ticks(&harness.ticker_tx, PROBE_INTERVAL_TICKS as usize).await;
@@ -561,9 +555,9 @@ async fn cluster_formation_using_join() {
     let _ = h3.query_topology_count().await;
 
     for _ in 0..PROBE_INTERVAL_TICKS * 2 {
-        h1.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
-        h2.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
-        h3.ticker_tx.send(Box::new([TickerCommand::ForceTick])).await.unwrap();
+        h1.ticker_tx.force_tick().await;
+        h2.ticker_tx.force_tick().await;
+        h3.ticker_tx.force_tick().await;
     }
 
     assert_eq!(h1.query_topology_count().await, 3);

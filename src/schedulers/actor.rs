@@ -1,9 +1,30 @@
 use crate::schedulers::ticker::Ticker;
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 use crate::schedulers::timer::TTimer;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
+
+pub fn spawn_scheduling_actor<T, C>(
+    callback_tx: mpsc::Sender<C>,
+    capacity: usize,
+    tick_period_ms: u64,
+    protocol_interval_ticks: Option<u64>,
+) -> SchedulerSender<T>
+where
+    T: TTimer + Send + 'static,
+    T::Callback: Send,
+    C: From<T::Callback> + Send + 'static,
+{
+    let (sender, rx) = SchedulerSender::<T>::channel(capacity);
+    tokio::spawn(run_scheduling_actor(
+        callback_tx,
+        rx,
+        tick_period_ms,
+        protocol_interval_ticks,
+    ));
+    sender
+}
 
 pub async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,

@@ -35,7 +35,7 @@ pub(crate) enum SwimTimeOutCallback {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum SwimTimerKind {
     DirectProbe,
     IndirectProbe,

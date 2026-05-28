@@ -6,7 +6,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::SwimNode;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
@@ -18,7 +18,7 @@ use tokio::sync::mpsc::error::SendError;
 pub struct SwimActor {
     state: Swim,
     transport_tx: BatchSender<OutboundPacket>,
-    scheduler_tx: BatchSender<TickerCommand<SwimTimer>>,
+    scheduler_tx: SchedulerSender<SwimTimer>,
     raft_tx: mpsc::Sender<MultiRaftActorCommand>,
 
     packets: Vec<OutboundPacket>,
@@ -35,13 +35,13 @@ impl SwimActor {
         mut mailbox: mpsc::Receiver<SwimActorCommand>,
         state: Swim,
         transport_tx: mpsc::Sender<Box<[OutboundPacket]>>,
-        scheduler_tx: mpsc::Sender<Box<[TickerCommand<SwimTimer>]>>,
+        scheduler_tx: SchedulerSender<SwimTimer>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {
         let mut actor = Self {
             state,
             transport_tx: transport_tx.into(),
-            scheduler_tx: scheduler_tx.into(),
+            scheduler_tx,
             raft_tx,
             packets: Vec::new(),
             timer_cmds: Vec::new(),
