@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use crate::{
     control_plane::NodeId,
+    control_plane::membership::ShardGroupId,
     data_plane::{
         SegmentKey,
         checkpoint::CheckpointJob,
-        messages::command::{DataPlaneInterNodeCommand, ReplicaAppend},
+        messages::command::{DataPlaneInterNodeCommand, ReplicaAppend, SealRequest},
         states::segment::cache::CachedEntry,
         timer::BatchFlushTimer,
     },
@@ -63,6 +64,16 @@ pub(crate) struct ReplicationTimedOut {
     pub committed_entry_id: u64,
 }
 
+pub(crate) struct SealRequestNeeded {
+    pub segment_key: SegmentKey,
+    pub shard_group_id: ShardGroupId,
+    pub end_entry_id: u64,
+}
+
+pub(crate) struct CoordinatorSealForward {
+    pub seal_request: SealRequest,
+}
+
 pub(crate) enum DataPlaneEvent {
     CheckpointRequired(CheckpointJob),
     BatchFlushTimerScheduled(TimerCommand<BatchFlushTimer>),
@@ -70,6 +81,8 @@ pub(crate) enum DataPlaneEvent {
     ReplicaAckReceived(ReplicaAckReceived),
     InterNodeCommandQueued(InterNodeCommandQueued),
     ReplicationTimedOut(ReplicationTimedOut),
+    SealRequestNeeded(SealRequestNeeded),
+    CoordinatorSealForward(CoordinatorSealForward),
 }
 
 impl_from_variant!(
@@ -80,4 +93,6 @@ impl_from_variant!(
     ReplicaAckReceived,
     InterNodeCommandQueued,
     ReplicationTimedOut,
+    SealRequestNeeded,
+    CoordinatorSealForward,
 );

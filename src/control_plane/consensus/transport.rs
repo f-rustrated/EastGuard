@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::control_plane::consensus::actor::RaftSender;
+use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::PacketReceived;
 use crate::control_plane::consensus::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
 use crate::control_plane::membership::actor::SwimSender;
@@ -37,7 +37,7 @@ impl RaftReader {
         Ok(msg)
     }
 
-    async fn run(mut self, tx: RaftSender) {
+    async fn run(mut self, tx: MutlRaftSender) {
         loop {
             match self.read_message().await {
                 Ok(msg) => {
@@ -91,7 +91,7 @@ impl RaftWriters {
         }
     }
 
-    async fn accept(&mut self, stream: TcpStream, raft_tx: &RaftSender) {
+    async fn accept(&mut self, stream: TcpStream, raft_tx: &MutlRaftSender) {
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftReader(read_half);
 
@@ -111,7 +111,7 @@ impl RaftWriters {
     async fn send(
         &mut self,
         packets: Vec<OutboundRaftPacket>,
-        raft_tx: &RaftSender,
+        raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) {
         let by_target = self.group_packets(packets);
@@ -145,7 +145,7 @@ impl RaftWriters {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &RaftSender,
+        raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
@@ -171,7 +171,7 @@ impl RaftWriters {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &RaftSender,
+        raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) -> bool {
         let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
@@ -298,7 +298,7 @@ impl RaftTransportActor {
     pub async fn run(
         node_id: NodeId,
         listener: TcpListener,
-        raft_tx: RaftSender,
+        raft_tx: MutlRaftSender,
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
     ) {

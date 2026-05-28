@@ -19,23 +19,25 @@ pub(crate) mod macros;
 #[cfg(any(test, debug_assertions))]
 mod test_traits;
 
-use crate::control_plane::consensus::actor::{MultiRaftActor, RaftSender};
+use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 
+use crate::config::Environment;
 use crate::control_plane::consensus::messages::{RaftTimer, RaftTransportCommand};
 use crate::control_plane::membership::OutboundPacket;
 use crate::control_plane::membership::SwimTimer;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::config::Environment;
+use crate::data_plane::transport::DataTransportActor;
+use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
-use crate::net::{TcpListener, TcpStream};
+use crate::net::{TcpListener, TcpStream, UdpSocket};
 use crate::schedulers::actor::run_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::TickerCommand;
 use crate::{
-    control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
     config::ENV,
     connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
+    control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
 };
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -78,11 +80,10 @@ impl StartUp {
         let state = self.env.swim(self.rng_seed);
         let node_id = state.node_id.clone();
 
-        let peer_bind_addr = self.env.peer_bind_addr();
-
         // Bind sockets before spawning — fail fast on port conflicts
-        let udp_socket = crate::net::UdpSocket::bind(peer_bind_addr).await?;
-        let tcp_listener = crate::net::TcpListener::bind(peer_bind_addr).await?;
+        let udp_socket = UdpSocket::bind(self.env.peer_bind_addr()).await?;
+        let tcp_listener = TcpListener::bind(self.env.peer_bind_addr()).await?;
+        let data_tcp_listener = TcpListener::bind(self.env.data_bind_addr()).await?;
 
         // Spawn actors (order: tickers → transports → protocols → client)
         tokio::spawn(run_scheduling_actor(
@@ -124,9 +125,18 @@ impl StartUp {
             std::hash::Hash::hash(&self.rng_seed, &mut hasher);
             std::hash::Hasher::finish(&hasher)
         };
-        // D3: data_transport_tx wired to DataTransportActor in Batch 3.
-        // For now, create a channel whose receiver is dropped — sends are no-ops.
-        let (data_transport_tx, _) = mpsc::channel(1);
+        let (data_transport_tx, data_transport_rx) =
+            mpsc::channel::<Box<[DataTransportCommand]>>(100);
+        // DataPlane not yet spawned (needs checkpoint actor, schedulers) —
+        // incoming inter-node commands are silently dropped until then.
+        let (data_plane_tx, _) = crossbeam_channel::bounded(1);
+        tokio::spawn(DataTransportActor::run(
+            node_id.clone(),
+            data_tcp_listener,
+            data_plane_tx,
+            data_transport_rx,
+            swim_sender.clone(),
+        ));
         tokio::spawn(MultiRaftActor::run(
             node_id,
             election_jitter_seed,
@@ -143,7 +153,7 @@ impl StartUp {
         Ok(())
     }
 
-    async fn receive_client_streams(self, swim_sender: SwimSender, raft_tx: RaftSender) {
+    async fn receive_client_streams(self, swim_sender: SwimSender, raft_tx: MutlRaftSender) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -168,7 +178,7 @@ impl StartUp {
 async fn handle_client_stream(
     stream: TcpStream,
     swim_sender: SwimSender,
-    raft_sender: RaftSender,
+    raft_sender: MutlRaftSender,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);

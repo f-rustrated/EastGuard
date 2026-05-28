@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::control_plane::consensus::actor::{MultiRaftActor, RaftSender};
+use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
@@ -28,7 +28,7 @@ async fn start_raft_node(
     peer_names: &[&str],
 ) -> Result<
     (
-        RaftSender,
+        MutlRaftSender,
         mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
     ),
     Box<dyn std::error::Error>,
@@ -115,7 +115,7 @@ async fn tick_n(ticker: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>, n: usize
 }
 
 async fn serve_leader(
-    raft_tx: &RaftSender,
+    raft_tx: &MutlRaftSender,
     group_id: ShardGroupId,
     query_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {

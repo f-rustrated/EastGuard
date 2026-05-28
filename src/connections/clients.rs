@@ -28,7 +28,7 @@ use crate::connections::protocol::{
 use crate::{
     control_plane::{
         SwimNodeState,
-        consensus::actor::RaftSender,
+        consensus::actor::MutlRaftSender,
         consensus::messages::ProposeError,
         membership::{ShardGroupId, actor::SwimSender},
         metadata::{
@@ -178,12 +178,12 @@ impl ClientStreamReader {
 #[derive(Clone)]
 pub struct ClientHandler {
     swim_sender: SwimSender,
-    raft_sender: RaftSender,
+    raft_sender: MutlRaftSender,
 }
 
 #[allow(dead_code)]
 impl ClientHandler {
-    pub fn new(swim_sender: SwimSender, raft_sender: RaftSender) -> Self {
+    pub fn new(swim_sender: SwimSender, raft_sender: MutlRaftSender) -> Self {
         Self {
             swim_sender,
             raft_sender,
@@ -474,7 +474,7 @@ mod tests {
 
     fn raft_sender_with(
         handler: impl Fn(MultiRaftActorCommand) + Send + 'static,
-    ) -> crate::control_plane::consensus::actor::RaftSender {
+    ) -> crate::control_plane::consensus::actor::MutlRaftSender {
         let (tx, mut rx) = MultiRaftActor::channel(16);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {

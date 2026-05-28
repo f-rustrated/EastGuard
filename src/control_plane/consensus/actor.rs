@@ -30,9 +30,9 @@ pub struct MultiRaftActor {
 }
 
 impl MultiRaftActor {
-    pub fn channel(buffer: usize) -> (RaftSender, mpsc::Receiver<MultiRaftActorCommand>) {
+    pub fn channel(buffer: usize) -> (MutlRaftSender, mpsc::Receiver<MultiRaftActorCommand>) {
         let (tx, rx) = mpsc::channel(buffer);
-        (RaftSender(tx), rx)
+        (MutlRaftSender(tx), rx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,9 +136,9 @@ async fn enrich_command(cmd: MultiRaftActorCommand, swim_tx: &SwimSender) -> Mul
 }
 
 #[derive(Clone, Debug)]
-pub struct RaftSender(mpsc::Sender<MultiRaftActorCommand>);
+pub struct MutlRaftSender(mpsc::Sender<MultiRaftActorCommand>);
 
-impl RaftSender {
+impl MutlRaftSender {
     pub(crate) async fn propose(
         &self,
         shard_group_id: ShardGroupId,
@@ -202,10 +202,17 @@ impl RaftSender {
     ) -> Result<(), mpsc::error::SendError<MultiRaftActorCommand>> {
         self.0.send(cmd.into()).await
     }
+
+    pub(crate) fn try_send(
+        &self,
+        cmd: impl Into<MultiRaftActorCommand>,
+    ) -> Result<(), mpsc::error::TrySendError<MultiRaftActorCommand>> {
+        self.0.try_send(cmd.into())
+    }
 }
 
-impl From<RaftSender> for mpsc::Sender<MultiRaftActorCommand> {
-    fn from(value: RaftSender) -> Self {
+impl From<MutlRaftSender> for mpsc::Sender<MultiRaftActorCommand> {
+    fn from(value: MutlRaftSender) -> Self {
         value.0
     }
 }

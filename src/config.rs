@@ -138,6 +138,12 @@ impl Environment {
             .expect("Invalid peer bind address")
     }
 
+    pub(crate) fn data_bind_addr(&self) -> std::net::SocketAddr {
+        format!("{}:{}", self.host, self.data_port)
+            .parse()
+            .expect("Invalid data bind address")
+    }
+
     /// The address gossiped to cluster peers — must be routable by other nodes.
     /// Defaults to `host:cluster_port` when `advertise_host` is not set.
     ///
