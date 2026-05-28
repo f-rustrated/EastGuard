@@ -1,6 +1,6 @@
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::messages::LogMutation;
+use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::membership::ShardGroupId;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -16,7 +16,7 @@ impl RaftPersistentState {
     }
 }
 
-pub(crate) trait RaftStorage: Send {
+pub(crate) trait RaftStorage: Send + Sync {
     fn load_state(&self, group_id: u64) -> RaftPersistentState;
     fn persist_mutations(&self, mutations: Vec<(ShardGroupId, LogMutation)>);
     fn delete_group(&self, group_id: ShardGroupId);

@@ -1,6 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+use crate::impl_from_variant;
 
 pub(crate) struct DataTransportSendToTargets {
     pub targets: Vec<NodeId>,
@@ -18,6 +19,13 @@ pub(crate) enum DataTransportCommand {
     #[allow(dead_code)]
     DisconnectPeer(NodeId),
 }
+
+impl_from_variant!(
+    DataTransportCommand,
+    SendToTargets(DataTransportSendToTargets),
+    SendToCoordinator(DataTransportSendToCoordinator),
+    DisconnectPeer(NodeId)
+);
 
 impl DataTransportCommand {
     pub(crate) fn send_to_targets(

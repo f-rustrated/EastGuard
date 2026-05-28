@@ -9,6 +9,7 @@ impl<T> BatchSender<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn blocking_send(&self, batch: Box<[T]>) {
         let _ = self.0.blocking_send(batch);
     }

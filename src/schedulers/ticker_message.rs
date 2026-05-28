@@ -19,6 +19,7 @@ impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T>
     }
 }
 
+#[allow(dead_code)]
 impl<T> SchedulerSender<T> {
     pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
         let cmd: TickerCommand<T> = TimerCommand::SetSchedule {
@@ -35,6 +36,11 @@ impl<T> SchedulerSender<T> {
 
     pub(crate) async fn send_batch(&self, cmds: Vec<TickerCommand<T>>) {
         self.0.send_batch(cmds).await;
+    }
+
+    pub(crate) fn blocking_send_batch(&self, cmds: Vec<TimerCommand<T>>) {
+        let ticker_cmds: Vec<TickerCommand<T>> = cmds.into_iter().map(Into::into).collect();
+        self.0.blocking_send_batch(ticker_cmds);
     }
 }
 

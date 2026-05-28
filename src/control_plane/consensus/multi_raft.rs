@@ -5,8 +5,8 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    ConsensusCommand, CoordinatorCommand, CoordinatorSealRequest, DeferredReply, LogMutation,
-    MetadataCommitted, MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
+    ConsensusCommand, CoordinatorSealRequest, DeferredReply, LogMutation, MetadataCommitted,
+    MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
     RaftTimeoutCallback, SealContext,
 };
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
@@ -112,9 +112,9 @@ impl MultiRaft {
                 self.deferred
                     .push(DeferredReply::GetTopicStats(reply, stats));
             }
-            MultiRaftActorCommand::Coordinator(cmd) => match cmd {
-                CoordinatorCommand::SealRequest(req) => self.handle_seal_request(req),
-            },
+            MultiRaftActorCommand::Coordinator(req) => {
+                self.handle_seal_request(req);
+            }
         }
     }
 
@@ -308,14 +308,15 @@ impl MultiRaft {
     }
 
     fn handle_seal_request(&mut self, req: CoordinatorSealRequest) {
-        if self.pending_seals.contains(&req.segment_key) {
+        let seal = &req.request;
+        if self.pending_seals.contains(&seal.segment_key) {
             return;
         }
 
-        let Some(group_id) = self.find_group_for_topic(&req.segment_key.topic_id) else {
+        let Some(group_id) = self.find_group_for_topic(&seal.segment_key.topic_id) else {
             tracing::warn!(
                 "SealRequest for unknown topic {:?}",
-                req.segment_key.topic_id
+                seal.segment_key.topic_id
             );
             return;
         };
@@ -323,20 +324,19 @@ impl MultiRaft {
             return;
         };
 
-        let segment_meta = raft.get_replica_set(&req.segment_key);
-        let Some(old_replica_set) = segment_meta else {
-            tracing::warn!("SealRequest for unknown segment {:?}", req.segment_key);
+        let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
+            tracing::warn!("SealRequest for unknown segment {:?}", seal.segment_key);
             return;
         };
 
         let new_replica_set =
-            compute_replacement_replica_set(&old_replica_set, &req.failed_nodes, &req.live_nodes);
+            compute_replacement_replica_set(&old_replica_set, &seal.failed_nodes, &req.live_nodes);
 
         let cmd = RollSegment {
-            segment_key: req.segment_key,
+            segment_key: seal.segment_key,
             sealed_at: now_ms(),
             new_replica_set,
-            end_entry_id: Some(req.end_entry_id),
+            end_entry_id: Some(seal.end_entry_id),
         };
 
         match raft.propose(cmd.into()) {
@@ -345,8 +345,8 @@ impl MultiRaft {
                     group_id,
                     log_index,
                     PendingSeal {
-                        requester: req.requester,
-                        segment_key: req.segment_key,
+                        requester: seal.from.clone(),
+                        segment_key: seal.segment_key,
                     },
                 );
                 self.dirty.insert(group_id);

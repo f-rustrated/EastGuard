@@ -3,6 +3,7 @@ use super::*;
 use crate::channels::BatchSender;
 use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeId;
+use crate::control_plane::SwimNode;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
 use crate::schedulers::ticker_message::TickerCommand;
@@ -118,7 +119,7 @@ impl SwimSender {
         Ok(recv.await?)
     }
 
-    pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<crate::control_plane::SwimNode>> {
+    pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<SwimNode>> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(SwimQueryCommand::GetMembers { reply: send })
             .await?;

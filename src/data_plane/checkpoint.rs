@@ -17,15 +17,22 @@ pub struct CheckpointWorker;
 impl CheckpointWorker {
     pub(crate) fn spawn(
         sparse_index: Arc<dyn SparseIndex>,
-        mailbox: Receiver<CheckpointJob>,
+        mailbox: Receiver<Box<[CheckpointJob]>>,
         data_plane_tx: Sender<DataPlaneCommand>,
     ) {
         thread::Builder::new()
             .name("checkpoint-worker".into())
             .spawn(move || {
-                while let Ok(job) = mailbox.recv() {
-                    if let Err(e) = Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx) {
-                        tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
+                while let Ok(batch) = mailbox.recv() {
+                    for job in batch {
+                        if let Err(e) =
+                            Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
+                        {
+                            tracing::error!(
+                                "Checkpoint failed for {:?}: {e}",
+                                job.segment_key
+                            );
+                        }
                     }
                 }
             })

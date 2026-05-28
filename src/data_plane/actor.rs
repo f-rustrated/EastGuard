@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::thread;
 
-use crossbeam_channel::Sender;
-
 use super::checkpoint::CheckpointJob;
+use super::messages::pending::DataPlaneOutputs;
 use super::state::DataPlane;
 use super::timer::{BatchFlushTimer, ReplicationTimer};
 use super::wal::WalWriter;
@@ -23,12 +22,12 @@ impl DataPlaneActor {
         node_id: NodeId,
         data_dir: PathBuf,
         config: DataNodeConfig,
-        checkpoint_tx: Sender<CheckpointJob>,
+        checkpoint_tx: crossbeam_channel::Sender<Box<[CheckpointJob]>>,
         batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
         repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
-    ) -> Sender<DataPlaneCommand> {
+    ) -> crossbeam_channel::Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
         thread::Builder::new()
@@ -41,7 +40,14 @@ impl DataPlaneActor {
                         return;
                     }
                 };
-                let mut state = DataPlane::new(node_id, config, wal, data_dir);
+                let out = DataPlaneOutputs::new(
+                    checkpoint_tx,
+                    batch_scheduler_tx,
+                    repl_scheduler_tx,
+                    data_transport_tx,
+                    coordinator_tx,
+                );
+                let mut state = DataPlane::new(node_id, config, wal, data_dir, out);
 
                 while let Ok(cmd) = mailbox.recv() {
                     state.handle_command(cmd);
@@ -50,13 +56,7 @@ impl DataPlaneActor {
                         state.handle_command(next);
                     }
 
-                    state.flush_and_dispatch(
-                        &checkpoint_tx,
-                        &batch_scheduler_tx,
-                        &repl_scheduler_tx,
-                        &data_transport_tx,
-                        &coordinator_tx,
-                    );
+                    state.flush_and_dispatch();
                 }
             })
             .expect("failed to spawn data-plane thread");

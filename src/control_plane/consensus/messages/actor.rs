@@ -5,7 +5,7 @@ use crate::control_plane::membership::{NodeDead, ShardGroupId};
 use crate::control_plane::metadata::types::TopicStats;
 
 use super::command::{
-    ConsensusCommand, CoordinatorCommand, EnsureGroup, HandleNodeJoin, PacketReceived,
+    ConsensusCommand, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, PacketReceived,
     ProposeError, RaftPropose, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
@@ -33,7 +33,7 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Vec<TopicStats>>,
     },
     /// Data plane SealRequest forwarded to coordinator for Raft proposal.
-    Coordinator(CoordinatorCommand),
+    Coordinator(CoordinatorSealRequest),
 }
 
 impl From<ConsensusCommand> for MultiRaftActorCommand {
