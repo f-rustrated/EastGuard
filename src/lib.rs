@@ -44,8 +44,6 @@ use crate::{
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
 };
 use anyhow::Result;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
