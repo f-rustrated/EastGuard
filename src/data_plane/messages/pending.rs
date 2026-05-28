@@ -86,8 +86,11 @@ impl DataPlaneOutputs {
         self.coordinator_cmds.push(cmd.into())
     }
 
-    pub(crate) fn store_timer(&mut self, timer: TimerCommand<BatchFlushTimer>) {
+    pub(crate) fn store_batch_produce_timer(&mut self, timer: TimerCommand<BatchFlushTimer>) {
         self.batch_timer_cmds.push(timer);
+    }
+    pub(crate) fn store_checkpoint(&mut self, job: CheckpointJob) {
+        self.checkpoint_jobs.push(job);
     }
 
     #[cfg(test)]
