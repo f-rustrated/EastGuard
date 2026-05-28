@@ -66,7 +66,7 @@ impl SwimActor {
     ) {
         let mut actor = Self {
             state,
-            transport_tx: transport_tx.into(),
+            transport_tx,
             scheduler_tx,
             raft_tx,
             packets: Vec::new(),

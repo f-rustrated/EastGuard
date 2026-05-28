@@ -1,0 +1,30 @@
+use bincode::{Decode, Encode};
+
+use crate::control_plane::NodeId;
+use crate::control_plane::metadata::command::{
+    CreateTopic, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
+};
+use crate::{impl_from_variant, impl_from_variant_via};
+
+/// Outer Raft log payload. The peer set is part of the replicated state machine,
+/// mutated only when `AddPeer` / `RemovePeer` entries apply — never by direct mutation
+/// from gossip events. See `diagrams/metadata-management/metadata_management_roadmap.md`
+/// Phase 3d ("Membership Changes via the Log") for the rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum RaftCommand {
+    Noop,
+    Metadata(MetadataCommand),
+    AddPeer(NodeId),
+    RemovePeer(NodeId),
+}
+
+impl_from_variant!(RaftCommand, Metadata(MetadataCommand));
+impl_from_variant_via!(
+    RaftCommand,
+    MetadataCommand,
+    CreateTopic,
+    RollSegment,
+    SplitRange,
+    MergeRange,
+    DeleteTopic
+);
