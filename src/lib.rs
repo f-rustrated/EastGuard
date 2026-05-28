@@ -22,10 +22,12 @@ use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 
 use crate::config::Environment;
-use crate::control_plane::consensus::messages::{RaftTimer, RaftTransportCommand};
-use crate::control_plane::membership::OutboundPacket;
+use crate::control_plane::consensus::messages::{
+    MultiRaftActorCommand, RaftTimer, RaftTransportCommand,
+};
 use crate::control_plane::membership::SwimTimer;
 use crate::control_plane::membership::actor::SwimSender;
+use crate::control_plane::membership::{OutboundPacket, SwimActorCommand};
 use crate::data_plane::actor::DataPlaneActor;
 use crate::data_plane::checkpoint::CheckpointWorker;
 use crate::data_plane::messages::command::DataPlaneCommand;
@@ -35,9 +37,8 @@ use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream, UdpSocket};
-use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_10_MS, TICK_PERIOD_100_MS};
-use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 use crate::{
     config::ENV,
     connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
@@ -65,43 +66,39 @@ impl StartUp {
     }
 
     pub async fn run(self) -> Result<()> {
-        // SWIM channels
-        let (swim_sender, swim_mailbox) = SwimActor::channel(100);
-        let (tx_outbound, rx_outbound) = mpsc::channel::<Box<[OutboundPacket]>>(100);
-        let (swim_ticker_tx, swim_ticker_rx) = mpsc::channel::<Box<[TickerCommand<SwimTimer>]>>(64);
-
-        // Raft channels
-        let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
-        let (raft_transport_tx, raft_transport_rx) =
-            mpsc::channel::<Box<[RaftTransportCommand]>>(100);
-        // Each vnode can have both an election and heartbeat timer active, so capacity
-        // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
-        let (raft_ticker_tx, raft_ticker_rx) = mpsc::channel::<Box<[TickerCommand<RaftTimer>]>>(
-            self.env.vnodes_per_node as usize * 16,
-        );
-
-        // Build SWIM state and extract node_id before handing state to the actor
-        let state = self.env.swim(self.rng_seed);
-        let node_id = state.node_id.clone();
-
         // Bind sockets before spawning — fail fast on port conflicts
         let udp_socket = UdpSocket::bind(self.env.peer_bind_addr()).await?;
         let tcp_listener = TcpListener::bind(self.env.peer_bind_addr()).await?;
         let data_tcp_listener = TcpListener::bind(self.env.data_bind_addr()).await?;
 
+        // SWIM channels
+        let (swim_sender, swim_mailbox) = SwimActor::channel(100);
+        let (tx_outbound, rx_outbound) = mpsc::channel::<Box<[OutboundPacket]>>(100);
+
+        // Raft channels
+        let (raft_tx, raft_mailbox) = MultiRaftActor::channel(4096);
+        let (raft_transport_tx, raft_transport_rx) =
+            mpsc::channel::<Box<[RaftTransportCommand]>>(100);
+
+        // Build SWIM state and extract node_id before handing state to the actor
+        let state = self.env.swim(self.rng_seed);
+        let node_id = state.node_id.clone();
+
         // Spawn actors (order: tickers → transports → protocols → client)
-        tokio::spawn(run_scheduling_actor(
+        let swim_ticker_tx = spawn_scheduling_actor::<SwimTimer, SwimActorCommand>(
             swim_sender.clone().into(),
-            swim_ticker_rx,
+            64,
             TICK_PERIOD_100_MS,
             Some(PROBE_INTERVAL_TICKS),
-        ));
-        tokio::spawn(run_scheduling_actor(
+        );
+        // Each vnode can have both an election and heartbeat timer active, so capacity
+        // must comfortably exceed vnodes_per_node * 2; * 16 gives ample headroom.
+        let raft_ticker_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
             raft_tx.clone().into(),
-            raft_ticker_rx,
+            self.env.vnodes_per_node as usize * 16,
             TICK_PERIOD_100_MS,
             Some(PROBE_INTERVAL_TICKS),
-        ));
+        );
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
             swim_sender.clone(),
@@ -135,30 +132,24 @@ impl StartUp {
         // Timer bridge: schedulers send via tokio mpsc, bridge forwards to crossbeam
         let (dp_timer_tx, mut dp_timer_rx) = mpsc::channel::<DataPlaneCommand>(64);
 
-        let (batch_tick_tx, batch_tick_rx) = SchedulerSender::<BatchFlushTimer>::channel(64);
-
-        let (repl_tick_tx, repl_tick_rx) = SchedulerSender::<ReplicationTimer>::channel(64);
-
-        let (_age_tick_tx, age_tick_rx) = SchedulerSender::<SegmentAgeTimer>::channel(64);
-
-        tokio::spawn(run_scheduling_actor(
+        let batch_tick_tx = spawn_scheduling_actor::<BatchFlushTimer, DataPlaneCommand>(
             dp_timer_tx.clone(),
-            batch_tick_rx,
+            64,
             TICK_PERIOD_10_MS,
             None,
-        ));
-        tokio::spawn(run_scheduling_actor(
+        );
+        let repl_tick_tx = spawn_scheduling_actor::<ReplicationTimer, DataPlaneCommand>(
             dp_timer_tx.clone(),
-            repl_tick_rx,
+            64,
             TICK_PERIOD_10_MS,
             None,
-        ));
-        tokio::spawn(run_scheduling_actor(
+        );
+        let _age_tick_tx = spawn_scheduling_actor::<SegmentAgeTimer, DataPlaneCommand>(
             dp_timer_tx,
-            age_tick_rx,
+            64,
             TICK_PERIOD_100_MS,
             Some(self.env.age_check_ticks()),
-        ));
+        );
 
         let data_plane_tx = DataPlaneActor::spawn(
             node_id.clone(),
@@ -196,7 +187,7 @@ impl StartUp {
             Box::new(raft_db),
             raft_mailbox,
             raft_transport_tx,
-            raft_ticker_tx.into(),
+            raft_ticker_tx,
             swim_sender.clone(),
             data_transport_tx,
         ));
