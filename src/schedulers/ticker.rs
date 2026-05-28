@@ -80,7 +80,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::clusters::swims::{
+    use crate::control_plane::membership::{
         DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
         SwimTimeOutCallback, SwimTimer, SwimTimerKind,
     };

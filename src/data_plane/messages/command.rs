@@ -3,9 +3,9 @@ use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
 use crate::{
-    clusters::NodeId,
-    clusters::metadata::SegmentId,
-    clusters::swims::ShardGroupId,
+    control_plane::NodeId,
+    control_plane::membership::ShardGroupId,
+    control_plane::metadata::SegmentId,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
@@ -55,6 +55,7 @@ pub struct CommitAdvance {
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SealRequest {
+    pub from: NodeId,
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
     pub end_entry_id: u64,

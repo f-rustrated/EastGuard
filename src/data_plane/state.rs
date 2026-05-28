@@ -7,7 +7,8 @@ use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
-use crate::clusters::NodeId;
+use crate::channels::BatchSender;
+use crate::control_plane::NodeId;
 use crate::data_plane::checkpoint::CheckpointJob;
 use crate::data_plane::messages::event::DataPlaneEvent;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
@@ -18,8 +19,6 @@ use bytes::Bytes;
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::mpsc as tokio_mpsc;
-
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -30,7 +29,7 @@ pub struct DataPlane<W: WalStorage> {
     wal: W,
     segments: HashMap<SegmentKey, SegmentTracker>,
     dirty_segments: Vec<SegmentKey>,
-    pending_events: Vec<DataPlaneEvent>,
+    pending_events: std::collections::VecDeque<DataPlaneEvent>,
     buffer_byte_count: usize,
 
     needs_flush: bool,
@@ -45,7 +44,7 @@ impl<W: WalStorage> DataPlane<W> {
             wal,
             segments: HashMap::new(),
             dirty_segments: Vec::new(),
-            pending_events: Vec::new(),
+            pending_events: std::collections::VecDeque::new(),
             buffer_byte_count: 0,
             needs_flush: false,
             data_dir,
@@ -77,7 +76,7 @@ impl<W: WalStorage> DataPlane<W> {
         checkpoint_tx: &Sender<CheckpointJob>,
         batch_scheduler: &SchedulerSender<BatchFlushTimer>,
         repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &tokio_mpsc::Sender<DataTransportCommand>,
+        transport_tx: &BatchSender<DataTransportCommand>,
     ) {
         if self.should_flush() {
             self.flush_batch();
@@ -363,7 +362,7 @@ impl<W: WalStorage> DataPlane<W> {
                         });
                     }
                     SegmentRole::Follower => {
-                        self.pending_events.push(
+                        self.pending_events.push_back(
                             event::InterNodeCommandQueued::new(
                                 vec![tracker.leader_node()],
                                 ReplicaAck {
@@ -379,7 +378,8 @@ impl<W: WalStorage> DataPlane<W> {
             }
 
             if tracker.size_limit_reached() {
-                self.pending_events.push(tracker.checkpoint(key).into());
+                self.pending_events
+                    .push_back(tracker.checkpoint(key).into());
             }
         }
 
@@ -430,89 +430,83 @@ impl<W: WalStorage> DataPlane<W> {
         checkpoint_tx: &Sender<CheckpointJob>,
         batch_scheduler: &SchedulerSender<BatchFlushTimer>,
         repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &tokio_mpsc::Sender<DataTransportCommand>,
+        transport_tx: &BatchSender<DataTransportCommand>,
     ) {
         use DataPlaneEvent as E;
-        while !self.pending_events.is_empty() {
-            let events = self.take_events();
-            for event in events {
-                match event {
-                    E::CheckpointRequired(job) => {
-                        let _ = checkpoint_tx.send(job);
-                    }
-                    E::BatchPublished(evt) => {
-                        for pending_repl in evt.segment_batches {
-                            if let Some(seq) = self.replication.begin_replication(&pending_repl) {
-                                repl_scheduler.schedule(
-                                    seq,
-                                    ReplicationTimer::timeout(pending_repl.segment_key),
-                                );
-                            }
-                            let (targets, message) = pending_repl.into_replica_append();
-                            let _ = transport_tx
-                                .blocking_send(DataTransportCommand::send(targets, message));
-                        }
-                    }
-                    E::BatchFlushTimerScheduled(cmd) => {
-                        batch_scheduler.send(cmd);
-                    }
-                    E::InterNodeCommandQueued(evt) => {
-                        let _ = transport_tx
-                            .blocking_send(DataTransportCommand::send(evt.targets, evt.message));
-                    }
-                    E::ReplicaAckReceived(evt) => {
-                        let Some(committed) =
-                            self.replication.process_ack(&evt.segment_key, &evt.from)
-                        else {
-                            continue;
-                        };
-
-                        self.commit_segment(evt.segment_key, committed.entry_id);
-
-                        for reply in committed.replies {
-                            let _ = reply.send(ProduceAck::Ok);
-                        }
-
-                        if let Some(seq) = committed.reset_timer_seq {
+        let mut transport_cmds = Vec::new();
+        while let Some(event) = self.pending_events.pop_front() {
+            match event {
+                E::CheckpointRequired(job) => {
+                    let _ = checkpoint_tx.send(job);
+                }
+                E::BatchPublished(evt) => {
+                    for pending_repl in evt.segment_batches {
+                        if let Some(seq) = self.replication.begin_replication(&pending_repl) {
                             repl_scheduler
-                                .schedule(seq, ReplicationTimer::timeout(evt.segment_key));
+                                .schedule(seq, ReplicationTimer::timeout(pending_repl.segment_key));
                         }
+                        let (targets, message) = pending_repl.into_replica_append();
+                        transport_cmds
+                            .push(DataTransportCommand::send_to_targets(targets, message));
                     }
-                    E::ReplicationTimedOut(evt) => {
-                        // In-flight state intentionally NOT cleared. A late ack may
-                        // commit the batch while SealRequest is in transit — safe
-                        // because apply_roll_segment() is idempotent (DS-RSM invariant 9).
+                }
+                E::BatchFlushTimerScheduled(cmd) => {
+                    batch_scheduler.send(cmd);
+                }
+                E::InterNodeCommandQueued(evt) => {
+                    transport_cmds.push(DataTransportCommand::send_to_targets(
+                        evt.targets,
+                        evt.message,
+                    ));
+                }
+                E::ReplicaAckReceived(evt) => {
+                    let Some(committed) = self.replication.process_ack(&evt.segment_key, &evt.from)
+                    else {
+                        continue;
+                    };
 
-                        let Some(nodes) = self.replication.in_flight_pending_acks(&evt.segment_key)
-                        else {
-                            continue;
-                        };
+                    self.commit_segment(evt.segment_key, committed.entry_id);
 
-                        // ! Locate Coordinator
-                        let targets = vec![];
-                        let _ = transport_tx.blocking_send(DataTransportCommand::send(
-                            targets,
-                            SealRequest {
-                                segment_key: evt.segment_key,
-                                failed_nodes: nodes,
-                                end_entry_id: evt.committed_entry_id,
-                            },
-                        ));
+                    for reply in committed.replies {
+                        let _ = reply.send(ProduceAck::Ok);
                     }
+
+                    if let Some(seq) = committed.reset_timer_seq {
+                        repl_scheduler.schedule(seq, ReplicationTimer::timeout(evt.segment_key));
+                    }
+                }
+                E::ReplicationTimedOut(evt) => {
+                    let Some(nodes) = self.replication.in_flight_pending_acks(&evt.segment_key)
+                    else {
+                        continue;
+                    };
+
+                    let targets = vec![];
+                    transport_cmds.push(DataTransportCommand::send_to_targets(
+                        targets,
+                        SealRequest {
+                            from: self.node_id.clone(),
+                            segment_key: evt.segment_key,
+                            failed_nodes: nodes,
+                            end_entry_id: evt.committed_entry_id,
+                        },
+                    ));
                 }
             }
         }
+        transport_tx.blocking_send_batch(transport_cmds);
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
 
     fn raise_event(&mut self, event: impl Into<DataPlaneEvent>) {
-        self.pending_events.push(event.into());
+        self.pending_events.push_back(event.into());
     }
 
+    #[cfg(test)]
     fn take_events(&mut self) -> Vec<DataPlaneEvent> {
-        std::mem::take(&mut self.pending_events)
+        self.pending_events.drain(..).collect()
     }
 
     #[cfg(test)]
@@ -548,8 +542,8 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
-    use crate::clusters::swims::ShardGroupId;
+    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::membership::ShardGroupId;
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
 

@@ -6,7 +6,7 @@ use bincode::enc::write::Writer;
 use bincode::error::{DecodeError, EncodeError};
 use bytes::Bytes;
 
-use crate::clusters::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::smart_pointer;
 
 pub(crate) mod actor;

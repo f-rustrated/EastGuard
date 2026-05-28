@@ -4,6 +4,10 @@
 
 Functions taking `&self`, `&mut self`, or a reference to a struct as their first argument must be methods on that struct. Free functions with `&SomeStruct` as first arg are never acceptable — add them as `impl SomeStruct` methods instead.
 
+## Enum struct pattern
+
+Enum variants that carry data must use the tuple-variant + named-struct pattern. Never use inline fields on enum variants. See `/.claude/skills/enum-struct-pattern/SKILL.md` for the full pattern including `impl_from_variant!` usage.
+
 ## Result over Option for observability
 
 Prefer `Result<T, E>` over `Option<T>` when `None` represents a failure condition that an operator or developer would want to diagnose. Silent `None` returns hide *why* something didn't happen — use `Result` so the error is observable via logging or propagation.
@@ -29,6 +33,10 @@ Never use wildcard `_ => {}` or `_ => unreachable!()` in match arms for enum dis
 Cross-actor channels should send `Box<[T]>` rather than individual `T` messages. The sender accumulates into a `Vec<T>` during its event loop iteration, then calls `.into_boxed_slice()` before sending — sheds unused capacity so only exact-size allocation crosses the channel. Benefits: fewer send operations (less channel contention), lower probability of a bounded channel being full, no wasted memory on the receiver side, and natural alignment with the flush-based actor pattern where side effects are drained after each event.
 
 For bounded channels using `try_send`, batching is especially important — one send per batch instead of per item means fewer opportunities for a full-channel drop.
+
+## Place methods on the struct that owns the data
+
+When adding a method, put it on the struct whose fields it reads or computes over — not on a parent that happens to hold a reference. If `MetadataStateMachine::topic_stats()` just iterates `self.topics` and calls per-topic logic, that per-topic logic belongs on `TopicMeta`, not inlined in the iterator. This keeps methods close to the fields they touch, makes them independently testable, and prevents parent structs from accumulating pass-through logic.
 
 ## Temporal coupling in error propagation
 

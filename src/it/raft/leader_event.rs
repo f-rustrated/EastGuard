@@ -7,14 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{LeaderChange, MultiRaftCommand};
-use crate::clusters::raft::transport::RaftTransportActor;
-use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{
+use crate::control_plane::consensus::actor::MultiRaftActor;
+use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::membership::actor::SwimActor;
+use crate::control_plane::membership::{
     ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand,
 };
-use crate::clusters::{BINCODE_CONFIG, NodeAddress, NodeId};
+use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -92,7 +92,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     );
                 }
 
-                let (raft_tx, raft_mailbox) = mpsc::channel(100);
+                let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
                 let (transport_tx, transport_rx) = mpsc::channel(100);
                 let (ticker_tx, ticker_rx) = mpsc::channel(64);
                 let (swim_tx, swim_rx) = SwimActor::channel(64);
@@ -108,7 +108,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     leader_events_tx,
                 ));
                 tokio::spawn(run_scheduling_actor(
-                    raft_tx.clone(),
+                    raft_tx.clone().into(),
                     ticker_rx,
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
@@ -128,18 +128,20 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     node_id.hash(&mut h);
                     h.finish()
                 };
+                let (data_tx, _) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(MultiRaftActor::run(
                     node_id,
                     election_jitter_seed,
                     Box::new(db),
                     raft_mailbox,
                     transport_tx,
-                    ticker_tx,
+                    ticker_tx.into(),
                     swim_tx,
+                    data_tx,
                 ));
 
                 raft_tx
-                    .send(MultiRaftCommand::EnsureGroup { group: g }.into())
+                    .send(EnsureGroup { group: g })
                     .await
                     .unwrap();
 

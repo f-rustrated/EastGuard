@@ -1,23 +1,32 @@
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
+use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
 
+pub(crate) struct DataTransportSendToTargets {
+    pub targets: Vec<NodeId>,
+    pub message: DataPlaneInterNodeCommand,
+}
+
+pub(crate) struct DataTransportSendToCoordinator {
+    pub shard_group_id: ShardGroupId,
+    pub message: DataPlaneInterNodeCommand,
+}
+
 pub(crate) enum DataTransportCommand {
-    Send {
-        targets: Vec<NodeId>,
-        message: DataPlaneInterNodeCommand,
-    },
+    SendToTargets(DataTransportSendToTargets),
+    SendToCoordinator(DataTransportSendToCoordinator),
     #[allow(dead_code)]
     DisconnectPeer(NodeId),
 }
 
 impl DataTransportCommand {
-    pub(crate) fn send(
+    pub(crate) fn send_to_targets(
         targets: Vec<NodeId>,
         message: impl Into<DataPlaneInterNodeCommand>,
     ) -> Self {
-        Self::Send {
+        Self::SendToTargets(DataTransportSendToTargets {
             targets,
             message: message.into(),
-        }
+        })
     }
 }

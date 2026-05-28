@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::clusters::SwimNodeState;
+use crate::control_plane::SwimNodeState;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,

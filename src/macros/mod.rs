@@ -24,6 +24,23 @@ macro_rules! impl_from_variant {
     };
 }
 
+/// Generates transitive `From` impls: `InnerType → MiddleEnum → OuterEnum`.
+/// Requires `From<InnerType> for MiddleEnum` (via `impl_from_variant!`)
+/// and `From<MiddleEnum> for OuterEnum` to already exist.
+#[macro_export]
+macro_rules! impl_from_variant_via {
+    ($outer:ty, $middle:ty, $($inner:ty),* $(,)?) => {
+        $(
+            impl From<$inner> for $outer {
+                fn from(val: $inner) -> Self {
+                    let mid: $middle = val.into();
+                    mid.into()
+                }
+            }
+        )*
+    };
+}
+
 #[macro_export]
 macro_rules! smart_pointer {
     // Arm 1: For generic tuple structs like `struct Wrapper<T>(T);`

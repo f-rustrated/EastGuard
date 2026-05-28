@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 #[cfg(test)]
-use crate::clusters::NodeId;
+use crate::control_plane::NodeId;
 
 pub(crate) trait TTimer: Debug + Send + Sync + 'static {
     type Callback: Default;

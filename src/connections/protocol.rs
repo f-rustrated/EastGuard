@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 
 use bincode::{Decode, Encode};
 
+use crate::control_plane::metadata::strategy::StoragePolicy;
+
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
 #[derive(Clone, Encode, Decode)]
@@ -28,10 +30,17 @@ pub enum ClientResponse {
 
 #[derive(Clone, Encode, Decode)]
 pub enum ControlPlaneRequest {
-    CreateTopic { name: String, retention_ms: u64, replication_factor: u8 },
-    DeleteTopic { name: String },
+    CreateTopic {
+        name: String,
+        storage_policy: StoragePolicy,
+    },
+    DeleteTopic {
+        name: String,
+    },
     ListHostedTopics,
-    DescribeTopic { name: String },
+    DescribeTopic {
+        name: String,
+    },
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -119,16 +128,33 @@ pub enum DataPlaneRequest {
 #[derive(Debug, Encode, Decode)]
 pub enum DataPlaneResponse {
     // Produce
-    Produced { entry_id: u64 },
-    RangeSplitting { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> },
+    Produced {
+        entry_id: u64,
+    },
+    RangeSplitting {
+        left_range_id: u64,
+        right_range_id: u64,
+        split_point: Vec<u8>,
+    },
     // Fetch
-    Fetched { entries: Vec<Entry>, next_entry_id: u64, range_status: RangeStatus },
+    Fetched {
+        entries: Vec<Entry>,
+        next_entry_id: u64,
+        range_status: RangeStatus,
+    },
     EntryIdOutOfRange,
     // ListOffsets
-    Offsets { start_entry_id: u64, committed_entry_id: u64 },
+    Offsets {
+        start_entry_id: u64,
+        committed_entry_id: u64,
+    },
     // Redirect errors — client reconnects and retries on the indicated node
-    NotLeader { leader_addr: Option<SocketAddr> },
-    ShardNotLocal { hint_node: SocketAddr },
+    NotLeader {
+        leader_addr: Option<SocketAddr>,
+    },
+    ShardNotLocal {
+        hint_node: SocketAddr,
+    },
     TopicNotFound,
     InternalError(String),
 }
@@ -146,13 +172,22 @@ pub struct Entry {
 #[derive(Debug, Encode, Decode)]
 pub enum RangeStatus {
     Active,
-    Sealed { end_offset: u64, transition: RangeTransition },
+    Sealed {
+        end_offset: u64,
+        transition: RangeTransition,
+    },
 }
 
 #[derive(Debug, Encode, Decode)]
 pub enum RangeTransition {
-    Split { left_range_id: u64, right_range_id: u64, split_point: Vec<u8> },
-    Merged { merged_range_id: u64 },
+    Split {
+        left_range_id: u64,
+        right_range_id: u64,
+        split_point: Vec<u8>,
+    },
+    Merged {
+        merged_range_id: u64,
+    },
 }
 
 // ── Admin ──────────────────────────────────────────────────────────────────
@@ -161,10 +196,18 @@ pub enum RangeTransition {
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,
-    SplitRange { topic_name: String, range_id: u64, split_point: Vec<u8> },
+    SplitRange {
+        topic_name: String,
+        range_id: u64,
+        split_point: Vec<u8>,
+    },
     // Internal/debug queries — also used by integration test helpers.
-    GetShardInfo { key: Vec<u8> },
-    GetShardLeader { shard_group_id: u64 },
+    GetShardInfo {
+        key: Vec<u8>,
+    },
+    GetShardLeader {
+        shard_group_id: u64,
+    },
 }
 
 #[derive(Debug, Encode, Decode)]

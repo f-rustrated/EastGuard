@@ -4,15 +4,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use turmoil::Builder;
 
-use crate::clusters::raft::actor::MultiRaftActor;
-use crate::clusters::raft::messages::{MultiRaftActorCommand, MultiRaftCommand};
-use crate::clusters::raft::transport::RaftTransportActor;
-use crate::clusters::swims::actor::SwimActor;
-use crate::clusters::swims::{ShardGroup, ShardGroupId};
-use crate::clusters::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::consensus::actor::{MultiRaftActor, RaftSender};
+use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::membership::actor::SwimActor;
+use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
+use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -28,8 +28,8 @@ async fn start_raft_node(
     peer_names: &[&str],
 ) -> Result<
     (
-        mpsc::Sender<MultiRaftActorCommand>,
-        mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
+        RaftSender,
+        mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -48,7 +48,7 @@ async fn start_raft_node(
         );
     }
 
-    let (raft_tx, raft_mailbox) = mpsc::channel(100);
+    let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
     let (ticker_tx, ticker_rx) = mpsc::channel(64);
     let (swim_tx, swim_rx) = SwimActor::channel(64);
@@ -59,7 +59,7 @@ async fn start_raft_node(
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
     tokio::spawn(run_scheduling_actor(
-        raft_tx.clone(),
+        raft_tx.clone().into(),
         ticker_rx,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
@@ -77,25 +77,26 @@ async fn start_raft_node(
         node_id.hash(&mut h);
         h.finish()
     };
+    let (data_tx, _) = tokio::sync::mpsc::channel(1);
     tokio::spawn(MultiRaftActor::run(
         node_id,
         election_jitter_seed,
         Box::new(db),
         raft_mailbox,
         transport_tx,
-        ticker_tx,
+        ticker_tx.into(),
         swim_tx,
+        data_tx,
     ));
 
-    raft_tx
-        .send(MultiRaftCommand::EnsureGroup { group }.into())
-        .await
-        .unwrap();
+    raft_tx.send(EnsureGroup { group }).await.unwrap();
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
     for _ in 0..200 {
-        let _ = ticker_force.send(Box::new([TickerCommand::ForceTick])).await;
+        let _ = ticker_force
+            .send(Box::new([TickerCommand::ForceTick]))
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -104,10 +105,7 @@ async fn start_raft_node(
     Ok((raft_tx, ticker_force))
 }
 
-async fn tick_n(
-    ticker: &mpsc::Sender<Box<[TickerCommand<crate::clusters::raft::messages::RaftTimer>]>>,
-    n: usize,
-) {
+async fn tick_n(ticker: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>, n: usize) {
     for _ in 0..n {
         let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
         tokio::task::yield_now().await;
@@ -117,19 +115,11 @@ async fn tick_n(
 }
 
 async fn serve_leader(
-    raft_tx: &mpsc::Sender<MultiRaftActorCommand>,
+    raft_tx: &RaftSender,
     group_id: ShardGroupId,
     query_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    raft_tx
-        .send(MultiRaftActorCommand::GetLeader {
-            group_id,
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let leader = reply_rx.await.unwrap();
+    let leader = raft_tx.get_leader(group_id).await;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
     let (stream, _) = listener.accept().await?;
@@ -187,12 +177,10 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, g.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(
-                        MultiRaftCommand::HandleNodeDeath {
-                            dead_node_id: NodeId::new("node-3"),
-                        }
-                        .into(),
-                    )
+                    .send(NodeDead {
+                        dead_node_id: NodeId::new("node-3"),
+                        live_nodes: vec!["node-1".into(), "node-2".into()],
+                    })
                     .await;
 
                 if name == "node-3" {
@@ -266,13 +254,10 @@ fn node_join_triggers_add_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, ig.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(
-                        MultiRaftCommand::HandleNodeJoin {
-                            new_node_id: NodeId::new("node-3"),
-                            affected_groups: vec![eg],
-                        }
-                        .into(),
-                    )
+                    .send(HandleNodeJoin {
+                        new_node_id: NodeId::new("node-3"),
+                        affected_groups: vec![eg],
+                    })
                     .await;
 
                 tick_n(&ticker, 100).await;

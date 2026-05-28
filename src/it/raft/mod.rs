@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 
-use crate::clusters::swims::{SwimActorCommand, SwimQueryCommand};
-use crate::clusters::{NodeAddress, NodeId};
+use crate::control_plane::membership::{SwimActorCommand, SwimQueryCommand};
+use crate::control_plane::{NodeAddress, NodeId};
 
 pub(super) const CLUSTER_PORT: u16 = 19000;
 pub(super) const QUERY_PORT: u16 = 29000;

@@ -47,4 +47,4 @@ Size guards: NodeId frames capped at 1KB, message frames at 4MB.
 
 6. **Messages batched per target.** `send()` groups outbound packets by `target NodeId`, encodes all messages for a target into a single buffer, writes once. Minimizes syscalls.
 
-7. **Transport is Raft-agnostic.** No consensus logic in transport. All inbound messages forwarded as `MultiRaftCommand::PacketReceived`. Transport never inspects or modifies RPC contents.
+7. **Transport is Raft-agnostic.** No consensus logic in transport. All inbound messages forwarded as `ConsensusCommand::PacketReceived`. Transport never inspects or modifies RPC contents.

@@ -17,6 +17,7 @@ use std::{io::ErrorKind, mem::size_of};
 const LEN_PREFIX_SIZE: usize = size_of::<u32>();
 const REQUEST_ID_SIZE: usize = size_of::<u64>();
 
+use anyhow::Context;
 use tokio::sync::mpsc;
 
 use crate::connections::protocol::{
@@ -25,15 +26,15 @@ use crate::connections::protocol::{
     TopicSummary,
 };
 use crate::{
-    clusters::{
+    control_plane::{
         SwimNodeState,
+        consensus::actor::RaftSender,
+        consensus::messages::ProposeError,
+        membership::{ShardGroupId, actor::SwimSender},
         metadata::{
             command::{CreateTopic, DeleteTopic, MetadataCommand},
-            strategy::{PartitionStrategy, StoragePolicy},
+            strategy::StoragePolicy,
         },
-        raft::actor::RaftSender,
-        raft::messages::{ProposeError, RaftCommand},
-        swims::{ShardGroupId, actor::SwimSender},
     },
     net::{OwnedReadHalf, OwnedWriteHalf},
 };
@@ -60,15 +61,9 @@ impl ClientRawWriter {
     ) -> anyhow::Result<()> {
         let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
         let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
-        self.stream.write_all(&len.to_be_bytes()).await.expect("write len failed");
-        self.stream
-            .write_all(&request_id.to_be_bytes())
-            .await
-            .expect("write request_id failed");
-        self.stream
-            .write_all(&encoded)
-            .await
-            .expect("write encoded failed");
+        self.stream.write_all(&len.to_be_bytes()).await?;
+        self.stream.write_all(&request_id.to_be_bytes()).await?;
+        self.stream.write_all(&encoded).await?;
         Ok(())
     }
 }
@@ -137,7 +132,9 @@ impl ClientStreamReader {
         if len < REQUEST_ID_SIZE {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
-                format!("Frame too small: len={len}, minimum is {REQUEST_ID_SIZE} (request_id field)"),
+                format!(
+                    "Frame too small: len={len}, minimum is {REQUEST_ID_SIZE} (request_id field)"
+                ),
             ));
         }
 
@@ -187,7 +184,10 @@ pub struct ClientHandler {
 #[allow(dead_code)]
 impl ClientHandler {
     pub fn new(swim_sender: SwimSender, raft_sender: RaftSender) -> Self {
-        Self { swim_sender, raft_sender }
+        Self {
+            swim_sender,
+            raft_sender,
+        }
     }
 
     /// Reads frames in a loop, spawning one handler task per request.
@@ -226,9 +226,10 @@ impl ClientHandler {
 
     async fn handle_control_plane(&self, request: ControlPlaneRequest) -> ClientResponse {
         let res = match request {
-            ControlPlaneRequest::CreateTopic { name, retention_ms, replication_factor } => {
-                self.handle_create_topic(name, retention_ms, replication_factor).await
-            }
+            ControlPlaneRequest::CreateTopic {
+                name,
+                storage_policy,
+            } => self.handle_create_topic(name, storage_policy).await,
             ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
             ControlPlaneRequest::ListHostedTopics => self.handle_list_hosted_topics().await,
             ControlPlaneRequest::DescribeTopic { .. } => todo!(),
@@ -245,61 +246,64 @@ impl ClientHandler {
     async fn handle_create_topic(
         &self,
         name: String,
-        retention_ms: u64,
-        replication_factor: u8,
+        storage_policy: StoragePolicy,
     ) -> anyhow::Result<ClientResponse> {
-        let Some(shard_group) = self.swim_sender.resolve_shard_group(name.as_bytes().to_vec()).await? else {
-            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                "shard group not found".into(),
-            )));
-        };
-        let now_ms = std::time::SystemTime::now()
+        let shard_group = self
+            .swim_sender
+            .resolve_shard_group(name.as_bytes().to_vec())
+            .await?
+            .context("shard group not found")?;
+
+        let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let cmd = RaftCommand::Metadata(MetadataCommand::CreateTopic(CreateTopic {
-            name: name.clone(),
-            storage_policy: StoragePolicy {
-                retention_ms,
-                replication_factor: replication_factor as u64,
-                partition_strategy: PartitionStrategy::AutoSplit,
-            },
+
+        let cmd = CreateTopic {
+            storage_policy,
+            name,
             replica_set: shard_group.members,
-            created_at: now_ms,
-        }));
-        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
-            Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
-            Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(
-                ControlPlaneResponse::InternalError(
-                    "not the leader for this shard group — retry on another node".into(),
-                ),
-            ),
-            Some(Err(e)) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                format!("{e:?}"),
-            )),
-            None => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                "shard group not found".into(),
-            )),
-        })
+            created_at,
+        };
+
+        Ok(
+            match self
+                .raft_sender
+                .propose(shard_group.id, cmd.into())
+                .await
+                .context("shard group not found")?
+            {
+                Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
+                Err(ProposeError::NotLeader(_)) => {
+                    ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                        "not the leader for this shard group — retry on another node".into(),
+                    ))
+                }
+                Err(e) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                    format!("{e:?}"),
+                )),
+            },
+        )
     }
 
     async fn handle_delete_topic(&self, name: String) -> anyhow::Result<ClientResponse> {
-        let Some(shard_group) = self.swim_sender.resolve_shard_group(name.as_bytes().to_vec()).await? else {
-            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                "shard group not found".into(),
-            )));
-        };
-        let cmd = RaftCommand::Metadata(MetadataCommand::DeleteTopic(DeleteTopic { name }));
+        let shard_group = self
+            .swim_sender
+            .resolve_shard_group(name.as_bytes().to_vec())
+            .await?
+            .context("shard group not found")?;
+
+        let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
         Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
             Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-            Some(Err(ProposeError::NotLeader(_))) => ClientResponse::ControlPlane(
-                ControlPlaneResponse::InternalError(
+            Some(Err(ProposeError::NotLeader(_))) => {
+                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                     "not the leader for this shard group — retry on another node".into(),
-                ),
-            ),
-            Some(Err(e)) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                format!("{e:?}"),
-            )),
+                ))
+            }
+            Some(Err(e)) => {
+                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(format!("{e:?}")))
+            }
             None => ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound),
         })
     }
@@ -316,7 +320,9 @@ impl ClientHandler {
                 state: crate::connections::protocol::TopicState::Active,
             })
             .collect();
-        Ok(ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }))
+        Ok(ClientResponse::ControlPlane(
+            ControlPlaneResponse::TopicList { topics },
+        ))
     }
 
     async fn handle_data_plane(&self, request: DataPlaneRequest) -> ClientResponse {
@@ -424,16 +430,18 @@ pub async fn run_client_writer(
 mod tests {
     use std::net::SocketAddr;
 
-    use crate::clusters::raft::actor::MultiRaftActor;
-    use crate::clusters::metadata::types::TopicStats as MetadataTopicStats;
-    use crate::clusters::raft::messages::MultiRaftActorCommand;
-    use crate::clusters::swims::actor::SwimActor;
-    use crate::clusters::swims::{ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand};
-    use crate::clusters::{NodeAddress, NodeId, SwimNode, SwimNodeState};
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
         ControlPlaneResponse, NodeState,
     };
+    use crate::control_plane::consensus::actor::MultiRaftActor;
+    use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+    use crate::control_plane::membership::actor::SwimActor;
+    use crate::control_plane::membership::{
+        ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand,
+    };
+    use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
 
     use super::ClientHandler;
 
@@ -446,12 +454,15 @@ mod tests {
     }
 
     fn test_shard_group() -> ShardGroup {
-        ShardGroup { id: ShardGroupId(42), members: vec![node_id("node-1")] }
+        ShardGroup {
+            id: ShardGroupId(42),
+            members: vec![node_id("node-1")],
+        }
     }
 
     fn swim_sender_with(
         handler: impl Fn(SwimActorCommand) + Send + 'static,
-    ) -> crate::clusters::swims::actor::SwimSender {
+    ) -> crate::control_plane::membership::actor::SwimSender {
         let (tx, mut rx) = SwimActor::channel(16);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
@@ -463,7 +474,7 @@ mod tests {
 
     fn raft_sender_with(
         handler: impl Fn(MultiRaftActorCommand) + Send + 'static,
-    ) -> crate::clusters::raft::actor::RaftSender {
+    ) -> crate::control_plane::consensus::actor::RaftSender {
         let (tx, mut rx) = MultiRaftActor::channel(16);
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
@@ -476,7 +487,8 @@ mod tests {
     #[tokio::test]
     async fn create_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
@@ -486,14 +498,23 @@ mod tests {
             }
         });
         let resp = ClientHandler::new(swim, raft)
-            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
-                name: "t1".into(),
-                retention_ms: 3_600_000,
-                replication_factor: 1,
-            }))
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::CreateTopic {
+                    name: "t1".into(),
+                    storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                        retention_ms: 3_600_000,
+                        replication_factor: 1,
+                        partition_strategy:
+                            crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
+                    },
+                },
+            ))
             .await;
         assert!(
-            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)),
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
+            ),
             "expected TopicCreated, got {resp:?}"
         );
     }
@@ -501,19 +522,29 @@ mod tests {
     #[tokio::test]
     async fn create_topic_shard_not_found() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            {
                 let _ = reply.send(None);
             }
         });
         let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
-            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
-                name: "t1".into(),
-                retention_ms: 3_600_000,
-                replication_factor: 1,
-            }))
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::CreateTopic {
+                    name: "t1".into(),
+                    storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                        retention_ms: 3_600_000,
+                        replication_factor: 1,
+                        partition_strategy:
+                            crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
+                    },
+                },
+            ))
             .await;
         assert!(
-            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(_))),
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(_))
+            ),
             "expected InternalError, got {resp:?}"
         );
     }
@@ -521,7 +552,8 @@ mod tests {
     #[tokio::test]
     async fn delete_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
@@ -531,12 +563,15 @@ mod tests {
             }
         });
         let resp = ClientHandler::new(swim, raft)
-            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::DeleteTopic {
-                name: "t1".into(),
-            }))
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::DeleteTopic { name: "t1".into() },
+            ))
             .await;
         assert!(
-            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)),
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)
+            ),
             "expected TopicDeleted, got {resp:?}"
         );
     }
@@ -549,7 +584,9 @@ mod tests {
             }
         });
         let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
-            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics))
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::ListHostedTopics,
+            ))
             .await;
         let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) = resp else {
             panic!("expected TopicList, got {resp:?}");
@@ -563,8 +600,18 @@ mod tests {
     async fn describe_cluster_maps_node_states() {
         let node_addr = NodeAddress::test(addr(18001), addr(8081));
         let nodes = vec![
-            SwimNode { node_id: node_id("n1"), addr: node_addr, state: SwimNodeState::Alive, incarnation: 0 },
-            SwimNode { node_id: node_id("n2"), addr: node_addr, state: SwimNodeState::Dead,  incarnation: 1 },
+            SwimNode {
+                node_id: node_id("n1"),
+                addr: node_addr,
+                state: SwimNodeState::Alive,
+                incarnation: 0,
+            },
+            SwimNode {
+                node_id: node_id("n2"),
+                addr: node_addr,
+                state: SwimNodeState::Dead,
+                incarnation: 1,
+            },
         ];
         let swim = {
             let nodes = nodes.clone();
@@ -590,7 +637,11 @@ mod tests {
     async fn get_shard_info_present() {
         let node_addr = NodeAddress::test(addr(18001), addr(8081));
         let group = test_shard_group();
-        let leader = ShardLeaderEntry { leader_node_id: node_id("n1"), leader_addr: node_addr, term: 3 };
+        let leader = ShardLeaderEntry {
+            leader_node_id: node_id("n1"),
+            leader_addr: node_addr,
+            term: 3,
+        };
         let swim = {
             let group = group.clone();
             let leader = leader.clone();
@@ -601,7 +652,9 @@ mod tests {
             })
         };
         let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo { key: b"any".to_vec() }))
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
+                key: b"any".to_vec(),
+            }))
             .await;
         let ClientResponse::Admin(AdminResponse::ShardInfo { detail: Some(d) }) = resp else {
             panic!("expected ShardInfo with detail, got {resp:?}");
@@ -620,10 +673,15 @@ mod tests {
             }
         });
         let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo { key: b"x".to_vec() }))
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
+                key: b"x".to_vec(),
+            }))
             .await;
         assert!(
-            matches!(resp, ClientResponse::Admin(AdminResponse::ShardInfo { detail: None })),
+            matches!(
+                resp,
+                ClientResponse::Admin(AdminResponse::ShardInfo { detail: None })
+            ),
             "expected ShardInfo{{None}}, got {resp:?}"
         );
     }
@@ -636,7 +694,9 @@ mod tests {
             }
         });
         let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader { shard_group_id: 42 }))
+            .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
+                shard_group_id: 42,
+            }))
             .await;
         let ClientResponse::Admin(AdminResponse::ShardLeader { leader }) = resp else {
             panic!("expected ShardLeader, got {resp:?}");
@@ -648,11 +708,17 @@ mod tests {
     async fn list_topic_stats() {
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::GetTopicStats { reply } = cmd {
-                let _ = reply.send(vec![MetadataTopicStats { name: "t1".into(), range_count: 2, total_bytes: 1024 }]);
+                let _ = reply.send(vec![MetadataTopicStats {
+                    name: "t1".into(),
+                    range_count: 2,
+                    total_bytes: 1024,
+                }]);
             }
         });
         let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
-            .dispatch(ClientRequest::Admin(AdminRequest::ListHostedTopicsWithStats))
+            .dispatch(ClientRequest::Admin(
+                AdminRequest::ListHostedTopicsWithStats,
+            ))
             .await;
         let ClientResponse::Admin(AdminResponse::TopicStats { topics }) = resp else {
             panic!("expected TopicStats, got {resp:?}");

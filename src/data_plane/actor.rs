@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::Sender;
-use tokio::sync::mpsc as tokio_mpsc;
 
 use super::checkpoint::CheckpointJob;
 use super::state::DataPlane;
 use super::timer::{BatchFlushTimer, ReplicationTimer};
 use super::wal::WalWriter;
-use crate::clusters::NodeId;
+use crate::channels::BatchSender;
+use crate::control_plane::NodeId;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::SchedulerSender;
@@ -22,7 +22,7 @@ impl DataPlaneActor {
         checkpoint_tx: Sender<CheckpointJob>,
         batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
         repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
-        data_transport_tx: tokio_mpsc::Sender<DataTransportCommand>,
+        data_transport_tx: BatchSender<DataTransportCommand>,
     ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
