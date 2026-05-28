@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
+use crate::control_plane::SwimNodeState;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
@@ -30,9 +31,9 @@ pub struct MultiRaftActor {
 }
 
 impl MultiRaftActor {
-    pub fn channel(buffer: usize) -> (RaftSender, mpsc::Receiver<MultiRaftActorCommand>) {
+    pub fn channel(buffer: usize) -> (MutlRaftSender, mpsc::Receiver<MultiRaftActorCommand>) {
         let (tx, rx) = mpsc::channel(buffer);
-        (RaftSender(tx), rx)
+        (MutlRaftSender(tx), rx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -64,7 +65,7 @@ impl MultiRaftActor {
                 break;
             }
             for cmd in buf.drain(..) {
-                let cmd = enrich_command(cmd, &actor.swim_tx).await;
+                let cmd = actor.enrich_command(cmd).await;
                 actor.store.process(cmd);
             }
             actor.flush().await;
@@ -117,28 +118,27 @@ impl MultiRaftActor {
             }
         }
     }
-}
-
-async fn enrich_command(cmd: MultiRaftActorCommand, swim_tx: &SwimSender) -> MultiRaftActorCommand {
-    match cmd {
-        MultiRaftActorCommand::Coordinator(CoordinatorCommand::SealRequest(mut req)) => {
-            if let Ok(members) = swim_tx.get_members().await {
-                req.live_nodes = members
-                    .into_iter()
-                    .filter(|m| m.state == crate::control_plane::SwimNodeState::Alive)
-                    .map(|m| m.node_id)
-                    .collect();
+    async fn enrich_command(&self, cmd: MultiRaftActorCommand) -> MultiRaftActorCommand {
+        match cmd {
+            MultiRaftActorCommand::Coordinator(mut req) => {
+                if let Ok(members) = self.swim_tx.get_members().await {
+                    req.live_nodes = members
+                        .into_iter()
+                        .filter(|m| m.state == SwimNodeState::Alive)
+                        .map(|m| m.node_id)
+                        .collect();
+                }
+                MultiRaftActorCommand::Coordinator(req)
             }
-            MultiRaftActorCommand::Coordinator(CoordinatorCommand::SealRequest(req))
+            other => other,
         }
-        other => other,
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct RaftSender(mpsc::Sender<MultiRaftActorCommand>);
+pub struct MutlRaftSender(mpsc::Sender<MultiRaftActorCommand>);
 
-impl RaftSender {
+impl MutlRaftSender {
     pub(crate) async fn propose(
         &self,
         shard_group_id: ShardGroupId,
@@ -202,10 +202,17 @@ impl RaftSender {
     ) -> Result<(), mpsc::error::SendError<MultiRaftActorCommand>> {
         self.0.send(cmd.into()).await
     }
+
+    pub(crate) fn try_send(
+        &self,
+        cmd: impl Into<MultiRaftActorCommand>,
+    ) -> Result<(), mpsc::error::TrySendError<MultiRaftActorCommand>> {
+        self.0.try_send(cmd.into())
+    }
 }
 
-impl From<RaftSender> for mpsc::Sender<MultiRaftActorCommand> {
-    fn from(value: RaftSender) -> Self {
+impl From<MutlRaftSender> for mpsc::Sender<MultiRaftActorCommand> {
+    fn from(value: MutlRaftSender) -> Self {
         value.0
     }
 }

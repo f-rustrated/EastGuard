@@ -178,6 +178,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_existing(data_dir: PathBuf, next_lsn: u64) -> io::Result<Self> {
         let wal_dir = data_dir.join("wal");
         fs::create_dir_all(&wal_dir)?;
@@ -235,6 +236,7 @@ impl WalWriter {
         self.files.back_mut().expect("invariant: files non-empty")
     }
 
+    #[allow(dead_code)]
     fn needs_rotation(&self) -> bool {
         if let Some(entry) = self.files.back() {
             entry.size >= self.max_file_size
@@ -348,58 +350,6 @@ impl WalStorage for WalWriter {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-
-    pub struct MockWalStorage {
-        pub writes: Vec<(Vec<u8>, u64)>,
-        pub fsyncs: u32,
-        pub rotations: u32,
-        pub deletes: Vec<u64>,
-        next_lsn: u64,
-        batch_buf: Vec<u8>,
-    }
-
-    impl MockWalStorage {
-        pub(crate) fn new() -> Self {
-            MockWalStorage {
-                writes: Vec::new(),
-                fsyncs: 0,
-                rotations: 0,
-                deletes: Vec::new(),
-                next_lsn: 1,
-                batch_buf: Vec::new(),
-            }
-        }
-    }
-
-    impl WalStorage for MockWalStorage {
-        fn buf(&mut self) -> &mut Vec<u8> {
-            &mut self.batch_buf
-        }
-
-        fn next_lsn(&self) -> u64 {
-            self.next_lsn
-        }
-
-        fn flush_batch(&mut self) -> io::Result<u64> {
-            let lsn = self.next_lsn;
-            self.writes.push((self.batch_buf.clone(), lsn));
-            self.batch_buf.clear();
-            self.fsyncs += 1;
-            self.next_lsn += 1;
-            Ok(lsn)
-        }
-
-        fn maybe_rotate(&mut self) -> io::Result<()> {
-            self.rotations += 1;
-            Ok(())
-        }
-
-        fn delete_below(&mut self, watermark_lsn: u64) {
-            self.deletes.push(watermark_lsn);
-        }
-
-        fn assert_invariants(&self) {}
-    }
 
     fn wal_write(wal: &mut WalWriter, data: &[u8]) -> io::Result<u64> {
         wal.buf().extend_from_slice(data);

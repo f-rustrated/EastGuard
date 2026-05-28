@@ -1,4 +1,5 @@
 use crate::impl_from_variant;
+use crate::impl_from_variant_via;
 use bincode::{Decode, Encode};
 use tokio::sync::oneshot;
 
@@ -96,6 +97,7 @@ impl_from_variant!(
 );
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ProduceAck {
     Ok,
     Err(String),
@@ -112,4 +114,22 @@ impl_from_variant!(
     CheckpointComplete,
     Timeout(DataPlaneTimeoutCallback),
     InterNode(DataPlaneInterNodeCommand),
+);
+
+use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};
+
+impl_from_variant_via!(
+    DataPlaneCommand,
+    DataPlaneTimeoutCallback,
+    BatchFlushCallback
+);
+impl_from_variant_via!(
+    DataPlaneCommand,
+    DataPlaneTimeoutCallback,
+    ReplicationCallback
+);
+impl_from_variant_via!(
+    DataPlaneCommand,
+    DataPlaneTimeoutCallback,
+    SegmentAgeCallback
 );

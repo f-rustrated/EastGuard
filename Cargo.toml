@@ -16,9 +16,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 thiserror = "2.0.18"
 rocksdb = "0.24.0"
-crossbeam-channel = "0.5"
+
 crc32fast = "1.4"
 arc-swap = "1"
+crossbeam-channel = "0.5.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::ProduceAck;
-use crate::data_plane::messages::event::PendingReplicationBatch;
+use crate::data_plane::messages::command::{ProduceAck, ReplicaAppend};
+use crate::data_plane::states::segment::cache::CachedEntry;
 
 #[derive(Default)]
 pub(crate) struct ReplicationState {
@@ -27,6 +28,26 @@ pub(crate) struct AckCommitted {
     pub reset_timer_seq: Option<u64>,
 }
 
+pub(crate) struct PendingReplicationBatch {
+    pub segment_key: SegmentKey,
+    pub entry: Arc<CachedEntry>,
+    pub replica_set: Vec<NodeId>,
+    pub followers: Vec<NodeId>,
+}
+
+impl PendingReplicationBatch {
+    pub(crate) fn into_replica_append(self) -> (Vec<NodeId>, ReplicaAppend) {
+        let targets = self.followers;
+        let message = ReplicaAppend {
+            segment_key: self.segment_key,
+            replica_set: self.replica_set,
+            data: self.entry.data.clone(),
+            record_count: self.entry.record_count,
+            entry_id: self.entry.entry_id,
+        };
+        (targets, message)
+    }
+}
 impl ReplicationState {
     pub(crate) fn enqueue_reply(
         &mut self,

@@ -1,54 +1,66 @@
 use super::SegmentKey;
 use super::messages::command::DataPlaneInterNodeCommand;
 use super::messages::command::*;
-use super::messages::event;
+use super::messages::pending::DataPlaneOutputs;
+use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
-use crate::channels::BatchSender;
+use crate::config::DataNodeConfig;
 use crate::control_plane::NodeId;
-use crate::data_plane::checkpoint::CheckpointJob;
-use crate::data_plane::messages::event::DataPlaneEvent;
+use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
+use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
-use crate::schedulers::ticker_message::{SchedulerSender, TimerCommand};
-#[cfg(test)]
-use bytes::Bytes;
-use crossbeam_channel::Sender;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use crate::data_plane::transport::command::DataTransportSendToCoordinator;
+use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
-const BATCH_MAX_BYTES: usize = 10 * 1024 * 1024; // 10MB
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+struct PendingSealRequest {
+    sent_at: std::time::Instant,
+    failed_nodes: Vec<NodeId>,
+}
 
 pub struct DataPlane<W: WalStorage> {
     node_id: NodeId,
+    config: DataNodeConfig,
     wal: W,
     segments: HashMap<SegmentKey, SegmentTracker>,
     dirty_segments: Vec<SegmentKey>,
-    pending_events: std::collections::VecDeque<DataPlaneEvent>,
     buffer_byte_count: usize,
-
     needs_flush: bool,
     data_dir: PathBuf,
     replication: ReplicationState,
+    pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+    out: DataPlaneOutputs,
 }
 
 impl<W: WalStorage> DataPlane<W> {
-    pub(crate) fn new(node_id: NodeId, wal: W, data_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        node_id: NodeId,
+        config: DataNodeConfig,
+        wal: W,
+        data_dir: PathBuf,
+        out: DataPlaneOutputs,
+    ) -> Self {
         DataPlane {
             node_id,
+            config,
             wal,
             segments: HashMap::new(),
             dirty_segments: Vec::new(),
-            pending_events: std::collections::VecDeque::new(),
             buffer_byte_count: 0,
             needs_flush: false,
             data_dir,
             replication: ReplicationState::default(),
+            pending_seal_requests: HashMap::new(),
+            out,
         }
     }
 
@@ -71,17 +83,15 @@ impl<W: WalStorage> DataPlane<W> {
         self.assert_invariants();
     }
 
-    pub(crate) fn flush_and_dispatch(
-        &mut self,
-        checkpoint_tx: &Sender<CheckpointJob>,
-        batch_scheduler: &SchedulerSender<BatchFlushTimer>,
-        repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &BatchSender<DataTransportCommand>,
-    ) {
+    pub(crate) fn flush_and_dispatch(&mut self) {
         if self.should_flush() {
             self.flush_batch();
         }
-        self.dispatch_events(checkpoint_tx, batch_scheduler, repl_scheduler, transport_tx);
+        self.enqueue_timed_out_seal_retries();
+        self.out.flush();
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
     }
 
     fn handle_produce(&mut self, cmd: Produce) {
@@ -105,10 +115,11 @@ impl<W: WalStorage> DataPlane<W> {
         tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count);
         self.dirty_segments.push(cmd.segment_key);
 
-        self.raise_event(TimerCommand::SetSchedule {
-            seq: self.wal.next_lsn(),
-            timer: BatchFlushTimer::deadline(),
-        });
+        self.out
+            .store_batch_produce_timer(TimerCommand::SetSchedule {
+                seq: self.wal.next_lsn(),
+                timer: BatchFlushTimer::deadline(),
+            });
     }
 
     fn handle_checkpoint_complete(&mut self, complete: CheckpointComplete) {
@@ -128,20 +139,10 @@ impl<W: WalStorage> DataPlane<W> {
                 self.flush_batch();
             }
             DataPlaneTimeoutCallback::ReplicationTimeout { seq, segment_key } => {
-                if !self.replication.is_active_timer(&segment_key, seq) {
-                    return;
-                }
-
-                let committed_entry_id = self
-                    .segments
-                    .get(&segment_key)
-                    .map(|t| t.committed_entry_id())
-                    .unwrap_or(0);
-
-                self.raise_event(event::ReplicationTimedOut {
-                    segment_key,
-                    committed_entry_id,
-                });
+                self.handle_replication_timeout(segment_key, seq);
+            }
+            DataPlaneTimeoutCallback::SegmentAgeCheck => {
+                self.enqueue_seal_for_aged_segments(self.config.max_segment_age);
             }
         }
     }
@@ -151,19 +152,38 @@ impl<W: WalStorage> DataPlane<W> {
         match cmd {
             C::SegmentAssignment(cmd) => self.handle_segment_assignment(cmd),
             C::ReplicaAppend(cmd) => self.process_replica_append(cmd),
-            C::ReplicaAck(cmd) => {
-                self.raise_event(event::ReplicaAckReceived {
-                    segment_key: cmd.segment_key,
-                    entry_id: cmd.entry_id,
-                    from: cmd.from,
-                });
-            }
+            C::ReplicaAck(cmd) => self.handle_replica_ack(cmd),
             C::CommitAdvance(cmd) => self.handle_commit_advance(cmd),
-            C::SealRequest(_) => {
-                tracing::info!("SealRequest received (coordinator routing in D3)");
-            }
             C::SealResponse(cmd) => self.handle_seal_response(cmd),
             C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd.segment_key),
+
+            // Pass-through to MultiRaftActor — SealRequest is a control plane
+            // message that shares the data transport wire format.
+            C::SealRequest(cmd) => {
+                self.out
+                    .store_coordinator_cmd(MultiRaftActorCommand::Coordinator(
+                        CoordinatorSealRequest {
+                            request: cmd,
+                            live_nodes: vec![],
+                        },
+                    ));
+            }
+        }
+    }
+
+    fn handle_replica_ack(&mut self, cmd: ReplicaAck) {
+        let Some(committed) = self.replication.process_ack(&cmd.segment_key, &cmd.from) else {
+            return;
+        };
+
+        self.commit_segment(cmd.segment_key, committed.entry_id);
+
+        self.out.produce_replies.extend(committed.replies);
+
+        if let Some(seq) = committed.reset_timer_seq {
+            self.out
+                .repl_schedules
+                .push((seq, ReplicationTimer::timeout(cmd.segment_key)));
         }
     }
 
@@ -176,6 +196,7 @@ impl<W: WalStorage> DataPlane<W> {
             cmd.segment_key.file_path(&self.data_dir),
             SegmentRole::Leader,
             cmd.replica_set,
+            cmd.shard_group_id,
             cmd.start_entry_id,
         );
 
@@ -183,7 +204,6 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn process_replica_append(&mut self, cmd: ReplicaAppend) {
-        // Self-authorizing segment
         if !self.segments.contains_key(&cmd.segment_key) {
             if !cmd.replica_set.contains(&self.node_id) {
                 tracing::warn!(
@@ -203,6 +223,7 @@ impl<W: WalStorage> DataPlane<W> {
                     cmd.segment_key.file_path(&self.data_dir),
                     SegmentRole::Follower,
                     cmd.replica_set,
+                    ShardGroupId(0),
                     cmd.entry_id,
                 ),
             );
@@ -234,16 +255,19 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_seal_response(&mut self, cmd: SealResponse) {
+        self.pending_seal_requests.remove(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
         };
 
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
 
+        let shard_group_id = old_tracker.shard_group_id();
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
             new_segment_key.file_path(&self.data_dir),
             SegmentRole::Leader,
             cmd.new_replica_set,
+            shard_group_id,
             old_tracker.committed_entry_id() + 1,
         );
 
@@ -263,12 +287,13 @@ impl<W: WalStorage> DataPlane<W> {
             .segment_handoff(cmd.old_segment_key, new_segment_key);
 
         if !old_tracker.followers().is_empty() {
-            self.raise_event(event::InterNodeCommandQueued::new(
-                old_tracker.followers().to_vec(),
-                SegmentSealed {
-                    segment_key: cmd.old_segment_key,
-                },
-            ));
+            self.out
+                .store_transport_cmd(DataTransportCommand::send_to_targets(
+                    old_tracker.followers().to_vec(),
+                    SegmentSealed {
+                        segment_key: cmd.old_segment_key,
+                    },
+                ));
         }
 
         self.segments.insert(new_segment_key, new_tracker);
@@ -278,7 +303,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     fn handle_segment_sealed(&mut self, segment_key: SegmentKey) {
         if let Some(tracker) = self.segments.remove(&segment_key) {
-            self.raise_event(tracker.checkpoint(segment_key));
+            self.out.store_checkpoint(tracker.checkpoint(segment_key));
         }
     }
 
@@ -291,18 +316,94 @@ impl<W: WalStorage> DataPlane<W> {
 
         let followers = tracker.followers().to_vec();
         if !followers.is_empty() {
-            self.raise_event(event::InterNodeCommandQueued::new(
-                followers,
-                CommitAdvance {
-                    segment_key,
-                    committed_entry_id: entry_id,
-                },
-            ));
+            self.out
+                .transport_cmds
+                .push(DataTransportCommand::send_to_targets(
+                    followers,
+                    CommitAdvance {
+                        segment_key,
+                        committed_entry_id: entry_id,
+                    },
+                ));
         }
     }
 
+    pub(crate) fn enqueue_seal_for_aged_segments(&mut self, max_age: std::time::Duration) {
+        let aged: Vec<SegmentKey> = self
+            .segments
+            .iter()
+            .filter(|(_, t)| t.role() == SegmentRole::Leader && t.age_limit_reached(max_age))
+            .map(|(&k, _)| k)
+            .collect();
+
+        for key in aged {
+            self.enqueue_seal_request(key);
+        }
+    }
+
+    fn handle_replication_timeout(&mut self, segment_key: SegmentKey, seq: u64) {
+        if !self.replication.is_active_timer(&segment_key, seq) {
+            return;
+        }
+        let Some(failed_nodes) = self.replication.in_flight_pending_acks(&segment_key) else {
+            return;
+        };
+        let Some(tracker) = self.segments.get(&segment_key) else {
+            return;
+        };
+
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id: tracker.shard_group_id(),
+                message: SealRequest {
+                    from: self.node_id.clone(),
+                    segment_key,
+                    failed_nodes: failed_nodes.clone(),
+                    end_entry_id: tracker.committed_entry_id(),
+                }
+                .into(),
+            });
+        self.pending_seal_requests.insert(
+            segment_key,
+            PendingSealRequest {
+                sent_at: std::time::Instant::now(),
+                failed_nodes,
+            },
+        );
+    }
+
+    fn enqueue_seal_request(&mut self, segment_key: SegmentKey) {
+        if self.pending_seal_requests.contains_key(&segment_key) {
+            return;
+        }
+        let Some(tracker) = self.segments.get(&segment_key) else {
+            return;
+        };
+        if tracker.role() != SegmentRole::Leader {
+            return;
+        }
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id: tracker.shard_group_id(),
+                message: SealRequest {
+                    from: self.node_id.clone(),
+                    segment_key,
+                    failed_nodes: vec![],
+                    end_entry_id: tracker.committed_entry_id(),
+                }
+                .into(),
+            });
+        self.pending_seal_requests.insert(
+            segment_key,
+            PendingSealRequest {
+                sent_at: std::time::Instant::now(),
+                failed_nodes: vec![],
+            },
+        );
+    }
+
     fn should_flush(&self) -> bool {
-        self.needs_flush || self.buffer_byte_count >= BATCH_MAX_BYTES
+        self.needs_flush || self.buffer_byte_count >= self.config.batch_max_bytes
     }
 
     fn flush_batch(&mut self) {
@@ -335,7 +436,7 @@ impl<W: WalStorage> DataPlane<W> {
             }
         };
 
-        let mut segment_batches: Vec<event::PendingReplicationBatch> = Vec::new();
+        let mut segment_batches: Vec<PendingReplicationBatch> = Vec::new();
 
         for key in dirty {
             let Some(tracker) = self.segments.get_mut(&key) else {
@@ -345,53 +446,51 @@ impl<W: WalStorage> DataPlane<W> {
                 continue;
             }
 
-            let entries = tracker.publish_staged(lsn);
-
-            for entry in entries {
-                let entry_id = entry.entry_id;
+            for entry in tracker.publish_staged(lsn) {
                 match tracker.role() {
-                    SegmentRole::Leader if tracker.followers().is_empty() => {
-                        tracker.commit_entry(entry_id);
-                    }
                     SegmentRole::Leader => {
-                        segment_batches.push(event::PendingReplicationBatch {
-                            segment_key: key,
-                            entry,
-                            replica_set: tracker.replica_set(),
-                            followers: tracker.followers().to_vec(),
-                        });
+                        if tracker.followers().is_empty() {
+                            tracker.commit_entry(entry.entry_id);
+                        } else {
+                            segment_batches.push(PendingReplicationBatch {
+                                segment_key: key,
+                                entry,
+                                replica_set: tracker.replica_set(),
+                                followers: tracker.followers().to_vec(),
+                            });
+                        }
                     }
                     SegmentRole::Follower => {
-                        self.pending_events.push_back(
-                            event::InterNodeCommandQueued::new(
+                        self.out
+                            .store_transport_cmd(DataTransportCommand::send_to_targets(
                                 vec![tracker.leader_node()],
                                 ReplicaAck {
                                     segment_key: key,
-                                    entry_id,
+                                    entry_id: entry.entry_id,
                                     from: self.node_id.clone(),
                                 },
-                            )
-                            .into(),
-                        );
+                            ));
                     }
                 }
             }
 
-            if tracker.size_limit_reached() {
-                self.pending_events
-                    .push_back(tracker.checkpoint(key).into());
+            if tracker.size_limit_reached(self.config.segment_size_limit) {
+                self.out.checkpoint_jobs.push(tracker.checkpoint(key));
+                self.enqueue_seal_request(key);
             }
         }
 
-        if !segment_batches.is_empty() {
-            self.raise_event(event::BatchPublished {
-                lsn,
-                segment_batches,
-            });
+        for pending_repl in segment_batches {
+            if let Some(seq) = self.replication.begin_replication(&pending_repl) {
+                self.out
+                    .repl_schedules
+                    .push((seq, ReplicationTimer::timeout(pending_repl.segment_key)));
+            }
+            let (targets, message) = pending_repl.into_replica_append();
+            self.out
+                .store_transport_cmd(DataTransportCommand::send_to_targets(targets, message));
         }
 
-        // No-follower fast path: replies for segments without followers were left
-        // in pending_replies (not moved to in_flight). Drain them now with Ok.
         for reply in self.replication.drain_all_pending_replies() {
             let _ = reply.send(ProduceAck::Ok);
         }
@@ -421,97 +520,38 @@ impl<W: WalStorage> DataPlane<W> {
         if let Some((key, _)) = candidates.first()
             && let Some(tracker) = self.segments.get(key)
         {
-            self.raise_event(tracker.checkpoint(*key));
+            self.out.checkpoint_jobs.push(tracker.checkpoint(*key));
         }
     }
 
-    fn dispatch_events(
-        &mut self,
-        checkpoint_tx: &Sender<CheckpointJob>,
-        batch_scheduler: &SchedulerSender<BatchFlushTimer>,
-        repl_scheduler: &SchedulerSender<ReplicationTimer>,
-        transport_tx: &BatchSender<DataTransportCommand>,
-    ) {
-        use DataPlaneEvent as E;
-        let mut transport_cmds = Vec::new();
-        while let Some(event) = self.pending_events.pop_front() {
-            match event {
-                E::CheckpointRequired(job) => {
-                    let _ = checkpoint_tx.send(job);
-                }
-                E::BatchPublished(evt) => {
-                    for pending_repl in evt.segment_batches {
-                        if let Some(seq) = self.replication.begin_replication(&pending_repl) {
-                            repl_scheduler
-                                .schedule(seq, ReplicationTimer::timeout(pending_repl.segment_key));
-                        }
-                        let (targets, message) = pending_repl.into_replica_append();
-                        transport_cmds
-                            .push(DataTransportCommand::send_to_targets(targets, message));
-                    }
-                }
-                E::BatchFlushTimerScheduled(cmd) => {
-                    batch_scheduler.send(cmd);
-                }
-                E::InterNodeCommandQueued(evt) => {
-                    transport_cmds.push(DataTransportCommand::send_to_targets(
-                        evt.targets,
-                        evt.message,
-                    ));
-                }
-                E::ReplicaAckReceived(evt) => {
-                    let Some(committed) = self.replication.process_ack(&evt.segment_key, &evt.from)
-                    else {
-                        continue;
-                    };
+    fn enqueue_timed_out_seal_retries(&mut self) {
+        let now = std::time::Instant::now();
+        let timeout = self.config.seal_request_timeout;
 
-                    self.commit_segment(evt.segment_key, committed.entry_id);
-
-                    for reply in committed.replies {
-                        let _ = reply.send(ProduceAck::Ok);
-                    }
-
-                    if let Some(seq) = committed.reset_timer_seq {
-                        repl_scheduler.schedule(seq, ReplicationTimer::timeout(evt.segment_key));
-                    }
-                }
-                E::ReplicationTimedOut(evt) => {
-                    let Some(nodes) = self.replication.in_flight_pending_acks(&evt.segment_key)
-                    else {
-                        continue;
-                    };
-
-                    let targets = vec![];
-                    transport_cmds.push(DataTransportCommand::send_to_targets(
-                        targets,
-                        SealRequest {
-                            from: self.node_id.clone(),
-                            segment_key: evt.segment_key,
-                            failed_nodes: nodes,
-                            end_entry_id: evt.committed_entry_id,
-                        },
-                    ));
-                }
+        for (key, pending) in &mut self.pending_seal_requests {
+            if now.duration_since(pending.sent_at) < timeout {
+                continue;
             }
+            let Some(tracker) = self.segments.get(key) else {
+                continue;
+            };
+            if tracker.role() != SegmentRole::Leader {
+                continue;
+            }
+
+            self.out
+                .store_transport_cmd(DataTransportSendToCoordinator {
+                    shard_group_id: tracker.shard_group_id(),
+                    message: SealRequest {
+                        from: self.node_id.clone(),
+                        segment_key: *key,
+                        failed_nodes: pending.failed_nodes.clone(),
+                        end_entry_id: tracker.committed_entry_id(),
+                    }
+                    .into(),
+                });
+            pending.sent_at = now;
         }
-        transport_tx.blocking_send_batch(transport_cmds);
-
-        #[cfg(any(test, debug_assertions))]
-        self.assert_invariants();
-    }
-
-    fn raise_event(&mut self, event: impl Into<DataPlaneEvent>) {
-        self.pending_events.push_back(event.into());
-    }
-
-    #[cfg(test)]
-    fn take_events(&mut self) -> Vec<DataPlaneEvent> {
-        self.pending_events.drain(..).collect()
-    }
-
-    #[cfg(test)]
-    fn has_buffered_data(&self) -> bool {
-        self.buffer_byte_count > 0
     }
 }
 
@@ -542,10 +582,18 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
+
+    use bytes::Bytes;
+
+    impl<T: WalStorage> DataPlane<T> {
+        fn has_buffered_data(&self) -> bool {
+            self.buffer_byte_count > 0
+        }
+    }
 
     fn test_key() -> SegmentKey {
         SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
@@ -555,9 +603,28 @@ mod tests {
         NodeId::new("test-node")
     }
 
+    const TEST_BATCH_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+    fn test_config() -> DataNodeConfig {
+        DataNodeConfig {
+            max_segment_age: std::time::Duration::from_secs(3600),
+            age_check_interval: std::time::Duration::from_secs(60),
+            segment_size_limit: 1024 * 1024 * 1024,
+            batch_max_bytes: TEST_BATCH_MAX_BYTES,
+            seal_request_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
     fn make_data_plane(dir: &tempfile::TempDir) -> DataPlane<WalWriter> {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        DataPlane::new(test_node_id(), wal, dir.path().to_path_buf())
+        let out = DataPlaneOutputs::test();
+        DataPlane::new(
+            test_node_id(),
+            test_config(),
+            wal,
+            dir.path().to_path_buf(),
+            out,
+        )
     }
 
     fn process_and_flush(dp: &mut DataPlane<WalWriter>, cmd: DataPlaneCommand) {
@@ -627,7 +694,6 @@ mod tests {
 
         let (cmd, rx) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -674,7 +740,6 @@ mod tests {
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         assert!(dp.has_buffered_data());
 
@@ -699,14 +764,12 @@ mod tests {
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
 
-        let events = dp.take_events();
-        let has_set_schedule = events.iter().any(|e| {
-            matches!(
-                e,
-                DataPlaneEvent::BatchFlushTimerScheduled(TimerCommand::SetSchedule { .. })
-            )
-        });
-        assert!(has_set_schedule);
+        assert!(
+            dp.out
+                .batch_timer_cmds
+                .iter()
+                .any(|c| matches!(c, TimerCommand::SetSchedule { .. }))
+        );
     }
 
     #[test]
@@ -718,10 +781,8 @@ mod tests {
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         dp.flush_batch();
-        dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -738,7 +799,6 @@ mod tests {
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -755,12 +815,12 @@ mod tests {
 
         dp.handle_command(Produce {
             segment_key: test_key(),
-            data: Bytes::from(vec![0u8; BATCH_MAX_BYTES]).into(),
+            data: Bytes::from(vec![0u8; TEST_BATCH_MAX_BYTES]).into(),
             record_count: 1,
             reply: oneshot::channel().0,
         });
 
-        assert!(dp.buffer_byte_count >= BATCH_MAX_BYTES);
+        assert!(dp.buffer_byte_count >= TEST_BATCH_MAX_BYTES);
         dp.flush_batch();
         assert!(!dp.has_buffered_data());
     }
@@ -773,13 +833,12 @@ mod tests {
 
         dp.handle_command(Produce {
             segment_key: test_key(),
-            data: Bytes::from(vec![0u8; BATCH_MAX_BYTES]).into(),
+            data: Bytes::from(vec![0u8; TEST_BATCH_MAX_BYTES]).into(),
             record_count: 1,
             reply: oneshot::channel().0,
         });
-        assert!(dp.buffer_byte_count >= BATCH_MAX_BYTES);
+        assert!(dp.buffer_byte_count >= TEST_BATCH_MAX_BYTES);
         dp.flush_batch();
-        dp.take_events();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -835,11 +894,8 @@ mod tests {
         let (cmd2, _rx2) = produce(test_key());
         let (cmd3, _rx3) = produce(test_key());
         dp.handle_command(cmd1);
-        dp.take_events();
         dp.handle_command(cmd2);
-        dp.take_events();
         dp.handle_command(cmd3);
-        dp.take_events();
 
         assert!(dp.has_buffered_data());
         assert!(!dp.should_flush());
@@ -870,7 +926,6 @@ mod tests {
 
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         process_and_flush(
             &mut dp,
@@ -892,7 +947,6 @@ mod tests {
 
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         process_and_flush(
             &mut dp,
@@ -905,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_emits_batch_published_for_replicated_segments() {
+    fn flush_emits_transport_cmds_for_replicated_segments() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
@@ -917,19 +971,13 @@ mod tests {
 
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
 
         process_and_flush(
             &mut dp,
             DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
         );
 
-        let events = dp.take_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, DataPlaneEvent::BatchPublished(..)))
-        );
+        assert!(!dp.out.transport_cmds.is_empty());
     }
 
     #[test]
@@ -942,24 +990,18 @@ mod tests {
 
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
-        dp.take_events();
         process_and_flush(
             &mut dp,
             DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
         );
-        dp.take_events();
+        dp.out.transport_cmds.clear();
 
         dp.commit_segment(test_key(), 0);
 
         let cache = dp.segments.get(&test_key()).unwrap().cache();
         assert_eq!(cache.load_read_cursor(), 1);
 
-        let events = dp.take_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, DataPlaneEvent::InterNodeCommandQueued(..)))
-        );
+        assert!(!dp.out.transport_cmds.is_empty());
     }
 
     #[test]
@@ -978,9 +1020,7 @@ mod tests {
             }
             .into(),
         ));
-        dp.take_events();
         dp.flush_batch();
-        dp.take_events();
 
         let (cmd, rx) = produce(test_key());
         dp.handle_command(cmd);
@@ -1048,9 +1088,7 @@ mod tests {
             }
             .into(),
         ));
-        dp.take_events();
         dp.flush_batch();
-        dp.take_events();
 
         dp.handle_command(DataPlaneCommand::InterNode(
             CommitAdvance {
@@ -1066,12 +1104,23 @@ mod tests {
     }
 
     #[test]
-    fn replication_timeout_emits_event() {
+    fn replication_timeout_generates_seal_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
+        let follower = NodeId::new("follower-1");
 
-        let seq = dp.replication.alloc_timer_seq();
-        dp.replication.set_timer_seq(test_key(), seq);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+        );
+
+        let seq = dp.out.repl_schedules[0].0;
+        dp.out.repl_schedules.clear();
+        dp.out.transport_cmds.clear();
 
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::ReplicationTimeout {
@@ -1080,12 +1129,58 @@ mod tests {
             },
         ));
 
-        let events = dp.take_events();
         assert!(
-            events
+            dp.out
+                .transport_cmds
                 .iter()
-                .any(|e| matches!(e, DataPlaneEvent::ReplicationTimedOut(..)))
+                .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
         );
+    }
+
+    #[test]
+    fn replication_timeout_stale_seq_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let follower = NodeId::new("follower-1");
+
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+        );
+        dp.out.transport_cmds.clear();
+
+        dp.handle_replication_timeout(test_key(), 9999);
+
+        assert!(dp.out.transport_cmds.is_empty());
+    }
+
+    #[test]
+    fn replication_timeout_stores_failed_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let follower = NodeId::new("follower-1");
+
+        dp.handle_command(assign_segment(
+            test_key(),
+            vec![test_node_id(), follower.clone()],
+        ));
+
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+        );
+
+        let seq = dp.out.repl_schedules[0].0;
+        dp.handle_replication_timeout(test_key(), seq);
+
+        let pending = dp.pending_seal_requests.get(&test_key()).unwrap();
+        assert!(pending.failed_nodes.contains(&follower));
     }
 
     #[test]
@@ -1118,14 +1213,12 @@ mod tests {
         let rs = vec![test_node_id(), follower.clone()];
 
         process_and_flush(&mut dp, assign_segment(test_key(), rs.clone()));
-        dp.take_events();
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
         dp.handle_command(DataPlaneCommand::Timeout(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
-        dp.take_events();
         dp.segments.get_mut(&test_key()).unwrap().commit_entry(0);
 
         dp.handle_command(DataPlaneCommand::InterNode(
@@ -1145,5 +1238,74 @@ mod tests {
 
         dp.flush_batch();
         assert!(!dp.needs_flush);
+    }
+
+    #[test]
+    fn enqueue_seal_request_sends_to_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+
+        dp.enqueue_seal_request(test_key());
+
+        assert!(
+            dp.out
+                .transport_cmds
+                .iter()
+                .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
+        );
+        assert!(dp.pending_seal_requests.contains_key(&test_key()));
+    }
+
+    #[test]
+    fn enqueue_seal_request_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+
+        dp.enqueue_seal_request(test_key());
+        dp.enqueue_seal_request(test_key());
+
+        assert_eq!(
+            dp.out
+                .transport_cmds
+                .iter()
+                .filter(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn enqueue_seal_request_skips_follower() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let leader = NodeId::new("leader-node");
+
+        dp.handle_command(DataPlaneCommand::InterNode(
+            ReplicaAppend {
+                segment_key: test_key(),
+                replica_set: vec![leader, test_node_id()],
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: 0,
+            }
+            .into(),
+        ));
+
+        dp.enqueue_seal_request(test_key());
+
+        assert!(dp.out.transport_cmds.is_empty());
+        assert!(!dp.pending_seal_requests.contains_key(&test_key()));
+    }
+
+    #[test]
+    fn enqueue_seal_request_skips_unknown_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        dp.enqueue_seal_request(test_key());
+
+        assert!(dp.out.transport_cmds.is_empty());
     }
 }

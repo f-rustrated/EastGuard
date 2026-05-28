@@ -8,8 +8,8 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::SegmentKey;
-use super::wal::{WalRecord, WalRecordType};
 use super::sparse_index::SparseIndex;
+use super::wal::{WalRecord, WalRecordType};
 
 const DEFAULT_POOL_SIZE: usize = 4;
 

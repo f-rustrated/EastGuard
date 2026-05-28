@@ -1,6 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::control_plane::NodeId;
+use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
@@ -8,8 +9,6 @@ use super::cache::CachedEntry;
 use super::record::{RoutingHeader, StagedEntry};
 
 use super::*;
-
-const SEGMENT_SIZE_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmentRole {
@@ -24,13 +23,20 @@ pub(crate) struct SegmentTracker {
     segment_file_path: PathBuf,
     role: SegmentRole,
     replica_set: Vec<NodeId>,
+    shard_group_id: ShardGroupId,
     committed_entry_id: u64,
     next_entry_id: u64,
     staged_entries: Vec<StagedEntry>,
+    created_at: std::time::Instant,
 }
 
 impl SegmentTracker {
-    pub(crate) fn new(path: PathBuf, role: SegmentRole, replica_set: Vec<NodeId>) -> Self {
+    pub(crate) fn new(
+        path: PathBuf,
+        role: SegmentRole,
+        replica_set: Vec<NodeId>,
+        shard_group_id: ShardGroupId,
+    ) -> Self {
         Self {
             cache: Arc::new(SegmentRingBuffer::new()),
             size_bytes: 0,
@@ -38,18 +44,22 @@ impl SegmentTracker {
             segment_file_path: path,
             role,
             replica_set,
+            shard_group_id,
             committed_entry_id: 0,
             next_entry_id: 0,
             staged_entries: Vec::new(),
+            created_at: std::time::Instant::now(),
         }
     }
+
     pub(crate) fn new_with_start_entry_id(
         path: PathBuf,
         role: SegmentRole,
         replica_set: Vec<NodeId>,
+        shard_group_id: ShardGroupId,
         start_entry_id: u64,
     ) -> Self {
-        let mut tracker = Self::new(path, role, replica_set);
+        let mut tracker = Self::new(path, role, replica_set, shard_group_id);
         tracker.next_entry_id = start_entry_id;
         tracker
     }
@@ -182,8 +192,16 @@ impl SegmentTracker {
             .push(StagedEntry::new(data, record_count, segment_key));
     }
 
-    pub(crate) fn size_limit_reached(&self) -> bool {
-        self.size_bytes >= SEGMENT_SIZE_LIMIT
+    pub(crate) fn shard_group_id(&self) -> ShardGroupId {
+        self.shard_group_id
+    }
+
+    pub(crate) fn age_limit_reached(&self, max_age: Duration) -> bool {
+        self.created_at.elapsed() >= max_age
+    }
+
+    pub(crate) fn size_limit_reached(&self, limit: u64) -> bool {
+        self.size_bytes >= limit
     }
 }
 
@@ -192,8 +210,8 @@ pub mod tests {
     #![allow(unused)]
 
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId};
     use crate::control_plane::metadata::TopicId;
+    use crate::control_plane::metadata::{RangeId, SegmentId};
     use crate::test_traits::TAssertInvariant;
     use bytes::Bytes;
     use std::sync::Arc;
@@ -265,6 +283,7 @@ pub mod tests {
             PathBuf::from("/tmp/test.seg"),
             role,
             vec![NodeId::new("leader"), NodeId::new("follower")],
+            ShardGroupId(1),
         )
     }
 
@@ -284,6 +303,7 @@ pub mod tests {
             PathBuf::from("/tmp/test.seg"),
             SegmentRole::Follower,
             vec![NodeId::new("leader"), NodeId::new("follower")],
+            ShardGroupId(1),
             5,
         );
         t.stage_entry_from_replica(test_key(), Bytes::from("data").into(), 1, 5);
@@ -352,6 +372,7 @@ pub mod tests {
             PathBuf::from("/tmp/t.seg"),
             SegmentRole::Leader,
             vec![NodeId::new("solo")],
+            ShardGroupId(1),
         );
         assert!(single.followers().is_empty());
     }
@@ -363,5 +384,17 @@ pub mod tests {
         t.advance_checkpoint(5);
         t.advance_checkpoint(20);
         assert_eq!(t.checkpoint_lsn(), 20);
+    }
+
+    #[test]
+    fn age_limit_not_reached_immediately() {
+        let t = make_tracker(SegmentRole::Leader);
+        assert!(!t.age_limit_reached(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn age_limit_reached_with_zero_duration() {
+        let t = make_tracker(SegmentRole::Leader);
+        assert!(t.age_limit_reached(Duration::ZERO));
     }
 }

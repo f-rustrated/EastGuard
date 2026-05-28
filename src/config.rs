@@ -1,4 +1,6 @@
-use std::sync::LazyLock;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use std::fs::{self, OpenOptions};
 
@@ -9,43 +11,40 @@ use crate::control_plane::membership::peer_discovery::JoinAttempt;
 use crate::control_plane::membership::swim::Swim;
 use crate::control_plane::membership::{Topology, TopologyConfig};
 use crate::control_plane::{NodeAddress, NodeId};
+use crate::data_plane::sparse_index::SparseIndex;
 use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
-    #[arg(
-        long,
-        env = "EASTGUARD_CONFIG_DIR",
-        default_value = "./eastguard/config"
-    )]
+    #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
-    #[arg(long, env = "EASTGUARD_DATA_DIR", default_value = "./eastguard/data")]
+    #[arg(long, env = "DATA_DIR", default_value = "./eastguard/data")]
     pub data_dir: String,
 
-    #[arg(long, env = "EASTGUARD_META_DIR", default_value = "./eastguard/meta")]
+    #[arg(long, env = "META_DIR", default_value = "./eastguard/meta")]
     pub meta_dir: String,
 
-    #[arg(long = "node-id-prefix", env = "EASTGUARD_NODE_ID_PREFIX")]
+    #[arg(long = "node-id-prefix", env = "NODE_ID_PREFIX")]
     pub node_id_prefix: Option<String>,
 
     #[arg(
         short = 'p',
         long = "client-port",
-        env = "EASTGUARD_CLIENT_PORT",
+        env = "CLIENT_PORT",
         default_value_t = 2921
     )]
     pub client_port: u16,
 
-    #[arg(long, env = "EASTGUARD_CLUSTER_PORT", default_value_t = 2922)]
+    #[arg(long, env = "CLUSTER_PORT", default_value_t = 2922)]
     pub cluster_port: u16,
 
-    #[arg(long, env = "EASTGUARD_DATA_PORT", default_value_t = 2923)]
+    #[arg(long, env = "DATA_PORT", default_value_t = 2923)]
     pub data_port: u16,
 
-    #[arg(long, env = "EASTGUARD_HOST", default_value = "0.0.0.0")]
+    #[arg(long, env = "HOST", default_value = "0.0.0.0")]
     pub host: String,
 
     /// The IP address gossiped to cluster peers so they can reach this node.
@@ -68,27 +67,50 @@ pub struct Environment {
     /// When `advertise_host` is `None`, it falls back to `host`. This is fine in development
     /// when `host` is already a routable address, but in any multi-node environment you should
     /// set it explicitly.
-    #[arg(long, env = "EASTGUARD_ADVERTISE_HOST")]
+    #[arg(long, env = "ADVERTISE_HOST")]
     pub advertise_host: Option<String>,
 
-    #[arg(long, env = "EASTGUARD_VNODES_PER_NODE", default_value_t = 256)]
+    #[arg(long, env = "VNODES_PER_NODE", default_value_t = 256)]
     pub vnodes_per_node: u64,
 
-    #[arg(long, env = "EASTGUARD_JOIN_SEED_NODES")]
+    #[arg(long, env = "JOIN_SEED_NODES")]
     pub join_seed_nodes: Vec<String>,
 
     // TODO: We know that when join_initial_delay_ms < tick interval, join process will fire immediately. Let's fix this when we think we need to.
-    #[arg(long, env = "EASTGUARD_JOIN_INITIAL_DELAY_MS", default_value_t = 1000)]
+    #[arg(long, env = "JOIN_INITIAL_DELAY_MS", default_value_t = 1000)]
     pub join_initial_delay_ms: u64,
 
-    #[arg(long, env = "EASTGUARD_JOIN_INTERVAL_MS", default_value_t = 1000)]
+    #[arg(long, env = "JOIN_INTERVAL_MS", default_value_t = 1000)]
     pub join_interval_ms: u64,
 
-    #[arg(long, env = "EASTGUARD_JOIN_MULTIPLIER", default_value_t = 2)]
+    #[arg(long, env = "JOIN_MULTIPLIER", default_value_t = 2)]
     pub join_multiplier: u32,
 
-    #[arg(long, env = "EASTGUARD_JOIN_MAX_ATTEMPTS", default_value_t = 5)]
+    #[arg(long, env = "JOIN_MAX_ATTEMPTS", default_value_t = 5)]
     pub join_max_attempts: u32,
+
+    #[arg(long, env = "MAX_SEGMENT_AGE_SECS", default_value_t = 3600)]
+    pub max_segment_age_secs: u64,
+
+    #[arg(long, env = "SEGMENT_AGE_CHECK_INTERVAL_SECS", default_value_t = 60)]
+    pub segment_age_check_interval_secs: u64,
+
+    #[arg(
+        long,
+        env = "SEGMENT_SIZE_LIMIT_BYTES",
+        default_value_t = 1024 * 1024 * 1024
+    )]
+    pub segment_size_limit_bytes: u64,
+
+    #[arg(
+        long,
+        env = "BATCH_MAX_BYTES",
+        default_value_t = 10 * 1024 * 1024
+    )]
+    pub batch_max_bytes: usize,
+
+    #[arg(long, env = "SEAL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
+    pub seal_request_timeout_secs: u64,
 }
 
 impl Environment {
@@ -136,6 +158,12 @@ impl Environment {
         format!("{}:{}", self.host, self.cluster_port)
             .parse()
             .expect("Invalid peer bind address")
+    }
+
+    pub(crate) fn data_bind_addr(&self) -> std::net::SocketAddr {
+        format!("{}:{}", self.host, self.data_port)
+            .parse()
+            .expect("Invalid data bind address")
     }
 
     /// The address gossiped to cluster peers — must be routable by other nodes.
@@ -224,6 +252,49 @@ impl Environment {
         )
         .bootstrap(self.bootstrap_servers())
     }
+
+    pub(crate) fn election_jitter_seed(&self, rng_seed: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Hash::hash(&self.node_id_prefix, &mut hasher);
+        Hash::hash(&rng_seed, &mut hasher);
+        Hasher::finish(&hasher)
+    }
+
+    pub(crate) fn sparse_index_db(&self) -> Arc<dyn SparseIndex> {
+        let sparse_index_db = rocksdb::DB::open_default(self.data_dir_path().join("sparse_index"))
+            .expect("sparse index DB");
+        Arc::new(sparse_index_db)
+    }
+    pub(crate) fn data_dir_path(&self) -> PathBuf {
+        std::path::PathBuf::from(&self.data_dir)
+    }
+
+    pub(crate) fn age_check_ticks(&self) -> u64 {
+        std::time::Duration::from_secs(self.segment_age_check_interval_secs).as_millis() as u64
+            / TICK_PERIOD_100_MS
+    }
+
+    pub(crate) fn data_node_config(&self) -> DataNodeConfig {
+        DataNodeConfig {
+            max_segment_age: std::time::Duration::from_secs(self.max_segment_age_secs),
+            age_check_interval: std::time::Duration::from_secs(
+                self.segment_age_check_interval_secs,
+            ),
+            segment_size_limit: self.segment_size_limit_bytes,
+            batch_max_bytes: self.batch_max_bytes,
+            seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct DataNodeConfig {
+    pub max_segment_age: std::time::Duration,
+    pub age_check_interval: std::time::Duration,
+    pub segment_size_limit: u64,
+    pub batch_max_bytes: usize,
+    pub seal_request_timeout: std::time::Duration,
 }
 
 pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -250,6 +321,11 @@ mod tests {
             join_interval_ms: 1000,
             join_multiplier: 2,
             join_max_attempts: 5,
+            max_segment_age_secs: 3600,
+            segment_age_check_interval_secs: 60,
+            segment_size_limit_bytes: 1024 * 1024 * 1024,
+            batch_max_bytes: 10 * 1024 * 1024,
+            seal_request_timeout_secs: 5,
         }
     }
 
@@ -366,9 +442,9 @@ mod tests {
     #[serial]
     fn test_env_vars_override() {
         unsafe {
-            std::env::set_var("EASTGUARD_NODE_ID_PREFIX", "env-node-1");
-            std::env::set_var("EASTGUARD_CLIENT_PORT", "8888");
-            std::env::set_var("EASTGUARD_HOST", "0.0.0.0");
+            std::env::set_var("NODE_ID_PREFIX", "env-node-1");
+            std::env::set_var("CLIENT_PORT", "8888");
+            std::env::set_var("HOST", "0.0.0.0");
         }
 
         let env = Environment::try_parse_from(vec!["my-server"]).expect("Failed to parse env vars");
@@ -378,9 +454,9 @@ mod tests {
         assert_eq!(env.host, "0.0.0.0");
 
         unsafe {
-            std::env::remove_var("EASTGUARD_NODE_ID_PREFIX");
-            std::env::remove_var("EASTGUARD_CLIENT_PORT");
-            std::env::remove_var("EASTGUARD_HOST");
+            std::env::remove_var("NODE_ID_PREFIX");
+            std::env::remove_var("CLIENT_PORT");
+            std::env::remove_var("HOST");
         }
     }
 

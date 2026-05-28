@@ -5,7 +5,7 @@ use crate::control_plane::consensus::messages::rpc::{OutboundRaftPacket, RaftRpc
 use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
 use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::command::MetadataCommand;
-use crate::data_plane::SegmentKey;
+use crate::data_plane::messages::command::SealRequest;
 use crate::impl_from_variant;
 
 #[derive(Debug, PartialEq, Eq, Decode, Encode)]
@@ -69,14 +69,6 @@ pub enum RaftTransportCommand {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct CoordinatorSealRequest {
-    pub requester: NodeId,
-    pub segment_key: SegmentKey,
-    pub failed_nodes: Vec<NodeId>,
-    pub end_entry_id: u64,
+    pub request: SealRequest,
     pub live_nodes: Vec<NodeId>,
-}
-
-#[derive(Debug)]
-pub enum CoordinatorCommand {
-    SealRequest(CoordinatorSealRequest),
 }

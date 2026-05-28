@@ -17,15 +17,19 @@ pub struct CheckpointWorker;
 impl CheckpointWorker {
     pub(crate) fn spawn(
         sparse_index: Arc<dyn SparseIndex>,
-        mailbox: Receiver<CheckpointJob>,
+        mailbox: Receiver<Box<[CheckpointJob]>>,
         data_plane_tx: Sender<DataPlaneCommand>,
     ) {
         thread::Builder::new()
             .name("checkpoint-worker".into())
             .spawn(move || {
-                while let Ok(job) = mailbox.recv() {
-                    if let Err(e) = Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx) {
-                        tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
+                while let Ok(batch) = mailbox.recv() {
+                    for job in batch {
+                        if let Err(e) =
+                            Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
+                        {
+                            tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
+                        }
                     }
                 }
             })
@@ -82,10 +86,13 @@ impl CheckpointWorker {
         sparse_index.put_batch(index_entries)?;
         job.cache.advance_eviction_frontier(checkpoint.new_frontier);
 
-        let _ = data_plane_tx.send(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
-            segment_key: job.segment_key,
-            checkpointed_lsn: checkpoint.last_lsn(),
-        }));
+        let _ = data_plane_tx.send(
+            CheckpointComplete {
+                segment_key: job.segment_key,
+                checkpointed_lsn: checkpoint.last_lsn(),
+            }
+            .into(),
+        );
 
         Ok(())
     }

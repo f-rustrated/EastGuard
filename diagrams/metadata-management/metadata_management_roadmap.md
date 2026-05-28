@@ -333,7 +333,7 @@ Client SDK concern. Server-side signals available:
 
 - **`NodeAddress { cluster_addr, client_addr }`** — first-class value object used in `SwimNode.addr`, `ShardLeaderInfo`, `ShardLeaderEntry`, `Swim.self_addr`, `RaftWriters.addr_cache`. Derives `Copy`.
 - **`SwimSender` / `RaftSender`** — typed wrappers encapsulating channel + oneshot request-reply pattern. Clean client handler code in `clients.rs`.
-- **`port` → `client_port`** — explicit naming (`--client-port`, `EASTGUARD_CLIENT_PORT`). Port collision check in `init()`.
+- **`port` → `client_port`** — explicit naming (`--client-port`, `CLIENT_PORT`). Port collision check in `init()`.
 
 **Depends on:** Phase 4.
 **Scope:** Completed in 4 PRs (epoch cancelled).

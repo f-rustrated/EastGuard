@@ -1,5 +1,3 @@
 pub(crate) mod command;
-pub(crate) mod event;
+pub(crate) mod pending;
 pub(super) use command::*;
-#[allow(unused_imports)]
-pub(super) use event::*;
