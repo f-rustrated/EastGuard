@@ -8,7 +8,9 @@ use super::state::DataPlane;
 use super::timer::{BatchFlushTimer, ReplicationTimer};
 use super::wal::WalWriter;
 use crate::channels::BatchSender;
+use crate::config::DataNodeConfig;
 use crate::control_plane::NodeId;
+use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::SchedulerSender;
@@ -16,13 +18,16 @@ use crate::schedulers::ticker_message::SchedulerSender;
 pub struct DataPlaneActor;
 
 impl DataPlaneActor {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         node_id: NodeId,
         data_dir: PathBuf,
+        config: DataNodeConfig,
         checkpoint_tx: Sender<CheckpointJob>,
         batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
         repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
         data_transport_tx: BatchSender<DataTransportCommand>,
+        coordinator_tx: MutlRaftSender,
     ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
@@ -36,7 +41,7 @@ impl DataPlaneActor {
                         return;
                     }
                 };
-                let mut state = DataPlane::new(node_id, wal, data_dir);
+                let mut state = DataPlane::new(node_id, config, wal, data_dir);
 
                 while let Ok(cmd) = mailbox.recv() {
                     state.handle_command(cmd);
@@ -50,6 +55,7 @@ impl DataPlaneActor {
                         &batch_scheduler_tx,
                         &repl_scheduler_tx,
                         &data_transport_tx,
+                        &coordinator_tx,
                     );
                 }
             })

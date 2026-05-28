@@ -10,8 +10,6 @@ use super::record::{RoutingHeader, StagedEntry};
 
 use super::*;
 
-const SEGMENT_SIZE_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmentRole {
     Leader,
@@ -202,8 +200,8 @@ impl SegmentTracker {
         self.created_at.elapsed() >= max_age
     }
 
-    pub(crate) fn size_limit_reached(&self) -> bool {
-        self.size_bytes >= SEGMENT_SIZE_LIMIT
+    pub(crate) fn size_limit_reached(&self, limit: u64) -> bool {
+        self.size_bytes >= limit
     }
 }
 

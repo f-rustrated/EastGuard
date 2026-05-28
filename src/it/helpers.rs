@@ -1,8 +1,10 @@
-use crate::control_plane::SwimNode;
-use crate::control_plane::SwimNodeState;
 use crate::config::Environment;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
-use crate::connections::protocol::{AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState};
+use crate::connections::protocol::{
+    AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState,
+};
+use crate::control_plane::SwimNode;
+use crate::control_plane::SwimNodeState;
 use crate::net::TcpStream;
 
 pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
@@ -31,6 +33,11 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
         join_multiplier: 2,
         join_max_attempts: 5,
         data_port: 2923,
+        max_segment_age_secs: 3600,
+        segment_age_check_interval_secs: 60,
+        segment_size_limit_bytes: 1024 * 1024 * 1024,
+        batch_max_bytes: 10 * 1024 * 1024,
+        seal_request_timeout_secs: 5,
     }
 }
 
@@ -39,14 +46,19 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
-    writer.write(0, &ClientRequest::Admin(AdminRequest::DescribeCluster)).await?;
+    writer
+        .write(0, &ClientRequest::Admin(AdminRequest::DescribeCluster))
+        .await?;
     let (_, response): (_, ClientResponse) = reader.read_request().await?;
     let nodes = match response {
         ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }) => nodes,
-        other => return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unexpected response: {:?}", std::mem::discriminant(&other)),
-        ).into()),
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected response: {:?}", std::mem::discriminant(&other)),
+            )
+            .into());
+        }
     };
     let members = nodes
         .into_iter()
