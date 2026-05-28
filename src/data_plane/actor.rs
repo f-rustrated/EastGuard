@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::thread;
 
+use crossbeam_channel::Sender;
+
 use super::checkpoint::CheckpointJob;
 use super::messages::pending::DataPlaneOutputs;
 use super::state::DataPlane;
@@ -22,12 +24,12 @@ impl DataPlaneActor {
         node_id: NodeId,
         data_dir: PathBuf,
         config: DataNodeConfig,
-        checkpoint_tx: crossbeam_channel::Sender<Box<[CheckpointJob]>>,
+        checkpoint_tx: Sender<Box<[CheckpointJob]>>,
         batch_scheduler_tx: SchedulerSender<BatchFlushTimer>,
         repl_scheduler_tx: SchedulerSender<ReplicationTimer>,
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
-    ) -> crossbeam_channel::Sender<DataPlaneCommand> {
+    ) -> Sender<DataPlaneCommand> {
         let (tx, mailbox) = crossbeam_channel::bounded(4096);
 
         thread::Builder::new()

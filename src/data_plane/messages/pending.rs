@@ -56,13 +56,9 @@ impl DataPlaneOutputs {
             let _ = reply.send(ProduceAck::Ok);
         }
 
-        if !self.checkpoint_jobs.is_empty() {
-            let _ = self.checkpoint_tx.send(
-                self.checkpoint_jobs
-                    .drain(..)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            );
+        let checkpoint_jobs = std::mem::take(&mut self.checkpoint_jobs);
+        if !checkpoint_jobs.is_empty() {
+            let _ = self.checkpoint_tx.send(checkpoint_jobs.into_boxed_slice());
         }
         self.batch_scheduler
             .blocking_send_batch(self.batch_timer_cmds.drain(..).collect());

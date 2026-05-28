@@ -28,10 +28,7 @@ impl CheckpointWorker {
                         if let Err(e) =
                             Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
                         {
-                            tracing::error!(
-                                "Checkpoint failed for {:?}: {e}",
-                                job.segment_key
-                            );
+                            tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
                         }
                     }
                 }
@@ -89,10 +86,13 @@ impl CheckpointWorker {
         sparse_index.put_batch(index_entries)?;
         job.cache.advance_eviction_frontier(checkpoint.new_frontier);
 
-        let _ = data_plane_tx.send(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
-            segment_key: job.segment_key,
-            checkpointed_lsn: checkpoint.last_lsn(),
-        }));
+        let _ = data_plane_tx.send(
+            CheckpointComplete {
+                segment_key: job.segment_key,
+                checkpointed_lsn: checkpoint.last_lsn(),
+            }
+            .into(),
+        );
 
         Ok(())
     }

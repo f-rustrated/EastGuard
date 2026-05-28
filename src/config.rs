@@ -1,4 +1,6 @@
-use std::sync::LazyLock;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use std::fs::{self, OpenOptions};
 
@@ -9,6 +11,7 @@ use crate::control_plane::membership::peer_discovery::JoinAttempt;
 use crate::control_plane::membership::swim::Swim;
 use crate::control_plane::membership::{Topology, TopologyConfig};
 use crate::control_plane::{NodeAddress, NodeId};
+use crate::data_plane::sparse_index::SparseIndex;
 use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
@@ -249,20 +252,28 @@ impl Environment {
         )
         .bootstrap(self.bootstrap_servers())
     }
-}
 
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-pub struct DataNodeConfig {
-    pub max_segment_age: std::time::Duration,
-    pub age_check_interval: std::time::Duration,
-    pub segment_size_limit: u64,
-    pub batch_max_bytes: usize,
-    pub seal_request_timeout: std::time::Duration,
-}
+    pub(crate) fn election_jitter_seed(&self, rng_seed: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Hash::hash(&self.node_id_prefix, &mut hasher);
+        Hash::hash(&rng_seed, &mut hasher);
+        Hasher::finish(&hasher)
+    }
 
-#[allow(dead_code)]
-impl Environment {
+    pub(crate) fn sparse_index_db(&self) -> Arc<dyn SparseIndex> {
+        let sparse_index_db = rocksdb::DB::open_default(self.data_dir_path().join("sparse_index"))
+            .expect("sparse index DB");
+        Arc::new(sparse_index_db)
+    }
+    pub(crate) fn data_dir_path(&self) -> PathBuf {
+        std::path::PathBuf::from(&self.data_dir)
+    }
+
+    pub(crate) fn age_check_ticks(&self) -> u64 {
+        std::time::Duration::from_secs(self.segment_age_check_interval_secs).as_millis() as u64
+            / TICK_PERIOD_100_MS
+    }
+
     pub(crate) fn data_node_config(&self) -> DataNodeConfig {
         DataNodeConfig {
             max_segment_age: std::time::Duration::from_secs(self.max_segment_age_secs),
@@ -274,6 +285,16 @@ impl Environment {
             seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct DataNodeConfig {
+    pub max_segment_age: std::time::Duration,
+    pub age_check_interval: std::time::Duration,
+    pub segment_size_limit: u64,
+    pub batch_max_bytes: usize,
+    pub seal_request_timeout: std::time::Duration,
 }
 
 pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standard();

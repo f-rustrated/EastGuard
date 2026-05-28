@@ -21,6 +21,16 @@ impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T>
 
 #[allow(dead_code)]
 impl<T> SchedulerSender<T> {
+    pub(crate) fn channel(
+        capacity: usize,
+    ) -> (
+        SchedulerSender<T>,
+        tokio_mpsc::Receiver<Box<[TickerCommand<T>]>>,
+    ) {
+        let (tx, rx) = tokio_mpsc::channel(capacity);
+
+        (tx.into(), rx)
+    }
     pub(crate) fn schedule(&self, seq: u64, timer: impl Into<T>) {
         let cmd: TickerCommand<T> = TimerCommand::SetSchedule {
             seq,

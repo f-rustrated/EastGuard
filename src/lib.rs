@@ -5,7 +5,6 @@ mod config;
 mod connections;
 
 mod control_plane;
-#[allow(dead_code)]
 mod data_plane;
 
 mod net;
@@ -27,19 +26,26 @@ use crate::control_plane::consensus::messages::{RaftTimer, RaftTransportCommand}
 use crate::control_plane::membership::OutboundPacket;
 use crate::control_plane::membership::SwimTimer;
 use crate::control_plane::membership::actor::SwimSender;
+use crate::data_plane::actor::DataPlaneActor;
+use crate::data_plane::checkpoint::CheckpointWorker;
+use crate::data_plane::messages::command::DataPlaneCommand;
+
+use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer, SegmentAgeTimer};
 use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream, UdpSocket};
 use crate::schedulers::actor::run_scheduling_actor;
-use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_10_MS, TICK_PERIOD_100_MS};
+use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 use crate::{
     config::ENV,
     connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
 };
 use anyhow::Result;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -119,17 +125,66 @@ impl StartUp {
             raft_tx.clone().into(),
         ));
         let raft_db = MetadataStorage::open(self.env.raft_db_path());
-        let election_jitter_seed = {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::hash::Hash::hash(&self.env.node_id_prefix, &mut hasher);
-            std::hash::Hash::hash(&self.rng_seed, &mut hasher);
-            std::hash::Hasher::finish(&hasher)
-        };
+
         let (data_transport_tx, data_transport_rx) =
             mpsc::channel::<Box<[DataTransportCommand]>>(100);
-        // DataPlane not yet spawned (needs checkpoint actor, schedulers) —
-        // incoming inter-node commands are silently dropped until then.
-        let (data_plane_tx, _) = crossbeam_channel::bounded(1);
+
+        // DataPlane stack
+
+        let sparse_index_db = self.env.sparse_index_db();
+        let (checkpoint_tx, checkpoint_rx) = crossbeam_channel::bounded(64);
+
+        // Timer bridge: schedulers send via tokio mpsc, bridge forwards to crossbeam
+        let (dp_timer_tx, mut dp_timer_rx) = mpsc::channel::<DataPlaneCommand>(64);
+
+        let (batch_tick_tx, batch_tick_rx) = SchedulerSender::<BatchFlushTimer>::channel(64);
+
+        let (repl_tick_tx, repl_tick_rx) = SchedulerSender::<ReplicationTimer>::channel(64);
+
+        let (_age_tick_tx, age_tick_rx) = SchedulerSender::<SegmentAgeTimer>::channel(64);
+
+        tokio::spawn(run_scheduling_actor(
+            dp_timer_tx.clone(),
+            batch_tick_rx,
+            TICK_PERIOD_10_MS,
+            None,
+        ));
+        tokio::spawn(run_scheduling_actor(
+            dp_timer_tx.clone(),
+            repl_tick_rx,
+            TICK_PERIOD_10_MS,
+            None,
+        ));
+        tokio::spawn(run_scheduling_actor(
+            dp_timer_tx,
+            age_tick_rx,
+            TICK_PERIOD_100_MS,
+            Some(self.env.age_check_ticks()),
+        ));
+
+        let data_plane_tx = DataPlaneActor::spawn(
+            node_id.clone(),
+            self.env.data_dir_path(),
+            self.env.data_node_config(),
+            checkpoint_tx,
+            batch_tick_tx,
+            repl_tick_tx,
+            data_transport_tx.clone().into(),
+            raft_tx.clone(),
+        );
+
+        CheckpointWorker::spawn(sparse_index_db, checkpoint_rx, data_plane_tx.clone());
+
+        // Bridge: scheduler callbacks (tokio mpsc) → DataPlane mailbox (crossbeam)
+        let dp_tx_bridge = data_plane_tx.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = dp_timer_rx.recv().await {
+                if dp_tx_bridge.send(cmd).is_err() {
+                    break;
+                }
+            }
+        });
+
         tokio::spawn(DataTransportActor::run(
             node_id.clone(),
             data_tcp_listener,
@@ -139,7 +194,7 @@ impl StartUp {
         ));
         tokio::spawn(MultiRaftActor::run(
             node_id,
-            election_jitter_seed,
+            self.env.election_jitter_seed(self.rng_seed),
             Box::new(raft_db),
             raft_mailbox,
             raft_transport_tx,

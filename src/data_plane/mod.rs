@@ -12,6 +12,7 @@ use crate::smart_pointer;
 pub(crate) mod actor;
 
 pub(crate) mod checkpoint;
+#[allow(dead_code)]
 pub(crate) mod cold_read;
 pub(crate) mod messages;
 pub(crate) mod sparse_index;
@@ -32,6 +33,7 @@ pub struct SegmentKey {
 pub struct EntryPayload(Bytes);
 
 impl EntryPayload {
+    #[allow(dead_code)]
     pub fn new(data: Bytes) -> Self {
         Self(data)
     }
