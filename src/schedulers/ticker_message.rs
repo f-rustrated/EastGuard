@@ -20,13 +20,10 @@ impl<T> From<tokio_mpsc::Sender<Box<[TickerCommand<T>]>>> for SchedulerSender<T>
     }
 }
 
+pub(crate) type SchedulerReceiver<T> = tokio_mpsc::Receiver<Box<[TickerCommand<T>]>>;
+
 impl<T> SchedulerSender<T> {
-    pub(crate) fn channel(
-        capacity: usize,
-    ) -> (
-        SchedulerSender<T>,
-        tokio_mpsc::Receiver<Box<[TickerCommand<T>]>>,
-    ) {
+    pub(crate) fn channel(capacity: usize) -> (SchedulerSender<T>, SchedulerReceiver<T>) {
         let (tx, rx) = tokio_mpsc::channel(capacity);
 
         (tx.into(), rx)
