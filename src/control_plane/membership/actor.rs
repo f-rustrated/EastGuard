@@ -6,6 +6,8 @@ use crate::control_plane::NodeId;
 use crate::control_plane::SwimNode;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
+use crate::schedulers::actor::spawn_scheduling_actor;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
@@ -31,10 +33,34 @@ impl SwimActor {
         (SwimSender(swim_sender), swim_mailbox)
     }
 
-    pub async fn run(
+    /// Spawn the SwimActor along with its dedicated scheduler. Returns the
+    /// `SwimSender` for use as a callback target by other actors.
+    pub fn spawn(
+        sender: SwimSender,
+        mailbox: mpsc::Receiver<SwimActorCommand>,
+        state: Swim,
+        transport_tx: impl Into<BatchSender<OutboundPacket>>,
+        raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+    ) {
+        let scheduler_tx = spawn_scheduling_actor(
+            sender.into(),
+            64,
+            TICK_PERIOD_100_MS,
+            Some(PROBE_INTERVAL_TICKS),
+        );
+        tokio::spawn(Self::run(
+            mailbox,
+            state,
+            transport_tx.into(),
+            scheduler_tx,
+            raft_tx,
+        ));
+    }
+
+    pub(crate) async fn run(
         mut mailbox: mpsc::Receiver<SwimActorCommand>,
         state: Swim,
-        transport_tx: mpsc::Sender<Box<[OutboundPacket]>>,
+        transport_tx: BatchSender<OutboundPacket>,
         scheduler_tx: SchedulerSender<SwimTimer>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
     ) {

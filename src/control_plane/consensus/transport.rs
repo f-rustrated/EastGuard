@@ -8,7 +8,9 @@ use tokio::time::Instant;
 
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::PacketReceived;
-use crate::control_plane::consensus::messages::{OutboundRaftPacket, RaftTransportCommand, WireRaftMessage};
+use crate::control_plane::consensus::messages::{
+    OutboundRaftPacket, RaftTransportCommand, WireRaftMessage,
+};
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
@@ -439,7 +441,8 @@ mod tests {
             .build();
 
         sim.host("acceptor", || async {
-            let (raft_tx, _raft_rx) = crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
+            let (raft_tx, _raft_rx) =
+                crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let mut state = RaftWriters::new(NodeId::new("node-b"));
 
@@ -475,7 +478,8 @@ mod tests {
             .build();
 
         sim.host("node-b", || async {
-            let (raft_tx, _raft_rx) = crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
+            let (raft_tx, _raft_rx) =
+                crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
             let mut state = RaftWriters::new(NodeId::new("node-b"));

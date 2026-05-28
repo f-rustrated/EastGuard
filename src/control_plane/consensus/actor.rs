@@ -13,6 +13,8 @@ use crate::control_plane::membership::SwimCommand;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::metadata::MetadataCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
+use crate::schedulers::actor::spawn_scheduling_actor;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
@@ -36,16 +38,50 @@ impl MultiRaftActor {
         (MutlRaftSender(tx), rx)
     }
 
+    /// Spawn the MultiRaftActor along with its dedicated scheduler. The scheduler
+    /// capacity is sized for `vnodes_per_node`: each vnode can have both an
+    /// election and heartbeat timer active, so capacity must comfortably exceed
+    /// `vnodes_per_node * 2`; `* 16` gives ample headroom.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        sender: MutlRaftSender,
+        mailbox: mpsc::Receiver<MultiRaftActorCommand>,
+        node_id: NodeId,
+        election_jitter_seed: u64,
+        storage: Box<dyn RaftStorage>,
+        vnodes_per_node: usize,
+        transport_tx: impl Into<BatchSender<RaftTransportCommand>>,
+        swim_tx: SwimSender,
+        data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
+    ) {
+        let scheduler_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
+            sender.into(),
+            vnodes_per_node * 16,
+            TICK_PERIOD_100_MS,
+            Some(PROBE_INTERVAL_TICKS),
+        );
+        tokio::spawn(Self::run(
+            node_id,
+            election_jitter_seed,
+            storage,
+            mailbox,
+            transport_tx.into(),
+            scheduler_tx,
+            swim_tx,
+            data_transport_tx.into(),
+        ));
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         node_id: NodeId,
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
-        transport_tx: mpsc::Sender<Box<[RaftTransportCommand]>>,
+        transport_tx: BatchSender<RaftTransportCommand>,
         scheduler_tx: SchedulerSender<RaftTimer>,
         swim_tx: SwimSender,
-        data_transport_tx: mpsc::Sender<Box<[DataTransportCommand]>>,
+        data_transport_tx: BatchSender<DataTransportCommand>,
     ) {
         let mut actor = Self {
             store: MultiRaft::new(node_id, election_jitter_seed, storage),

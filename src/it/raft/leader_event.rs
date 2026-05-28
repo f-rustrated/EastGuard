@@ -134,16 +134,13 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     election_jitter_seed,
                     Box::new(db),
                     raft_mailbox,
-                    transport_tx,
+                    transport_tx.into(),
                     ticker_tx.into(),
                     swim_tx,
-                    data_tx,
+                    data_tx.into(),
                 ));
 
-                raft_tx
-                    .send(EnsureGroup { group: g })
-                    .await
-                    .unwrap();
+                raft_tx.send(EnsureGroup { group: g }).await.unwrap();
 
                 let mut events = Vec::new();
                 for _ in 0..150 {

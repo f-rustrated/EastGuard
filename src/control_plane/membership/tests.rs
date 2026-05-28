@@ -174,7 +174,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     tokio::spawn(SwimActor::run(
         rx_in,
         swim,
-        tx_out.clone(),
+        tx_out.clone().into(),
         ticker_tx.clone(),
         raft_tx,
     ));

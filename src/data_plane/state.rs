@@ -18,9 +18,7 @@ use crate::data_plane::transport::command::DataTransportSendToCoordinator;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 struct PendingSealRequest {
     sent_at: std::time::Instant,
@@ -35,7 +33,7 @@ pub struct DataPlane<W: WalStorage> {
     dirty_segments: Vec<SegmentKey>,
     buffer_byte_count: usize,
     needs_flush: bool,
-    data_dir: PathBuf,
+
     replication: ReplicationState,
     pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
     out: DataPlaneOutputs,
@@ -46,7 +44,7 @@ impl<W: WalStorage> DataPlane<W> {
         node_id: NodeId,
         config: DataNodeConfig,
         wal: W,
-        data_dir: PathBuf,
+
         out: DataPlaneOutputs,
     ) -> Self {
         DataPlane {
@@ -57,7 +55,7 @@ impl<W: WalStorage> DataPlane<W> {
             dirty_segments: Vec::new(),
             buffer_byte_count: 0,
             needs_flush: false,
-            data_dir,
+
             replication: ReplicationState::default(),
             pending_seal_requests: HashMap::new(),
             out,
@@ -193,7 +191,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         let tracker = SegmentTracker::new_with_start_entry_id(
-            cmd.segment_key.file_path(&self.data_dir),
+            cmd.segment_key.file_path(&self.config.data_dir),
             SegmentRole::Leader,
             cmd.replica_set,
             cmd.shard_group_id,
@@ -220,7 +218,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.segments.insert(
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
-                    cmd.segment_key.file_path(&self.data_dir),
+                    cmd.segment_key.file_path(&self.config.data_dir),
                     SegmentRole::Follower,
                     cmd.replica_set,
                     ShardGroupId(0),
@@ -264,7 +262,7 @@ impl<W: WalStorage> DataPlane<W> {
 
         let shard_group_id = old_tracker.shard_group_id();
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
-            new_segment_key.file_path(&self.data_dir),
+            new_segment_key.file_path(&self.config.data_dir),
             SegmentRole::Leader,
             cmd.new_replica_set,
             shard_group_id,
@@ -581,6 +579,8 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
@@ -605,13 +605,14 @@ mod tests {
 
     const TEST_BATCH_MAX_BYTES: usize = 10 * 1024 * 1024;
 
-    fn test_config() -> DataNodeConfig {
+    fn test_config(dir: PathBuf) -> DataNodeConfig {
         DataNodeConfig {
             max_segment_age: std::time::Duration::from_secs(3600),
             age_check_interval: std::time::Duration::from_secs(60),
             segment_size_limit: 1024 * 1024 * 1024,
             batch_max_bytes: TEST_BATCH_MAX_BYTES,
             seal_request_timeout: std::time::Duration::from_secs(5),
+            data_dir: dir,
         }
     }
 
@@ -620,9 +621,8 @@ mod tests {
         let out = DataPlaneOutputs::test();
         DataPlane::new(
             test_node_id(),
-            test_config(),
+            test_config(dir.path().to_path_buf()),
             wal,
-            dir.path().to_path_buf(),
             out,
         )
     }

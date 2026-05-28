@@ -269,11 +269,6 @@ impl Environment {
         std::path::PathBuf::from(&self.data_dir)
     }
 
-    pub(crate) fn age_check_ticks(&self) -> u64 {
-        std::time::Duration::from_secs(self.segment_age_check_interval_secs).as_millis() as u64
-            / TICK_PERIOD_100_MS
-    }
-
     pub(crate) fn data_node_config(&self) -> DataNodeConfig {
         DataNodeConfig {
             max_segment_age: std::time::Duration::from_secs(self.max_segment_age_secs),
@@ -283,18 +278,26 @@ impl Environment {
             segment_size_limit: self.segment_size_limit_bytes,
             batch_max_bytes: self.batch_max_bytes,
             seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
+            data_dir: self.data_dir_path(),
         }
     }
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DataNodeConfig {
     pub max_segment_age: std::time::Duration,
     pub age_check_interval: std::time::Duration,
     pub segment_size_limit: u64,
     pub batch_max_bytes: usize,
     pub seal_request_timeout: std::time::Duration,
+    pub data_dir: PathBuf,
+}
+
+impl DataNodeConfig {
+    pub(crate) fn age_check_ticks(&self) -> u64 {
+        self.age_check_interval.as_millis() as u64 / TICK_PERIOD_100_MS
+    }
 }
 
 pub const SERDE_CONFIG: bincode::config::Configuration = bincode::config::standard();

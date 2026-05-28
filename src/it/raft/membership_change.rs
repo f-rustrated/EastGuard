@@ -83,10 +83,10 @@ async fn start_raft_node(
         election_jitter_seed,
         Box::new(db),
         raft_mailbox,
-        transport_tx,
+        transport_tx.into(),
         ticker_tx.into(),
         swim_tx,
-        data_tx,
+        data_tx.into(),
     ));
 
     raft_tx.send(EnsureGroup { group }).await.unwrap();

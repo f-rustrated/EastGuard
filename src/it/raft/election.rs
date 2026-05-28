@@ -42,7 +42,9 @@ fn build_address_map(
 }
 
 async fn drive_ticks(
-    ticker: &mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
+    ticker: &mpsc::Sender<
+        Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>,
+    >,
     count: usize,
 ) {
     for _ in 0..count {
@@ -124,10 +126,10 @@ async fn run_raft_node(
         election_jitter_seed,
         Box::new(db),
         raft_mailbox,
-        transport_tx,
+        transport_tx.into(),
         ticker_tx.into(),
         swim_tx,
-        data_tx,
+        data_tx.into(),
     ));
 
     raft_tx
