@@ -118,10 +118,11 @@ impl RaftRpcDispatcher {
             .establish_session(target_id.clone(), msgs, swim_tx)
             .await
         {
-            Some(rpc_listener) => {
+            Ok(rpc_listener) => {
                 tokio::spawn(rpc_listener.run(raft_tx.clone()));
             }
-            None => {
+            Err(err) => {
+                tracing::warn!("{err}");
                 self.connect_backoffs.insert(target_id, Instant::now());
             }
         }
@@ -131,16 +132,14 @@ impl RaftRpcDispatcher {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-
         swim_tx: &SwimSender,
-    ) -> Option<RaftRpcListener> {
+    ) -> anyhow::Result<RaftRpcListener> {
         let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
-            tracing::warn!(
+            anyhow::bail!(
                 "[{}] Cannot resolve address for {:?}",
                 self.node_id,
                 target_id
             );
-            return None;
         };
         // Timeout required: in turmoil (and on dead hosts generally), TcpStream::connect
         // never returns an error — it hangs forever, stalling the select loop.
@@ -151,34 +150,32 @@ impl RaftRpcDispatcher {
         .await
         .ok()
         .and_then(|r| r.ok()) else {
-            tracing::warn!(
+            anyhow::bail!(
                 "[{}] Failed to connect to {} ({:?})",
                 self.node_id,
                 node_addr.cluster_addr,
                 target_id
             );
-            return None;
         };
+
         let (read_half, write_half) = stream.into_split();
         self.writers.insert(target_id.clone(), write_half);
         if let Err(e) = self.handshake(&target_id).await {
-            tracing::warn!(
+            anyhow::bail!(
                 "[{}] Handshake with {:?} failed: {e}",
                 self.node_id,
                 target_id
             );
-            return None;
         }
         if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
-            tracing::warn!(
+            anyhow::bail!(
                 "[{}] Write {} msgs to {:?} failed: {e}",
                 self.node_id,
                 msgs.len(),
                 target_id
             );
-            return None;
         }
-        Some(RaftRpcListener(read_half))
+        Ok(RaftRpcListener(read_half))
     }
 
     pub(super) fn disconnect(&mut self, peer_id: NodeId) {
