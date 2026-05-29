@@ -113,28 +113,34 @@ impl RaftRpcDispatcher {
         {
             return;
         }
-        if !self
-            .connect_and_send(target_id.clone(), msgs, raft_tx, swim_tx)
+
+        match self
+            .establish_session(target_id.clone(), msgs, swim_tx)
             .await
         {
-            self.connect_backoffs.insert(target_id, Instant::now());
+            Some(rpc_listener) => {
+                tokio::spawn(rpc_listener.run(raft_tx.clone()));
+            }
+            None => {
+                self.connect_backoffs.insert(target_id, Instant::now());
+            }
         }
     }
 
-    async fn connect_and_send(
+    async fn establish_session(
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &MutlRaftSender,
+
         swim_tx: &SwimSender,
-    ) -> bool {
+    ) -> Option<RaftRpcListener> {
         let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
             tracing::warn!(
                 "[{}] Cannot resolve address for {:?}",
                 self.node_id,
                 target_id
             );
-            return false;
+            return None;
         };
         // Timeout required: in turmoil (and on dead hosts generally), TcpStream::connect
         // never returns an error — it hangs forever, stalling the select loop.
@@ -151,7 +157,7 @@ impl RaftRpcDispatcher {
                 node_addr.cluster_addr,
                 target_id
             );
-            return false;
+            return None;
         };
         let (read_half, write_half) = stream.into_split();
         self.writers.insert(target_id.clone(), write_half);
@@ -161,7 +167,7 @@ impl RaftRpcDispatcher {
                 self.node_id,
                 target_id
             );
-            return false;
+            return None;
         }
         if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
             tracing::warn!(
@@ -170,10 +176,9 @@ impl RaftRpcDispatcher {
                 msgs.len(),
                 target_id
             );
-            return false;
+            return None;
         }
-        tokio::spawn(RaftRpcListener(read_half).run(raft_tx.clone()));
-        true
+        Some(RaftRpcListener(read_half))
     }
 
     pub(super) fn disconnect(&mut self, peer_id: NodeId) {
