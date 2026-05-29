@@ -10,9 +10,9 @@ use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
+use crate::test_traits::TAssertInvariant;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
-use crate::test_traits::TAssertInvariant;
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
 // ==========================================
@@ -152,8 +152,7 @@ impl SwimSender {
 
     pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<SwimNode>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(QueryCommand::GetMembers { reply: send })
-            .await?;
+        self.send(QueryCommand::GetMembers { reply: send }).await?;
         Ok(recv.await?)
     }
 

@@ -1,8 +1,6 @@
-# Storage Key Layout
+# Storage Key Layout (Invariants)
 
-## Purpose
-
-All shard groups share a single RocksDB default column family. Each key is prefixed with the shard group ID to isolate groups within the same keyspace.
+All shard groups share a single RocksDB default column family. Each key is prefixed with the shard group ID to isolate groups within the same keyspace. For the design rationale, see `diagrams/metadata-management/mental-model.md` § "Storage layout".
 
 ## Key Structure
 
@@ -21,18 +19,16 @@ All shard groups share a single RocksDB default column family. Each key is prefi
 
 ## Invariants
 
-1. **Single CF for all groups.** No per-group column families. Previous design used one CF per shard group — with 768 groups, each `create_cf` fsynced MANIFEST (~230ms each, ~177s total at startup). Single CF with composite keys eliminates this.
+1. **Lexicographic order matches numeric order.** Big-endian encoding for both group ID and log index. RocksDB sorts by raw bytes, so big-endian gives us group-contiguous storage and in-group log entries sorted by index. Little-endian would scatter entries and break range scans.
 
-2. **Big-endian encoding preserves sort order.** RocksDB sorts keys lexicographically. Big-endian makes lexicographic order match numeric order: group 1's keys cluster together, group 7 follows, within each group log entries sort by index.
+2. **Within a group, log entries sort before metadata.** Key types are ordered `0x01 (LogEntry) < 0x02 (HardState) < 0x03+ (reserved)`. Enables prefix-bounded range scans that cover only log entries (`[group_id][0x01]..[group_id][0x02]`).
 
-3. **Log entries sort before metadata within each group.** Key type 0x01 (LogEntry) < 0x02 (HardState) < 0x03+ (other metadata). Enables prefix-bounded range scans that cover only log entries.
+3. **Group isolation via prefix.** Every key for a group starts with the same 8-byte `group_id`. Deleting a group is a single range delete `[group_id]..[group_id + 1]`. Scanning a group's log is a single range scan. No iteration across groups; no key collisions between groups.
 
-4. **Group isolation via prefix.** All keys for a group share the same 8-byte prefix. Deleting a group = `delete_range([group_id], [group_id + 1])`. Scanning a group's log = `range([group_id][0x01][0x00...], [group_id][0x02])`.
+4. **Flush is atomic.** `persist_mutations()` writes all log mutations and hard-state updates for all dirty groups in one `WriteBatch`. Either the whole batch lands or none of it does — partial application would let some groups advance their stable index while others lost entries.
 
-5. **Flush is atomic via WriteBatch.** `persist_mutations()` writes all log mutations and hard state updates for all dirty groups in a single `WriteBatch`. Either all writes succeed or none do.
+5. **Log index is 1-based.** Index 0 is never stored. A `stabled_index` of 0 means "no entries persisted yet"; index 0 is not a valid log slot. Removes the ambiguity between "no entries" and "entry at index 0".
 
-6. **Log index is 1-based.** Raft log entries use 1-based indexing. Index 0 is never stored. `stabled_index` tracks the last persisted log entry.
+6. **Truncation preserves non-log keys.** `TruncateFrom(index)` deletes log entries from `index` onward but never touches `HardState` or other metadata keys. Upper bound of the delete is `[group_id][0x02]`, exclusive. Losing hard state would break Raft's term/voted-for guarantees.
 
-7. **Truncation preserves metadata.** `TruncateFrom(index)` deletes log entries from `index` onward but preserves HardState and other metadata keys (upper bound is `[group_id][0x02]`, exclusive).
-
-8. **stabled_index advances only after successful flush.** `advance_stabled_index()` called after `persist_mutations()` returns. Raft's `commit_index` is bounded by `min(commit_index, stabled_index)` — ensures entries are durable before being applied.
+7. **`stabled_index` advances only after a successful flush.** Set only after `persist_mutations()` returns successfully. Apply is bounded by `min(commit_index, stabled_index)` — entries cannot be applied before they are durable. Apply-before-durable would let a crash erase already-applied state.

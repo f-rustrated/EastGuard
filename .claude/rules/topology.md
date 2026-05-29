@@ -1,10 +1,8 @@
-# Topology
+# Topology (Invariants)
 
-## Purpose
+`Topology` — consistent hash ring mapping resource keys to shard groups, plus a tracker of current Raft leaders per shard group. Maintained locally on every node, updated via SWIM membership events. Pure synchronous data structure. For the conceptual picture, see `diagrams/metadata-management/mental-model.md` § "Topology — the hash ring".
 
-`Topology` — consistent hash ring mapping resource keys to shard groups and tracking shard leader locations. Maintained locally on every node, updated via SWIM membership events. Pure synchronous data structure.
-
-## Architecture
+## Structure
 
 ```
 Topology
@@ -16,32 +14,20 @@ Topology
 
 `VirtualNodeToken` sorted by `(hash, pnode_id, replica_index)` — deterministic tiebreaker on hash collision.
 
-## Key Operations
-
-| Operation | Trigger | Effect |
-|---|---|---|
-| `insert_node` | SWIM `Alive` event | Adds `vnodes_per_pnode` virtual nodes, rebuilds reverse index |
-| `remove_node` | SWIM `Dead` event | Removes all virtual nodes for that pnode, rebuilds reverse index |
-| `shard_group_for(key)` | Routing query | Walks ring clockwise from `hash(key)` to nearest vnode |
-| `shard_groups_for_node(id)` | Node join/death handling | O(1) lookup via reverse index |
-| `update_shard_leader(info)` | SWIM gossip piggybacking | Updates leader map if term is strictly higher |
-
 ## Invariants
 
-1. **Deterministic hash routing.**  Same key always maps to same shard group given same ring state.
+1. **Hash routing is deterministic.** Same key + same ring state → same shard group, on every node. Required for cluster-wide routing convergence without a central coordinator.
 
-2. **Topic name globally unique via hash routing.** `hash(topic_name)` deterministically routes to exactly one shard group. Within that shard group, names are unique (enforced by `topic_name_index`). Two different shard groups can never both own the same topic name.
+2. **Each topic name maps to exactly one shard group.** `hash(topic_name)` deterministically routes to one group; within that group, `topic_name_index` rejects duplicates. Two different shard groups can never own the same topic name. This is what makes "topic name" a globally unique key without coordination.
 
-3. **Shard group members are distinct physical nodes.** `token_owners_at()` skips duplicate `pnode_id`s when walking the ring. A shard group never lists the same node twice.
+3. **A shard group never lists the same physical node twice.** Walking the ring skips duplicate `pnode_id`s when selecting a group's members. A group with duplicate members would have inflated apparent replication while actually holding fewer than `replication_factor` copies.
 
-4. **Ring mutation triggers full reverse index rebuild.** `insert_node()` and `remove_node()` always call `rebuild_reverse_index()`. `groups` and `node_group_ids` maps are rebuilt from scratch, never patched incrementally — prevents stale entries.
+4. **Reverse index is consistent with the vnode set.** `node_group_ids` always reflects exactly the groups derived from the current `vnodes`. Ring mutations rebuild the index from scratch rather than patching incrementally — eliminates the class of bugs where partial updates leave stale entries.
 
-5. **Insert is idempotent.** Adding a node already on the ring is a no-op (`add_pnode` checks `node_group_ids` existence first).
+5. **Insert is idempotent.** Adding a node already on the ring is a no-op. Re-receiving an `Alive` event during gossip convergence does not corrupt the ring.
 
-6. **Shard leader map is term-monotonic.** `update_shard_leader()` accepts update only if `info.term > existing.term`. Equal or lower terms rejected. Prevents stale leader claims from deposed leaders.
+6. **Shard leader map is term-monotonic.** An update is accepted only if its term is strictly higher than the existing entry. Equal or lower terms rejected. Prevents a deposed leader from re-installing itself via stale gossip.
 
-7. **Shard leader map NOT cleared on node death.** Removing a node from the ring does not clear its leader entries. Stale entries are eventually overwritten by Raft re-election gossip with higher term. This avoids a gap where no leader is known during re-election.
+7. **Leader map entries persist until overwritten.** A node's death does not clear its leader entries; they're only replaced by a higher-term claim from a re-election. Avoids a window where "no leader is known" — clients would fail to route during the gap.
 
-8. **ShardGroupId derived from nearest vnode hash.** `ShardGroupId(vnode_token.hash as u64)`. Deterministic given ring state — no randomness, no counter.
-
-9. **Suspect state is a no-op for topology.** Only `Alive` (insert) and `Dead` (remove) trigger ring mutations. Suspect does not modify the ring — the node remains in the ring until confirmed dead.
+8. **Suspect does not mutate the ring.** Only `Alive` (insert) and `Dead` (remove) change topology. Suspect leaves the node in place — the node may refute. Otherwise topology would churn on every flap.

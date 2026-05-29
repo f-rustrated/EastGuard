@@ -126,12 +126,12 @@ RaftTransportActor              (TCP I/O)
 
 ## Invariants
 
-1. **Actor is sole driver of all Raft instances.** No other code calls `step()`, `handle_timeout()`, or `propose()` on `Raft` instance in production.
+1. **Group lifecycle commands originate only from `SwimActor`.** `MultiRaftActor` does not decide when to create or remove groups, nor when to add or remove peers — it only responds to `EnsureGroup`, `RemoveGroup`, `HandleNodeDeath`, `HandleNodeJoin`. If two parts of the system could each initiate group lifecycle, races would let a group be removed by one path while the other is adding peers to it.
 
-2. **Every event must be followed by flush.** `Raft` state machine buffers all side effects internally. Skip flush → packets and timer commands silently lost.
+2. **On `LeaderChange → self`, the new leader reconciles against SWIM.** Actor snapshots SWIM's live member set and proposes `RemovePeer` for every current peer not in that set. Without this, SWIM facts about deaths that occurred while no leader existed (typically: the previous leader was one of the dead) never become Raft truth — the events have already been disseminated by SWIM and won't re-fire.
 
-3. **Raft instances are independent.** Processing event for `Shard #12` never touches `Shard #45`'s state.
+3. **`MetadataCommitted` is dispatched only by the current leader.** During event drain, if the replica is no longer leader, its `MetadataCommitted` events are discarded (the entry still applies — only the outbound dispatch is suppressed). Otherwise every replica would emit duplicate `SegmentAssignment` / `SealResponse` to the data plane, and a former leader would dispatch entries it can no longer be authoritative about.
 
-4. **Group lifecycle controlled by SwimActor.** MultiRaftActor does not decide when to create or remove groups. Only responds to `EnsureGroup`, `RemoveGroup`, `HandleNodeDeath`, and `HandleNodeJoin` commands sent by SwimActor.
+4. **`pending_seals` is bounded.** Cleared in two places: (a) on observed `LogMutation::TruncateFrom(idx)`, entries with `log_index ≥ idx` are dropped — the new leader may have truncated those proposals; (b) when `!raft.is_leader()` at drain time, all entries for that group are dropped — the `SealResponse` will not come from this replica. Without this, unbounded growth as leaders churn.
 
-5. **Timer commands flow through scheduler.** Actor converts `TimerCommand<RaftTimer>` into `TickerCommand<RaftTimer>` (via `.into()`) and sends to shared ticker. Ticker fires `RaftTimeoutCallback` back into actor's mailbox.
+5. **`flush` terminates within a bounded number of rounds.** `MultiRaftActor::flush` loops `store.flush()` up to `MAX_FLUSH_ROUNDS = 8` because `route_event` may call back into the store (reconciliation proposes new `RemovePeer` entries). Bounded so a feedback bug cannot deadlock the actor. Steady-state shape is ≤ 2 rounds.

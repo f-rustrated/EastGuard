@@ -11,7 +11,7 @@ EastGuard not use monolithic metadata store or single controller quorum. Metadat
 - Single node participates in **many** Raft groups simultaneously (some leader, others follower).
 - Each `Raft` instance has own term, voted_for, log, commit_index — fully independent.
 - `MultiRaftActor` multiplexes all groups through `HashMap<ShardGroupId, Raft>`.
-- Log storage backed by shared RocksDB instance, keyed by `(shard_group_id, key_type, index)`. See `storage-layout.md`.
+- Log storage backed by shared RocksDB instance, keyed by `(shard_group_id, key_type, index)`. See `diagrams/metadata-management/mental-model.md` § "Storage layout" for the full key scheme.
 
 ## Architecture
 
@@ -111,14 +111,18 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 ## Invariants
 
-1. **Raft is purely synchronous.** No async, no I/O, no channels. All side effects buffered in `pending_outbound` and `pending_timer_commands`.
+1. **Only the leader can propose.** `propose()` returns `Err(ProposeError::NotLeader)` if called on a follower or candidate. Followers may apply, never originate.
 
-2. **Each Raft instance independent.** In DS-RSM, node runs many Raft instances. Share no state. `MultiRaftActor` maps `ShardGroupId → Raft`.
+2. **At most one leader per term.** Enforced by vote deduplication (`voted_for`) and the log-up-to-date check (§5.4.1). Two leaders in the same term would commit conflicting entries — Raft's primary safety violation.
 
-3. **Every event must be followed by draining output buffers.** Actor layer must call `take_outbound()` and `take_timer_commands()` after every `step()`, `handle_timeout()`, or `propose()` call.
+3. **A leader commits only entries from its own term.** Entries from prior terms become committed implicitly when a current-term entry is committed (Figure 8). Direct commit of an old-term entry can be retroactively overwritten by a yet-older leader's truncation — a safety violation.
 
-4. **Only leader can propose.** `propose()` returns `Err(ProposeError::NotLeader)` if called on follower or candidate.
+4. **Apply is gated by both commit and durability.** `apply_committed_entries` advances `last_applied_index` only up to `min(commit_index, stabled_index)`. An entry is never applied to state on a replica that has not also persisted it. Without this, a crash after apply but before persistence would lose already-observable state.
 
-5. **At most one leader per term.** Enforced by vote dedup (`voted_for`) and log-up-to-date check (§5.4.1).
+5. **`last_applied_index ≤ commit_index ≤ stabled_index ≤ log_last_index`** at all times. Maintained by: the apply-gate (#4), `stabled_index` advancing only after a successful flush, `commit_index` only set inside the quorum-ack check, and entries appearing in the log before being indexable.
 
-6. **Dead entries from old terms not directly committed.** Leader only commits entries matching `current_term`. Preceding entries implicitly committed once current-term entry committed.
+6. **The peer set mutates only via apply of committed `AddPeer` / `RemovePeer` entries.** No external code path mutates `peers`. The single bootstrap exception: initial peers are seeded into the constructor when the group is created. Direct mutation outside this discipline lets replicas disagree on quorum size at the same log index → split-brain commit.
+
+7. **`peer_states` exists only on the leader.** Initialized in `become_leader` for every peer; cleared in `step_down`. Followers carry an empty `peer_states`. Apply-time `AddPeer` / `RemovePeer` keep `peer_states` in sync with `peers` *only when this replica is leader* at apply time.
+
+8. **Apply is deterministic across replicas.** Given the same committed log, every replica produces the same `peers`, the same `MetadataStateMachine`, the same `last_applied_index`. This is the foundation of the replicated state machine — anything that breaks it (originating mutations outside apply, non-deterministic apply logic) breaks consensus.
