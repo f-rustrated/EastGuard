@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
@@ -85,10 +85,10 @@ impl MultiRaftActor {
     ) {
         let mut actor = Self {
             store: MultiRaft::new(node_id, election_jitter_seed, storage),
-            transport_tx: transport_tx.into(),
+            transport_tx,
             scheduler_tx,
             swim_tx,
-            data_transport_tx: data_transport_tx.into(),
+            data_transport_tx,
             packets_by_target: HashMap::new(),
             timer_cmds: Vec::new(),
             transport_cmds: Vec::new(),
@@ -109,8 +109,20 @@ impl MultiRaftActor {
     }
 
     async fn flush(&mut self) {
-        for event in self.store.flush() {
-            self.route_event(event).await;
+        // Reconciliation proposals created during route_event re-enter
+        // store as new dirty groups; loop until store yields no further events.
+        // Bounded to prevent runaway in case of a feedback bug.
+        // ! The MAX_FLUSH_ROUNDS = 8 bound is purely defensive
+        // ! there's no scenario in the current code that should produce a feedback chain longer than 2 or 3.
+        const MAX_FLUSH_ROUNDS: u32 = 8;
+        for _ in 0..MAX_FLUSH_ROUNDS {
+            let events = self.store.flush();
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                self.route_event(event).await;
+            }
         }
         for packets in self.packets_by_target.drain() {
             self.transport_cmds
@@ -139,6 +151,9 @@ impl MultiRaftActor {
             }
             RaftEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
             RaftEvent::LeaderChange(lc) => {
+                if lc.leader_node_id == *self.store.node_id() {
+                    self.reconcile_peers_against_swim(lc.shard_group_id).await;
+                }
                 let _ = self
                     .swim_tx
                     .send(SwimCommand::AnnounceShardLeader(lc))
@@ -153,6 +168,22 @@ impl MultiRaftActor {
                     .extend(committed.into_data_transport_cmds());
             }
         }
+    }
+
+    /// On becoming leader of a group, propose `RemovePeer` for any peer that
+    /// SWIM no longer considers Alive — covers the case where the previous
+    /// leader died before it could propose the removal. See
+    /// `diagrams/metadata-management/membership-reconciliation-and-rebalancing.md`
+    async fn reconcile_peers_against_swim(&mut self, group_id: ShardGroupId) {
+        let Ok(members) = self.swim_tx.get_members().await else {
+            return;
+        };
+        let live: HashSet<NodeId> = members
+            .into_iter()
+            .filter(|m| m.state == SwimNodeState::Alive)
+            .map(|m| m.node_id)
+            .collect();
+        self.store.reconcile_peers(group_id, &live);
     }
     async fn enrich_command(&self, cmd: MultiRaftActorCommand) -> MultiRaftActorCommand {
         match cmd {

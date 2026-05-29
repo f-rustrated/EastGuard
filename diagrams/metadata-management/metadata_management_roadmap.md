@@ -209,6 +209,8 @@ The peer set determines quorum size at every log index. If two replicas disagree
 
 A node may become leader while its `peers` set contains nodes SWIM already considers dead (e.g., the previous leader died before proposing `RemovePeer` for them). On `LeaderChange → self`, the new leader queries SWIM (`get_members`) and proposes `RemovePeer` for any peer not in the live set. This closes the only gap where direct mutation seems tempting.
 
+**Important caveat — reconciliation alone shrinks the group.** Removing a dead peer without adding a replacement reduces total membership, which reduces the number of future failures the group can tolerate. The proper paired operation is `RemovePeer(dead) + AddPeer(replacement)`. The replacement-selection half is **not yet built** — current reconciliation is the first half of a two-step pattern. See `membership-reconciliation-and-rebalancing.md` for the failure cases, the brittleness analysis, and what the missing half should look like.
+
 **Pending-entry cleanup:**
 
 A leader that proposes `RemovePeer` but loses leadership before commit must drop its in-memory `pending_*` bookkeeping for that entry — the new leader may truncate it. `MultiRaft` clears pending proposal contexts on `LeaderChange → away` and on log truncation. Same mechanism already covers `pending_proposals` and `pending_seals`.
