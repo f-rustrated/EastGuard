@@ -641,14 +641,78 @@ pub mod props {
             if self.state == TopicState::Active {
                 self.assert_keyspace_coverage();
             }
+            self.assert_fixed_strategy_single_range();
+            self.assert_delete_cascade();
             for range in self.ranges.values() {
-                TAssertInvariant::assert_invariants(range);
+                range.assert_invariants();
+
                 self.assert_split_children_cooldown(range);
             }
         }
     }
 
     impl TopicMeta {
+        /// Invariant: a Fixed-strategy topic rejects splits at apply, so its
+        /// range topology can never grow beyond the initial single full-keyspace
+        /// range. Sealed topics retain that range; active topics must still have
+        /// exactly one active range.
+        fn assert_fixed_strategy_single_range(&self) {
+            if self.storage_policy.partition_strategy != PartitionStrategy::Fixed {
+                return;
+            }
+            assert_eq!(
+                self.ranges.len(),
+                1,
+                "Fixed-strategy topic {:?} has {} ranges; splits should be rejected",
+                self.id,
+                self.ranges.len(),
+            );
+            if self.state == TopicState::Active {
+                assert_eq!(
+                    self.active_ranges.len(),
+                    1,
+                    "Fixed-strategy active topic {:?} has {} active ranges",
+                    self.id,
+                    self.active_ranges.len(),
+                );
+            }
+        }
+
+        /// Invariant: deleting a topic cascades to every range and every
+        /// segment in one applied operation. A Deleted topic with any range or
+        /// segment not marked Deleting would leak storage past GC.
+        fn assert_delete_cascade(&self) {
+            if self.state != TopicState::Deleted {
+                return;
+            }
+            assert!(
+                self.active_ranges.is_empty(),
+                "Deleted topic {:?} still has {} active ranges",
+                self.id,
+                self.active_ranges.len(),
+            );
+            for range in self.ranges.values() {
+                assert_eq!(
+                    range.state,
+                    RangeState::Deleting,
+                    "Deleted topic {:?} has range {:?} in state {:?}",
+                    self.id,
+                    range.range_id,
+                    range.state,
+                );
+                for seg in range.segments.values() {
+                    assert_eq!(
+                        seg.state,
+                        SegmentState::Deleting,
+                        "Deleted topic {:?} has segment {:?} in state {:?}",
+                        self.id,
+                        seg.segment_id,
+                        seg.state,
+                    );
+                }
+            }
+        }
+
         fn assert_split_children_cooldown(&self, range: &RangeMeta) {
             let Some([left, right]) = range.split_into else {
                 return;
@@ -697,6 +761,7 @@ pub mod props {
     impl TAssertInvariant for RangeMeta {
         fn assert_invariants(&self) {
             self.assert_active_segment_state();
+            self.assert_single_active_segment();
             for sid in self.segments.keys() {
                 assert!(
                     sid.0 < self.next_segment_id,
@@ -709,10 +774,68 @@ pub mod props {
                 "range both split and merged"
             );
             self.assert_seal_history();
+            self.assert_offset_chain();
         }
     }
 
     impl RangeMeta {
+        /// Invariant: each range has at most one segment in `Active` state.
+        /// An Active range has exactly one; Sealed/Deleting ranges have zero.
+        /// Two concurrently-active segments would admit conflicting writes at the
+        /// same offset on the same range.
+        fn assert_single_active_segment(&self) {
+            let active_count = self
+                .segments
+                .values()
+                .filter(|s| s.state == SegmentState::Active)
+                .count();
+            let expected = match self.state {
+                RangeState::Active => 1,
+                RangeState::Sealed | RangeState::Deleting => 0,
+            };
+            assert_eq!(
+                active_count, expected,
+                "range {:?} (state={:?}) has {} active segments, expected {}",
+                self.range_id, self.state, active_count, expected,
+            );
+        }
+
+        /// Invariants: ordered by segment_id, segments form a contiguous
+        /// offset chain (`seg[N].end_offset + 1 == seg[N+1].start_offset`) wherever
+        /// `end_offset` is known, and `next_offset` covers the active head. The
+        /// chain may have one trailing hole — a death-triggered roll seals with
+        /// `end_offset = None` and is later patched by `correct_end_offset`.
+        fn assert_offset_chain(&self) {
+            let mut segs: Vec<&SegmentMeta> = self.segments.values().collect();
+            segs.sort_by_key(|s| s.segment_id.0);
+            for window in segs.windows(2) {
+                let (prev, next) = (&window[0], &window[1]);
+                if let Some(end) = prev.end_offset {
+                    assert_eq!(
+                        end + 1,
+                        next.start_offset,
+                        "range {:?} offset gap: seg {:?} end_offset+1={} != seg {:?} start_offset={}",
+                        self.range_id,
+                        prev.segment_id,
+                        end + 1,
+                        next.segment_id,
+                        next.start_offset,
+                    );
+                }
+            }
+            if let Some(active_seg_id) = self.active_segment
+                && let Some(active_seg) = self.segments.get(&active_seg_id)
+            {
+                assert!(
+                    self.next_offset >= active_seg.start_offset,
+                    "range {:?} next_offset ({}) < active segment start_offset ({})",
+                    self.range_id,
+                    self.next_offset,
+                    active_seg.start_offset,
+                );
+            }
+        }
+
         fn assert_sealed_segments(&self) {
             for seg in self.segments.values() {
                 if seg.state == SegmentState::Sealed {

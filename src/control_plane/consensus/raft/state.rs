@@ -872,12 +872,17 @@ impl Raft {
 #[cfg(any(test, debug_assertions))]
 impl crate::test_traits::TAssertInvariant for Raft {
     fn assert_invariants(&self) {
-        // last_applied_index <= commit_index <= log length
         assert!(
             self.last_applied_index <= self.commit_index,
             "last_applied ({}) > commit_index ({})",
             self.last_applied_index,
             self.commit_index,
+        );
+        assert!(
+            self.last_applied_index <= self.stabled_index,
+            "last_applied ({}) > stabled_index ({}) — applied a non-durable entry",
+            self.last_applied_index,
+            self.stabled_index,
         );
         assert!(
             self.commit_index <= self.log_last_index(),
@@ -894,20 +899,58 @@ impl crate::test_traits::TAssertInvariant for Raft {
                 "log entry at position {i} has non-contiguous index {}",
                 entry.index,
             );
+            assert!(
+                entry.term <= self.current_term,
+                "log entry at index {} has term {} > current_term {}",
+                entry.index,
+                entry.term,
+                self.current_term,
+            );
         }
 
-        // Leader must have peer_states for all peers
-        if self.role == Role::Leader {
-            for peer in &self.peers {
+        // Invariant: peer_states exists only on the leader (and matches the peer
+        // set when leader). Followers/candidates carry an empty peer_states.
+        match self.role {
+            Role::Leader => {
+                for peer in &self.peers {
+                    assert!(
+                        self.peer_states.contains_key(peer),
+                        "leader missing peer_state for {:?}",
+                        peer,
+                    );
+                }
+                assert_eq!(
+                    self.peer_states.len(),
+                    self.peers.len(),
+                    "leader peer_states size ({}) != peers size ({})",
+                    self.peer_states.len(),
+                    self.peers.len(),
+                );
+                // Invariant: at most one leader per term. A snapshot can only check
+                // the local fragment of this: a leader must have voted for itself this
+                // term (and is therefore the only node that could have won this term).
+                assert_eq!(
+                    self.voted_for.as_ref(),
+                    Some(&self.node_id),
+                    "leader has voted_for {:?}, expected self ({:?})",
+                    self.voted_for,
+                    self.node_id,
+                );
+            }
+            Role::Follower | Role::Candidate { .. } => {
                 assert!(
-                    self.peer_states.contains_key(peer),
-                    "leader missing peer_state for {:?}",
-                    peer,
+                    self.peer_states.is_empty(),
+                    "non-leader carries peer_states ({} entries)",
+                    self.peer_states.len(),
                 );
             }
         }
 
-        // Self is never in peers
+        // Invariant (partial): self is never in peers. The peer set is otherwise
+        // mutated only via apply of committed AddPeer/RemovePeer entries — the
+        // discipline itself is enforced by keeping `apply_add_peer`/`apply_remove_peer`
+        // as the sole callers of `peers.insert`/`peers.remove` (callers checked at
+        // compile time by their private visibility).
         assert!(
             !self.peers.contains(&self.node_id),
             "self found in peers set",

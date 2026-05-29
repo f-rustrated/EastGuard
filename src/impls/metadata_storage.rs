@@ -1,10 +1,10 @@
 use crate::control_plane::{
     BINCODE_CONFIG, NodeId,
+    consensus::messages::LogMutation,
     consensus::raft::{
         log::LogEntry,
         storage::{RaftPersistentState, RaftStorage},
     },
-    consensus::messages::LogMutation,
     membership::ShardGroupId,
 };
 #[cfg(any(test, debug_assertions))]
@@ -251,12 +251,20 @@ impl TAssertInvariant for MetadataStorage {
             );
 
             // LogEntry keys must be exactly 17 bytes (8 group + 1 tag + 8 index)
+            // and the index portion must be >= 1 (invariant 5: log index is 1-based;
+            // index 0 is never stored).
             if type_tag == 0x01 {
                 assert_eq!(
                     key.len(),
                     17,
                     "LogEntry key must be 17 bytes, got {}",
                     key.len(),
+                );
+                let index = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                assert!(
+                    index >= 1,
+                    "LogEntry index must be >= 1 (1-based), got {}",
+                    index,
                 );
             }
 

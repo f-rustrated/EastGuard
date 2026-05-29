@@ -108,8 +108,6 @@ impl Topology {
             //TODO clarify implications of this behaviour while removing it from the Livetracker on suspect
             SwimNodeState::Suspect => {}
         }
-        #[cfg(any(test, debug_assertions))]
-        self.assert_invariants();
     }
 
     fn add_pnode(&mut self, pnode_id: NodeId) {
@@ -214,8 +212,7 @@ impl Topology {
     /// Looks up the canonical `ShardGroup` from the `groups` map.
     ///
     /// Returns `None` if the ring is empty.
-    #[allow(dead_code)]
-    pub fn shard_group_for(&self, key: &[u8]) -> Option<&ShardGroup> {
+    pub(crate) fn shard_group_for(&self, key: &[u8]) -> Option<&ShardGroup> {
         let hash = hash_stable(key);
         let nearest_token = self.walk_clockwise_from(hash).next()?;
         let id = ShardGroupId::from_vnode_hash(nearest_token.hash);
@@ -224,23 +221,18 @@ impl Topology {
 
     /// Returns all unique shard groups that `node_id` participates in.
     /// O(G) where G = number of groups for this node (lookups into `groups` map).
-    pub fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<&ShardGroup> {
+    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<&ShardGroup> {
         self.node_group_ids
             .get(node_id)
             .map(|ids| ids.iter().filter_map(|id| self.groups.get(id)).collect())
             .unwrap_or_default()
     }
 
-    #[expect(dead_code)]
-    pub fn num_nodes(&self) -> usize {
-        self.node_group_ids.len()
-    }
-
-    pub fn live_nodes(&self) -> Vec<NodeId> {
+    pub(crate) fn live_nodes(&self) -> Vec<NodeId> {
         self.node_group_ids.keys().cloned().collect()
     }
 
-    pub fn update_shard_leader(&mut self, info: &ShardLeaderInfo) -> bool {
+    pub(crate) fn update_shard_leader(&mut self, info: &ShardLeaderInfo) -> bool {
         if let Some(existing) = self.shard_leaders.get(&info.shard_group_id)
             && info.term <= existing.term
         {
@@ -296,6 +288,7 @@ pub mod props {
             self.assert_reverse_index_consistent();
             self.assert_groups_consistent();
             self.assert_vnode_counts();
+            self.assert_shard_leaders_valid();
         }
     }
     impl Topology {
@@ -337,6 +330,21 @@ pub mod props {
                     group.members.len(),
                     "group {:?} has duplicate members",
                     gid
+                );
+            }
+        }
+
+        /// Invariants : every stored leader entry carries a Raft term >= 1
+        /// (Raft's first elected term). A term of 0 is the "no leader yet" sentinel
+        /// and must never appear as a stored entry. The map is never auto-cleared
+        /// on node death, so the presence check also guards invariant 7
+        /// (entries persist until overwritten by a higher term).
+        fn assert_shard_leaders_valid(&self) {
+            for (gid, entry) in &self.shard_leaders {
+                assert!(
+                    entry.term >= 1,
+                    "shard leader for group {:?} has invalid term 0",
+                    gid,
                 );
             }
         }

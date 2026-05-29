@@ -229,7 +229,7 @@ impl crate::test_traits::TAssertInvariant for MetadataStateMachine {
             assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
         }
         for topic in self.topics.values() {
-            crate::test_traits::TAssertInvariant::assert_invariants(topic);
+            topic.assert_invariants();
         }
     }
 }

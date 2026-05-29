@@ -488,6 +488,9 @@ impl Swim {
                     self.incarnation,
                     new_incarnation
                 );
+                // SWIM invariant: self-incarnation only increases.
+                debug_assert!(new_incarnation > self.incarnation);
+
                 self.incarnation = new_incarnation;
                 // Enqueue refutation so that the cluster learns quickly
                 self.gossip_buffer.enqueue(
@@ -720,6 +723,7 @@ pub mod props {
             );
             self.assert_tracker_only_alive();
             self.assert_suspected_seqs_consistent();
+            self.topology.assert_invariants();
         }
     }
 
