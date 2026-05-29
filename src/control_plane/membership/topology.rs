@@ -105,6 +105,7 @@ impl Topology {
             SwimNodeState::Dead => {
                 self.remove_node(&node_id);
             }
+            //TODO clarify implications of this behaviour while removing it from the Livetracker on suspect
             SwimNodeState::Suspect => {}
         }
         #[cfg(any(test, debug_assertions))]
