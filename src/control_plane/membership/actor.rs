@@ -12,7 +12,7 @@ use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
-
+use crate::test_traits::TAssertInvariant;
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
 // ==========================================
@@ -83,8 +83,13 @@ impl SwimActor {
                 break;
             }
             for event in buf.drain(..) {
-                actor.state.dispatch(event);
+                match event {
+                    SwimActorCommand::Command(cmd) => actor.state.dispatch_command(cmd),
+                    SwimActorCommand::Query(q) => actor.state.handle_query(q),
+                }
             }
+            #[cfg(any(test, debug_assertions))]
+            actor.state.assert_invariants()
         }
     }
 
@@ -127,7 +132,7 @@ impl SwimSender {
         resource_key: Vec<u8>,
     ) -> anyhow::Result<Option<ShardGroup>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveShardGroup {
+        self.send(QueryCommand::ResolveShardGroup {
             key: resource_key,
             reply: send,
         })
@@ -140,14 +145,14 @@ impl SwimSender {
         key: Vec<u8>,
     ) -> anyhow::Result<Option<(ShardGroup, Option<ShardLeaderEntry>)>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::GetShardInfo { key, reply: send })
+        self.send(QueryCommand::GetShardInfo { key, reply: send })
             .await?;
         Ok(recv.await?)
     }
 
     pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<SwimNode>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::GetMembers { reply: send })
+        self.send(QueryCommand::GetMembers { reply: send })
             .await?;
         Ok(recv.await?)
     }
@@ -157,7 +162,7 @@ impl SwimSender {
         node_id: NodeId,
     ) -> anyhow::Result<Option<NodeAddress>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveAddress {
+        self.send(QueryCommand::ResolveAddress {
             node_id,
             reply: send,
         })
@@ -170,7 +175,7 @@ impl SwimSender {
         shard_group_id: ShardGroupId,
     ) -> anyhow::Result<Option<ShardLeaderEntry>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveShardLeader {
+        self.send(QueryCommand::ResolveShardLeader {
             shard_group_id,
             reply: send,
         })

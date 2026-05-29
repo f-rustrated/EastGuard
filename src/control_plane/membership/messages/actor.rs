@@ -7,12 +7,12 @@ use super::command::{SwimCommand, SwimTimeOutCallback};
 /// Actor-level command envelope. Lives only in east-guard (tokio-dependent).
 #[derive(Debug)]
 pub(crate) enum SwimActorCommand {
-    Protocol(SwimCommand),
-    Query(SwimQueryCommand),
+    Command(SwimCommand),
+    Query(QueryCommand),
 }
 
 #[derive(Debug)]
-pub enum SwimQueryCommand {
+pub enum QueryCommand {
     GetMembers {
         reply: tokio::sync::oneshot::Sender<Vec<SwimNode>>,
     },
@@ -36,18 +36,18 @@ pub enum SwimQueryCommand {
 
 impl From<SwimCommand> for SwimActorCommand {
     fn from(cmd: SwimCommand) -> Self {
-        SwimActorCommand::Protocol(cmd)
+        SwimActorCommand::Command(cmd)
     }
 }
 
 impl From<SwimTimeOutCallback> for SwimActorCommand {
     fn from(cb: SwimTimeOutCallback) -> Self {
-        SwimActorCommand::Protocol(SwimCommand::Timeout(cb))
+        SwimActorCommand::Command(SwimCommand::Timeout(cb))
     }
 }
 
-impl From<SwimQueryCommand> for SwimActorCommand {
-    fn from(q: SwimQueryCommand) -> Self {
+impl From<QueryCommand> for SwimActorCommand {
+    fn from(q: QueryCommand) -> Self {
         SwimActorCommand::Query(q)
     }
 }

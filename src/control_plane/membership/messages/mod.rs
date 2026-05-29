@@ -5,7 +5,7 @@ pub(crate) mod event;
 mod packet;
 mod timer;
 
-pub use actor::SwimQueryCommand;
+pub use actor::QueryCommand;
 pub use command::SwimEvent;
 pub use event::{MembershipEvent, NodeAlive, NodeDead};
 

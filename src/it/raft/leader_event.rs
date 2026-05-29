@@ -12,7 +12,7 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{
-    ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, SwimQueryCommand,
+    ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, QueryCommand,
 };
 use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
@@ -32,14 +32,14 @@ async fn swim_handler_with_leader_capture(
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) => {
+            SwimActorCommand::Query(QueryCommand::ResolveAddress { node_id, reply }) => {
                 let _ = reply.send(
                     address_map
                         .get(&node_id)
                         .map(|&addr| NodeAddress::test(addr, addr)),
                 );
             }
-            SwimActorCommand::Protocol(SwimCommand::AnnounceShardLeader(event)) => {
+            SwimActorCommand::Command(SwimCommand::AnnounceShardLeader(event)) => {
                 let _ = leader_events_tx.send(event).await;
             }
             _ => {}

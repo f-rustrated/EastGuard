@@ -374,6 +374,7 @@ impl Swim {
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         self.process_piggybacked_gossip(&packet);
+
         match packet {
             SwimPacket::Ping(header) => self.handle_ping(src, header),
             SwimPacket::Ack(header) => self.handle_ack(src, header),
@@ -479,8 +480,8 @@ impl Swim {
 
     fn apply_membership_update(&mut self, member: SwimNode) {
         // Refutation: only refute Suspect, not Dead (Dead is terminal per SWIM spec)
-        if member.node_id == self.node_id {
-            if member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation {
+        if self.is_me(&member) {
+            if self.should_refute(&member) {
                 let new_incarnation = member.incarnation + 1;
                 tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
@@ -509,6 +510,14 @@ impl Swim {
             member.state,
             member.incarnation,
         );
+    }
+
+    fn should_refute(&self, member: &SwimNode) -> bool {
+        member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation
+    }
+
+    fn is_me(&self, member: &SwimNode) -> bool {
+        member.node_id == self.node_id
     }
 
     fn handle_incarnation_check(
@@ -657,14 +666,7 @@ impl Swim {
         std::mem::take(&mut self.pending_events)
     }
 
-    pub(crate) fn dispatch(&mut self, event: SwimActorCommand) {
-        match event {
-            SwimActorCommand::Protocol(cmd) => self.dispatch_protocol(cmd),
-            SwimActorCommand::Query(q) => self.handle_query(q),
-        }
-    }
-
-    fn dispatch_protocol(&mut self, cmd: SwimCommand) {
+    pub(crate) fn dispatch_command(&mut self, cmd: SwimCommand) {
         match cmd {
             SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
             SwimCommand::Timeout(event) => self.handle_timeout(event),
@@ -674,21 +676,21 @@ impl Swim {
         }
     }
 
-    fn handle_query(&self, command: SwimQueryCommand) {
+    pub(crate) fn handle_query(&self, command: QueryCommand) {
         match command {
-            SwimQueryCommand::GetMembers { reply } => {
+            QueryCommand::GetMembers { reply } => {
                 let _ = reply.send(self.get_members());
             }
-            SwimQueryCommand::ResolveAddress { node_id, reply } => {
+            QueryCommand::ResolveAddress { node_id, reply } => {
                 let _ = reply.send(self.resolve_address(&node_id));
             }
-            SwimQueryCommand::ResolveShardGroup { key, reply } => {
+            QueryCommand::ResolveShardGroup { key, reply } => {
                 let _ = reply.send(self.topology.shard_group_for(&key).cloned());
             }
-            SwimQueryCommand::GetShardInfo { key, reply } => {
+            QueryCommand::GetShardInfo { key, reply } => {
                 let _ = reply.send(self.get_shard_info(&key));
             }
-            SwimQueryCommand::ResolveShardLeader {
+            QueryCommand::ResolveShardLeader {
                 shard_group_id,
                 reply,
             } => {

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 
-use crate::control_plane::membership::{SwimActorCommand, SwimQueryCommand};
+use crate::control_plane::membership::{SwimActorCommand, QueryCommand};
 use crate::control_plane::{NodeAddress, NodeId};
 
 pub(super) const CLUSTER_PORT: u16 = 19000;
@@ -14,7 +14,7 @@ pub(super) async fn mock_swim_handler(
     address_map: HashMap<NodeId, SocketAddr>,
 ) {
     while let Some(cmd) = rx.recv().await {
-        if let SwimActorCommand::Query(SwimQueryCommand::ResolveAddress { node_id, reply }) = cmd {
+        if let SwimActorCommand::Query(QueryCommand::ResolveAddress { node_id, reply }) = cmd {
             let _ = reply.send(
                 address_map
                     .get(&node_id)
