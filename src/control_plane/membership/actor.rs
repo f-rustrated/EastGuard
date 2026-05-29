@@ -12,7 +12,7 @@ use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
-
+use crate::test_traits::TAssertInvariant;
 // ==========================================
 // PROTOCOL LAYER (SWIM Actor)
 // ==========================================
@@ -88,6 +88,8 @@ impl SwimActor {
                     SwimActorCommand::Query(q) => actor.state.handle_query(q),
                 }
             }
+            #[cfg(any(test, debug_assertions))]
+            actor.state.assert_invariants()
         }
     }
 
