@@ -127,7 +127,7 @@ impl SwimSender {
         resource_key: Vec<u8>,
     ) -> anyhow::Result<Option<ShardGroup>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveShardGroup {
+        self.send(QueryCommand::ResolveShardGroup {
             key: resource_key,
             reply: send,
         })
@@ -140,14 +140,14 @@ impl SwimSender {
         key: Vec<u8>,
     ) -> anyhow::Result<Option<(ShardGroup, Option<ShardLeaderEntry>)>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::GetShardInfo { key, reply: send })
+        self.send(QueryCommand::GetShardInfo { key, reply: send })
             .await?;
         Ok(recv.await?)
     }
 
     pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<SwimNode>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::GetMembers { reply: send })
+        self.send(QueryCommand::GetMembers { reply: send })
             .await?;
         Ok(recv.await?)
     }
@@ -157,7 +157,7 @@ impl SwimSender {
         node_id: NodeId,
     ) -> anyhow::Result<Option<NodeAddress>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveAddress {
+        self.send(QueryCommand::ResolveAddress {
             node_id,
             reply: send,
         })
@@ -170,7 +170,7 @@ impl SwimSender {
         shard_group_id: ShardGroupId,
     ) -> anyhow::Result<Option<ShardLeaderEntry>> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(SwimQueryCommand::ResolveShardLeader {
+        self.send(QueryCommand::ResolveShardLeader {
             shard_group_id,
             reply: send,
         })

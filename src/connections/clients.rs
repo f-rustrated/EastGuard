@@ -438,7 +438,7 @@ mod tests {
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
-        ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, SwimQueryCommand,
+        ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, QueryCommand,
     };
     use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
     use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
@@ -487,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn create_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
             {
                 let _ = reply.send(Some(test_shard_group()));
             }
@@ -522,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn create_topic_shard_not_found() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
             {
                 let _ = reply.send(None);
             }
@@ -552,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn delete_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::ResolveShardGroup { reply, .. }) = cmd
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
             {
                 let _ = reply.send(Some(test_shard_group()));
             }
@@ -616,7 +616,7 @@ mod tests {
         let swim = {
             let nodes = nodes.clone();
             swim_sender_with(move |cmd| {
-                if let SwimActorCommand::Query(SwimQueryCommand::GetMembers { reply }) = cmd {
+                if let SwimActorCommand::Query(QueryCommand::GetMembers { reply }) = cmd {
                     let _ = reply.send(nodes.clone());
                 }
             })
@@ -646,7 +646,7 @@ mod tests {
             let group = group.clone();
             let leader = leader.clone();
             swim_sender_with(move |cmd| {
-                if let SwimActorCommand::Query(SwimQueryCommand::GetShardInfo { reply, .. }) = cmd {
+                if let SwimActorCommand::Query(QueryCommand::GetShardInfo { reply, .. }) = cmd {
                     let _ = reply.send(Some((group.clone(), Some(leader.clone()))));
                 }
             })
@@ -668,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn get_shard_info_absent() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(SwimQueryCommand::GetShardInfo { reply, .. }) = cmd {
+            if let SwimActorCommand::Query(QueryCommand::GetShardInfo { reply, .. }) = cmd {
                 let _ = reply.send(None);
             }
         });

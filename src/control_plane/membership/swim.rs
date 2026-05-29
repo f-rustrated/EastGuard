@@ -659,7 +659,7 @@ impl Swim {
 
     pub(crate) fn dispatch(&mut self, event: SwimActorCommand) {
         match event {
-            SwimActorCommand::Protocol(cmd) => self.dispatch_protocol(cmd),
+            SwimActorCommand::Command(cmd) => self.dispatch_protocol(cmd),
             SwimActorCommand::Query(q) => self.handle_query(q),
         }
     }
@@ -674,21 +674,21 @@ impl Swim {
         }
     }
 
-    fn handle_query(&self, command: SwimQueryCommand) {
+    fn handle_query(&self, command: QueryCommand) {
         match command {
-            SwimQueryCommand::GetMembers { reply } => {
+            QueryCommand::GetMembers { reply } => {
                 let _ = reply.send(self.get_members());
             }
-            SwimQueryCommand::ResolveAddress { node_id, reply } => {
+            QueryCommand::ResolveAddress { node_id, reply } => {
                 let _ = reply.send(self.resolve_address(&node_id));
             }
-            SwimQueryCommand::ResolveShardGroup { key, reply } => {
+            QueryCommand::ResolveShardGroup { key, reply } => {
                 let _ = reply.send(self.topology.shard_group_for(&key).cloned());
             }
-            SwimQueryCommand::GetShardInfo { key, reply } => {
+            QueryCommand::GetShardInfo { key, reply } => {
                 let _ = reply.send(self.get_shard_info(&key));
             }
-            SwimQueryCommand::ResolveShardLeader {
+            QueryCommand::ResolveShardLeader {
                 shard_group_id,
                 reply,
             } => {
