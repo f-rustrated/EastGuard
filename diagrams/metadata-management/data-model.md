@@ -606,7 +606,7 @@ Client                    MultiRaftActor                    Raft
 - Already has `HashMap<ShardGroupId, Raft>` — can check `is_leader()` directly
 - `ShardGroupId::new(key)` is a pure hash — no topology query needed
 - Avoids async round-trip to SWIM for routing info
-- Internal proposals (AddPeer/RemovePeer from SWIM events) already go through `MultiRaft` directly via `HandleNodeDeath`/`HandleNodeJoin`
+- Internal proposals (`AddPeer`/`RemovePeer` from SWIM events) flow through the same `MultiRaft::propose()` path as application commands — `HandleNodeDeath`/`HandleNodeJoin` translate the SWIM event into a `RaftCommand::AddPeer`/`RemovePeer` log entry on the affected shard group's leader. Peer set is part of the replicated state; mutating it outside the log would let replicas disagree on quorum size. See `metadata_management_roadmap.md` § Phase 3d "Membership Changes via the Log".
 - Client handler in `lib.rs` stays thin — just forwards to `MultiRaftActor`
 
 **Current `MultiRaftActorCommand::Propose` takes `shard_group_id: ShardGroupId`.** This changes to `resource_key: Vec<u8>`. MultiRaft computes the ShardGroupId internally. The caller never needs to know shard assignment.

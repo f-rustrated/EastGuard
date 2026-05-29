@@ -268,6 +268,7 @@ impl TAssertInvariant for MetadataStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::consensus::raft::command::RaftCommand;
 
     fn temp_db() -> (MetadataStorage, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -279,7 +280,7 @@ mod tests {
         LogEntry {
             term,
             index,
-            command: None,
+            command: RaftCommand::Noop,
         }
     }
 

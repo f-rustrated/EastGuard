@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::membership::ShardGroupId;
@@ -246,6 +247,10 @@ impl Raft {
         self.peers.len()
     }
 
+    pub fn peers_iter(&self) -> impl Iterator<Item = &NodeId> {
+        self.peers.iter()
+    }
+
     pub fn current_leader(&self) -> Option<&NodeId> {
         self.current_leader.as_ref()
     }
@@ -451,7 +456,7 @@ impl Raft {
         // preceding entries from earlier terms can be committed.
         // Without this, old-term entries remain in limbo until a real
         // client proposal arrives.
-        self.add_new_entry(None);
+        self.add_new_entry(RaftCommand::Noop);
 
         // Send AppendEntries (with the Noop) to all peers.
         self.send_heartbeats();
@@ -684,8 +689,10 @@ impl Raft {
                 break;
             };
             match entry.command {
-                None => {}
-                Some(cmd) => self.apply_metadata_entry(cmd, entry.index),
+                RaftCommand::Noop => {}
+                RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
+                RaftCommand::AddPeer(node_id) => self.apply_add_peer(node_id),
+                RaftCommand::RemovePeer(node_id) => self.apply_remove_peer(node_id),
             }
         }
     }
@@ -723,14 +730,14 @@ impl Raft {
         }
     }
 
-    /// Directly add a peer to this Raft instance. Called by MultiRaft on
-    /// SWIM `NodeAlive` events — bypasses the log since SWIM is membership authority.
-    pub(crate) fn add_peer(&mut self, node_id: NodeId) {
+    /// Apply-only helper. Invoked from `apply_committed_entries()` when an
+    /// `AddPeer` log entry commits. Never call directly — the peer set is part
+    /// of the replicated state machine and must only mutate through the log.
+    fn apply_add_peer(&mut self, node_id: NodeId) {
         if node_id == self.node_id {
             return;
         }
-        self.peers.insert(node_id.clone());
-        if self.role == Role::Leader {
+        if self.peers.insert(node_id.clone()) && self.role == Role::Leader {
             self.peer_states.insert(
                 node_id,
                 PeerState {
@@ -741,15 +748,17 @@ impl Raft {
         }
     }
 
-    /// Directly remove a peer from this Raft instance. Called by MultiRaft on
-    /// SWIM `NodeDead` events — bypasses the log since SWIM is membership authority.
-    pub(crate) fn remove_peer(&mut self, node_id: &NodeId) {
-        self.peers.remove(node_id);
-        self.peer_states.remove(node_id);
-        self.events.push(RaftEvent::DisconnectPeer(node_id.clone()));
+    /// Apply-only helper. Invoked from `apply_committed_entries()` when a
+    /// `RemovePeer` log entry commits. Never call directly — the peer set is part
+    /// of the replicated state machine and must only mutate through the log.
+    fn apply_remove_peer(&mut self, node_id: NodeId) {
+        if self.peers.remove(&node_id) {
+            self.peer_states.remove(&node_id);
+            self.events.push(RaftEvent::DisconnectPeer(node_id));
+        }
     }
 
-    fn add_new_entry(&mut self, command: Option<MetadataCommand>) {
+    fn add_new_entry(&mut self, command: RaftCommand) {
         let entry = LogEntry {
             term: self.current_term,
             index: self.log_last_index() + 1,
@@ -768,12 +777,12 @@ impl Raft {
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
     /// Returns the log index at which the command was appended on success.
-    pub fn propose(&mut self, command: MetadataCommand) -> Result<u64, ProposeError> {
+    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader(self.current_leader.clone()));
         }
 
-        self.add_new_entry(Some(command));
+        self.add_new_entry(command);
         let index = self.log_last_index();
 
         // Immediately replicate to all peers.
@@ -912,17 +921,7 @@ mod tests {
 
     impl Raft {
         pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposeError> {
-            if self.role != Role::Leader {
-                return Err(ProposeError::NotLeader(self.current_leader.clone()));
-            }
-            self.add_new_entry(None);
-            let index = self.log_last_index();
-            let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
-            for peer_id in peers {
-                self.send_append_entries(peer_id);
-            }
-            self.try_advance_commit_index();
-            Ok(index)
+            self.propose(RaftCommand::Noop)
         }
 
         pub(crate) fn simulate_flush(&mut self) {
@@ -1153,7 +1152,7 @@ mod tests {
         raft.log_append(LogEntry {
             term: 2,
             index: 1,
-            command: None,
+            command: RaftCommand::Noop,
         });
 
         // node-1 requests vote with older log (term 1)
@@ -1203,7 +1202,7 @@ mod tests {
                 panic!("expected AppendEntries")
             };
             assert_eq!(ae.entries.len(), 1, "initial AE should carry noop");
-            assert_eq!(ae.entries[0].command, None);
+            assert_eq!(ae.entries[0].command, RaftCommand::Noop);
             assert_eq!(ae.entries[0].term, 1);
         }
 
@@ -1248,7 +1247,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                command: None,
+                command: RaftCommand::Noop,
             }],
             leader_commit: 0,
         };
@@ -1303,7 +1302,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 2,
-                command: None,
+                command: RaftCommand::Noop,
             }],
             leader_commit: 0,
         };
@@ -1405,7 +1404,7 @@ mod tests {
             entries: vec![LogEntry {
                 term: 1,
                 index: 1,
-                command: None,
+                command: RaftCommand::Noop,
             }],
             leader_commit: 1,
         };
@@ -1751,30 +1750,46 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Direct peer mutation: add_peer / remove_peer
+    // Membership changes via the Raft log
     // -------------------------------------------------------------------
+    //
+    // AddPeer/RemovePeer apply through `apply_committed_entries()` on commit.
+    // Direct mutation is gone — the peer set is part of the replicated state.
 
     #[test]
-    fn add_peer_inserts_into_peers() {
+    fn add_peer_log_entry_inserts_into_peers_on_apply() {
         let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        assert!(raft.is_leader());
         assert_eq!(raft.peers_count(), 0);
 
-        raft.add_peer(node("node-2"));
+        raft.propose(RaftCommand::AddPeer(node("node-2"))).unwrap();
+        raft.simulate_flush();
 
         assert!(raft.has_peer(&node("node-2")));
         assert_eq!(raft.peers_count(), 1);
     }
 
     #[test]
-    fn add_peer_skips_self() {
+    fn add_peer_log_entry_skips_self() {
         let mut raft = single_node_raft();
-        raft.add_peer(node("node-1")); // node-1 is self
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+
+        raft.propose(RaftCommand::AddPeer(node("node-1"))).unwrap();
+        raft.simulate_flush();
+
         assert!(!raft.has_peer(&node("node-1")));
         assert_eq!(raft.peers_count(), 0);
     }
 
     #[test]
-    fn add_peer_leader_initializes_peer_state() {
+    fn add_peer_log_entry_leader_initializes_peer_state() {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
@@ -1782,8 +1797,9 @@ mod tests {
         drain(&mut raft);
         assert!(raft.is_leader());
 
-        raft.add_peer(node("node-2"));
-        assert!(raft.has_peer(&node("node-2")));
+        raft.propose(RaftCommand::AddPeer(node("node-2"))).unwrap();
+        raft.simulate_flush();
+        drain(&mut raft);
 
         // Next heartbeat must include AppendEntries to node-2.
         raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
@@ -1795,18 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_peer_removes_from_peers() {
-        let mut raft = three_node_raft("node-1");
-        assert!(raft.has_peer(&node("node-3")));
-
-        raft.remove_peer(&node("node-3"));
-
-        assert!(!raft.has_peer(&node("node-3")));
-        assert_eq!(raft.peers_count(), 1);
-    }
-
-    #[test]
-    fn remove_peer_clears_peer_state_for_leader() {
+    fn remove_peer_log_entry_removes_from_peers_on_apply() {
         let mut n1 = three_node_raft("node-1");
         let mut n2 = three_node_raft("node-2");
 
@@ -1824,10 +1829,13 @@ mod tests {
         }
         assert!(n1.is_leader());
         drain(&mut n1);
+        assert!(n1.has_peer(&node("node-3")));
 
-        n1.remove_peer(&node("node-3"));
+        // Direct apply: simulate the RemovePeer entry committing on this leader
+        // without needing a full 3-node simulation. The apply helper is the
+        // production code path triggered by `apply_committed_entries()`.
+        n1.apply_remove_peer(node("node-3"));
 
-        // After removal, next heartbeat must NOT target node-3.
         n1.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
             shard_group_id: TEST_SHARD,
         });
@@ -1863,7 +1871,7 @@ mod tests {
             created_at: 1000,
         });
 
-        let result = raft.propose(cmd);
+        let result = raft.propose(cmd.into());
         assert!(result.is_ok());
         raft.simulate_flush();
         assert!(raft.last_applied_index > 0);
@@ -1998,7 +2006,7 @@ mod tests {
         drain(&mut raft);
         raft.simulate_flush();
 
-        raft.propose(test_create_topic_cmd("blue")).unwrap();
+        raft.propose(test_create_topic_cmd("blue").into()).unwrap();
         raft.simulate_flush();
 
         assert!(raft.state_machine().get_topic_by_name("blue").is_some());
@@ -2028,10 +2036,10 @@ mod tests {
         drain(&mut raft);
         raft.simulate_flush();
 
-        raft.propose(test_create_topic_cmd("red")).unwrap();
+        raft.propose(test_create_topic_cmd("red").into()).unwrap();
         raft.simulate_flush();
 
-        raft.propose(test_create_topic_cmd("red")).unwrap();
+        raft.propose(test_create_topic_cmd("red").into()).unwrap();
         raft.simulate_flush();
 
         assert_eq!(raft.state_machine().topic_count(), 1);
@@ -2046,8 +2054,8 @@ mod tests {
         drain(&mut raft);
         raft.simulate_flush();
 
-        raft.propose(test_create_topic_cmd("alpha")).unwrap();
-        raft.propose(test_create_topic_cmd("beta")).unwrap();
+        raft.propose(test_create_topic_cmd("alpha").into()).unwrap();
+        raft.propose(test_create_topic_cmd("beta").into()).unwrap();
         raft.simulate_flush();
 
         assert_eq!(raft.state_machine().topic_count(), 2);
@@ -2077,7 +2085,7 @@ mod tests {
                 entries: vec![LogEntry {
                     term: 1,
                     index: 1,
-                    command: None,
+                    command: RaftCommand::Noop,
                 }],
                 leader_commit: 0,
             }),

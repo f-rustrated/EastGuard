@@ -9,6 +9,7 @@ use crate::control_plane::consensus::messages::{
     MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
     RaftTimeoutCallback, SealContext,
 };
+use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::metadata::TopicId;
 use crate::control_plane::metadata::command::RollSegment;
@@ -35,7 +36,7 @@ pub(crate) struct MultiRaft {
 
 #[derive(Default)]
 struct PendingSealTracker {
-    by_index: HashMap<(ShardGroupId, u64), PendingSeal>,
+    by_group: HashMap<ShardGroupId, BTreeMap<u64, PendingSeal>>,
     by_key: HashSet<SegmentKey>,
 }
 
@@ -46,11 +47,20 @@ impl PendingSealTracker {
 
     fn insert(&mut self, group_id: ShardGroupId, log_index: u64, seal: PendingSeal) {
         self.by_key.insert(seal.segment_key);
-        self.by_index.insert((group_id, log_index), seal);
+        self.by_group
+            .entry(group_id)
+            .or_default()
+            .insert(log_index, seal);
     }
-
     fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<PendingSeal> {
-        let seal = self.by_index.remove(&(group_id, log_index))?;
+        let group_map = self.by_group.get_mut(&group_id)?;
+        let seal = group_map.remove(&log_index)?;
+
+        // Clean up the empty map to prevent memory leaks over time
+        if group_map.is_empty() {
+            self.by_group.remove(&group_id);
+        }
+
         self.by_key.remove(&seal.segment_key);
         Some(seal)
     }
@@ -61,6 +71,34 @@ impl PendingSealTracker {
                 requester: seal.requester,
                 old_segment_key: seal.segment_key,
             });
+        }
+    }
+
+    /// Drop pending seal contexts for `group_id` whose log indices were
+    /// truncated by a new leader. Prevents unbounded growth of `by_key` /
+    /// `by_index` when proposals are rejected by truncation.
+    fn drop_from(&mut self, group_id: ShardGroupId, from_index: u64) {
+        if let Some(group_map) = self.by_group.get_mut(&group_id) {
+            let stale = group_map.split_off(&from_index);
+            for seal in stale.into_values() {
+                self.by_key.remove(&seal.segment_key);
+            }
+
+            if group_map.is_empty() {
+                self.by_group.remove(&group_id);
+            }
+        }
+    }
+
+    /// Drop every pending seal context for `group_id`. Called when a leader
+    /// steps down — any not-yet-committed proposals will either be truncated
+    /// by the new leader or commit there, but this replica will no longer be
+    /// the one to dispatch the SealResponse.
+    fn drop_group(&mut self, group_id: ShardGroupId) {
+        if let Some(stale_group) = self.by_group.remove(&group_id) {
+            for seal in stale_group.into_values() {
+                self.by_key.remove(&seal.segment_key);
+            }
         }
     }
 }
@@ -88,6 +126,42 @@ impl MultiRaft {
             pending_proposes: BTreeMap::new(),
             pending_seals: PendingSealTracker::default(),
         }
+    }
+
+    pub(crate) fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// Propose `RemovePeer` for any peer of `group_id` that SWIM does not
+    /// consider alive. Only the leader can propose, so this is a no-op on
+    /// followers. Invoked on `LeaderChange → self` to close the gap where the
+    /// previous leader died before proposing the removal.
+    pub(crate) fn reconcile_peers(&mut self, group_id: ShardGroupId, live: &HashSet<NodeId>) {
+        let Some(raft) = self.groups.get_mut(&group_id) else {
+            return;
+        };
+        if !raft.is_leader() {
+            return;
+        }
+        let dead: Vec<NodeId> = raft
+            .peers_iter()
+            .filter(|p| !live.contains(*p))
+            .cloned()
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        for node_id in dead {
+            if let Err(e) = raft.propose(RaftCommand::RemovePeer(node_id.clone())) {
+                tracing::debug!(
+                    "Reconciliation RemovePeer({:?}) on {:?} rejected: {:?}",
+                    node_id,
+                    group_id,
+                    e
+                );
+            }
+        }
+        self.dirty.insert(group_id);
     }
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
@@ -270,16 +344,28 @@ impl MultiRaft {
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)
     // and the scan is O(groups) with cheap has_peer/is_leader checks.
+    //
+    // Membership changes flow through the Raft log: only the leader proposes
+    // `RemovePeer`, and followers apply on commit. Direct mutation would let
+    // replicas disagree on quorum size during gossip convergence. See
+    // `diagrams/metadata-management/metadata_management_roadmap.md` Phase 3d.
     fn handle_node_death(&mut self, dead_node_id: NodeId, live_nodes: Vec<NodeId>) {
         for (group_id, raft) in self.groups.iter_mut() {
-            if raft.has_peer(&dead_node_id) {
-                raft.remove_peer(&dead_node_id);
-                self.dirty.insert(*group_id);
-            }
-
             if !raft.is_leader() {
                 continue;
             }
+
+            if raft.has_peer(&dead_node_id)
+                && let Err(e) = raft.propose(RaftCommand::RemovePeer(dead_node_id.clone()))
+            {
+                tracing::warn!(
+                    "Death-triggered RemovePeer({:?}) on {:?} rejected: {:?}",
+                    dead_node_id,
+                    group_id,
+                    e
+                );
+            }
+            self.dirty.insert(*group_id);
 
             // ? how does this work when we have 3 nodes while replication factor is being three?
             for (segment_key, old_replica_set) in raft.active_segments_for_node(&dead_node_id) {
@@ -295,7 +381,6 @@ impl MultiRaft {
                     end_entry_id: None,
                 };
 
-                // ! Consider retry logic as for leader's this is only path
                 if let Err(e) = raft.propose(cmd.into()) {
                     tracing::warn!(
                         "Death-triggered RollSegment for {:?} failed: {:?}",
@@ -370,11 +455,22 @@ impl MultiRaft {
 
     fn add_peer_to_existing_groups(&mut self, node_id: &NodeId, groups: &[ShardGroup]) {
         for group in groups {
-            if let Some(raft) = self.groups.get_mut(&group.id)
-                && !raft.has_peer(node_id)
-            {
-                raft.add_peer(node_id.clone());
+            let Some(raft) = self.groups.get_mut(&group.id) else {
+                continue;
+            };
+            if !raft.is_leader() || raft.has_peer(node_id) {
+                continue;
             }
+            if let Err(e) = raft.propose(RaftCommand::AddPeer(node_id.clone())) {
+                tracing::warn!(
+                    "Join-triggered AddPeer({:?}) on {:?} rejected: {:?}",
+                    node_id,
+                    group.id,
+                    e
+                );
+                continue;
+            }
+            self.dirty.insert(group.id);
         }
     }
 
@@ -401,7 +497,7 @@ impl MultiRaft {
     fn propose_internal(&mut self, cmd: RaftPropose) -> Result<u64, ProposeError> {
         match self.groups.get_mut(&cmd.shard_group_id) {
             Some(raft) => {
-                let result = raft.propose(cmd.command);
+                let result = raft.propose(cmd.command.into());
                 self.dirty.insert(cmd.shard_group_id);
                 result
             }
@@ -424,7 +520,7 @@ impl MultiRaft {
                 continue;
             };
             for cmd in raft.take_pending_proposals() {
-                if let Err(e) = raft.propose(cmd) {
+                if let Err(e) = raft.propose(cmd.into()) {
                     tracing::warn!("Auto-proposal rejected for {:?}: {:?}", id, e);
                 }
             }
@@ -447,7 +543,17 @@ impl MultiRaft {
 
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
+                if let LogMutation::TruncateFrom(from_index) = &log {
+                    self.pending_seals.drop_from(*id, *from_index);
+                }
                 mutations.push((*id, log));
+            }
+            // If this replica is no longer leader, drop any outstanding seal
+            // contexts — the SealResponse for those proposals will not come from
+            // here. Avoids unbounded growth of `pending_seals` when a leader
+            // loses leadership between propose and commit.
+            if !raft.is_leader() {
+                self.pending_seals.drop_group(*id);
             }
             for event in raft.take_events() {
                 match event {
@@ -695,6 +801,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
+    use crate::control_plane::consensus::raft::command::RaftCommand;
     use crate::control_plane::consensus::raft::log::LogEntry;
 
     const TEST_GROUP_ID: ShardGroupId = ShardGroupId(42);
@@ -814,12 +921,12 @@ mod tests {
                     LogEntry {
                         term: 1,
                         index: 1,
-                        command: None,
+                        command: RaftCommand::Noop,
                     },
                     LogEntry {
                         term: 1,
                         index: 2,
-                        command: None,
+                        command: RaftCommand::Noop,
                     },
                 ],
                 leader_commit: 0,
@@ -848,7 +955,7 @@ mod tests {
                 entries: vec![LogEntry {
                     term: 2,
                     index: 1,
-                    command: None,
+                    command: RaftCommand::Noop,
                 }],
                 leader_commit: 0,
             }),
