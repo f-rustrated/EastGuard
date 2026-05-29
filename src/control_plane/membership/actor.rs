@@ -83,7 +83,10 @@ impl SwimActor {
                 break;
             }
             for event in buf.drain(..) {
-                actor.state.dispatch(event);
+                match event {
+                    SwimActorCommand::Command(cmd) => actor.state.dispatch_command(cmd),
+                    SwimActorCommand::Query(q) => actor.state.handle_query(q),
+                }
             }
         }
     }

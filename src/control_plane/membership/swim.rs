@@ -657,14 +657,7 @@ impl Swim {
         std::mem::take(&mut self.pending_events)
     }
 
-    pub(crate) fn dispatch(&mut self, event: SwimActorCommand) {
-        match event {
-            SwimActorCommand::Command(cmd) => self.dispatch_protocol(cmd),
-            SwimActorCommand::Query(q) => self.handle_query(q),
-        }
-    }
-
-    fn dispatch_protocol(&mut self, cmd: SwimCommand) {
+    pub(crate) fn dispatch_command(&mut self, cmd: SwimCommand) {
         match cmd {
             SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
             SwimCommand::Timeout(event) => self.handle_timeout(event),
@@ -674,7 +667,7 @@ impl Swim {
         }
     }
 
-    fn handle_query(&self, command: QueryCommand) {
+    pub(crate) fn handle_query(&self, command: QueryCommand) {
         match command {
             QueryCommand::GetMembers { reply } => {
                 let _ = reply.send(self.get_members());
