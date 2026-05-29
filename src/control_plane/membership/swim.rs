@@ -374,6 +374,7 @@ impl Swim {
 
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         self.process_piggybacked_gossip(&packet);
+
         match packet {
             SwimPacket::Ping(header) => self.handle_ping(src, header),
             SwimPacket::Ack(header) => self.handle_ack(src, header),
@@ -479,8 +480,8 @@ impl Swim {
 
     fn apply_membership_update(&mut self, member: SwimNode) {
         // Refutation: only refute Suspect, not Dead (Dead is terminal per SWIM spec)
-        if member.node_id == self.node_id {
-            if member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation {
+        if self.is_me(&member) {
+            if self.should_refute(&member) {
                 let new_incarnation = member.incarnation + 1;
                 tracing::info!(
                     "Refuting suspicion! (My Inc: {} -> {})",
@@ -509,6 +510,14 @@ impl Swim {
             member.state,
             member.incarnation,
         );
+    }
+
+    fn should_refute(&self, member: &SwimNode) -> bool {
+        member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation
+    }
+
+    fn is_me(&self, member: &SwimNode) -> bool {
+        member.node_id == self.node_id
     }
 
     fn handle_incarnation_check(
