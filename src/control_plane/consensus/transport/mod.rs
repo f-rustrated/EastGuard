@@ -27,29 +27,29 @@ impl RaftTransportActor {
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
     ) {
-        let mut state = RaftRpcDispatcher::new(node_id);
+        let mut write_dispatcher = RaftRpcDispatcher::new(node_id);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await; // consume immediate first tick
 
         loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
-                    state.accept(stream, &raft_tx).await;
+                    write_dispatcher.accept(stream, &raft_tx).await;
                 }
                 Some(batch) = from_actor.recv() => {
                     for cmd in batch {
                         match cmd {
                             RaftTransportCommand::Send(packets) => {
-                                state.send(packets, &raft_tx, &swim_tx).await;
+                                write_dispatcher.send(packets, &raft_tx, &swim_tx).await;
                             }
                             RaftTransportCommand::DisconnectPeer(peer_id) => {
-                                state.disconnect(peer_id);
+                                write_dispatcher.disconnect(peer_id);
                             }
                         }
                     }
                 }
                 _ = cleanup_interval.tick() => {
-                    state.cleanup_dead_peers();
+                    write_dispatcher.cleanup_dead_peers();
                 }
             }
         }
