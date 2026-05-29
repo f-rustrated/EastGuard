@@ -1,574 +1,195 @@
 # EastGuard Metadata Management Roadmap
 
-SWIM + MultiRaft infrastructure is drafted. This roadmap covers the path from the current consensus/membership layer to a full metadata management system — topics, ranges, segments — following the DS-RSM (Dynamically-Sharded Replicated State Machine) architecture inspired by Northguard.
+EastGuard avoids both a global metadata store (etcd, Zookeeper) and a dedicated controller quorum (Kafka KRaft). Both add complexity, become bottlenecks, and require external coordination to move data around. Instead, every node participates in metadata storage through a **Dynamically-Sharded Replicated State Machine (DS-RSM)**: metadata is hash-partitioned across the cluster, each partition is its own small Raft group, and cluster membership is maintained by SWIM gossip.
+
+This roadmap walks the path from raw consensus + membership primitives to a working metadata system that manages topics, ranges, and segments.
+
+For the SWIM ↔ Raft interplay (how SWIM facts become Raft truth, why membership changes go through the log, and the brittleness of reconciliation without rebalancing), see `mental-model.md`.
 
 ---
 
-## Phase 1: Data Model + MetadataStateMachine ✅
+## Phase 1 — Data Model + Metadata State Machine ✅
 
-**Goal:** Define metadata types and a pure in-memory state machine.
+**Goal.** Define the entity model (topics, ranges, segments — their states and lifecycle transitions) and a pure, in-memory state machine that mutates them. No I/O, no async — a deterministic function from "current state + command" to "new state".
 
+**Shape.**
+- A *topic* owns *ranges*; each range covers a contiguous slice of the keyspace.
+- A *range* owns *segments*: the active write head plus all sealed segments before it.
+- Ownership is structural — ranges nest inside topics, segments nest inside ranges. No back-references.
+- ID counters are scoped to the parent: a topic mints range IDs, a range mints segment IDs.
 
+State enums distinguish Active / Sealed / Deleting transitions. The state machine itself is purely passive: it never originates work, only applies committed log entries.
 
-### Types (`types.rs`)
-
-```
-TopicId(u64), RangeId(u64), SegmentId(u64)
-
-TopicState  { Active, Sealed, Deleted }
-RangeState  { Active, Sealed, Deleting }
-SegmentState { Active, Sealed, Reassigning { from, to }, Deleting }
-
-StoragePolicy { retention_ms, replication_factor }
-
-TopicMeta {
-    topic_id, name, state, storage_policy,
-    active_ranges: Vec<RangeId>,              // keyspace coverage for write routing
-    ranges: HashMap<RangeId, RangeMeta>,      // all ranges including sealed
-    next_range_id: u64,
-}
-
-RangeMeta {
-    range_id, keyspace: [start, end),
-    state, active_segment,
-    segments: HashMap<SegmentId, SegmentMeta>,
-    next_segment_id: u64,
-    next_offset: u64,
-    split_into, merged_into, merged_from
-}
-
-SegmentMeta {
-    segment_id, state,
-    replica_set, size_bytes,
-    start_offset: u64, end_offset: Option<u64>,
-    created_at, sealed_at
-}
-```
-
-ID counters scoped to parent: `next_range_id` in TopicMeta, `next_segment_id` in RangeMeta. No back-references — ownership expressed by nesting.
-
-### State Machine (`state_machine.rs`)
-
-```rust
-struct MetadataStateMachine {
-    topics:           HashMap<TopicId, TopicMeta>,
-    topic_name_index: HashMap<String, TopicId>,
-    next_topic_id:    u64,
-}
-```
-
-Flat maps for ranges/segments removed — they live nested inside `TopicMeta` and `RangeMeta` respectively.
-
-Pure functions: `apply_create_topic()`, `apply_split_range()`, `apply_roll_segment()`. No I/O, no async.
-
-See `diagrams/metadata-management/data-model.md` for full entity relationships, state transitions, cascading effects, and invariants.
-
-**Depends on:** Nothing.
-**Scope:** ~300-400 lines + unit tests.
+**Depends on.** Nothing.
 
 ---
 
-## Phase 2: Extend RaftCommand ✅
+## Phase 2 — Outer Log Payload ✅
 
-**Goal:** Grow `RaftCommand` from internal-only to include metadata operations.
+**Goal.** Define what kinds of things can be replicated through the Raft log.
 
-### File: `src/clusters/raft/messages/command.rs`
+**Shape.** Two categories of payload, plus a no-op variant:
+- **Metadata commands** — create topic, roll segment, split range, merge range, delete topic. These mutate the application state machine on apply.
+- **Membership changes** — add or remove a peer from a shard group's Raft set. These mutate the consensus layer's own peer set on apply.
+- **No-op** — used for empty entries (e.g., the first entry a new leader appends to safely commit any prior-term entries).
 
-**`RaftCommand` is the outer log payload — wraps `MetadataCommand` and carries consensus-layer membership variants:**
+The peer set is part of the replicated state machine; it must mutate *only* through committed log entries, never through direct gossip-driven mutation. The rationale and the failure scenarios are in `mental-model.md`.
 
-```rust
-enum RaftCommand {
-    Noop,
-    Metadata(MetadataCommand),
-    AddPeer(NodeId),
-    RemovePeer(NodeId),
-}
-```
-
-`Metadata(..)` carries application state changes; `AddPeer` / `RemovePeer` carry peer-set changes. Both kinds are log entries — the peer set is part of the replicated state machine, mutated only when entries apply, on every replica, deterministically. Direct mutation outside the log is forbidden because divergent peer sets across replicas break Raft's quorum math (see Phase 3d).
-
-`MetadataCommand` is a separate enum in `src/clusters/metadata/command.rs` with typed structs per variant:
-
-```rust
-enum MetadataCommand {
-    CreateTopic(CreateTopic),
-    RollSegment(RollSegment),
-    SplitRange(SplitRange),
-    MergeRange(MergeRange),
-    DeleteTopic(DeleteTopic),
-}
-```
-
-Each struct carries its own fields (e.g., `CreateTopic { name, storage_policy, replica_set, created_at }`). `DeleteTopic` uses `name: String` — resolved to `TopicId` at apply time via `topic_name_index`.
-
-No `AssignRange` — ranges emerge from `CreateTopic` (initial full-keyspace range) or `SplitRange`/`MergeRange` (lifecycle). See `diagrams/metadata-management/data-model.md` § "How Range ID and Keyspace Are Determined".
-
-**`ProposeError`:**
-
-```rust
-enum ProposeError {
-    NotLeader,
-    ShardNotFound,
-}
-```
-
-`NotLeader(Option<NodeId>)` added in Phase 5 — carries leader hint. Epoch cancelled (not needed).
-
-**Depends on:** Phase 1 (needs `TopicId`, `StoragePolicy`, etc.).
-**Scope:** Mostly type changes + match arm updates.
+**Depends on.** Phase 1.
 
 ---
 
-## Phase 3: Application State Machine Dispatch ✅
+## Phase 3 — Application State Machine Dispatch ✅
 
-**Goal:** `Raft` owns `MetadataStateMachine` and applies committed metadata commands inline.
+**Goal.** Wire the metadata state machine into Raft's apply path so that committed log entries deterministically advance metadata state on every replica.
 
-### 3a. Embed `MetadataStateMachine` inside `Raft`
+### 3a — Direct ownership
 
-Raft = log machine + state machine. EastGuard is a metadata system, not a generic Raft library. Only one state machine type ever exists. Direct ownership, no trait, no generic.
+Raft owns the metadata state machine. EastGuard is a metadata system, not a generic Raft library — exactly one state-machine type ever exists. No trait, no generic, no plug-in interface.
 
-```rust
-// In state.rs:
-pub struct Raft {
-    // ... existing consensus fields ...
-    state_machine: MetadataStateMachine,
-}
-```
+### 3b — Apply at the consensus boundary
 
-Initialized to `MetadataStateMachine::default()` in `Raft::new()`.
+When the log advances and an entry is both committed AND durable, Raft dispatches by payload type: metadata commands go to the state machine's apply step; membership changes mutate the peer set; no-ops do nothing. Apply runs inside Raft itself, guarded so an entry is never applied before it is both committed and stable on disk.
 
-### 3b. Inline apply in `apply_committed_entries()`
+### 3c — Read-only access for tests
 
-```rust
-fn apply_committed_entries(&mut self) {
-    while self.last_applied_index < self.commit_index.min(self.stabled_index) {
-        self.last_applied_index += 1;
-        let entry = self.log_get(self.last_applied_index).clone();
-        match entry.command {
-            RaftCommand::Noop => {}
-            RaftCommand::Metadata(cmd) => {
-                match self.state_machine.apply(cmd) {
-                    Ok(result)  => tracing::debug!("Applied: {:?}", result),
-                    Err(e)      => tracing::error!("Apply error: {:?}", e),
-                }
-            }
-            RaftCommand::AddPeer(node_id)    => self.apply_add_peer(node_id),
-            RaftCommand::RemovePeer(node_id) => self.apply_remove_peer(node_id),
-        }
-    }
-}
-```
+A non-mutating accessor lets tests assert the applied state without exposing mutation paths.
 
-No buffer-drain pattern. No `take_applied_entries()`. Apply happens at consensus boundary, inside `Raft`, guarded by `commit_index.min(stabled_index)`.
+### 3d — Membership Changes Through the Log
 
-`apply_add_peer` / `apply_remove_peer` mutate `self.peers` and (when leader) `self.peer_states`. These are private apply-time helpers — they are **never** called outside `apply_committed_entries()`. The old `Raft::add_peer` / `Raft::remove_peer` public methods that mutated state directly are gone.
+Every change to a Raft group's peer set is a log entry. SWIM detects node up/down; the shard group leader observes the event and proposes the corresponding membership change; followers apply on commit. Direct gossip-driven mutation of the peer set is forbidden — divergent peer sets across replicas would let two leaders compute different quorums for the same log index and admit a split-brain commit.
 
-### 3c. Read-only accessor
+When a node becomes leader, it performs a reference-back step: snapshot the current SWIM live set and propose removals for any peer no longer alive. This closes the gap where a leader died before it could itself convert a death event into a Raft log entry.
 
-```rust
-pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
-    &self.state_machine
-}
-```
+A removal must be paired with an addition of a replacement — otherwise the group's failure tolerance shrinks monotonically. The replacement-selection half is not yet built; current reconciliation is the first half of a two-step pattern. See `mental-model.md` for the mental model, the failure scenarios, and what the missing half should look like.
 
-For tests to query applied state.
-
-### 3d. Membership Changes via the Log
-
-**Rule:** every change to a Raft group's peer set is a log entry. SWIM detects node up/down; the shard group leader observes the SWIM event and proposes `AddPeer` / `RemovePeer`; followers learn the change when the entry commits and applies.
-
-See `diagrams/metadata-management/membership-change-via-log.mmd` for the full sequence diagram.
-
-**Flow:**
-
-```
-SwimActor                 MultiRaftActor             Raft (leader)        Raft (followers)
-    │                            │                         │                      │
-    │── HandleNodeDeath(n3) ────▶│                         │                      │
-    │                            │  for each group where   │                      │
-    │                            │  n3 ∈ peers && leader:  │                      │
-    │                            │     propose(RemovePeer  │                      │
-    │                            │              (n3)) ────▶│                      │
-    │                            │                         │── AppendEntries ────▶│
-    │                            │                         │◀───── ack ───────────│
-    │                            │                         │  commit              │
-    │                            │                         │  apply_remove_peer:  │
-    │                            │                         │   peers -= {n3}      │
-    │                            │                         │── CommitAdvance ────▶│
-    │                            │                         │                      │  apply_remove_peer:
-    │                            │                         │                      │   peers -= {n3}
-```
-
-`HandleNodeJoin` is symmetric: leader proposes `AddPeer(new)` for each group where this node should add the new peer. Initial group formation (`EnsureGroup`) uses the seeded members list and does not go through `AddPeer` — the group is created with its initial peer set already populated.
-
-**Why not direct mutation (the rejected alternative):**
-
-The peer set determines quorum size at every log index. If two replicas disagree on `peers.len()` at the same index, they compute different majority thresholds and may both believe they have quorum on conflicting entries — i.e., split-brain commit. SWIM-driven direct mutation creates exactly this window during gossip convergence (~hundreds of ms). The Raft paper §6 and CockroachDB's joint-consensus paper both treat membership-in-the-log as required for the safety theorem. Production systems that pair SWIM with Raft (Consul/Serf, etcd, CockroachDB, TiKV) all funnel membership through the log for this reason.
-
-**Leader-election reconciliation:**
-
-A node may become leader while its `peers` set contains nodes SWIM already considers dead (e.g., the previous leader died before proposing `RemovePeer` for them). On `LeaderChange → self`, the new leader queries SWIM (`get_members`) and proposes `RemovePeer` for any peer not in the live set. This closes the only gap where direct mutation seems tempting.
-
-**Important caveat — reconciliation alone shrinks the group.** Removing a dead peer without adding a replacement reduces total membership, which reduces the number of future failures the group can tolerate. The proper paired operation is `RemovePeer(dead) + AddPeer(replacement)`. The replacement-selection half is **not yet built** — current reconciliation is the first half of a two-step pattern. See `membership-reconciliation-and-rebalancing.md` for the failure cases, the brittleness analysis, and what the missing half should look like.
-
-**Pending-entry cleanup:**
-
-A leader that proposes `RemovePeer` but loses leadership before commit must drop its in-memory `pending_*` bookkeeping for that entry — the new leader may truncate it. `MultiRaft` clears pending proposal contexts on `LeaderChange → away` and on log truncation. Same mechanism already covers `pending_proposals` and `pending_seals`.
+**Depends on.** Phase 2.
 
 ---
 
-## Phase 4: Client → Raft Propose Pathway ✅
+## Phase 4 — Client Propose Pathway ✅
 
-**Goal:** Wire end-to-end path: Client → `MultiRaftActor` → hash(key) → propose to local Raft → commit → apply → respond.
+**Goal.** End-to-end path for a client request: client → routing → propose → commit → apply → reply.
 
-`MultiRaftActor` handles routing internally. No separate broker/routing layer needed.
+**Shape.** Clients submit operations keyed by a resource (e.g., topic name). The receiving node hashes the key to find the owning shard group. If the local instance is leader, it proposes to the group's Raft log and waits for commit before replying. If not leader, the node returns a redirect hint to the client (or forwards transparently — see Phase 5).
 
-### 4a. Redesign `MultiRaftActorCommand::Propose`
+Commit-completion tracking lives in the consensus actor: when a proposal is accepted into the log, the actor records the log position and a reply channel. When apply reaches that position, the reply fires with success. On leader stepdown, all pending replies are drained with a not-leader error so callers don't hang.
 
-Current (dormant, zero callers):
-```rust
-Propose {
-    shard_group_id: ShardGroupId,  // caller must know the shard
-    command: RaftCommand,
-    reply: oneshot::Sender<Result<(), ProposeError>>,
-}
-```
-
-New:
-```rust
-Propose {
-    resource_key: Vec<u8>,         // MultiRaft hashes internally
-    command: RaftCommand,
-    reply: oneshot::Sender<Result<(), ProposeError>>,
-}
-```
-
-Inside `MultiRaft::propose()`:
-```rust
-fn propose(&mut self, resource_key: &[u8], command: RaftCommand) -> Result<(), ProposeError> {
-    let shard_id = ShardGroupId::new(resource_key);
-    match self.groups.get_mut(&shard_id) {
-        Some(shard) if shard.raft.is_leader() => {
-            shard.raft.propose(command)
-            // dirty tracking, etc.
-        }
-        Some(shard) => Err(ProposeError::NotLeaderHint(
-            shard.raft.current_leader().cloned()
-        )),
-        None => Err(ProposeError::NotLeader),
-    }
-}
-```
-
-**Why MultiRaftActor routes, not a separate layer:**
-- Already has `HashMap<ShardGroupId, Raft>` — checks `is_leader()` directly
-- `ShardGroupId::new(key)` is a pure hash — no topology query needed
-- Avoids async round-trip to SWIM for routing
-- Client handler in `lib.rs` stays thin
-
-### 4b. Extend client protocol
-
-**File:** `src/connections/request.rs`
-
-```rust
-enum ConnectionRequests {
-    // Existing
-    Discovery,
-    Connection(ConnectionRequest),
-    Query(QueryCommand),
-    // New
-    Propose(ProposeRequest),
-}
-
-struct ProposeRequest {
-    resource_key: Vec<u8>,
-    command: ClientCommand,
-}
-
-enum ClientCommand {
-    CreateTopic { name: String, storage_policy: StoragePolicy },
-}
-
-enum ProposeResponse {
-    Success,
-    NotLeader(Option<NodeId>),
-    ShardNotFound,
-    Error(String),
-}
-```
-
-### 4c. Thread `raft_tx` to client handler
-
-In `lib.rs`, `raft_tx` is currently moved into `SwimActor::run()`. Clone before that, pass clone to `receive_client_streams`. Client handler translates `ClientCommand` → `RaftCommand`, sends `MultiRaftActorCommand::Propose { resource_key, command, reply }`.
-
-### 4d. Commit-completion tracking
-
-Current `raft.propose()` returns `Ok(())` on log append — does NOT wait for commit. For client API, must wait for commit + apply.
-
-```rust
-// In MultiRaft:
-pending_proposals: HashMap<(ShardGroupId, u64 /* log_index */), oneshot::Sender<ProposeResult>>,
-```
-
-On `propose()`: store `(shard_id, log_index) → reply`.
-On `take_applied_entries()`: resolve reply with result.
-On leader stepdown: drain all pending, send `NotLeader`.
-
-### 4e. Full propose flow
-
-```
-Client                 lib.rs              MultiRaftActor            Raft
-  │── CreateTopic ──────▶│                       │                     │
-  │   ("blue")           │── Propose ───────────▶│                     │
-  │                      │   key="blue"          │── hash("blue")      │
-  │                      │   cmd=CreateTopic     │   = shard #45       │
-  │                      │                       │── groups[#45]       │
-  │                      │                       │   .is_leader()? yes │
-  │                      │                       │── raft.propose() ──▶│
-  │                      │                       │                     │
-  │                      │                       │  ... replication ...│
-  │                      │                       │                     │
-  │                      │                       │◀── committed ───────│
-  │                      │                       │   apply to SM       │
-  │                      │                       │   resolve reply     │
-  │◀── Success ──────────│◀──────────────────────│                     │
-```
-
-**Depends on:** Phases 1-3.
-**Scope:** 3-4 PRs.
+**Depends on.** Phases 1–3.
 
 ---
 
-## Phase 5: Leader Forwarding + Shard Discovery 
+## Phase 5 — Leader Forwarding + Shard Discovery ✅
 
-**Goal:** Non-leader nodes forward proposals transparently; clients can discover shard → leader mappings.
+**Goal.** Non-leader nodes forward proposals transparently to the leader so clients don't always need to know who the leader is. Clients can also explicitly discover shard-to-leader mappings.
 
-### 5a. Leader forwarding 
+**Shape.**
+- A not-leader response carries a leader hint where available. Non-leader nodes can use that hint to forward the proposal to the actual leader over TCP. Forwarding is capped at one hop so a misrouted proposal can't bounce around the cluster.
+- A query interface lets a client ask "for this resource key, which shard owns it and who's currently leading?" in a single round trip to SWIM, which already tracks both the hash ring and shard-leader gossip.
+- Epoch validation was originally planned and cancelled: SWIM converges fast enough that stale routing is self-healing via the not-leader path. Revisit only if client-side caches become the primary routing source.
 
-`ProposeError::NotLeader(Option<NodeId>)` carries leader hint. Non-leader nodes transparently forward proposals to the leader via TCP. Two-strategy forwarding:
-1. **Fast path:** Use leader hint + `ResolveAddress` → `NodeAddress.client_addr` (SWIM membership, converges in ~2-3s)
-2. **Slow path:** Fall back to `ResolveShardLeader` → shard leader gossip
-
-Max 1 hop — `ProposeRequest.forwarded: bool` prevents re-forwarding.
-
-### 5b. Epoch validation — cancelled ❌
-
-Originally planned to track `conf_ver` per shard group. Cancelled because:
-- Clients never send replica sets — server resolves from SWIM topology
-- SWIM convergence (~2-3s) makes staleness window near-zero
-- `NotLeader` hint + forwarding already handles leader changes
-- Even stale replica sets are self-healing on subsequent operations
-
-Revisit only if client-side routing cache bypasses server-side routing.
-
-### 5c. Shard discovery query 
-
-```rust
-QueryCommand::GetShardInfo { key: Vec<u8> }
-// Returns: Option<ShardInfoResponse { shard_group_id, leader_node_id, leader_addr }>
-```
-
-Single actor round-trip via `SwimQueryCommand::GetShardInfo` — resolves shard group + leader in one hop.
-
-### 5d. Client-side routing cache (backlog)
-
-Client SDK concern. Server-side signals available:
-- `ProposeResponse::Error(NotLeader(Some(leader_id)))` — cache miss
-- `GetShardInfo` — cache population
-- Error-driven invalidation (no TTL, no polling)
-
-### Architecture changes in Phase 5
-
-- **`NodeAddress { cluster_addr, client_addr }`** — first-class value object used in `SwimNode.addr`, `ShardLeaderInfo`, `ShardLeaderEntry`, `Swim.self_addr`, `RaftWriters.addr_cache`. Derives `Copy`.
-- **`SwimSender` / `RaftSender`** — typed wrappers encapsulating channel + oneshot request-reply pattern. Clean client handler code in `clients.rs`.
-- **`port` → `client_port`** — explicit naming (`--client-port`, `CLIENT_PORT`). Port collision check in `init()`.
-
-**Depends on:** Phase 4.
-**Scope:** Completed in 4 PRs (epoch cancelled).
+**Depends on.** Phase 4.
 
 ---
 
-## Phase 6: Hot Range Detection + Auto-Split/Merge ✅
+## Phase 6 — Hot Range Detection + Auto-Split / Merge ✅
 
-**Goal:** MetadataStateMachine detects hot/cold ranges and proposes `SplitRange`/`MergeRange` automatically. Simplest viable approach — no probe protocol, no key histograms.
+**Goal.** The system detects ranges with disproportionate load and rebalances them through splits and merges, without external metrics infrastructure.
 
-### Core Insight
+**Core insight.** Segment seals are already in the Raft log. A range whose segments seal frequently is a hot range. Counting seal frequency gives a load signal for free — no probe protocol, no data plane → metadata reporting pipeline, no key histograms.
 
-`MetadataStateMachine` already sees every `RollSegment` commit. A segment seals when it reaches ~1GB. If a range's segments seal frequently, that range is hot. No external metrics pipeline needed — the Raft log IS the signal.
+**Decision logic.** Each range tracks its recent seal timestamps within a sliding window. When the seal count exceeds the split threshold (and the range isn't in a cooldown window from a recent split), the leader proposes a split at the keyspace midpoint. Adjacent buddy ranges — children of the same parent split — with no recent seals can merge back together. Hysteresis between split and merge thresholds prevents oscillation.
 
-### 6a. Per-Range Seal Tracker
+**Anti-recursion.** The apply path never proposes. Auto-proposals are buffered during apply and drained at the start of the next flush cycle, so a split apply can't recursively trigger another split. Stale auto-proposals (e.g., a merge proposed but the range was already split) are rejected by apply-time precondition checks.
 
-`RangeSealHistory` on `RangeMeta`:
+Midpoint splitting is good enough for now. Percentile-based split points are in the backlog.
 
-```rust
-struct RangeSealHistory {
-    seal_timestamps: VecDeque<u64>,         // recent seal times within measurement window
-    created_by_split_at: Option<u64>,  // cooldown anchor for child ranges
-}
-```
-
-Lives inside `RangeMeta` — no separate tracker map needed. Naturally scoped to the range, cleaned up when range is deleted.
-
-Updated inside `RangeMeta::roll_segment()` via `record_seal()` — pure, deterministic, replicated on every node. Old timestamps pruned on each seal (sliding window).
-
-### 6b. Split Decision Logic
-
-`RangeMeta::roll_segment()` returns `should_split` bool. `MetadataStateMachine::roll_segment()` checks the return value (leader-only evaluation via `pending_proposals` buffer):
-
-```rust
-// RangeSealHistory::should_split():
-seal_count >= SPLIT_SEAL_THRESHOLD
-    && (no split cooldown OR cooldown expired)
-
-// RangeMeta::roll_segment() returns should_split
-// MetadataStateMachine checks: can_split && should_split && valid_split_point(midpoint)
-```
-
-Split point = midpoint of keyspace (`RangeMeta::compute_midpoint()`). `valid_split_point()` guards against ranges too narrow to split (integer truncation makes midpoint equal to start).
-
-**Constants:**
-
-| Constant | Value | Meaning |
-|---|---|---|
-| `SPLIT_SEAL_THRESHOLD` | 3 | Seals within window to trigger split |
-| `MEASUREMENT_WINDOW_MS` | 300_000 (5 min) | Sliding window for counting seals |
-| `SPLIT_COOLDOWN_MS` | 300_000 (5 min) | No re-split after recent split |
-| `MERGE_SEAL_THRESHOLD` | 0 | Both ranges must be idle (no seals in window) |
-
-### 6c. Merge Decision Logic
-
-Periodic check by leader via `MergeCheckTimeout` timer (not per-event):
-
-```rust
-// MetadataStateMachine::evaluate_merges(now):
-// For each topic with AutoSplit strategy and 2+ active ranges:
-//   Walk adjacent pairs in active_ranges (sorted by keyspace_start)
-//   If both ranges have recent_seal_count(now) == MERGE_SEAL_THRESHOLD:
-//     Propose MergeRange, break (one merge per topic per evaluation)
-```
-
-`RangeMeta::mergeable_with()` checks both ranges are cold. Hysteresis built in: split at 3 seals/window, merge at 0. No oscillation.
-
-### 6d. Proposal Path — Lazy Execution
-
-Auto-proposals flow through a two-level buffer:
-
-1. `MetadataStateMachine::pending_proposals` — populated during `apply()` (deterministic on all replicas, but only leader drains them)
-2. `Raft::pending_proposals` — leader wraps in `RaftCommand::Metadata(...)`, drained by `MultiRaft::flush()`
-
-**Lazy execution:** `MultiRaft::flush()` drains `pending_proposals` at the **start** of the next flush cycle, proposing them as regular entries. They are persisted in the same batch — no second persist pass. ~100ms latency (one tick) is negligible for decisions based on 5-minute windows.
-
-**Anti-recursion:** `apply_committed_entries()` never calls `propose()`. Auto-proposals are buffered, not acted on inline. `SplitRange` apply does not generate further proposals (children start with empty seal history). Max depth: 1 level.
-
-Stale proposals (e.g., merge proposed but range split before commit) are safe — `apply_split_range()` / `apply_merge_range()` precondition checks reject them. `RollSegment` with wrong segment ID is a no-op (stale seal).
-
-### 6e. MergeCheck Timer
-
-`RaftTimerKind::MergeCheck` variant, `MERGE_CHECK_INTERVAL_TICKS = 6000` (10 min at 100ms/tick). Set on `become_leader()`, cancelled on stepdown via `cancel_all_timers()`. On timeout, leader calls `evaluate_merges()` with wall-clock time and reschedules.
-
-### 6f. Key Design Decisions
-
-- **`RangeSealHistory` uses timestamp Vec, not counter+window.** Pruning on each seal keeps the Vec bounded. `recent_seal_count(now)` re-evaluates against current time for merge checks.
-- **Split logic lives on `RangeMeta`.** `roll_segment()`, `split()`, `merge()`, `compute_midpoint()`, `mergeable_with()` are methods on `RangeMeta` — state machine dispatches, range owns the logic.
-- **`TimerSeqs` struct groups timer seq values.** Avoids too-many-arguments on `Raft::new()`.
-- **Child ranges get `created_by_split_at` via `with_split_origin()` builder.** Enforces cooldown without adding parameters to `RangeMeta::new()`.
-- **Stale `RollSegment` is no-op, not error.** If `active_seg_id != cmd.segment_id`, returns `Ok(())` — expected during leader transitions, not worth error logging.
-
-**Depends on:** Phases 1-4 (needs working propose pathway + state machine dispatch). Phase 5 not required.
+**Depends on.** Phases 1–4. Phase 5 not required.
 
 ---
 
 ## Phase Dependency Graph
 
 ```
-Phase 1 (Data Model + MetadataStateMachine)              ✅
+Phase 1 (Data Model + Metadata State Machine)        ✅
     │
     ▼
-Phase 2 (Extend RaftCommand)                             ✅
+Phase 2 (Outer Log Payload)                          ✅
     │
     ▼
-Phase 3 (Application State Machine Dispatch)             ✅
+Phase 3 (Application State Machine Dispatch)         ✅
     │
-    ├──────────────────────────┐
-    ▼                          ▼
-Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection) ✅
-    │                          ✅
+    ├────────────────────────┐
+    ▼                        ▼
+Phase 4 (Propose Pathway)   Phase 6 (Hot Range Detection ✅)
+    │
     ▼
-Phase 5 (Leader Forwarding + Shard Discovery)            ✅
+Phase 5 (Leader Forwarding + Shard Discovery)        ✅
 ```
 
 ---
 
-## Backlog (Out of Scope)
+## Backlog
 
-### Hot Range Detection Optimizations
+### Hot range detection — better signals
 
-Not in Phase 6 — add only when midpoint splitting proves insufficient:
+Add only when midpoint splitting proves insufficient:
 
-- **Key histogram / percentile-based split points** — requires sampling infrastructure on data plane nodes, probe protocol from MetadataStateMachine, memory budget management. Only valuable for highly skewed workloads where midpoint splits don't divide load evenly.
-- **Write throughput metrics** — counting writes/sec rather than seal frequency. More granular but requires data plane → MetadataStateMachine reporting pipeline.
-- **Adaptive thresholds** — per-topic or per-range thresholds based on historical patterns instead of global constants.
-- **Predictive splitting** — split before hotspot causes problems, based on trend detection. Requires time-series analysis.
+- **Percentile-based split points** from a key histogram. Better for skewed workloads but requires sampling infrastructure and a probe protocol.
+- **Write throughput as a signal**, alongside or instead of seal frequency. More granular; requires data plane reporting.
+- **Adaptive thresholds** per topic or per range, based on historical patterns.
+- **Predictive splitting** from load-trend detection.
 
-### Consumer Protocol for Range Lifecycle
+### Consumer protocol for range lifecycle
 
-Not in metadata management scope — data plane concern. But depends on metadata providing:
-- `end_offset` on sealed segments (consumer knows "done with this range")
-- `merged_into` / `split_into` lineage (consumer follows range transitions)
-- `active_ranges` list (consumer discovers current write targets)
+Out of metadata-management scope, but depends on metadata exposing:
 
-Consumer behavior on merge:
-- **Single consumer, both ranges:** drain both sealed ranges to completion, then switch to merged range at offset 0.
-- **Two consumers (one per range):** one takes merged range ownership, other → hot standby for next split.
+- Final offsets on sealed segments so a consumer knows when it has drained a range.
+- Lineage of splits and merges so a consumer can follow a range through its transitions.
+- The current set of active ranges so a consumer can find write targets.
 
-Consumer behavior on split:
-- **Single consumer:** switches to consuming both child ranges (may spawn second consumer).
-- **Consumer group:** rebalance — assign each child range to a consumer.
+### Snapshot subsystem
 
-### RocksDB Storage Integration ✅ (log persistence)
+Durable log persistence is implemented (shared key-value store with composite keys per group, atomic batched writes with fsync, hard state persistence, startup recovery). Remaining: install-snapshot RPC, snapshot creation and restore for the metadata state machine, log compaction, and applied-index persistence. Logs grow unbounded until snapshots land — acceptable for the current scale.
 
-Durable storage implemented. Single RocksDB instance shared across all shard groups with composite keys (`[group_id BE][key_type][index BE]`). Covers: RocksDB dependency, `RaftStorage` trait, `MetadataStorage` implementation, atomic `WriteBatch` flush with fsync, `LogMutation` drain pattern, `stabled_index` tracking, HardState persistence, startup recovery, multi-group isolation, `delete_group()` via range delete.
+### Membership rebalancing — the missing addition half
 
-**Remaining (snapshot subsystem):** InstallSnapshot RPC, snapshot creation/restore on `MetadataStateMachine`, log compaction, applied index persistence. Logs grow unbounded until snapshots land — acceptable for current scale.
+Pair every reconciliation removal with an addition of a replacement node. Without this, groups shrink monotonically as members die. Selection picks a healthy node not currently in the group, preferring nodes with available capacity. Coordinates with segment-level data movement (data plane concern). See `mental-model.md` for the full argument.
 
 ---
 
-## Key Design Decisions
+## Key design decisions
 
-**1. MultiRaftActor handles routing — no separate broker layer.**
-`MultiRaftActorCommand::Propose` takes `resource_key`, not `shard_group_id`. MultiRaft hashes the key to find the shard group, checks leadership, and proposes — all internally. Client handler in `lib.rs` stays thin (just forwards). No async topology queries needed because `ShardGroupId::new(key)` is a pure hash function.
+1. **Routing lives inside the consensus actor — no separate broker layer.** The actor already holds the per-group Raft instances and can check leadership directly. Hashing a resource key to a shard is a pure function, so routing needs no asynchronous query to gossip.
 
-**2. MetadataStateMachine lives per shard group, inside MultiRaft(Store).**
-Not inside `Raft`. Raft remains a pure consensus state machine — no knowledge of topics, ranges, segments.
+2. **The metadata state machine lives per shard group, owned by the per-group Raft instance.** Raft here is not a generic consensus library — it is the consensus core of a metadata system. Direct ownership, no traits.
 
-**3. Application commands use buffer-drain pattern.**
-Consistent with `take_outbound()`, `take_timer_commands()`, `take_log_mutations()`. New: `take_applied_entries()`.
+3. **Apply runs inside Raft, not in a buffer drained by the actor.** Side effects (outbound packets, timer commands, log mutations) are buffered for the actor to drain. The application-state apply is not — it happens at the consensus boundary, guarded by both commit and durability.
 
-**4. Commit completion tracked via pending_proposals map.**
-`raft.propose()` returns immediately (entry appended). Actual commit notification comes asynchronously. `MultiRaft` tracks `(shard_id, log_index) → oneshot::Sender` to resolve reply on commit+apply. Leader stepdown drains all pending with `NotLeader`.
+4. **Commit completion is tracked by log position.** A proposal records its log index plus a reply channel. When apply reaches that index, the reply fires. Leader stepdown drains all pending replies with a not-leader error.
 
-**5. Client redirect first, transparent forwarding second.**
-Phase 4 returns `NotLeader(leader_hint)` — client redirects. Phase 5 adds transparent forwarding. Both coexist in production.
+5. **Client-redirect first, transparent forwarding second.** Phase 4 returns a not-leader hint so clients can redirect; Phase 5 added one-hop forwarding so they don't have to. Both paths coexist.
 
-**6. Nested ownership — no flat maps, no back-references.**
-Ranges nested inside `TopicMeta`, segments nested inside `RangeMeta`. ID counters (`next_range_id`, `next_segment_id`) scoped to parent entity. Eliminates `topic_id` back-ref on Range, `range_id` back-ref on Segment. Ownership expressed by structure. `DeleteTopic` = drop the `TopicMeta`. `RaftCommand` variants carry `topic_id` (and `range_id` for segment ops) to navigate the tree.
+6. **Nested ownership — no flat maps, no back-references.** Ranges live inside topics; segments live inside ranges. Counters scoped to the parent. Deleting a topic is dropping the topic record; the rest cascades structurally.
 
-**7. Offsets on segments enable consumer position tracking.**
-`start_offset` / `end_offset` on `SegmentMeta`, `next_offset` on `RangeMeta`. Consumer knows "done with sealed range" when position reaches last segment's `end_offset`. On split/merge, child ranges start at offset 0 — clean break. Consumer protocol (backlog) uses these fields plus `merged_into`/`split_into` lineage to navigate range transitions.
+7. **Segment offsets enable consumer position tracking.** Each sealed segment knows where it ended; consumers know they are done with a range when their position reaches the last segment's end. On split or merge, children start at offset 0 — a clean break from the parent's offset space.
 
-**8. Seal frequency as hot range signal — no external metrics pipeline.**
-`RollSegment` commits are already in the Raft log. Counting seal frequency per range gives a load signal for free. No probe protocol, no data plane → MetadataStateMachine reporting, no key histograms. Midpoint split. Accuracy is good enough for Phase 6 — optimization is backlog.
+8. **Seal frequency is the hot-range signal.** Already in the log, costs nothing additional, accurate enough for midpoint splitting.
+
+9. **Membership changes go through the log, never via direct mutation.** Detailed in Phase 3d and `mental-model.md`.
 
 ---
 
-## Risk Areas
+## Risk areas
 
 | Risk | Mitigation |
 |---|---|
-| Pending proposals leak on leader stepdown | Drain and error all pending in `step_down()` |
-| Hash ring divergence between client/broker | Server resolves routing from SWIM topology (~2-3s convergence). Leader forwarding handles misrouted proposals. Epoch cancelled — not needed. |
-| Bincode format change on new `RaftCommand` variants | RocksDB persists entries now; version byte on `LogEntry` when format changes needed |
-| Midpoint split doesn't balance skewed workloads | Acceptable for Phase 6 — percentile-based split in backlog |
-| Seal tracker grows unbounded for long-lived ranges | Sliding window bounded; entries removed on range seal/delete |
-| Two leaders coexisting briefly (partition heal) with divergent peer sets | `AddPeer`/`RemovePeer` go through the Raft log — quorum size advances deterministically with the log index. A leader cannot commit under one peer set while a future leader applies under a different one for the same index. See Phase 3d. |
-| New leader inherits dead peers (predecessor died before proposing `RemovePeer`) | On `LeaderChange → self`, reconcile `peers` against SWIM's live set and propose `RemovePeer` for stragglers. See Phase 3d "Leader-election reconciliation". |
+| Pending reply channels leak on leader stepdown | Drain and error all pending on stepdown. |
+| Hash ring divergence between client and server | Server resolves routing from SWIM (fast convergence). Leader forwarding handles misrouted proposals. |
+| Log entry format changes on payload variants | A version byte on log entries when bincode-incompatible changes are needed. |
+| Midpoint split does not balance skewed workloads | Acceptable for now; percentile-based split is in the backlog. |
+| Seal tracker grows unbounded on long-lived ranges | Sliding window keeps it bounded; cleaned up on range seal or delete. |
+| Two leaders coexisting briefly with divergent peer sets | Membership goes through the Raft log — quorum size advances deterministically with the log index. Split-brain commit is structurally impossible. See Phase 3d. |
+| New leader inherits dead peers because the predecessor died before converting the event | Reference-back step on becoming leader (Phase 3d; detailed in `mental-model.md`). |
+| Reconciliation shrinks the group's failure budget | Pair every removal with an addition. The addition-selection half is not yet built. |
+| Quorum loss before a leader can act on it | Not recoverable from inside Raft. Requires external intervention (manual reconfiguration or a future external recovery protocol). |

@@ -1,84 +1,10 @@
-# DS-RSM (System-Level Architecture)
+# DS-RSM (System-Level Invariants)
 
-## Purpose
-
-EastGuard uses Dynamically-Sharded Replicated State Machines (DS-RSM) instead of a monolithic metadata store or single controller quorum. Metadata is sharded by resource key and each shard forms a small Raft group among hosting nodes.
-
-## Architecture
-
-```
-                   SWIM (UDP, membership + gossip)
-                          │
-              ┌───────────┼───────────┐
-              ▼           ▼           ▼
-           Node A      Node B      Node C
-           ┌─────┐    ┌─────┐    ┌─────┐
-           │Shard│    │Shard│    │Shard│
-           │ #1  │◄──►│ #1  │◄──►│ #1  │   ← Raft group (TCP)
-           │(L)  │    │(F)  │    │(F)  │
-           ├─────┤    ├─────┤    ├─────┤
-           │Shard│    │Shard│    │Shard│
-           │ #2  │    │ #2  │    │ #2  │   ← another Raft group
-           │(F)  │    │(L)  │    │(F)  │
-           └─────┘    └─────┘    └─────┘
-```
-
-Each node runs `MultiRaftActor` multiplexing all its shard groups. Single actor, many state machines.
-
-## Subsystem Hierarchy
-
-DS-RSM is the top-level architecture. All other components are subsystems within it.
-
-```
-DS-RSM (this file: ds-rsm.md)
-├── Membership Layer
-│   ├── SwimActor / Swim           → swim.md
-│   ├── Topology (hash ring)       → topology.md
-│   └── SwimTransportActor (UDP)   → (covered in swim.md)
-│
-├── Consensus Layer
-│   ├── MultiRaftActor / MultiRaft → raft-actor.md
-│   ├── Raft (per shard group)     → raft.md
-│   ├── MetadataStateMachine       → metadata-state-machine.md
-│   └── RaftTransportActor (TCP)   → raft-transport.md
-│
-├── Timer Infrastructure
-│   └── Ticker / Scheduler         → scheduler.md
-│
-└── Storage
-    └── RocksDB key layout         → storage-layout.md
-```
-
-Membership drives consensus: SWIM detects node join/death → tells MultiRaftActor to create/remove groups and add/remove peers. Consensus drives application state: Raft commits log entries → MetadataStateMachine applies them.
-
-## Component Ownership
-
-| Component | Owns | Driven By |
-|---|---|---|
-| `SwimActor` | `Swim` state machine | UDP packets, timer callbacks |
-| `MultiRaftActor` | `MultiRaft` → `HashMap<ShardGroupId, Raft>` | TCP packets, timer callbacks, SWIM membership events |
-| `Raft` | `MetadataStateMachine` (per shard group) | Committed log entries |
-| `Topology` | Consistent hash ring + shard leader map | SWIM membership events |
-| `Ticker<T>` | Timer state for either SWIM or Raft | Real-time interval ticks |
-
-## Routing
-
-```
-Client request (resource_key)
-    │
-    ▼
-hash(resource_key) → ShardGroupId → Raft group
-    │
-    ▼
-is_leader()? → propose(command) → replicate → commit → apply to MetadataStateMachine
-```
-
-`MultiRaftActor` handles routing internally. No separate broker or routing layer. `ShardGroupId::new(key)` is a pure hash — no topology query needed for routing.
-
+Top-level architecture for EastGuard's metadata management. Sharded Raft groups across the cluster, SWIM for membership. For the full conceptual picture, see `diagrams/metadata-management/mental-model.md`.
 
 ## Invariants
 
-1. **Each Raft instance is fully independent.** In DS-RSM, a node runs many Raft instances. They share no state — separate term, voted_for, log, commit_index, peers. `MultiRaftActor` maps `ShardGroupId → Raft`. Processing event for one shard never touches another's state.
+1. **Each Raft instance is fully independent.** A node runs many Raft instances (one per shard group it hosts). They share no state — separate term, voted_for, log, commit_index, peers. `MultiRaftActor` maps `ShardGroupId → Raft`. Processing event for one shard never touches another's state.
 
 2. **SWIM is sole membership authority.** Group lifecycle (create, remove) and peer changes (add, remove) are driven by SWIM membership events. `MultiRaftActor` does not decide when to create or remove groups — only responds to commands from `SwimActor`.
 
@@ -90,10 +16,12 @@ is_leader()? → propose(command) → replicate → commit → apply to Metadata
 
 6. **Timer seq values unique across all shard groups on a node.** `MultiRaft` uses `RaftTimerTokenGenerator` (monotonic wrapping counter) to assign globally unique timer seq values. Prevents cross-group timer collisions in shared `Ticker`.
 
-7. **Dual transport separation.** SWIM uses UDP on `cluster_port` for failure detection and gossip. Raft uses TCP on `raft_port` for log replication and elections. Different protocols, different actors, different ports. Never mixed.
+7. **Leader forwarding is max 1 hop.** `ProposeRequest.forwarded: bool` prevents re-forwarding. Non-leader forwards to leader once; if that also fails, error returned to client.
 
-8. **Leader forwarding is max 1 hop.** `ProposeRequest.forwarded: bool` prevents re-forwarding. Non-leader forwards to leader once; if that also fails, error returned to client.
+8. **Stale proposals are safe.** Split/merge/seal proposals that arrive after state has changed are rejected by `apply_*` precondition checks in `MetadataStateMachine`. Two leaders briefly coexisting (network partition) cannot cause inconsistency — only one proposal commits.
 
-9. **Stale proposals are safe.** Split/merge/seal proposals that arrive after state has changed are rejected by `apply_*` precondition checks in MetadataStateMachine. Two leaders briefly coexisting (network partition) cannot cause inconsistency — only one proposal commits.
+9. **No cross-shard coordination for single-topic operations.** Topic and all its ranges and segments live in one shard group. Every mutation is a single Raft log entry — atomic by construction. Cross-topic operations (e.g., list all topics) require scatter-gather.
 
-10. **No cross-shard coordination for single-topic operations.** Topic and all its ranges and segments live in one shard group. Every mutation is a single Raft log entry — atomic by construction. Cross-topic operations (e.g., list all topics) require scatter-gather.
+10. **SWIM facts that no node could convert stay outside Raft until a leader exists.** SWIM does not re-fire already-disseminated events. A leader that takes over after such a gap must explicitly refer back to SWIM and propose the missed conversions. See `raft-actor.md` invariant on leader-election reconciliation.
+
+11. **Membership changes flow through the Raft log on every replica, never via direct mutation.** Direct mutation from gossip events would let replicas disagree on quorum size at the same log index, admitting split-brain commit. See `raft.md`.
