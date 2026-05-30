@@ -133,3 +133,17 @@ pub async fn send_request(host: &str, port: u16, req: ClientRequest) -> ClientRe
     let (_, response) = reader.read_request().await.unwrap();
     response
 }
+
+/// Sends a `ClientRequest` directly to a `SocketAddr` (e.g. a `leader_addr` from `NotLeader`).
+pub async fn send_request_to_addr(
+    addr: std::net::SocketAddr,
+    req: ClientRequest,
+) -> ClientResponse {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut writer = ClientRawWriter::new(write_half);
+    let mut reader = ClientStreamReader::new(read_half);
+    writer.write(0, &req).await.unwrap();
+    let (_, response) = reader.read_request().await.unwrap();
+    response
+}
