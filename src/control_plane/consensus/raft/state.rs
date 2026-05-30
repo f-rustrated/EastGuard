@@ -684,6 +684,12 @@ impl Raft {
         self.stabled_index = self.stabled_index.max(value);
     }
 
+    /// Apply any committed entries that became durable after the last stabled_index advance.
+    /// Called by MultiRaft after persist_and_advance() so the actor controls when apply happens.
+    pub(crate) fn apply_after_flush(&mut self) {
+        self.apply_committed_entries();
+    }
+
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;

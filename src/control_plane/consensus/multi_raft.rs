@@ -677,6 +677,7 @@ impl MultiRaft {
         for (id, last_log_index) in last_indices {
             if let Some(raft) = self.groups.get_mut(&id) {
                 raft.advance_stabled_index(last_log_index);
+                raft.apply_after_flush();
             }
         }
     }
