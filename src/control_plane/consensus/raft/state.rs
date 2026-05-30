@@ -161,6 +161,13 @@ impl Raft {
         Some(seg.replica_set.clone())
     }
 
+    pub(crate) fn get_topic_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&crate::control_plane::metadata::types::TopicMeta> {
+        self.state_machine.get_topic_by_name(name)
+    }
+
     #[cfg(test)]
     pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
         &self.state_machine
