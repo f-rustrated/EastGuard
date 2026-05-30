@@ -12,27 +12,26 @@
 ///
 /// This allows multiple requests to be in-flight on a single connection simultaneously,
 /// with responses arriving in any order.
-use std::{io::ErrorKind, mem::size_of};
+use std::{io::ErrorKind, mem::size_of, net::SocketAddr};
 
 const LEN_PREFIX_SIZE: usize = size_of::<u32>();
 const REQUEST_ID_SIZE: usize = size_of::<u64>();
 
-use anyhow::Context;
 use tokio::sync::mpsc;
 
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneRequest, NodeInfo, NodeState, ShardDetail, TopicStats,
-    TopicSummary,
+    ControlPlaneResponse, DataPlaneRequest, NodeInfo, NodeState, RangeDetail, RangeState,
+    ShardDetail, TopicDetail, TopicStats, TopicSummary,
 };
 use crate::{
     control_plane::{
-        SwimNodeState,
+        NodeId, SwimNodeState,
         consensus::actor::MutlRaftSender,
-        consensus::messages::ProposeError,
-        membership::{ShardGroupId, actor::SwimSender},
+        consensus::messages::{GroupStatus, ProposeError, TopicDetailQueryResult},
+        membership::{ShardGroup, actor::SwimSender},
         metadata::{
-            command::{CreateTopic, DeleteTopic, MetadataCommand},
+            command::{CreateTopic, DeleteTopic, MetadataCommand, SplitRange},
             strategy::StoragePolicy,
         },
     },
@@ -224,6 +223,8 @@ impl ClientHandler {
         }
     }
 
+    // ── Control Plane ─────────────────────────────────────────────────────
+
     async fn handle_control_plane(&self, request: ControlPlaneRequest) -> ClientResponse {
         let res = match request {
             ControlPlaneRequest::CreateTopic {
@@ -232,7 +233,7 @@ impl ClientHandler {
             } => self.handle_create_topic(name, storage_policy).await,
             ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
             ControlPlaneRequest::ListHostedTopics => self.handle_list_hosted_topics().await,
-            ControlPlaneRequest::DescribeTopic { .. } => todo!(),
+            ControlPlaneRequest::DescribeTopic { name } => self.handle_describe_topic(name).await,
         };
         match res {
             Ok(resp) => resp,
@@ -248,64 +249,120 @@ impl ClientHandler {
         name: String,
         storage_policy: StoragePolicy,
     ) -> anyhow::Result<ClientResponse> {
-        let shard_group = self
+        let Some(shard_group) = self
             .swim_sender
             .resolve_shard_group(name.as_bytes().to_vec())
             .await?
-            .context("shard group not found")?;
-
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let cmd = CreateTopic {
-            storage_policy,
-            name,
-            replica_set: shard_group.members,
-            created_at,
+        else {
+            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )));
         };
-
-        Ok(
-            match self
-                .raft_sender
-                .propose(shard_group.id, cmd.into())
-                .await
-                .context("shard group not found")?
-            {
-                Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
-                Err(ProposeError::NotLeader(_)) => {
-                    ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                        "not the leader for this shard group — retry on another node".into(),
-                    ))
+        match self.raft_sender.get_group_status(shard_group.id).await {
+            GroupStatus::Hosted { is_leader: true, .. } => {
+                let detail =
+                    self.raft_sender.get_topic_detail(shard_group.id, name.clone()).await;
+                if matches!(detail, TopicDetailQueryResult::Found(_)) {
+                    return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists));
                 }
-                Err(e) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                    format!("{e:?}"),
-                )),
-            },
-        )
+                let now_ms = current_time_ms();
+                let cmd = MetadataCommand::CreateTopic(CreateTopic {
+                    name: name.clone(),
+                    storage_policy,
+                    replica_set: shard_group.members,
+                    created_at: now_ms,
+                });
+                Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
+                    Some(Ok(())) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
+                    }
+                    Some(Err(ProposeError::NotLeader(leader_id))) => {
+                        let leader_addr = match leader_id {
+                            Some(id) => self.resolve_leader_addr(id).await,
+                            None => None,
+                        };
+                        ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                            leader_addr,
+                        })
+                    }
+                    Some(Err(ProposeError::ShardNotFound)) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                            "shard not found".into(),
+                        ))
+                    }
+                    Some(Err(ProposeError::ShardGroupRemoved)) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                            "shard group removed".into(),
+                        ))
+                    }
+                    None => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                        "shard group not found".into(),
+                    )),
+                })
+            }
+            GroupStatus::Hosted { is_leader: false, leader: Some(leader_id) } => {
+                let leader_addr = self.resolve_leader_addr(leader_id).await;
+                Ok(ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader { leader_addr }))
+            }
+            GroupStatus::Hosted { is_leader: false, leader: None } => {
+                Ok(ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                    leader_addr: None,
+                }))
+            }
+            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+        }
     }
 
     async fn handle_delete_topic(&self, name: String) -> anyhow::Result<ClientResponse> {
-        let shard_group = self
+        let Some(shard_group) = self
             .swim_sender
             .resolve_shard_group(name.as_bytes().to_vec())
             .await?
-            .context("shard group not found")?;
-
-        let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
-        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
-            Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-            Some(Err(ProposeError::NotLeader(_))) => {
-                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                    "not the leader for this shard group — retry on another node".into(),
-                ))
+        else {
+            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )));
+        };
+        match self.raft_sender.get_group_status(shard_group.id).await {
+            GroupStatus::Hosted { is_leader: true, .. } => {
+                let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name: name.clone() });
+                Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
+                    Some(Ok(())) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)
+                    }
+                    Some(Err(ProposeError::NotLeader(leader_id))) => {
+                        let leader_addr = match leader_id {
+                            Some(id) => self.resolve_leader_addr(id).await,
+                            None => None,
+                        };
+                        ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                            leader_addr,
+                        })
+                    }
+                    Some(Err(ProposeError::ShardNotFound)) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                            "shard not found".into(),
+                        ))
+                    }
+                    Some(Err(ProposeError::ShardGroupRemoved)) => {
+                        ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                            "shard group removed".into(),
+                        ))
+                    }
+                    None => ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound),
+                })
             }
-            Some(Err(e)) => {
-                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(format!("{e:?}")))
+            GroupStatus::Hosted { is_leader: false, leader: Some(leader_id) } => {
+                let leader_addr = self.resolve_leader_addr(leader_id).await;
+                Ok(ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader { leader_addr }))
             }
-            None => ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound),
-        })
+            GroupStatus::Hosted { is_leader: false, leader: None } => {
+                Ok(ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                    leader_addr: None,
+                }))
+            }
+            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+        }
     }
 
     async fn handle_list_hosted_topics(&self) -> anyhow::Result<ClientResponse> {
@@ -325,6 +382,111 @@ impl ClientHandler {
         ))
     }
 
+    async fn handle_describe_topic(&self, name: String) -> anyhow::Result<ClientResponse> {
+        let Some(shard_group) = self
+            .swim_sender
+            .resolve_shard_group(name.as_bytes().to_vec())
+            .await?
+        else {
+            return Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "shard group not found".into(),
+            )));
+        };
+        match self.raft_sender.get_group_status(shard_group.id).await {
+            GroupStatus::Hosted { .. } => {
+                self.read_describe_topic_with_group(name, shard_group.id.0).await
+            }
+            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+        }
+    }
+
+    // ── Control Plane primitives ──────────────────────────────────────────
+
+    async fn read_describe_topic_with_group(
+        &self,
+        name: String,
+        shard_group_id: u64,
+    ) -> anyhow::Result<ClientResponse> {
+        use crate::control_plane::membership::ShardGroupId;
+        let result = self
+            .raft_sender
+            .get_topic_detail(ShardGroupId(shard_group_id), name.clone())
+            .await;
+        Ok(match result {
+            TopicDetailQueryResult::Found(data) => {
+                let ranges = data
+                    .ranges
+                    .into_iter()
+                    .map(|r| RangeDetail {
+                        range_id: r.range_id,
+                        keyspace_start: r.keyspace_start,
+                        keyspace_end: r.keyspace_end,
+                        active_segment_id: r.active_segment_id,
+                        state: match r.state {
+                            crate::control_plane::metadata::types::RangeState::Active => {
+                                RangeState::Active
+                            }
+                            crate::control_plane::metadata::types::RangeState::Sealed => {
+                                RangeState::Sealed
+                            }
+                            crate::control_plane::metadata::types::RangeState::Deleting => {
+                                RangeState::Deleting
+                            }
+                        },
+                    })
+                    .collect();
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(TopicDetail {
+                    name: data.name,
+                    ranges,
+                }))
+            }
+            TopicDetailQueryResult::TopicNotFound => {
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound)
+            }
+            TopicDetailQueryResult::GroupNotHosted => {
+                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                    "shard group not hosted on this node".into(),
+                ))
+            }
+        })
+    }
+
+    /// Returns `ShardNotLocal` for the given shard group, using the first member as the hint.
+    async fn cp_not_local(&self, shard_group: &ShardGroup) -> anyhow::Result<ClientResponse> {
+        match self.pick_member_addr(shard_group).await {
+            Ok(hint_node) => Ok(ClientResponse::ControlPlane(
+                ControlPlaneResponse::ShardNotLocal { hint_node },
+            )),
+            Err(_) => Ok(ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                "no shard group member reachable".into(),
+            ))),
+        }
+    }
+
+    async fn resolve_leader_addr(&self, leader_id: NodeId) -> Option<SocketAddr> {
+        self.swim_sender
+            .resolve_address(leader_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.client_addr)
+    }
+
+    async fn pick_member_addr(&self, shard_group: &ShardGroup) -> anyhow::Result<SocketAddr> {
+        let member_id = shard_group
+            .members
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("shard group has no members"))?
+            .clone();
+        self.swim_sender
+            .resolve_address(member_id)
+            .await?
+            .map(|a| a.client_addr)
+            .ok_or_else(|| anyhow::anyhow!("shard group member address unknown"))
+    }
+
+    // ── Data Plane ────────────────────────────────────────────────────────
+
     async fn handle_data_plane(&self, request: DataPlaneRequest) -> ClientResponse {
         match request {
             DataPlaneRequest::Produce { .. } => todo!(),
@@ -333,13 +495,17 @@ impl ClientHandler {
         }
     }
 
+    // ── Admin ─────────────────────────────────────────────────────────────
+
     async fn handle_admin(&self, request: AdminRequest) -> ClientResponse {
         let res = match request {
             AdminRequest::DescribeCluster => self.handle_describe_cluster().await,
             AdminRequest::ListHostedTopicsWithStats => {
                 self.handle_list_hosted_topics_with_stats().await
             }
-            AdminRequest::SplitRange { .. } => todo!(),
+            AdminRequest::SplitRange { topic_name, range_id, split_point } => {
+                self.handle_split_range(topic_name, range_id, split_point).await
+            }
             AdminRequest::GetShardInfo { key } => self.handle_get_shard_info(key).await,
             AdminRequest::GetShardLeader { shard_group_id } => {
                 self.handle_get_shard_leader(shard_group_id).await
@@ -383,6 +549,105 @@ impl ClientHandler {
         Ok(ClientResponse::Admin(AdminResponse::TopicStats { topics }))
     }
 
+    async fn handle_split_range(
+        &self,
+        topic_name: String,
+        range_id: u64,
+        split_point: Vec<u8>,
+    ) -> anyhow::Result<ClientResponse> {
+        let Some(shard_group) = self
+            .swim_sender
+            .resolve_shard_group(topic_name.as_bytes().to_vec())
+            .await?
+        else {
+            return Ok(ClientResponse::Admin(AdminResponse::InternalError(
+                "shard group not found".into(),
+            )));
+        };
+        match self.raft_sender.get_group_status(shard_group.id).await {
+            GroupStatus::Hosted { is_leader: true, .. } => {
+                self.propose_split_range_local(shard_group, topic_name, range_id, split_point)
+                    .await
+            }
+            GroupStatus::Hosted { is_leader: false, leader: Some(leader_id) } => {
+                let leader_addr = self.resolve_leader_addr(leader_id).await;
+                Ok(ClientResponse::Admin(AdminResponse::InternalError(format!(
+                    "not the leader, try {leader_addr:?}"
+                ))))
+            }
+            GroupStatus::Hosted { is_leader: false, leader: None } => Ok(
+                ClientResponse::Admin(AdminResponse::InternalError("election in progress".into())),
+            ),
+            GroupStatus::NotHosted => Ok(ClientResponse::Admin(AdminResponse::InternalError(
+                "shard group not hosted on this node".into(),
+            ))),
+        }
+    }
+
+    async fn propose_split_range_local(
+        &self,
+        shard_group: ShardGroup,
+        topic_name: String,
+        range_id: u64,
+        split_point: Vec<u8>,
+    ) -> anyhow::Result<ClientResponse> {
+        use crate::control_plane::metadata::{RangeId, TopicId};
+
+        let detail = match self
+            .raft_sender
+            .get_topic_detail(shard_group.id, topic_name.clone())
+            .await
+        {
+            TopicDetailQueryResult::Found(d) => d,
+            TopicDetailQueryResult::TopicNotFound => {
+                return Ok(ClientResponse::Admin(AdminResponse::InternalError(
+                    "topic not found".into(),
+                )));
+            }
+            TopicDetailQueryResult::GroupNotHosted => {
+                return Ok(ClientResponse::Admin(AdminResponse::InternalError(
+                    "shard group not hosted".into(),
+                )));
+            }
+        };
+
+        let Some(range) = detail.ranges.iter().find(|r| r.range_id == range_id) else {
+            return Ok(ClientResponse::Admin(AdminResponse::InternalError(
+                "range not found".into(),
+            )));
+        };
+
+        if split_point <= range.keyspace_start || split_point >= range.keyspace_end {
+            return Ok(ClientResponse::Admin(AdminResponse::InvalidSplitPoint));
+        }
+
+        let now_ms = current_time_ms();
+        let cmd = MetadataCommand::SplitRange(SplitRange {
+            topic_id: TopicId(detail.topic_id),
+            range_id: RangeId(range_id),
+            split_point: split_point.clone(),
+            created_at: now_ms,
+            left_replica_set: range.replica_set.clone(),
+            right_replica_set: range.replica_set.clone(),
+        });
+
+        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
+            Some(Ok(())) => ClientResponse::Admin(AdminResponse::RangeSplit),
+            Some(Err(ProposeError::NotLeader(_))) => {
+                ClientResponse::Admin(AdminResponse::InternalError("not the leader".into()))
+            }
+            Some(Err(ProposeError::ShardNotFound)) => {
+                ClientResponse::Admin(AdminResponse::InternalError("shard not found".into()))
+            }
+            Some(Err(ProposeError::ShardGroupRemoved)) => {
+                ClientResponse::Admin(AdminResponse::InternalError("shard group removed".into()))
+            }
+            None => {
+                ClientResponse::Admin(AdminResponse::InternalError("shard group not found".into()))
+            }
+        })
+    }
+
     async fn handle_get_shard_info(&self, key: Vec<u8>) -> anyhow::Result<ClientResponse> {
         let detail = self
             .swim_sender
@@ -397,7 +662,11 @@ impl ClientHandler {
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
     }
 
-    async fn handle_get_shard_leader(&self, shard_group_id: u64) -> anyhow::Result<ClientResponse> {
+    async fn handle_get_shard_leader(
+        &self,
+        shard_group_id: u64,
+    ) -> anyhow::Result<ClientResponse> {
+        use crate::control_plane::membership::ShardGroupId;
         let leader = self
             .raft_sender
             .get_leader(ShardGroupId(shard_group_id))
@@ -426,10 +695,18 @@ pub async fn run_client_writer(
     Ok(())
 }
 
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
+    use crate::control_plane::consensus::messages::{GroupStatus, TopicDetailQueryResult};
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
         ControlPlaneResponse, NodeState,
@@ -484,31 +761,45 @@ mod tests {
         tx
     }
 
-    #[tokio::test]
-    async fn create_topic_ok() {
-        let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
-            {
-                let _ = reply.send(Some(test_shard_group()));
+    fn swim_leader_for(group: ShardGroup) -> crate::control_plane::membership::actor::SwimSender {
+        swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
             }
-        });
-        let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
+        })
+    }
+
+    fn raft_leader_for(group: ShardGroup) -> crate::control_plane::consensus::actor::MutlRaftSender {
+        let group_id = group.id;
+        raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetGroupStatus { reply, .. } => {
+                let _ = reply.send(GroupStatus::Hosted { is_leader: true, leader: None });
+            }
+            MultiRaftActorCommand::GetTopicDetail { reply, .. } => {
+                let _ = reply.send(TopicDetailQueryResult::TopicNotFound);
+            }
+            MultiRaftActorCommand::Propose { reply, propose, .. }
+                if propose.shard_group_id == group_id =>
+            {
                 let _ = reply.send(Ok(()));
             }
-        });
-        let resp = ClientHandler::new(swim, raft)
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::CreateTopic {
-                    name: "t1".into(),
-                    storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
-                        retention_ms: 3_600_000,
-                        replication_factor: 1,
-                        partition_strategy:
-                            crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
-                    },
+            _ => {}
+        })
+    }
+
+    #[tokio::test]
+    async fn create_topic_ok() {
+        let group = test_shard_group();
+        let resp = ClientHandler::new(swim_leader_for(group.clone()), raft_leader_for(group))
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                    retention_ms: 3_600_000,
+                    replication_factor: 1,
+                    partition_strategy:
+                        crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
                 },
-            ))
+            }))
             .await;
         assert!(
             matches!(
@@ -516,6 +807,48 @@ mod tests {
                 ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
             ),
             "expected TopicCreated, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_topic_already_exists() {
+        let group = test_shard_group();
+        let swim = swim_leader_for(group.clone());
+        use crate::control_plane::metadata::types::{RangeDetailData, RangeState, TopicDetailData};
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetGroupStatus { reply, .. } => {
+                let _ = reply.send(GroupStatus::Hosted { is_leader: true, leader: None });
+            }
+            MultiRaftActorCommand::GetTopicDetail { reply, .. } => {
+                let _ = reply.send(TopicDetailQueryResult::Found(TopicDetailData {
+                    name: "t1".into(),
+                    topic_id: 1,
+                    ranges: vec![RangeDetailData {
+                        range_id: 0,
+                        keyspace_start: vec![],
+                        keyspace_end: vec![255],
+                        active_segment_id: Some(0),
+                        state: RangeState::Active,
+                        replica_set: vec![],
+                    }],
+                }));
+            }
+            _ => {}
+        });
+        let resp = ClientHandler::new(swim, raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                    retention_ms: 3_600_000,
+                    replication_factor: 1,
+                    partition_strategy:
+                        crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
+                },
+            }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)),
+            "expected AlreadyExists, got {resp:?}"
         );
     }
 
@@ -550,22 +883,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_topic_ok() {
-        let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
-            {
-                let _ = reply.send(Some(test_shard_group()));
-            }
-        });
-        let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
-                let _ = reply.send(Ok(()));
+    async fn create_topic_not_leader_returns_redirect() {
+        let group = test_shard_group();
+        let swim = swim_leader_for(group.clone());
+        let raft = raft_sender_with(move |cmd| {
+            if let MultiRaftActorCommand::GetGroupStatus { reply, .. } = cmd {
+                let _ = reply.send(GroupStatus::Hosted {
+                    is_leader: false,
+                    leader: Some(node_id("other-node")),
+                });
             }
         });
         let resp = ClientHandler::new(swim, raft)
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::DeleteTopic { name: "t1".into() },
-            ))
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                    retention_ms: 3_600_000,
+                    replication_factor: 1,
+                    partition_strategy:
+                        crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
+                },
+            }))
+            .await;
+        // SWIM has no address for "other-node" so leader_addr resolves to None.
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader { .. })
+            ),
+            "expected NotLeader, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_topic_ok() {
+        let group = test_shard_group();
+        let resp = ClientHandler::new(swim_leader_for(group.clone()), raft_leader_for(group))
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::DeleteTopic {
+                name: "t1".into(),
+            }))
             .await;
         assert!(
             matches!(
@@ -573,6 +929,67 @@ mod tests {
                 ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)
             ),
             "expected TopicDeleted, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_topic_found() {
+        use crate::control_plane::metadata::types::{RangeDetailData, RangeState, TopicDetailData};
+        let group = test_shard_group();
+        let swim = swim_leader_for(group.clone());
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetGroupStatus { reply, .. } => {
+                let _ = reply.send(GroupStatus::Hosted { is_leader: false, leader: None });
+            }
+            MultiRaftActorCommand::GetTopicDetail { reply, .. } => {
+                let _ = reply.send(TopicDetailQueryResult::Found(TopicDetailData {
+                    name: "t1".into(),
+                    topic_id: 1,
+                    ranges: vec![RangeDetailData {
+                        range_id: 0,
+                        keyspace_start: vec![],
+                        keyspace_end: vec![255],
+                        active_segment_id: Some(0),
+                        state: RangeState::Active,
+                        replica_set: vec![],
+                    }],
+                }));
+            }
+            _ => {}
+        });
+        let resp = ClientHandler::new(swim, raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic {
+                name: "t1".into(),
+            }))
+            .await;
+        let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) = resp else {
+            panic!("expected TopicDetail, got {resp:?}");
+        };
+        assert_eq!(detail.name, "t1");
+        assert_eq!(detail.ranges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn describe_topic_not_found() {
+        let group = test_shard_group();
+        let swim = swim_leader_for(group.clone());
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetGroupStatus { reply, .. } => {
+                let _ = reply.send(GroupStatus::Hosted { is_leader: false, leader: None });
+            }
+            MultiRaftActorCommand::GetTopicDetail { reply, .. } => {
+                let _ = reply.send(TopicDetailQueryResult::TopicNotFound);
+            }
+            _ => {}
+        });
+        let resp = ClientHandler::new(swim, raft)
+            .dispatch(ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic {
+                name: "t1".into(),
+            }))
+            .await;
+        assert!(
+            matches!(resp, ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound)),
+            "expected TopicNotFound, got {resp:?}"
         );
     }
 

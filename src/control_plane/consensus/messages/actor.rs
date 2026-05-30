@@ -77,7 +77,6 @@ impl_from_variant_via!(
 /// Pairs a reply channel with its computed value so the actor can send all replies
 /// after draining outbound packets and timer commands — the flush protocol requires
 /// side effects to leave the state machine before any caller is unblocked.
-
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     Propose(
