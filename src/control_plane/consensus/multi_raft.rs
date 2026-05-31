@@ -197,6 +197,11 @@ impl MultiRaft {
                 let result = self.get_topic_detail(shard_group_id, &topic_name);
                 self.deferred.push(DeferredReply::GetTopicDetail(reply, result));
             }
+            #[cfg(test)]
+            MultiRaftActorCommand::IsReady { reply } => {
+                let ready = self.all_leaders_known();
+                self.deferred.push(DeferredReply::IsReady(reply, ready));
+            }
         }
     }
 
@@ -219,6 +224,10 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopicDetail(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                #[cfg(test)]
+                DeferredReply::IsReady(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -354,6 +363,12 @@ impl MultiRaft {
             .values()
             .flat_map(|raft| raft.topic_stats())
             .collect()
+    }
+
+    #[cfg(test)]
+    fn all_leaders_known(&self) -> bool {
+        !self.groups.is_empty()
+            && self.groups.values().all(|r| r.current_leader().is_some())
     }
 
     fn get_group_status(&self, group_id: ShardGroupId) -> GroupStatus {

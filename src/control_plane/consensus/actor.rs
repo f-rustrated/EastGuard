@@ -300,6 +300,20 @@ impl MutlRaftSender {
         recv.await.unwrap_or(TopicDetailQueryResult::GroupNotHosted)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn is_cluster_ready(&self) -> bool {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::IsReady { reply: send })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        recv.await.unwrap_or(false)
+    }
+
     pub(crate) async fn send(
         &self,
         cmd: impl Into<MultiRaftActorCommand>,

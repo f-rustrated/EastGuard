@@ -214,6 +214,8 @@ pub enum AdminRequest {
     GetShardLeader {
         shard_group_id: u64,
     },
+    #[cfg(test)]
+    IsClusterReady,
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -231,6 +233,8 @@ pub enum AdminResponse {
     ShardLeader { leader: Option<String> },
     // All admin operations
     InternalError(String),
+    #[cfg(test)]
+    ClusterReady(bool),
 }
 
 #[derive(Debug, Encode, Decode)]

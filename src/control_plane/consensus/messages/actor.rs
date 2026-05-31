@@ -50,6 +50,12 @@ pub enum MultiRaftActorCommand {
         topic_name: String,
         reply: oneshot::Sender<TopicDetailQueryResult>,
     },
+    /// Returns true when every shard group on this node has a known Raft leader.
+    /// Used by test helpers to detect cluster readiness without a write probe.
+    #[cfg(test)]
+    IsReady {
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 impl From<ConsensusCommand> for MultiRaftActorCommand {
@@ -87,4 +93,6 @@ pub(crate) enum DeferredReply {
     GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
     GetGroupStatus(oneshot::Sender<GroupStatus>, GroupStatus),
     GetTopicDetail(oneshot::Sender<TopicDetailQueryResult>, TopicDetailQueryResult),
+    #[cfg(test)]
+    IsReady(oneshot::Sender<bool>, bool),
 }

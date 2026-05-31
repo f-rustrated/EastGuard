@@ -510,6 +510,8 @@ impl ClientHandler {
             AdminRequest::GetShardLeader { shard_group_id } => {
                 self.handle_get_shard_leader(shard_group_id).await
             }
+            #[cfg(test)]
+            AdminRequest::IsClusterReady => self.handle_is_cluster_ready().await,
         };
         res.unwrap_or_else(|e| {
             tracing::error!("client admin dispatch error: {e}");
@@ -673,6 +675,12 @@ impl ClientHandler {
             .await
             .map(|n| n.to_string());
         Ok(ClientResponse::Admin(AdminResponse::ShardLeader { leader }))
+    }
+
+    #[cfg(test)]
+    async fn handle_is_cluster_ready(&self) -> anyhow::Result<ClientResponse> {
+        let ready = self.raft_sender.is_cluster_ready().await;
+        Ok(ClientResponse::Admin(AdminResponse::ClusterReady(ready)))
     }
 }
 
