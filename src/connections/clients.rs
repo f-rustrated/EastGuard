@@ -311,7 +311,7 @@ impl ClientHandler {
                     leader_addr: None,
                 }))
             }
-            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+            GroupStatus::NotHosted => self.shard_not_local_response(&shard_group).await,
         }
     }
 
@@ -363,7 +363,7 @@ impl ClientHandler {
                     leader_addr: None,
                 }))
             }
-            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+            GroupStatus::NotHosted => self.shard_not_local_response(&shard_group).await,
         }
     }
 
@@ -398,7 +398,7 @@ impl ClientHandler {
             GroupStatus::Hosted { .. } => {
                 self.read_describe_topic_with_group(name, shard_group.id.0).await
             }
-            GroupStatus::NotHosted => self.cp_not_local(&shard_group).await,
+            GroupStatus::NotHosted => self.shard_not_local_response(&shard_group).await,
         }
     }
 
@@ -454,7 +454,7 @@ impl ClientHandler {
     }
 
     /// Returns `ShardNotLocal` for the given shard group, using the first member as the hint.
-    async fn cp_not_local(&self, shard_group: &ShardGroup) -> anyhow::Result<ClientResponse> {
+    async fn shard_not_local_response(&self, shard_group: &ShardGroup) -> anyhow::Result<ClientResponse> {
         match self.pick_member_addr(shard_group).await {
             Ok(hint_node) => Ok(ClientResponse::ControlPlane(
                 ControlPlaneResponse::ShardNotLocal { hint_node },
