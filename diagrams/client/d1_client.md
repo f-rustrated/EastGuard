@@ -77,6 +77,28 @@ The new design resolves each problem:
 The rule of thumb: `ConnectionRequests` was "the API needed to test the internals."
 `ClientRequest` / `ClientResponse` is "the API a producer or consumer actually calls."
 
+### Why control-plane routing is client-side
+
+The original design resolved the Raft leader server-side for control-plane requests: the receiving
+node silently forwarded to the leader via an `InternalForward` variant (max 1 hop). This created
+an asymmetry between the two planes:
+
+| Plane | Who handles routing |
+|---|---|
+| Control plane (original) | Server — auto-forwarded to leader; client never saw `NotLeader` |
+| Data plane | Client — `NotLeader` / `ShardNotLocal` returned; client retries |
+
+Both planes now use the same model. Control-plane handlers return `NotLeader { leader_addr }` or
+`ShardNotLocal { hint_node }` and the client follows the same redirect logic as for data-plane
+requests. This removes `ControlPlaneRouter`, `InternalForward`, and a hidden network hop from the
+server.
+
+`leader_addr` is `Option<SocketAddr>` because a leader may genuinely be unknown: when the previous
+leader dies and a new election has not yet completed, no follower knows who the new leader is.
+`hint_node` is always a concrete address because `ShardNotLocal` is only emitted after the server
+has already resolved at least one shard group member from its local Topology — if no member could
+be found, `InternalError` is returned instead.
+
 ---
 
 ## Connection Model
@@ -118,9 +140,20 @@ ClientRequest:
 
 Error responses are split by plane:
 
-**Control plane errors** — routing is handled server-side; clients never see `NotLeader` or
-`ShardNotLocal`. The receiving node resolves the correct leader internally and forwards the request
-once (`ProposeRequest { forwarded: true }`). If forwarding fails, `InternalError` is returned.
+**Control plane errors** — routing is the client's responsibility, identical to the data plane.
+The server never auto-forwards; it returns a redirect and the client retries.
+
+```
+NotLeader { leader_addr: Option<SocketAddr> }
+  <- This node is not the Raft leader (writes) or does not host the shard group (reads).
+     leader_addr is Some when a leader is known; None when an election is in progress
+     (the previous leader died and no replacement has won yet). Client retries with backoff.
+
+ShardNotLocal { hint_node: SocketAddr }
+  <- This node does not host the shard group for the requested topic at all.
+     hint_node: a live shard group member resolved from the local Topology. Client
+     reconnects and retries on hint_node.
+```
 
 **Data plane errors** — routing is the client's responsibility via `TopicRoutingCache`.
 
@@ -755,11 +788,11 @@ pub struct ConsumerGroupMeta {
 New `MetadataCommand` variants:
 
 ```rust
-JoinConsumerGroup {
-group_id:  String,
-topic_id:  TopicId,
-member_id: String,
-joined_at: u64,
+enum JoinConsumerGroup {
+    group_id:  String
+    topic_id:  TopicId
+    member_id: String
+    joined_at: u64
 }
 
 LeaveConsumerGroup {

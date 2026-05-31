@@ -5,6 +5,7 @@ use crate::control_plane::consensus::messages::rpc::{OutboundRaftPacket, RaftRpc
 use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
 use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::command::MetadataCommand;
+use crate::control_plane::metadata::types::TopicDetailData;
 use crate::data_plane::messages::command::SealRequest;
 use crate::impl_from_variant;
 
@@ -64,6 +65,19 @@ impl_from_variant!(
 pub enum RaftTransportCommand {
     Send(Vec<OutboundRaftPacket>),
     DisconnectPeer(NodeId),
+}
+
+#[allow(dead_code)]
+pub enum GroupStatus {
+    NotHosted,
+    Hosted { is_leader: bool, leader: Option<NodeId> },
+}
+
+#[allow(dead_code)]
+pub enum TopicDetailQueryResult {
+    GroupNotHosted,
+    TopicNotFound,
+    Found(TopicDetailData),
 }
 
 #[allow(dead_code)]

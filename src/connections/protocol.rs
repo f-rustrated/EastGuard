@@ -13,6 +13,8 @@ pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(DataPlaneRequest),
     Admin(AdminRequest),
+    #[cfg(test)]
+    Test(TestRequest),
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -20,13 +22,14 @@ pub enum ClientResponse {
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),
     Admin(AdminResponse),
+    #[cfg(test)]
+    Test(TestResponse),
 }
 
 // ── Control Plane ──────────────────────────────────────────────────────────
 //
-// The server resolves the correct destination internally and forwards the request
-// at most once. Clients never need to retry on a different node — on forwarding
-// failure a generic error is returned.
+// Routing is the client's responsibility. The server returns NotLeader or
+// ShardNotLocal when it cannot handle a request locally; the client retries.
 
 #[derive(Clone, Encode, Decode)]
 pub enum ControlPlaneRequest {
@@ -55,6 +58,13 @@ pub enum ControlPlaneResponse {
     TopicList { topics: Vec<TopicSummary> },
     // DescribeTopic
     TopicDetail(TopicDetail),
+    // Redirect errors — client reconnects and retries on the indicated node
+    /// This node is not the Raft leader (writes) or any shard group host (reads).
+    /// `leader_addr` is `None` when an election is in progress and no leader is yet known.
+    NotLeader { leader_addr: Option<SocketAddr> },
+    /// This node does not host the shard group for the requested topic.
+    /// `hint_node` is a live shard group member the client can retry on.
+    ShardNotLocal { hint_node: SocketAddr },
     // All control plane operations
     InternalError(String),
 }
@@ -254,4 +264,23 @@ pub struct TopicStats {
     pub name: String,
     pub range_count: u32,
     pub total_bytes: u64,
+}
+
+// ── Test protocol ──────────────────────────────────────────────────────────
+//
+// Test-only requests and responses sent as `ClientRequest::Test` /
+// `ClientResponse::Test`. Kept in a dedicated enum so production enums stay
+// free of `#[cfg(test)]` variants.
+
+#[cfg(test)]
+#[derive(Clone, Encode, Decode)]
+pub enum TestRequest {
+    /// Returns true when every shard group on this node has an elected Raft leader.
+    IsClusterReady,
+}
+
+#[cfg(test)]
+#[derive(Debug, Encode, Decode)]
+pub enum TestResponse {
+    ClusterReady(bool),
 }

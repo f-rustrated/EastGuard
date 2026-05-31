@@ -884,3 +884,18 @@ pub struct TopicStats {
     pub range_count: u32,
     pub total_bytes: u64,
 }
+
+pub struct TopicDetailData {
+    pub name: String,
+    pub topic_id: u64,
+    pub ranges: Vec<RangeDetailData>,
+}
+
+pub struct RangeDetailData {
+    pub range_id: u64,
+    pub keyspace_start: Vec<u8>,
+    pub keyspace_end: Vec<u8>,
+    pub active_segment_id: Option<u64>,
+    pub state: RangeState,
+    pub replica_set: Vec<NodeId>,
+}

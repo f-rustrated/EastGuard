@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use crate::config::Environment;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState,
+    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneResponse, NodeState,
+    TestRequest, TestResponse,
 };
 use crate::control_plane::SwimNode;
 use crate::control_plane::SwimNodeState;
@@ -125,11 +128,120 @@ pub async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> boo
 
 /// Sends a `ClientRequest` to a node and returns the raw `ClientResponse`.
 pub async fn send_request(host: &str, port: u16, req: ClientRequest) -> ClientResponse {
-    let stream = TcpStream::connect((host, port)).await.unwrap();
+    try_send_request(host, port, req)
+        .await
+        .expect("send_request: failed to connect or read response")
+}
+
+/// Sends a `ClientRequest` directly to a `SocketAddr` (e.g. a `leader_addr` from `NotLeader`).
+pub async fn send_request_to_addr(
+    addr: std::net::SocketAddr,
+    req: ClientRequest,
+) -> ClientResponse {
+    let stream = TcpStream::connect(addr).await.unwrap();
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer.write(0, &req).await.unwrap();
     let (_, response) = reader.read_request().await.unwrap();
     response
+}
+
+/// polls until every node in `nodes` reports at least `expected_alive` SWIM-alive members. Panics after 30s.
+pub async fn wait_swim_ready(nodes: &[(&str, u16)], expected_alive: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SWIM did not converge to {expected_alive} alive nodes within 30s"
+        );
+        let mut all_ready = true;
+        for &(host, port) in nodes {
+            match get_members(host, port).await {
+                Ok(members) => {
+                    let alive = members
+                        .iter()
+                        .filter(|m| m.state == SwimNodeState::Alive)
+                        .count();
+                    if alive < expected_alive {
+                        all_ready = false;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    all_ready = false;
+                    break;
+                }
+            }
+        }
+        if all_ready {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Step 2a of cluster initialization: polls until every shard group on every node has an
+/// elected Raft leader. Uses the `#[cfg(test)] IsClusterReady` admin command — no write
+/// side effects. Panics after 15s.
+pub async fn wait_raft_ready(nodes: &[(&str, u16)]) {
+    let probe = ClientRequest::Test(TestRequest::IsClusterReady);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Raft leader not elected within 15s after SWIM convergence"
+        );
+        let mut all_ready = true;
+        for &(host, port) in nodes {
+            match try_send_request(host, port, probe.clone()).await {
+                Some(ClientResponse::Test(TestResponse::ClusterReady(true))) => {}
+                _ => {
+                    all_ready = false;
+                    break;
+                }
+            }
+        }
+        if all_ready {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Step 2b of cluster initialization: calls `wait_raft_ready`, then sends `req` to whichever
+/// node is the leader (following any `NotLeader { leader_addr: Some }` redirect).
+///
+/// Returns `(leader_port, response)` where `leader_port` is the client port of the node that
+/// handled the request — useful for tests that need to identify and avoid the leader.
+pub async fn wait_leader_ready(nodes: &[(&str, u16)], req: ClientRequest) -> (u16, ClientResponse) {
+    wait_raft_ready(nodes).await;
+    for &(host, port) in nodes {
+        let Some(resp) = try_send_request(host, port, req.clone()).await else {
+            continue;
+        };
+        match resp {
+            ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                leader_addr: None,
+            }) => continue,
+            ClientResponse::ControlPlane(ControlPlaneResponse::NotLeader {
+                leader_addr: Some(addr),
+            }) => {
+                let leader_resp = send_request_to_addr(addr, req).await;
+                return (addr.port(), leader_resp);
+            }
+            other => return (port, other),
+        }
+    }
+    panic!("no leader found after IsClusterReady returned true — this is a bug");
+}
+
+async fn try_send_request(host: &str, port: u16, req: ClientRequest) -> Option<ClientResponse> {
+    let stream = TcpStream::connect((host, port)).await.ok()?;
+    let (read_half, write_half) = stream.into_split();
+    let mut writer = ClientRawWriter::new(write_half);
+    let mut reader = ClientStreamReader::new(read_half);
+    writer.write(0, &req).await.ok()?;
+    let (_, response) = reader.read_request().await.ok()?;
+    Some(response)
 }

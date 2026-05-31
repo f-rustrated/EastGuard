@@ -5,15 +5,15 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    ConsensusCommand, CoordinatorSealRequest, DeferredReply, LogMutation, MetadataCommitted,
-    MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
-    RaftTimeoutCallback, SealContext,
+    ConsensusCommand, CoordinatorSealRequest, DeferredReply, GroupStatus, LogMutation,
+    MetadataCommitted, MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
+    RaftTimeoutCallback, SealContext, TopicDetailQueryResult,
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::metadata::TopicId;
 use crate::control_plane::metadata::command::RollSegment;
-use crate::control_plane::metadata::types::TopicStats;
+use crate::control_plane::metadata::types::{RangeDetailData, TopicDetailData, TopicStats};
 
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
@@ -189,6 +189,19 @@ impl MultiRaft {
             MultiRaftActorCommand::Coordinator(req) => {
                 self.handle_seal_request(req);
             }
+            MultiRaftActorCommand::GetGroupStatus { shard_group_id, reply } => {
+                let status = self.get_group_status(shard_group_id);
+                self.deferred.push(DeferredReply::GetGroupStatus(reply, status));
+            }
+            MultiRaftActorCommand::GetTopicDetail { shard_group_id, topic_name, reply } => {
+                let result = self.get_topic_detail(shard_group_id, &topic_name);
+                self.deferred.push(DeferredReply::GetTopicDetail(reply, result));
+            }
+            #[cfg(test)]
+            MultiRaftActorCommand::IsReady { reply } => {
+                let ready = self.all_leaders_known();
+                self.deferred.push(DeferredReply::IsReady(reply, ready));
+            }
         }
     }
 
@@ -205,6 +218,16 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopicStats(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetGroupStatus(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetTopicDetail(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                #[cfg(test)]
+                DeferredReply::IsReady(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -340,6 +363,56 @@ impl MultiRaft {
             .values()
             .flat_map(|raft| raft.topic_stats())
             .collect()
+    }
+
+    #[cfg(test)]
+    fn all_leaders_known(&self) -> bool {
+        !self.groups.is_empty()
+            && self.groups.values().all(|r| r.current_leader().is_some())
+    }
+
+    fn get_group_status(&self, group_id: ShardGroupId) -> GroupStatus {
+        match self.groups.get(&group_id) {
+            None => GroupStatus::NotHosted,
+            Some(raft) => {
+                let leader = raft.current_leader().cloned();
+                let is_leader = leader.as_ref() == Some(&self.node_id);
+                GroupStatus::Hosted { is_leader, leader }
+            }
+        }
+    }
+
+    fn get_topic_detail(&self, group_id: ShardGroupId, topic_name: &str) -> TopicDetailQueryResult {
+        let Some(raft) = self.groups.get(&group_id) else {
+            return TopicDetailQueryResult::GroupNotHosted;
+        };
+        let Some(topic) = raft.get_topic_by_name(topic_name) else {
+            return TopicDetailQueryResult::TopicNotFound;
+        };
+        let ranges = topic
+            .ranges
+            .values()
+            .map(|r| {
+                let replica_set = r
+                    .active_segment
+                    .and_then(|seg_id| r.segments.get(&seg_id))
+                    .map(|s| s.replica_set.clone())
+                    .unwrap_or_default();
+                RangeDetailData {
+                    range_id: r.range_id.0,
+                    keyspace_start: r.keyspace_start.clone(),
+                    keyspace_end: r.keyspace_end.clone(),
+                    active_segment_id: r.active_segment.map(|s| s.0),
+                    state: r.state,
+                    replica_set,
+                }
+            })
+            .collect();
+        TopicDetailQueryResult::Found(TopicDetailData {
+            name: topic.name.clone(),
+            topic_id: topic.id.0,
+            ranges,
+        })
     }
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)
@@ -619,6 +692,7 @@ impl MultiRaft {
         for (id, last_log_index) in last_indices {
             if let Some(raft) = self.groups.get_mut(&id) {
                 raft.advance_stabled_index(last_log_index);
+                raft.apply_after_flush();
             }
         }
     }

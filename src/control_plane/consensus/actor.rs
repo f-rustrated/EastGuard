@@ -263,6 +263,57 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
+    pub(crate) async fn get_group_status(
+        &self,
+        shard_group_id: ShardGroupId,
+    ) -> GroupStatus {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::GetGroupStatus { shard_group_id, reply: send })
+            .await
+            .is_err()
+        {
+            return GroupStatus::NotHosted;
+        }
+        recv.await.unwrap_or(GroupStatus::NotHosted)
+    }
+
+    pub(crate) async fn get_topic_detail(
+        &self,
+        shard_group_id: ShardGroupId,
+        topic_name: String,
+    ) -> TopicDetailQueryResult {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::GetTopicDetail {
+                shard_group_id,
+                topic_name,
+                reply: send,
+            })
+            .await
+            .is_err()
+        {
+            return TopicDetailQueryResult::GroupNotHosted;
+        }
+        recv.await.unwrap_or(TopicDetailQueryResult::GroupNotHosted)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn is_cluster_ready(&self) -> bool {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::IsReady { reply: send })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        recv.await.unwrap_or(false)
+    }
+
     pub(crate) async fn send(
         &self,
         cmd: impl Into<MultiRaftActorCommand>,

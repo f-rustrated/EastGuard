@@ -161,6 +161,13 @@ impl Raft {
         Some(seg.replica_set.clone())
     }
 
+    pub(crate) fn get_topic_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&crate::control_plane::metadata::types::TopicMeta> {
+        self.state_machine.get_topic_by_name(name)
+    }
+
     #[cfg(test)]
     pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
         &self.state_machine
@@ -675,6 +682,12 @@ impl Raft {
 
     pub(crate) fn advance_stabled_index(&mut self, value: u64) {
         self.stabled_index = self.stabled_index.max(value);
+    }
+
+    /// Apply any committed entries that became durable after the last stabled_index advance.
+    /// Called by MultiRaft after persist_and_advance() so the actor controls when apply happens.
+    pub(crate) fn apply_after_flush(&mut self) {
+        self.apply_committed_entries();
     }
 
     fn apply_committed_entries(&mut self) {

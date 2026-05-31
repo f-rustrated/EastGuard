@@ -5,13 +5,16 @@ use crate::control_plane::membership::{NodeDead, ShardGroupId};
 use crate::control_plane::metadata::types::TopicStats;
 
 use super::command::{
-    ConsensusCommand, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, PacketReceived,
-    ProposeError, RaftPropose, RemoveGroup,
+    ConsensusCommand, CoordinatorSealRequest, EnsureGroup, GroupStatus, HandleNodeJoin,
+    PacketReceived, ProposeError, RaftPropose, RemoveGroup, TopicDetailQueryResult,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
 
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
+///
+/// Split from [`MultiRaftCommand`] because query variants carry `oneshot::Sender` reply
+/// channels — tokio types that cannot live inside the pure sync state machine.
 #[allow(dead_code)]
 pub enum MultiRaftActorCommand {
     /// Fire-and-forget: no reply channel needed.
@@ -34,6 +37,25 @@ pub enum MultiRaftActorCommand {
     },
     /// Data plane SealRequest forwarded to coordinator for Raft proposal.
     Coordinator(CoordinatorSealRequest),
+    /// Used by `ClientHandler` to decide whether to handle a write locally
+    /// (this node is leader) or return `NotLeader` so the client can redirect.
+    GetGroupStatus {
+        shard_group_id: ShardGroupId,
+        reply: oneshot::Sender<GroupStatus>,
+    },
+    /// Serves two callers: `DescribeTopic` reads (any replica) and the
+    /// `AlreadyExists` pre-check before proposing `CreateTopic`.
+    GetTopicDetail {
+        shard_group_id: ShardGroupId,
+        topic_name: String,
+        reply: oneshot::Sender<TopicDetailQueryResult>,
+    },
+    /// Returns true when every shard group on this node has a known Raft leader.
+    /// Used by test helpers to detect cluster readiness without a write probe.
+    #[cfg(test)]
+    IsReady {
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 impl From<ConsensusCommand> for MultiRaftActorCommand {
@@ -58,6 +80,9 @@ impl_from_variant_via!(
     HandleNodeJoin,
 );
 
+/// Pairs a reply channel with its computed value so the actor can send all replies
+/// after draining outbound packets and timer commands — the flush protocol requires
+/// side effects to leave the state machine before any caller is unblocked.
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     Propose(
@@ -66,4 +91,8 @@ pub(crate) enum DeferredReply {
     ),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
     GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
+    GetGroupStatus(oneshot::Sender<GroupStatus>, GroupStatus),
+    GetTopicDetail(oneshot::Sender<TopicDetailQueryResult>, TopicDetailQueryResult),
+    #[cfg(test)]
+    IsReady(oneshot::Sender<bool>, bool),
 }

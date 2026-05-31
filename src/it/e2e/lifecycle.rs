@@ -3,7 +3,7 @@ use std::time::Duration;
 use turmoil::Builder;
 
 use crate::StartUp;
-use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
+use crate::it::helpers::{check_dead_or_not_exist, default_env, wait_swim_ready};
 
 /// Full-stack E2E: SWIM cluster formation with MultiRaftActor wired in.
 ///
@@ -59,11 +59,10 @@ fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
     });
 
     sim.client("checker", async {
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+
         tracing::info!("[E2E] Phase 1: waiting for cluster formation");
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        check_alive_count("node-1", 8081, 3).await?;
-        check_alive_count("node-2", 8082, 3).await?;
-        check_alive_count("node-3", 8083, 3).await?;
+        wait_swim_ready(&nodes, 3).await;
         tracing::info!("[E2E] Phase 1 OK: all 3 nodes alive");
 
         tracing::info!("[E2E] Phase 2: waiting for node-3 death detection");
@@ -79,10 +78,7 @@ fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
         tracing::info!("[E2E] Phase 2 OK: node-3 confirmed dead");
 
         tracing::info!("[E2E] Phase 3: waiting for node-3 to rejoin");
-        tokio::time::sleep(Duration::from_secs(50)).await;
-        check_alive_count("node-1", 8081, 3).await?;
-        check_alive_count("node-2", 8082, 3).await?;
-        check_alive_count("node-3", 8083, 3).await?;
+        wait_swim_ready(&nodes, 3).await;
         tracing::info!("[E2E] Phase 3 OK: node-3 rejoined, all 3 alive");
 
         Ok(())
