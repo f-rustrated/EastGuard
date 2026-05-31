@@ -220,6 +220,8 @@ impl ClientHandler {
             ClientRequest::ControlPlane(cp) => self.handle_control_plane(cp).await,
             ClientRequest::DataPlane(dp) => self.handle_data_plane(dp).await,
             ClientRequest::Admin(admin) => self.handle_admin(admin).await,
+            #[cfg(test)]
+            ClientRequest::Test(req) => self.handle_test(req).await,
         }
     }
 
@@ -510,8 +512,6 @@ impl ClientHandler {
             AdminRequest::GetShardLeader { shard_group_id } => {
                 self.handle_get_shard_leader(shard_group_id).await
             }
-            #[cfg(test)]
-            AdminRequest::IsClusterReady => self.handle_is_cluster_ready().await,
         };
         res.unwrap_or_else(|e| {
             tracing::error!("client admin dispatch error: {e}");
@@ -678,9 +678,14 @@ impl ClientHandler {
     }
 
     #[cfg(test)]
-    async fn handle_is_cluster_ready(&self) -> anyhow::Result<ClientResponse> {
-        let ready = self.raft_sender.is_cluster_ready().await;
-        Ok(ClientResponse::Admin(AdminResponse::ClusterReady(ready)))
+    async fn handle_test(&self, req: crate::connections::protocol::TestRequest) -> ClientResponse {
+        use crate::connections::protocol::{TestRequest, TestResponse};
+        match req {
+            TestRequest::IsClusterReady => {
+                let ready = self.raft_sender.is_cluster_ready().await;
+                ClientResponse::Test(TestResponse::ClusterReady(ready))
+            }
+        }
     }
 }
 

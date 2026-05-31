@@ -13,6 +13,8 @@ pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(DataPlaneRequest),
     Admin(AdminRequest),
+    #[cfg(test)]
+    Test(TestRequest),
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -20,6 +22,8 @@ pub enum ClientResponse {
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),
     Admin(AdminResponse),
+    #[cfg(test)]
+    Test(TestResponse),
 }
 
 // ── Control Plane ──────────────────────────────────────────────────────────
@@ -214,8 +218,6 @@ pub enum AdminRequest {
     GetShardLeader {
         shard_group_id: u64,
     },
-    #[cfg(test)]
-    IsClusterReady,
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -233,8 +235,6 @@ pub enum AdminResponse {
     ShardLeader { leader: Option<String> },
     // All admin operations
     InternalError(String),
-    #[cfg(test)]
-    ClusterReady(bool),
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -264,4 +264,23 @@ pub struct TopicStats {
     pub name: String,
     pub range_count: u32,
     pub total_bytes: u64,
+}
+
+// ── Test protocol ──────────────────────────────────────────────────────────
+//
+// Test-only requests and responses sent as `ClientRequest::Test` /
+// `ClientResponse::Test`. Kept in a dedicated enum so production enums stay
+// free of `#[cfg(test)]` variants.
+
+#[cfg(test)]
+#[derive(Clone, Encode, Decode)]
+pub enum TestRequest {
+    /// Returns true when every shard group on this node has an elected Raft leader.
+    IsClusterReady,
+}
+
+#[cfg(test)]
+#[derive(Debug, Encode, Decode)]
+pub enum TestResponse {
+    ClusterReady(bool),
 }

@@ -9,7 +9,9 @@ use crate::connections::protocol::{
 };
 use crate::connections::protocol::ControlPlaneResponse::NotLeader;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
-use crate::it::helpers::{default_env, send_request, send_request_to_addr};
+use crate::it::helpers::{
+    default_env, send_request, send_request_to_addr, wait_leader_ready, wait_swim_ready,
+};
 
 /// CreateTopic eventually succeeds when tried across all nodes (exactly one is the leader),
 /// and DescribeCluster returns a non-empty node list from every node.
@@ -55,25 +57,17 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
         });
-        // Allow time for SWIM convergence then retry across all nodes until a leader
-        // responds — different shard groups finish elections at different times.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let mut create_ok = false;
-        'create: for _ in 0..20u32 {
-            for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                let r = send_request(host, port, req.clone()).await;
-                if matches!(
-                    r,
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                        | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
-                ) {
-                    create_ok = true;
-                    break 'create;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert!(create_ok, "CreateTopic did not succeed on any node within 24s");
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+        wait_swim_ready(&nodes, 3).await;
+        let (_, resp) = wait_leader_ready(&nodes, req).await;
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
+                    | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
+            ),
+            "unexpected CreateTopic response: {resp:?}"
+        );
 
         // DescribeCluster must return a non-empty node list from every node.
         for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
@@ -84,8 +78,8 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
             )
             .await;
             match cluster_resp {
-                ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }) => {
-                    assert!(!nodes.is_empty(), "{host} returned empty node list");
+                ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: cluster_nodes }) => {
+                    assert!(!cluster_nodes.is_empty(), "{host} returned empty node list");
                 }
                 other => panic!("{host}: unexpected DescribeCluster response: {other:?}"),
             }
@@ -139,24 +133,9 @@ fn delete_topic() -> turmoil::Result {
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
         });
-
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let mut create_ok = false;
-        'create: for _ in 0..20u32 {
-            for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                let r = send_request(host, port, create_req.clone()).await;
-                if matches!(
-                    r,
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                        | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
-                ) {
-                    create_ok = true;
-                    break 'create;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert!(create_ok, "CreateTopic did not succeed on any node within 24s");
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+        wait_swim_ready(&nodes, 3).await;
+        wait_leader_ready(&nodes, create_req).await;
         // Wait for Raft replication to reach all nodes (one heartbeat period = 1s).
         tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -283,23 +262,9 @@ fn list_topic_stats_after_create() -> turmoil::Result {
             },
         });
 
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let mut create_ok = false;
-        'create: for _ in 0..20u32 {
-            for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                let r = send_request(host, port, create_req.clone()).await;
-                if matches!(
-                    r,
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                        | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
-                ) {
-                    create_ok = true;
-                    break 'create;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert!(create_ok, "CreateTopic did not succeed on any node within 24s");
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+        wait_swim_ready(&nodes, 3).await;
+        wait_leader_ready(&nodes, create_req).await;
 
         // At least one node must report stats for "stats-test".
         let mut found = false;
@@ -373,24 +338,9 @@ fn delete_topic_redirects_to_leader() -> turmoil::Result {
             },
         });
 
-        // Wait for SWIM convergence + Raft election, then create via retry loop.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let mut leader_port: Option<u16> = None;
-        'create: for _ in 0..20u32 {
-            for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                let r = send_request(host, port, create_req.clone()).await;
-                if matches!(
-                    r,
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                        | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
-                ) {
-                    leader_port = Some(port);
-                    break 'create;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        let leader_port = leader_port.expect("CreateTopic did not succeed on any node within 24s");
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+        wait_swim_ready(&nodes, 3).await;
+        let (leader_port, _) = wait_leader_ready(&nodes, create_req.clone()).await;
 
         // Wait for replication.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -471,24 +421,9 @@ fn describe_topic_served_by_all_replicas() -> turmoil::Result {
             },
         });
 
-        // Wait for SWIM convergence + Raft election, then create.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let mut create_ok = false;
-        'create: for _ in 0..20u32 {
-            for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                let r = send_request(host, port, create_req.clone()).await;
-                if matches!(
-                    r,
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                        | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists)
-                ) {
-                    create_ok = true;
-                    break 'create;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert!(create_ok, "CreateTopic did not succeed within 24s");
+        let nodes = [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)];
+        wait_swim_ready(&nodes, 3).await;
+        wait_leader_ready(&nodes, create_req).await;
 
         // Wait for the committed entry to replicate to all followers.
         tokio::time::sleep(Duration::from_secs(2)).await;
