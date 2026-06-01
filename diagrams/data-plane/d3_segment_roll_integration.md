@@ -1,6 +1,6 @@
 # Phase D3: Segment Lifecycle Integration
 
-**Goal:** Connect data plane storage to metadata consensus. Three classes of integration: (1) seal triggers — size, age, failure, node death — all converge to `RollSegment` via the coordinator, (2) lifecycle event propagation — `CreateTopic`, `RollSegment`, `SplitRange`, `MergeRange` commit → `SegmentAssignment` to data plane, (3) coordinator routing — segment leader resolves and reaches the coordinator.
+**Goal:** Connect data plane storage to metadata consensus. Three classes of integration: (1) seal triggers — size, age, replication failure, node death — all converging on a single segment-roll committed through the coordinator, (2) lifecycle event propagation — topic creation, segment roll, range split, and range merge commits turn into segment assignments delivered to the data plane, (3) coordinator routing — the segment leader resolves and reaches the coordinator.
 
 **Depends on:** Phase D2 (segment replication), metadata control plane (shard leader gossip via SWIM).
 
@@ -8,84 +8,84 @@
 
 ## Coordinator
 
-The **coordinator** is the Raft leader for the shard group that owns the topic. Not a separate component — it's a role that any vnode member can hold by winning Raft election. The coordinator proposes metadata changes (`CreateTopic`, `RollSegment`, `SplitRange`, `MergeRange`) via Raft and sends lifecycle notifications to the data plane after commit.
+The **coordinator** is the Raft leader for the shard group that owns the topic. It is not a separate component — it's a role that any vnode member can hold by winning a Raft election. The coordinator proposes metadata changes (topic creation, segment roll, range split, range merge) through Raft and sends lifecycle notifications to the data plane after commit.
 
 **Routing** — how the segment leader locates the coordinator:
 
 ```
-SegmentTracker.shard_group_id          ← routing metadata from SegmentAssignment
+shard group id            ← cached by the segment from its assignment
     │
     ▼
-Topology::shard_leader(shard_group_id)
-    → ShardLeaderEntry { leader_node_id, leader_addr, term }
+local topology view        → current leader of that shard group:
+                             leader node id + address + election term
     │
     ▼
-DataTransportActor::send(leader_addr, SealRequest { ... })
+send the seal request to that leader over the data port
 ```
 
-The shard leader map is maintained by SWIM gossip (`ShardLeaderInfo` piggybacked on protocol messages), term-monotonic (stale entries rejected), and NOT cleared on node death (overwritten by next election).
+The shard leader map is maintained by SWIM gossip (leader hints piggybacked on protocol messages), is term-monotonic (stale entries rejected), and is **not** cleared on node death (it is overwritten by the next election).
 
-**Stale routing is safe.** A deposed leader rejects the proposal (`ProposeError::NotLeader`). The segment leader refreshes from `Topology` and retries via `SealRequestTimeout`. May take multiple retries until SWIM gossip propagates the new leader — convergence depends on cluster size and probe interval. No correctness risk — only latency.
+**Stale routing is safe.** A deposed leader rejects the proposal as "not leader". The segment leader refreshes its view from the local topology and retries after a seal-request timeout. Convergence may take several retries while SWIM gossip propagates the new leader — how many depends on cluster size and probe interval. There is no correctness risk, only added latency.
 
 ---
 
 ## Seal Triggers
 
-Four triggers, one response: seal the current segment and open a new one via `RollSegment`. No retry, no ISR, no reconciliation.
+Four triggers, one response: seal the current segment and open a new one via a segment roll. No retry, no ISR, no reconciliation.
 
 | Trigger | Source | Detection | Initiator |
 |---|---|---|---|
-| Replication failure | Follower timeout | Sub-second (`ReplicationTimeout`) | Segment leader sends `SealRequest` |
-| Segment size | ~1GB threshold | On each `flush_batch()` | Segment leader sends `SealRequest` |
-| Segment age | Configurable max age | Periodic ticker (~60s) | Segment leader sends `SealRequest` |
-| Node death | SWIM protocol | ~6-7s | Coordinator proposes `RollSegment` directly |
+| Replication failure | Follower timeout | Sub-second (replication timeout) | Segment leader sends a seal request |
+| Segment size | ~1GB threshold | On each flush | Segment leader sends a seal request |
+| Segment age | Configurable max age | Periodic ticker (~60s) | Segment leader sends a seal request |
+| Node death | SWIM protocol | ~6-7s | Coordinator proposes the roll directly |
 
 ### Trigger 1: Replication Failure (D2)
 
-Already implemented in D2. `ReplicationTimeout` fires when any follower fails to ack. The segment leader emits `ReplicationTimedOut`, dispatched as a `SealRequest` to the coordinator. D3 completes the flow by adding coordinator routing (currently `targets = vec![]`).
+The detection itself was built in D2: a replication timeout fires when any follower fails to ack, and the segment leader raises a seal intent. D2 emitted that intent but left the coordinator target unresolved. D3 completes the flow by resolving the coordinator from the local topology view and carrying the real set of failed nodes in the seal request.
 
 ### Trigger 2: Segment Size
 
-When `SegmentTracker::size_bytes` approaches 1GB, the segment leader sends a `SealRequest`. Planned transition — no failed nodes, no uncommitted tail complications.
+When a segment's accumulated size approaches the ~1GB threshold, the segment leader sends a seal request. This is a planned transition — no failed nodes, no uncommitted-tail complications.
 
 ```
-flush_batch() completes
+flush completes
     │
-    ├── tracker.size_limit_reached()?
-    │       └── yes → emit SealRequest {
-    │                   segment_key,
-    │                   failed_nodes: vec![],
-    │                   end_entry_id: committed_entry_id
-    │                 }
+    ├── size threshold reached?
+    │       └── yes → seal request:
+    │                   this segment,
+    │                   failed nodes = none,
+    │                   end entry id = last committed entry
     └── no → continue
 ```
 
-`end_entry_id` is set to the current `committed_entry_id`, which may lag `write_cursor` by in-flight entries — those are replayed into the new segment via `handle_seal_response()`. This replay relies on the coordinator preserving the SealRequest sender as `new_replica_set[0]` — the sender is alive (it just sent the request) and holds the uncommitted tail. The size check runs after every `flush_batch()`, not on a timer.
+The reported end entry id is the segment's last committed entry, which may lag the write cursor by in-flight entries — those are replayed into the new segment when the seal response arrives. This replay relies on the coordinator keeping the seal requester as the new segment's primary: the requester is alive (it just sent the request) and holds the uncommitted tail. The size check runs after every flush, not on a timer.
 
 ### Trigger 3: Segment Age
 
-When a segment has been active longer than the configured max age (e.g., 24 hours), the segment leader sends a `SealRequest`. Bounds segment lifetime for low-traffic topics — prevents stale long-lived segments, simplifies retention and WAL management.
+When a segment has been active longer than the configured max age (e.g., 24 hours), the segment leader sends a seal request. This bounds segment lifetime for low-traffic topics — it prevents stale long-lived segments and simplifies retention and WAL management.
 
 ```
-Periodic age ticker fires (~60s)
+periodic age ticker fires (~60s)
     │
-    ├── for each active segment where tracker.role() == Leader:
-    │       tracker.age_limit_reached(max_segment_age)?
-    │           └── yes → emit SealRequest { segment_key, failed_nodes: vec![], end_entry_id: committed_entry_id }
+    ├── for each active segment this node leads:
+    │       age beyond configured max?
+    │           └── yes → seal request (failed nodes = none,
+    │                                    end entry id = last committed entry)
     └── no → continue
 ```
 
-Unlike size and replication triggers, the age check is driven by a periodic ticker, not by `flush_batch()`. This is the only trigger that fires without a write — necessary for idle segments.
+Unlike the size and replication triggers, the age check is driven by a periodic ticker, not by writes. It is the only trigger that fires without a write — necessary for idle segments.
 
 ### Trigger 4: SWIM Node Death
 
-SWIM detects node death after ~6-7 seconds. The coordinator scans for active segments with the dead node in their `replica_set` and proposes `RollSegment` for each. No `SealRequest` needed — the coordinator has direct access to MetadataStateMachine. See [HandleNodeDeath Integration](#handleNodeDeath-integration) for full flow.
+SWIM detects node death after ~6-7 seconds. The coordinator scans for active segments with the dead node in their replica set and proposes a roll for each. No seal request is involved — the coordinator has direct access to the metadata state machine. See [Node-Death-Triggered Seals](#node-death-triggered-seals) for the full flow.
 
 ---
 
-## Seal Flow: SealRequest → RollSegment → SealResponse
+## Seal Flow: Seal Request → Roll → Seal Response
 
-The full round-trip connecting data plane to metadata consensus.
+The full round-trip connecting the data plane to metadata consensus.
 
 ### Message Flow
 
@@ -94,281 +94,215 @@ Segment Leader (node D)           Coordinator (node A)           Raft [A, B, C]
         │                               │                            │
   trigger fires                         │                            │
         │                               │                            │
-  resolve coordinator:                  │                            │
-  Topology::shard_leader(sgid)          │                            │
+  resolve coordinator                   │                            │
+  from local topology                   │                            │
         │                               │                            │
-        │── SealRequest ──────────────► │                            │
-        │   { segment_key,              │                            │
-        │     failed_nodes,          receive SealRequest             │
-        │     end_entry_id }         via DataTransportActor          │
+        │── seal request ─────────────► │                            │
+        │   (segment, failed          receive seal request           │
+        │    nodes, end entry id,                                     │
+        │    requester)              dedup against in-flight seals    │
+        │                            build the roll                   │
+        │                            store pending context            │
         │                               │                            │
-        │                          dedup check (pending_seal_keys)   │
-        │                          build RollSegment                 │
-        │                          store pending context             │
-        │                               │                            │
-        │                               │── propose RollSegment ───► │
+        │                               │── propose roll ──────────► │
         │                               │                            │ commit
         │                               │◄─── commit notification ───│
         │                               │                            │
-        │                          ALWAYS: SegmentAssignment ──► new_replica_set[0]
+        │                          ALWAYS: segment assignment ──► new primary
         │                               │                            │
-        │◄── SealResponse ──────────────│  (best-effort, if          │
-        │   { old_segment_key,          │   PendingRollContext       │
-        │     new_segment_id,           │   exists)                  │
-        │     new_replica_set }         │                            │
+        │◄── seal response ─────────────│  (best-effort, only if     │
+        │   (old segment,               │   pending context still    │
+        │    new segment id,            │   exists on this leader)   │
+        │    new replica set)           │                            │
         │                               │                            │
-  handle_seal_response()                │                            │
   open new segment                      │                            │
   replay uncommitted tail               │                            │
   resume produce (~100ms)               │                            │
 ```
 
-### Types
+### Information Carried
 
-```rust
-// Sent by DataPlaneActor to MultiRaftActor via coordinator_tx
-enum CoordinatorCommand {
-    SealRequest {
-        requester: NodeId,         // segment leader — SealResponse target
-        segment_key: SegmentKey,
-        failed_nodes: Vec<NodeId>,
-        end_entry_id: u64,
-    },
-}
+The flow moves three pieces of information, each scoped to where it is needed:
 
-// Proposed via Raft
-pub struct RollSegment {
-    pub topic_id: TopicId,
-    pub range_id: RangeId,
-    pub segment_id: SegmentId,
-    pub sealed_at: u64,
-    pub new_replica_set: Vec<NodeId>,
-    pub end_entry_id: Option<u64>,     // Some(id) from SealRequest; None for node-death seals
-}
+- **Seal request** (segment leader → coordinator): the requester's identity, which segment to seal, which nodes failed (empty for size/age seals), and the last committed entry id. The requester identity is carried **explicitly** in the request — it is not inferred from the transport connection. Node-death-triggered rolls do not use a seal request at all and therefore have no requester.
 
-// Stored on propose, resolved on commit
-struct PendingRollContext {
-    requester: NodeId,
-    old_segment_key: SegmentKey,
-}
+- **Roll command** (proposed through Raft): which segment, the seal timestamp, the new replica set, and an *optional* end entry id. The end entry id is present for segment-leader-initiated seals (it came from the seal request) and absent for node-death seals, where the coordinator does not know the actual committed offset.
 
-// In MultiRaftActor:
-pending_rolls: HashMap<(ShardGroupId, u64 /* log_index */), PendingRollContext>,
-pending_seal_keys: HashSet<SegmentKey>,  // dedup: skip duplicate SealRequests
-```
-
-`requester` is the NodeId of the segment leader that sent the SealRequest, extracted from the TCP connection's peer identity (handshake NodeId in DataTransportActor). For `HandleNodeDeath`-initiated rolls, `requester` is `None` — no SealResponse needed.
+- **Pending context** (held by the coordinator between propose and commit): the requester and the old segment identity, keyed by the proposal's log position. The coordinator also keeps a dedup set of in-flight seal keys so duplicate seal requests for the same segment are skipped.
 
 ### Channel Wiring
 
 ```
-                          DataTransportActor (tokio, data_port TCP)
-                         /         │         \
-                inbound messages   │   outbound messages
-                        │          │          ▲
-                        ▼          │          │
-                   DataPlaneActor  │   data_transport_tx
-                   (OS thread)     │   (new channel)
-                        │          │          │
-                coordinator_tx     │          │
-                (new channel)      │          │
-                        ▼          │          │
-                   MultiRaftActor (tokio)
+                          data-port transport (TCP)
+                         /            │            \
+                inbound messages      │      outbound messages
+                        │             │             ▲
+                        ▼             │             │
+                   data plane         │       outbound channel
+                   (OS thread)        │       (coordinator → transport)
+                        │             │             │
+                forwarding channel    │             │
+                (data plane →         │             │
+                 coordinator)         │             │
+                        ▼             │             │
+                   coordinator / Raft layer (tokio)
 ```
 
-| Channel | Type | Direction | Purpose |
-|---|---|---|---|
-| `coordinator_tx` | `tokio::mpsc::Sender<Box<[CoordinatorCommand]>>` | DataPlaneActor → MultiRaftActor | Forward SealRequests for Raft proposal |
-| `data_transport_tx` | `tokio::mpsc::Sender<Box<[DataTransportCommand]>>` | MultiRaftActor → DataTransportActor | Send SealResponse, SegmentAssignment |
+| Channel | Direction | Purpose |
+|---|---|---|
+| Seal-request forwarding | data plane → coordinator | Forward seal requests for Raft proposal |
+| Lifecycle outbound | coordinator → data-port transport | Send seal responses and segment assignments |
 
-Both channels send `Box<[T]>` per the project-wide batching convention (see `code-convention.md`). The sender accumulates into `Vec<T>` during its event loop, then `.into_boxed_slice()` before sending.
+Both channels send batched slices rather than individual messages, per the project-wide batching convention (see `code-convention.md`). The sender accumulates during its event loop, then sheds unused capacity before sending.
 
-### DataPlaneActor: SealRequest Forwarding
+### Data Plane: Seal-Request Forwarding
 
-On inbound `SealRequest` from data_port: convert to `CoordinatorCommand::SealRequest`, accumulate in batch, flush via `coordinator_tx.try_send(batch)` at end of event loop. Uses `try_send`, not `blocking_send` — the OS thread must not block on tokio. Dropped batches are retriable via `SealRequestTimeout`.
+On an inbound seal request from the data port, the data plane converts it to a coordinator-bound command, accumulates it in the outgoing batch, and forwards it without blocking — the data plane runs on a dedicated OS thread and must not block on the async runtime. A dropped batch (full channel) is not fatal: the seal-request timeout retries it.
 
-### MultiRaftActor: SealRequest Handling
+### Coordinator: Seal-Request Handling
 
 ```
-on CoordinatorCommand::SealRequest { requester, segment_key, failed_nodes, end_entry_id }:
-    if segment_key ∈ pending_seal_keys → skip (dedup)
-    compute new_replica_set from current replica_set − failed_nodes + healthy nodes
-    build RollSegment { topic_id, range_id, segment_id, sealed_at, new_replica_set, end_entry_id }
-    propose via Raft:
-        Ok(log_index) → insert pending_seal_keys + pending_rolls
-        NotLeader → send error to requester (they retry)
+on a seal request (requester, segment, failed nodes, end entry id):
+    if this segment already has an in-flight seal → skip (dedup)
+    compute new replica set = current replica set − failed nodes + healthy nodes
+    build the roll (segment, seal timestamp, new replica set, end entry id)
+    propose through Raft:
+        accepted → record the in-flight seal key + pending context
+        rejected (not leader) → no reply; the requester retries on timeout
 ```
 
-### DataPlane: SealRequest Dispatch and Timeout
+### Data Plane: Seal-Request Dispatch and Timeout
 
-**`dispatch_events()` additions:** On `ReplicationTimedOut`, after `flush_batch()` size check, and on periodic age ticker — resolve coordinator via `Topology::shard_leader(tracker.shard_group_id)` and send `SealRequest` to coordinator via data_port. Replaces `let targets = vec![];` with actual coordinator resolution.
+**Dispatch:** on a replication timeout, after a flush size check, and on the periodic age ticker, the data plane resolves the coordinator from the local topology view and sends a seal request to it over the data port.
 
-**SealRequest timeout (~5s):** On SealRequest send, set `SealRequestTimeout` timer. On expiry, refresh coordinator from `Topology` and retry. For size/age-triggered seals, this is the only recovery path — `ReplicationTimeout` won't fire since replication is healthy.
+**Timeout (~5s):** when a seal request is sent, the data plane records it. If no seal response arrives before the timeout, it refreshes the coordinator from the topology and retries. For size- and age-triggered seals this is the only recovery path — the replication timeout won't fire, since replication is healthy.
 
-### apply_roll_segment()
+### Applying a Roll
 
-Seals the active segment with `end_offset = cmd.end_entry_id`, creates the new segment with `start_offset = cmd.end_entry_id + 1`. This aligns the metadata view with the actual data boundary reported by the segment leader.
+Applying a roll seals the active segment with its end offset set to the reported end entry id, and creates the new segment starting one past that. This aligns the metadata view with the actual data boundary reported by the segment leader.
 
-**`end_entry_id = None` for node-death seals:** The coordinator doesn't know the actual committed offset. Sealed segment's `end_offset` and new segment's `start_offset` remain unset until corrected via `correct_end_offset` (if the segment leader is alive) or D5 sealed segment repair.
+When the end entry id is absent (node-death seals), the coordinator doesn't know the actual committed offset, so the sealed segment's end offset and the new segment's start offset are left unset until corrected — either by a later seal request from the segment leader (if it is still alive) or by D5 sealed-segment repair.
 
-### RollSegment Idempotency
+### Roll Idempotency
 
-Both write-path timeout (D2) and SWIM node death may fire for the same failure. This is safe: `apply_roll_segment()` checks that the segment is still active. If already sealed, the duplicate returns `Err(StaleSegment)` — a no-op (DS-RSM invariant 9).
+Both the write-path timeout (D2) and SWIM node death may fire for the same failure. This is safe: applying a roll first checks that the segment is still active. If it has already been sealed, the duplicate is a no-op rather than an error (see the roll-idempotency invariant in `metadata-state-machine.md`).
 
-**Exception: end_offset correction.** If a death-triggered `RollSegment` (with `end_entry_id = None`) commits first, and the segment leader's `SealRequest` arrives later with the correct `end_entry_id`, `correct_end_offset()` updates the sealed segment's `end_offset` and the new segment's `start_offset`. Guard: only when current `end_offset` is `None` and new `end_entry_id` is `Some`. The `apply()` returns `Noop` — no duplicate `SegmentAssignment` sent.
+**Exception: offset correction.** If a death-triggered roll (with no end entry id) commits first, and the segment leader's seal request arrives later carrying the correct end entry id, an offset-correction step fills in the sealed segment's end offset and the new segment's start offset. It applies only when the current end offset is unset and the incoming end entry id is present; re-application is a no-op, and no duplicate segment assignment is sent.
 
 ---
 
 ## Lifecycle Event Propagation
 
-After Raft commits a metadata command that creates new segments, the coordinator sends `SegmentAssignment` to `replica_set[0]`. Followers self-authorize from the leader's first `ReplicaAppend` (D2).
+After Raft commits a metadata command that creates new segments, the coordinator sends a segment assignment to each new segment's primary. Followers self-authorize from the primary's first replication append (D2).
 
-| Metadata Event | Segments Created | SegmentAssignment Target |
+| Metadata Event | Segments Created | Assignment Target |
 |---|---|---|
-| `CreateTopic` | 1 (initial segment for initial range) | `replica_set[0]` |
-| `RollSegment` | 1 (new segment replacing sealed one) | `new_replica_set[0]` |
-| `SplitRange` | 2 (one per child range) | Each child's `replica_set[0]` |
-| `MergeRange` | 1 (for the merged range) | `merged_replica_set[0]` |
+| Topic created | 1 (initial segment for the initial range) | new segment's primary |
+| Segment rolled | 1 (replacing the sealed one) | new segment's primary |
+| Range split | 2 (one per child range) | each child's primary |
+| Range merged | 1 (for the merged range) | merged range's primary |
 
-### ApplyResult
+### Apply Result
 
-```rust
-enum ApplyResult {
-    TopicCreated {
-        topic_id: TopicId,
-        range_id: RangeId,
-        segment_id: SegmentId,
-        replica_set: Vec<NodeId>,
-    },
-    SegmentRolled {
-        topic_id: TopicId,
-        range_id: RangeId,
-        new_segment_id: SegmentId,
-        new_replica_set: Vec<NodeId>,
-        end_entry_id: Option<u64>,
-    },
-    RangeSplit {
-        children: [(RangeId, SegmentId, Vec<NodeId>); 2],
-    },
-    RangeMerged {
-        merged_range_id: RangeId,
-        segment_id: SegmentId,
-        replica_set: Vec<NodeId>,
-    },
-    TopicDeleted,
-}
-```
+Applying a metadata command yields a result describing what was created — enough, on its own, to construct the corresponding segment assignment(s):
 
-`SegmentRolled` carries all fields needed to construct SegmentAssignment independently of `PendingRollContext`. This ensures SegmentAssignment is always sent — even when a coordinator leadership change loses the pending context.
+- **Topic created** — the new topic, its initial range and segment, and that segment's replica set.
+- **Segment rolled** — the rolled segment's identity, the new replica set, and the end entry id.
+- **Range split** — both child ranges, each with its new segment and replica set.
+- **Range merged** — the merged range, its new segment, and its replica set.
+- **Topic deleted** — no segment created.
+- **No-op** — nothing changed (e.g., an idempotent re-applied roll).
 
-### SegmentAssignment
+The rolled-segment result carries everything needed to build the assignment **independently of the coordinator's pending context**. This is what guarantees the assignment is always sent, even when a coordinator leadership change has lost the pending context.
 
-```rust
-struct SegmentAssignment {
-    segment_key: SegmentKey,      // (topic_id, range_id, segment_id)
-    shard_group_id: ShardGroupId, // routing metadata — cached by SegmentTracker for coordinator resolution
-    replica_set: Vec<NodeId>,
-    start_entry_id: u64,          // new segments: 0, rolled: prev.end_entry_id + 1
-}
-```
+### Segment Assignment
 
-### RaftEvent Extension
+A segment assignment carries: the segment identity, the shard group id (routing metadata the segment caches for future coordinator resolution), the replica set, and the starting entry id (0 for brand-new segments; one past the previous segment's end for rolls).
 
-```rust
-enum RaftEvent {
-    // ... existing variants ...
-    MetadataApplied {                     // NEW
-        shard_group_id: ShardGroupId,
-        result: ApplyResult,
-        log_index: u64,
-    },
-}
-```
+### Commit Event
 
-Emitted from `apply_metadata_entry()` after successful apply. All replicas emit the event; only the leader dispatches notifications.
+Applying a committed metadata entry emits a "metadata committed" event carrying the shard group, the apply result, and the log position. **All replicas emit it** (apply is deterministic), but **only the leader dispatches** the resulting notifications — followers apply the entry and drop the event.
 
-### Event Dispatch
-
-On `RaftEvent::MetadataApplied`, leader-only dispatch:
+### Dispatch (leader only)
 
 ```
-SegmentRolled { topic_id, range_id, new_segment_id, new_replica_set, end_entry_id }:
-    ALWAYS: send SegmentAssignment to new_replica_set[0] (start_entry_id = end_entry_id + 1)
-    if PendingRollContext exists:
-        remove old_segment_key from pending_seal_keys
-        send SealResponse to requester (best-effort)
+segment rolled:
+    ALWAYS: segment assignment → new primary (start = end entry id + 1)
+    if pending context exists for this roll:
+        clear the in-flight seal key
+        seal response → requester (best-effort)
 
-TopicCreated { topic_id, range_id, segment_id, replica_set }:
-    send SegmentAssignment to replica_set[0] (start_entry_id = 0)
+topic created:
+    segment assignment → primary (start = 0)
 
-RangeSplit, RangeMerged:
-    send SegmentAssignment to each new segment's replica_set[0]
+range split / range merged:
+    segment assignment → each new segment's primary
 ```
 
-`ApplyResult` is produced on ALL replicas (deterministic apply). Only the Raft leader dispatches. `SegmentAssignment` is always sent for `SegmentRolled` — the result carries full context independent of `PendingRollContext`.
+The apply result is produced on all replicas; only the leader dispatches. For a rolled segment the assignment is always sent (the result carries full context); the seal response is sent only when pending context still exists on this leader.
 
-### MetadataStateMachine Extension
+### Active-Segment Lookup
 
-New method: `active_segments_for_node(node_id) → Vec<(TopicId, RangeId, SegmentId, Vec<NodeId>)>`. Full scan: topics → active ranges → active segment, filtered by `replica_set.contains(node_id)`.
+Node-death handling needs to find every active segment a given node hosts. The metadata state machine answers this with a full scan: topics → active ranges → active segment, filtered by membership in the replica set. Node death is rare and the scan is microseconds for typical segment counts; if counts grow into the thousands, a reverse index can be added later.
 
 ---
 
-## HandleNodeDeath Integration
+## Node-Death-Triggered Seals
 
-Extends `MultiRaft::remove_node()` to also propose `RollSegment` for affected segments. The coordinator uses a full scan (not a reverse index) to find affected segments — node death is rare, the scan takes microseconds for typical segment counts. If the count grows past thousands, add a reverse index then.
+When SWIM reports a node death, the coordinator does two things for every group it leads: bring the dead node out of the Raft peer set, and seal every active segment the dead node was part of.
 
 ```
-remove_node(dead_node_id):
-    for each (group_id, raft) in self.groups:
-        // Changed (D3): propose RemovePeer via Raft (was direct remove_peer)
-        if raft.has_peer(dead_node_id) && raft.is_leader():
-            propose RemovePeer(dead_node_id)
+on node death (dead node):
+    for each group this node leads:
+        if the dead node is a peer → propose its removal through Raft
 
-        // NEW (D3): propose RollSegment for affected segments
-        if !raft.is_leader(): continue
-        for each active segment where dead_node_id ∈ replica_set:
-            new_replica_set = replace dead_node_id with healthy node
-            propose RollSegment { ..., end_entry_id: None }  // unknown — resolved by correction or D5
+        for each active segment where the dead node ∈ replica set:
+            new replica set = replace the dead node with a healthy node
+            propose a roll with no end entry id
+              (the committed offset is unknown — resolved later by
+               offset correction or D5 repair)
 ```
 
-**Segment leader preservation:** When a follower dies, the coordinator keeps the existing leader at `replica_set[0]`. When the leader itself dies, a surviving follower is promoted. Replacement nodes selected from healthy cluster members not already in the set, tie-breaking by node ID.
+Peer removal flows through the Raft log rather than direct mutation, so every replica agrees on the peer set at the same log position.
+
+**Segment-leader preservation:** when a follower dies, the coordinator keeps the existing leader as the new segment's primary. When the leader itself dies, a surviving follower is promoted. Replacement nodes are chosen from healthy cluster members not already in the set, tie-broken by node id.
 
 ---
 
 ## Wire Protocol
 
-Updated message catalog (additions from D3 in bold):
+Updated message catalog (D3 additions in bold):
 
-| Message | Direction | Key fields | Phase |
+| Message | Direction | Carries | Phase |
 |---|---|---|---|
-| `ReplicaAppend` | Leader → followers | `segment_key`, `replica_set`, `data`, `record_count`, `entry_id` | D2 |
-| `ReplicaAck` | Follower → leader | `segment_key`, `entry_id`, `from` | D2 |
-| `CommitAdvance` | Leader → followers | `segment_key`, `committed_entry_id` | D2 |
-| `SealRequest` | Leader → coordinator | `segment_key`, `failed_nodes`, `end_entry_id`, **`from`** | D2 |
-| `SealResponse` | Coordinator → leader | `old_segment_key`, `new_segment_id`, `new_replica_set` | D2 |
-| `SegmentSealed` | Leader → old followers | `segment_key` | D2 |
-| **`SegmentAssignment`** | **Coordinator → leader** | **`segment_key`, `shard_group_id`, `replica_set`, `start_entry_id`** | **D3** |
+| Replica append | Leader → followers | segment, replica set, data, record count, entry id | D2 |
+| Replica ack | Follower → leader | segment, entry id, sender | D2 |
+| Commit advance | Leader → followers | segment, committed entry id | D2 |
+| Seal request | Leader → coordinator | segment, failed nodes, end entry id, **requester** | D2 |
+| Seal response | Coordinator → leader | old segment, new segment id, new replica set | D2 |
+| Segment sealed | Leader → old followers | segment | D2 |
+| **Segment assignment** | **Coordinator → leader** | **segment, shard group id, replica set, start entry id** | **D3** |
 
-`SealRequest.from` is explicit (was inferred from TCP handshake). `SegmentAssignment` was defined in D2 but not sent; D3 implements the send path.
+The seal request now carries the requester's identity explicitly rather than inferring it from the transport connection. The segment assignment message type existed in D2 but was never sent; D3 implements the send path.
 
 ---
 
 ## Examples
 
-### CreateTopic End-to-End
+### Topic Creation End-to-End
 
 ```
 Client                 Coordinator A          Raft [A,B,C]         Broker D
   │                         │                      │                  │
-  │── CreateTopic ────────► │                      │                  │
+  │── create topic ───────► │                      │                  │
   │                         │── propose ──────────►│                  │
   │                         │                      │ commit           │
   │                         │◄─────────────────────│                  │
-  │◄─── Ok(TopicId(0)) ─────│                      │                  │
-  │                         │── SegmentAssignment ───────────────────►│
-  │                         │   { key: (0,0,0),    │          create tracker
-  │                         │     rs: [D,E,F],     │          (Leader)
-  │                         │     start_entry: 0 } │     ready for produce
+  │◄─── ok (topic id) ──────│                      │                  │
+  │                         │── segment assignment ──────────────────►│
+  │                         │   (segment (0,0,0),  │          create segment
+  │                         │    replicas [D,E,F], │          (leader)
+  │                         │    start 0)          │     ready for produce
 ```
 
 ### Size-Based Seal
@@ -376,16 +310,15 @@ Client                 Coordinator A          Raft [A,B,C]         Broker D
 ```
 Broker D (segment leader)       Coordinator A        Raft [A,B,C]
    │                                  │                    │
-   │ size_bytes exceeds 1GB           │                    │
-   │── SealRequest { seg 7,           │                    │
-   │   failed: [],                    │                    │
-   │   end_entry_id: 42000 }─────────►│                    │
+   │ size exceeds ~1GB                │                    │
+   │── seal request (seg 7,           │                    │
+   │   failed [], end 42000) ────────►│                    │
    │                                  │── propose ────────►│
    │                                  │                    │ commit
    │                                  │◄───────────────────│
-   │◄─── SealResponse { seg 8 } ──────│                    │
+   │◄─── seal response (seg 8) ───────│                    │
    │                                  │                    │
-   │ open seg 8 (start: 42001)        │                    │
+   │ open seg 8 (start 42001)         │                    │
    │ replay uncommitted tail          │                    │
    │ resume produce                   │                    │
 ```
@@ -394,20 +327,20 @@ Broker D (segment leader)       Coordinator A        Raft [A,B,C]
 
 ## Invariants
 
-1. **Coordinator is sole proposer for segment lifecycle.** All `RollSegment` proposals come from the coordinator — either on behalf of a SealRequest or directly on SWIM node death. DataPlaneActor never proposes Raft commands.
+1. **The coordinator is the sole proposer for segment lifecycle.** Every roll proposal comes from the coordinator — either on behalf of a seal request or directly on SWIM node death. The data plane never proposes Raft commands.
 
-2. **SegmentAssignment sent only by coordinator, only after Raft commit.** No speculative assignments — the segment exists in MetadataStateMachine before any data node learns about it.
+2. **Segment assignments are sent only by the coordinator, only after Raft commit.** No speculative assignments — the segment exists in the metadata state machine before any data node learns about it.
 
-3. **SealResponse is best-effort.** Lost if coordinator changes between propose and commit (no `PendingRollContext` on new leader). Segment leader has a `SealRequestTimeout` to detect and retry.
+3. **Seal responses are best-effort.** A response is lost if the coordinator changes between propose and commit (the new leader has no pending context). The segment leader detects this via the seal-request timeout and retries.
 
-4. **ApplyResult emitted on all replicas, dispatched only by leader.** Followers apply but don't notify. `SegmentAssignment` always sent on `SegmentRolled` (full context in ApplyResult). `SealResponse` only if `PendingRollContext` exists.
+4. **Apply results are produced on all replicas but dispatched only by the leader.** Followers apply but don't notify. The segment assignment for a roll is always sent (the result carries full context); the seal response is sent only when pending context exists.
 
-5. **SealRequest routing is retryable.** Rejected proposals (not leader) trigger retry via `SealRequestTimeout` after refreshing shard leader view from SWIM gossip. May take multiple rounds until gossip converges — safe, only affects latency.
+5. **Seal-request routing is retryable.** A proposal rejected because the target is no longer leader triggers a retry after refreshing the shard leader view from SWIM gossip. Convergence may take several rounds — safe, affecting only latency.
 
-6. **`end_entry_id` handoff is exact for segment-leader-initiated seals.** Equals `tracker.committed_entry_id`. Carried through `RollSegment` → `SegmentMeta.end_offset`. New segment starts at `end_entry_id + 1`.
+6. **The end entry id handoff is exact for segment-leader-initiated seals.** It equals the segment's last committed entry, is carried through the roll into the sealed segment's end offset, and the new segment starts one past it.
 
-7. **`end_entry_id = None` for node-death seals.** The coordinator doesn't know the actual offset. Corrected via `correct_end_offset` (if segment leader is alive and sends SealRequest with `Some(id)`) or D5 sealed segment repair. Temporarily violates MetadataStateMachine invariant 8 (offset continuity) — holds after correction.
+7. **Node-death seals carry no end entry id.** The coordinator doesn't know the actual offset. It is corrected later — by a seal request from the segment leader (if alive) or by D5 sealed-segment repair. This temporarily violates the metadata state machine's offset-continuity invariant (offset continuity within a range), which holds again after correction.
 
-8. **Size-based and age-based seals reuse the failure path.** Same flow, `failed_nodes` empty, replica set preserved.
+8. **Size- and age-based seals reuse the failure path.** Same flow, with no failed nodes and the replica set preserved.
 
-9. **No SegmentAssignment needed for followers.** Followers self-authorize from the leader's first `ReplicaAppend` (D2 invariant 7).
+9. **Followers need no segment assignment.** They self-authorize from the leader's first replication append (D2).
