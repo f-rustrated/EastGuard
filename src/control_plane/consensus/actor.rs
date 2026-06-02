@@ -209,6 +209,22 @@ impl MutlRaftSender {
         recv.await.ok().flatten()
     }
 
+    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::GetPeers {
+                group_id,
+                reply: send,
+            })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        recv.await.unwrap_or_default()
+    }
+
     pub(crate) async fn get_topics(&self) -> Vec<String> {
         let (send, recv) = tokio::sync::oneshot::channel();
         if self

@@ -148,6 +148,34 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
     leader
 }
 
+async fn serve_peers(
+    raft_tx: &MutlRaftSender,
+    group_id: ShardGroupId,
+    query_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let peers = raft_tx.get_peers(group_id).await;
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
+    let (stream, _) = listener.accept().await?;
+    let (_read, mut write) = stream.into_split();
+    let bytes = bincode::encode_to_vec(&peers, BINCODE_CONFIG).unwrap();
+    let len = bytes.len() as u32;
+    write.write_all(&len.to_be_bytes()).await?;
+    write.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn read_peers(host: &str, port: u16) -> Vec<NodeId> {
+    let addr = turmoil::lookup(host);
+    let stream = TcpStream::connect((addr, port)).await.unwrap();
+    let (mut read, _write) = stream.into_split();
+    let len = read.read_u32().await.unwrap() as usize;
+    let mut buf = vec![0u8; len];
+    read.read_exact(&mut buf).await.unwrap();
+    let (peers, _): (Vec<NodeId>, _) = bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
+    peers
+}
+
 /// 3-node cluster: after election, inject HandleNodeDeath for node-3.
 /// Leader proposes RemovePeer. Group continues with 2 members.
 #[test]
@@ -216,5 +244,131 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
         Ok(())
     });
 
+    sim.run()
+}
+
+/// 4-node-aware cluster (3 hosts + 1 ring-known spare), RF=3. The group
+/// starts as [n1, n2, n3]; n4 exists in the topology (so the ring will pick
+/// it as a replacement) but doesn't run a Raft host. Crash n3 — the
+/// leader's reconciliation must propose RemovePeer(n3) **paired** with
+/// AddPeer(n4), and the surviving leaders' view of group membership must
+/// converge to include n4 in place of n3.
+///
+/// `sim.crash("node-3")` actually kills the host so its Raft loop stops
+/// responding (returning early from the test function doesn't — the
+/// `tokio::spawn`'d Raft tasks would otherwise keep elections cycling). The
+/// surviving hosts inject `NodeDead(n3)` after the crash so the leader's
+/// `handle_node_death` runs with an actually-unreachable n3.
+///
+/// n4 is intentionally not a sim host — production would route n4 into the
+/// group via a SWIM `HandleNodeJoin`, but the mock SWIM here doesn't
+/// propagate joins. We verify the consensus-side outcome (n4 in the leaders'
+/// peer sets) without requiring n4 to functionally replicate.
+#[test]
+#[serial_test::serial]
+fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(1))
+        .simulation_duration(Duration::from_secs(120))
+        .build();
+
+    let group_id = ShardGroupId(101);
+    let initial_group = ShardGroup {
+        id: group_id,
+        members: vec![
+            NodeId::new("node-1"),
+            NodeId::new("node-2"),
+            NodeId::new("node-3"),
+        ],
+    };
+
+    // peer_names threaded into start_raft_node seed the stub topology — all
+    // three hosts must see n4 on the ring so `ring_replacements_for` returns
+    // n4 as the eligible non-member.
+    for (name, port, peers) in [
+        ("node-1", 1u16, vec!["node-2", "node-3", "node-4"]),
+        ("node-2", 2, vec!["node-1", "node-3", "node-4"]),
+        ("node-3", 3, vec!["node-1", "node-2", "node-4"]),
+    ] {
+        let group = initial_group.clone();
+        sim.host(name, move || {
+            let group = group.clone();
+            let peers = peers.clone();
+            async move {
+                let (raft_tx, ticker) =
+                    start_raft_node(name, CLUSTER_PORT + port, group.clone(), &peers).await?;
+
+                if name == "node-3" {
+                    // Stay alive until the sim driver crashes us.
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    return Ok(());
+                }
+
+                // Wait long enough for the cluster to stabilize a leader and
+                // for the sim driver to have crashed n3 (driver crashes at
+                // t≈15s).
+                tokio::time::sleep(Duration::from_secs(20)).await;
+
+                let _ = raft_tx
+                    .send(NodeDead {
+                        dead_node_id: NodeId::new("node-3"),
+                    })
+                    .await;
+
+                // Drive ticks for the chained proposals to commit and apply
+                // (RemovePeer → AddPeer at the leader; replication to the
+                // surviving follower).
+                tick_n(&ticker, 500).await;
+                serve_peers(&raft_tx, group.id, QUERY_PORT + port).await?;
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Ok(())
+            }
+        });
+    }
+
+    sim.client("checker", async {
+        // Total wait: cluster startup + 20s injection delay + 500 ticks of
+        // replication. Allow ample headroom for election + chained commits.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let n1_peers = read_peers("node-1", QUERY_PORT + 1).await;
+        let n2_peers = read_peers("node-2", QUERY_PORT + 2).await;
+
+        let n3 = NodeId::new("node-3");
+        let n4 = NodeId::new("node-4");
+
+        assert!(
+            !n1_peers.contains(&n3),
+            "node-1 peers should not include node-3 after reconciliation, got {:?}",
+            n1_peers
+        );
+        assert!(
+            !n2_peers.contains(&n3),
+            "node-2 peers should not include node-3 after reconciliation, got {:?}",
+            n2_peers
+        );
+
+        assert!(
+            n1_peers.contains(&n4),
+            "node-1 peers should include node-4 after paired AddPeer, got {:?}",
+            n1_peers
+        );
+        assert!(
+            n2_peers.contains(&n4),
+            "node-2 peers should include node-4 after paired AddPeer, got {:?}",
+            n2_peers
+        );
+
+        Ok(())
+    });
+
+    // Step the sim until t≈15s, then crash node-3. After that, run the sim
+    // to completion (the surviving hosts have a 20s pre-injection wait, so
+    // crashing at 15s gives them ~5s with a confirmed-dead n3 before they
+    // tell the leader).
+    while sim.elapsed() < Duration::from_secs(15) {
+        sim.step()?;
+    }
+    sim.crash("node-3");
     sim.run()
 }

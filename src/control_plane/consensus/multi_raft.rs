@@ -169,6 +169,10 @@ impl MultiRaft {
                 let result = self.get_leader(group_id);
                 self.deferred.push(DeferredReply::GetLeader(reply, result));
             }
+            MultiRaftActorCommand::GetPeers { group_id, reply } => {
+                let result = self.get_peers(group_id);
+                self.deferred.push(DeferredReply::GetPeers(reply, result));
+            }
             MultiRaftActorCommand::Propose { propose, reply } => {
                 self.propose(propose, reply);
             }
@@ -192,6 +196,9 @@ impl MultiRaft {
         for reply in self.deferred.drain(..) {
             match reply {
                 DeferredReply::GetLeader(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetPeers(sender, v) => {
                     let _ = sender.send(v);
                 }
                 DeferredReply::Propose(sender, v) => {
@@ -318,6 +325,13 @@ impl MultiRaft {
         self.groups
             .get(&group_id)
             .and_then(|r| r.current_leader().cloned())
+    }
+
+    fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+        self.groups
+            .get(&group_id)
+            .map(|r| r.peers_iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn get_topics(&self) -> Vec<String> {

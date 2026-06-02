@@ -253,7 +253,7 @@ impl Raft {
             changed |= self.propose_replace_peer(dead_node_id.clone(), replacement);
         }
 
-        changed || self.reconcile_segments(&live_set)
+        changed || self.reconcile_segments(live_set)
     }
 
     pub(crate) fn dead_nodes(&mut self, live: &HashSet<NodeId>) -> impl Iterator<Item = &NodeId> {
