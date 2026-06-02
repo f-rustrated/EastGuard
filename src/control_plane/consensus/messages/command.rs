@@ -36,7 +36,6 @@ pub struct RaftPropose {
 
 pub struct HandleNodeJoin {
     pub new_node_id: NodeId,
-    pub affected_groups: Vec<ShardGroup>,
 }
 
 #[allow(dead_code)]
@@ -66,9 +65,7 @@ pub enum RaftTransportCommand {
     DisconnectPeer(NodeId),
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CoordinatorSealRequest {
     pub request: SealRequest,
-    pub live_nodes: Vec<NodeId>,
 }

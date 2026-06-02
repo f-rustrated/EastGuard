@@ -156,14 +156,13 @@ impl<W: WalStorage> DataPlane<W> {
             C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd.segment_key),
 
             // Pass-through to MultiRaftActor — SealRequest is a control plane
-            // message that shares the data transport wire format.
+            // message that shares the data transport wire format. The
+            // coordinator loads its own live-nodes view from the shared
+            // topology snapshot, so the data plane just forwards the request.
             C::SealRequest(cmd) => {
                 self.out
                     .store_coordinator_cmd(MultiRaftActorCommand::Coordinator(
-                        CoordinatorSealRequest {
-                            request: cmd,
-                            live_nodes: vec![],
-                        },
+                        CoordinatorSealRequest { request: cmd },
                     ));
             }
         }

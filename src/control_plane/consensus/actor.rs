@@ -1,16 +1,14 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
-use crate::control_plane::SwimNodeState;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
-use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::membership::SwimCommand;
 use crate::control_plane::membership::actor::SwimSender;
+use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::MetadataCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::actor::spawn_scheduling_actor;
@@ -53,6 +51,7 @@ impl MultiRaftActor {
         transport_tx: impl Into<BatchSender<RaftTransportCommand>>,
         swim_tx: SwimSender,
         data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
+        topology: TopologyReader,
     ) {
         let scheduler_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
             sender.into(),
@@ -69,6 +68,7 @@ impl MultiRaftActor {
             scheduler_tx,
             swim_tx,
             data_transport_tx.into(),
+            topology,
         ));
     }
 
@@ -82,9 +82,10 @@ impl MultiRaftActor {
         scheduler_tx: SchedulerSender<RaftTimer>,
         swim_tx: SwimSender,
         data_transport_tx: BatchSender<DataTransportCommand>,
+        topology: TopologyReader,
     ) {
         let mut actor = Self {
-            store: MultiRaft::new(node_id, election_jitter_seed, storage),
+            store: MultiRaft::new(node_id, election_jitter_seed, storage, topology),
             transport_tx,
             scheduler_tx,
             swim_tx,
@@ -101,7 +102,6 @@ impl MultiRaftActor {
                 break;
             }
             for cmd in buf.drain(..) {
-                let cmd = actor.enrich_command(cmd).await;
                 actor.store.process(cmd);
             }
             actor.flush().await;
@@ -151,8 +151,11 @@ impl MultiRaftActor {
             }
             RaftEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
             RaftEvent::LeaderChange(lc) => {
+                // On becoming leader, run both halves of takeover reconciliation:
+                // - replace any peer that SWIM no longer considers alive
+                // - roll any active segment whose replica set still names a non-live node
                 if lc.leader_node_id == *self.store.node_id() {
-                    self.reconcile_peers_against_swim(lc.shard_group_id).await;
+                    self.store.reconcile_on_leadership_change(lc.shard_group_id);
                 }
                 let _ = self
                     .swim_tx
@@ -167,37 +170,6 @@ impl MultiRaftActor {
                 self.data_transport_cmds
                     .extend(committed.into_data_transport_cmds());
             }
-        }
-    }
-
-    /// On becoming leader of a group, propose `RemovePeer` for any peer that
-    /// SWIM no longer considers Alive — covers the case where the previous
-    /// leader died before it could propose the removal. See
-    /// `diagrams/metadata-management/membership-reconciliation-and-rebalancing.md`
-    async fn reconcile_peers_against_swim(&mut self, group_id: ShardGroupId) {
-        let Ok(members) = self.swim_tx.get_members().await else {
-            return;
-        };
-        let live: HashSet<NodeId> = members
-            .into_iter()
-            .filter(|m| m.state == SwimNodeState::Alive)
-            .map(|m| m.node_id)
-            .collect();
-        self.store.reconcile_peers(group_id, &live);
-    }
-    async fn enrich_command(&self, cmd: MultiRaftActorCommand) -> MultiRaftActorCommand {
-        match cmd {
-            MultiRaftActorCommand::Coordinator(mut req) => {
-                if let Ok(members) = self.swim_tx.get_members().await {
-                    req.live_nodes = members
-                        .into_iter()
-                        .filter(|m| m.state == SwimNodeState::Alive)
-                        .map(|m| m.node_id)
-                        .collect();
-                }
-                MultiRaftActorCommand::Coordinator(req)
-            }
-            other => other,
         }
     }
 }
@@ -235,6 +207,22 @@ impl MutlRaftSender {
             .await
             .ok()?;
         recv.await.ok().flatten()
+    }
+
+    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(MultiRaftActorCommand::GetPeers {
+                group_id,
+                reply: send,
+            })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        recv.await.unwrap_or_default()
     }
 
     pub(crate) async fn get_topics(&self) -> Vec<String> {

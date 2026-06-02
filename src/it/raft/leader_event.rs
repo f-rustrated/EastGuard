@@ -12,7 +12,7 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{
-    ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand, QueryCommand,
+    QueryCommand, ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand,
 };
 use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
@@ -129,6 +129,9 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     h.finish()
                 };
                 let (data_tx, _) = tokio::sync::mpsc::channel(1);
+                let all_nodes: Vec<&str> =
+                    std::iter::once(name).chain(peers.iter().copied()).collect();
+                let topology_reader = super::stub_topology_reader(&all_nodes);
                 tokio::spawn(MultiRaftActor::run(
                     node_id,
                     election_jitter_seed,
@@ -138,6 +141,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     ticker_tx.into(),
                     swim_tx,
                     data_tx.into(),
+                    topology_reader,
                 ));
 
                 raft_tx.send(EnsureGroup { group: g }).await.unwrap();

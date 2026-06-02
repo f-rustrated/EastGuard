@@ -1,7 +1,10 @@
+use arc_swap::ArcSwap;
 use bincode::{Decode, Encode};
 use murmur3::murmur3_32;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
+
+use std::sync::Arc;
 
 use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::control_plane::{NodeAddress, NodeId, SwimNodeState};
@@ -71,6 +74,73 @@ pub struct Topology {
     /// Shard leader map: tracks current leader for each shard group.
     /// NOT auto-cleared on node death — Raft re-election gossips new leader with higher term.
     shard_leaders: HashMap<ShardGroupId, ShardLeaderEntry>,
+    /// Set inside mutators (ring update, shard-leader accepted). The owning
+    /// `SwimActor` consumes this flag at the end of each event-loop iteration
+    /// via `take_dirty()` to decide whether to publish a fresh snapshot into
+    /// the shared `ArcSwap<Topology>`. Stays untouched on no-op mutations
+    /// (e.g., stale-term shard-leader updates) so we don't pay clone cost for
+    /// publishes that would carry no new information.
+    dirty: bool,
+}
+
+/// Read-only handle on the shared topology snapshot.
+///
+/// `SwimActor` is the sole writer; every other actor that needs the current
+/// topology holds a clone of this handle. `.load()` returns an `Arc<Topology>`
+/// snapshot atomically — lock-free, no contention with the writer or other
+/// readers, and internally consistent (no torn reads, no mid-update views).
+///
+/// Cloning the handle is just an `Arc` bump (shares the underlying `ArcSwap`).
+#[derive(Clone)]
+pub(crate) struct TopologyReader(Arc<ArcSwap<Topology>>);
+
+impl TopologyReader {
+    pub(crate) fn live_nodes(&self) -> Vec<NodeId> {
+        self.0.load().live_nodes()
+    }
+
+    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<ShardGroup> {
+        self.0
+            .load()
+            .shard_groups_for_node(node_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn ring_replacements_for(
+        &self,
+        group_id: ShardGroupId,
+        excluded: &HashSet<NodeId>,
+        count: usize,
+    ) -> Vec<NodeId> {
+        let replacements = self
+            .0
+            .load()
+            .ring_replacements_for(group_id, excluded, count);
+
+        if replacements.len() != count {
+            // ! log replacement shortfall.
+            tracing::warn!(
+                "Reconciliation on {:?}: needed {} replacement(s), pool yielded none — \
+             group remains under-replicated until cluster grows",
+                group_id,
+                count
+            );
+        }
+        replacements
+    }
+}
+
+/// Construct a (publisher, reader) pair sharing one underlying `ArcSwap`.
+///
+/// The publisher half stays with `SwimActor` (single writer); the reader can
+/// be cloned freely to any number of consumers. Both see the same atomic slot;
+/// what differs is the API surface — readers can only `load()`.
+pub(crate) fn topology_channel(initial: Topology) -> (Arc<ArcSwap<Topology>>, TopologyReader) {
+    let arc = Arc::new(ArcSwap::from_pointee(initial));
+    let reader = TopologyReader(arc.clone());
+    (arc, reader)
 }
 
 impl Topology {
@@ -81,12 +151,25 @@ impl Topology {
             groups: HashMap::new(),
             node_group_ids: HashMap::new(),
             shard_leaders: HashMap::new(),
+            dirty: false,
         };
         for pnode_id in nodes {
             topology.add_pnode(pnode_id);
         }
         topology.rebuild_reverse_index();
+        // Initial construction is not a "publish-worthy mutation" — the
+        // `topology_channel` factory seeds the ArcSwap with this snapshot
+        // directly, so we leave `dirty` cleared.
+        topology.dirty = false;
         topology
+    }
+
+    /// Consume the dirty flag. Returns true if the topology has been mutated
+    /// since the last `take_dirty()` call (or since construction). The owning
+    /// SwimActor calls this at the end of each event-loop iteration to decide
+    /// whether to clone and publish a fresh snapshot.
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
     }
 
     pub(crate) fn vnodes_per_pnode(&self) -> usize {
@@ -146,31 +229,45 @@ impl Topology {
         if self.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
-        self.collect_distinct_owners(hash, n)
+        self.collect_distinct_owners_excluding(hash, n, &HashSet::new())
     }
 
-    fn collect_distinct_owners(&self, hash: u32, n: usize) -> Vec<&NodeId> {
+    fn collect_distinct_owners_excluding(
+        &self,
+        hash: u32,
+        n: usize,
+        excluded: &HashSet<NodeId>,
+    ) -> Vec<&NodeId> {
         let mut result: Vec<&NodeId> = Vec::with_capacity(n);
         for token in self.walk_clockwise_from(hash) {
-            if !result.iter().any(|o| **o == token.pnode_id) {
-                result.push(&token.pnode_id);
-                if result.len() == n {
-                    break;
-                }
+            if excluded.contains(&token.pnode_id) {
+                continue;
+            }
+            if result.iter().any(|o| **o == token.pnode_id) {
+                continue;
+            }
+            result.push(&token.pnode_id);
+            if result.len() == n {
+                break;
             }
         }
         result
     }
 
     fn insert_node(&mut self, pnode_id: NodeId) {
+        let already_present = self.node_group_ids.contains_key(&pnode_id);
         self.add_pnode(pnode_id);
-        self.rebuild_reverse_index();
+        if !already_present {
+            self.rebuild_reverse_index();
+            self.dirty = true;
+        }
     }
 
     fn remove_node(&mut self, pnode_id: &NodeId) -> bool {
         let removed = self.remove_pnode(pnode_id);
         if removed {
             self.rebuild_reverse_index();
+            self.dirty = true;
         }
         removed
     }
@@ -205,6 +302,17 @@ impl Topology {
         self.token_owners_at(hash, n)
     }
 
+    /// Returns all unique shard groups that `node_id` participates in,
+    /// borrowed from this snapshot. `TopologyReader::shard_groups_for_node`
+    /// is the owned-clone wrapper that other actors call; this method is the
+    /// data-layer primitive (also used directly in tests).
+    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<&ShardGroup> {
+        self.node_group_ids
+            .get(node_id)
+            .map(|ids| ids.iter().filter_map(|id| self.groups.get(id)).collect())
+            .unwrap_or_default()
+    }
+
     /// Returns the shard group responsible for `key`.
     ///
     /// Walks the consistent hash ring clockwise from the key's hash position to
@@ -219,13 +327,36 @@ impl Topology {
         self.groups.get(&id)
     }
 
-    /// Returns all unique shard groups that `node_id` participates in.
-    /// O(G) where G = number of groups for this node (lookups into `groups` map).
-    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<&ShardGroup> {
-        self.node_group_ids
-            .get(node_id)
-            .map(|ids| ids.iter().filter_map(|id| self.groups.get(id)).collect())
-            .unwrap_or_default()
+    /// Walks the ring clockwise from this group's anchor and returns up to `count`
+    /// physical nodes that are NOT in `excluded`. Used by reconciliation to pick
+    /// replacements when a node leaves a Raft peer set or a segment's replica set.
+    ///
+    /// Deterministic given the current ring state and the exclusion set, which is
+    /// what lets both metadata and data-plane callers reach the same choice for
+    /// the same death without coordinating: ask the ring.
+    ///
+    /// Exclusion is the caller's responsibility — typically the current set plus
+    /// the node being replaced. The ring already excludes dead nodes (SWIM removes
+    /// them); suspects remain on the ring, so a caller that wants to skip them
+    /// must put them in `excluded` explicitly.
+    ///
+    /// Returns fewer than `count` (possibly zero) when the ring lacks that many
+    /// eligible nodes — the caller decides what to do with a short return
+    /// (degrade-and-proceed, with severity-appropriate logging).
+    pub(crate) fn ring_replacements_for(
+        &self,
+        group_id: ShardGroupId,
+        excluded: &HashSet<NodeId>,
+        count: usize,
+    ) -> Vec<NodeId> {
+        if count == 0 || self.vnodes.is_empty() {
+            return Vec::new();
+        }
+        let anchor = group_id.0 as u32;
+        self.collect_distinct_owners_excluding(anchor, count, excluded)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn live_nodes(&self) -> Vec<NodeId> {
@@ -246,6 +377,7 @@ impl Topology {
                 term: info.term,
             },
         );
+        self.dirty = true;
         true
     }
 
@@ -378,7 +510,7 @@ mod tests {
 
     #[test]
     fn new_builds_correct_node_and_vnode_counts() {
-        let topology = topology_from(
+        let mut topology = topology_from(
             &["node-0", "node-1", "node-2"],
             TopologyConfig {
                 vnodes_per_pnode: 4,
@@ -392,6 +524,10 @@ mod tests {
         assert!(topology.node_group_ids.contains_key("node-1"));
         assert!(topology.node_group_ids.contains_key("node-2"));
         assert!(!topology.node_group_ids.contains_key("node-3"));
+
+        // Construction is not a publish-worthy mutation — the topology_channel
+        // factory seeds the ArcSwap with this snapshot directly.
+        assert!(!topology.take_dirty());
     }
 
     #[test]
@@ -409,6 +545,10 @@ mod tests {
         assert_eq!(topology.node_group_ids.len(), 4);
         assert_eq!(topology.vnodes.len(), 16);
         assert!(topology.node_group_ids.contains_key("node-3"));
+        assert!(
+            topology.take_dirty(),
+            "inserting a new node must mark dirty"
+        );
     }
 
     #[test]
@@ -425,6 +565,10 @@ mod tests {
 
         assert_eq!(topology.node_group_ids.len(), 3);
         assert_eq!(topology.vnodes.len(), 12);
+        assert!(
+            !topology.take_dirty(),
+            "duplicate insert is a no-op and must not mark dirty"
+        );
     }
 
     #[test]
@@ -442,6 +586,14 @@ mod tests {
         assert_eq!(topology.node_group_ids.len(), 2);
         assert_eq!(topology.vnodes.len(), 8);
         assert!(!topology.node_group_ids.contains_key("node-0"));
+        assert!(topology.take_dirty(), "actual removal must mark dirty");
+
+        let removed_again = topology.remove_node(&NodeId::new("node-0"));
+        assert!(!removed_again);
+        assert!(
+            !topology.take_dirty(),
+            "removing an absent node must not mark dirty"
+        );
     }
 
     #[test]
@@ -657,6 +809,237 @@ mod tests {
         assert!(groups.is_empty());
     }
 
+    // --- TopologyReader / topology_channel tests ---
+
+    #[test]
+    fn reader_loads_initial_snapshot() {
+        let topology = topology_from(
+            &["a", "b"],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 2,
+            },
+        );
+        let (_pub_handle, reader) = topology_channel(topology);
+
+        assert_eq!(reader.live_nodes().len(), 2);
+    }
+
+    #[test]
+    fn reader_sees_published_update() {
+        let topology = topology_from(
+            &["a"],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+        let (pub_handle, reader) = topology_channel(topology);
+        assert_eq!(reader.live_nodes().len(), 1);
+
+        // Simulate what SwimActor does at the end of an iteration: build a fresh
+        // Topology that reflects new state and store it.
+        let next = topology_from(
+            &["a", "b", "c"],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+        pub_handle.store(Arc::new(next));
+
+        assert_eq!(reader.live_nodes().len(), 3);
+    }
+
+    #[test]
+    fn reader_clone_shares_underlying_swap() {
+        let topology = topology_from(
+            &["a"],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+        let (pub_handle, reader1) = topology_channel(topology);
+        let reader2 = reader1.clone();
+
+        pub_handle.store(Arc::new(topology_from(
+            &["a", "b"],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        )));
+
+        // Both readers see the same new snapshot.
+        assert_eq!(reader1.live_nodes().len(), 2);
+        assert_eq!(reader2.live_nodes().len(), 2);
+    }
+
+    // --- ring_replacements_for tests ---
+
+    fn five_node_topology() -> Topology {
+        topology_from(
+            &["node-0", "node-1", "node-2", "node-3", "node-4"],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        )
+    }
+
+    #[test]
+    fn ring_replacements_returns_node_not_in_excluded() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+
+        let picks = topology.ring_replacements_for(group.id, &current, 1);
+
+        assert_eq!(picks.len(), 1);
+        assert!(
+            !current.contains(&picks[0]),
+            "pick {:?} must not be among current members {:?}",
+            picks[0],
+            current
+        );
+    }
+
+    #[test]
+    fn ring_replacements_skips_every_excluded_node() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        // Exclude four of five nodes: every member plus one extra outsider.
+        let mut excluded: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let outsider = topology
+            .live_nodes()
+            .into_iter()
+            .find(|n| !excluded.contains(n))
+            .expect("must have at least one outsider with 5 nodes and RF=3");
+        excluded.insert(outsider.clone());
+
+        let picks = topology.ring_replacements_for(group.id, &excluded, 5);
+
+        assert_eq!(
+            picks.len(),
+            1,
+            "exactly one eligible node should remain (5 total − 4 excluded)"
+        );
+        for p in &picks {
+            assert!(
+                !excluded.contains(p),
+                "pick {:?} must not appear in excluded set",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn ring_replacements_returns_fewer_than_count_when_pool_depleted() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+
+        // 5 total, 3 excluded → 2 eligible. Ask for 5; expect 2.
+        let picks = topology.ring_replacements_for(group.id, &current, 5);
+        assert_eq!(picks.len(), 2);
+    }
+
+    #[test]
+    fn ring_replacements_returns_empty_when_all_excluded() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        let all: HashSet<NodeId> = topology.live_nodes().into_iter().collect();
+
+        let picks = topology.ring_replacements_for(group.id, &all, 1);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn ring_replacements_empty_for_count_zero() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        let picks = topology.ring_replacements_for(group.id, &HashSet::new(), 0);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn ring_replacements_empty_when_ring_empty() {
+        let topology = topology_from(
+            &[],
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+        // Group id chosen arbitrarily; with an empty ring nothing is eligible.
+        let picks = topology.ring_replacements_for(ShardGroupId(123), &HashSet::new(), 3);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn ring_replacements_deterministic_across_calls() {
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+
+        let a = topology.ring_replacements_for(group.id, &current, 2);
+        let b = topology.ring_replacements_for(group.id, &current, 2);
+        assert_eq!(a, b, "same inputs must yield identical results");
+    }
+
+    #[test]
+    fn ring_replacements_deterministic_across_instances() {
+        // Two topologies built from the same node set must agree on replacement.
+        // This is what lets the leader propose and other replicas accept without
+        // recomputing — but is also a useful property in its own right.
+        let config = TopologyConfig {
+            vnodes_per_pnode: 64,
+            replication_factor: 3,
+        };
+        let t1 = topology_from(
+            &["node-0", "node-1", "node-2", "node-3", "node-4"],
+            config.clone(),
+        );
+        let t2 = topology_from(
+            &["node-4", "node-3", "node-2", "node-1", "node-0"], // different insert order
+            config,
+        );
+
+        let g1 = t1.shard_group_for(b"topic-blue").unwrap().clone();
+        let g2 = t2.shard_group_for(b"topic-blue").unwrap();
+        assert_eq!(g1.id, g2.id, "group id must be deterministic");
+
+        let excluded: HashSet<NodeId> = g1.members.iter().cloned().collect();
+        let p1 = t1.ring_replacements_for(g1.id, &excluded, 2);
+        let p2 = t2.ring_replacements_for(g2.id, &excluded, 2);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn ring_replacements_matches_ring_continuation_past_current_members() {
+        // The semantic claim of "ring-aware": replacements are exactly the nodes
+        // the ring would yield if we kept walking past the current member count.
+        // Verifies we're picking the ring's natural successors, not arbitrary nodes.
+        let topology = five_node_topology();
+        let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
+        assert_eq!(group.members.len(), 3);
+
+        // Owners at RF=5 are: the 3 current members, then the 2 ring successors.
+        let owners_5: Vec<NodeId> = topology
+            .token_owners_at(group.id.0 as u32, 5)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(owners_5.len(), 5);
+        assert_eq!(&owners_5[..3], group.members.as_slice());
+        let expected_successors = &owners_5[3..];
+
+        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let picks = topology.ring_replacements_for(group.id, &current, 2);
+        assert_eq!(picks.as_slice(), expected_successors);
+    }
+
     // --- shard leader map tests ---
 
     #[test]
@@ -691,6 +1074,10 @@ mod tests {
             "127.0.0.1:7080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(entry.term, 1);
+        assert!(
+            topology.take_dirty(),
+            "accepted shard-leader update must mark dirty"
+        );
     }
 
     #[test]
@@ -713,6 +1100,7 @@ mod tests {
             term: 1,
         };
         topology.update_shard_leader(&info1);
+        assert!(topology.take_dirty(), "first update must mark dirty");
 
         let info2 = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
@@ -724,6 +1112,7 @@ mod tests {
             term: 3,
         };
         assert!(topology.update_shard_leader(&info2));
+        assert!(topology.take_dirty(), "higher-term update must mark dirty");
 
         let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
         assert_eq!(entry.leader_node_id, NodeId::new("node-1"));
@@ -750,6 +1139,9 @@ mod tests {
             term: 5,
         };
         topology.update_shard_leader(&info1);
+        // Clear the dirty bit from the seeding update so the next two
+        // rejected updates have a clean baseline to assert against.
+        let _ = topology.take_dirty();
 
         let stale = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
@@ -761,6 +1153,10 @@ mod tests {
             term: 2,
         };
         assert!(!topology.update_shard_leader(&stale));
+        assert!(
+            !topology.take_dirty(),
+            "lower-term rejection must not mark dirty"
+        );
 
         let equal = ShardLeaderInfo {
             shard_group_id: ShardGroupId(42),
@@ -772,6 +1168,10 @@ mod tests {
             term: 5,
         };
         assert!(!topology.update_shard_leader(&equal));
+        assert!(
+            !topology.take_dirty(),
+            "same-term rejection must not mark dirty"
+        );
 
         let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
         assert_eq!(entry.leader_node_id, NodeId::new("node-0"));

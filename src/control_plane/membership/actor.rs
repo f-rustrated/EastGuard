@@ -1,11 +1,16 @@
 use super::*;
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+
 use crate::channels::BatchSender;
 use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeId;
 use crate::control_plane::SwimNode;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::membership::swim::Swim;
+use crate::control_plane::membership::topology::Topology;
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
@@ -22,6 +27,10 @@ pub struct SwimActor {
     transport_tx: BatchSender<OutboundPacket>,
     scheduler_tx: SchedulerSender<SwimTimer>,
     raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+
+    /// Writer half of the shared topology snapshot. SwimActor is the sole
+    /// writer; readers (MultiRaftActor, etc.) hold a `TopologyReader`.
+    topology_pub: Arc<ArcSwap<Topology>>,
 
     packets: Vec<OutboundPacket>,
     timer_cmds: Vec<TickerCommand<SwimTimer>>,
@@ -41,6 +50,7 @@ impl SwimActor {
         state: Swim,
         transport_tx: impl Into<BatchSender<OutboundPacket>>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+        topology_pub: Arc<ArcSwap<Topology>>,
     ) {
         let scheduler_tx = spawn_scheduling_actor(
             sender.into(),
@@ -54,6 +64,7 @@ impl SwimActor {
             transport_tx.into(),
             scheduler_tx,
             raft_tx,
+            topology_pub,
         ));
     }
 
@@ -63,12 +74,14 @@ impl SwimActor {
         transport_tx: BatchSender<OutboundPacket>,
         scheduler_tx: SchedulerSender<SwimTimer>,
         raft_tx: mpsc::Sender<MultiRaftActorCommand>,
+        topology_pub: Arc<ArcSwap<Topology>>,
     ) {
         let mut actor = Self {
             state,
             transport_tx,
             scheduler_tx,
             raft_tx,
+            topology_pub,
             packets: Vec::new(),
             timer_cmds: Vec::new(),
         };
@@ -88,8 +101,17 @@ impl SwimActor {
                     SwimActorCommand::Query(q) => actor.state.handle_query(q),
                 }
             }
+
+            // Publish a fresh snapshot if anything in this batch mutated topology.
+            // Batched per iteration so several mutations in one mailbox drain.
+            if actor.state.topology.take_dirty() {
+                actor
+                    .topology_pub
+                    .store(Arc::new(actor.state.topology.clone()));
+            }
+
             #[cfg(any(test, debug_assertions))]
-            actor.state.assert_invariants()
+            actor.state.assert_invariants();
         }
     }
 
@@ -99,9 +121,7 @@ impl SwimActor {
                 SwimEvent::Packet(pkt) => self.packets.push(pkt),
                 SwimEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
                 SwimEvent::MembershipEvent(m) => {
-                    if let Some(cmd) =
-                        m.into_raft_command(&self.state.node_id, &self.state.topology)
-                    {
+                    if let Some(cmd) = m.into_raft_command(&self.state.node_id) {
                         let _ = self.raft_tx.send(cmd).await;
                     }
                 }

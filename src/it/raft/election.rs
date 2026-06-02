@@ -121,6 +121,10 @@ async fn run_raft_node(
         h.finish()
     };
     let (data_tx, _) = tokio::sync::mpsc::channel(1);
+    let all_nodes: Vec<&str> = std::iter::once(node_name)
+        .chain(peer_names.iter().copied())
+        .collect();
+    let topology_reader = super::stub_topology_reader(&all_nodes);
     tokio::spawn(MultiRaftActor::run(
         node_id,
         election_jitter_seed,
@@ -130,6 +134,7 @@ async fn run_raft_node(
         ticker_tx.into(),
         swim_tx,
         data_tx.into(),
+        topology_reader,
     ));
 
     raft_tx

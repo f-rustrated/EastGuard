@@ -11,12 +11,13 @@ use crate::control_plane::consensus::messages::{
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
+use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::metadata::TopicId;
 use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::types::TopicStats;
 
 use crate::control_plane::consensus::raft::storage::RaftStorage;
-use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::data_plane::SegmentKey;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
@@ -32,6 +33,11 @@ pub(crate) struct MultiRaft {
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
     pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposeError>>>,
     pending_seals: PendingSealTracker,
+    /// Read-only snapshot handle on the topology owned by SwimActor. Loaded
+    /// synchronously wherever this state machine needs live cluster shape
+    /// (peer reconciliation, ring-aware replacement picks, live-node filters
+    /// for seal-request handling). `.load()` is a lock-free Arc bump.
+    topology: TopologyReader,
 }
 
 #[derive(Default)]
@@ -113,6 +119,7 @@ impl MultiRaft {
         node_id: NodeId,
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
+        topology: TopologyReader,
     ) -> Self {
         Self {
             node_id,
@@ -125,6 +132,7 @@ impl MultiRaft {
             deferred: Vec::new(),
             pending_proposes: BTreeMap::new(),
             pending_seals: PendingSealTracker::default(),
+            topology,
         }
     }
 
@@ -132,36 +140,24 @@ impl MultiRaft {
         &self.node_id
     }
 
-    /// Propose `RemovePeer` for any peer of `group_id` that SWIM does not
-    /// consider alive. Only the leader can propose, so this is a no-op on
-    /// followers. Invoked on `LeaderChange → self` to close the gap where the
-    /// previous leader died before proposing the removal.
-    pub(crate) fn reconcile_peers(&mut self, group_id: ShardGroupId, live: &HashSet<NodeId>) {
-        let Some(raft) = self.groups.get_mut(&group_id) else {
+    /// Invoked on `LeaderChange → self` to close the gap where the previous leader died
+    /// before proposing the removals (or their pairings).
+    pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
+        let Some(raft) = self.groups.get_mut(&shard_group_id) else {
             return;
         };
         if !raft.is_leader() {
             return;
         }
-        let dead: Vec<NodeId> = raft
-            .peers_iter()
-            .filter(|p| !live.contains(*p))
-            .cloned()
-            .collect();
-        if dead.is_empty() {
-            return;
-        }
-        for node_id in dead {
-            if let Err(e) = raft.propose(RaftCommand::RemovePeer(node_id.clone())) {
-                tracing::debug!(
-                    "Reconciliation RemovePeer({:?}) on {:?} rejected: {:?}",
-                    node_id,
-                    group_id,
-                    e
-                );
-            }
-        }
-        self.dirty.insert(group_id);
+
+        let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
+
+        let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
+        let segment_reconciled = raft.reconcile_segments(&live_set);
+
+        if peer_reconciled || segment_reconciled {
+            self.dirty.insert(shard_group_id);
+        };
     }
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
@@ -172,6 +168,10 @@ impl MultiRaft {
             MultiRaftActorCommand::GetLeader { group_id, reply } => {
                 let result = self.get_leader(group_id);
                 self.deferred.push(DeferredReply::GetLeader(reply, result));
+            }
+            MultiRaftActorCommand::GetPeers { group_id, reply } => {
+                let result = self.get_peers(group_id);
+                self.deferred.push(DeferredReply::GetPeers(reply, result));
             }
             MultiRaftActorCommand::Propose { propose, reply } => {
                 self.propose(propose, reply);
@@ -198,6 +198,9 @@ impl MultiRaft {
                 DeferredReply::GetLeader(sender, v) => {
                     let _ = sender.send(v);
                 }
+                DeferredReply::GetPeers(sender, v) => {
+                    let _ = sender.send(v);
+                }
                 DeferredReply::Propose(sender, v) => {
                     let _ = sender.send(v);
                 }
@@ -217,12 +220,8 @@ impl MultiRaft {
             ConsensusCommand::Timeout(cb) => self.handle_timeout(cb),
             ConsensusCommand::EnsureGroup(cmd) => self.add_group(cmd.group),
             ConsensusCommand::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
-            ConsensusCommand::HandleNodeDeath(cmd) => {
-                self.handle_node_death(cmd.dead_node_id, cmd.live_nodes)
-            }
-            ConsensusCommand::HandleNodeJoin(cmd) => {
-                self.add_node(cmd.new_node_id, cmd.affected_groups)
-            }
+            ConsensusCommand::HandleNodeDeath(cmd) => self.handle_node_death(cmd.dead_node_id),
+            ConsensusCommand::HandleNodeJoin(cmd) => self.add_node(cmd.new_node_id),
         }
     }
 
@@ -328,6 +327,13 @@ impl MultiRaft {
             .and_then(|r| r.current_leader().cloned())
     }
 
+    fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+        self.groups
+            .get(&group_id)
+            .map(|r| r.peers_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn get_topics(&self) -> Vec<String> {
         self.groups
             .values()
@@ -349,45 +355,15 @@ impl MultiRaft {
     // `RemovePeer`, and followers apply on commit. Direct mutation would let
     // replicas disagree on quorum size during gossip convergence. See
     // `diagrams/metadata-management/metadata_management_roadmap.md` Phase 3d.
-    fn handle_node_death(&mut self, dead_node_id: NodeId, live_nodes: Vec<NodeId>) {
+    //
+    // The live set is loaded fresh from the topology snapshot — drift between
+    // event emission and processing is absorbed naturally, and there's one
+    // canonical source of "current cluster shape" (the topology reader).
+    fn handle_node_death(&mut self, dead_node_id: NodeId) {
+        let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
         for (group_id, raft) in self.groups.iter_mut() {
-            if !raft.is_leader() {
-                continue;
-            }
-
-            if raft.has_peer(&dead_node_id)
-                && let Err(e) = raft.propose(RaftCommand::RemovePeer(dead_node_id.clone()))
-            {
-                tracing::warn!(
-                    "Death-triggered RemovePeer({:?}) on {:?} rejected: {:?}",
-                    dead_node_id,
-                    group_id,
-                    e
-                );
-            }
-            self.dirty.insert(*group_id);
-
-            // ? how does this work when we have 3 nodes while replication factor is being three?
-            for (segment_key, old_replica_set) in raft.active_segments_for_node(&dead_node_id) {
-                let new_replica_set = compute_replacement_replica_set(
-                    &old_replica_set,
-                    std::slice::from_ref(&dead_node_id),
-                    &live_nodes,
-                );
-                let cmd = RollSegment {
-                    segment_key,
-                    sealed_at: now_ms(),
-                    new_replica_set,
-                    end_entry_id: None,
-                };
-
-                if let Err(e) = raft.propose(cmd.into()) {
-                    tracing::warn!(
-                        "Death-triggered RollSegment for {:?} failed: {:?}",
-                        segment_key,
-                        e
-                    );
-                }
+            if raft.handle_node_death(&dead_node_id, &live_set, &self.topology) {
+                self.dirty.insert(*group_id);
             }
         }
     }
@@ -414,8 +390,10 @@ impl MultiRaft {
             return;
         };
 
+        let live_nodes = self.topology.live_nodes();
+
         let new_replica_set =
-            compute_replacement_replica_set(&old_replica_set, &seal.failed_nodes, &req.live_nodes);
+            compute_replacement_replica_set(&old_replica_set, &seal.failed_nodes, &live_nodes);
 
         let cmd = RollSegment {
             segment_key: seal.segment_key,
@@ -448,7 +426,16 @@ impl MultiRaft {
             .find_map(|(gid, raft)| raft.has_topic(topic_id).then_some(*gid))
     }
 
-    fn add_node(&mut self, node_id: NodeId, affected_groups: Vec<ShardGroup>) {
+    /// Compute affected groups (the ones this new node now participates in)
+    /// from the fresh topology snapshot, then propose `AddPeer` for groups
+    /// this node already leads and create new groups it newly joins. Loading
+    /// fresh means the join sees the latest cluster shape — including any
+    /// topology drift between the SWIM event and this handler running.
+    fn add_node(&mut self, node_id: NodeId) {
+        let affected_groups: Vec<ShardGroup> = self.topology.shard_groups_for_node(&node_id);
+        if affected_groups.is_empty() {
+            return;
+        }
         self.add_peer_to_existing_groups(&node_id, &affected_groups);
         self.ensure_new_groups(affected_groups);
     }
@@ -633,38 +620,6 @@ impl RaftTimerTokenGenerator {
     }
 }
 
-fn compute_replacement_replica_set(
-    old: &[NodeId],
-    dead_nodes: &[NodeId],
-    live_nodes: &[NodeId],
-) -> Vec<NodeId> {
-    let rf = old.len();
-    let mut new_set: Vec<NodeId> = old
-        .iter()
-        .filter(|n| !dead_nodes.contains(n))
-        .cloned()
-        .collect();
-    for candidate in live_nodes {
-        if new_set.len() >= rf {
-            break;
-        }
-        if !new_set.contains(candidate) && !dead_nodes.contains(candidate) {
-            new_set.push(candidate.clone());
-        }
-    }
-    if new_set.is_empty() {
-        tracing::error!("All replicas dead for segment — empty replica set");
-    }
-    new_set
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 impl MultiRaft {
     fn stabled_for(&self, id: ShardGroupId) -> u64 {
@@ -709,7 +664,18 @@ mod tests {
     }
 
     fn new_store(node_id: NodeId, storage: Box<dyn RaftStorage>) -> MultiRaft {
-        MultiRaft::new(node_id, 0, storage)
+        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        // Tests just need a valid topology reader; empty topology is fine —
+        // these tests don't exercise reconciliation or ring picks.
+        let topology = Topology::new(
+            std::iter::empty(),
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        );
+        let (_pub_handle, reader) = topology_channel(topology);
+        MultiRaft::new(node_id, 0, storage, reader)
     }
 
     #[test]
@@ -1139,6 +1105,152 @@ mod tests {
             raft.state_machine().topic_count(),
             1,
             "duplicate must not create a second topic"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Reconciliation pairing: removals are paired with ring-aware additions
+    // so the group's failure budget doesn't shrink monotonically.
+    // ---------------------------------------------------------------------
+
+    /// Build a MultiRaft with a topology populated by `all_nodes`. The publisher
+    /// half is dropped; the reader's own Arc keeps the ArcSwap alive for the
+    /// test's lifetime. Use this whenever a test needs the reader's queries
+    /// (live_nodes / ring_replacements_for / shard_groups_for_node) to return
+    /// non-empty results.
+    fn new_store_with_topology(
+        node_id: NodeId,
+        storage: Box<dyn RaftStorage>,
+        all_nodes: &[NodeId],
+    ) -> MultiRaft {
+        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        let topology = Topology::new(
+            all_nodes.iter().cloned(),
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+        let (_pub_handle, reader) = topology_channel(topology);
+        MultiRaft::new(node_id, 0, storage, reader)
+    }
+
+    /// Drive `TEST_GROUP_ID` to elect this node as leader by simulating
+    /// vote-granted RequestVoteResponses from a majority of `peers`. Mirrors
+    /// the pattern used in `raft/state.rs` tests: ElectionTimeout transitions
+    /// to Candidate, then enough RequestVoteResponses tip past quorum.
+    fn elect_leader_with_peers(store: &mut MultiRaft, peers: &[NodeId]) {
+        use crate::control_plane::consensus::messages::{RaftRpc, RequestVoteResponse};
+
+        elect_leader(store);
+
+        // Cluster size = peers.len() + 1 (self). Self has already voted for
+        // itself in become_candidate, so we need `cluster_size / 2` more votes
+        // to clear majority.
+        let cluster_size = peers.len() + 1;
+        let needed = cluster_size / 2;
+        let raft = store.groups.get_mut(&TEST_GROUP_ID).unwrap();
+        let term = raft.current_term();
+        for peer in peers.iter().take(needed) {
+            raft.step(
+                peer.clone(),
+                RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                    term,
+                    node_id: peer.clone(),
+                    vote_granted: true,
+                }),
+            );
+        }
+        store.dirty.insert(TEST_GROUP_ID);
+    }
+
+    /// All proposals committed so far on `TEST_GROUP_ID`, in log order.
+    /// Skips the bootstrap noop appended by `become_leader`.
+    fn proposals_after_become_leader(store: &MultiRaft) -> Vec<RaftCommand> {
+        let state = store.storage.load_state(TEST_GROUP_ID.0);
+        state
+            .log
+            .into_iter()
+            .skip(1) // index 1 is the become_leader noop
+            .map(|e| e.command)
+            .collect()
+    }
+
+    #[test]
+    fn handle_node_death_pairs_remove_with_ring_aware_add() {
+        // Cluster has 5 nodes on the ring; the test group has 3 of them.
+        // After the leader processes the death of one member, it must propose
+        // RemovePeer for the dead node AND AddPeer for a ring-picked replacement
+        // chosen from the 2 non-member nodes.
+        let (storage, _) = temp_storage();
+        let me = node("me");
+        let peers = vec![node("n2"), node("n3")];
+        let group_members = std::iter::once(me.clone())
+            .chain(peers.iter().cloned())
+            .collect::<Vec<_>>();
+        let all_nodes = vec![me.clone(), node("n2"), node("n3"), node("n4"), node("n5")];
+        let mut store = new_store_with_topology(me.clone(), storage, &all_nodes);
+
+        store.add_group(shard(TEST_GROUP_ID.0, group_members.clone()));
+        elect_leader_with_peers(&mut store, &peers);
+        store.flush();
+
+        store.handle_node_death(node("n2"));
+        store.flush();
+
+        let proposals = proposals_after_become_leader(&store);
+        assert_eq!(
+            proposals.len(),
+            2,
+            "death of a peer must propose exactly RemovePeer + paired AddPeer (got {:?})",
+            proposals
+        );
+        assert_eq!(proposals[0], RaftCommand::RemovePeer(node("n2")));
+
+        let add_target = match &proposals[1] {
+            RaftCommand::AddPeer(t) => t.clone(),
+            other => panic!("expected AddPeer paired with RemovePeer, got {:?}", other),
+        };
+        let current: HashSet<NodeId> = group_members.iter().cloned().collect();
+        assert!(
+            !current.contains(&add_target),
+            "AddPeer target {:?} must not be a current group member",
+            add_target
+        );
+        assert_ne!(
+            add_target,
+            node("n2"),
+            "AddPeer target must not be the just-removed peer"
+        );
+        assert!(
+            add_target == node("n4") || add_target == node("n5"),
+            "AddPeer target must be one of the ring's non-member nodes, got {:?}",
+            add_target
+        );
+    }
+
+    #[test]
+    fn handle_node_death_degrades_when_pool_exhausted() {
+        // Cluster is exactly [me, n2] — once n2 dies, no replacement is
+        // available. RemovePeer must still be proposed; AddPeer must not.
+        let (storage, _) = temp_storage();
+        let me = node("me");
+        let peers = vec![node("n2")];
+        let all_nodes = vec![me.clone(), node("n2")];
+        let mut store = new_store_with_topology(me.clone(), storage, &all_nodes);
+
+        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone(), node("n2")]));
+        elect_leader_with_peers(&mut store, &peers);
+        store.flush();
+
+        store.handle_node_death(node("n2"));
+        store.flush();
+
+        let proposals = proposals_after_become_leader(&store);
+        assert_eq!(
+            proposals,
+            vec![RaftCommand::RemovePeer(node("n2"))],
+            "exhausted pool must yield only the removal, no paired addition"
         );
     }
 }
