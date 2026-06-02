@@ -21,9 +21,7 @@ pub enum MultiRaftActorCommand {
         group_id: ShardGroupId,
         reply: oneshot::Sender<Option<NodeId>>,
     },
-    /// Query the current Raft peer set of a shard group on this node. Used
-    /// by integration tests to verify reconciliation-driven membership
-    /// changes (RemovePeer + AddPeer) have taken effect.
+
     GetPeers {
         group_id: ShardGroupId,
         reply: oneshot::Sender<Vec<NodeId>>,
