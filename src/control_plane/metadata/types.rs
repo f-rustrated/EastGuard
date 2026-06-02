@@ -34,11 +34,12 @@ pub enum SegmentState {
     Deleting,
 }
 
+pub(crate) type ReplicaSet = Vec<NodeId>;
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct SegmentMeta {
     pub segment_id: SegmentId,
     pub state: SegmentState,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: ReplicaSet,
     pub size_bytes: u64,
     pub start_offset: u64,
     pub end_offset: Option<u64>,
@@ -49,7 +50,7 @@ pub struct SegmentMeta {
 impl SegmentMeta {
     pub(crate) fn new(
         segment_id: SegmentId,
-        replica_set: Vec<NodeId>,
+        replica_set: ReplicaSet,
         start_offset: u64,
         created_at: u64,
     ) -> Self {
@@ -102,7 +103,7 @@ impl RangeMeta {
         range_id: RangeId,
         keyspace_start: Vec<u8>,
         keyspace_end: Vec<u8>,
-        replica_set: Vec<NodeId>,
+        replica_set: ReplicaSet,
         created_at: u64,
     ) -> Self {
         let segment_id = SegmentId(0);
@@ -252,7 +253,7 @@ impl RangeMeta {
         &mut self,
         other: &mut RangeMeta,
         merged_id: RangeId,
-        replica_set: Vec<NodeId>,
+        replica_set: ReplicaSet,
         requested_at: u64,
     ) -> Result<RangeMeta, MetadataError> {
         self.validate_mergeable(other)?;
@@ -286,7 +287,7 @@ impl RangeMeta {
         &self,
         other: &RangeMeta,
         merged_id: RangeId,
-        replica_set: Vec<NodeId>,
+        replica_set: ReplicaSet,
         requested_at: u64,
     ) -> RangeMeta {
         let (merged_start, merged_end) = self.merged_keyspace(other);
@@ -392,7 +393,7 @@ impl TopicMeta {
     pub(crate) fn new(
         name: String,
         id: TopicId,
-        replica_set: Vec<NodeId>,
+        replica_set: ReplicaSet,
         created_at: u64,
         storage_policy: StoragePolicy,
     ) -> Self {
@@ -448,24 +449,53 @@ impl TopicMeta {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
         if self.state != TopicState::Active {
             return Vec::new();
         }
         self.active_ranges
             .iter()
             .filter_map(|range_id| {
-                let range = self.ranges.get(range_id)?;
-                let seg_id = range.active_segment?;
-                let seg = range.segments.get(&seg_id)?;
+                let seg = self.get_active_segment(range_id)?;
                 seg.replica_set.contains(node_id).then(|| {
                     (
-                        SegmentKey::new(self.id, *range_id, seg_id),
+                        SegmentKey::new(self.id, *range_id, seg.segment_id),
                         seg.replica_set.clone(),
                     )
                 })
             })
             .collect()
+    }
+
+    /// Active segments whose `replica_set` contains at least one node not in
+    /// `live` state.
+    pub(crate) fn active_segments_with_dead_members(
+        &self,
+        live: &std::collections::HashSet<NodeId>,
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
+        if self.state != TopicState::Active {
+            return Vec::new();
+        }
+        self.active_ranges
+            .iter()
+            .filter_map(|range_id| {
+                let seg = self.get_active_segment(range_id)?;
+                let has_dead = seg.replica_set.iter().any(|n| !live.contains(n));
+                has_dead.then(|| {
+                    (
+                        SegmentKey::new(self.id, *range_id, seg.segment_id),
+                        seg.replica_set.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn get_active_segment(&self, range_id: &RangeId) -> Option<&SegmentMeta> {
+        let range = self.ranges.get(range_id)?;
+        let seg_id = range.active_segment?;
+        let seg = range.segments.get(&seg_id)?;
+        Some(seg)
     }
 
     pub(crate) fn stats(&self) -> TopicStats {

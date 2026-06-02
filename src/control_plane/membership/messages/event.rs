@@ -2,13 +2,11 @@ use std::net::SocketAddr;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{HandleNodeJoin, MultiRaftActorCommand};
-use crate::control_plane::membership::topology::Topology;
 use crate::impl_from_variant;
 
 #[derive(Debug)]
 pub struct NodeDead {
     pub dead_node_id: NodeId,
-    pub live_nodes: Vec<NodeId>,
 }
 
 #[allow(dead_code)]
@@ -36,42 +34,29 @@ impl MembershipEvent {
 }
 
 impl NodeDead {
-    pub fn new(dead_node_id: NodeId, live_nodes: Vec<NodeId>) -> Self {
-        Self {
-            dead_node_id,
-            live_nodes,
-        }
+    pub fn new(dead_node_id: NodeId) -> Self {
+        Self { dead_node_id }
     }
 }
 
 impl MembershipEvent {
-    pub(crate) fn into_raft_command(
-        self,
-        local_node_id: &NodeId,
-        topology: &Topology,
-    ) -> Option<MultiRaftActorCommand> {
+    /// Turn a membership event into the consensus-side notification command.
+    /// The command intentionally carries no topology snapshot — handlers load
+    /// fresh from the shared topology reader at processing time, so they see
+    /// the latest cluster shape even if topology drifted between this event's
+    /// emission and the handler running.
+    pub(crate) fn into_raft_command(self, local_node_id: &NodeId) -> Option<MultiRaftActorCommand> {
         if self.node_id() == local_node_id {
             return None;
         }
         match self {
             MembershipEvent::NodeDead(evt) => Some(evt.into()),
-            MembershipEvent::NodeAlive(evt) => {
-                let affected_groups: Vec<_> = topology
-                    .shard_groups_for_node(&evt.node_id)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                if affected_groups.is_empty() {
-                    return None;
+            MembershipEvent::NodeAlive(evt) => Some(
+                HandleNodeJoin {
+                    new_node_id: evt.node_id,
                 }
-                Some(
-                    HandleNodeJoin {
-                        new_node_id: evt.node_id,
-                        affected_groups,
-                    }
-                    .into(),
-                )
-            }
+                .into(),
+            ),
         }
     }
 }

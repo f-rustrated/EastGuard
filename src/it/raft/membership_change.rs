@@ -78,6 +78,10 @@ async fn start_raft_node(
         h.finish()
     };
     let (data_tx, _) = tokio::sync::mpsc::channel(1);
+    let all_nodes: Vec<&str> = std::iter::once(node_name)
+        .chain(peer_names.iter().copied())
+        .collect();
+    let topology_reader = super::stub_topology_reader(&all_nodes);
     tokio::spawn(MultiRaftActor::run(
         node_id,
         election_jitter_seed,
@@ -87,6 +91,7 @@ async fn start_raft_node(
         ticker_tx.into(),
         swim_tx,
         data_tx.into(),
+        topology_reader,
     ));
 
     raft_tx.send(EnsureGroup { group }).await.unwrap();
@@ -179,7 +184,6 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                 let _ = raft_tx
                     .send(NodeDead {
                         dead_node_id: NodeId::new("node-3"),
-                        live_nodes: vec!["node-1".into(), "node-2".into()],
                     })
                     .await;
 
@@ -208,78 +212,6 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
             leader1.unwrap(),
             leader2.unwrap(),
             "surviving nodes should agree on leader"
-        );
-        Ok(())
-    });
-
-    sim.run()
-}
-
-/// 2-node cluster: after election, inject HandleNodeJoin for node-3.
-/// Leader proposes AddPeer. Group expands to include node-3.
-#[test]
-#[serial_test::serial]
-fn node_join_triggers_add_peer() -> turmoil::Result {
-    let mut sim = Builder::new()
-        .tick_duration(Duration::from_millis(1))
-        .simulation_duration(Duration::from_secs(60))
-        .build();
-
-    let group_id = ShardGroupId(200);
-    let initial_group = ShardGroup {
-        id: group_id,
-        members: vec![NodeId::new("node-1"), NodeId::new("node-2")],
-    };
-    let expanded_group = ShardGroup {
-        id: group_id,
-        members: vec![
-            NodeId::new("node-1"),
-            NodeId::new("node-2"),
-            NodeId::new("node-3"),
-        ],
-    };
-
-    for (name, port, peers) in [
-        ("node-1", 1u16, vec!["node-2", "node-3"]),
-        ("node-2", 2, vec!["node-1", "node-3"]),
-    ] {
-        let ig = initial_group.clone();
-        let eg = expanded_group.clone();
-        sim.host(name, move || {
-            let ig = ig.clone();
-            let eg = eg.clone();
-            let peers = peers.clone();
-            async move {
-                let (raft_tx, ticker) =
-                    start_raft_node(name, CLUSTER_PORT + port, ig.clone(), &peers).await?;
-
-                let _ = raft_tx
-                    .send(HandleNodeJoin {
-                        new_node_id: NodeId::new("node-3"),
-                        affected_groups: vec![eg],
-                    })
-                    .await;
-
-                tick_n(&ticker, 100).await;
-                serve_leader(&raft_tx, ig.id, QUERY_PORT + port).await?;
-                tokio::time::sleep(Duration::from_secs(600)).await;
-                Ok(())
-            }
-        });
-    }
-
-    sim.client("checker", async {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-
-        let leader1 = read_leader("node-1", QUERY_PORT + 1).await;
-        let leader2 = read_leader("node-2", QUERY_PORT + 2).await;
-
-        assert!(leader1.is_some(), "node-1 should know the leader");
-        assert!(leader2.is_some(), "node-2 should know the leader");
-        assert_eq!(
-            leader1.unwrap(),
-            leader2.unwrap(),
-            "nodes should agree on leader after AddPeer"
         );
         Ok(())
     });

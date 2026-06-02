@@ -629,7 +629,7 @@ impl Swim {
                 // pending suspect timer so it doesn't fire and re-emit a stale Dead event.
                 self.cancel_suspect_timer(node_id);
                 self.pending_events
-                    .push(NodeDead::new(node_id.clone(), self.topology.live_nodes()).into());
+                    .push(NodeDead::new(node_id.clone()).into());
             }
             SwimNodeState::Suspect => {
                 let seq = self.next_seq();
@@ -1813,4 +1813,5 @@ mod tests {
             assert_eq!(entry.term, 7);
         }
     }
+
 }

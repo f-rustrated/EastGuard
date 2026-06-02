@@ -8,9 +8,10 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
-use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
+use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
-use crate::control_plane::metadata::{MetadataCommand, TopicStats};
+use crate::control_plane::metadata::{MetadataCommand, ReplicaSet, RollSegment, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -146,24 +147,134 @@ impl Raft {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
         self.state_machine.active_segments_for_node(node_id)
+    }
+
+    pub(crate) fn reconcile_peers(
+        &mut self,
+
+        topology_reader: &TopologyReader,
+        live: &HashSet<NodeId>,
+    ) -> bool {
+        let mut changed = false;
+        let mut peer_nodes: HashSet<NodeId> = self.peers_iter().cloned().collect();
+
+        let dead_count = peer_nodes.iter().filter(|p| !live.contains(*p)).count();
+
+        if dead_count == 0 {
+            return changed;
+        }
+
+        peer_nodes.insert(self.node_id.clone());
+        let replacements =
+            topology_reader.ring_replacements_for(self.shard_group_id, &peer_nodes, dead_count);
+
+        for (i, node_id) in peer_nodes
+            .into_iter()
+            .filter(|p| !live.contains(p))
+            .enumerate()
+        {
+            // get(i) index-pairs the i-th dead peer with the i-th replacement, and gracefully yields None when the replacement pool is shorter than the dead set
+            // which is the case the degrade-and-proceed policy exists to handle.
+            let replacement = replacements.get(i).cloned();
+            changed |= self.propose_replace_peer(node_id.clone(), replacement);
+        }
+
+        changed
+    }
+
+    /// scan active segments in this group for any whose replica set still names a
+    /// node SWIM considers dead, and propose a `RollSegment` to swap in
+    /// healthy replacements. Closes the gap where deaths landed during the
+    /// no-leader window — the live-leader path (`handle_node_death`) catches
+    /// those per-event, this is the backfill sweep on takeover.
+    pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
+        let mut changed = false;
+
+        let live_nodes: Vec<NodeId> = live_set.clone().into_iter().collect();
+
+        for (segment_key, old_replica_set) in self.active_segments_with_dead_members(live_set) {
+            let dead_in_set: Vec<NodeId> = old_replica_set
+                .iter()
+                .filter(|n| !live_set.contains(*n))
+                .cloned()
+                .collect();
+            let new_replica_set =
+                compute_replacement_replica_set(&old_replica_set, &dead_in_set, &live_nodes);
+            // end_entry_id = None: takeover doesn't know the committed offset.
+            // The sealed segment's end_offset is corrected later (D5 repair or
+            // by the segment leader's subsequent SealRequest carrying it).
+            let cmd = RollSegment {
+                segment_key,
+                sealed_at: now_ms(),
+                new_replica_set,
+                end_entry_id: None,
+            };
+            if let Err(e) = self.propose(cmd.into()) {
+                tracing::warn!(
+                    "Takeover-triggered RollSegment for {:?} on {:?} failed: {:?}",
+                    segment_key,
+                    self.shard_group_id,
+                    e
+                );
+            } else {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn handle_node_death(
+        &mut self,
+        dead_node_id: &NodeId,
+        live_set: &HashSet<NodeId>,
+        topology_reader: &TopologyReader,
+    ) -> bool {
+        if !self.is_leader() {
+            return false;
+        }
+
+        let mut changed = false;
+        if self.has_peer(dead_node_id) {
+            // Pair the removal with a ring-aware addition so failure
+            // tolerance doesn't shrink monotonically.
+            let mut excluded: HashSet<NodeId> = self.peers_iter().cloned().collect();
+            excluded.insert(self.node_id.clone());
+
+            // Compute the replacement BEFORE proposing the swap — the dying node is
+            // still in `raft.peers`, so it's naturally excluded by
+            // including the current peer set in the exclusion.
+            let replacement = topology_reader
+                .ring_replacements_for(self.shard_group_id, &excluded, 1)
+                .into_iter()
+                .next();
+
+            changed |= self.propose_replace_peer(dead_node_id.clone(), replacement);
+        }
+
+        changed || self.reconcile_segments(&live_set)
+    }
+
+    pub(crate) fn dead_nodes(&mut self, live: &HashSet<NodeId>) -> impl Iterator<Item = &NodeId> {
+        self.peers_iter().filter(|p| !live.contains(*p))
+    }
+
+    pub(crate) fn active_segments_with_dead_members(
+        &self,
+        live: &HashSet<NodeId>,
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
+        self.state_machine.active_segments_with_dead_members(live)
     }
 
     pub(crate) fn has_topic(&self, topic_id: &crate::control_plane::metadata::TopicId) -> bool {
         self.state_machine.get_topic(topic_id).is_some()
     }
 
-    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<Vec<NodeId>> {
+    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
         let topic = self.state_machine.get_topic(&key.topic_id)?;
-        let range = topic.ranges.get(&key.range_id)?;
-        let seg = range.segments.get(&key.segment_id)?;
+        let seg = topic.get_active_segment(&key.range_id)?;
         Some(seg.replica_set.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
-        &self.state_machine
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
@@ -181,10 +292,6 @@ impl Raft {
     pub(crate) fn last_applied_index(&self) -> u64 {
         self.last_applied_index
     }
-
-    // -------------------------------------------------------------------
-    // In-memory log helpers (1-based indexing; index 0 means "before log")
-    // -------------------------------------------------------------------
 
     pub(crate) fn log_last_index(&self) -> u64 {
         self.log.last().map_or(0, |e| e.index)
@@ -801,6 +908,47 @@ impl Raft {
         Ok(index)
     }
 
+    /// Replace a peer at the *intent* level: propose `RemovePeer(remove)`
+    /// then a paired `AddPeer(replacement)`, or degrade-and-proceed when no
+    /// replacement is available. The two stay as separate log entries —
+    /// Raft's single-server-change rule means we cannot atomically swap two
+    /// members in one entry without joint consensus, so committing them in
+    /// order (each step a one-server change) is what keeps old-config and
+    /// new-config majorities overlapping.
+    pub(crate) fn propose_replace_peer(
+        &mut self,
+        remove: NodeId,
+        replacement: Option<NodeId>,
+    ) -> bool {
+        if let Err(e) = self.propose(RaftCommand::RemovePeer(remove.clone())) {
+            tracing::debug!(
+                "RemovePeer({:?}) on {:?} rejected: {:?} — skipping paired AddPeer",
+                remove,
+                self.shard_group_id,
+                e
+            );
+            return false;
+        }
+
+        let Some(replacement) = replacement else {
+            tracing::debug!(
+                "Replace on {:?}: no ring-eligible replacement (cluster too small for RF) — group operating below replication factor until capacity is added",
+                self.shard_group_id
+            );
+            return true;
+        };
+        if let Err(e) = self.propose(RaftCommand::AddPeer(replacement.clone())) {
+            tracing::warn!(
+                "Paired AddPeer({:?}) on {:?} rejected: {:?}",
+                replacement,
+                self.shard_group_id,
+                e
+            );
+        }
+
+        true
+    }
+
     fn reset_election_timer(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
@@ -856,16 +1004,6 @@ impl Raft {
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.merge_check,
             }));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_term(&self) -> u64 {
-        self.current_term
-    }
-
-    #[cfg(test)]
-    pub(crate) fn voted_for(&self) -> Option<NodeId> {
-        self.voted_for.clone()
     }
 }
 
@@ -970,6 +1108,23 @@ mod tests {
         pub(crate) fn simulate_flush(&mut self) {
             self.advance_stabled_index(self.log_last_index());
             self.apply_committed_entries();
+        }
+
+        pub(crate) fn current_term(&self) -> u64 {
+            self.current_term
+        }
+
+        pub(crate) fn voted_for(&self) -> Option<NodeId> {
+            self.voted_for.clone()
+        }
+
+        pub(crate) fn simulate_flush_and_apply(&mut self) {
+            self.advance_stabled_index(self.log_last_index());
+            self.apply_committed_entries();
+        }
+
+        pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
+            &self.state_machine
         }
     }
     fn node(id: &str) -> NodeId {
@@ -2216,6 +2371,219 @@ mod tests {
         assert!(
             merge_check_set,
             "merge_check timer must be scheduled on become_leader"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Reconciliation: peer pairing + segment catch-up
+    //
+    // These tests were originally in `multi_raft.rs` but moved here when
+    // `reconcile_peers` and `reconcile_segments` became methods on `Raft`.
+    // They construct a `Raft` directly, drive it into Leader role, and
+    // verify the proposals appear in the log.
+    // -------------------------------------------------------------------
+
+    use crate::control_plane::membership::{
+        Topology, TopologyConfig, TopologyReader, topology_channel,
+    };
+
+    /// Build a `TopologyReader` seeded with `nodes` as live members. The
+    /// publisher half is dropped on return — the reader's own Arc keeps the
+    /// underlying ArcSwap alive for the test's lifetime.
+    fn topology_reader_with(nodes: &[&str]) -> TopologyReader {
+        let topology = Topology::new(
+            nodes.iter().map(|n| NodeId::new(*n)),
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+        let (_pub_handle, reader) = topology_channel(topology);
+        reader
+    }
+
+    fn live_set(nodes: &[&str]) -> HashSet<NodeId> {
+        nodes.iter().map(|n| NodeId::new(*n)).collect()
+    }
+
+    /// Three-node Raft as `id`, then drive it to Leader by simulating one
+    /// vote-granted RequestVoteResponse from a peer (majority of 3 = 2 votes
+    /// including self).
+    fn three_node_raft_as_leader(id: &str) -> Raft {
+        let mut raft = three_node_raft(id);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        let peer = raft
+            .peers_iter()
+            .next()
+            .expect("three_node_raft must have peers")
+            .clone();
+        let term = raft.current_term;
+        raft.step(
+            peer.clone(),
+            RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                term,
+                node_id: peer,
+                vote_granted: true,
+            }),
+        );
+        drain(&mut raft);
+        assert_eq!(raft.role, Role::Leader, "must be leader after election");
+        raft
+    }
+
+    /// Single-node Raft, immediately leader after ElectionTimeout (no peers
+    /// to wait for, quorum=1). Used by segment tests so CreateTopic commits
+    /// without needing follower RPCs.
+    fn single_node_raft_as_leader() -> Raft {
+        let mut raft = single_node_raft();
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        drain(&mut raft);
+        assert_eq!(raft.role, Role::Leader);
+        raft
+    }
+
+    /// Proposals in the log after the become_leader noop (index 1).
+    fn proposals_after_become_leader(raft: &Raft) -> Vec<RaftCommand> {
+        (2..=raft.log_last_index())
+            .filter_map(|i| raft.log_get(i).map(|e| e.command.clone()))
+            .collect()
+    }
+
+    fn create_topic_in_raft(raft: &mut Raft, name: &str, replica_set: Vec<NodeId>) {
+        use crate::control_plane::metadata::command::CreateTopic;
+        use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+        let rf = replica_set.len();
+        let cmd: RaftCommand = MetadataCommand::CreateTopic(CreateTopic {
+            name: name.to_string(),
+            storage_policy: StoragePolicy {
+                retention_ms: 3_600_000,
+                replication_factor: rf as u64,
+                partition_strategy: PartitionStrategy::AutoSplit,
+            },
+            replica_set,
+            created_at: 1000,
+        })
+        .into();
+        raft.propose(cmd).expect("CreateTopic propose failed");
+        // Drive apply so the state machine sees the committed entry.
+        raft.simulate_flush_and_apply();
+    }
+
+    #[test]
+    fn reconcile_peers_pairs_each_dead_with_replacement() {
+        // 3-node raft as node-1 (peers = [node-2, node-3]). Topology has
+        // [node-1, node-3, node-4] — so node-2 is dead per SWIM, and node-4
+        // is the ring-eligible replacement. Reconciliation must propose
+        // RemovePeer(node-2) + AddPeer(node-4).
+        let mut raft = three_node_raft_as_leader("node-1");
+        let topology = topology_reader_with(&["node-1", "node-3", "node-4"]);
+        let live = live_set(&["node-1", "node-3", "node-4"]);
+
+        raft.reconcile_peers(&topology, &live);
+
+        let proposals = proposals_after_become_leader(&raft);
+        assert_eq!(
+            proposals.len(),
+            2,
+            "reconciliation must propose RemovePeer + AddPeer (got {:?})",
+            proposals
+        );
+        assert_eq!(proposals[0], RaftCommand::RemovePeer(node("node-2")));
+        assert_eq!(
+            proposals[1],
+            RaftCommand::AddPeer(node("node-4")),
+            "node-4 is the only ring-eligible node not already in the group"
+        );
+    }
+
+    #[test]
+    fn reconcile_peers_degrades_when_pool_exhausted() {
+        // 3-node raft as node-1 (peers = [node-2, node-3]). Topology has only
+        // [node-1, node-3] — node-2 is dead AND no replacement is available.
+        // RemovePeer must still fire; AddPeer must not.
+        let mut raft = three_node_raft_as_leader("node-1");
+        let topology = topology_reader_with(&["node-1", "node-3"]);
+        let live = live_set(&["node-1", "node-3"]);
+
+        raft.reconcile_peers(&topology, &live);
+
+        let proposals = proposals_after_become_leader(&raft);
+        assert_eq!(
+            proposals,
+            vec![RaftCommand::RemovePeer(node("node-2"))],
+            "exhausted pool must yield only the removal, no paired addition"
+        );
+    }
+
+    #[test]
+    fn reconcile_segments_rolls_segments_with_dead_replicas() {
+        // Single-node Raft so CreateTopic commits trivially (quorum=1),
+        // letting us seed an active segment. The segment's replica_set
+        // [x,y,z] is independent of the Raft peer set — none of x/y/z appear
+        // in the live set, so they're all "dead" per SWIM. Takeover-time
+        // segment catch-up must propose a RollSegment for that segment.
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(
+            &mut raft,
+            "test-topic",
+            vec![node("x"), node("y"), node("z")],
+        );
+        let before = proposals_after_become_leader(&raft).len();
+
+        let live = live_set(&["node-1"]);
+        raft.reconcile_segments(&live);
+
+        let after = proposals_after_become_leader(&raft);
+        assert_eq!(
+            after.len() - before,
+            1,
+            "reconcile_segments must propose exactly one RollSegment (got tail: {:?})",
+            &after[before..]
+        );
+        match &after[before] {
+            RaftCommand::Metadata(MetadataCommand::RollSegment(roll)) => {
+                for member in &roll.new_replica_set {
+                    assert!(
+                        live.contains(member),
+                        "new replica_set must contain only live nodes, found {:?}",
+                        member
+                    );
+                }
+                assert_eq!(
+                    roll.end_entry_id, None,
+                    "takeover-triggered rolls don't know the committed offset"
+                );
+            }
+            other => panic!("expected Metadata(RollSegment), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reconcile_segments_noop_when_all_replicas_live() {
+        // Same setup, but the live set now includes x/y/z — no dead
+        // replicas, so reconcile_segments must not propose anything.
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(
+            &mut raft,
+            "test-topic",
+            vec![node("x"), node("y"), node("z")],
+        );
+        let before = proposals_after_become_leader(&raft).len();
+
+        let live = live_set(&["node-1", "x", "y", "z"]);
+        raft.reconcile_segments(&live);
+
+        let after = proposals_after_become_leader(&raft);
+        assert_eq!(
+            after.len(),
+            before,
+            "reconcile_segments must be a no-op when all replicas are live (got tail: {:?})",
+            &after[before..]
         );
     }
 }

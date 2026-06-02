@@ -9,6 +9,7 @@ use crate::test_traits::TAssertInvariant;
 
 use MetadataError::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct MetadataStateMachine {
@@ -48,10 +49,22 @@ impl MetadataStateMachine {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
         self.topics
             .values()
             .flat_map(|t| t.active_segments_for_node(node_id))
+            .collect()
+    }
+
+    /// Active segments across all topics whose `replica_set` contains at
+    /// least one non-live member.
+    pub(crate) fn active_segments_with_dead_members(
+        &self,
+        live: &HashSet<NodeId>,
+    ) -> Vec<(SegmentKey, ReplicaSet)> {
+        self.topics
+            .values()
+            .flat_map(|t| t.active_segments_with_dead_members(live))
             .collect()
     }
 

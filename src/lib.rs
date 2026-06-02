@@ -28,6 +28,7 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneActor;
 use crate::data_plane::checkpoint::CheckpointWorker;
 
+use crate::control_plane::membership::topology_channel;
 use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
@@ -76,6 +77,10 @@ impl StartUp {
         let state = self.env.swim(self.rng_seed);
         let node_id = state.node_id.clone();
 
+        // Topology snapshot channel: SwimActor publishes, all other actors read.
+        // Single-writer / many-readers via ArcSwap — no locks, no contention.
+        let (topology_pub, topology_reader) = topology_channel(state.topology.clone());
+
         // Transports
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
@@ -97,6 +102,7 @@ impl StartUp {
             state,
             tx_outbound,
             raft_tx.clone().into(),
+            topology_pub,
         );
 
         // Data plane (spawns its own three schedulers + crossbeam bridge internally)
@@ -132,6 +138,7 @@ impl StartUp {
             raft_transport_tx,
             swim_sender.clone(),
             data_transport_tx,
+            topology_reader,
         );
 
         // Client handler
