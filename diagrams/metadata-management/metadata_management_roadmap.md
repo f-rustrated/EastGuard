@@ -154,7 +154,13 @@ Durable log persistence is implemented (shared key-value store with composite ke
 
 ### Membership rebalancing — the missing addition half
 
-Pair every reconciliation removal with an addition of a replacement node. Without this, groups shrink monotonically as members die. Selection picks a healthy node not currently in the group, preferring nodes with available capacity. Coordinates with segment-level data movement (data plane concern). See `mental-model.md` for the full argument.
+Pair every removal with an addition of a replacement, so failure tolerance does not shrink monotonically. The same pattern applies at two layers, both unfinished in different ways:
+
+**Raft-group peers.** Reconciliation currently proposes only removals — both on leader takeover (against SWIM's live set) and on live-leader node death. Each unpaired removal consumes one slot of failure budget; the group walks toward fragility. The missing piece selects a replacement node not already in the group (preferring available capacity) and proposes its addition alongside the removal. See `mental-model.md` for the full argument and the failure scenarios that motivate it.
+
+**Data-plane segment replica sets.** A node's death also touches every active segment that listed it as a replica. The live-leader path already proposes segment rolls that swap the dead node for a healthy replacement, preserving the replication factor. The takeover path does not: deaths that fell into the no-leader gap leave their segments under-replicated until the next ordinary roll — or indefinitely, for segments that take no further writes. The missing piece is the takeover-time counterpart of the live-leader behavior: on becoming leader, find active segments whose replica set still names a node SWIM considers dead and propose rolls that replace it. Sealed-segment repair (restoring redundancy on already-immutable data) is a related but distinct concern at the data-plane layer — see `diagrams/data-plane/d2_segment_replication.md` §F3.
+
+The two layers should share one replacement-selection policy. Otherwise the same node death produces different replacements for a topic's Raft group and for that topic's segments, with no design reason — just two independent placement heuristics drifting apart.
 
 ---
 
@@ -191,5 +197,5 @@ Pair every reconciliation removal with an addition of a replacement node. Withou
 | Seal tracker grows unbounded on long-lived ranges | Sliding window keeps it bounded; cleaned up on range seal or delete. |
 | Two leaders coexisting briefly with divergent peer sets | Membership goes through the Raft log — quorum size advances deterministically with the log index. Split-brain commit is structurally impossible. See Phase 3d. |
 | New leader inherits dead peers because the predecessor died before converting the event | Reference-back step on becoming leader (Phase 3d; detailed in `mental-model.md`). |
-| Reconciliation shrinks the group's failure budget | Pair every removal with an addition. The addition-selection half is not yet built. |
+| Reconciliation shrinks the group's failure budget | Pair every removal with an addition — at both the Raft-peer and segment-replica-set layers. Not yet built. |
 | Quorum loss before a leader can act on it | Not recoverable from inside Raft. Requires external intervention (manual reconfiguration or a future external recovery protocol). |
