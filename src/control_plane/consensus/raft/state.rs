@@ -11,7 +11,9 @@ use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
-use crate::control_plane::metadata::{MetadataCommand, ReplicaSet, RollSegment, TopicStats};
+use crate::control_plane::metadata::{
+    MetadataCommand, ReplicaSet, RollSegment, TopicMeta, TopicStats,
+};
 use crate::data_plane::SegmentKey;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -142,6 +144,10 @@ impl Raft {
 
     pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
         self.state_machine.topic_stats()
+    }
+
+    pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
+        self.state_machine.get_topic_by_name(name)
     }
 
     pub(crate) fn active_segments_for_node(

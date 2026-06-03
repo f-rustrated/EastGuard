@@ -18,6 +18,7 @@ pub(crate) mod macros;
 #[cfg(any(test, debug_assertions))]
 mod test_traits;
 
+use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 
@@ -131,7 +132,7 @@ impl StartUp {
         MultiRaftActor::spawn(
             raft_tx.clone(),
             raft_mailbox,
-            node_id,
+            node_id.clone(),
             self.env.election_jitter_seed(self.rng_seed),
             Box::new(MetadataStorage::open(self.env.raft_db_path())),
             self.env.vnodes_per_node as usize,
@@ -142,11 +143,18 @@ impl StartUp {
         );
 
         // Client handler
-        let _ = self.receive_client_streams(swim_sender, raft_tx).await;
+        let _ = self
+            .receive_client_streams(node_id, swim_sender, raft_tx)
+            .await;
         Ok(())
     }
 
-    async fn receive_client_streams(self, swim_sender: SwimSender, raft_tx: MutlRaftSender) {
+    async fn receive_client_streams(
+        self,
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_tx: MutlRaftSender,
+    ) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -156,11 +164,12 @@ impl StartUp {
         );
 
         while let Ok((stream, _)) = listener.accept().await {
+            let node_id = node_id.clone();
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
 
             tokio::spawn(async move {
-                if let Err(err) = handle_client_stream(stream, swim_tx, raft).await {
+                if let Err(err) = handle_client_stream(stream, node_id, swim_tx, raft).await {
                     tracing::error!("{}", err);
                 }
             });
@@ -170,12 +179,13 @@ impl StartUp {
 
 async fn handle_client_stream(
     stream: TcpStream,
+    node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);
-    let handler = ClientHandler::new(swim_sender, raft_sender);
+    let handler = ClientHandler::new(node_id, swim_sender, raft_sender);
     tokio::spawn(run_client_writer(write_half, writer_rx));
     handler
         .run(ClientStreamReader::new(read_half), writer_tx)

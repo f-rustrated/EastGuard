@@ -26,6 +26,10 @@ pub(crate) struct SegmentTracker {
     shard_group_id: ShardGroupId,
     committed_entry_id: u64,
     next_entry_id: u64,
+    /// The entry id this segment was created with. Stable for the segment's
+    /// lifetime; used by the data-plane (range, offset) → segment resolver to
+    /// pin BTreeMap keys to a per-segment identity that survives writes.
+    start_entry_id: u64,
     staged_entries: Vec<StagedEntry>,
     created_at: std::time::Instant,
 }
@@ -47,6 +51,7 @@ impl SegmentTracker {
             shard_group_id,
             committed_entry_id: 0,
             next_entry_id: 0,
+            start_entry_id: 0,
             staged_entries: Vec::new(),
             created_at: std::time::Instant::now(),
         }
@@ -61,7 +66,17 @@ impl SegmentTracker {
     ) -> Self {
         let mut tracker = Self::new(path, role, replica_set, shard_group_id);
         tracker.next_entry_id = start_entry_id;
+        tracker.start_entry_id = start_entry_id;
         tracker
+    }
+
+    pub(crate) fn start_entry_id(&self) -> u64 {
+        self.start_entry_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn segment_file_path(&self) -> &PathBuf {
+        &self.segment_file_path
     }
     pub(crate) fn replica_set(&self) -> Vec<NodeId> {
         self.replica_set.clone()

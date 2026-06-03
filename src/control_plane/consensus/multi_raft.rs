@@ -12,9 +12,9 @@ use crate::control_plane::consensus::messages::{
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::metadata::TopicId;
 use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::types::TopicStats;
+use crate::control_plane::metadata::{TopicId, TopicMeta};
 
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
@@ -186,6 +186,11 @@ impl MultiRaft {
                 self.deferred
                     .push(DeferredReply::GetTopicStats(reply, stats));
             }
+            MultiRaftActorCommand::GetTopicMetadata { topic_name, reply } => {
+                let meta = self.get_topic_metadata(&topic_name);
+                self.deferred
+                    .push(DeferredReply::GetTopicMetadata(reply, meta));
+            }
             MultiRaftActorCommand::Coordinator(req) => {
                 self.handle_seal_request(req);
             }
@@ -208,6 +213,9 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopicStats(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetTopicMetadata(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -346,6 +354,12 @@ impl MultiRaft {
             .values()
             .flat_map(|raft| raft.topic_stats())
             .collect()
+    }
+
+    fn get_topic_metadata(&self, name: &str) -> Option<TopicMeta> {
+        self.groups
+            .values()
+            .find_map(|raft| raft.get_topic_by_name(name).cloned())
     }
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)

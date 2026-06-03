@@ -4,6 +4,7 @@ use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
+use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
@@ -29,13 +30,16 @@ pub struct DataPlane<W: WalStorage> {
     node_id: NodeId,
     config: DataNodeConfig,
     wal: W,
-    segments: HashMap<SegmentKey, SegmentTracker>,
+    /// All locally-resident segments + the secondary indexes the consume
+    /// read path needs. See `states::segment_store::SegmentStore`.
+    segments: SegmentStore,
     dirty_segments: Vec<SegmentKey>,
     buffer_byte_count: usize,
     needs_flush: bool,
 
     replication: ReplicationState,
     pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+
     out: DataPlaneOutputs,
 }
 
@@ -51,7 +55,7 @@ impl<W: WalStorage> DataPlane<W> {
             node_id,
             config,
             wal,
-            segments: HashMap::new(),
+            segments: SegmentStore::new(),
             dirty_segments: Vec::new(),
             buffer_byte_count: 0,
             needs_flush: false,
@@ -188,7 +192,6 @@ impl<W: WalStorage> DataPlane<W> {
         if self.segments.contains_key(&cmd.segment_key) {
             return;
         }
-
         let tracker = SegmentTracker::new_with_start_entry_id(
             cmd.segment_key.file_path(&self.config.data_dir),
             SegmentRole::Leader,
@@ -196,8 +199,7 @@ impl<W: WalStorage> DataPlane<W> {
             cmd.shard_group_id,
             cmd.start_entry_id,
         );
-
-        self.segments.insert(cmd.segment_key, tracker);
+        self.segments.insert_active(cmd.segment_key, tracker);
     }
 
     fn process_replica_append(&mut self, cmd: ReplicaAppend) {
@@ -214,7 +216,7 @@ impl<W: WalStorage> DataPlane<W> {
                 return;
             }
 
-            self.segments.insert(
+            self.segments.insert_active(
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
                     cmd.segment_key.file_path(&self.config.data_dir),
@@ -260,12 +262,15 @@ impl<W: WalStorage> DataPlane<W> {
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
 
         let shard_group_id = old_tracker.shard_group_id();
+        let old_start = old_tracker.start_entry_id();
+        let old_end = old_tracker.committed_entry_id();
+        let new_start_entry_id = old_end + 1;
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
             new_segment_key.file_path(&self.config.data_dir),
             SegmentRole::Leader,
             cmd.new_replica_set,
             shard_group_id,
-            old_tracker.committed_entry_id() + 1,
+            new_start_entry_id,
         );
 
         // Replay uncommitted records into the new tracker's staged_records.
@@ -293,13 +298,22 @@ impl<W: WalStorage> DataPlane<W> {
                 ));
         }
 
-        self.segments.insert(new_segment_key, new_tracker);
+        self.segments.insert_active(new_segment_key, new_tracker);
+        // The leader's old tracker stays in self.segments (no remove here —
+        // that happens via the follower-side SegmentSealed path). But the
+        // resolver index now points at the new active segment for the range;
+        // the old one moves to sealed so cold reads still find it.
+        self.segments
+            .move_active_to_sealed(cmd.old_segment_key, old_start, old_end);
         self.dirty_segments.push(new_segment_key);
         self.needs_flush = true;
     }
 
     fn handle_segment_sealed(&mut self, segment_key: SegmentKey) {
-        if let Some(tracker) = self.segments.remove(&segment_key) {
+        // On followers this is where the seal is first observed; the store
+        // captures end_entry_id from the tracker's own committed boundary.
+        // a duplicate migrate would be harmless (the sealed entry is immutable by construction).
+        if let Some(tracker) = self.segments.take_active_and_seal(segment_key) {
             self.out.store_checkpoint(tracker.checkpoint(segment_key));
         }
     }
@@ -573,6 +587,8 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
             "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count})",
             self.buffer_byte_count
         );
+
+        self.segments.assert_invariants();
     }
 }
 
@@ -1306,5 +1322,72 @@ mod tests {
         dp.enqueue_seal_request(test_key());
 
         assert!(dp.out.transport_cmds.is_empty());
+    }
+
+    // ── D4 integration tests ──────────────────────────────────────────
+    //
+    // These exercise the resolver end-to-end via `DataPlane` commands —
+    // SegmentAssignment routes through `handle_segment_assignment`, seal
+    // routes through `handle_seal_response`, etc. The unit-level tests for
+    // the index itself live in `states/segment_store.rs`.
+
+    use crate::data_plane::states::segment_store::SegmentReadState;
+
+    #[test]
+    fn segment_assignment_indexes_for_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        let resolved = dp
+            .segments
+            .resolve(TopicId(1), RangeId(0), 0)
+            .expect("active segment should resolve");
+        assert!(matches!(resolved, SegmentReadState::Active(k) if k == test_key()));
+    }
+
+    /// Verifies the leader-side seal path: after `SealResponse`, the old
+    /// segment migrates to the sealed table with `end_entry_id` set from
+    /// the tracker's `committed_entry_id`, and the new segment becomes the
+    /// active index entry for the range.
+    #[test]
+    fn seal_response_routes_old_offsets_through_sealed_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        // Single-replica produce auto-commits on flush, so entry 0 is
+        // committed at the time we issue the seal. After seal: end=0 on the
+        // sealed entry, new segment starts at offset 1.
+        dp.handle_command(assign_segment(test_key(), vec![]));
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+        );
+
+        dp.handle_command(DataPlaneCommand::InterNode(
+            SealResponse {
+                old_segment_key: test_key(),
+                new_segment_id: SegmentId(1),
+                new_replica_set: vec![],
+            }
+            .into(),
+        ));
+
+        let s0 = test_key();
+        let s1 = s0.with_segment_id(SegmentId(1));
+
+        let lookup = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        match lookup {
+            SegmentReadState::Sealed { key, end_entry_id } => {
+                assert_eq!(key, s0);
+                assert_eq!(end_entry_id, 0);
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+
+        let active = dp.segments.resolve(TopicId(1), RangeId(0), 1).unwrap();
+        assert!(matches!(active, SegmentReadState::Active(k) if k == s1));
     }
 }

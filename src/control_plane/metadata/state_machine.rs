@@ -686,7 +686,7 @@ mod tests {
         for range in topic.ranges.values() {
             assert_eq!(range.state, RangeState::Deleting);
             for seg in range.segments.values() {
-                assert_eq!(seg.state, SegmentState::Deleting);
+                assert_eq!(seg.state, SegmentMetaState::Deleting);
             }
         }
     }

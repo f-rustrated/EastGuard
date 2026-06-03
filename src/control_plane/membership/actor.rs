@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -189,6 +191,18 @@ impl SwimSender {
         Ok(recv.await?)
     }
 
+    pub(crate) async fn resolve_any(
+        &self,
+        members: &[NodeId],
+    ) -> anyhow::Result<Option<(NodeId, NodeAddress)>> {
+        for member in members {
+            if let Some(addr) = self.resolve_address(member.clone()).await? {
+                return Ok(Some((member.clone(), addr)));
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) async fn resolve_shard_leader(
         &self,
         shard_group_id: ShardGroupId,
@@ -200,6 +214,17 @@ impl SwimSender {
         })
         .await?;
         Ok(recv.await?)
+    }
+
+    pub(crate) async fn list_all_node_addresses(
+        &self,
+    ) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
+        Ok(self
+            .get_members()
+            .await?
+            .into_iter()
+            .map(|m| (m.node_id, m.addr.client_addr))
+            .collect())
     }
 }
 

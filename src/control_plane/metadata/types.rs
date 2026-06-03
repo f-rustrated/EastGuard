@@ -27,7 +27,7 @@ pub enum RangeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub enum SegmentState {
+pub enum SegmentMetaState {
     Active,
     Sealed,
     Reassigning { from: NodeId, to: NodeId },
@@ -38,7 +38,7 @@ pub(crate) type ReplicaSet = Vec<NodeId>;
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct SegmentMeta {
     pub segment_id: SegmentId,
-    pub state: SegmentState,
+    pub state: SegmentMetaState,
     pub replica_set: ReplicaSet,
     pub size_bytes: u64,
     pub start_offset: u64,
@@ -56,7 +56,7 @@ impl SegmentMeta {
     ) -> Self {
         SegmentMeta {
             segment_id,
-            state: SegmentState::Active,
+            state: SegmentMetaState::Active,
             replica_set,
             size_bytes: 0,
             start_offset,
@@ -70,11 +70,11 @@ impl SegmentMeta {
         end_offset: Option<u64>,
         sealed_at: u64,
     ) -> Result<(), MetadataError> {
-        if self.state != SegmentState::Active {
+        if self.state != SegmentMetaState::Active {
             return Err(MetadataError::SegmentNotActive);
         }
 
-        self.state = SegmentState::Sealed;
+        self.state = SegmentMetaState::Sealed;
         self.end_offset = end_offset;
         self.sealed_at = Some(sealed_at);
 
@@ -192,7 +192,7 @@ impl RangeMeta {
         let Some(seg) = self.segments.get_mut(&segment_id) else {
             return;
         };
-        if seg.state != SegmentState::Sealed || seg.end_offset.is_some() {
+        if seg.state != SegmentMetaState::Sealed || seg.end_offset.is_some() {
             return;
         }
         seg.end_offset = Some(end_entry_id);
@@ -317,7 +317,7 @@ impl RangeMeta {
     fn validate_sealable(&self) -> Result<(), MetadataError> {
         if let Some(seg_id) = self.active_segment
             && let Some(seg) = self.segments.get(&seg_id)
-            && seg.state != SegmentState::Active
+            && seg.state != SegmentMetaState::Active
         {
             return Err(MetadataError::SegmentNotActive);
         }
@@ -343,7 +343,7 @@ impl RangeMeta {
         self.state = RangeState::Deleting;
         self.active_segment = None;
         for segment in self.segments.values_mut() {
-            segment.state = SegmentState::Deleting;
+            segment.state = SegmentMetaState::Deleting;
         }
     }
 
@@ -733,7 +733,7 @@ pub mod props {
                 for seg in range.segments.values() {
                     assert_eq!(
                         seg.state,
-                        SegmentState::Deleting,
+                        SegmentMetaState::Deleting,
                         "Deleted topic {:?} has segment {:?} in state {:?}",
                         self.id,
                         seg.segment_id,
@@ -817,7 +817,7 @@ pub mod props {
             let active_count = self
                 .segments
                 .values()
-                .filter(|s| s.state == SegmentState::Active)
+                .filter(|s| s.state == SegmentMetaState::Active)
                 .count();
             let expected = match self.state {
                 RangeState::Active => 1,
@@ -868,7 +868,7 @@ pub mod props {
 
         fn assert_sealed_segments(&self) {
             for seg in self.segments.values() {
-                if seg.state == SegmentState::Sealed {
+                if seg.state == SegmentMetaState::Sealed {
                     assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
                 }
             }
@@ -894,7 +894,7 @@ pub mod props {
                         .expect("active_segment points to missing segment");
                     assert_eq!(
                         seg.state,
-                        SegmentState::Active,
+                        SegmentMetaState::Active,
                         "active_segment not in Active state"
                     );
                 }
