@@ -106,6 +106,44 @@ A consumer first needs the ranges covering the keys it cares about. Topic metada
 
 ---
 
+## Bootstrap
+
+Before its first fetch, a consumer must learn two things from the metadata layer:
+
+1. The set of ranges covering the keyspace it wants to read, with bounds, state, and lineage — what "Where to Start" presupposes.
+2. For each range it intends to read, the replica set of the range's current segment — the nodes a fetch can be sent to.
+
+A **topic-metadata query** answers both, and it must reach a node in the topic's metadata shard group — **there is no server-side proxying**. The query is sent to any cluster node the consumer knows (a bootstrap address from configuration, or any node it has previously talked to), with two possible outcomes:
+
+```
+Common case (the addressed node owns the topic's metadata):
+
+Consumer                         Cluster node = metadata owner
+   │                                   │
+   │── topic-metadata (topic) ────────►│
+   │◄── range list +           ────────│
+   │    per-range active               │
+   │    segment + replica set          │
+
+Redirect case (first contact, or owner has changed):
+
+Consumer                         Cluster node             Metadata owner
+   │                                   │                        │
+   │── topic-metadata (topic) ────────►│                        │
+   │◄── redirect: owner is N5  ────────│                        │
+   │                                                            │
+   │── topic-metadata (topic) ─────────────────────────────────►│
+   │◄── range list + ...     ───────────────────────────────────│
+```
+
+The consumer caches the (topic → owner) mapping so subsequent queries hit the right node directly. A redirect costs at most one extra round trip on first contact or when the owner has changed (leader re-election, shard group membership change). The same RPC is reused on any fetch that fails with "stale targeting" — both initial discovery and post-roll re-resolution go through the same path.
+
+**Why redirect rather than proxy.** The owner is the authoritative source for the topic's metadata; a proxying intermediary tempts stale caches and obscures who actually answered. And since every subsequent read from the consumer already goes directly to data nodes (the fetch path), the consumer must already be able to address arbitrary cluster nodes — making bootstrap redirect-driven keeps the addressing model uniform end-to-end.
+
+D6 will finalize the full client-facing connection layer (bootstrap address management, handshake, keep-alive). D4 introduces only the metadata-query RPC and its redirect response — the minimum the read path needs to function end-to-end.
+
+---
+
 ## Fetch Flow
 
 ```
@@ -123,7 +161,7 @@ Consumer                         Data node
    │ status Sealed   → drain to end offset, then follow transition
 ```
 
-**Resolving a node to fetch from.** A consumer reads from any replica of the range's current segment, preferring the nearest. Historical (sealed) segments have a fixed, immutable replica set — those reads are stable. Tail reads may need to re-resolve after a segment roll changes the active replica set: if a targeted node no longer hosts the segment, it says so and the consumer re-resolves from metadata and retries. As with coordinator routing in D3, stale targeting costs a retry, never correctness.
+**Resolving a node to fetch from.** A consumer reads from any replica of the range's current segment. D4 imposes no preferred-replica policy of its own — refining the choice (a tag-based placement and selection policy combining hard constraints from provisioned node labels with soft signals like CPU and I/O) is a separate concern that lives outside D4. Historical (sealed) segments have a fixed, immutable replica set — those reads are stable. Tail reads may need to re-resolve after a segment roll changes the active replica set: if a targeted node no longer hosts the segment, it says so and the consumer re-resolves from metadata and retries. As with coordinator routing in D3, stale targeting costs a retry, never correctness.
 
 ---
 
@@ -144,6 +182,7 @@ Consumer                         Data node
 - Consumer-side range-cursor tracking: holding one cursor per covering range and following lineage on transition.
 - The ordering discipline (drain the owning predecessor before its successor) and initial discovery (route keys to ranges, choose a start point).
 - A reserved keyspace-bound field on the fetch request — D4 fixes its shape in the wire format so a future consumer-group layer can enable server-side filtering without a protocol break.
+- The topic-metadata query RPC and its redirect response — when the addressed node owns the topic's metadata it answers directly; otherwise it returns the address of an owner and the consumer retries (no server-side proxying). What "Where to Start" presupposes; also the path a fetch falls back to on stale targeting.
 
 ---
 
@@ -151,6 +190,8 @@ Consumer                         Data node
 
 | Message | Direction | Carries | Status |
 |---|---|---|---|
+| Topic-metadata request | Consumer → any cluster node | topic | Introduced by D4 |
+| Topic-metadata response | Cluster node → consumer | either the **metadata payload** (range list with bounds/state/lineage + per-range active segment with replica set) or a **redirect** (address of a member of the owning metadata shard group) | Introduced by D4 |
 | Fetch request | Consumer → data node | topic, range, start offset, max bytes, optional keyspace bound | Type extended in D4; handler is D4 |
 | Fetch response | Data node → consumer | records, next offset, **range status** | Type exists (send path is D4) |
 | Range status (in response) | — | `Active`, or `Sealed { end offset, transition }` | Exists |
