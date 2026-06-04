@@ -20,11 +20,9 @@ const REQUEST_ID_SIZE: usize = size_of::<u64>();
 use anyhow::Context;
 use tokio::sync::mpsc;
 
-use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneRequest, NodeAddressInfo, NodeInfo, NodeState, ShardDetail,
-    TopicDetail, TopicStats, TopicSummary,
-};
+use crate::connections::protocol::*;
+use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
 use crate::{
     control_plane::{
         NodeId, SwimNodeState,
@@ -32,8 +30,10 @@ use crate::{
         consensus::messages::ProposeError,
         membership::{ShardGroupId, actor::SwimSender},
         metadata::{
+            RangeId,
             command::{CreateTopic, DeleteTopic, MetadataCommand},
             strategy::StoragePolicy,
+            types::RangeMeta,
         },
     },
     net::{OwnedReadHalf, OwnedWriteHalf},
@@ -179,14 +179,21 @@ pub struct ClientHandler {
     node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
+    data_plane_tx: DataPlaneSender,
 }
 
 impl ClientHandler {
-    pub fn new(node_id: NodeId, swim_sender: SwimSender, raft_sender: MutlRaftSender) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_sender: MutlRaftSender,
+        data_plane_tx: DataPlaneSender,
+    ) -> Self {
         Self {
             node_id,
             swim_sender,
             raft_sender,
+            data_plane_tx,
         }
     }
 
@@ -363,12 +370,82 @@ impl ClientHandler {
         ))
     }
 
-    async fn handle_data_plane(&self, request: DataPlaneRequest) -> ClientResponse {
-        match request {
-            DataPlaneRequest::Produce { .. } => todo!(),
-            DataPlaneRequest::Fetch { .. } => todo!(),
-            DataPlaneRequest::ListOffsets { .. } => todo!(),
+    async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {
+        let res = match request {
+            ClientDataPlaneRequest::Produce(_) => {
+                return ClientResponse::DataPlane(DataPlaneResponse::InternalError(
+                    "Produce not yet implemented".into(),
+                ));
+            }
+            ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
+            ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
+        };
+        match res {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("client data plane dispatch error: {e}");
+                ClientResponse::DataPlane(DataPlaneResponse::InternalError(e.to_string()))
+            }
         }
+    }
+
+    /// Consume read path.
+    /// 1. Resolves topic_name -> TopicMeta via the metadata RSM (one round trip),
+    /// 2. validates the optional keyspace bound,
+    /// 3. computes the range's current `RangeProgressSignal` from its lineage
+    /// 4. dispatches a `DataPlaneQuery::Fetch` carrying everything the sync data-plane
+    ///
+    /// state machine needs to answer without any further I/O.
+    async fn handle_fetch(&self, req: FetchRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        let Some(range) = meta.ranges.get(&RangeId(req.range_id)) else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        if !keyspace_bound_matches_range(&req.keyspace_bound, range) {
+            return Ok(DataPlaneResponse::KeyspaceBoundNarrowed.into());
+        }
+        let progress_signal = RangeProgressSignal::compute_progress_signal(range);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let query = DataPlaneQuery::Fetch(Fetch {
+            topic_id: meta.id,
+            range_id: RangeId(req.range_id),
+            entry_id: req.entry_id,
+            max_bytes: req.max_bytes,
+            progress_signal,
+            reply: reply_tx,
+        });
+        if self.data_plane_tx.send(query).is_err() {
+            return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
+        }
+        let result = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("data plane dropped reply"))?;
+        Ok(DataPlaneResponse::from_fetch_result(result).into())
+    }
+
+    /// Offset-bounds query — used by consumers to bound their read window
+    /// for the range's currently-active segment on this node.
+    async fn handle_list_offsets(&self, req: ListOffsetsRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        let query: DataPlaneQuery = ListOffsets {
+            topic_id: meta.id,
+            range_id: RangeId(req.range_id),
+            reply: reply_tx,
+        }
+        .into();
+
+        let _ = self.data_plane_tx.send(query);
+
+        let list_offset_result = reply_rx.await.context("data plane dropped reply")?;
+        let result = DataPlaneResponse::from_list_offset_result(list_offset_result);
+        Ok(result.into())
     }
 
     async fn handle_admin(&self, request: AdminRequest) -> ClientResponse {
@@ -445,6 +522,19 @@ impl ClientHandler {
     }
 }
 
+// ── Pure helpers for the fetch path ────────────────────────────────────────
+
+/// D4 accepts only `None` or a bound matching the range's full keyspace.
+/// Anything narrower is rejected with `KeyspaceBoundNarrowed` so the future
+/// consumer-group layer can enable server-side narrowing without a wire-format
+/// break (see d4_consumer_range_tracking.md §Wire Protocol).
+fn keyspace_bound_matches_range(bound: &Option<KeyspaceBound>, range: &RangeMeta) -> bool {
+    match bound {
+        None => true,
+        Some(b) => b.start == range.keyspace_start && b.end == range.keyspace_end,
+    }
+}
+
 /// Writer task for a single client connection.
 ///
 /// Drains `rx` and writes length-prefixed response frames to `write_half`.
@@ -480,6 +570,7 @@ mod tests {
     };
     use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
     use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
+    use crate::data_plane::actor::DataPlaneSender;
 
     use super::ClientHandler;
 
@@ -522,6 +613,14 @@ mod tests {
         tx
     }
 
+    /// Test stub for the data-plane sender. Existing tests don't exercise the
+    /// data plane path, so a dropped-receiver channel is fine — sends would
+    /// fail, but the tested code paths never send.
+    fn dp_stub() -> DataPlaneSender {
+        let (tx, _) = crossbeam_channel::bounded(1);
+        DataPlaneSender(tx)
+    }
+
     #[tokio::test]
     async fn create_topic_ok() {
         let swim = swim_sender_with(|cmd| {
@@ -534,7 +633,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft)
+        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
@@ -563,7 +662,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
@@ -597,7 +696,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft)
+        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DeleteTopic { name: "t1".into() },
             ))
@@ -618,7 +717,7 @@ mod tests {
                 let _ = reply.send(vec!["alpha".into(), "beta".into()]);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::ListHostedTopics,
             ))
@@ -655,7 +754,7 @@ mod tests {
                 _ => {}
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DescribeTopic {
                     name: "elsewhere".into(),
@@ -692,7 +791,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(me, swim, raft)
+        let resp = ClientHandler::new(me, swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DescribeTopic {
                     name: "missing".into(),
@@ -733,7 +832,7 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::DescribeCluster))
             .await;
         let ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: info }) = resp else {
@@ -763,7 +862,7 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
                 key: b"any".to_vec(),
             }))
@@ -784,7 +883,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
                 key: b"x".to_vec(),
             }))
@@ -805,7 +904,7 @@ mod tests {
                 let _ = reply.send(Some(node_id("n1")));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
                 shard_group_id: 42,
             }))
@@ -827,7 +926,7 @@ mod tests {
                 }]);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::Admin(
                 AdminRequest::ListHostedTopicsWithStats,
             ))

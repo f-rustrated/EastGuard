@@ -6,7 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::data_plane::messages::command::DataPlaneCommand;
+use crate::data_plane::actor::DataPlaneSender;
+
 use crate::net::TcpListener;
 
 use command::DataTransportCommand;
@@ -18,7 +19,7 @@ impl DataTransportActor {
     pub async fn run(
         node_id: NodeId,
         listener: TcpListener,
-        data_plane_tx: crossbeam_channel::Sender<DataPlaneCommand>,
+        data_plane_tx: DataPlaneSender,
         mut from_actor: mpsc::Receiver<Box<[DataTransportCommand]>>,
         swim_tx: SwimSender,
     ) {

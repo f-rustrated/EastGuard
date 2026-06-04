@@ -6,7 +6,8 @@ use tokio::time::Instant;
 
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
-use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
+use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 use super::reader::DataReader;
@@ -58,7 +59,7 @@ impl TransportState {
         targets: &[NodeId],
         msg: &DataPlaneInterNodeCommand,
         swim_tx: &SwimSender,
-        data_plane_tx: &crossbeam_channel::Sender<DataPlaneCommand>,
+        data_plane_tx: &DataPlaneSender,
     ) {
         for target in targets {
             if self.dead_peers.contains(target) {

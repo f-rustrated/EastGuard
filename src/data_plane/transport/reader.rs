@@ -1,6 +1,7 @@
 use tokio::io::AsyncReadExt;
 
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::OwnedReadHalf;
 
@@ -23,7 +24,7 @@ impl DataReader {
         self.read_frame(NODE_ID_FRAME_MAX).await
     }
 
-    pub(crate) async fn run(mut self, data_plane_tx: crossbeam_channel::Sender<DataPlaneCommand>) {
+    pub(crate) async fn run(mut self, data_plane_tx: DataPlaneSender) {
         loop {
             match self
                 .read_frame::<DataPlaneInterNodeCommand>(DATA_FRAME_MAX)

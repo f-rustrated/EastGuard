@@ -1,7 +1,9 @@
 use super::SegmentKey;
+use super::messages::DataPlaneMessage;
 use super::messages::command::DataPlaneInterNodeCommand;
 use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
+use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
 use super::states::segment_store::SegmentStore;
@@ -14,6 +16,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
 use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
+use crate::data_plane::states::segment_store::SegmentReadState;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
 use crate::data_plane::transport::command::DataTransportSendToCoordinator;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -66,7 +69,14 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
+    pub(crate) fn process(&mut self, msg: impl Into<DataPlaneMessage>) {
+        match msg.into() {
+            DataPlaneMessage::Command(cmd) => self.handle_command(cmd),
+            DataPlaneMessage::Query(q) => self.handle_query(q),
+        }
+    }
+
+    fn handle_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
         let cmd = cmd.into();
         match cmd {
             DataPlaneCommand::Produce(cmd) => self.handle_produce(cmd),
@@ -83,6 +93,13 @@ impl<W: WalStorage> DataPlane<W> {
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
+    }
+
+    fn handle_query(&self, q: impl Into<DataPlaneQuery>) {
+        match q.into() {
+            DataPlaneQuery::Fetch(f) => self.handle_fetch(f),
+            DataPlaneQuery::ListOffsets(lo) => self.handle_list_offsets(lo),
+        }
     }
 
     pub(crate) fn flush_and_dispatch(&mut self) {
@@ -122,6 +139,109 @@ impl<W: WalStorage> DataPlane<W> {
                 seq: self.wal.next_lsn(),
                 timer: BatchFlushTimer::deadline(),
             });
+    }
+
+    /// Hot-path fetch — read committed records from the active segment's tail
+    /// cache. Resolves `(topic, range, entry_id)` through the segment store;
+    /// returns:
+    /// - `EntryIdOutOfRange` when the offset is past the local commit boundary,
+    /// - `SegmentNotLocal` when the offset falls into no locally-hosted segment.
+    ///
+    /// Cold-path reads of sealed segments are not yet implemented — see the TODO below.
+    fn handle_fetch(&self, cmd: Fetch) {
+        let reply = cmd.reply;
+
+        let Some(read_stat) = self
+            .segments
+            .resolve(cmd.topic_id, cmd.range_id, cmd.entry_id)
+        else {
+            let _ = reply.send(FetchResult::SegmentNotLocal);
+            return;
+        };
+
+        let key = match read_stat {
+            SegmentReadState::Active(k) => k,
+            SegmentReadState::Sealed { .. } => {
+                // TODO(D4 follow-up): dispatch to ColdReadPool for historical reads
+                let _ = reply.send(FetchResult::InternalError(
+                    "cold reads not yet implemented".into(),
+                ));
+                return;
+            }
+        };
+
+        let Some(tracker) = self.segments.get(&key) else {
+            // Resolver and store invariants should keep these in sync(just a guard)
+            let _ = reply.send(FetchResult::SegmentNotLocal);
+            return;
+        };
+
+        let cache = tracker.cache();
+        let read_cursor = cache.load_read_cursor();
+
+        // Note: tracker.committed_entry_id() is omitted here but available for future bound checks.
+        // The active tail can have `committed_entry_id = 0` and no entries
+        // yet committed; distinguish "no data committed at all" by also
+        // checking against the cache read cursor.
+        if cmd.entry_id >= read_cursor {
+            // Past the tail — nothing to return.
+            let _ = reply.send(FetchResult::Records {
+                entries: Vec::new(),
+                next_entry_id: cmd.entry_id,
+                progress_signal: cmd.progress_signal,
+            });
+            return;
+        }
+
+        let mut entries = Vec::new();
+        let mut next_entry_id = cmd.entry_id;
+        let mut bytes_read: usize = 0;
+        let max_bytes = cmd.max_bytes as usize;
+
+        while let Some(entry_arc) = cache.read_committed(next_entry_id) {
+            let payload_len = entry_arc.data.len();
+            // Always include at least one entry (even if max_bytes is small).
+            if !entries.is_empty() && bytes_read + payload_len > max_bytes {
+                break;
+            }
+            next_entry_id = entry_arc.entry_id + 1;
+            entries.push(entry_arc);
+            bytes_read += payload_len;
+
+            if bytes_read >= max_bytes {
+                break;
+            }
+        }
+
+        let _ = reply.send(FetchResult::Records {
+            entries,
+            next_entry_id,
+            progress_signal: cmd.progress_signal,
+        });
+    }
+
+    /// Returns the start and currently-committed entry IDs for the range's
+    /// active segment on this node. Used by the consumer's `ListOffsets`
+    /// query to bound its read window.
+    fn handle_list_offsets(&self, cmd: ListOffsets) {
+        // The active write head sits at the largest `start_entry_id` in the
+        // active index. Resolve via the highest indexable offset (u64::MAX)
+        // to land on whatever's currently active.
+        let Some(SegmentReadState::Active(key)) =
+            self.segments.resolve(cmd.topic_id, cmd.range_id, u64::MAX)
+        else {
+            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            return;
+        };
+
+        let Some(tracker) = self.segments.get(&key) else {
+            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            return;
+        };
+        let _ = cmd.reply.send(ListOffsetsResult::Offsets {
+            start_entry_id: tracker.start_entry_id(),
+            committed_entry_id: tracker.committed_entry_id(),
+        });
     }
 
     fn handle_checkpoint_complete(&mut self, complete: CheckpointComplete) {

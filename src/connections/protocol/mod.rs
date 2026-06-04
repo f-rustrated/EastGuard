@@ -34,7 +34,7 @@ use crate::impl_from_variant;
 #[derive(Clone, Encode, Decode)]
 pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
-    DataPlane(DataPlaneRequest),
+    DataPlane(ClientDataPlaneRequest),
     Admin(AdminRequest),
 }
 
