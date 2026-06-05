@@ -406,7 +406,7 @@ impl ClientHandler {
         if !keyspace_bound_matches_range(&req.keyspace_bound, range) {
             return Ok(DataPlaneResponse::KeyspaceBoundNarrowed.into());
         }
-        let progress_signal = RangeProgressSignal::compute_progress_signal(range);
+        let progress_signal = RangeProgressSignal::compute_progress_signal(range, &meta);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = DataPlaneQuery::Fetch(Fetch {

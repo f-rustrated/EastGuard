@@ -513,6 +513,10 @@ impl TopicMeta {
         }
     }
 
+    pub(crate) fn merged_from(&self, range_id: RangeId) -> Option<[RangeId; 2]> {
+        self.ranges.get(&range_id).and_then(|m| m.merged_from)
+    }
+
     pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
         if !self.is_merge_eligible() {
             return None;

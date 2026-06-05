@@ -3,6 +3,7 @@
 pub(crate) mod channels;
 mod config;
 mod connections;
+mod consumer;
 
 mod control_plane;
 mod data_plane;

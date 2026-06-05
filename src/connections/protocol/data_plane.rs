@@ -13,7 +13,7 @@ use bincode::{Decode, Encode};
 
 use crate::{
     connections::protocol::RangeState,
-    control_plane::metadata::RangeMeta,
+    control_plane::metadata::{RangeId, RangeMeta, TopicMeta},
     data_plane::messages::query::{FetchResult, ListOffsetsResult},
     impl_from_variant,
 };
@@ -191,12 +191,13 @@ pub enum RangeProgressSignal {
 #[derive(Debug, Encode, Decode)]
 pub enum RangeTransition {
     Split {
-        left_range_id: u64,
-        right_range_id: u64,
+        left_range_id: RangeId,
+        right_range_id: RangeId,
         split_point: Vec<u8>,
     },
     Merged {
-        merged_range_id: u64,
+        merged_range_id: RangeId,
+        merged_from: [RangeId; 2],
     },
 }
 
@@ -205,7 +206,7 @@ impl RangeProgressSignal {
     /// range's metadata snapshot. Active → `Active`. Sealed → `Sealed{end_offset,
     /// transition}` where `end_offset` comes from `next_offset - 1` and the
     /// transition is whichever lineage pointer is set (split vs merge).
-    pub(crate) fn compute_progress_signal(range: &RangeMeta) -> Self {
+    pub(crate) fn compute_progress_signal(range: &RangeMeta, topic: &TopicMeta) -> Self {
         if range.state == RangeState::Active {
             return RangeProgressSignal::Active;
         }
@@ -223,17 +224,23 @@ impl RangeProgressSignal {
             return RangeProgressSignal::Sealed {
                 end_offset,
                 transition: RangeTransition::Split {
-                    left_range_id: left.0,
-                    right_range_id: right.0,
+                    left_range_id: left,
+                    right_range_id: right,
                     split_point: range.keyspace_end.clone(),
                 },
             };
         }
         if let Some(merged) = range.merged_into {
+            // Look up M to get its merged_from.
+            // ! SAFETY: failre of resolving merged_from shouldn't happen
+            let merged_from = topic
+                .merged_from(merged)
+                .expect("Merged from not found when range.merge_into is invoked");
             return RangeProgressSignal::Sealed {
                 end_offset,
                 transition: RangeTransition::Merged {
-                    merged_range_id: merged.0,
+                    merged_range_id: merged,
+                    merged_from,
                 },
             };
         }
@@ -244,7 +251,8 @@ impl RangeProgressSignal {
         RangeProgressSignal::Sealed {
             end_offset,
             transition: RangeTransition::Merged {
-                merged_range_id: range.range_id.0,
+                merged_range_id: range.range_id,
+                merged_from: [range.range_id, range.range_id],
             },
         }
     }

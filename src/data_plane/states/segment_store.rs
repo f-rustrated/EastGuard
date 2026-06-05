@@ -358,12 +358,16 @@ mod tests {
         let mut store = SegmentStore::new();
         let first = RangeProgressSignal::Sealed {
             end_offset: 42,
-            transition: RangeTransition::Merged { merged_range_id: 7 },
+            transition: RangeTransition::Merged {
+                merged_range_id: RangeId(7),
+                merged_from: [RangeId(1), RangeId(2)],
+            },
         };
         let conflicting = RangeProgressSignal::Sealed {
             end_offset: 99,
             transition: RangeTransition::Merged {
-                merged_range_id: 99,
+                merged_range_id: RangeId(99),
+                merged_from: [RangeId(1), RangeId(2)],
             },
         };
         store.cache_progress_signal(TopicId(1), RangeId(0), first);
