@@ -112,7 +112,7 @@ impl Swim {
     pub fn bootstrap(mut self, bootstrap_servers: Vec<JoinAttempt>) -> Self {
         for attempt in bootstrap_servers
             .into_iter()
-            .filter(|t| t.seed_addr != self.self_addr.cluster_addr)
+            .filter(|t| t.seed_addr != self.self_addr.cluster_addr())
             .collect::<Vec<_>>()
         {
             self.handle_join(attempt);
@@ -222,7 +222,7 @@ impl Swim {
             let Some(cluster_addr) = self
                 .members
                 .get(&target_node_id)
-                .map(|m| m.addr.cluster_addr)
+                .map(|m| m.addr.cluster_addr())
             else {
                 return;
             };
@@ -248,7 +248,7 @@ impl Swim {
         let Some(cluster_addr) = self
             .members
             .get(&target_node_id)
-            .map(|m| m.addr.cluster_addr)
+            .map(|m| m.addr.cluster_addr())
         else {
             return;
         };
@@ -302,7 +302,7 @@ impl Swim {
             return false;
         }
         if let Some(member) = self.members.get(peer) {
-            addrs.push(member.addr.cluster_addr);
+            addrs.push(member.addr.cluster_addr());
         }
         addrs.len() == INDIRECT_PING_COUNT
     }
@@ -539,11 +539,7 @@ impl Swim {
         } else {
             self.update_member(
                 source_node_id,
-                NodeAddress {
-                    cluster_addr: addr,
-                    client_addr: addr,
-                    data_addr: addr,
-                },
+                NodeAddress::new(addr, addr, addr),
                 SwimNodeState::Alive,
                 remote_inc,
             );
@@ -598,8 +594,21 @@ impl Swim {
                 if node.state == SwimNodeState::Dead {
                     return None;
                 }
-                let changed = node.resolve_state(state, incarnation);
-                Some((changed, node.clone()))
+                // Adopt the incoming address when the info is at least as fresh
+                // as ours. A node's address is fixed within an incarnation, so an
+                // equal-or-higher incarnation carries authoritative addresses.
+                // This heals a placeholder address — e.g. one fabricated by
+                // `handle_incarnation_check` for a node first seen via a probe,
+                // where `data_addr`/`client_addr` default to the cluster addr —
+                // once full gossip carrying the real `NodeAddress` arrives.
+                // Without it, the data transport would keep dialing the cluster
+                // (raft) port for that node and every data message would be lost.
+                let addr_changed = incarnation >= node.incarnation && node.addr != addr;
+                if addr_changed {
+                    node.addr = addr;
+                }
+                let state_changed = node.resolve_state(state, incarnation);
+                Some((state_changed || addr_changed, node.clone()))
             }
         }
     }
@@ -619,7 +628,7 @@ impl Swim {
                 self.pending_events.push(
                     NodeAlive {
                         node_id: node_id.clone(),
-                        addr: member.addr.cluster_addr,
+                        addr: member.addr.cluster_addr(),
                     }
                     .into(),
                 );
@@ -890,7 +899,7 @@ mod tests {
                 .get("node-b")
                 .expect("unknown node should be added");
             assert_eq!(member.state, SwimNodeState::Alive);
-            assert_eq!(member.addr.cluster_addr, sender);
+            assert_eq!(member.addr.cluster_addr(), sender);
 
             let out = p.take_packets();
             assert_eq!(out.len(), 1);
@@ -1780,8 +1789,8 @@ mod tests {
             assert!(entry.is_some(), "topology should have shard leader entry");
             let entry = entry.unwrap();
             assert_eq!(entry.leader_node_id, NodeId::new("node-local"));
-            assert_eq!(entry.leader_addr.cluster_addr, peer_addr);
-            assert_eq!(entry.leader_addr.client_addr, client_addr);
+            assert_eq!(entry.leader_addr.cluster_addr(), peer_addr);
+            assert_eq!(entry.leader_addr.client_addr(), client_addr);
             assert_eq!(entry.term, 1);
         }
 
@@ -1813,5 +1822,4 @@ mod tests {
             assert_eq!(entry.term, 7);
         }
     }
-
 }

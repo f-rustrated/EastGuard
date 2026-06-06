@@ -10,18 +10,9 @@ use bincode::{Decode, Encode};
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,
-    SplitRange {
-        topic_name: String,
-        range_id: u64,
-        split_point: Vec<u8>,
-    },
     // Internal/debug queries — also used by integration test helpers.
-    GetShardInfo {
-        key: Vec<u8>,
-    },
-    GetShardLeader {
-        shard_group_id: u64,
-    },
+    GetShardInfo { key: Vec<u8> },
+    GetShardLeader { shard_group_id: u64 },
 }
 
 #[derive(Debug, Encode, Decode)]

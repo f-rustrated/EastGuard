@@ -8,7 +8,8 @@
 
 use std::collections::HashSet;
 
-use crate::connections::protocol::{RangeDetail, RangeState, TopicDetail};
+use crate::connections::protocol::{RangeDetail, TopicDetail};
+use crate::control_plane::metadata::RangeState;
 
 use super::cursor::RangeCursor;
 use super::cursor_set::RangeCursorSet;

@@ -11,18 +11,38 @@ use crate::control_plane::SwimNodeState::Alive;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct NodeAddress {
     pub cluster_addr: SocketAddr,
-    pub client_addr: SocketAddr,
-    pub data_addr: SocketAddr,
+    client_addr: SocketAddr,
+    data_addr: SocketAddr,
 }
 
 impl NodeAddress {
     #[cfg(test)]
     pub fn test(cluster_addr: SocketAddr, client_addr: SocketAddr) -> Self {
+        Self::new(
+            cluster_addr,
+            client_addr,
+            SocketAddr::new(cluster_addr.ip(), cluster_addr.port() + 1),
+        )
+    }
+
+    pub fn new(cluster_addr: SocketAddr, client_addr: SocketAddr, data_addr: SocketAddr) -> Self {
         Self {
             cluster_addr,
             client_addr,
-            data_addr: SocketAddr::new(cluster_addr.ip(), cluster_addr.port() + 1),
+            data_addr,
         }
+    }
+
+    pub(crate) fn cluster_addr(&self) -> SocketAddr {
+        self.cluster_addr
+    }
+
+    pub(crate) fn client_addr(&self) -> SocketAddr {
+        self.client_addr
+    }
+
+    pub(crate) fn data_addr(&self) -> SocketAddr {
+        self.data_addr
     }
 }
 

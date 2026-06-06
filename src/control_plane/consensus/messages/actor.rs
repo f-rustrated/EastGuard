@@ -2,7 +2,8 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::{NodeDead, ShardGroupId};
-use crate::control_plane::metadata::types::{TopicMeta, TopicStats};
+use crate::control_plane::metadata::{TopicMeta, TopicStats};
+use crate::data_plane::messages::command::SegmentAssignmentAck;
 
 use super::command::{
     ConsensusCommand, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, PacketReceived,
@@ -48,6 +49,9 @@ pub enum MultiRaftActorCommand {
     },
     /// Data plane SealRequest forwarded to coordinator for Raft proposal.
     Coordinator(CoordinatorSealRequest),
+    /// Data-leader confirmation that it received a `SegmentAssignment`. Marks the
+    /// segment confirmed so the leader's heartbeat sweep stops re-driving it.
+    AssignmentAck(SegmentAssignmentAck),
 }
 
 impl From<ConsensusCommand> for MultiRaftActorCommand {

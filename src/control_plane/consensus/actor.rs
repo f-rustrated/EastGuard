@@ -170,6 +170,9 @@ impl MultiRaftActor {
                 self.data_transport_cmds
                     .extend(committed.into_data_transport_cmds());
             }
+            RaftEvent::RedriveAssignments(cmds) => {
+                self.data_transport_cmds.extend(cmds);
+            }
         }
     }
 }

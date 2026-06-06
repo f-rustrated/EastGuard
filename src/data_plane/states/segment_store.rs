@@ -15,11 +15,6 @@
 //!   file are on disk; the stored location carries the `end_entry_id` so the
 //!   resolver knows where the segment ends.
 //!
-//! - `progress_signal_cache` — pull-on-miss permanent cache of range-level
-//!   `RangeProgressSignal`. Sealed lineage is immutable per metadata invariants 3 &
-//!   4, so a cached `Sealed` never needs invalidation; the cache is
-//!   insert-if-absent.
-//!
 //! The store does **not** own the seal-handshake state (`pending_seal_requests`)
 //! or replication bookkeeping — those are about coordinator + peer protocols,
 //! not about where bytes live. It is intentionally a passive registry: it
@@ -29,7 +24,6 @@
 use super::segment::tracker::SegmentTracker;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::connections::protocol::RangeProgressSignal;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 
@@ -60,7 +54,6 @@ pub(crate) struct SegmentStore {
     by_key: HashMap<SegmentKey, SegmentTracker>,
     active_by_range: HashMap<(TopicId, RangeId), BTreeMap<u64, SegmentId>>,
     sealed_by_range: HashMap<(TopicId, RangeId), BTreeMap<u64, SealedSegmentLocation>>,
-    progress_signal_cache: HashMap<(TopicId, RangeId), RangeProgressSignal>,
 }
 
 impl SegmentStore {
@@ -69,7 +62,6 @@ impl SegmentStore {
             by_key: HashMap::new(),
             active_by_range: HashMap::new(),
             sealed_by_range: HashMap::new(),
-            progress_signal_cache: HashMap::new(),
         }
     }
 
@@ -104,8 +96,18 @@ impl SegmentStore {
     /// Idempotent — if the key already exists the new tracker is dropped, so
     /// callers can blindly retry a SegmentAssignment without checking first.
     /// The active index keys by `tracker.start_entry_id()` (invariant 2).
+    ///
+    /// Refuses to resurrect an already-sealed segment. A sealed segment is
+    /// immutable and its tracker has been handed off.
     pub(crate) fn insert_active(&mut self, key: SegmentKey, tracker: SegmentTracker) {
         if self.by_key.contains_key(&key) {
+            return;
+        }
+        let already_sealed = self
+            .sealed_by_range
+            .get(&(key.topic_id, key.range_id))
+            .is_some_and(|sealed| sealed.values().any(|loc| loc.segment_id == key.segment_id));
+        if already_sealed {
             return;
         }
         let start = tracker.start_entry_id();
@@ -197,33 +199,6 @@ impl SegmentStore {
         })
     }
 
-    // ── Range-status cache ────────────────────────────────────────────────
-
-    #[allow(dead_code)]
-    pub(crate) fn cached_progress_signal(
-        &self,
-        topic_id: TopicId,
-        range_id: RangeId,
-    ) -> Option<&RangeProgressSignal> {
-        self.progress_signal_cache.get(&(topic_id, range_id))
-    }
-
-    /// Insert-if-absent record of a range's sealed status. Sealed lineage is
-    /// immutable per `metadata-state-machine.md` invariants 3 & 4, so a
-    /// second observation of the same range MUST agree — `assert_invariants`
-    /// additionally enforces that only `Sealed` ever lands in the cache.
-    #[allow(dead_code)]
-    pub(crate) fn cache_progress_signal(
-        &mut self,
-        topic_id: TopicId,
-        range_id: RangeId,
-        status: RangeProgressSignal,
-    ) {
-        self.progress_signal_cache
-            .entry((topic_id, range_id))
-            .or_insert(status);
-    }
-
     // ── Invariants ────────────────────────────────────────────────────────
 
     /// D4 invariants on the (range, offset) → segment resolver indexes.
@@ -265,25 +240,12 @@ impl SegmentStore {
                 }
             }
         }
-
-        // (3) progress_signal_cache holds only RangeProgressSignal::Sealed and is
-        //     effectively insert-if-absent — sealed lineage is immutable per
-        //     metadata invariants 3 & 4. A cached Active would race against
-        //     a subsequent seal observation and serve stale data; storing
-        //     only Sealed and never overwriting prevents that.
-        for ((topic_id, range_id), status) in &self.progress_signal_cache {
-            assert!(
-                matches!(status, RangeProgressSignal::Sealed { .. }),
-                "progress_signal_cache for ({topic_id:?}, {range_id:?}) holds non-Sealed {status:?}",
-            );
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::protocol::RangeTransition;
     use crate::control_plane::membership::ShardGroupId;
     use crate::data_plane::states::segment::tracker::SegmentRole;
     use std::path::PathBuf;
@@ -351,34 +313,5 @@ mod tests {
 
         // Offset past sealed end_entry_id → no segment found.
         assert!(store.resolve(TopicId(1), RangeId(0), 43).is_none());
-    }
-
-    #[test]
-    fn cache_progress_signal_is_insert_if_absent() {
-        let mut store = SegmentStore::new();
-        let first = RangeProgressSignal::Sealed {
-            end_offset: 42,
-            transition: RangeTransition::Merged {
-                merged_range_id: RangeId(7),
-                merged_from: [RangeId(1), RangeId(2)],
-            },
-        };
-        let conflicting = RangeProgressSignal::Sealed {
-            end_offset: 99,
-            transition: RangeTransition::Merged {
-                merged_range_id: RangeId(99),
-                merged_from: [RangeId(1), RangeId(2)],
-            },
-        };
-        store.cache_progress_signal(TopicId(1), RangeId(0), first);
-        store.cache_progress_signal(TopicId(1), RangeId(0), conflicting);
-
-        let cached = store
-            .cached_progress_signal(TopicId(1), RangeId(0))
-            .unwrap();
-        match cached {
-            RangeProgressSignal::Sealed { end_offset, .. } => assert_eq!(*end_offset, 42),
-            other => panic!("expected Sealed, got {other:?}"),
-        }
     }
 }

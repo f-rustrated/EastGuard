@@ -15,6 +15,8 @@ use crate::control_plane::metadata::{
     MetadataCommand, ReplicaSet, RollSegment, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
+use crate::data_plane::messages::command::{SegmentAssignment, SegmentAssignmentAck};
+use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -93,6 +95,11 @@ pub struct Raft {
     pending_proposals: Vec<MetadataCommand>,
     election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
+
+    /// Segments whose data-leader has acked its
+    /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
+    /// re-driving a segment whose confirmed node still matches `replica_set[0]`
+    confirmed_assignment: HashMap<SegmentKey, NodeId>,
 }
 
 pub(crate) struct TimerSeqs {
@@ -129,6 +136,7 @@ impl Raft {
             peer_states: HashMap::new(),
             election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
+            confirmed_assignment: HashMap::new(),
         };
         raft.reset_election_timer();
         raft
@@ -155,6 +163,13 @@ impl Raft {
         node_id: &NodeId,
     ) -> Vec<(SegmentKey, ReplicaSet)> {
         self.state_machine.active_segments_for_node(node_id)
+    }
+
+    /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
+    /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
+    /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
+    pub(crate) fn active_segment_assignments(&self) -> Vec<(SegmentKey, ReplicaSet, u64)> {
+        self.state_machine.active_segment_assignments()
     }
 
     pub(crate) fn reconcile_peers(
@@ -397,7 +412,7 @@ impl Raft {
             RaftTimeoutCallback::ElectionTimeout { .. } => {
                 self.start_election();
             }
-            RaftTimeoutCallback::HeartbeatTimeout { .. } => {
+            RaftTimeoutCallback::RpcTimeout { .. } => {
                 self.send_heartbeats();
             }
             RaftTimeoutCallback::MergeCheckTimeout { now, .. } => {
@@ -546,7 +561,7 @@ impl Raft {
 
         // Cancel election timer, start heartbeat + merge check timers.
         self.cancel_all_timers();
-        self.schedule_heartbeat_timer();
+        self.schedule_rpc_timer();
         self.schedule_merge_check_timer();
 
         // next_index is set *before* the noop is appended, so it points
@@ -585,6 +600,7 @@ impl Raft {
         self.role = Role::Follower;
         self.current_leader = None;
         self.peer_states.clear();
+        self.confirmed_assignment.clear();
         self.cancel_all_timers();
         self.reset_election_timer();
     }
@@ -604,7 +620,45 @@ impl Raft {
             self.send_append_entries(peer_id);
         }
 
-        self.schedule_heartbeat_timer();
+        self.schedule_rpc_timer();
+        self.maybe_redrive_segment_assignments();
+    }
+
+    fn maybe_redrive_segment_assignments(&mut self) {
+        // rederive Metadata <> Datanode segment assignment
+        let active = self.active_segment_assignments();
+        let active_keys: HashSet<SegmentKey> = active.iter().map(|(k, _, _)| *k).collect();
+        self.confirmed_assignment
+            .retain(|k, _| active_keys.contains(k));
+
+        let mut redrives = Vec::new();
+        for (segment_key, replica_set, start_entry_id) in active {
+            let Some(target) = replica_set.first() else {
+                continue;
+            };
+
+            // * If data leader acks assignment, it would have been added to confirmed_assignment through Raft::handle_assignment_ack
+            if self.confirmed_assignment.get(&segment_key) == Some(target) {
+                continue;
+            }
+
+            redrives.push(DataTransportCommand::send_to_targets(
+                vec![target.clone()],
+                SegmentAssignment {
+                    segment_key,
+                    shard_group_id: self.shard_group_id,
+                    replica_set,
+                    start_entry_id,
+                },
+            ));
+        }
+        if !redrives.is_empty() {
+            self.events.push(RaftEvent::RedriveAssignments(redrives));
+        }
+    }
+
+    pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
+        self.confirmed_assignment.insert(ack.segment_key, ack.from);
     }
 
     fn send_append_entries(&mut self, peer_id: NodeId) {
@@ -788,6 +842,10 @@ impl Raft {
 
     pub(crate) fn advance_stabled_index(&mut self, value: u64) {
         self.stabled_index = self.stabled_index.max(value);
+        self.apply_committed_entries();
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
     }
 
     fn apply_committed_entries(&mut self) {
@@ -968,11 +1026,11 @@ impl Raft {
             }));
     }
 
-    fn schedule_heartbeat_timer(&mut self) {
+    fn schedule_rpc_timer(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
                 seq: self.timer_seqs.heartbeat,
-                timer: RaftTimer::heartbeat(self.shard_group_id),
+                timer: RaftTimer::rpc(self.shard_group_id),
             }));
     }
 
@@ -1382,7 +1440,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn leader_sends_noop_on_election_then_heartbeats() {
+    fn leader_sends_noop_on_election_then_rpc() {
         let mut raft = three_node_raft("node-1");
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
@@ -1425,7 +1483,7 @@ mod tests {
         drain(&mut raft);
 
         // Subsequent heartbeats are empty
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+        raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
         });
         let out = packets(&mut raft);
@@ -1738,11 +1796,11 @@ mod tests {
     }
 
     #[test]
-    fn follower_ignores_heartbeat_timeout() {
+    fn follower_ignores_rpc_timeout() {
         let mut raft = three_node_raft("node-1");
         assert_eq!(raft.role, Role::Follower);
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+        raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
         });
 
@@ -1751,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_ignores_heartbeat_timeout() {
+    fn candidate_ignores_rpc_timeout() {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
@@ -1759,7 +1817,7 @@ mod tests {
         drain(&mut raft);
         assert!(matches!(raft.role, Role::Candidate { .. }));
 
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+        raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
         });
 
@@ -2006,7 +2064,7 @@ mod tests {
         drain(&mut raft);
 
         // Next heartbeat must include AppendEntries to node-2.
-        raft.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+        raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
         });
         let heartbeats = packets(&mut raft);
@@ -2040,7 +2098,7 @@ mod tests {
         // production code path triggered by `apply_committed_entries()`.
         n1.apply_remove_peer(node("node-3"));
 
-        n1.handle_timeout(RaftTimeoutCallback::HeartbeatTimeout {
+        n1.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
         });
         let heartbeats = packets(&mut n1);

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 
 const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024; // 64MB
-const HEADER_SIZE: usize = 9; // crc32(4) + type(1) + length(4)
+const HEADER_SIZE: usize = 13; // crc32(4) + type(1) + record_count(4) + length(4)
 const TRAILING_LENGTH_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +32,18 @@ impl WalRecordType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WalRecord {
     pub record_type: WalRecordType,
+    /// Number of logical records batched into `payload`. Persisted so a cold
+    /// read of a sealed segment file can rebuild the wire `Entry.record_count`
+    /// without the in-memory `CachedEntry`
+    pub record_count: u32,
     pub payload: Bytes,
 }
 
 impl WalRecord {
-    pub(crate) fn data(payload: Bytes) -> Self {
+    pub(crate) fn data(payload: Bytes, record_count: u32) -> Self {
         WalRecord {
             record_type: WalRecordType::Data,
+            record_count,
             payload,
         }
     }
@@ -46,6 +51,7 @@ impl WalRecord {
     pub(crate) fn batch_end() -> Self {
         WalRecord {
             record_type: WalRecordType::BatchEnd,
+            record_count: 0,
             payload: Bytes::new(),
         }
     }
@@ -59,12 +65,14 @@ impl WalRecord {
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&[self.record_type as u8]);
+        hasher.update(&self.record_count.to_be_bytes());
         hasher.update(&payload_len.to_be_bytes());
         hasher.update(&self.payload);
         let crc = hasher.finalize();
 
         writer.write_all(&crc.to_be_bytes())?;
         writer.write_all(&[self.record_type as u8])?;
+        writer.write_all(&self.record_count.to_be_bytes())?;
         writer.write_all(&payload_len.to_be_bytes())?;
         writer.write_all(&self.payload)?;
         writer.write_all(&payload_len.to_be_bytes())?;
@@ -77,7 +85,8 @@ impl WalRecord {
 
         let stored_crc = u32::from_be_bytes(header[0..4].try_into().unwrap());
         let record_type = WalRecordType::from_u8(header[4])?;
-        let payload_len = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
+        let record_count = u32::from_be_bytes(header[5..9].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(header[9..13].try_into().unwrap()) as usize;
 
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
@@ -94,6 +103,7 @@ impl WalRecord {
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&[record_type as u8]);
+        hasher.update(&record_count.to_be_bytes());
         hasher.update(&(payload_len as u32).to_be_bytes());
         hasher.update(&payload);
         let computed_crc = hasher.finalize();
@@ -104,6 +114,7 @@ impl WalRecord {
 
         Ok(WalRecord {
             record_type,
+            record_count,
             payload: Bytes::from(payload),
         })
     }
@@ -450,7 +461,7 @@ pub mod tests {
 
     #[test]
     fn wal_record_roundtrip() {
-        let record = WalRecord::data(Bytes::from("hello world"));
+        let record = WalRecord::data(Bytes::from("hello world"), 7);
         let mut buf = Vec::new();
         record.encode_to(&mut buf).unwrap();
 
@@ -470,7 +481,7 @@ pub mod tests {
 
     #[test]
     fn wal_crc_detects_corruption() {
-        let record = WalRecord::data(Bytes::from("test data"));
+        let record = WalRecord::data(Bytes::from("test data"), 1);
         let mut buf = Vec::new();
         record.encode_to(&mut buf).unwrap();
 

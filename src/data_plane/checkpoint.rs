@@ -58,7 +58,7 @@ impl CheckpointWorker {
         for entry in &checkpoint.batches {
             let entry_start_position = byte_position;
 
-            let record = WalRecord::data((*entry.data).clone());
+            let record = WalRecord::data((*entry.data).clone(), entry.record_count);
             record.encode_to(&mut writer)?;
             byte_position += record.encoded_size() as u64;
 

@@ -21,7 +21,10 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 
 use crate::connections::protocol::*;
+use crate::control_plane::metadata::RangeMeta;
+use crate::data_plane::EntryPayload;
 use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::messages::command::{Produce, ProduceAck};
 use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
 use crate::{
     control_plane::{
@@ -33,7 +36,6 @@ use crate::{
             RangeId,
             command::{CreateTopic, DeleteTopic, MetadataCommand},
             strategy::StoragePolicy,
-            types::RangeMeta,
         },
     },
     net::{OwnedReadHalf, OwnedWriteHalf},
@@ -273,7 +275,7 @@ impl ClientHandler {
             return Ok(ControlPlaneResponse::TopicMetadataRedirect {
                 owner: NodeAddressInfo {
                     node_id: node_id.to_string(),
-                    client_addr: addr.client_addr,
+                    client_addr: addr.client_addr(),
                 },
             }
             .into());
@@ -372,11 +374,7 @@ impl ClientHandler {
 
     async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {
         let res = match request {
-            ClientDataPlaneRequest::Produce(_) => {
-                return ClientResponse::DataPlane(DataPlaneResponse::InternalError(
-                    "Produce not yet implemented".into(),
-                ));
-            }
+            ClientDataPlaneRequest::Produce(req) => self.handle_produce(req).await,
             ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
             ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
         };
@@ -387,6 +385,41 @@ impl ClientHandler {
                 ClientResponse::DataPlane(DataPlaneResponse::InternalError(e.to_string()))
             }
         }
+    }
+
+    /// Resolves `topic_name` -> `TopicMeta`, routes `routing_key`
+    /// to the owning active range, and dispatches a `Produce` to the data plane
+    /// for that range's active segment.
+    /// If this node is a follower (or doesn't host it), reply `Err` and the producer re-resolves via `DescribeTopic`.
+    async fn handle_produce(&self, req: ProduceRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+
+        let Some(segment_key) = meta.route_active_segment_key(&req.routing_key) else {
+            return Ok(DataPlaneResponse::InternalError(
+                "no range/segment owns the routing key range has no active segment".into(),
+            )
+            .into());
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = Produce {
+            segment_key,
+            data: EntryPayload::from(req.data),
+            record_count: req.record_count,
+            reply: reply_tx,
+        };
+        let _ = self.data_plane_tx.send(cmd);
+
+        let ack = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("data plane dropped produce reply"))?;
+
+        Ok(match ack {
+            ProduceAck::Ok { entry_id } => DataPlaneResponse::Produced { entry_id }.into(),
+            ProduceAck::Err(reason) => DataPlaneResponse::InternalError(reason).into(),
+        })
     }
 
     /// Consume read path.
@@ -454,7 +487,7 @@ impl ClientHandler {
             AdminRequest::ListHostedTopicsWithStats => {
                 self.handle_list_hosted_topics_with_stats().await
             }
-            AdminRequest::SplitRange { .. } => todo!(),
+
             AdminRequest::GetShardInfo { key } => self.handle_get_shard_info(key).await,
             AdminRequest::GetShardLeader { shard_group_id } => {
                 self.handle_get_shard_leader(shard_group_id).await
@@ -472,7 +505,7 @@ impl ClientHandler {
             .into_iter()
             .map(|m| NodeInfo {
                 node_id: m.node_id.to_string(),
-                addr: m.addr.client_addr,
+                addr: m.addr.client_addr(),
                 state: match m.state {
                     SwimNodeState::Alive => NodeState::Alive,
                     SwimNodeState::Suspect => NodeState::Suspect,
@@ -506,7 +539,7 @@ impl ClientHandler {
             .map(|(group, leader)| ShardDetail {
                 shard_group_id: group.id.0,
                 leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
-                leader_addr: leader.map(|e| e.leader_addr.client_addr),
+                leader_addr: leader.map(|e| e.leader_addr.client_addr()),
                 member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
@@ -556,8 +589,6 @@ pub async fn run_client_writer(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
         ControlPlaneResponse, NodeState,
@@ -568,9 +599,10 @@ mod tests {
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
     };
-    use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
     use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
     use crate::data_plane::actor::DataPlaneSender;
+    use std::net::SocketAddr;
 
     use super::ClientHandler;
 

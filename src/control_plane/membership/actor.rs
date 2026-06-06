@@ -223,7 +223,7 @@ impl SwimSender {
             .get_members()
             .await?
             .into_iter()
-            .map(|m| (m.node_id, m.addr.client_addr))
+            .map(|m| (m.node_id, m.addr.client_addr()))
             .collect())
     }
 }

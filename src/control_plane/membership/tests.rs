@@ -338,7 +338,7 @@ async fn test_gossip_propagation() {
             && let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet()
         {
             // Check if our rumor is in this specific Ack
-            if let Some(rumor) = gossip.iter().find(|m| m.addr.cluster_addr == dead_node) {
+            if let Some(rumor) = gossip.iter().find(|m| m.addr.cluster_addr() == dead_node) {
                 assert_eq!(rumor.state, SwimNodeState::Dead);
                 propagated = true;
                 break; // Success!

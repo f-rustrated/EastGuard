@@ -14,9 +14,9 @@ use bincode::{Decode, Encode};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
-pub use crate::control_plane::metadata::types::RangeState;
-use crate::control_plane::metadata::types::{
-    RangeMeta, SegmentMeta, TopicMeta, TopicState as MetaTopicState,
+
+use crate::control_plane::metadata::{
+    RangeMeta, RangeState, SegmentMeta, TopicMeta, TopicState as MetaTopicState,
 };
 
 #[derive(Clone, Encode, Decode)]

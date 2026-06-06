@@ -1070,7 +1070,7 @@ mod tests {
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            entry.leader_addr.client_addr,
+            entry.leader_addr.client_addr(),
             "127.0.0.1:7080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(entry.term, 1);

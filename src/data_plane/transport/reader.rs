@@ -1,4 +1,5 @@
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::data_plane::actor::DataPlaneSender;
@@ -24,14 +25,19 @@ impl DataReader {
         self.read_frame(NODE_ID_FRAME_MAX).await
     }
 
-    pub(crate) async fn run(mut self, data_plane_tx: DataPlaneSender) {
+    pub(crate) async fn run(
+        mut self,
+        data_plane_tx: DataPlaneSender,
+        peer: NodeId,
+        disconnect_tx: mpsc::Sender<NodeId>,
+    ) {
         loop {
             match self
                 .read_frame::<DataPlaneInterNodeCommand>(DATA_FRAME_MAX)
                 .await
             {
                 Ok(msg) => {
-                    let _ = data_plane_tx.send(DataPlaneCommand::InterNode(msg));
+                    let _ = data_plane_tx.send(DataPlaneCommand::DataPlaneInterNodeCommand(msg));
                 }
                 Err(e) => {
                     tracing::debug!("DataReader connection closed: {e}");
@@ -39,5 +45,14 @@ impl DataReader {
                 }
             }
         }
+
+        // Read inbound frames until the connection closes, then signal the
+        // transport to evict `peer`'s cached writer. Without this, a connection
+        // that dies (peer reset, or the loser of a simultaneous-connect race) would
+        // leave a half-open writer behind — `write_message` keeps succeeding into
+        // the local TCP buffer and bytes silently vanish, so retries never recover.
+        // Eviction forces the next send to reconnect; a spurious eviction only
+        // costs one reconnect, so it's always safe.
+        let _ = disconnect_tx.send(peer).await;
     }
 }

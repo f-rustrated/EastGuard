@@ -11,9 +11,12 @@ pub(in crate::control_plane::membership) const MAX_GOSSIP_BYTES: usize = 1400;
 const LAMBDA: u32 = 3;
 
 pub(in crate::control_plane::membership) type SwimBuffer = DisseminationBuffer<SwimNode>;
-pub(in crate::control_plane::membership) type ShardLeaderGossipBuffer = DisseminationBuffer<ShardLeaderInfo>;
+pub(in crate::control_plane::membership) type ShardLeaderGossipBuffer =
+    DisseminationBuffer<ShardLeaderInfo>;
 
-pub(in crate::control_plane::membership) trait Disseminable: Clone {
+pub(in crate::control_plane::membership) trait Disseminable:
+    Clone
+{
     type Key: PartialEq;
     fn key(&self) -> Self::Key;
     fn should_replace(&self, other: &Self) -> bool;
@@ -179,7 +182,7 @@ mod tests {
         let result = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(result.len(), 2);
 
-        let addrs: Vec<_> = result.iter().map(|m| m.addr.cluster_addr).collect();
+        let addrs: Vec<_> = result.iter().map(|m| m.addr.cluster_addr()).collect();
         assert!(addrs.contains(&addr(1)));
         assert!(addrs.contains(&addr(2)));
     }
@@ -239,14 +242,14 @@ mod tests {
 
         let first = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(
-            first[0].addr.cluster_addr,
+            first[0].addr.cluster_addr(),
             addr(2),
             "member(2) should lead (higher remaining)"
         );
 
         let second = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(
-            second[0].addr.cluster_addr,
+            second[0].addr.cluster_addr(),
             addr(2),
             "member(2) should still lead after sort() in previous collect()"
         );
@@ -264,8 +267,8 @@ mod tests {
 
         let result = buf.collect(MAX_GOSSIP_BYTES);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].addr.cluster_addr, addr(2));
-        assert_eq!(result[1].addr.cluster_addr, addr(1));
+        assert_eq!(result[0].addr.cluster_addr(), addr(2));
+        assert_eq!(result[1].addr.cluster_addr(), addr(1));
     }
 
     #[test]
@@ -311,7 +314,7 @@ mod tests {
         buf.enqueue(new, 10);
 
         let result = buf.collect(MAX_GOSSIP_BYTES);
-        assert!(result.iter().any(|m| m.addr.cluster_addr == addr(999)));
+        assert!(result.iter().any(|m| m.addr.cluster_addr() == addr(999)));
     }
 
     // shard leader info tests

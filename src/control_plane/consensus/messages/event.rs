@@ -52,6 +52,11 @@ pub enum RaftEvent {
     DisconnectPeer(NodeId),
     #[allow(dead_code)]
     MetadataCommitted(MetadataCommitted),
+    /// Idempotent re-delivery of active-segment `SegmentAssignment`s, emitted by
+    /// the leader on each heartbeat so a `SegmentAssignment` lost on its one-shot
+    /// delivery (the original send is fire-and-forget) self-heals. The data plane
+    /// drops re-drives for segments it already hosts.
+    RedriveAssignments(Vec<DataTransportCommand>),
 }
 
 impl MetadataCommitted {

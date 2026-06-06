@@ -1,6 +1,7 @@
 use super::command::*;
 use super::event::*;
-use super::types::*;
+use super::segment::*;
+use super::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId, error::MetadataError};
 use crate::data_plane::SegmentKey;
@@ -53,6 +54,15 @@ impl MetadataStateMachine {
         self.topics
             .values()
             .flat_map(|t| t.active_segments_for_node(node_id))
+            .collect()
+    }
+
+    /// Every active segment across all topics with its replica set and start
+    /// offset, for the leader's periodic assignment re-drive.
+    pub(crate) fn active_segment_assignments(&self) -> Vec<(SegmentKey, ReplicaSet, u64)> {
+        self.topics
+            .values()
+            .flat_map(|t| t.active_segment_assignments())
             .collect()
     }
 
@@ -249,6 +259,8 @@ impl crate::test_traits::TAssertInvariant for MetadataStateMachine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::*;
+    use super::super::range::*;
     use super::*;
     use std::collections::VecDeque;
 

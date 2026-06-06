@@ -22,7 +22,9 @@ pub(crate) struct DataPlaneOutputs {
     pub(crate) batch_timer_cmds: Vec<TimerCommand<BatchFlushTimer>>,
     pub(crate) repl_schedules: Vec<(u64, ReplicationTimer)>,
     pub(crate) coordinator_cmds: Vec<MultiRaftActorCommand>,
-    pub(crate) produce_replies: Vec<oneshot::Sender<ProduceAck>>,
+    /// `(entry_id, reply)` — the committed offset is paired with each waiting
+    /// producer so the `ProduceAck::Ok` carries it back to the client.
+    pub(crate) produce_replies: Vec<(u64, oneshot::Sender<ProduceAck>)>,
 }
 
 impl DataPlaneOutputs {
@@ -52,8 +54,8 @@ impl DataPlaneOutputs {
         for cmd in self.coordinator_cmds.drain(..) {
             let _ = self.coordinator_tx.try_send(cmd);
         }
-        for reply in self.produce_replies.drain(..) {
-            let _ = reply.send(ProduceAck::Ok);
+        for (entry_id, reply) in self.produce_replies.drain(..) {
+            let _ = reply.send(ProduceAck::Ok { entry_id });
         }
 
         let checkpoint_jobs = std::mem::take(&mut self.checkpoint_jobs);

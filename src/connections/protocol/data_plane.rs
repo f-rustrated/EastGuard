@@ -12,8 +12,7 @@ use std::net::SocketAddr;
 use bincode::{Decode, Encode};
 
 use crate::{
-    connections::protocol::RangeState,
-    control_plane::metadata::{RangeId, RangeMeta, TopicMeta},
+    control_plane::metadata::{RangeId, RangeMeta, RangeState, TopicMeta},
     data_plane::messages::query::{FetchResult, ListOffsetsResult},
     impl_from_variant,
 };

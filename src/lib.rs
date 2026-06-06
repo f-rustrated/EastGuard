@@ -105,7 +105,8 @@ impl StartUp {
             topology_pub,
         );
 
-        // Data plane (spawns its own three schedulers + crossbeam bridge internally)
+        // Data plane (spawns its own three schedulers + crossbeam bridge internally).
+        let sparse_index = self.env.sparse_index_db();
         let (checkpoint_tx, checkpoint_rx) = crossbeam_channel::bounded(64);
         let data_plane_tx = DataPlaneActor::spawn(
             node_id.clone(),
@@ -113,12 +114,9 @@ impl StartUp {
             checkpoint_tx,
             data_transport_tx.clone().into(),
             raft_tx.clone(),
+            sparse_index.clone(),
         );
-        CheckpointWorker::spawn(
-            self.env.sparse_index_db(),
-            checkpoint_rx,
-            data_plane_tx.clone(),
-        );
+        CheckpointWorker::spawn(sparse_index, checkpoint_rx, data_plane_tx.clone());
 
         tokio::spawn(DataTransportActor::run(
             node_id.clone(),

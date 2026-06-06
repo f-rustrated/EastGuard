@@ -105,7 +105,8 @@ impl SegmentTracker {
         for (i, staged) in self.staged_entries.iter().enumerate() {
             let entry_id = self.next_entry_id + i as u64;
             let header = RoutingHeader::new(staged.segment_key, entry_id, staged.record_count);
-            let _ = WalRecord::data(header.build_wal_payload(&staged.data)).encode_to(wal_buf);
+            let _ = WalRecord::data(header.build_wal_payload(&staged.data), staged.record_count)
+                .encode_to(wal_buf);
         }
     }
 
