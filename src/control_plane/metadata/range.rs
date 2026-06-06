@@ -1,85 +1,18 @@
+use super::constants::*;
+use bincode::{Decode, Encode};
 use std::collections::{HashMap, VecDeque};
 
-use bincode::{Decode, Encode};
-
-use crate::control_plane::{
-    NodeId,
-    metadata::{
-        RangeId, SegmentId, SplitRange, TopicId,
-        command::{MergeRange, MetadataCommand, RollSegment},
-        error::MetadataError,
-        strategy::{PartitionStrategy, StoragePolicy},
-    },
+use crate::control_plane::metadata::{
+    RangeId, ReplicaSet, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
+    command::{MetadataCommand, RollSegment},
+    error::MetadataError,
 };
-use crate::data_plane::SegmentKey;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub enum TopicState {
-    Active,
-    Sealed,
-    Deleted,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum RangeState {
     Active,
     Sealed,
     Deleting,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub enum SegmentState {
-    Active,
-    Sealed,
-    Reassigning { from: NodeId, to: NodeId },
-    Deleting,
-}
-
-pub(crate) type ReplicaSet = Vec<NodeId>;
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct SegmentMeta {
-    pub segment_id: SegmentId,
-    pub state: SegmentState,
-    pub replica_set: ReplicaSet,
-    pub size_bytes: u64,
-    pub start_offset: u64,
-    pub end_offset: Option<u64>,
-    pub created_at: u64,
-    pub sealed_at: Option<u64>,
-}
-
-impl SegmentMeta {
-    pub(crate) fn new(
-        segment_id: SegmentId,
-        replica_set: ReplicaSet,
-        start_offset: u64,
-        created_at: u64,
-    ) -> Self {
-        SegmentMeta {
-            segment_id,
-            state: SegmentState::Active,
-            replica_set,
-            size_bytes: 0,
-            start_offset,
-            end_offset: None,
-            created_at,
-            sealed_at: None,
-        }
-    }
-    pub(crate) fn seal(
-        &mut self,
-        end_offset: Option<u64>,
-        sealed_at: u64,
-    ) -> Result<(), MetadataError> {
-        if self.state != SegmentState::Active {
-            return Err(MetadataError::SegmentNotActive);
-        }
-
-        self.state = SegmentState::Sealed;
-        self.end_offset = end_offset;
-        self.sealed_at = Some(sealed_at);
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -192,7 +125,7 @@ impl RangeMeta {
         let Some(seg) = self.segments.get_mut(&segment_id) else {
             return;
         };
-        if seg.state != SegmentState::Sealed || seg.end_offset.is_some() {
+        if seg.state != SegmentMetaState::Sealed || seg.end_offset.is_some() {
             return;
         }
         seg.end_offset = Some(end_entry_id);
@@ -317,7 +250,7 @@ impl RangeMeta {
     fn validate_sealable(&self) -> Result<(), MetadataError> {
         if let Some(seg_id) = self.active_segment
             && let Some(seg) = self.segments.get(&seg_id)
-            && seg.state != SegmentState::Active
+            && seg.state != SegmentMetaState::Active
         {
             return Err(MetadataError::SegmentNotActive);
         }
@@ -339,11 +272,11 @@ impl RangeMeta {
         self.keyspace_end == other.keyspace_start || other.keyspace_end == self.keyspace_start
     }
 
-    fn delete(&mut self) {
+    pub(super) fn delete(&mut self) {
         self.state = RangeState::Deleting;
         self.active_segment = None;
         for segment in self.segments.values_mut() {
-            segment.state = SegmentState::Deleting;
+            segment.state = SegmentMetaState::Deleting;
         }
     }
 
@@ -378,249 +311,6 @@ impl RangeMeta {
         r1_recent == MERGE_SEAL_THRESHOLD && r2_recent == MERGE_SEAL_THRESHOLD
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct TopicMeta {
-    pub id: TopicId,
-    pub name: String,
-    pub state: TopicState,
-    pub storage_policy: StoragePolicy,
-    pub active_ranges: Vec<RangeId>,
-    pub ranges: HashMap<RangeId, RangeMeta>,
-    pub next_range_id: u64,
-}
-impl TopicMeta {
-    pub(crate) fn new(
-        name: String,
-        id: TopicId,
-        replica_set: ReplicaSet,
-        created_at: u64,
-        storage_policy: StoragePolicy,
-    ) -> Self {
-        let range_id = RangeId(0);
-        let range = RangeMeta::new(
-            range_id,
-            KEYSPACE_MIN.to_vec(),
-            KEYSPACE_MAX.to_vec(),
-            replica_set,
-            created_at,
-        );
-
-        TopicMeta {
-            id,
-            name,
-            state: TopicState::Active,
-            storage_policy,
-            active_ranges: vec![range_id],
-            ranges: HashMap::from([(range_id, range)]),
-            next_range_id: 1,
-        }
-    }
-
-    pub(crate) fn get_ranges_mut<const N: usize>(
-        &mut self,
-        ranges: [&RangeId; N],
-    ) -> Result<[&mut RangeMeta; N], MetadataError> {
-        let options = self.ranges.get_disjoint_mut(ranges);
-
-        let vec_ranges: Vec<&mut RangeMeta> = options
-            .into_iter()
-            .map(|opt| opt.ok_or(MetadataError::RangeNotFound)) // Bubble up the error
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // ! SAFETY: We can safely unwrap() here because we know the Vec was built
-        // ! from an array of exactly size N, so it will never fail.
-        Ok(vec_ranges.try_into().unwrap())
-    }
-
-    pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
-        (self.state == TopicState::Active)
-            .then_some(())
-            .ok_or(MetadataError::TopicNotActive(self.id))
-    }
-    pub(crate) fn is_merge_eligible(&self) -> bool {
-        self.state == TopicState::Active && self.can_split() && self.active_ranges.len() >= 2
-    }
-
-    pub(crate) fn can_split(&self) -> bool {
-        self.storage_policy.partition_strategy != PartitionStrategy::Fixed
-    }
-
-    pub(crate) fn active_segments_for_node(
-        &self,
-        node_id: &NodeId,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
-        if self.state != TopicState::Active {
-            return Vec::new();
-        }
-        self.active_ranges
-            .iter()
-            .filter_map(|range_id| {
-                let seg = self.get_active_segment(range_id)?;
-                seg.replica_set.contains(node_id).then(|| {
-                    (
-                        SegmentKey::new(self.id, *range_id, seg.segment_id),
-                        seg.replica_set.clone(),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Active segments whose `replica_set` contains at least one node not in
-    /// `live` state.
-    pub(crate) fn active_segments_with_dead_members(
-        &self,
-        live: &std::collections::HashSet<NodeId>,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
-        if self.state != TopicState::Active {
-            return Vec::new();
-        }
-        self.active_ranges
-            .iter()
-            .filter_map(|range_id| {
-                let seg = self.get_active_segment(range_id)?;
-                let has_dead = seg.replica_set.iter().any(|n| !live.contains(n));
-                has_dead.then(|| {
-                    (
-                        SegmentKey::new(self.id, *range_id, seg.segment_id),
-                        seg.replica_set.clone(),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn get_active_segment(&self, range_id: &RangeId) -> Option<&SegmentMeta> {
-        let range = self.ranges.get(range_id)?;
-        let seg_id = range.active_segment?;
-        let seg = range.segments.get(&seg_id)?;
-        Some(seg)
-    }
-
-    pub(crate) fn stats(&self) -> TopicStats {
-        let range_count = self.ranges.len() as u32;
-        let total_bytes: u64 = self
-            .ranges
-            .values()
-            .flat_map(|r| r.segments.values())
-            .map(|s| s.size_bytes)
-            .sum();
-        TopicStats {
-            name: self.name.clone(),
-            range_count,
-            total_bytes,
-        }
-    }
-
-    pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
-        if !self.is_merge_eligible() {
-            return None;
-        }
-        self.active_ranges.windows(2).find_map(|pair| {
-            self.try_merge_pair(&self.ranges[&pair[0]], &self.ranges[&pair[1]], now)
-        })
-    }
-
-    fn try_merge_pair(&self, r1: &RangeMeta, r2: &RangeMeta, now: u64) -> Option<MetadataCommand> {
-        if r1.state != RangeState::Active || r2.state != RangeState::Active {
-            return None;
-        }
-        if !r1.mergeable_with(r2, now) {
-            return None;
-        }
-        let replica_set = r1
-            .active_segment
-            .and_then(|sid| r1.segments.get(&sid))
-            .map(|s| s.replica_set.clone())
-            .unwrap_or_default();
-        Some(MetadataCommand::MergeRange(MergeRange {
-            topic_id: self.id,
-            range_id_1: r1.range_id,
-            range_id_2: r2.range_id,
-            created_at: now,
-            merged_replica_set: replica_set,
-        }))
-    }
-
-    pub(crate) fn execute_split(
-        &mut self,
-        cmd: SplitRange,
-    ) -> Result<(RangeId, RangeId), MetadataError> {
-        let left_id = RangeId(self.next_range_id);
-        let right_id = RangeId(self.next_range_id + 1);
-        let range = self
-            .ranges
-            .get_mut(&cmd.range_id)
-            .ok_or(MetadataError::RangeNotFound)?;
-        let (left, right) = range.split(cmd, left_id, right_id)?;
-        let parent_range_id = range.range_id;
-        self.next_range_id += 2;
-        self.active_ranges.retain(|id| *id != parent_range_id);
-        self.ranges.insert(left_id, left);
-        self.ranges.insert(right_id, right);
-        self.insert_range_sorted(left_id);
-        self.insert_range_sorted(right_id);
-        Ok((left_id, right_id))
-    }
-
-    pub(crate) fn execute_merge(&mut self, cmd: MergeRange) -> Result<RangeId, MetadataError> {
-        let merged_id = RangeId(self.next_range_id);
-        let [r1, r2] = self.get_ranges_mut([&cmd.range_id_1, &cmd.range_id_2])?;
-        let merged = r1.merge(r2, merged_id, cmd.merged_replica_set, cmd.created_at)?;
-        self.ranges.insert(merged_id, merged);
-        self.active_ranges
-            .retain(|id| *id != cmd.range_id_1 && *id != cmd.range_id_2);
-        self.insert_range_sorted(merged_id);
-        self.next_range_id += 1;
-        Ok(merged_id)
-    }
-
-    pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
-        let start = &self.ranges[&range_id].keyspace_start;
-        let pos = self
-            .active_ranges
-            .iter()
-            .position(|id| &self.ranges[id].keyspace_start > start)
-            .unwrap_or(self.active_ranges.len());
-        self.active_ranges.insert(pos, range_id);
-    }
-
-    pub(crate) fn seal_range(
-        &mut self,
-        range_id: RangeId,
-        sealed_at: u64,
-    ) -> Result<(), MetadataError> {
-        let range = self
-            .ranges
-            .get_mut(&range_id)
-            .ok_or(MetadataError::RangeNotFound)?;
-
-        range.seal(sealed_at)?;
-        Ok(())
-    }
-
-    pub(crate) fn delete(&mut self) {
-        self.state = TopicState::Deleted;
-        self.active_ranges.clear();
-
-        for range in self.ranges.values_mut() {
-            range.delete();
-        }
-    }
-}
-
-// --- Keyspace Constants ---
-// Full partition-key space covered by a topic's ranges. Lexicographic ordering on Vec<u8>.
-// [0xFF] is a 1-byte placeholder — production should use &[0xFF; 32] for a 256-bit ring.
-pub const KEYSPACE_MIN: &[u8] = &[];
-pub const KEYSPACE_MAX: &[u8] = &[0xFF];
-
-// --- Hot Range Detection Constants ---
-pub const SPLIT_SEAL_THRESHOLD: usize = 3;
-pub const MEASUREMENT_WINDOW_MS: u64 = 300_000; // 5 min sliding window
-pub const SPLIT_COOLDOWN_MS: u64 = 300_000; // 5 min cooldown after a split
-pub const MERGE_SEAL_THRESHOLD: usize = 0; // both ranges must be fully idle
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct RangeSealHistory {
@@ -663,131 +353,6 @@ pub mod props {
 
     use super::*;
 
-    impl TAssertInvariant for TopicMeta {
-        fn assert_invariants(&self) {
-            for rid in self.ranges.keys() {
-                assert!(rid.0 < self.next_range_id, "range ID >= next_range_id");
-            }
-            if self.state == TopicState::Active {
-                self.assert_keyspace_coverage();
-            }
-            self.assert_fixed_strategy_single_range();
-            self.assert_delete_cascade();
-            for range in self.ranges.values() {
-                range.assert_invariants();
-
-                self.assert_split_children_cooldown(range);
-            }
-        }
-    }
-
-    impl TopicMeta {
-        /// Invariant: a Fixed-strategy topic rejects splits at apply, so its
-        /// range topology can never grow beyond the initial single full-keyspace
-        /// range. Sealed topics retain that range; active topics must still have
-        /// exactly one active range.
-        fn assert_fixed_strategy_single_range(&self) {
-            if self.storage_policy.partition_strategy != PartitionStrategy::Fixed {
-                return;
-            }
-            assert_eq!(
-                self.ranges.len(),
-                1,
-                "Fixed-strategy topic {:?} has {} ranges; splits should be rejected",
-                self.id,
-                self.ranges.len(),
-            );
-            if self.state == TopicState::Active {
-                assert_eq!(
-                    self.active_ranges.len(),
-                    1,
-                    "Fixed-strategy active topic {:?} has {} active ranges",
-                    self.id,
-                    self.active_ranges.len(),
-                );
-            }
-        }
-
-        /// Invariant: deleting a topic cascades to every range and every
-        /// segment in one applied operation. A Deleted topic with any range or
-        /// segment not marked Deleting would leak storage past GC.
-        fn assert_delete_cascade(&self) {
-            if self.state != TopicState::Deleted {
-                return;
-            }
-            assert!(
-                self.active_ranges.is_empty(),
-                "Deleted topic {:?} still has {} active ranges",
-                self.id,
-                self.active_ranges.len(),
-            );
-            for range in self.ranges.values() {
-                assert_eq!(
-                    range.state,
-                    RangeState::Deleting,
-                    "Deleted topic {:?} has range {:?} in state {:?}",
-                    self.id,
-                    range.range_id,
-                    range.state,
-                );
-                for seg in range.segments.values() {
-                    assert_eq!(
-                        seg.state,
-                        SegmentState::Deleting,
-                        "Deleted topic {:?} has segment {:?} in state {:?}",
-                        self.id,
-                        seg.segment_id,
-                        seg.state,
-                    );
-                }
-            }
-        }
-
-        fn assert_split_children_cooldown(&self, range: &RangeMeta) {
-            let Some([left, right]) = range.split_into else {
-                return;
-            };
-            if let Some(left_range) = self.ranges.get(&left) {
-                assert!(
-                    left_range.seal_history.created_by_split_at.is_some(),
-                    "split child missing created_by_split_at"
-                );
-            }
-            if let Some(right_range) = self.ranges.get(&right) {
-                assert!(
-                    right_range.seal_history.created_by_split_at.is_some(),
-                    "split child missing created_by_split_at"
-                );
-            }
-        }
-
-        fn assert_keyspace_coverage(&self) {
-            if self.active_ranges.is_empty() {
-                return;
-            }
-            let ranges: Vec<&RangeMeta> = self
-                .active_ranges
-                .iter()
-                .map(|id| &self.ranges[id])
-                .collect();
-            assert_eq!(
-                ranges[0].keyspace_start, KEYSPACE_MIN,
-                "first range must start at MIN"
-            );
-            assert_eq!(
-                ranges.last().unwrap().keyspace_end,
-                KEYSPACE_MAX,
-                "last range must end at MAX"
-            );
-            for w in ranges.windows(2) {
-                assert_eq!(
-                    w[0].keyspace_end, w[1].keyspace_start,
-                    "keyspace gap between active ranges"
-                );
-            }
-        }
-    }
-
     impl TAssertInvariant for RangeMeta {
         fn assert_invariants(&self) {
             self.assert_active_segment_state();
@@ -817,7 +382,7 @@ pub mod props {
             let active_count = self
                 .segments
                 .values()
-                .filter(|s| s.state == SegmentState::Active)
+                .filter(|s| s.state == SegmentMetaState::Active)
                 .count();
             let expected = match self.state {
                 RangeState::Active => 1,
@@ -868,7 +433,7 @@ pub mod props {
 
         fn assert_sealed_segments(&self) {
             for seg in self.segments.values() {
-                if seg.state == SegmentState::Sealed {
+                if seg.state == SegmentMetaState::Sealed {
                     assert!(seg.sealed_at.is_some(), "sealed segment missing sealed_at");
                 }
             }
@@ -894,7 +459,7 @@ pub mod props {
                         .expect("active_segment points to missing segment");
                     assert_eq!(
                         seg.state,
-                        SegmentState::Active,
+                        SegmentMetaState::Active,
                         "active_segment not in Active state"
                     );
                 }
@@ -907,10 +472,4 @@ pub mod props {
             }
         }
     }
-}
-
-pub struct TopicStats {
-    pub name: String,
-    pub range_count: u32,
-    pub total_bytes: u64,
 }

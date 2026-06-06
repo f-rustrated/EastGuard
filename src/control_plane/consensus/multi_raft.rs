@@ -12,13 +12,14 @@ use crate::control_plane::consensus::messages::{
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::metadata::TopicId;
 use crate::control_plane::metadata::command::RollSegment;
-use crate::control_plane::metadata::types::TopicStats;
+
+use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
 
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::data_plane::SegmentKey;
+use crate::data_plane::messages::command::SegmentAssignmentAck;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -33,10 +34,7 @@ pub(crate) struct MultiRaft {
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
     pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposeError>>>,
     pending_seals: PendingSealTracker,
-    /// Read-only snapshot handle on the topology owned by SwimActor. Loaded
-    /// synchronously wherever this state machine needs live cluster shape
-    /// (peer reconciliation, ring-aware replacement picks, live-node filters
-    /// for seal-request handling). `.load()` is a lock-free Arc bump.
+
     topology: TopologyReader,
 }
 
@@ -186,8 +184,16 @@ impl MultiRaft {
                 self.deferred
                     .push(DeferredReply::GetTopicStats(reply, stats));
             }
+            MultiRaftActorCommand::GetTopicMetadata { topic_name, reply } => {
+                let meta = self.get_topic_metadata(&topic_name);
+                self.deferred
+                    .push(DeferredReply::GetTopicMetadata(reply, meta));
+            }
             MultiRaftActorCommand::Coordinator(req) => {
                 self.handle_seal_request(req);
+            }
+            MultiRaftActorCommand::AssignmentAck(ack) => {
+                self.handle_assignment_ack(ack);
             }
         }
     }
@@ -208,6 +214,9 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopicStats(sender, v) => {
+                    let _ = sender.send(v);
+                }
+                DeferredReply::GetTopicMetadata(sender, v) => {
                     let _ = sender.send(v);
                 }
             }
@@ -312,13 +321,21 @@ impl MultiRaft {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
             RaftTimeoutCallback::ElectionTimeout { shard_group_id }
-            | RaftTimeoutCallback::HeartbeatTimeout { shard_group_id }
+            | RaftTimeoutCallback::RpcTimeout { shard_group_id }
             | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. } => *shard_group_id,
         };
+
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.handle_timeout(cb);
             self.dirty.insert(shard_id);
         }
+    }
+
+    fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
+        let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
+            return;
+        };
+        raft.handle_assignment_ack(ack);
     }
 
     fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
@@ -346,6 +363,12 @@ impl MultiRaft {
             .values()
             .flat_map(|raft| raft.topic_stats())
             .collect()
+    }
+
+    fn get_topic_metadata(&self, name: &str) -> Option<TopicMeta> {
+        self.groups
+            .values()
+            .find_map(|raft| raft.get_topic_by_name(name).cloned())
     }
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)
@@ -537,24 +560,36 @@ impl MultiRaft {
             }
             // If this replica is no longer leader, drop any outstanding seal
             // contexts — the SealResponse for those proposals will not come from
-            // here. Avoids unbounded growth of `pending_seals` when a leader
-            // loses leadership between propose and commit.
+            // here. Avoids unbounded growth of `pending_seals`
             if !raft.is_leader() {
                 self.pending_seals.drop_group(*id);
             }
-            for event in raft.take_events() {
-                match event {
-                    RaftEvent::MetadataCommitted(_) if !raft.is_leader() => {}
-                    RaftEvent::MetadataCommitted(mut committed) => {
-                        self.pending_seals.attach_seal_context(*id, &mut committed);
-                        self.pending_events
-                            .push(RaftEvent::MetadataCommitted(committed));
-                    }
-                    other => self.pending_events.push(other),
-                }
-            }
+            self.route_group_events(*id);
         }
         (mutations, last_indices)
+    }
+
+    /// Drain a group's buffered events into `pending_events`. `MetadataCommitted`
+    /// is dropped on non-leaders (only the current leader dispatches to the data
+    /// plane — see invariant 3); seal context is attached for the leader. Called
+    /// both after step-driven apply (`collect_mutations`) and after the durability
+    /// gate advances apply (`persist_and_advance`).
+    fn route_group_events(&mut self, id: ShardGroupId) {
+        let Some(raft) = self.groups.get_mut(&id) else {
+            return;
+        };
+        let is_leader = raft.is_leader();
+        for event in raft.take_events() {
+            match event {
+                RaftEvent::MetadataCommitted(_) if !is_leader => {}
+                RaftEvent::MetadataCommitted(mut committed) => {
+                    self.pending_seals.attach_seal_context(id, &mut committed);
+                    self.pending_events
+                        .push(RaftEvent::MetadataCommitted(committed));
+                }
+                other => self.pending_events.push(other),
+            }
+        }
     }
 
     fn resolve_pending_proposes(&mut self, dirty: &[ShardGroupId]) {
@@ -605,8 +640,13 @@ impl MultiRaft {
         self.storage.persist_mutations(mutations);
         for (id, last_log_index) in last_indices {
             if let Some(raft) = self.groups.get_mut(&id) {
+                // Advancing the durability gate re-attempts apply for entries that
+                // committed before they were persisted. Drain any events that apply
+                // produced — `collect_mutations` already ran this round, so without
+                // this they'd sit undrained until the next flush cycle.
                 raft.advance_stabled_index(last_log_index);
             }
+            self.route_group_events(id);
         }
     }
 }

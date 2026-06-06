@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 
+use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 
 use super::SegmentKey;
+use super::messages::command::DataPlaneCommand;
 use super::messages::*;
 use super::sparse_index::{SparseEntry, SparseIndex};
 use super::wal::WalRecord;
@@ -18,7 +20,7 @@ impl CheckpointWorker {
     pub(crate) fn spawn(
         sparse_index: Arc<dyn SparseIndex>,
         mailbox: Receiver<Box<[CheckpointJob]>>,
-        data_plane_tx: Sender<DataPlaneCommand>,
+        data_plane_tx: DataPlaneSender,
     ) {
         thread::Builder::new()
             .name("checkpoint-worker".into())
@@ -39,7 +41,7 @@ impl CheckpointWorker {
     fn process_job(
         sparse_index: &dyn SparseIndex,
         job: &CheckpointJob,
-        data_plane_tx: &Sender<DataPlaneCommand>,
+        data_plane_tx: &DataPlaneSender,
     ) -> std::io::Result<()> {
         let checkpoint = job.cache.drain_for_checkpoint();
         if checkpoint.is_empty() {
@@ -56,7 +58,7 @@ impl CheckpointWorker {
         for entry in &checkpoint.batches {
             let entry_start_position = byte_position;
 
-            let record = WalRecord::data((*entry.data).clone());
+            let record = WalRecord::data((*entry.data).clone(), entry.record_count);
             record.encode_to(&mut writer)?;
             byte_position += record.encoded_size() as u64;
 
@@ -86,13 +88,12 @@ impl CheckpointWorker {
         sparse_index.put_batch(index_entries)?;
         job.cache.advance_eviction_frontier(checkpoint.new_frontier);
 
-        let _ = data_plane_tx.send(
-            CheckpointComplete {
-                segment_key: job.segment_key,
-                checkpointed_lsn: checkpoint.last_lsn(),
-            }
-            .into(),
-        );
+        let completion: DataPlaneCommand = CheckpointComplete {
+            segment_key: job.segment_key,
+            checkpointed_lsn: checkpoint.last_lsn(),
+        }
+        .into();
+        let _ = data_plane_tx.send(DataPlaneMessage::Command(completion));
 
         Ok(())
     }

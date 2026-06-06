@@ -20,18 +20,20 @@ const REQUEST_ID_SIZE: usize = size_of::<u64>();
 use anyhow::Context;
 use tokio::sync::mpsc;
 
-use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneRequest, NodeInfo, NodeState, ShardDetail, TopicStats,
-    TopicSummary,
-};
+use crate::connections::protocol::*;
+use crate::control_plane::metadata::RangeMeta;
+use crate::data_plane::EntryPayload;
+use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::messages::command::{Produce, ProduceAck};
+use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
 use crate::{
     control_plane::{
-        SwimNodeState,
+        NodeId, SwimNodeState,
         consensus::actor::MutlRaftSender,
         consensus::messages::ProposeError,
         membership::{ShardGroupId, actor::SwimSender},
         metadata::{
+            RangeId,
             command::{CreateTopic, DeleteTopic, MetadataCommand},
             strategy::StoragePolicy,
         },
@@ -172,21 +174,28 @@ impl ClientStreamReader {
 /// Shared across connections (wrappable in `Arc`) — holds no per-connection
 /// state. The caller owns the writer channel and passes it into `run`.
 ///
-/// `node_id`, `data_plane_sender`, and `routing_cache` will be added as fields
-/// in PRs 4–5 once the corresponding types exist.
-#[allow(dead_code)]
+/// `data_plane_sender` will be added as a field once Fetch / ListOffsets land.
+
 #[derive(Clone)]
 pub struct ClientHandler {
+    node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
+    data_plane_tx: DataPlaneSender,
 }
 
-#[allow(dead_code)]
 impl ClientHandler {
-    pub fn new(swim_sender: SwimSender, raft_sender: MutlRaftSender) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_sender: MutlRaftSender,
+        data_plane_tx: DataPlaneSender,
+    ) -> Self {
         Self {
+            node_id,
             swim_sender,
             raft_sender,
+            data_plane_tx,
         }
     }
 
@@ -232,7 +241,7 @@ impl ClientHandler {
             } => self.handle_create_topic(name, storage_policy).await,
             ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
             ControlPlaneRequest::ListHostedTopics => self.handle_list_hosted_topics().await,
-            ControlPlaneRequest::DescribeTopic { .. } => todo!(),
+            ControlPlaneRequest::DescribeTopic { name } => self.handle_describe_topic(name).await,
         };
         match res {
             Ok(resp) => resp,
@@ -241,6 +250,44 @@ impl ClientHandler {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(e.to_string()))
             }
         }
+    }
+
+    /// If this node belongs to the topic's owning shard group, answers directly;
+    /// otherwise it returns the address of any owner so
+    /// the consumer retries against the right node.
+    // ! **No server-side proxying**
+    async fn handle_describe_topic(&self, topic_name: String) -> anyhow::Result<ClientResponse> {
+        let shard_group = self
+            .swim_sender
+            .resolve_shard_group(topic_name.as_bytes().to_vec())
+            .await?
+            .context("shard group not found for topic")?;
+
+        // * Leader Redirection Hint Or NotFound
+        if !shard_group.members.contains(&self.node_id) {
+            let Some((node_id, addr)) = self.swim_sender.resolve_any(&shard_group.members).await?
+            else {
+                return Ok(ControlPlaneResponse::InternalError(
+                    "no reachable member of the topic's metadata shard group".into(),
+                )
+                .into());
+            };
+            return Ok(ControlPlaneResponse::TopicMetadataRedirect {
+                owner: NodeAddressInfo {
+                    node_id: node_id.to_string(),
+                    client_addr: addr.client_addr(),
+                },
+            }
+            .into());
+        }
+
+        let Some(meta) = self.raft_sender.get_topic_metadata(topic_name).await else {
+            return Ok(ControlPlaneResponse::TopicNotFound.into());
+        };
+
+        let addresses = self.swim_sender.list_all_node_addresses().await?;
+        let detail = TopicDetail::from_meta(meta, &addresses);
+        Ok(ControlPlaneResponse::TopicDetail(detail).into())
     }
 
     async fn handle_create_topic(
@@ -325,12 +372,113 @@ impl ClientHandler {
         ))
     }
 
-    async fn handle_data_plane(&self, request: DataPlaneRequest) -> ClientResponse {
-        match request {
-            DataPlaneRequest::Produce { .. } => todo!(),
-            DataPlaneRequest::Fetch { .. } => todo!(),
-            DataPlaneRequest::ListOffsets { .. } => todo!(),
+    async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {
+        let res = match request {
+            ClientDataPlaneRequest::Produce(req) => self.handle_produce(req).await,
+            ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
+            ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
+        };
+        match res {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("client data plane dispatch error: {e}");
+                ClientResponse::DataPlane(DataPlaneResponse::InternalError(e.to_string()))
+            }
         }
+    }
+
+    /// Resolves `topic_name` -> `TopicMeta`, routes `routing_key`
+    /// to the owning active range, and dispatches a `Produce` to the data plane
+    /// for that range's active segment.
+    /// If this node is a follower (or doesn't host it), reply `Err` and the producer re-resolves via `DescribeTopic`.
+    async fn handle_produce(&self, req: ProduceRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+
+        let Some(segment_key) = meta.route_active_segment_key(&req.routing_key) else {
+            return Ok(DataPlaneResponse::InternalError(
+                "no range/segment owns the routing key range has no active segment".into(),
+            )
+            .into());
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = Produce {
+            segment_key,
+            data: EntryPayload::from(req.data),
+            record_count: req.record_count,
+            reply: reply_tx,
+        };
+        let _ = self.data_plane_tx.send(cmd);
+
+        let ack = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("data plane dropped produce reply"))?;
+
+        Ok(match ack {
+            ProduceAck::Ok { entry_id } => DataPlaneResponse::Produced { entry_id }.into(),
+            ProduceAck::Err(reason) => DataPlaneResponse::InternalError(reason).into(),
+        })
+    }
+
+    /// Consume read path.
+    /// 1. Resolves topic_name -> TopicMeta via the metadata RSM (one round trip),
+    /// 2. validates the optional keyspace bound,
+    /// 3. computes the range's current `RangeProgressSignal` from its lineage
+    /// 4. dispatches a `DataPlaneQuery::Fetch` carrying everything the sync data-plane
+    ///
+    /// state machine needs to answer without any further I/O.
+    async fn handle_fetch(&self, req: FetchRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        let Some(range) = meta.ranges.get(&RangeId(req.range_id)) else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        if !keyspace_bound_matches_range(&req.keyspace_bound, range) {
+            return Ok(DataPlaneResponse::KeyspaceBoundNarrowed.into());
+        }
+        let progress_signal = RangeProgressSignal::compute_progress_signal(range, &meta);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let query = DataPlaneQuery::Fetch(Fetch {
+            topic_id: meta.id,
+            range_id: RangeId(req.range_id),
+            entry_id: req.entry_id,
+            max_bytes: req.max_bytes,
+            progress_signal,
+            reply: reply_tx,
+        });
+        if self.data_plane_tx.send(query).is_err() {
+            return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
+        }
+        let result = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("data plane dropped reply"))?;
+        Ok(DataPlaneResponse::from_fetch_result(result).into())
+    }
+
+    /// Offset-bounds query — used by consumers to bound their read window
+    /// for the range's currently-active segment on this node.
+    async fn handle_list_offsets(&self, req: ListOffsetsRequest) -> anyhow::Result<ClientResponse> {
+        let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
+            return Ok(DataPlaneResponse::TopicNotFound.into());
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        let query: DataPlaneQuery = ListOffsets {
+            topic_id: meta.id,
+            range_id: RangeId(req.range_id),
+            reply: reply_tx,
+        }
+        .into();
+
+        let _ = self.data_plane_tx.send(query);
+
+        let list_offset_result = reply_rx.await.context("data plane dropped reply")?;
+        let result = DataPlaneResponse::from_list_offset_result(list_offset_result);
+        Ok(result.into())
     }
 
     async fn handle_admin(&self, request: AdminRequest) -> ClientResponse {
@@ -339,7 +487,7 @@ impl ClientHandler {
             AdminRequest::ListHostedTopicsWithStats => {
                 self.handle_list_hosted_topics_with_stats().await
             }
-            AdminRequest::SplitRange { .. } => todo!(),
+
             AdminRequest::GetShardInfo { key } => self.handle_get_shard_info(key).await,
             AdminRequest::GetShardLeader { shard_group_id } => {
                 self.handle_get_shard_leader(shard_group_id).await
@@ -357,7 +505,7 @@ impl ClientHandler {
             .into_iter()
             .map(|m| NodeInfo {
                 node_id: m.node_id.to_string(),
-                addr: m.addr.client_addr,
+                addr: m.addr.client_addr(),
                 state: match m.state {
                     SwimNodeState::Alive => NodeState::Alive,
                     SwimNodeState::Suspect => NodeState::Suspect,
@@ -391,7 +539,7 @@ impl ClientHandler {
             .map(|(group, leader)| ShardDetail {
                 shard_group_id: group.id.0,
                 leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
-                leader_addr: leader.map(|e| e.leader_addr.client_addr),
+                leader_addr: leader.map(|e| e.leader_addr.client_addr()),
                 member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
@@ -404,6 +552,19 @@ impl ClientHandler {
             .await
             .map(|n| n.to_string());
         Ok(ClientResponse::Admin(AdminResponse::ShardLeader { leader }))
+    }
+}
+
+// ── Pure helpers for the fetch path ────────────────────────────────────────
+
+/// D4 accepts only `None` or a bound matching the range's full keyspace.
+/// Anything narrower is rejected with `KeyspaceBoundNarrowed` so the future
+/// consumer-group layer can enable server-side narrowing without a wire-format
+/// break (see d4_consumer_range_tracking.md §Wire Protocol).
+fn keyspace_bound_matches_range(bound: &Option<KeyspaceBound>, range: &RangeMeta) -> bool {
+    match bound {
+        None => true,
+        Some(b) => b.start == range.keyspace_start && b.end == range.keyspace_end,
     }
 }
 
@@ -428,8 +589,6 @@ pub async fn run_client_writer(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
         ControlPlaneResponse, NodeState,
@@ -438,10 +597,12 @@ mod tests {
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
-        ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, QueryCommand,
+        QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
     };
-    use crate::control_plane::metadata::types::TopicStats as MetadataTopicStats;
+    use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
     use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
+    use crate::data_plane::actor::DataPlaneSender;
+    use std::net::SocketAddr;
 
     use super::ClientHandler;
 
@@ -484,11 +645,18 @@ mod tests {
         tx
     }
 
+    /// Test stub for the data-plane sender. Existing tests don't exercise the
+    /// data plane path, so a dropped-receiver channel is fine — sends would
+    /// fail, but the tested code paths never send.
+    fn dp_stub() -> DataPlaneSender {
+        let (tx, _) = crossbeam_channel::bounded(1);
+        DataPlaneSender(tx)
+    }
+
     #[tokio::test]
     async fn create_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
-            {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
@@ -497,7 +665,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(swim, raft)
+        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
@@ -522,12 +690,11 @@ mod tests {
     #[tokio::test]
     async fn create_topic_shard_not_found() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
-            {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
@@ -552,8 +719,7 @@ mod tests {
     #[tokio::test]
     async fn delete_topic_ok() {
         let swim = swim_sender_with(|cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd
-            {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
@@ -562,7 +728,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(swim, raft)
+        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DeleteTopic { name: "t1".into() },
             ))
@@ -583,7 +749,7 @@ mod tests {
                 let _ = reply.send(vec!["alpha".into(), "beta".into()]);
             }
         });
-        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::ListHostedTopics,
             ))
@@ -594,6 +760,83 @@ mod tests {
         assert_eq!(topics.len(), 2);
         assert_eq!(topics[0].name, "alpha");
         assert_eq!(topics[1].name, "beta");
+    }
+
+    /// When the addressed node is NOT in the topic's owning shard group, the
+    /// handler must return a redirect carrying the address of an owner — never
+    /// proxy the request. See d4_consumer_range_tracking.md §Bootstrap.
+    #[tokio::test]
+    async fn describe_topic_redirects_when_not_owner() {
+        let owner = node_id("owner");
+        let owner_addr = NodeAddress::test(addr(18002), addr(8082));
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            members: vec![owner.clone()],
+        };
+        let swim = {
+            let group = group.clone();
+            let owner = owner.clone();
+            swim_sender_with(move |cmd| match cmd {
+                SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
+                    let _ = reply.send(Some(group.clone()));
+                }
+                SwimActorCommand::Query(QueryCommand::ResolveAddress { node_id: q, reply }) => {
+                    let _ = reply.send((q == owner).then_some(owner_addr));
+                }
+                _ => {}
+            })
+        };
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::DescribeTopic {
+                    name: "elsewhere".into(),
+                },
+            ))
+            .await;
+        let ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect {
+            owner: redirect_owner,
+        }) = resp
+        else {
+            panic!("expected TopicMetadataRedirect, got {resp:?}");
+        };
+        assert_eq!(redirect_owner.node_id, "owner");
+        assert_eq!(redirect_owner.client_addr, addr(8082));
+    }
+
+    /// When the addressed node IS in the owning shard group but the topic
+    /// does not exist there, return TopicNotFound — only the owner can
+    /// authoritatively report absence.
+    #[tokio::test]
+    async fn describe_topic_not_found_on_owner() {
+        let me = node_id("self");
+        let group = ShardGroup {
+            id: ShardGroupId(7),
+            members: vec![me.clone()],
+        };
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::GetTopicMetadata { reply, .. } = cmd {
+                let _ = reply.send(None);
+            }
+        });
+        let resp = ClientHandler::new(me, swim, raft, dp_stub())
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::DescribeTopic {
+                    name: "missing".into(),
+                },
+            ))
+            .await;
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound)
+            ),
+            "expected TopicNotFound, got {resp:?}"
+        );
     }
 
     #[tokio::test]
@@ -621,7 +864,7 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::DescribeCluster))
             .await;
         let ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: info }) = resp else {
@@ -651,7 +894,7 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
                 key: b"any".to_vec(),
             }))
@@ -672,7 +915,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(swim, raft_sender_with(|_| {}))
+        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
                 key: b"x".to_vec(),
             }))
@@ -693,7 +936,7 @@ mod tests {
                 let _ = reply.send(Some(node_id("n1")));
             }
         });
-        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
                 shard_group_id: 42,
             }))
@@ -715,7 +958,7 @@ mod tests {
                 }]);
             }
         });
-        let resp = ClientHandler::new(swim_sender_with(|_| {}), raft)
+        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
             .dispatch(ClientRequest::Admin(
                 AdminRequest::ListHostedTopicsWithStats,
             ))

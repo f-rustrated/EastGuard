@@ -28,7 +28,13 @@ fn spawn_node(sim: &mut turmoil::Sim<'static>, i: u8, total: u8) {
         let me = turmoil::lookup(name.as_str());
         let seeds: Vec<String> = (1..=total)
             .filter(|&j| j != i)
-            .map(|j| format!("{}:{}", turmoil::lookup(node_name(j).as_str()), cluster_port(j)))
+            .map(|j| {
+                format!(
+                    "{}:{}",
+                    turmoil::lookup(node_name(j).as_str()),
+                    cluster_port(j)
+                )
+            })
             .collect();
         let mut env = default_env(i as u32, name.clone(), cp, rp);
         env.advertise_host = Some(me.to_string());
@@ -71,9 +77,9 @@ fn metadata_visible() -> turmoil::Result {
         }
         assert!(acked, "CreateTopic was not acked by any node within 30s");
 
-        let nodes: &[(&str, u16)] =
-            &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
-        assert_topic_visible_on_quorum(nodes, "visible-test", 60, Duration::from_millis(100)).await?;
+        let nodes: &[(&str, u16)] = &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        assert_topic_visible_on_quorum(nodes, "visible-test", 60, Duration::from_millis(100))
+            .await?;
         Ok(())
     });
 
@@ -119,18 +125,33 @@ fn leader_elects_after_kill() -> turmoil::Result {
         tokio::time::sleep(Duration::from_secs(10)).await; // ensures we are past t=20s
 
         // Retry until at least one surviving node reports a leader that isn't node-1.
+        // Transient query errors (e.g. inner connect/read timeouts firing while the
+        // surviving nodes are mid-election) are treated as "no leader yet" — the
+        // whole point of this loop is to absorb such transients during convergence.
         let mut elected = false;
         for _ in 0..300u32 {
-            let l2 = query_shard_leader("node-2", 8082, shard_group_id).await?;
-            let l3 = query_shard_leader("node-3", 8083, shard_group_id).await?;
-            let any_new = [&l2, &l3].into_iter().flatten().any(|l| !l.starts_with("node-1"));
+            let l2 = query_shard_leader("node-2", 8082, shard_group_id)
+                .await
+                .ok()
+                .flatten();
+            let l3 = query_shard_leader("node-3", 8083, shard_group_id)
+                .await
+                .ok()
+                .flatten();
+            let any_new = [&l2, &l3]
+                .into_iter()
+                .flatten()
+                .any(|l| !l.starts_with("node-1"));
             if any_new {
                 elected = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(elected, "no new leader elected within 30s after killing node-1");
+        assert!(
+            elected,
+            "no new leader elected within 30s after killing node-1"
+        );
 
         let survivors: &[(&str, u16)] = &[("node-2", 8082), ("node-3", 8083)];
         assert_single_leader(survivors, shard_group_id, Duration::ZERO).await?;
@@ -177,8 +198,7 @@ fn membership_converges_after_rejoin() -> turmoil::Result {
         // node-1 is bounced at t≈40s. Wait for rejoin + membership convergence.
         tokio::time::sleep(Duration::from_secs(30)).await; // now at t≈65s
 
-        let all_nodes: &[(&str, u16)] =
-            &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        let all_nodes: &[(&str, u16)] = &[("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
         assert_membership_converged(all_nodes, 30, Duration::from_secs(1)).await?;
         Ok(())
     });

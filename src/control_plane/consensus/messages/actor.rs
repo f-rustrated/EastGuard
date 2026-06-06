@@ -2,7 +2,8 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::{NodeDead, ShardGroupId};
-use crate::control_plane::metadata::types::TopicStats;
+use crate::control_plane::metadata::{TopicMeta, TopicStats};
+use crate::data_plane::messages::command::SegmentAssignmentAck;
 
 use super::command::{
     ConsensusCommand, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, PacketReceived,
@@ -37,8 +38,20 @@ pub enum MultiRaftActorCommand {
     GetTopicStats {
         reply: oneshot::Sender<Vec<TopicStats>>,
     },
+    /// Query full metadata for a single topic by name. Returns `None` when the
+    /// topic's metadata is not hosted on this node (i.e. this node is not in
+    /// the topic's owning shard group). Callers above use that signal to issue
+    /// a redirect rather than to declare the topic missing — only the metadata
+    /// owner can authoritatively report absence.
+    GetTopicMetadata {
+        topic_name: String,
+        reply: oneshot::Sender<Option<TopicMeta>>,
+    },
     /// Data plane SealRequest forwarded to coordinator for Raft proposal.
     Coordinator(CoordinatorSealRequest),
+    /// Data-leader confirmation that it received a `SegmentAssignment`. Marks the
+    /// segment confirmed so the leader's heartbeat sweep stops re-driving it.
+    AssignmentAck(SegmentAssignmentAck),
 }
 
 impl From<ConsensusCommand> for MultiRaftActorCommand {
@@ -72,4 +85,5 @@ pub(crate) enum DeferredReply {
     ),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
     GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
+    GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Option<TopicMeta>),
 }

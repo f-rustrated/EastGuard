@@ -67,6 +67,25 @@ impl ReplicationState {
         self.pending_replies.remove(segment_key).unwrap_or_default()
     }
 
+    /// Pop the oldest waiting reply for a segment (FIFO). The no-follower commit
+    /// path publishes one entry per produce in order, so popping one reply per
+    /// published entry pairs each producer with its exact committed `entry_id`.
+    pub(crate) fn pop_pending_reply(
+        &mut self,
+        segment_key: &SegmentKey,
+    ) -> Option<oneshot::Sender<ProduceAck>> {
+        let replies = self.pending_replies.get_mut(segment_key)?;
+        if replies.is_empty() {
+            self.pending_replies.remove(segment_key);
+            return None;
+        }
+        let reply = replies.remove(0);
+        if replies.is_empty() {
+            self.pending_replies.remove(segment_key);
+        }
+        Some(reply)
+    }
+
     pub(crate) fn drain_all_pending_replies(
         &mut self,
     ) -> impl Iterator<Item = oneshot::Sender<ProduceAck>> + '_ {
@@ -314,8 +333,11 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .send(ProduceAck::Ok);
-        assert!(matches!(rx.blocking_recv().unwrap(), ProduceAck::Ok));
+            .send(ProduceAck::Ok { entry_id: 42 });
+        assert!(matches!(
+            rx.blocking_recv().unwrap(),
+            ProduceAck::Ok { entry_id: 42 }
+        ));
     }
 
     #[test]

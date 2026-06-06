@@ -3,8 +3,8 @@ use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState,
 };
-use crate::control_plane::SwimNode;
-use crate::control_plane::SwimNodeState;
+use crate::control_plane::{NodeAddress, SwimNode};
+use crate::control_plane::{NodeId, SwimNodeState};
 use crate::net::TcpStream;
 
 pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
@@ -63,12 +63,8 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
     let members = nodes
         .into_iter()
         .map(|n| SwimNode {
-            node_id: crate::control_plane::NodeId::new(&n.node_id),
-            addr: crate::control_plane::NodeAddress {
-                cluster_addr: n.addr,
-                client_addr: n.addr,
-                data_addr: n.addr,
-            },
+            node_id: NodeId::new(&n.node_id),
+            addr: NodeAddress::new(n.addr, n.addr, n.addr),
             state: match n.state {
                 NodeState::Alive => SwimNodeState::Alive,
                 NodeState::Suspect => SwimNodeState::Suspect,
@@ -124,12 +120,30 @@ pub async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> boo
 }
 
 /// Sends a `ClientRequest` to a node and returns the raw `ClientResponse`.
+/// Upper bound on a single client round-trip. Healthy produce/fetch/metadata
+/// requests complete in well under a second; this only trips when the server
+/// holds the reply indefinitely (e.g. a produce parked on a stalled commit).
+/// Failing fast with a clear message beats hanging the whole (serial) suite —
+/// `send_request` has no other escape, since the data plane can legitimately
+/// park a reply until commit.
+const SEND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn send_request(host: &str, port: u16, req: ClientRequest) -> ClientResponse {
-    let stream = TcpStream::connect((host, port)).await.unwrap();
-    let (read_half, write_half) = stream.into_split();
-    let mut writer = ClientRawWriter::new(write_half);
-    let mut reader = ClientStreamReader::new(read_half);
-    writer.write(0, &req).await.unwrap();
-    let (_, response) = reader.read_request().await.unwrap();
-    response
+    let exchange = async {
+        let stream = TcpStream::connect((host, port)).await.unwrap();
+        let (read_half, write_half) = stream.into_split();
+        let mut writer = ClientRawWriter::new(write_half);
+        let mut reader = ClientStreamReader::new(read_half);
+        writer.write(0, &req).await.unwrap();
+        let (_, response) = reader.read_request().await.unwrap();
+        response
+    };
+    tokio::time::timeout(SEND_REQUEST_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "send_request to {host}:{port} timed out after {SEND_REQUEST_TIMEOUT:?} \
+                 (server never replied — likely a parked/stalled request)"
+            )
+        })
 }

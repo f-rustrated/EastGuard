@@ -1,5 +1,7 @@
 use super::checkpoint::CheckpointJob;
+use super::cold_read::ColdReadPool;
 use super::messages::pending::DataPlaneOutputs;
+use super::sparse_index::SparseIndex;
 use super::state::DataPlane;
 use super::timer::SegmentAgeTimer;
 use super::wal::WalWriter;
@@ -7,11 +9,15 @@ use crate::channels::BatchSender;
 use crate::config::DataNodeConfig;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
+use crate::data_plane::cold_read::DEFAULT_POOL_SIZE;
+use crate::data_plane::messages::DataPlaneMessage;
 use crate::data_plane::messages::command::DataPlaneCommand;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{TICK_PERIOD_10_MS, TICK_PERIOD_100_MS};
-use crossbeam_channel::Sender;
+
+use crossbeam_channel::{SendError, Sender};
+use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
 
@@ -27,9 +33,13 @@ impl DataPlaneActor {
         checkpoint_tx: Sender<Box<[CheckpointJob]>>,
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
-    ) -> Sender<DataPlaneCommand> {
-        // Schedulers send DataPlaneCommand via tokio mpsc; bridge forwards to crossbeam.
+        sparse_index: Arc<dyn SparseIndex>,
+    ) -> DataPlaneSender {
         let (timer_tx, mut timer_rx) = mpsc::channel::<DataPlaneCommand>(64);
+
+        // Cold-read pool: serves fetches that land on sealed segment files.
+        // Shares the same sparse index the checkpoint worker populates.
+        let cold_read_tx = ColdReadPool::spawn(DEFAULT_POOL_SIZE, sparse_index);
 
         let batch_scheduler_tx =
             spawn_scheduling_actor(timer_tx.clone(), 64, TICK_PERIOD_10_MS, None);
@@ -43,13 +53,13 @@ impl DataPlaneActor {
             Some(config.age_check_ticks()),
         );
 
-        let (tx, mailbox) = crossbeam_channel::bounded(4096);
+        let (tx, mailbox) = crossbeam_channel::bounded::<DataPlaneMessage>(4096);
 
         // Timer bridge: schedulers send via tokio mpsc, bridge forwards to crossbeam
         let bridge_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(cmd) = timer_rx.recv().await {
-                if bridge_tx.send(cmd).is_err() {
+                if bridge_tx.send(DataPlaneMessage::Command(cmd)).is_err() {
                     break;
                 }
             }
@@ -72,13 +82,13 @@ impl DataPlaneActor {
                     data_transport_tx,
                     coordinator_tx,
                 );
-                let mut state = DataPlane::new(node_id, config, wal, out);
+                let mut state = DataPlane::new(node_id, config, wal, cold_read_tx, out);
 
-                while let Ok(cmd) = mailbox.recv() {
-                    state.handle_command(cmd);
+                while let Ok(msg) = mailbox.recv() {
+                    state.process(msg);
 
                     while let Ok(next) = mailbox.try_recv() {
-                        state.handle_command(next);
+                        state.process(next);
                     }
 
                     state.flush_and_dispatch();
@@ -86,6 +96,18 @@ impl DataPlaneActor {
             })
             .expect("failed to spawn data-plane thread");
 
-        tx
+        DataPlaneSender(tx)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DataPlaneSender(pub crossbeam_channel::Sender<DataPlaneMessage>);
+
+impl DataPlaneSender {
+    pub fn send(
+        &self,
+        msg: impl Into<DataPlaneMessage>,
+    ) -> Result<(), SendError<DataPlaneMessage>> {
+        self.0.send(msg.into())
     }
 }

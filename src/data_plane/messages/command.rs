@@ -13,8 +13,8 @@ use crate::{
 pub enum DataPlaneCommand {
     Produce(Produce),
     CheckpointComplete(CheckpointComplete),
-    Timeout(DataPlaneTimeoutCallback),
-    InterNode(DataPlaneInterNodeCommand),
+    DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
+    DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 }
 
 pub struct Produce {
@@ -30,6 +30,13 @@ pub struct SegmentAssignment {
     pub shard_group_id: ShardGroupId,
     pub replica_set: Vec<NodeId>,
     pub start_entry_id: u64,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SegmentAssignmentAck {
+    pub segment_key: SegmentKey,
+    pub shard_group_id: ShardGroupId,
+    pub from: NodeId,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -77,6 +84,7 @@ pub struct SegmentSealed {
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
+    SegmentAssignmentAck(SegmentAssignmentAck),
     ReplicaAppend(ReplicaAppend),
     ReplicaAck(ReplicaAck),
     CommitAdvance(CommitAdvance),
@@ -88,6 +96,7 @@ pub enum DataPlaneInterNodeCommand {
 impl_from_variant!(
     DataPlaneInterNodeCommand,
     SegmentAssignment,
+    SegmentAssignmentAck,
     ReplicaAppend,
     ReplicaAck,
     CommitAdvance,
@@ -99,7 +108,12 @@ impl_from_variant!(
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum ProduceAck {
-    Ok,
+    /// `entry_id` is the committed offset for this produce. Exact for a producer
+    /// with one request in flight at a time (the common case); under pipelining
+    /// it is the segment's committed highwater at ack time (an upper bound).
+    Ok {
+        entry_id: u64,
+    },
     Err(String),
 }
 
@@ -112,8 +126,8 @@ impl_from_variant!(
     DataPlaneCommand,
     Produce,
     CheckpointComplete,
-    Timeout(DataPlaneTimeoutCallback),
-    InterNode(DataPlaneInterNodeCommand),
+    DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
+    DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );
 
 use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};

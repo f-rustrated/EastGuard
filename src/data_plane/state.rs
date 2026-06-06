@@ -1,9 +1,13 @@
 use super::SegmentKey;
+use super::cold_read::ColdReadRequest;
+use super::messages::DataPlaneMessage;
 use super::messages::command::DataPlaneInterNodeCommand;
 use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
+use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
+use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
@@ -13,6 +17,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
 use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
+use crate::data_plane::states::segment_store::SegmentReadState;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
 use crate::data_plane::transport::command::DataTransportSendToCoordinator;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -29,13 +34,22 @@ pub struct DataPlane<W: WalStorage> {
     node_id: NodeId,
     config: DataNodeConfig,
     wal: W,
-    segments: HashMap<SegmentKey, SegmentTracker>,
+    /// All locally-resident segments + the secondary indexes the consume
+    /// read path needs. See `states::segment_store::SegmentStore`.
+    segments: SegmentStore,
     dirty_segments: Vec<SegmentKey>,
     buffer_byte_count: usize,
     needs_flush: bool,
 
     replication: ReplicationState,
     pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+
+    /// Hand-off channel to the cold-read thread pool. A fetch that resolves to a
+    /// sealed segment (whose live tracker is gone) is forwarded here; the pool
+    /// reads the segment file and fulfils the consumer's reply directly, so this
+    /// synchronous worker never blocks on disk I/O.
+    cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+
     out: DataPlaneOutputs,
 }
 
@@ -44,41 +58,55 @@ impl<W: WalStorage> DataPlane<W> {
         node_id: NodeId,
         config: DataNodeConfig,
         wal: W,
-
+        cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
         out: DataPlaneOutputs,
     ) -> Self {
         DataPlane {
             node_id,
             config,
             wal,
-            segments: HashMap::new(),
+            segments: SegmentStore::new(),
             dirty_segments: Vec::new(),
             buffer_byte_count: 0,
             needs_flush: false,
-
             replication: ReplicationState::default(),
             pending_seal_requests: HashMap::new(),
+            cold_read_handoff_sender,
             out,
         }
     }
 
-    pub(crate) fn handle_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
+    pub(crate) fn process(&mut self, msg: impl Into<DataPlaneMessage>) {
+        match msg.into() {
+            DataPlaneMessage::Command(cmd) => self.handle_command(cmd),
+            DataPlaneMessage::Query(q) => self.handle_query(q),
+        }
+    }
+
+    fn handle_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
         let cmd = cmd.into();
         match cmd {
             DataPlaneCommand::Produce(cmd) => self.handle_produce(cmd),
             DataPlaneCommand::CheckpointComplete(complete) => {
                 self.handle_checkpoint_complete(complete);
             }
-            DataPlaneCommand::Timeout(callback) => {
+            DataPlaneCommand::DataPlaneTimeoutCallback(callback) => {
                 self.handle_timeout(callback);
             }
-            DataPlaneCommand::InterNode(inter) => {
+            DataPlaneCommand::DataPlaneInterNodeCommand(inter) => {
                 self.process_inter_node(inter);
             }
         }
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
+    }
+
+    fn handle_query(&self, q: impl Into<DataPlaneQuery>) {
+        match q.into() {
+            DataPlaneQuery::Fetch(f) => self.handle_fetch(f),
+            DataPlaneQuery::ListOffsets(lo) => self.handle_list_offsets(lo),
+        }
     }
 
     pub(crate) fn flush_and_dispatch(&mut self) {
@@ -118,6 +146,125 @@ impl<W: WalStorage> DataPlane<W> {
                 seq: self.wal.next_lsn(),
                 timer: BatchFlushTimer::deadline(),
             });
+    }
+
+    /// Consume fetch. Resolves `(topic, range, entry_id)` through the segment
+    /// store and routes to one of two read paths:
+    /// - **Active** segment → hot read from the live tracker's tail cache.
+    /// - **Sealed** segment → hand off to the cold-read pool, which reads the
+    ///   segment file off disk and fulfils the consumer's reply itself.
+    ///
+    /// Returns `SegmentNotLocal` when no locally-hosted segment of the range
+    /// covers the offset (the consumer re-resolves via `DescribeTopic`).
+    fn handle_fetch(&self, cmd: Fetch) {
+        let Some(read_stat) = self
+            .segments
+            .resolve(cmd.topic_id, cmd.range_id, cmd.entry_id)
+        else {
+            let _ = cmd.reply.send(FetchResult::SegmentNotLocal);
+            return;
+        };
+
+        match read_stat {
+            SegmentReadState::Active(key) => self.handle_hot_fetch(cmd, key),
+            SegmentReadState::Sealed { key, end_entry_id } => {
+                self.dispatch_cold_fetch(cmd, key, end_entry_id)
+            }
+        }
+    }
+
+    /// Read committed records from a live (active) segment's tail cache.
+    fn handle_hot_fetch(&self, cmd: Fetch, key: SegmentKey) {
+        let Some(tracker) = self.segments.get(&key) else {
+            // Resolver and store invariants should keep these in sync(just a guard)
+            let _ = cmd.reply.send(FetchResult::SegmentNotLocal);
+            return;
+        };
+
+        let cache = tracker.cache();
+        let read_cursor = cache.load_read_cursor();
+
+        // The active tail can have `committed_entry_id = 0` and no entries
+        // yet committed; distinguish "no data committed at all" by also
+        // checking against the cache read cursor.
+        if cmd.entry_id >= read_cursor {
+            // Past the tail — nothing to return.
+            let _ = cmd.reply.send(FetchResult::Records {
+                entries: Vec::new(),
+                next_entry_id: cmd.entry_id,
+                progress_signal: cmd.progress_signal,
+            });
+            return;
+        }
+
+        let mut entries = Vec::new();
+        let mut next_entry_id = cmd.entry_id;
+        let mut bytes_read: usize = 0;
+        let max_bytes = cmd.max_bytes as usize;
+
+        while let Some(entry_arc) = cache.read_committed(next_entry_id) {
+            let payload_len = entry_arc.data.len();
+            // Always include at least one entry (even if max_bytes is small).
+            if !entries.is_empty() && bytes_read + payload_len > max_bytes {
+                break;
+            }
+            next_entry_id = entry_arc.entry_id + 1;
+            entries.push(entry_arc);
+            bytes_read += payload_len;
+
+            if bytes_read >= max_bytes {
+                break;
+            }
+        }
+
+        let _ = cmd.reply.send(FetchResult::Records {
+            entries,
+            next_entry_id,
+            progress_signal: cmd.progress_signal,
+        });
+    }
+
+    /// Hand a sealed-segment read off to the cold-read pool. The pool owns the
+    /// reply channel from here on, so this returns immediately without blocking.
+    fn dispatch_cold_fetch(&self, cmd: Fetch, key: SegmentKey, end_entry_id: u64) {
+        let req = ColdReadRequest {
+            segment_key: key,
+            segment_file_path: key.file_path(&self.config.data_dir),
+            start_entry_offset: cmd.entry_id,
+            end_entry_id,
+            max_bytes: cmd.max_bytes as u64,
+            progress_signal: cmd.progress_signal,
+            reply: cmd.reply,
+        };
+        if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req) {
+            let _ = req.reply.send(FetchResult::InternalError(
+                "cold-read pool unavailable".into(),
+            ));
+        }
+    }
+
+    /// Returns the start and currently-committed entry IDs for the range's
+    /// active segment on this node. Used by the consumer's `ListOffsets`
+    /// query to bound its read window.
+    fn handle_list_offsets(&self, cmd: ListOffsets) {
+        // The active write head sits at the largest `start_entry_id` in the
+        // active index. Resolve via the highest indexable offset (u64::MAX)
+        // to land on whatever's currently active.
+        let Some(SegmentReadState::Active(key)) =
+            self.segments.resolve(cmd.topic_id, cmd.range_id, u64::MAX)
+        else {
+            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            return;
+        };
+
+        let Some(tracker) = self.segments.get(&key) else {
+            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            return;
+        };
+        let _ = cmd.reply.send(ListOffsetsResult::Offsets {
+            start_entry_id: tracker.start_entry_id(),
+            committed_entry_id: tracker.committed_entry_id(),
+        });
     }
 
     fn handle_checkpoint_complete(&mut self, complete: CheckpointComplete) {
@@ -165,6 +312,14 @@ impl<W: WalStorage> DataPlane<W> {
                         CoordinatorSealRequest { request: cmd },
                     ));
             }
+
+            // Assignment confirmation from a data-leader — forward to the local
+            // MultiRaftActor (we are this shard's coordinator), which marks the
+            // segment confirmed so the heartbeat sweep stops re-driving it.
+            C::SegmentAssignmentAck(cmd) => {
+                self.out
+                    .store_coordinator_cmd(MultiRaftActorCommand::AssignmentAck(cmd));
+            }
         }
     }
 
@@ -174,8 +329,12 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         self.commit_segment(cmd.segment_key, committed.entry_id);
-
-        self.out.produce_replies.extend(committed.replies);
+        self.out.produce_replies.extend(
+            committed
+                .replies
+                .into_iter()
+                .map(|reply| (committed.entry_id, reply)),
+        );
 
         if let Some(seq) = committed.reset_timer_seq {
             self.out
@@ -185,19 +344,27 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
-        if self.segments.contains_key(&cmd.segment_key) {
-            return;
+        if !self.segments.contains_key(&cmd.segment_key) {
+            let tracker = SegmentTracker::new_with_start_entry_id(
+                cmd.segment_key.file_path(&self.config.data_dir),
+                SegmentRole::Leader,
+                cmd.replica_set,
+                cmd.shard_group_id,
+                cmd.start_entry_id,
+            );
+            self.segments.insert_active(cmd.segment_key, tracker);
         }
 
-        let tracker = SegmentTracker::new_with_start_entry_id(
-            cmd.segment_key.file_path(&self.config.data_dir),
-            SegmentRole::Leader,
-            cmd.replica_set,
-            cmd.shard_group_id,
-            cmd.start_entry_id,
-        );
-
-        self.segments.insert(cmd.segment_key, tracker);
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id: cmd.shard_group_id,
+                message: SegmentAssignmentAck {
+                    segment_key: cmd.segment_key,
+                    shard_group_id: cmd.shard_group_id,
+                    from: self.node_id.clone(),
+                }
+                .into(),
+            });
     }
 
     fn process_replica_append(&mut self, cmd: ReplicaAppend) {
@@ -214,7 +381,7 @@ impl<W: WalStorage> DataPlane<W> {
                 return;
             }
 
-            self.segments.insert(
+            self.segments.insert_active(
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
                     cmd.segment_key.file_path(&self.config.data_dir),
@@ -260,12 +427,15 @@ impl<W: WalStorage> DataPlane<W> {
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
 
         let shard_group_id = old_tracker.shard_group_id();
+        let old_start = old_tracker.start_entry_id();
+        let old_end = old_tracker.committed_entry_id();
+        let new_start_entry_id = old_end + 1;
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
             new_segment_key.file_path(&self.config.data_dir),
             SegmentRole::Leader,
             cmd.new_replica_set,
             shard_group_id,
-            old_tracker.committed_entry_id() + 1,
+            new_start_entry_id,
         );
 
         // Replay uncommitted records into the new tracker's staged_records.
@@ -293,13 +463,22 @@ impl<W: WalStorage> DataPlane<W> {
                 ));
         }
 
-        self.segments.insert(new_segment_key, new_tracker);
+        self.segments.insert_active(new_segment_key, new_tracker);
+        // The leader's old tracker stays in self.segments (no remove here —
+        // that happens via the follower-side SegmentSealed path). But the
+        // resolver index now points at the new active segment for the range;
+        // the old one moves to sealed so cold reads still find it.
+        self.segments
+            .move_active_to_sealed(cmd.old_segment_key, old_start, old_end);
         self.dirty_segments.push(new_segment_key);
         self.needs_flush = true;
     }
 
     fn handle_segment_sealed(&mut self, segment_key: SegmentKey) {
-        if let Some(tracker) = self.segments.remove(&segment_key) {
+        // On followers this is where the seal is first observed; the store
+        // captures end_entry_id from the tracker's own committed boundary.
+        // a duplicate migrate would be harmless (the sealed entry is immutable by construction).
+        if let Some(tracker) = self.segments.take_active_and_seal(segment_key) {
             self.out.store_checkpoint(tracker.checkpoint(segment_key));
         }
     }
@@ -447,7 +626,13 @@ impl<W: WalStorage> DataPlane<W> {
                 match tracker.role() {
                     SegmentRole::Leader => {
                         if tracker.followers().is_empty() {
+                            // No followers → committed the moment it's durable.
                             tracker.commit_entry(entry.entry_id);
+                            if let Some(reply) = self.replication.pop_pending_reply(&key) {
+                                let _ = reply.send(ProduceAck::Ok {
+                                    entry_id: entry.entry_id,
+                                });
+                            }
                         } else {
                             segment_batches.push(PendingReplicationBatch {
                                 segment_key: key,
@@ -486,10 +671,6 @@ impl<W: WalStorage> DataPlane<W> {
             let (targets, message) = pending_repl.into_replica_append();
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(targets, message));
-        }
-
-        for reply in self.replication.drain_all_pending_replies() {
-            let _ = reply.send(ProduceAck::Ok);
         }
 
         self.buffer_byte_count = 0;
@@ -573,6 +754,8 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
             "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count})",
             self.buffer_byte_count
         );
+
+        self.segments.assert_invariants();
     }
 }
 
@@ -583,6 +766,7 @@ mod tests {
     use super::*;
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::data_plane::cold_read::DEFAULT_POOL_SIZE;
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
 
@@ -618,10 +802,15 @@ mod tests {
     fn make_data_plane(dir: &tempfile::TempDir) -> DataPlane<WalWriter> {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
         let out = DataPlaneOutputs::test();
+        // Tests don't exercise the cold-read path; an unbounded sink channel
+        // whose receiver we leak keeps any dispatched request from panicking.
+        let (cold_read_tx, _cold_read_rx) = crossbeam_channel::unbounded();
+        std::mem::forget(_cold_read_rx);
         DataPlane::new(
             test_node_id(),
             test_config(dir.path().to_path_buf()),
             wal,
+            cold_read_tx,
             out,
         )
     }
@@ -634,7 +823,7 @@ mod tests {
     }
 
     fn assign_segment(key: SegmentKey, replica_set: Vec<NodeId>) -> DataPlaneCommand {
-        DataPlaneCommand::InterNode(
+        DataPlaneCommand::DataPlaneInterNodeCommand(
             SegmentAssignment {
                 segment_key: key,
                 shard_group_id: ShardGroupId(1),
@@ -694,12 +883,12 @@ mod tests {
         let (cmd, rx) = produce(test_key());
         dp.handle_command(cmd);
 
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
 
         let ack = rx.blocking_recv().unwrap();
-        assert!(matches!(ack, ProduceAck::Ok));
+        assert!(matches!(ack, ProduceAck::Ok { .. }));
     }
 
     #[test]
@@ -744,7 +933,9 @@ mod tests {
 
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         assert!(!dp.has_buffered_data());
@@ -783,7 +974,7 @@ mod tests {
 
         dp.flush_batch();
 
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
         assert!(!dp.has_buffered_data());
@@ -799,7 +990,7 @@ mod tests {
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
 
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
 
@@ -839,7 +1030,7 @@ mod tests {
         assert!(dp.buffer_byte_count >= TEST_BATCH_MAX_BYTES);
         dp.flush_batch();
 
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
         assert!(!dp.has_buffered_data());
@@ -928,7 +1119,9 @@ mod tests {
 
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         let tracker = dp.segments.get(&test_key()).unwrap();
@@ -949,7 +1142,9 @@ mod tests {
 
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         let cache = dp.segments.get(&test_key()).unwrap().cache();
@@ -973,7 +1168,9 @@ mod tests {
 
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         assert!(!dp.out.transport_cmds.is_empty());
@@ -991,7 +1188,9 @@ mod tests {
         dp.handle_command(cmd);
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
         dp.out.transport_cmds.clear();
 
@@ -1009,7 +1208,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader, test_node_id()],
@@ -1034,7 +1233,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader.clone(), test_node_id()],
@@ -1057,7 +1256,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![NodeId::new("other-leader"), NodeId::new("other-follower")],
@@ -1077,7 +1276,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader.clone(), test_node_id()],
@@ -1089,7 +1288,7 @@ mod tests {
         ));
         dp.flush_batch();
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CommitAdvance {
                 segment_key: test_key(),
                 committed_entry_id: 0,
@@ -1114,14 +1313,16 @@ mod tests {
         dp.handle_command(cmd);
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         let seq = dp.out.repl_schedules[0].0;
         dp.out.repl_schedules.clear();
         dp.out.transport_cmds.clear();
 
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::ReplicationTimeout {
                 seq,
                 segment_key: test_key(),
@@ -1148,7 +1349,9 @@ mod tests {
         dp.handle_command(cmd);
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
         dp.out.transport_cmds.clear();
 
@@ -1172,7 +1375,9 @@ mod tests {
         dp.handle_command(cmd);
         process_and_flush(
             &mut dp,
-            DataPlaneCommand::Timeout(DataPlaneTimeoutCallback::BatchFlushDeadline),
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
         );
 
         let seq = dp.out.repl_schedules[0].0;
@@ -1190,7 +1395,7 @@ mod tests {
 
         assert!(!dp.needs_flush);
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader, test_node_id()],
@@ -1215,12 +1420,12 @@ mod tests {
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
-        dp.handle_command(DataPlaneCommand::Timeout(
+        dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
         dp.segments.get_mut(&test_key()).unwrap().commit_entry(0);
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SealResponse {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
@@ -1265,11 +1470,17 @@ mod tests {
         dp.enqueue_seal_request(test_key());
         dp.enqueue_seal_request(test_key());
 
+        // Count only seal requests — `handle_segment_assignment` also emits a
+        // SegmentAssignmentAck via SendToCoordinator, which is not a seal.
         assert_eq!(
             dp.out
                 .transport_cmds
                 .iter()
-                .filter(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
+                .filter(|c| matches!(
+                    c,
+                    DataTransportCommand::SendToCoordinator(s)
+                        if matches!(s.message, DataPlaneInterNodeCommand::SealRequest(_))
+                ))
                 .count(),
             1
         );
@@ -1281,7 +1492,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::InterNode(
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             ReplicaAppend {
                 segment_key: test_key(),
                 replica_set: vec![leader, test_node_id()],
@@ -1306,5 +1517,191 @@ mod tests {
         dp.enqueue_seal_request(test_key());
 
         assert!(dp.out.transport_cmds.is_empty());
+    }
+
+    // ── D4 integration tests ──────────────────────────────────────────
+    //
+    // These exercise the resolver end-to-end via `DataPlane` commands —
+    // SegmentAssignment routes through `handle_segment_assignment`, seal
+    // routes through `handle_seal_response`, etc. The unit-level tests for
+    // the index itself live in `states/segment_store.rs`.
+
+    use crate::data_plane::states::segment_store::SegmentReadState;
+
+    #[test]
+    fn segment_assignment_indexes_for_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        let resolved = dp
+            .segments
+            .resolve(TopicId(1), RangeId(0), 0)
+            .expect("active segment should resolve");
+        assert!(matches!(resolved, SegmentReadState::Active(k) if k == test_key()));
+    }
+
+    /// Verifies the leader-side seal path: after `SealResponse`, the old
+    /// segment migrates to the sealed table with `end_entry_id` set from
+    /// the tracker's `committed_entry_id`, and the new segment becomes the
+    /// active index entry for the range.
+    #[test]
+    fn seal_response_routes_old_offsets_through_sealed_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        // Single-replica produce auto-commits on flush, so entry 0 is
+        // committed at the time we issue the seal. After seal: end=0 on the
+        // sealed entry, new segment starts at offset 1.
+        dp.handle_command(assign_segment(test_key(), vec![]));
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
+        );
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            SealResponse {
+                old_segment_key: test_key(),
+                new_segment_id: SegmentId(1),
+                new_replica_set: vec![],
+            }
+            .into(),
+        ));
+
+        let s0 = test_key();
+        let s1 = s0.with_segment_id(SegmentId(1));
+
+        let lookup = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        match lookup {
+            SegmentReadState::Sealed { key, end_entry_id } => {
+                assert_eq!(key, s0);
+                assert_eq!(end_entry_id, 0);
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+
+        let active = dp.segments.resolve(TopicId(1), RangeId(0), 1).unwrap();
+        assert!(matches!(active, SegmentReadState::Active(k) if k == s1));
+    }
+
+    /// End-to-end cold read through `DataPlane`: a sealed segment's data lives on
+    /// disk; a `Fetch` resolves to it and is served by a *real* `ColdReadPool`
+    /// over a *real* sparse index — exercising the dispatch wiring, the on-disk
+    /// `WalRecord` format agreement with `checkpoint.rs`, and `record_count`
+    /// round-tripping through the file. Bypasses the coordinator seal round-trip
+    /// (driven directly) so it's deterministic.
+    #[test]
+    fn cold_fetch_serves_sealed_segment_from_disk() {
+        use crate::connections::protocol::RangeProgressSignal;
+        use crate::data_plane::cold_read::ColdReadPool;
+        use crate::data_plane::messages::query::{DataPlaneQuery, Fetch};
+        use crate::data_plane::sparse_index::{SparseEntry, SparseIndex};
+        use crate::data_plane::wal::WalRecord;
+        use std::io::Write as _;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Real sparse index + cold-read pool, shared the way production wires them.
+        let sparse: Arc<dyn SparseIndex> =
+            Arc::new(rocksdb::DB::open_default(dir.path().join("sparse")).unwrap());
+        let cold_read_tx = ColdReadPool::spawn(DEFAULT_POOL_SIZE, Arc::clone(&sparse));
+
+        let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
+        let mut dp = DataPlane::new(
+            test_node_id(),
+            test_config(dir.path().to_path_buf()),
+            wal,
+            cold_read_tx,
+            DataPlaneOutputs::test(),
+        );
+
+        // Assign + produce 3 records (single replica → commit inline on flush).
+        dp.handle_command(assign_segment(test_key(), vec![]));
+        let records: [(&[u8], u32); 3] = [(b"alpha", 2), (b"bravo", 5), (b"charlie", 1)];
+        for (payload, record_count) in records {
+            let (tx, _rx) = oneshot::channel();
+            dp.handle_command(Produce {
+                segment_key: test_key(),
+                data: Bytes::copy_from_slice(payload).into(),
+                record_count,
+                reply: tx,
+            });
+        }
+        dp.flush_batch();
+
+        // Write the segment file + sparse index exactly as the checkpoint worker
+        // would (Data + BatchEnd per entry), then seal so the resolver routes
+        // offset 0 to the sealed table → cold path.
+        let seg_path = test_key().file_path(dir.path());
+        if let Some(parent) = seg_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut buf = Vec::new();
+        let mut index_entries = Vec::new();
+        for (i, (payload, record_count)) in records.iter().enumerate() {
+            index_entries.push(SparseEntry::new(
+                test_key(),
+                i as u64,
+                (buf.len() as u64).to_be_bytes(),
+            ));
+            WalRecord::data(Bytes::copy_from_slice(payload), *record_count)
+                .encode_to(&mut buf)
+                .unwrap();
+            WalRecord::batch_end().encode_to(&mut buf).unwrap();
+        }
+        std::fs::File::create(&seg_path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        sparse.put_batch(index_entries).unwrap();
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            SegmentSealed {
+                segment_key: test_key(),
+            }
+            .into(),
+        ));
+
+        // Fetch offset 0 → must resolve Sealed and be served cold from disk.
+        let (reply, reply_rx) = oneshot::channel();
+        dp.process(DataPlaneMessage::Query(DataPlaneQuery::Fetch(Fetch {
+            topic_id: TopicId(1),
+            range_id: RangeId(0),
+            entry_id: 0,
+            max_bytes: 1 << 20,
+            progress_signal: RangeProgressSignal::Active,
+            reply,
+        })));
+
+        let result = reply_rx
+            .blocking_recv()
+            .expect("cold-read pool dropped the reply");
+        let FetchResult::Records {
+            entries,
+            next_entry_id,
+            ..
+        } = result
+        else {
+            panic!("expected Records from cold read, got {result:?}");
+        };
+        let got: Vec<(u64, u32, Vec<u8>)> = entries
+            .iter()
+            .map(|e| (e.entry_id, e.record_count, e.data.to_vec()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 2, b"alpha".to_vec()),
+                (1, 5, b"bravo".to_vec()),
+                (2, 1, b"charlie".to_vec()),
+            ],
+            "cold read must restore payloads AND record_counts from disk"
+        );
+        assert_eq!(next_entry_id, 3);
     }
 }

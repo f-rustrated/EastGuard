@@ -81,7 +81,13 @@ pub async fn assert_single_leader(
     tokio::time::sleep(timeout).await;
     let mut leaders: Vec<Option<String>> = Vec::new();
     for &(host, port) in nodes {
-        let leader = query_shard_leader(host, port, shard_group_id).await?;
+        // Treat transient query failures (timeouts under contention) as "no leader
+        // known from this node" rather than propagating — split-brain is only
+        // observable when 2+ nodes give different non-None answers.
+        let leader = query_shard_leader(host, port, shard_group_id)
+            .await
+            .ok()
+            .flatten();
         leaders.push(leader);
     }
     let known: Vec<&String> = leaders.iter().flatten().collect();

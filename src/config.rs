@@ -236,11 +236,11 @@ impl Environment {
     pub(crate) fn swim(&self, rng_seed: u64) -> Swim {
         Swim::new(
             NodeId::new(self.resolve_node_id()),
-            NodeAddress {
-                cluster_addr: self.advertise_peer_addr(),
-                client_addr: self.advertise_client_addr(),
-                data_addr: self.advertise_data_addr(),
-            },
+            NodeAddress::new(
+                self.advertise_peer_addr(),
+                self.advertise_client_addr(),
+                self.advertise_data_addr(),
+            ),
             Topology::new(
                 std::iter::empty(),
                 TopologyConfig {
@@ -260,6 +260,9 @@ impl Environment {
         Hasher::finish(&hasher)
     }
 
+    // The sparse index is opened once and shared: the checkpoint worker writes
+    // it, the cold-read pool (inside the data-plane actor) reads it. Two opens
+    // of the same RocksDB path would conflict.
     pub(crate) fn sparse_index_db(&self) -> Arc<dyn SparseIndex> {
         let sparse_index_db = rocksdb::DB::open_default(self.data_dir_path().join("sparse_index"))
             .expect("sparse index DB");

@@ -3,16 +3,19 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
 use crate::impl_from_variant;
 
+#[derive(Debug)]
 pub(crate) struct DataTransportSendToTargets {
     pub targets: Vec<NodeId>,
     pub message: DataPlaneInterNodeCommand,
 }
 
+#[derive(Debug)]
 pub(crate) struct DataTransportSendToCoordinator {
     pub shard_group_id: ShardGroupId,
     pub message: DataPlaneInterNodeCommand,
 }
 
+#[derive(Debug)]
 pub(crate) enum DataTransportCommand {
     SendToTargets(DataTransportSendToTargets),
     SendToCoordinator(DataTransportSendToCoordinator),

@@ -2,7 +2,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::schedulers::timer::TTimer;
 
 const ELECTION_TIMEOUT_BASE_TICKS: u32 = 50; // 5s base (+ jitter)
-const HEARTBEAT_INTERVAL_TICKS: u32 = 10; // 1s
+const RAFT_RPC_INTERVAL_TICKS: u32 = 10; // 1s
 const MERGE_CHECK_INTERVAL_TICKS: u32 = 6_000; // 10 minutes
 
 #[derive(Debug)]
@@ -15,7 +15,7 @@ pub struct RaftTimer {
 #[derive(Debug)]
 pub enum RaftTimerKind {
     Election,
-    Heartbeat,
+    Rpc,
     MergeCheck,
 }
 
@@ -26,7 +26,7 @@ pub enum RaftTimeoutCallback {
     ElectionTimeout {
         shard_group_id: ShardGroupId,
     },
-    HeartbeatTimeout {
+    RpcTimeout {
         shard_group_id: ShardGroupId,
     },
     MergeCheckTimeout {
@@ -48,7 +48,7 @@ impl TTimer for RaftTimer {
             RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: self.shard_group_id,
             },
-            RaftTimerKind::Heartbeat => RaftTimeoutCallback::HeartbeatTimeout {
+            RaftTimerKind::Rpc => RaftTimeoutCallback::RpcTimeout {
                 shard_group_id: self.shard_group_id,
             },
             RaftTimerKind::MergeCheck => RaftTimeoutCallback::MergeCheckTimeout {
@@ -73,11 +73,11 @@ impl RaftTimer {
         }
     }
 
-    pub fn heartbeat(shard_group_id: ShardGroupId) -> Self {
+    pub fn rpc(shard_group_id: ShardGroupId) -> Self {
         Self {
             shard_group_id,
-            kind: RaftTimerKind::Heartbeat,
-            ticks_remaining: HEARTBEAT_INTERVAL_TICKS,
+            kind: RaftTimerKind::Rpc,
+            ticks_remaining: RAFT_RPC_INTERVAL_TICKS,
         }
     }
 

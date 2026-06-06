@@ -145,7 +145,7 @@ impl RaftRpcDispatcher {
         // never returns an error — it hangs forever, stalling the select loop.
         let Some(stream) = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            TcpStream::connect(node_addr.cluster_addr),
+            TcpStream::connect(node_addr.cluster_addr()),
         )
         .await
         .ok()
@@ -153,7 +153,7 @@ impl RaftRpcDispatcher {
             anyhow::bail!(
                 "[{}] Failed to connect to {} ({:?})",
                 self.node_id,
-                node_addr.cluster_addr,
+                node_addr.cluster_addr(),
                 target_id
             );
         };

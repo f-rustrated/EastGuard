@@ -2,10 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::{OwnedWriteHalf, TcpStream};
 
@@ -38,7 +40,10 @@ impl TransportState {
         }
     }
 
-    pub async fn accept(&mut self, stream: crate::net::TcpStream) -> anyhow::Result<DataReader> {
+    pub async fn accept(
+        &mut self,
+        stream: crate::net::TcpStream,
+    ) -> anyhow::Result<(NodeId, DataReader)> {
         let (read_half, write_half) = stream.into_split();
         let mut reader = DataReader(read_half);
 
@@ -49,8 +54,15 @@ impl TransportState {
             "duplicate connection from {peer_id} dropped (lower NodeId wins)"
         );
 
-        self.writers.insert(peer_id, write_half);
-        Ok(reader)
+        self.writers.insert(peer_id.clone(), write_half);
+        Ok((peer_id, reader))
+    }
+
+    /// Drop a peer's cached writer (without marking it dead) so the next send
+    /// re-establishes a fresh connection. Called when that peer's reader task
+    /// ends — see `DataReader::run`.
+    pub fn evict_writer(&mut self, peer: &NodeId) {
+        self.writers.remove(peer);
     }
 
     pub async fn send(
@@ -58,9 +70,18 @@ impl TransportState {
         targets: &[NodeId],
         msg: &DataPlaneInterNodeCommand,
         swim_tx: &SwimSender,
-        data_plane_tx: &crossbeam_channel::Sender<DataPlaneCommand>,
+        data_plane_tx: &DataPlaneSender,
+        disconnect_tx: &mpsc::Sender<NodeId>,
     ) {
         for target in targets {
+            // Self-delivery: a node can be its own target (e.g. a SegmentAssignment
+            // to `replica_set[0]`
+            if *target == self.node_id {
+                let _ =
+                    data_plane_tx.send(DataPlaneCommand::DataPlaneInterNodeCommand(msg.clone()));
+                continue;
+            }
+
             if self.dead_peers.contains(target) {
                 continue;
             }
@@ -81,7 +102,11 @@ impl TransportState {
 
             match self.connect_and_send(target.clone(), msg, swim_tx).await {
                 Ok(reader) => {
-                    tokio::spawn(reader.run(data_plane_tx.clone()));
+                    tokio::spawn(reader.run(
+                        data_plane_tx.clone(),
+                        target.clone(),
+                        disconnect_tx.clone(),
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -107,7 +132,7 @@ impl TransportState {
 
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            TcpStream::connect(node_addr.data_addr),
+            TcpStream::connect(node_addr.data_addr()),
         )
         .await
         .context("connect timed out")?

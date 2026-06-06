@@ -6,7 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::data_plane::messages::command::DataPlaneCommand;
+use crate::data_plane::actor::DataPlaneSender;
+
 use crate::net::TcpListener;
 
 use command::DataTransportCommand;
@@ -18,13 +19,17 @@ impl DataTransportActor {
     pub async fn run(
         node_id: NodeId,
         listener: TcpListener,
-        data_plane_tx: crossbeam_channel::Sender<DataPlaneCommand>,
+        data_plane_tx: DataPlaneSender,
         mut from_actor: mpsc::Receiver<Box<[DataTransportCommand]>>,
         swim_tx: SwimSender,
     ) {
         let mut state = TransportState::new(node_id);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await;
+
+        // Reader tasks report here when their connection ends, so the writer for
+        // that peer is evicted and the next send reconnects (see DataReader::run).
+        let (disconnect_tx, mut disconnect_rx) = mpsc::channel::<NodeId>(64);
 
         loop {
             tokio::select! {
@@ -33,14 +38,14 @@ impl DataTransportActor {
                     for cmd in batch {
                         match cmd {
                             DataTransportCommand::SendToTargets(cmd) => {
-                                state.send(&cmd.targets, &cmd.message, &swim_tx, &data_plane_tx).await;
+                                state.send(&cmd.targets, &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                             }
                             DataTransportCommand::SendToCoordinator(cmd) => {
                                 let Ok(Some(entry)) = swim_tx.resolve_shard_leader(cmd.shard_group_id).await else {
                                     tracing::debug!("No shard leader for {:?}, SealRequest will retry via timeout", cmd.shard_group_id);
                                     continue;
                                 };
-                                state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx).await;
+                                state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                             }
                             DataTransportCommand::DisconnectPeer(peer_id) => {
                                 state.disconnect(peer_id);
@@ -51,13 +56,17 @@ impl DataTransportActor {
 
                 Ok((stream, _)) = listener.accept() => {
                     match state.accept(stream).await {
-                        Ok(reader) => {
-                            tokio::spawn(reader.run(data_plane_tx.clone()));
+                        Ok((peer, reader)) => {
+                            tokio::spawn(reader.run(data_plane_tx.clone(), peer, disconnect_tx.clone()));
                         }
                         Err(e) => {
                             tracing::debug!("Data accept rejected: {e}");
                         }
                     }
+                }
+
+                Some(peer) = disconnect_rx.recv() => {
+                    state.evict_writer(&peer);
                 }
 
                 _ = cleanup_interval.tick() => {

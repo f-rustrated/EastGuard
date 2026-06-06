@@ -1,11 +1,18 @@
 pub(crate) mod command;
+pub mod constants;
+
 pub mod error;
 pub(crate) mod event;
+pub(crate) mod range;
 #[allow(dead_code)]
 pub(crate) mod state_machine;
 pub mod strategy;
+pub(crate) mod topic;
+
+pub(crate) use range::{RangeMeta, RangeState};
+pub(crate) use topic::{TopicMeta, TopicState, TopicStats};
 #[allow(dead_code)]
-pub(crate) mod types;
+pub(crate) mod segment;
 
 use bincode::{Decode, Encode};
 #[allow(unused_imports)]
@@ -13,9 +20,9 @@ pub(crate) use command::*;
 #[allow(unused_imports)]
 pub(crate) use event::*;
 #[allow(unused_imports)]
-pub(crate) use state_machine::*;
+pub(crate) use segment::*;
 #[allow(unused_imports)]
-pub(crate) use types::*;
+pub(crate) use state_machine::*;
 
 use crate::smart_pointer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
