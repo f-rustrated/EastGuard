@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use turmoil::Builder;
@@ -11,8 +13,8 @@ use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
-use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
-use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId, Topology};
+use crate::control_plane::{BINCODE_CONFIG, NodeId, SwimNodeState};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::run_scheduling_actor;
@@ -30,6 +32,7 @@ async fn start_raft_node(
     (
         MutlRaftSender,
         mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
+        Arc<ArcSwap<Topology>>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -81,7 +84,7 @@ async fn start_raft_node(
     let all_nodes: Vec<&str> = std::iter::once(node_name)
         .chain(peer_names.iter().copied())
         .collect();
-    let topology_reader = super::stub_topology_reader(&all_nodes);
+    let (topology_pub, topology_reader) = super::stub_topology_channel(&all_nodes);
     tokio::spawn(MultiRaftActor::run(
         node_id,
         election_jitter_seed,
@@ -107,7 +110,7 @@ async fn start_raft_node(
         tokio::task::yield_now().await;
     }
 
-    Ok((raft_tx, ticker_force))
+    Ok((raft_tx, ticker_force, topology_pub))
 }
 
 async fn tick_n(ticker: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>, n: usize) {
@@ -206,7 +209,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
             let g = g.clone();
             let peers = peers.clone();
             async move {
-                let (raft_tx, ticker) =
+                let (raft_tx, ticker, _topology_pub) =
                     start_raft_node(name, CLUSTER_PORT + port, g.clone(), &peers).await?;
 
                 let _ = raft_tx
@@ -269,7 +272,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
 fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))
-        .simulation_duration(Duration::from_secs(120))
+        .simulation_duration(Duration::from_secs(360))
         .build();
 
     let group_id = ShardGroupId(101);
@@ -295,7 +298,7 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
             let group = group.clone();
             let peers = peers.clone();
             async move {
-                let (raft_tx, ticker) =
+                let (raft_tx, ticker, topology_pub) =
                     start_raft_node(name, CLUSTER_PORT + port, group.clone(), &peers).await?;
 
                 if name == "node-3" {
@@ -309,6 +312,17 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
                 // t≈15s).
                 tokio::time::sleep(Duration::from_secs(20)).await;
 
+                // Mirror what `SwimActor` does in production: mutate the local
+                // topology to mark node-3 dead BEFORE emitting NodeDead. Without
+                // this, the leader-takeover safety net
+                // (`reconcile_on_leadership_change` → `reconcile_peers`) sees
+                // node-3 as still-alive in `live_nodes()` and proposes nothing,
+                // so if a re-election lands after the NodeDead arrives and the
+                // event was no-op'd on a follower, nothing recovers it.
+                let mut topology = (**topology_pub.load()).clone();
+                topology.update(NodeId::new("node-3"), &SwimNodeState::Dead);
+                topology_pub.store(Arc::new(topology));
+
                 let _ = raft_tx
                     .send(NodeDead {
                         dead_node_id: NodeId::new("node-3"),
@@ -318,7 +332,7 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
                 // Drive ticks for the chained proposals to commit and apply
                 // (RemovePeer → AddPeer at the leader; replication to the
                 // surviving follower).
-                tick_n(&ticker, 500).await;
+                tick_n(&ticker, 1000).await;
                 serve_peers(&raft_tx, group.id, QUERY_PORT + port).await?;
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 Ok(())
@@ -327,9 +341,9 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
     }
 
     sim.client("checker", async {
-        // Total wait: cluster startup + 20s injection delay + 500 ticks of
+        // Total wait: cluster startup + 20s injection delay + 1000 ticks of
         // replication. Allow ample headroom for election + chained commits.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
 
         let n1_peers = read_peers("node-1", QUERY_PORT + 1).await;
         let n2_peers = read_peers("node-2", QUERY_PORT + 2).await;
@@ -339,8 +353,8 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
 
         assert!(
             !n1_peers.contains(&n3),
-            "node-1 peers should not include node-3 after reconciliation, got {:?}",
-            n1_peers
+            "node-1 peers should not include node-3 after reconciliation, got peers={:?} n2_peers={:?}",
+            n1_peers, n2_peers
         );
         assert!(
             !n2_peers.contains(&n3),

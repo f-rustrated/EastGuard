@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 
 use crate::control_plane::membership::{
@@ -33,6 +35,18 @@ pub(super) async fn mock_swim_handler(
 /// exercise topology mutation, and the reader's own Arc keeps the underlying
 /// `ArcSwap` alive.
 pub(super) fn stub_topology_reader(peer_names: &[&str]) -> TopologyReader {
+    let (_pub_handle, reader) = stub_topology_channel(peer_names);
+    reader
+}
+
+/// Same as `stub_topology_reader` but also returns the publisher handle so the
+/// caller can mutate the topology mid-test — used by tests that simulate a
+/// node-death gossip event by removing the dead node from the topology
+/// (mirroring what `SwimActor` does in production before emitting
+/// `HandleNodeDeath`).
+pub(super) fn stub_topology_channel(
+    peer_names: &[&str],
+) -> (Arc<ArcSwap<Topology>>, TopologyReader) {
     let topology = Topology::new(
         peer_names.iter().map(|n| NodeId::new(*n)),
         TopologyConfig {
@@ -40,8 +54,7 @@ pub(super) fn stub_topology_reader(peer_names: &[&str]) -> TopologyReader {
             replication_factor: 3,
         },
     );
-    let (_pub_handle, reader) = topology_channel(topology);
-    reader
+    topology_channel(topology)
 }
 
 mod election;
