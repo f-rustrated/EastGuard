@@ -46,12 +46,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::SERDE_CONFIG;
 
-#[allow(dead_code)]
 pub struct ClientRawWriter {
     stream: OwnedWriteHalf,
 }
 
-#[allow(dead_code)]
 impl ClientRawWriter {
     pub fn new(write_half: OwnedWriteHalf) -> Self {
         Self { stream: write_half }
@@ -69,6 +67,19 @@ impl ClientRawWriter {
         self.stream.write_all(&encoded).await?;
         Ok(())
     }
+}
+
+async fn run_client_writer(
+    mut write_half: ClientRawWriter,
+    mut rx: mpsc::Receiver<(u64, ClientResponse)>,
+) -> anyhow::Result<()> {
+    while let Some((request_id, response)) = rx.recv().await {
+        if matches!(response, ClientResponse::Stop) {
+            break;
+        }
+        write_half.write(request_id, &response).await?;
+    }
+    Ok(())
 }
 
 pub struct ClientStreamReader {
@@ -577,32 +588,13 @@ pub async fn handle_client_stream(
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);
     let handler = ClientHandler::new(node_id, swim_sender, raft_sender, data_plane_tx);
-    tokio::spawn(run_client_writer(write_half, writer_rx));
+    tokio::spawn(run_client_writer(
+        ClientRawWriter::new(write_half),
+        writer_rx,
+    ));
     handler
         .run(ClientStreamReader::new(read_half), writer_tx)
         .await;
-}
-
-/// Writer task for a single client connection.
-///
-/// Drains `rx` and writes length-prefixed response frames to `write_half`.
-/// Exits when the sender side of `rx` is dropped (connection closed).
-async fn run_client_writer(
-    mut write_half: OwnedWriteHalf,
-    mut rx: mpsc::Receiver<(u64, ClientResponse)>,
-) -> anyhow::Result<()> {
-    while let Some((request_id, response)) = rx.recv().await {
-        if matches!(response, ClientResponse::Stop) {
-            break;
-        }
-
-        let encoded = bincode::encode_to_vec(&response, SERDE_CONFIG)?;
-        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
-        write_half.write_all(&len.to_be_bytes()).await?;
-        write_half.write_all(&request_id.to_be_bytes()).await?;
-        write_half.write_all(&encoded).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
