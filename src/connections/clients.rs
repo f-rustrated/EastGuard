@@ -572,7 +572,6 @@ fn keyspace_bound_matches_range(bound: &Option<KeyspaceBound>, range: &RangeMeta
 ///
 /// Drains `rx` and writes length-prefixed response frames to `write_half`.
 /// Exits when the sender side of `rx` is dropped (connection closed).
-#[allow(dead_code)]
 pub async fn run_client_writer(
     mut write_half: OwnedWriteHalf,
     mut rx: mpsc::Receiver<(u64, ClientResponse)>,
