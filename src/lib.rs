@@ -20,6 +20,7 @@ pub(crate) mod macros;
 mod test_traits;
 
 use crate::config::Environment;
+use crate::connections::clients::handle_client_stream;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::RaftTransportCommand;
@@ -32,10 +33,9 @@ use crate::data_plane::checkpoint::CheckpointWorker;
 use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
-use crate::net::{TcpListener, TcpStream, UdpSocket};
+use crate::net::{TcpListener, UdpSocket};
 use crate::{
     config::ENV,
-    connections::clients::{ClientHandler, ClientStreamReader, run_client_writer},
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
 };
 use anyhow::Result;
@@ -170,20 +170,4 @@ impl StartUp {
             tokio::spawn(handle_client_stream(stream, node_id, swim_tx, raft, dp));
         }
     }
-}
-
-async fn handle_client_stream(
-    stream: TcpStream,
-    node_id: NodeId,
-    swim_sender: SwimSender,
-    raft_sender: MutlRaftSender,
-    data_plane_tx: DataPlaneSender,
-) {
-    let (read_half, write_half) = stream.into_split();
-    let (writer_tx, writer_rx) = mpsc::channel(128);
-    let handler = ClientHandler::new(node_id, swim_sender, raft_sender, data_plane_tx);
-    tokio::spawn(run_client_writer(write_half, writer_rx));
-    handler
-        .run(ClientStreamReader::new(read_half), writer_tx)
-        .await;
 }

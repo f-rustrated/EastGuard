@@ -26,6 +26,7 @@ use crate::data_plane::EntryPayload;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{Produce, ProduceAck};
 use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
+use crate::net::TcpStream;
 use crate::{
     control_plane::{
         NodeId, SwimNodeState,
@@ -566,11 +567,27 @@ fn keyspace_bound_matches_range(bound: &Option<KeyspaceBound>, range: &RangeMeta
     }
 }
 
+pub async fn handle_client_stream(
+    stream: TcpStream,
+    node_id: NodeId,
+    swim_sender: SwimSender,
+    raft_sender: MutlRaftSender,
+    data_plane_tx: DataPlaneSender,
+) {
+    let (read_half, write_half) = stream.into_split();
+    let (writer_tx, writer_rx) = mpsc::channel(128);
+    let handler = ClientHandler::new(node_id, swim_sender, raft_sender, data_plane_tx);
+    tokio::spawn(run_client_writer(write_half, writer_rx));
+    handler
+        .run(ClientStreamReader::new(read_half), writer_tx)
+        .await;
+}
+
 /// Writer task for a single client connection.
 ///
 /// Drains `rx` and writes length-prefixed response frames to `write_half`.
 /// Exits when the sender side of `rx` is dropped (connection closed).
-pub async fn run_client_writer(
+async fn run_client_writer(
     mut write_half: OwnedWriteHalf,
     mut rx: mpsc::Receiver<(u64, ClientResponse)>,
 ) -> anyhow::Result<()> {
