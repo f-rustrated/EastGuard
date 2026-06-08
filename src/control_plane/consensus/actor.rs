@@ -42,7 +42,7 @@ impl MultiRaftActor {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         sender: MutlRaftSender,
-        mailbox: mpsc::Receiver<MultiRaftActorCommand>,
+        mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         node_id: NodeId,
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
@@ -52,16 +52,18 @@ impl MultiRaftActor {
         data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
         topology: TopologyReader,
     ) {
-        let scheduler_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
-            sender.into(),
-            vnodes_per_node * 16,
-            TICK_PERIOD_100_MS,
-            Some(PROBE_INTERVAL_TICKS),
-        );
+        tokio::spawn({
+            let scheduler_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
+                sender.into(),
+                vnodes_per_node * 16,
+                TICK_PERIOD_100_MS,
+                Some(PROBE_INTERVAL_TICKS),
+            );
 
-        tokio::spawn(Self::run(
-            Self {
-                store: MultiRaft::new(node_id, election_jitter_seed, storage, topology),
+            let store = MultiRaft::new(node_id, election_jitter_seed, storage, topology);
+
+            let mut actor = MultiRaftActor {
+                store,
                 transport_tx: transport_tx.into(),
                 scheduler_tx,
                 swim_tx,
@@ -70,26 +72,21 @@ impl MultiRaftActor {
                 timer_cmds: Vec::new(),
                 transport_cmds: Vec::new(),
                 data_transport_cmds: Vec::new(),
-            },
-            mailbox,
-        ));
-    }
+            };
 
-    pub async fn run(
-        mut actor: MultiRaftActor,
-        mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
-    ) {
-        let mut buf = Vec::with_capacity(64);
-
-        loop {
-            if mailbox.recv_many(&mut buf, 64).await == 0 {
-                break;
+            async move {
+                let mut buf = Vec::with_capacity(64);
+                loop {
+                    if mailbox.recv_many(&mut buf, 64).await == 0 {
+                        break;
+                    }
+                    for cmd in buf.drain(..) {
+                        actor.store.process(cmd);
+                    }
+                    actor.flush().await;
+                }
             }
-            for cmd in buf.drain(..) {
-                actor.store.process(cmd);
-            }
-            actor.flush().await;
-        }
+        });
     }
 
     async fn flush(&mut self) {
