@@ -43,6 +43,7 @@ pub enum ClientResponse {
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),
     Admin(AdminResponse),
+    Stop,
 }
 
 impl_from_variant!(

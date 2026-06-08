@@ -220,7 +220,7 @@ impl ClientHandler {
             }
         }
 
-        // TODO stop write half
+        let _ = writer_tx.send((0, ClientResponse::Stop)).await;
     }
 
     pub async fn dispatch(&self, request: ClientRequest) -> ClientResponse {
@@ -575,6 +575,10 @@ pub async fn run_client_writer(
     mut rx: mpsc::Receiver<(u64, ClientResponse)>,
 ) -> anyhow::Result<()> {
     while let Some((request_id, response)) = rx.recv().await {
+        if matches!(response, ClientResponse::Stop) {
+            break;
+        }
+
         let encoded = bincode::encode_to_vec(&response, SERDE_CONFIG)?;
         let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
         write_half.write_all(&len.to_be_bytes()).await?;

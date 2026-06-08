@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use crate::control_plane::SwimNodeState;
 use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
     ControlPlaneResponse, ShardDetail, TopicSummary,
 };
+use crate::control_plane::SwimNodeState;
 use crate::it::helpers::get_members;
 use crate::net::TcpStream;
 
@@ -61,7 +61,8 @@ pub async fn assert_membership_converged(
     let canonical = &views[0];
     for (i, view) in views[1..].iter().enumerate() {
         assert_eq!(
-            view, canonical,
+            view,
+            canonical,
             "membership divergence: node[{}] disagrees (got {:?}, expected {:?})",
             i + 1,
             view,
@@ -95,9 +96,13 @@ pub async fn assert_single_leader(
         let first = known[0];
         for (i, l) in known[1..].iter().enumerate() {
             assert_eq!(
-                *l, first,
+                *l,
+                first,
                 "split-brain detected for shard {}: node[{}] reports leader {:?}, node[0] reports {:?}",
-                shard_group_id, i + 1, l, first
+                shard_group_id,
+                i + 1,
+                l,
+                first
             );
         }
     }
@@ -145,16 +150,16 @@ pub(super) async fn query_shard_leader(
     port: u16,
     shard_group_id: u64,
 ) -> turmoil::Result<Option<String>> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((host, port)),
-    )
-    .await??;
+    let stream =
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(0, &ClientRequest::Admin(AdminRequest::GetShardLeader { shard_group_id }))
+        .write(
+            0,
+            &ClientRequest::Admin(AdminRequest::GetShardLeader { shard_group_id }),
+        )
         .await?;
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
@@ -169,16 +174,16 @@ pub(super) async fn query_shard_info(
     port: u16,
     key: &[u8],
 ) -> turmoil::Result<Option<ShardDetail>> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((host, port)),
-    )
-    .await??;
+    let stream =
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(0, &ClientRequest::Admin(AdminRequest::GetShardInfo { key: key.to_vec() }))
+        .write(
+            0,
+            &ClientRequest::Admin(AdminRequest::GetShardInfo { key: key.to_vec() }),
+        )
         .await?;
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
@@ -189,16 +194,16 @@ pub(super) async fn query_shard_info(
 }
 
 pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<TopicSummary>> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((host, port)),
-    )
-    .await??;
+    let stream =
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;
     let (read_half, write_half) = stream.into_split();
     let mut writer = ClientRawWriter::new(write_half);
     let mut reader = ClientStreamReader::new(read_half);
     writer
-        .write(0, &ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics))
+        .write(
+            0,
+            &ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
+        )
         .await?;
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
