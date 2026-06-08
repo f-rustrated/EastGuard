@@ -161,7 +161,7 @@ impl MultiRaft {
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
         match cmd {
             MultiRaftActorCommand::ConsensusCommand(c) => {
-                self.handle_command(c);
+                self.handle_consensus(c);
             }
             MultiRaftActorCommand::GetLeader { group_id, reply } => {
                 let result = self.get_leader(group_id);
@@ -223,7 +223,7 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, cmd: impl Into<ConsensusCommand>) {
+    pub(crate) fn handle_consensus(&mut self, cmd: impl Into<ConsensusCommand>) {
         match cmd.into() {
             ConsensusCommand::PacketReceived(cmd) => self.step(cmd),
             ConsensusCommand::Timeout(cb) => self.handle_timeout(cb),
@@ -751,7 +751,7 @@ mod tests {
         let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![me.clone()]));
-        store.handle_command(ConsensusCommand::Timeout(
+        store.handle_consensus(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
             },
@@ -784,12 +784,12 @@ mod tests {
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(1, vec![me.clone()]));
             store.add_group(shard(2, vec![me.clone()]));
-            store.handle_command(ConsensusCommand::Timeout(
+            store.handle_consensus(ConsensusCommand::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
                 },
             ));
-            store.handle_command(ConsensusCommand::Timeout(
+            store.handle_consensus(ConsensusCommand::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(2),
                 },
@@ -815,7 +815,7 @@ mod tests {
     /// Elect n1 as leader of a single-node shard group. Single-node clusters
     /// become leader immediately on ElectionTimeout (no peers to wait for).
     fn elect_leader(store: &mut MultiRaft) {
-        store.handle_command(ConsensusCommand::Timeout(
+        store.handle_consensus(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: TEST_GROUP_ID,
             },
@@ -915,7 +915,7 @@ mod tests {
         store.flush(); // consume add_group dirty
 
         // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
-        store.handle_command(PacketReceived {
+        store.handle_consensus(PacketReceived {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -950,7 +950,7 @@ mod tests {
 
         // n2 re-sends from index 1 at term 2, conflicting with the existing term-1 entries.
         // Raft truncates from index 1 and replaces with the new entry.
-        store.handle_command(PacketReceived {
+        store.handle_consensus(PacketReceived {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -1078,7 +1078,7 @@ mod tests {
         store.flush();
 
         // Elect leader in group 1 only
-        store.handle_command(ConsensusCommand::Timeout(
+        store.handle_consensus(ConsensusCommand::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(1),
             },

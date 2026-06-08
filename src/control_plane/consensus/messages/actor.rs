@@ -13,7 +13,7 @@ use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
 
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
-#[allow(dead_code)]
+
 pub enum MultiRaftActorCommand {
     /// Fire-and-forget: no reply channel needed.
     ConsensusCommand(ConsensusCommand),

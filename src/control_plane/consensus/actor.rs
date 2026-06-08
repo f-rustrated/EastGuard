@@ -11,8 +11,6 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::{MetadataCommand, TopicMeta, TopicStats};
 use crate::data_plane::transport::command::DataTransportCommand;
-use crate::schedulers::actor::spawn_scheduling_actor;
-use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
@@ -41,25 +39,17 @@ impl MultiRaftActor {
     /// `vnodes_per_node * 2`; `* 16` gives ample headroom.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        sender: MutlRaftSender,
+        scheduler_tx: SchedulerSender<RaftTimer>,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
         node_id: NodeId,
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
-        vnodes_per_node: usize,
         transport_tx: impl Into<BatchSender<RaftTransportCommand>>,
         swim_tx: SwimSender,
         data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
         topology: TopologyReader,
     ) {
         tokio::spawn({
-            let scheduler_tx = spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
-                sender.into(),
-                vnodes_per_node * 16,
-                TICK_PERIOD_100_MS,
-                Some(PROBE_INTERVAL_TICKS),
-            );
-
             let store = MultiRaft::new(node_id, election_jitter_seed, storage, topology);
 
             let mut actor = MultiRaftActor {

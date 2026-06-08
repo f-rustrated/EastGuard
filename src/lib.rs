@@ -23,7 +23,9 @@ use crate::config::Environment;
 use crate::connections::controller::handle_client_stream;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
-use crate::control_plane::consensus::messages::RaftTransportCommand;
+use crate::control_plane::consensus::messages::{
+    MultiRaftActorCommand, RaftTimer, RaftTransportCommand,
+};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::OutboundPacket;
 use crate::control_plane::membership::actor::SwimSender;
@@ -34,6 +36,8 @@ use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, UdpSocket};
+use crate::schedulers::actor::spawn_scheduling_actor;
+use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -127,12 +131,16 @@ impl StartUp {
         ));
 
         MultiRaftActor::spawn(
-            raft_tx.clone(),
+            spawn_scheduling_actor::<RaftTimer, MultiRaftActorCommand>(
+                raft_tx.clone().into(),
+                self.env.vnodes_per_node as usize * 16,
+                TICK_PERIOD_100_MS,
+                Some(PROBE_INTERVAL_TICKS),
+            ),
             raft_mailbox,
             node_id.clone(),
             self.env.election_jitter_seed(self.rng_seed),
             Box::new(MetadataStorage::open(self.env.raft_db_path())),
-            self.env.vnodes_per_node as usize,
             raft_transport_tx,
             swim_sender.clone(),
             data_transport_tx,

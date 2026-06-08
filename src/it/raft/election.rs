@@ -125,17 +125,17 @@ async fn run_raft_node(
         .chain(peer_names.iter().copied())
         .collect();
     let topology_reader = super::stub_topology_reader(&all_nodes);
-    tokio::spawn(MultiRaftActor::run(
+    MultiRaftActor::spawn(
+        ticker_force.clone().into(),
+        raft_mailbox,
         node_id,
         election_jitter_seed,
         Box::new(db),
-        raft_mailbox,
-        transport_tx.into(),
-        ticker_tx.into(),
+        transport_tx,
         swim_tx,
-        data_tx.into(),
+        data_tx,
         topology_reader,
-    ));
+    );
 
     raft_tx
         .send(crate::control_plane::consensus::messages::EnsureGroup {
