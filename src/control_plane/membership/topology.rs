@@ -314,12 +314,6 @@ impl Topology {
     }
 
     /// Returns the shard group responsible for `key`.
-    ///
-    /// Walks the consistent hash ring clockwise from the key's hash position to
-    /// find the nearest vnode. That vnode's token hash becomes the `ShardGroupId`.
-    /// Looks up the canonical `ShardGroup` from the `groups` map.
-    ///
-    /// Returns `None` if the ring is empty.
     pub(crate) fn shard_group_for(&self, key: &[u8]) -> Option<&ShardGroup> {
         let hash = hash_stable(key);
         let nearest_token = self.walk_clockwise_from(hash).next()?;

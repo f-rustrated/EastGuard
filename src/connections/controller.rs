@@ -98,7 +98,7 @@ impl ClientController {
                 storage_policy,
             } => self.handle_create_topic(name, storage_policy).await,
             ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
-            ControlPlaneRequest::ListHostedTopics => self.handle_list_hosted_topics().await,
+            ControlPlaneRequest::ListHostedTopics => return self.handle_list_hosted_topics().await,
             ControlPlaneRequest::DescribeTopic { name } => self.handle_describe_topic(name).await,
         };
         match res {
@@ -172,12 +172,7 @@ impl ClientController {
         };
 
         Ok(
-            match self
-                .raft_sender
-                .propose(shard_group.id, cmd.into())
-                .await
-                .context("shard group not found")?
-            {
+            match self.raft_sender.propose(shard_group.id, cmd.into()).await {
                 Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
                 Err(ProposeError::NotLeader(_)) => {
                     ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
@@ -200,20 +195,19 @@ impl ClientController {
 
         let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
         Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
-            Some(Ok(())) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-            Some(Err(ProposeError::NotLeader(_))) => {
+            Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
+            Err(ProposeError::NotLeader(_)) => {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                     "not the leader for this shard group — retry on another node".into(),
                 ))
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(format!("{e:?}")))
             }
-            None => ClientResponse::ControlPlane(ControlPlaneResponse::TopicNotFound),
         })
     }
 
-    async fn handle_list_hosted_topics(&self) -> anyhow::Result<ClientResponse> {
+    async fn handle_list_hosted_topics(&self) -> ClientResponse {
         let topics = self
             .raft_sender
             .get_topics()
@@ -225,9 +219,7 @@ impl ClientController {
                 state: crate::connections::protocol::TopicState::Active,
             })
             .collect();
-        Ok(ClientResponse::ControlPlane(
-            ControlPlaneResponse::TopicList { topics },
-        ))
+        ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics })
     }
 
     async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {

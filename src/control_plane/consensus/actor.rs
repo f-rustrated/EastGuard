@@ -185,18 +185,18 @@ impl MutlRaftSender {
         &self,
         shard_group_id: ShardGroupId,
         command: MetadataCommand,
-    ) -> Option<Result<(), ProposeError>> {
+    ) -> Result<(), ProposeError> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        self.send(MultiRaftActorCommand::Propose {
-            propose: RaftPropose {
-                shard_group_id,
-                command,
-            },
-            reply,
-        })
-        .await
-        .ok()?;
-        recv.await.ok()
+        let _ = self
+            .send(MultiRaftActorCommand::Propose {
+                propose: RaftPropose {
+                    shard_group_id,
+                    command,
+                },
+                reply,
+            })
+            .await;
+        recv.await.expect("sender in propose dropped")
     }
 
     pub(crate) async fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
