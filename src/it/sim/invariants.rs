@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
+use crate::connections::clients::ClientStreamReader;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
     ControlPlaneResponse, ShardDetail, TopicSummary,
 };
+use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::SwimNodeState;
 use crate::it::helpers::get_members;
 use crate::net::TcpStream;

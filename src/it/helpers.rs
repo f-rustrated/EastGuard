@@ -1,8 +1,9 @@
 use crate::config::Environment;
-use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
+use crate::connections::clients::ClientStreamReader;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState,
 };
+use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::{NodeAddress, SwimNode};
 use crate::control_plane::{NodeId, SwimNodeState};
 use crate::net::TcpStream;

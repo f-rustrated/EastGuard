@@ -12,15 +12,13 @@
 ///
 /// This allows multiple requests to be in-flight on a single connection simultaneously,
 /// with responses arriving in any order.
-use std::{io::ErrorKind, mem::size_of};
-
-const LEN_PREFIX_SIZE: usize = size_of::<u32>();
-const REQUEST_ID_SIZE: usize = size_of::<u64>();
+use std::io::ErrorKind;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
 
-use crate::connections::protocol::*;
+use crate::connections::writer::ClientRawWriter;
+use crate::connections::{LEN_PREFIX_SIZE, REQUEST_ID_SIZE, protocol::*, run_client_writer};
 use crate::control_plane::metadata::RangeMeta;
 use crate::data_plane::EntryPayload;
 use crate::data_plane::actor::DataPlaneSender;
@@ -39,53 +37,15 @@ use crate::{
             strategy::StoragePolicy,
         },
     },
-    net::{OwnedReadHalf, OwnedWriteHalf},
+    net::OwnedReadHalf,
 };
 use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::config::SERDE_CONFIG;
 
-pub struct ClientRawWriter {
-    stream: OwnedWriteHalf,
-}
-
-impl ClientRawWriter {
-    pub fn new(write_half: OwnedWriteHalf) -> Self {
-        Self { stream: write_half }
-    }
-
-    pub async fn write<T: bincode::Encode>(
-        &mut self,
-        request_id: u64,
-        data: &T,
-    ) -> anyhow::Result<()> {
-        let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
-        let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
-        self.stream.write_all(&len.to_be_bytes()).await?;
-        self.stream.write_all(&request_id.to_be_bytes()).await?;
-        self.stream.write_all(&encoded).await?;
-        Ok(())
-    }
-}
-
-async fn run_client_writer(
-    mut write_half: ClientRawWriter,
-    mut rx: mpsc::Receiver<(u64, ClientResponse)>,
-) -> anyhow::Result<()> {
-    while let Some((request_id, response)) = rx.recv().await {
-        if matches!(response, ClientResponse::Stop) {
-            break;
-        }
-        write_half.write(request_id, &response).await?;
-    }
-    Ok(())
-}
-
 pub struct ClientStreamReader {
     pub(crate) stream: OwnedReadHalf,
-    // Persistent Buffer - instead of creating a new buffer for every message,
-    // we keep one buffer
     buffer: BytesMut,
 }
 
@@ -106,7 +66,7 @@ impl ClientStreamReader {
     }
 
     async fn read_more(&mut self) -> Result<(), std::io::Error> {
-        let n = self.stream.read_buf(&mut self.buffer).await?;
+        let n: usize = self.stream.read_buf(&mut self.buffer).await?;
         if n == 0 {
             let kind = if self.buffer.is_empty() {
                 ErrorKind::ConnectionAborted
@@ -197,7 +157,7 @@ pub struct ClientHandler {
 }
 
 impl ClientHandler {
-    pub fn new(
+    fn new(
         node_id: NodeId,
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,

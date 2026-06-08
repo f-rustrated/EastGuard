@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 use turmoil::Builder;
 
 use crate::StartUp;
-use crate::connections::clients::{ClientRawWriter, ClientStreamReader};
+use crate::connections::clients::ClientStreamReader;
 use crate::connections::protocol::{
     ClientRequest, ClientResponse, ControlPlaneRequest, ControlPlaneResponse,
 };
+use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::default_env;
 use crate::it::sim::invariants::{
