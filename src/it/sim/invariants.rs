@@ -1,14 +1,13 @@
-use std::time::Duration;
-
-use crate::connections::clients::ClientStreamReader;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
     ControlPlaneResponse, ShardDetail, TopicSummary,
 };
+use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::SwimNodeState;
 use crate::it::helpers::get_members;
 use crate::net::TcpStream;
+use std::time::Duration;
 
 /// Queries `GetMembers` from every node and asserts all see the same sorted set of alive IDs.
 /// Retries up to `max_attempts` times with `tick` between each attempt.
