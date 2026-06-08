@@ -23,7 +23,6 @@ pub struct MultiRaftActor {
     scheduler_tx: SchedulerSender<RaftTimer>,
     swim_tx: SwimSender,
     data_transport_tx: BatchSender<DataTransportCommand>,
-
     packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
     timer_cmds: Vec<TickerCommand<RaftTimer>>,
     transport_cmds: Vec<RaftTransportCommand>,
@@ -59,42 +58,27 @@ impl MultiRaftActor {
             TICK_PERIOD_100_MS,
             Some(PROBE_INTERVAL_TICKS),
         );
+
         tokio::spawn(Self::run(
-            node_id,
-            election_jitter_seed,
-            storage,
+            Self {
+                store: MultiRaft::new(node_id, election_jitter_seed, storage, topology),
+                transport_tx: transport_tx.into(),
+                scheduler_tx,
+                swim_tx,
+                data_transport_tx: data_transport_tx.into(),
+                packets_by_target: HashMap::new(),
+                timer_cmds: Vec::new(),
+                transport_cmds: Vec::new(),
+                data_transport_cmds: Vec::new(),
+            },
             mailbox,
-            transport_tx.into(),
-            scheduler_tx,
-            swim_tx,
-            data_transport_tx.into(),
-            topology,
         ));
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn run(
-        node_id: NodeId,
-        election_jitter_seed: u64,
-        storage: Box<dyn RaftStorage>,
+        mut actor: MultiRaftActor,
         mut mailbox: mpsc::Receiver<MultiRaftActorCommand>,
-        transport_tx: BatchSender<RaftTransportCommand>,
-        scheduler_tx: SchedulerSender<RaftTimer>,
-        swim_tx: SwimSender,
-        data_transport_tx: BatchSender<DataTransportCommand>,
-        topology: TopologyReader,
     ) {
-        let mut actor = Self {
-            store: MultiRaft::new(node_id, election_jitter_seed, storage, topology),
-            transport_tx,
-            scheduler_tx,
-            swim_tx,
-            data_transport_tx,
-            packets_by_target: HashMap::new(),
-            timer_cmds: Vec::new(),
-            transport_cmds: Vec::new(),
-            data_transport_cmds: Vec::new(),
-        };
         let mut buf = Vec::with_capacity(64);
 
         loop {
