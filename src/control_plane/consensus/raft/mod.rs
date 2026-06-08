@@ -17,14 +17,14 @@ pub(crate) fn compute_replacement_replica_set(
     dead_nodes: &[NodeId],
     live_nodes: &[NodeId],
 ) -> Vec<NodeId> {
-    let rf = old.len();
+    let replication_factor = old.len();
     let mut new_set: Vec<NodeId> = old
         .iter()
         .filter(|n| !dead_nodes.contains(n))
         .cloned()
         .collect();
     for candidate in live_nodes {
-        if new_set.len() >= rf {
+        if new_set.len() >= replication_factor {
             break;
         }
         if !new_set.contains(candidate) && !dead_nodes.contains(candidate) {
