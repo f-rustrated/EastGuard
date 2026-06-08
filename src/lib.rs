@@ -167,11 +167,7 @@ impl StartUp {
             let raft = raft_tx.clone();
             let dp = data_plane_tx.clone();
 
-            tokio::spawn(async move {
-                if let Err(err) = handle_client_stream(stream, node_id, swim_tx, raft, dp).await {
-                    tracing::error!("{}", err);
-                }
-            });
+            tokio::spawn(handle_client_stream(stream, node_id, swim_tx, raft, dp));
         }
     }
 }
@@ -182,7 +178,7 @@ async fn handle_client_stream(
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-) -> Result<()> {
+) {
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);
     let handler = ClientHandler::new(node_id, swim_sender, raft_sender, data_plane_tx);
@@ -190,5 +186,4 @@ async fn handle_client_stream(
     handler
         .run(ClientStreamReader::new(read_half), writer_tx)
         .await;
-    Ok(())
 }
