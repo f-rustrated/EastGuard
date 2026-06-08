@@ -11,8 +11,7 @@ use crate::control_plane::membership::{
     SwimHeader, SwimPacket, SwimTimer, Topology, TopologyConfig,
 };
 use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
-
-use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker_message::SchedulerSender;
 
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
@@ -144,7 +143,6 @@ async fn setup_single() -> TestHarness {
 async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     let (tx_in, rx_in) = mpsc::channel(100);
     let (tx_out, rx_out) = mpsc::channel(100);
-    let (ticker_tx, ticker_rx) = SchedulerSender::<SwimTimer>::channel(100);
 
     let peer_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let client_addr: SocketAddr = format!("127.0.0.1:{}", port + 1000).parse().unwrap();
@@ -170,12 +168,12 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     let (topology_pub, _topology_reader) =
         crate::control_plane::membership::topology_channel(swim.topology.clone());
 
-    tokio::spawn(run_scheduling_actor(
+    let ticker_tx = spawn_scheduling_actor(
         tx_in.clone(),
-        ticker_rx,
+        100,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
-    ));
+    );
     tokio::spawn(SwimActor::run(
         rx_in,
         swim,

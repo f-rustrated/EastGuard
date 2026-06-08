@@ -5,14 +5,14 @@ const ELECTION_TIMEOUT_BASE_TICKS: u32 = 50; // 5s base (+ jitter)
 const RAFT_RPC_INTERVAL_TICKS: u32 = 10; // 1s
 const MERGE_CHECK_INTERVAL_TICKS: u32 = 6_000; // 10 minutes
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RaftTimer {
     pub(crate) shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RaftTimerKind {
     Election,
     Rpc,

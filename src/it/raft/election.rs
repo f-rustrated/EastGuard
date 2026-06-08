@@ -8,16 +8,17 @@ use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
 use crate::control_plane::consensus::actor::MultiRaftActor;
-use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+use crate::control_plane::consensus::messages::{MultiRaftActorCommand, RaftTimer};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
-use crate::schedulers::actor::run_scheduling_actor;
+
+use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
@@ -41,14 +42,9 @@ fn build_address_map(
     address_map
 }
 
-async fn drive_ticks(
-    ticker: &mpsc::Sender<
-        Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>,
-    >,
-    count: usize,
-) {
+async fn drive_ticks(ticker: &SchedulerSender<RaftTimer>, count: usize) {
     for _ in 0..count {
-        let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
+        let _ = ticker.send_batch(vec![TickerCommand::ForceTick]).await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -93,20 +89,19 @@ async fn run_raft_node(
 
     let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
-    let (ticker_tx, ticker_rx) = mpsc::channel(64);
+
     let (swim_tx, swim_rx) = SwimActor::channel(64);
-    let ticker_force = ticker_tx.clone();
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cluster_port).parse().unwrap();
     let listener = crate::net::TcpListener::bind(bind_addr).await?;
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
-    tokio::spawn(run_scheduling_actor(
+    let ticker_force = spawn_scheduling_actor(
         raft_tx.clone().into(),
-        ticker_rx,
+        64,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
-    ));
+    );
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,

@@ -17,7 +17,7 @@ use crate::control_plane::membership::{
 use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
-use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 
 use super::CLUSTER_PORT;
@@ -94,7 +94,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
 
                 let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
                 let (transport_tx, transport_rx) = mpsc::channel(100);
-                let (ticker_tx, ticker_rx) = mpsc::channel(64);
+
                 let (swim_tx, swim_rx) = SwimActor::channel(64);
                 let (leader_events_tx, mut leader_events_rx) = mpsc::channel(64);
 
@@ -107,12 +107,13 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     address_map,
                     leader_events_tx,
                 ));
-                tokio::spawn(run_scheduling_actor(
+
+                let ticker_tx = spawn_scheduling_actor(
                     raft_tx.clone().into(),
-                    ticker_rx,
+                    64,
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
-                ));
+                );
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
                     listener,

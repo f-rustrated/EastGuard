@@ -26,7 +26,7 @@ where
     sender
 }
 
-pub async fn run_scheduling_actor<T>(
+async fn run_scheduling_actor<T>(
     sender: mpsc::Sender<impl From<T::Callback>>,
     mut mailbox: mpsc::Receiver<Box<[TickerCommand<T>]>>,
     tick_period_ms: u64,

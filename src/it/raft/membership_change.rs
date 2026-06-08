@@ -17,9 +17,9 @@ use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId, Topol
 use crate::control_plane::{BINCODE_CONFIG, NodeId, SwimNodeState};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
-use crate::schedulers::actor::run_scheduling_actor;
+use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::schedulers::ticker_message::TickerCommand;
+use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
@@ -31,7 +31,7 @@ async fn start_raft_node(
 ) -> Result<
     (
         MutlRaftSender,
-        mpsc::Sender<Box<[TickerCommand<crate::control_plane::consensus::messages::RaftTimer>]>>,
+        SchedulerSender<RaftTimer>,
         Arc<ArcSwap<Topology>>,
     ),
     Box<dyn std::error::Error>,
@@ -53,19 +53,21 @@ async fn start_raft_node(
 
     let (raft_tx, raft_mailbox) = MultiRaftActor::channel(100);
     let (transport_tx, transport_rx) = mpsc::channel(100);
-    let (ticker_tx, ticker_rx) = mpsc::channel(64);
+
     let (swim_tx, swim_rx) = SwimActor::channel(64);
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", cluster_port).parse().unwrap();
     let listener = crate::net::TcpListener::bind(bind_addr).await?;
 
     tokio::spawn(mock_swim_handler(swim_rx, address_map));
-    tokio::spawn(run_scheduling_actor(
+
+    let ticker_tx = spawn_scheduling_actor(
         raft_tx.clone().into(),
-        ticker_rx,
+        100,
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
-    ));
+    );
+
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,
@@ -86,7 +88,7 @@ async fn start_raft_node(
     let (topology_pub, topology_reader) = super::stub_topology_channel(&all_nodes);
 
     MultiRaftActor::spawn(
-        ticker_tx.clone().into(),
+        ticker_tx.clone(),
         raft_mailbox,
         node_id,
         election_jitter_seed,
@@ -102,7 +104,10 @@ async fn start_raft_node(
         tokio::task::yield_now().await;
     }
     for _ in 0..200 {
-        let _ = ticker_tx.send(Box::new([TickerCommand::ForceTick])).await;
+        let _ = ticker_tx
+            .clone()
+            .send_batch(vec![TickerCommand::ForceTick])
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -111,9 +116,9 @@ async fn start_raft_node(
     Ok((raft_tx, ticker_tx, topology_pub))
 }
 
-async fn tick_n(ticker: &mpsc::Sender<Box<[TickerCommand<RaftTimer>]>>, n: usize) {
+async fn tick_n(ticker: &SchedulerSender<RaftTimer>, n: usize) {
     for _ in 0..n {
-        let _ = ticker.send(Box::new([TickerCommand::ForceTick])).await;
+        let _ = ticker.send_batch(vec![TickerCommand::ForceTick]).await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
