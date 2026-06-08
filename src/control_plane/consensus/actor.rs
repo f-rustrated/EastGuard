@@ -9,7 +9,7 @@ use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
-use crate::control_plane::metadata::{MetadataCommand, TopicMeta};
+use crate::control_plane::metadata::{MetadataCommand, TopicMeta, TopicStats};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
@@ -209,37 +209,26 @@ impl MutlRaftSender {
 
     pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        if self
+        let _ = self
             .send(MultiRaftActorCommand::GetPeers { group_id, reply })
-            .await
-            .is_err()
-        {
-            return vec![];
-        }
+            .await;
+
         recv.await.unwrap_or_default()
     }
 
     pub(crate) async fn get_topics(&self) -> Vec<String> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        if self
-            .send(MultiRaftActorCommand::GetTopics { reply })
-            .await
-            .is_err()
-        {
-            return vec![];
-        }
+        let _ = self.send(MultiRaftActorCommand::GetTopics { reply }).await;
+
         recv.await.unwrap_or_default()
     }
 
-    pub(crate) async fn get_topic_stats(&self) -> Vec<crate::control_plane::metadata::TopicStats> {
+    pub(crate) async fn get_topic_stats(&self) -> Vec<TopicStats> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        if self
+        let _ = self
             .send(MultiRaftActorCommand::GetTopicStats { reply })
-            .await
-            .is_err()
-        {
-            return vec![];
-        }
+            .await;
+
         recv.await.unwrap_or_default()
     }
 
@@ -248,14 +237,11 @@ impl MutlRaftSender {
     /// the actor channel is dead.
     pub(crate) async fn get_topic_metadata(&self, topic_name: String) -> Option<TopicMeta> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        if self
+        let _ = self
             .send(MultiRaftActorCommand::GetTopicMetadata { topic_name, reply })
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        recv.await.ok().flatten()
+            .await;
+
+        recv.await.unwrap_or_default()
     }
 
     pub(crate) async fn send(
