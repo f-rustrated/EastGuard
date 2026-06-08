@@ -36,24 +36,15 @@ use crate::data_plane::messages::command::{Produce, ProduceAck};
 use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
 use crate::net::TcpStream;
 
-// ── Client handler ─────────────────────────────────────────────────────────
-
-/// Pure request-to-response converter for one persistent client connection.
-///
-/// Shared across connections (wrappable in `Arc`) — holds no per-connection
-/// state. The caller owns the writer channel and passes it into `run`.
-///
-/// `data_plane_sender` will be added as a field once Fetch / ListOffsets land.
-
 #[derive(Clone)]
-pub struct ClientHandler {
+pub struct ClientController {
     node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
 }
 
-impl ClientHandler {
+impl ClientController {
     fn new(
         node_id: NodeId,
         swim_sender: SwimSender,
@@ -444,7 +435,7 @@ pub async fn handle_client_stream(
 ) {
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);
-    let handler = ClientHandler::new(node_id, swim_sender, raft_sender, data_plane_tx);
+    let handler = ClientController::new(node_id, swim_sender, raft_sender, data_plane_tx);
     tokio::spawn(run_client_writer(
         ClientRawWriter::new(write_half),
         writer_rx,
@@ -471,7 +462,7 @@ mod tests {
     use crate::data_plane::actor::DataPlaneSender;
     use std::net::SocketAddr;
 
-    use super::ClientHandler;
+    use super::ClientController;
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -532,7 +523,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
+        let resp = ClientController::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
@@ -561,19 +552,24 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::CreateTopic {
-                    name: "t1".into(),
-                    storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
-                        retention_ms: 3_600_000,
-                        replication_factor: 1,
-                        partition_strategy:
-                            crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
-                    },
+        let resp = ClientController::new(
+            node_id("self"),
+            swim,
+            raft_sender_with(|_| {}),
+            dp_stub(),
+        )
+        .dispatch(ClientRequest::ControlPlane(
+            ControlPlaneRequest::CreateTopic {
+                name: "t1".into(),
+                storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                    retention_ms: 3_600_000,
+                    replication_factor: 1,
+                    partition_strategy:
+                        crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
                 },
-            ))
-            .await;
+            },
+        ))
+        .await;
         assert!(
             matches!(
                 resp,
@@ -595,7 +591,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft, dp_stub())
+        let resp = ClientController::new(node_id("self"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DeleteTopic { name: "t1".into() },
             ))
@@ -616,11 +612,12 @@ mod tests {
                 let _ = reply.send(vec!["alpha".into(), "beta".into()]);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::ListHostedTopics,
-            ))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
+                .dispatch(ClientRequest::ControlPlane(
+                    ControlPlaneRequest::ListHostedTopics,
+                ))
+                .await;
         let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) = resp else {
             panic!("expected TopicList, got {resp:?}");
         };
@@ -653,13 +650,14 @@ mod tests {
                 _ => {}
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::DescribeTopic {
-                    name: "elsewhere".into(),
-                },
-            ))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+                .dispatch(ClientRequest::ControlPlane(
+                    ControlPlaneRequest::DescribeTopic {
+                        name: "elsewhere".into(),
+                    },
+                ))
+                .await;
         let ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect {
             owner: redirect_owner,
         }) = resp
@@ -690,7 +688,7 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(me, swim, raft, dp_stub())
+        let resp = ClientController::new(me, swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::DescribeTopic {
                     name: "missing".into(),
@@ -731,9 +729,10 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
-            .dispatch(ClientRequest::Admin(AdminRequest::DescribeCluster))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+                .dispatch(ClientRequest::Admin(AdminRequest::DescribeCluster))
+                .await;
         let ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: info }) = resp else {
             panic!("expected ClusterInfo, got {resp:?}");
         };
@@ -761,11 +760,12 @@ mod tests {
                 }
             })
         };
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
-                key: b"any".to_vec(),
-            }))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+                .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
+                    key: b"any".to_vec(),
+                }))
+                .await;
         let ClientResponse::Admin(AdminResponse::ShardInfo { detail: Some(d) }) = resp else {
             panic!("expected ShardInfo with detail, got {resp:?}");
         };
@@ -782,11 +782,12 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
-                key: b"x".to_vec(),
-            }))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+                .dispatch(ClientRequest::Admin(AdminRequest::GetShardInfo {
+                    key: b"x".to_vec(),
+                }))
+                .await;
         assert!(
             matches!(
                 resp,
@@ -803,11 +804,12 @@ mod tests {
                 let _ = reply.send(Some(node_id("n1")));
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
-            .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
-                shard_group_id: 42,
-            }))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
+                .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
+                    shard_group_id: 42,
+                }))
+                .await;
         let ClientResponse::Admin(AdminResponse::ShardLeader { leader }) = resp else {
             panic!("expected ShardLeader, got {resp:?}");
         };
@@ -825,11 +827,12 @@ mod tests {
                 }]);
             }
         });
-        let resp = ClientHandler::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
-            .dispatch(ClientRequest::Admin(
-                AdminRequest::ListHostedTopicsWithStats,
-            ))
-            .await;
+        let resp =
+            ClientController::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
+                .dispatch(ClientRequest::Admin(
+                    AdminRequest::ListHostedTopicsWithStats,
+                ))
+                .await;
         let ClientResponse::Admin(AdminResponse::TopicStats { topics }) = resp else {
             panic!("expected TopicStats, got {resp:?}");
         };

@@ -1,4 +1,4 @@
-pub mod clients;
+pub mod controller;
 pub mod protocol;
 pub(crate) mod reader;
 pub(crate) mod writer;

@@ -20,7 +20,7 @@ pub(crate) mod macros;
 mod test_traits;
 
 use crate::config::Environment;
-use crate::connections::clients::handle_client_stream;
+use crate::connections::controller::handle_client_stream;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::RaftTransportCommand;
