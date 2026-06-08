@@ -208,14 +208,10 @@ impl ClientHandler {
         loop {
             match reader.read_request::<ClientRequest>().await {
                 Ok((request_id, request)) => {
-                    let handler = self.clone();
-                    let tx = writer_tx.clone();
-                    tokio::spawn(async move {
-                        let response = handler.dispatch(request).await;
-                        if tx.send((request_id, response)).await.is_err() {
-                            tracing::debug!("client writer closed");
-                        }
-                    });
+                    let response = self.dispatch(request).await;
+                    if writer_tx.send((request_id, response)).await.is_err() {
+                        tracing::debug!("client writer closed");
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("client connection closed: {e}");
@@ -223,6 +219,8 @@ impl ClientHandler {
                 }
             }
         }
+
+        // TODO stop write half
     }
 
     pub async fn dispatch(&self, request: ClientRequest) -> ClientResponse {
