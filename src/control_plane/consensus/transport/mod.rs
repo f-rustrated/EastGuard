@@ -28,14 +28,14 @@ impl RaftTransportActor {
         swim_tx: SwimSender,
     ) {
         let (dial_tx, mut dial_rx) = mpsc::channel(256);
-        let mut write_dispatcher = RaftRpcDispatcher::new(node_id, dial_tx);
+        let mut dispatcher = RaftRpcDispatcher::new(node_id, dial_tx);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await; // consume immediate first tick
 
         loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
-                    write_dispatcher.accept(stream, &raft_tx).await;
+                    dispatcher.accept(stream, &raft_tx).await;
                 }
                 Some(batch) = from_actor.recv() => {
                     // Aggregate the batch into ONE dispatcher.send() call: the
@@ -51,19 +51,19 @@ impl RaftTransportActor {
                         match cmd {
                             RaftTransportCommand::Send(packets) => to_send.extend(packets),
                             RaftTransportCommand::DisconnectPeer(peer_id) => {
-                                write_dispatcher.disconnect(peer_id);
+                                dispatcher.disconnect(peer_id);
                             }
                         }
                     }
                     if !to_send.is_empty() {
-                        write_dispatcher.send(to_send, &raft_tx, &swim_tx).await;
+                        dispatcher.send(to_send, &swim_tx).await;
                     }
                 }
                 Some(result) = dial_rx.recv() => {
-                    write_dispatcher.on_dial_result(result, &raft_tx).await;
+                    dispatcher.on_dial_result(result, &raft_tx).await;
                 }
                 _ = cleanup_interval.tick() => {
-                    write_dispatcher.cleanup_dead_peers();
+                    dispatcher.cleanup_dead_peers();
                 }
             }
         }

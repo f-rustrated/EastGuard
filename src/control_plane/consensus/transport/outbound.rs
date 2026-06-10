@@ -10,7 +10,7 @@ use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMess
 
 use crate::control_plane::consensus::transport::RaftRpcListener;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
+use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -78,14 +78,9 @@ impl RaftRpcDispatcher {
         tokio::spawn(reader.run(raft_tx.clone()));
     }
 
-    pub(super) async fn send(
-        &mut self,
-        packets: Vec<OutboundRaftPacket>,
-        raft_tx: &MutlRaftSender,
-        swim_tx: &SwimSender,
-    ) {
+    pub(super) async fn send(&mut self, packets: Vec<OutboundRaftPacket>, swim_tx: &SwimSender) {
         for (target_id, msgs) in self.group_packets(packets) {
-            self.send_to_target(target_id, msgs, raft_tx, swim_tx).await;
+            self.send_to_target(target_id, msgs, swim_tx).await;
         }
     }
 
@@ -114,7 +109,6 @@ impl RaftRpcDispatcher {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        _raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
@@ -158,33 +152,32 @@ impl RaftRpcDispatcher {
     pub(super) async fn on_dial_result(&mut self, result: DialOutcome, raft_tx: &MutlRaftSender) {
         let DialOutcome { target, outcome } = result;
         let buffered = self.pending_dials.remove(&target).unwrap_or_default();
-        match outcome {
-            Ok((reader, write_half)) => {
-                if self.dead_peers.contains(&target) {
-                    return;
-                }
-                // Mirror `accept`'s tie-break: the connection initiated by
-                // the lower NodeId wins, and we initiated this one. Losing the
-                // tie-break must not lose the buffered messages — deliver them
-                // over the surviving (accepted) connection instead; otherwise
-                // e.g. a buffered RequestVote silently costs a full election
-                // round (#133).
-                if self.writers.contains_key(&target) && self.node_id > target {
-                    if !buffered.is_empty() {
-                        let _ = self.write_messages_to(&target, &buffered).await;
-                    }
-                    return;
-                }
-                self.writers.insert(target.clone(), write_half);
-                tokio::spawn(reader.run(raft_tx.clone()));
-                if !buffered.is_empty() {
-                    let _ = self.write_messages_to(&target, &buffered).await;
-                }
+
+        let Ok((reader, write_half)) = outcome else {
+            self.connect_backoffs.insert(target, Instant::now());
+            return;
+        };
+
+        if self.dead_peers.contains(&target) {
+            return;
+        }
+        // Mirror `accept`'s tie-break: the connection initiated by
+        // the lower NodeId wins, and we initiated this one. Losing the
+        // tie-break must not lose the buffered messages — deliver them
+        // over the surviving (accepted) connection instead; otherwise
+        // e.g. a buffered RequestVote silently costs a full election
+        // round (#133).
+        if self.writers.contains_key(&target) && self.node_id > target {
+            if !buffered.is_empty() {
+                let _ = self.write_messages_to(&target, &buffered).await;
             }
-            Err(err) => {
-                tracing::warn!("{err}");
-                self.connect_backoffs.insert(target, Instant::now());
-            }
+            return;
+        }
+        self.writers.insert(target.clone(), write_half);
+        tokio::spawn(reader.run(raft_tx.clone()));
+
+        if !buffered.is_empty() {
+            let _ = self.write_messages_to(&target, &buffered).await;
         }
     }
 
@@ -234,37 +227,23 @@ impl RaftRpcDispatcher {
 }
 
 /// Resolve, connect (3s cap), and handshake — on a spawned task, so a hung
-/// connect can never block the transport select loop (#133). The loop
+/// connect can never block the transport select loop. The loop
 /// installs the writer and flushes buffered messages in `on_dial_result`.
 async fn dial(
     node_id: NodeId,
     target_id: NodeId,
     swim_tx: SwimSender,
 ) -> anyhow::Result<(RaftRpcListener, OwnedWriteHalf)> {
-    let addr: NodeAddress = match swim_tx.resolve_address(target_id.clone()).await {
-        Ok(Some(addr)) => addr,
-        Ok(None) => anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id),
-        Err(e) => anyhow::bail!(
-            "[{}] Resolve address for {:?} failed: {e}",
-            node_id,
-            target_id
-        ),
+    let Some(addr) = swim_tx.resolve_address(target_id.clone()).await? else {
+        anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id);
     };
-    tracing::debug!(node = %node_id, target = %target_id, "transport: dialing");
-    let Some(stream) = tokio::time::timeout(
+
+    let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         TcpStream::connect(addr.cluster_addr()),
     )
-    .await
-    .ok()
-    .and_then(|r| r.ok()) else {
-        anyhow::bail!(
-            "[{}] Failed to connect to {} ({:?})",
-            node_id,
-            addr.cluster_addr(),
-            target_id
-        );
-    };
+    .await??;
+
     let (read_half, mut write_half) = stream.into_split();
     let bytes = bincode::encode_to_vec(&node_id, BINCODE_CONFIG)
         .map_err(|e| anyhow::anyhow!("[{}] Handshake encode failed: {e}", node_id))?;
