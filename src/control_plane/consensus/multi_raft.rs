@@ -163,15 +163,15 @@ impl MultiRaft {
                 if member == self.node_id || !live_set.contains(&member) {
                     continue;
                 }
-                if raft.propose(RaftCommand::AddPeer(member.clone())).is_err() {
+                if raft.propose(RaftCommand::AddPeer(member.clone())).is_ok() {
+                    membership_asserted = true;
+                } else {
                     tracing::warn!(
                         "Takeover membership assert AddPeer({:?}) on {:?} rejected",
                         member,
                         shard_group_id,
                     );
-                    continue;
-                };
-                membership_asserted = true;
+                }
             }
         }
 
