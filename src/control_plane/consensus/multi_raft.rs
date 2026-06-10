@@ -153,7 +153,6 @@ impl MultiRaft {
         // `apply_add_peer` is idempotent and self-skipping, so healthy
         // replicas no-op while divergent ones heal. Dead members are skipped
         // replacement is `reconcile_peers`'s job, rejoin is `add_node`'s.
-        let mut membership_asserted = false;
 
         if let Some(members) = self
             .topology
@@ -164,7 +163,7 @@ impl MultiRaft {
                     continue;
                 }
                 if raft.propose(RaftCommand::AddPeer(member.clone())).is_ok() {
-                    membership_asserted = true;
+                    self.dirty.insert(shard_group_id);
                 } else {
                     tracing::warn!(
                         "Takeover membership assert AddPeer({:?}) on {:?} rejected",
@@ -178,7 +177,7 @@ impl MultiRaft {
         let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
         let segment_reconciled = raft.reconcile_segments(&live_set);
 
-        if membership_asserted || peer_reconciled || segment_reconciled {
+        if peer_reconciled || segment_reconciled {
             self.dirty.insert(shard_group_id);
         };
     }
@@ -280,7 +279,7 @@ impl MultiRaft {
 
         let timer_seqs = TimerSeqs {
             election: self.seq_counter.generate(),
-            heartbeat: self.seq_counter.generate(),
+            rpc: self.seq_counter.generate(),
             merge_check: self.seq_counter.generate(),
         };
 

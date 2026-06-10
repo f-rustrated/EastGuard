@@ -107,7 +107,7 @@ pub struct Raft {
 
 pub(crate) struct TimerSeqs {
     pub election: u64,
-    pub heartbeat: u64,
+    pub rpc: u64,
     pub merge_check: u64,
 }
 
@@ -147,7 +147,7 @@ impl Raft {
     }
 
     pub(crate) fn heartbeat_seq(&self) -> u64 {
-        self.timer_seqs.heartbeat
+        self.timer_seqs.rpc
     }
 
     pub(crate) fn topic_names(&self) -> Vec<String> {
@@ -636,38 +636,25 @@ impl Raft {
     }
 
     fn step_down(&mut self, new_term: u64) {
-        self.current_term = new_term;
-        self.voted_for = None;
-        self.push_hard_state();
-        let was_leader = self.role == Role::Leader;
-        self.role = Role::Follower;
-        self.current_leader = None;
-        self.peer_states.clear();
-        self.confirmed_assignment.clear();
-        // Raft resets a node's election timer only when it grants a vote or
-        // recognizes AppendEntries from the current leader (§5.2; etcd
-        // implements the same). Resetting here — on *any* higher-term
-        // message, including a RequestVote we are about to reject — lets a
-        // candidate that can never win (e.g. its log fell behind before the
-        // old leader died) push back the one electable survivor's deadline
-        // every round: a livelock observed in #133 as both survivors
-        // reporting no leader for 40s+. Followers and candidates therefore
-        // keep their already-armed deadline; the explicit resets on the
-        // grant path (`handle_request_vote`) and on leader contact
-        // (`recognize_leader`) provide the paper's resets. Only an
-        // ex-leader — which runs no election timer — arms a fresh one so it
-        // cannot be stranded with no timer at all.
         tracing::debug!(
             node = %self.node_id,
             group = self.shard_group_id.0,
             new_term,
-            was_leader,
+            was_leader = self.role == Role::Leader,
             "election: stepping down"
         );
+
+        self.current_term = new_term;
+        self.voted_for = None;
+        self.push_hard_state();
         self.cancel_leader_timers();
-        if was_leader {
+        if self.role == Role::Leader {
             self.reset_election_timer();
         }
+        self.role = Role::Follower;
+        self.current_leader = None;
+        self.peer_states.clear();
+        self.confirmed_assignment.clear();
     }
 
     // -------------------------------------------------------------------
@@ -1109,7 +1096,7 @@ impl Raft {
     fn schedule_rpc_timer(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.timer_seqs.heartbeat,
+                seq: self.timer_seqs.rpc,
                 timer: RaftTimer::rpc(self.shard_group_id),
             }));
     }
@@ -1141,7 +1128,7 @@ impl Raft {
     fn cancel_leader_timers(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.heartbeat,
+                seq: self.timer_seqs.rpc,
             }));
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
@@ -1157,7 +1144,7 @@ impl Raft {
             }));
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.heartbeat,
+                seq: self.timer_seqs.rpc,
             }));
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
@@ -1319,7 +1306,7 @@ mod tests {
     fn test_timer_seqs() -> TimerSeqs {
         TimerSeqs {
             election: 0,
-            heartbeat: 1,
+            rpc: 1,
             merge_check: 2,
         }
     }
