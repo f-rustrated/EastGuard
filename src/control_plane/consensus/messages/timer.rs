@@ -10,6 +10,9 @@ pub struct RaftTimer {
     pub(crate) shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
+    /// Election-timer generation (see `Raft::election_epoch`, #133). Only
+    /// meaningful for `RaftTimerKind::Election`; 0 otherwise.
+    epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +28,11 @@ pub enum RaftTimeoutCallback {
     Ignored,
     ElectionTimeout {
         shard_group_id: ShardGroupId,
+        /// Generation of the timer that fired. A `CancelSchedule` cannot
+        /// retract a callback already emitted and in flight to the actor, so
+        /// `Raft::handle_timeout` drops fires whose epoch is stale (#133).
+        /// `u64::MAX` bypasses the check for direct invocations in tests.
+        epoch: u64,
     },
     RpcTimeout {
         shard_group_id: ShardGroupId,
@@ -47,6 +55,7 @@ impl TTimer for RaftTimer {
         match self.kind {
             RaftTimerKind::Election => RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: self.shard_group_id,
+                epoch: self.epoch,
             },
             RaftTimerKind::Rpc => RaftTimeoutCallback::RpcTimeout {
                 shard_group_id: self.shard_group_id,
@@ -65,11 +74,12 @@ impl TTimer for RaftTimer {
 }
 
 impl RaftTimer {
-    pub fn election(jitter_ticks: u32, shard_group_id: ShardGroupId) -> Self {
+    pub fn election(jitter_ticks: u32, shard_group_id: ShardGroupId, epoch: u64) -> Self {
         Self {
             shard_group_id,
             kind: RaftTimerKind::Election,
             ticks_remaining: ELECTION_TIMEOUT_BASE_TICKS + jitter_ticks,
+            epoch,
         }
     }
 
@@ -78,6 +88,7 @@ impl RaftTimer {
             shard_group_id,
             kind: RaftTimerKind::Rpc,
             ticks_remaining: RAFT_RPC_INTERVAL_TICKS,
+            epoch: 0,
         }
     }
 
@@ -86,6 +97,7 @@ impl RaftTimer {
             shard_group_id,
             kind: RaftTimerKind::MergeCheck,
             ticks_remaining: MERGE_CHECK_INTERVAL_TICKS,
+            epoch: 0,
         }
     }
 }

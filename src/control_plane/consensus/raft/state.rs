@@ -94,6 +94,12 @@ pub struct Raft {
     state_machine: MetadataStateMachine,
     election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
+    /// Election-timer generation. Bumped whenever the election timer is
+    /// (re)armed or cancelled; a fired `ElectionTimeout` carrying an older
+    /// epoch raced its own cancellation in flight and must be ignored
+    /// (#133: a stale fire one tick after a vote grant bumped the term and
+    /// deposed the freshly elected leader).
+    election_epoch: u64,
     /// Segments whose data-leader has acked its
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
@@ -135,6 +141,7 @@ impl Raft {
             peer_states: HashMap::new(),
             election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
+            election_epoch: 0,
             confirmed_assignment: HashMap::new(),
         };
         raft.reset_election_timer();
@@ -408,8 +415,18 @@ impl Raft {
     pub fn handle_timeout(&mut self, event: RaftTimeoutCallback) {
         match event {
             RaftTimeoutCallback::Ignored => {}
-            RaftTimeoutCallback::ElectionTimeout { .. } => {
-                self.start_election();
+            RaftTimeoutCallback::ElectionTimeout { epoch, .. } => {
+                if epoch == self.election_epoch || epoch == u64::MAX {
+                    self.start_election();
+                } else {
+                    tracing::debug!(
+                        node = %self.node_id,
+                        group = self.shard_group_id.0,
+                        stale_epoch = epoch,
+                        epoch = self.election_epoch,
+                        "election: dropped stale election timeout"
+                    );
+                }
             }
             RaftTimeoutCallback::RpcTimeout { .. } => {
                 self.send_heartbeats();
@@ -455,6 +472,12 @@ impl Raft {
 
         self.role = Role::Candidate { votes_received: 1 }; // vote for self
         self.reset_election_timer();
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            term = self.current_term,
+            "election: became candidate, broadcasting RequestVote"
+        );
 
         let req = RequestVote {
             term: self.current_term,
@@ -477,9 +500,22 @@ impl Raft {
             self.step_down(req.term);
         }
 
-        let vote_granted = req.term == self.current_term
-            && self.vote_available_for(&req.candidate_id)
-            && self.log_is_up_to_date(req.last_log_index, req.last_log_term);
+        let term_ok = req.term == self.current_term;
+        let vote_ok = self.vote_available_for(&req.candidate_id);
+        let log_ok = self.log_is_up_to_date(req.last_log_index, req.last_log_term);
+        let vote_granted = term_ok && vote_ok && log_ok;
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            from = %req.candidate_id,
+            req_term = req.term,
+            term = self.current_term,
+            granted = vote_granted,
+            term_ok,
+            vote_ok,
+            log_ok,
+            "election: RequestVote received"
+        );
 
         if vote_granted {
             self.voted_for = Some(req.candidate_id);
@@ -502,6 +538,15 @@ impl Raft {
     }
 
     fn handle_request_vote_response(&mut self, resp: RequestVoteResponse) {
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            from = %resp.node_id,
+            resp_term = resp.term,
+            term = self.current_term,
+            granted = resp.vote_granted,
+            "election: RequestVoteResponse received"
+        );
         if resp.term > self.current_term {
             self.step_down(resp.term);
             return;
@@ -548,6 +593,12 @@ impl Raft {
     fn become_leader(&mut self) {
         self.role = Role::Leader;
         self.current_leader = Some(self.node_id.clone());
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            term = self.current_term,
+            "election: became leader"
+        );
 
         self.events.push(
             LeaderChange {
@@ -596,12 +647,35 @@ impl Raft {
         self.current_term = new_term;
         self.voted_for = None;
         self.push_hard_state();
+        let was_leader = self.role == Role::Leader;
         self.role = Role::Follower;
         self.current_leader = None;
         self.peer_states.clear();
         self.confirmed_assignment.clear();
-        self.cancel_all_timers();
-        self.reset_election_timer();
+        // Raft resets a node's election timer only when it grants a vote or
+        // recognizes AppendEntries from the current leader (§5.2; etcd
+        // implements the same). Resetting here — on *any* higher-term
+        // message, including a RequestVote we are about to reject — lets a
+        // candidate that can never win (e.g. its log fell behind before the
+        // old leader died) push back the one electable survivor's deadline
+        // every round: a livelock observed in #133 as both survivors
+        // reporting no leader for 40s+. Followers and candidates therefore
+        // keep their already-armed deadline; the explicit resets on the
+        // grant path (`handle_request_vote`) and on leader contact
+        // (`recognize_leader`) provide the paper's resets. Only an
+        // ex-leader — which runs no election timer — arms a fresh one so it
+        // cannot be stranded with no timer at all.
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            new_term,
+            was_leader,
+            "election: stepping down"
+        );
+        self.cancel_leader_timers();
+        if was_leader {
+            self.reset_election_timer();
+        }
     }
 
     // -------------------------------------------------------------------
@@ -719,6 +793,13 @@ impl Raft {
         }
         self.current_leader = Some(req.leader_id.clone());
         self.reset_election_timer();
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            term = self.current_term,
+            leader = %req.leader_id,
+            "election: leader recognized"
+        );
     }
 
     fn check_log_consistency(&self, prev_log_index: u64, prev_log_term: u64) -> bool {
@@ -1013,15 +1094,23 @@ impl Raft {
     }
 
     fn reset_election_timer(&mut self) {
+        self.election_epoch = self.election_epoch.wrapping_add(1);
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.election,
             }));
         let jitter = self.election_jitter.next();
+        tracing::debug!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            epoch = self.election_epoch,
+            jitter_ticks = jitter,
+            "election: timer armed"
+        );
         self.events
             .push(RaftEvent::Timer(TimerCommand::SetSchedule {
                 seq: self.timer_seqs.election,
-                timer: RaftTimer::election(jitter, self.shard_group_id),
+                timer: RaftTimer::election(jitter, self.shard_group_id, self.election_epoch),
             }));
     }
 
@@ -1054,7 +1143,22 @@ impl Raft {
         self.schedule_merge_check_timer();
     }
 
+    /// Cancels the leader-side timers (heartbeat, merge-check) without
+    /// touching the election timer — used by `step_down` so a follower or
+    /// candidate keeps its currently armed election deadline (#133).
+    fn cancel_leader_timers(&mut self) {
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.heartbeat,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.merge_check,
+            }));
+    }
+
     pub(crate) fn cancel_all_timers(&mut self) {
+        self.election_epoch = self.election_epoch.wrapping_add(1);
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.election,
@@ -1263,6 +1367,7 @@ mod tests {
 
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         assert_eq!(raft.role, Role::Leader);
@@ -1275,6 +1380,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         assert_eq!(raft.current_term, 1);
 
@@ -1282,6 +1388,7 @@ mod tests {
         raft.step_down(1);
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         assert_eq!(raft.current_term, 2);
     }
@@ -1296,6 +1403,7 @@ mod tests {
 
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         assert!(matches!(raft.role, Role::Candidate { votes_received: 1 }));
@@ -1369,6 +1477,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -1388,6 +1497,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -1444,6 +1554,7 @@ mod tests {
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1585,6 +1696,7 @@ mod tests {
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1686,6 +1798,7 @@ mod tests {
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1728,6 +1841,7 @@ mod tests {
         // Become leader at term 1
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1767,6 +1881,7 @@ mod tests {
         // Become leader at term 1
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1784,6 +1899,7 @@ mod tests {
         // Stale election timeout arrives — should be ignored
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         assert_eq!(
@@ -1812,6 +1928,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         assert!(matches!(raft.role, Role::Candidate { .. }));
@@ -1839,6 +1956,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -1883,6 +2001,7 @@ mod tests {
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -1997,6 +2116,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         assert!(raft.is_leader());
     }
@@ -2022,6 +2142,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         assert!(raft.is_leader());
@@ -2039,6 +2160,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -2054,6 +2176,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         assert!(raft.is_leader());
@@ -2078,6 +2201,7 @@ mod tests {
 
         n1.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         let vote_reqs = packets(&mut n1);
         for pkt in &vote_reqs {
@@ -2118,6 +2242,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -2147,6 +2272,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
 
@@ -2173,6 +2299,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         let events = leader_events(&mut raft);
@@ -2187,6 +2314,7 @@ mod tests {
         // Become leader
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -2223,6 +2351,7 @@ mod tests {
         // First election: term 1
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         let events = leader_events(&mut raft);
         assert_eq!(events[0].term, 1);
@@ -2231,6 +2360,7 @@ mod tests {
         raft.step_down(1);
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         let reelection_events = leader_events(&mut raft);
@@ -2263,6 +2393,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.simulate_flush();
@@ -2278,6 +2409,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.simulate_flush();
@@ -2293,6 +2425,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.simulate_flush();
@@ -2311,6 +2444,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.simulate_flush();
@@ -2359,6 +2493,7 @@ mod tests {
         // node-1 wins election at term 2
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         raft.handle_rpc(
@@ -2422,6 +2557,7 @@ mod tests {
         );
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
 
         let events = raft.take_events();
@@ -2476,6 +2612,7 @@ mod tests {
         let mut raft = three_node_raft(id);
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         let peer = raft
@@ -2504,6 +2641,7 @@ mod tests {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
         });
         drain(&mut raft);
         assert_eq!(raft.role, Role::Leader);

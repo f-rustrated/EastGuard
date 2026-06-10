@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::control_plane::consensus::actor::MutlRaftSender;
@@ -13,6 +14,9 @@ use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+/// Upper bound on messages buffered per peer while its dial is in flight;
+/// overflow is dropped (raft retries by timer).
+const PENDING_DIAL_BUFFER_CAP: usize = 256;
 
 /// Manages peer connections, address resolution, and dead-peer tracking.
 ///
@@ -33,15 +37,27 @@ pub(super) struct RaftRpcDispatcher {
     /// rapid reconnect storms to dead/unreachable peers that would block
     /// the transport's select loop and stall flush_events in MultiRaftActor.
     connect_backoffs: HashMap<NodeId, Instant>,
+    /// Messages buffered for peers whose connection is being established on a
+    /// background task; flushed (or dropped on failure) in `on_dial_result`.
+    pending_dials: HashMap<NodeId, Vec<WireRaftMessage>>,
+    dial_tx: mpsc::Sender<DialOutcome>,
+}
+
+/// Result of a background dial attempt, delivered back to the transport loop.
+pub(super) struct DialOutcome {
+    target: NodeId,
+    outcome: anyhow::Result<(RaftRpcListener, OwnedWriteHalf)>,
 }
 
 impl RaftRpcDispatcher {
-    pub(super) fn new(node_id: NodeId) -> Self {
+    pub(super) fn new(node_id: NodeId, dial_tx: mpsc::Sender<DialOutcome>) -> Self {
         Self {
             node_id,
             writers: HashMap::new(),
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
+            pending_dials: HashMap::new(),
+            dial_tx,
         }
     }
 
@@ -69,7 +85,13 @@ impl RaftRpcDispatcher {
         swim_tx: &SwimSender,
     ) {
         let by_target = self.group_packets(packets);
-        for (target_id, msgs) in by_target {
+        // Dials run on background tasks (see `dial` / `on_dial_result`), so
+        // target order is no longer load-bearing (#133); flushing connected
+        // peers first simply gets wire bytes moving before dial bookkeeping.
+        let (connected, dialing): (Vec<_>, Vec<_>) = by_target
+            .into_iter()
+            .partition(|(target, _)| self.writers.contains_key(target));
+        for (target_id, msgs) in connected.into_iter().chain(dialing) {
             self.send_to_target(target_id, msgs, raft_tx, swim_tx).await;
         }
     }
@@ -77,8 +99,8 @@ impl RaftRpcDispatcher {
     fn group_packets(
         &self,
         packets: Vec<OutboundRaftPacket>,
-    ) -> HashMap<NodeId, Vec<WireRaftMessage>> {
-        let mut by_target: HashMap<NodeId, Vec<WireRaftMessage>> = HashMap::new();
+    ) -> BTreeMap<NodeId, Vec<WireRaftMessage>> {
+        let mut by_target: BTreeMap<NodeId, Vec<WireRaftMessage>> = BTreeMap::new();
         for pkt in packets {
             if self.dead_peers.contains(&pkt.target) {
                 continue;
@@ -99,7 +121,7 @@ impl RaftRpcDispatcher {
         &mut self,
         target_id: NodeId,
         msgs: Vec<WireRaftMessage>,
-        raft_tx: &MutlRaftSender,
+        _raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
@@ -113,73 +135,69 @@ impl RaftRpcDispatcher {
         {
             return;
         }
+        // No usable writer: hand the messages to the in-flight dial (if any)
+        // or start one on a background task. Dials must never run inline — a
+        // hung connect (crashed peer; acceptor starved because *its* loop is
+        // mid-dial) blocks this select loop for the full connect timeout,
+        // stalling every queued batch and the accept arm with it (#133).
+        if let Some(buffered) = self.pending_dials.get_mut(&target_id) {
+            if buffered.len() + msgs.len() <= PENDING_DIAL_BUFFER_CAP {
+                buffered.extend(msgs);
+            }
+            return;
+        }
+        self.pending_dials.insert(target_id.clone(), msgs);
+        let dial_task = dial(self.node_id.clone(), target_id.clone(), swim_tx.clone());
+        let dial_tx = self.dial_tx.clone();
+        tokio::spawn(async move {
+            let outcome = dial_task.await;
+            let _ = dial_tx
+                .send(DialOutcome {
+                    target: target_id,
+                    outcome,
+                })
+                .await;
+        });
+    }
 
-        match self
-            .establish_session(target_id.clone(), msgs, swim_tx)
-            .await
-        {
-            Ok(rpc_listener) => {
-                tokio::spawn(rpc_listener.run(raft_tx.clone()));
+    /// Installs (or discards, per the NodeId tie-break) a completed dial and
+    /// flushes any messages buffered while it was in flight.
+    pub(super) async fn on_dial_result(&mut self, result: DialOutcome, raft_tx: &MutlRaftSender) {
+        let DialOutcome { target, outcome } = result;
+        let buffered = self.pending_dials.remove(&target).unwrap_or_default();
+        match outcome {
+            Ok((reader, write_half)) => {
+                if self.dead_peers.contains(&target) {
+                    return;
+                }
+                // Mirror `accept`'s tie-break: the connection initiated by
+                // the lower NodeId wins, and we initiated this one. Losing the
+                // tie-break must not lose the buffered messages — deliver them
+                // over the surviving (accepted) connection instead; otherwise
+                // e.g. a buffered RequestVote silently costs a full election
+                // round (#133).
+                if self.writers.contains_key(&target) && self.node_id > target {
+                    if !buffered.is_empty() {
+                        let _ = self.write_messages_to(&target, &buffered).await;
+                    }
+                    return;
+                }
+                self.writers.insert(target.clone(), write_half);
+                tokio::spawn(reader.run(raft_tx.clone()));
+                if !buffered.is_empty() {
+                    let _ = self.write_messages_to(&target, &buffered).await;
+                }
             }
             Err(err) => {
                 tracing::warn!("{err}");
-                self.connect_backoffs.insert(target_id, Instant::now());
+                self.connect_backoffs.insert(target, Instant::now());
             }
         }
-    }
-
-    async fn establish_session(
-        &mut self,
-        target_id: NodeId,
-        msgs: Vec<WireRaftMessage>,
-        swim_tx: &SwimSender,
-    ) -> anyhow::Result<RaftRpcListener> {
-        let Some(node_addr) = self.resolve_address(&target_id, swim_tx).await else {
-            anyhow::bail!(
-                "[{}] Cannot resolve address for {:?}",
-                self.node_id,
-                target_id
-            );
-        };
-        // Timeout required: in turmoil (and on dead hosts generally), TcpStream::connect
-        // never returns an error — it hangs forever, stalling the select loop.
-        let Some(stream) = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(node_addr.cluster_addr()),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok()) else {
-            anyhow::bail!(
-                "[{}] Failed to connect to {} ({:?})",
-                self.node_id,
-                node_addr.cluster_addr(),
-                target_id
-            );
-        };
-
-        let (read_half, write_half) = stream.into_split();
-        self.writers.insert(target_id.clone(), write_half);
-        if let Err(e) = self.handshake(&target_id).await {
-            anyhow::bail!(
-                "[{}] Handshake with {:?} failed: {e}",
-                self.node_id,
-                target_id
-            );
-        }
-        if let Err(e) = self.write_messages_to(&target_id, &msgs).await {
-            anyhow::bail!(
-                "[{}] Write {} msgs to {:?} failed: {e}",
-                self.node_id,
-                msgs.len(),
-                target_id
-            );
-        }
-        Ok(RaftRpcListener(read_half))
     }
 
     pub(super) fn disconnect(&mut self, peer_id: NodeId) {
         self.writers.remove(&peer_id);
+        self.pending_dials.remove(&peer_id);
         tracing::info!("[{}] Disconnected dead peer {:?}", self.node_id, peer_id);
         self.dead_peers.insert(peer_id);
     }
@@ -189,38 +207,8 @@ impl RaftRpcDispatcher {
         self.connect_backoffs.clear();
     }
 
-    async fn resolve_address(&self, node_id: &NodeId, swim_tx: &SwimSender) -> Option<NodeAddress> {
-        match swim_tx.resolve_address(node_id.clone()).await {
-            Ok(addr) => addr,
-            Err(e) => {
-                tracing::debug!("Resolve address for {:?} failed: {e}", node_id);
-                None
-            }
-        }
-    }
-
     // --- Wire helpers ---
     // On error, writer is removed from the map so subsequent calls reconnect.
-
-    /// Send handshake (our NodeId) to a writer already in the map.
-    async fn handshake(&mut self, target: &NodeId) -> std::io::Result<()> {
-        let writer = self.writers.get_mut(target).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "no writer for target")
-        })?;
-        let bytes = bincode::encode_to_vec(&self.node_id, BINCODE_CONFIG)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let len = bytes.len() as u32;
-        let result = async {
-            writer.write_all(&len.to_be_bytes()).await?;
-            writer.write_all(&bytes).await
-        }
-        .await;
-
-        if result.is_err() {
-            self.writers.remove(target);
-        }
-        result
-    }
 
     /// Encode all messages into a single buffer, write to target's connection.
     async fn write_messages_to(
@@ -250,4 +238,45 @@ impl RaftRpcDispatcher {
     pub fn contains(&self, node_id: &NodeId) -> bool {
         self.writers.contains_key(node_id)
     }
+}
+
+/// Resolve, connect (3s cap), and handshake — on a spawned task, so a hung
+/// connect can never block the transport select loop (#133). The loop
+/// installs the writer and flushes buffered messages in `on_dial_result`.
+async fn dial(
+    node_id: NodeId,
+    target_id: NodeId,
+    swim_tx: SwimSender,
+) -> anyhow::Result<(RaftRpcListener, OwnedWriteHalf)> {
+    let addr: NodeAddress = match swim_tx.resolve_address(target_id.clone()).await {
+        Ok(Some(addr)) => addr,
+        Ok(None) => anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id),
+        Err(e) => anyhow::bail!(
+            "[{}] Resolve address for {:?} failed: {e}",
+            node_id,
+            target_id
+        ),
+    };
+    tracing::debug!(node = %node_id, target = %target_id, "transport: dialing");
+    let Some(stream) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        TcpStream::connect(addr.cluster_addr()),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok()) else {
+        anyhow::bail!(
+            "[{}] Failed to connect to {} ({:?})",
+            node_id,
+            addr.cluster_addr(),
+            target_id
+        );
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    let bytes = bincode::encode_to_vec(&node_id, BINCODE_CONFIG)
+        .map_err(|e| anyhow::anyhow!("[{}] Handshake encode failed: {e}", node_id))?;
+    let len = bytes.len() as u32;
+    write_half.write_all(&len.to_be_bytes()).await?;
+    write_half.write_all(&bytes).await?;
+    Ok((RaftRpcListener(read_half), write_half))
 }

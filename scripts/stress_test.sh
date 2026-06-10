@@ -68,9 +68,12 @@ for i in $(seq 1 "$N"); do
   elif grep -q "test result: FAILED" "$log"; then
     fail=$((fail+1))
     mode=$(grep -oE "client_protocol.rs:[0-9]+" "$log" | head -1)
+    [ -z "$mode" ] && mode=$(grep -oE "phase[0-9]: [a-zA-Z0-9 -]+" "$log" | head -1)
+    [ -z "$mode" ] && mode=$(grep -oE "did not converge on a single replacement leader" "$log" | head -1)
     [ -z "$mode" ] && mode=$(grep -oE "Ran for duration[^\"]*" "$log" | head -1 | sed 's/ .*/-duration/')
-    echo "run=$i ${mode:-unknown}" >> "$SUMMARY"
-    echo "  run $i: FAIL ${mode:-unknown} (kept $log)"
+    seed=$(grep -oE "turmoil seed: [0-9]+" "$log" | head -1 | tr -dc '0-9')
+    echo "run=$i ${mode:-unknown} seed=${seed:-?}" >> "$SUMMARY"
+    echo "  run $i: FAIL ${mode:-unknown} seed=${seed:-?} (kept $log)"
   else
     pass=$((pass+1))
     rm -f "$log"   # keep only failing logs
@@ -82,9 +85,9 @@ echo "==================== RESULT ===================="
 echo "test=$TEST  pass=$pass  fail=$fail  /  $N"
 if [ "$fail" -gt 0 ]; then
   echo "---- failure breakdown ----"
-  sed -E 's/^run=[0-9]+ //' "$SUMMARY" | sort | uniq -c | sort -rn
+  sed -E 's/^run=[0-9]+ //; s/ seed=[0-9?]+$//' "$SUMMARY" | sort | uniq -c | sort -rn
   echo "---- failing logs kept in: $OUTDIR ----"
-  echo "(panic line guide: 503=produce never acked, 543=fetch timeout, *-duration=sim timeout)"
+  echo "(panic line guide: 503=produce never acked, 543=fetch timeout, phaseN:*=leader_elects_after_kill phase, *-duration=sim timeout)"
 else
   rm -rf "$OUTDIR"
 fi

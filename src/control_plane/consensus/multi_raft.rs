@@ -135,8 +135,11 @@ impl MultiRaft {
         &self.node_id
     }
 
-    /// Invoked on `LeaderChange → self` to close the gap where the previous leader died
-    /// before proposing the removals (or their pairings).
+    /// Invoked on `LeaderChange → self` for takeover reconciliation:
+    /// 1. assert the group's current ring membership into the log, healing
+    ///    replicas whose genesis peer set was seeded from a partial ring;
+    /// 2. close the gap where the previous leader died before proposing the
+    ///    removals (or their pairings) for peers SWIM no longer considers live.
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let Some(raft) = self.groups.get_mut(&shard_group_id) else {
             return;
@@ -147,10 +150,47 @@ impl MultiRaft {
 
         let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
 
+        // Each replica seeds its genesis peer set from its *local* ring
+        // snapshot at group-creation time, so the sets can diverge when a node
+        // created the group from a partially-joined ring (#133: a follower
+        // frozen with peers = {leader} can, after that leader dies, neither
+        // win an election — its RequestVotes go only to the corpse — nor grant
+        // one, because its own doomed candidacy self-votes first every round;
+        // the group livelocks leaderless). The peer set only mutates through
+        // the log, so the log must carry the membership at least once: on
+        // every takeover, assert the group's current ring membership as
+        // AddPeer entries. `apply_add_peer` is idempotent and self-skipping,
+        // making this a no-op on healthy replicas while healing divergent
+        // ones. Dead desired-members are deliberately skipped — replacing
+        // them is `reconcile_peers`'s job below, and a rejoining node is
+        // re-added by the join path (`add_node`).
+        let mut membership_asserted = false;
+        let desired = self
+            .topology
+            .shard_groups_for_node(&self.node_id)
+            .into_iter()
+            .find(|g| g.id == shard_group_id);
+        if let Some(group) = desired {
+            for member in group.members {
+                if member == self.node_id || !live_set.contains(&member) {
+                    continue;
+                }
+                match raft.propose(RaftCommand::AddPeer(member.clone())) {
+                    Ok(_) => membership_asserted = true,
+                    Err(e) => tracing::warn!(
+                        "Takeover membership assert AddPeer({:?}) on {:?} rejected: {:?}",
+                        member,
+                        shard_group_id,
+                        e
+                    ),
+                }
+            }
+        }
+
         let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
         let segment_reconciled = raft.reconcile_segments(&live_set);
 
-        if peer_reconciled || segment_reconciled {
+        if membership_asserted || peer_reconciled || segment_reconciled {
             self.dirty.insert(shard_group_id);
         };
     }
@@ -317,7 +357,7 @@ impl MultiRaft {
     fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
-            RaftTimeoutCallback::ElectionTimeout { shard_group_id }
+            RaftTimeoutCallback::ElectionTimeout { shard_group_id, .. }
             | RaftTimeoutCallback::RpcTimeout { shard_group_id }
             | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. } => *shard_group_id,
         };
@@ -768,6 +808,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
+                epoch: u64::MAX,
             },
         ));
         store.flush();
@@ -801,11 +842,13 @@ mod tests {
             store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
+                    epoch: u64::MAX,
                 },
             ));
             store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(2),
+                    epoch: u64::MAX,
                 },
             ));
             store.flush();
@@ -832,6 +875,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: TEST_GROUP_ID,
+                epoch: u64::MAX,
             },
         ));
     }
@@ -1095,6 +1139,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(1),
+                epoch: u64::MAX,
             },
         ));
         store.flush();

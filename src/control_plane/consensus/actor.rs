@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
@@ -21,7 +21,7 @@ pub struct MultiRaftActor {
     scheduler_tx: SchedulerSender<RaftTimer>,
     swim_tx: SwimSender,
     data_transport_tx: BatchSender<DataTransportCommand>,
-    packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
+    packets_by_target: BTreeMap<NodeId, Vec<OutboundRaftPacket>>,
     timer_cmds: Vec<TickerCommand<RaftTimer>>,
     transport_cmds: Vec<RaftTransportCommand>,
     data_transport_cmds: Vec<DataTransportCommand>,
@@ -58,7 +58,7 @@ impl MultiRaftActor {
                 scheduler_tx,
                 swim_tx,
                 data_transport_tx: data_transport_tx.into(),
-                packets_by_target: HashMap::new(),
+                packets_by_target: BTreeMap::new(),
                 timer_cmds: Vec::new(),
                 transport_cmds: Vec::new(),
                 data_transport_cmds: Vec::new(),
@@ -95,7 +95,7 @@ impl MultiRaftActor {
                 self.route_event(event).await;
             }
         }
-        for packets in self.packets_by_target.drain() {
+        for packets in std::mem::take(&mut self.packets_by_target) {
             self.transport_cmds
                 .push(RaftTransportCommand::Send(packets.1));
         }
