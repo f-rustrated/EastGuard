@@ -601,29 +601,40 @@ impl MultiRaft {
                 continue;
             };
             let last_applied = raft.last_applied_index();
-            let is_leader = raft.is_leader(); // NLL: borrow of `raft` ends here
 
-            let to_fire: Vec<_> = self
-                .pending_proposes
-                .range((*id, 0)..=(*id, last_applied))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in to_fire {
+            // 1. Resolve applied entries
+            loop {
+                // Find the first key in the applied range.
+                let first_key = self
+                    .pending_proposes
+                    .range((*id, 0)..=(*id, last_applied))
+                    .map(|(&k, _)| k)
+                    .next();
+
+                let Some(key) = first_key else {
+                    break; // No more applied entries for this shard
+                };
+
                 if let Some(sender) = self.pending_proposes.remove(&key) {
                     let _ = sender.send(Ok(()));
                 }
             }
 
-            // Reject senders for entries that will never be applied because
-            // this node is no longer the leader.
-            if !is_leader {
-                let to_reject: Vec<_> = self
-                    .pending_proposes
-                    .range((*id, last_applied.saturating_add(1))..)
-                    .take_while(|(k, _)| k.0 == *id)
-                    .map(|(k, _)| *k)
-                    .collect();
-                for key in to_reject {
+            // 2. Reject orphaned entries ONLY if we lost leadership
+            if !raft.is_leader() {
+                loop {
+                    // Find the first key GREATER than last_applied for this shard.
+                    let first_key = self
+                        .pending_proposes
+                        .range((*id, last_applied.saturating_add(1))..)
+                        .take_while(|((shard_id, _), _)| *shard_id == *id)
+                        .map(|(&k, _)| k)
+                        .next();
+
+                    let Some(key) = first_key else {
+                        break; // No more orphaned entries for this shard
+                    };
+
                     if let Some(sender) = self.pending_proposes.remove(&key) {
                         let _ = sender.send(Err(ClientProposalError::NotLeader(None)));
                     }
