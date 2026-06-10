@@ -195,7 +195,6 @@ impl RaftRpcDispatcher {
 
     // --- Wire helpers ---
     // On error, writer is removed from the map so subsequent calls reconnect.
-
     /// Encode all messages into a single buffer, write to target's connection.
     async fn write_messages_to(
         &mut self,
@@ -229,6 +228,8 @@ impl RaftRpcDispatcher {
 /// Resolve, connect (3s cap), and handshake — on a spawned task, so a hung
 /// connect can never block the transport select loop. The loop
 /// installs the writer and flushes buffered messages in `on_dial_result`.
+// ! never inline this. Actor Model should onkly do work whose duration it controls.
+// ! Anything whose latency the outside actor controls must not be awaited in the handler.
 async fn dial(
     node_id: NodeId,
     target_id: NodeId,
