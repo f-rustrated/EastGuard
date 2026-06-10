@@ -1,20 +1,3 @@
-/// # Client ↔ Server request_id protocol
-///
-/// 1. **Client assigns** — before sending each request, the client obtains a
-///    monotonically increasing ID from a per-connection `u64` counter.
-/// 2. **Client tracks** — the ID is stored in a `HashMap<u64, oneshot::Sender<Response>>`
-///    of in-flight requests, keyed by `request_id`.
-/// 3. **Server echoes** — the server reads `request_id` from the incoming frame and
-///    writes it back unchanged in the response frame. The server is stateless with
-///    respect to `request_id`.
-/// 4. **Client matches** — on receiving a response frame, the client looks up
-///    `request_id` in the in-flight map and delivers the response to the right waiter.
-///
-/// This allows multiple requests to be in-flight on a single connection simultaneously,
-/// with responses arriving in any order.
-use anyhow::Context;
-use tokio::sync::mpsc;
-
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
@@ -35,6 +18,22 @@ use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{Produce, ProduceAck};
 use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
 use crate::net::TcpStream;
+use anyhow::Context;
+use tokio::sync::mpsc;
+/// # Client ↔ Server request_id protocol
+///
+/// 1. **Client assigns** — before sending each request, the client obtains a
+///    monotonically increasing ID from a per-connection `u64` counter.
+/// 2. **Client tracks** — the ID is stored in a `HashMap<u64, oneshot::Sender<Response>>`
+///    of in-flight requests, keyed by `request_id`.
+/// 3. **Server echoes** — the server reads `request_id` from the incoming frame and
+///    writes it back unchanged in the response frame. The server is stateless with
+///    respect to `request_id`.
+/// 4. **Client matches** — on receiving a response frame, the client looks up
+///    `request_id` in the in-flight map and delivers the response to the right waiter.
+///
+/// This allows multiple requests to be in-flight on a single connection simultaneously,
+/// with responses arriving in any order.
 
 #[derive(Clone)]
 pub struct ClientController {
@@ -66,6 +65,7 @@ impl ClientController {
         writer_tx: mpsc::Sender<(u64, ClientResponse)>,
     ) {
         loop {
+            // TODO idempotency based on request id (or separate idempotence key)
             match reader.read_request::<ClientRequest>().await {
                 Ok((request_id, request)) => {
                     let response = self.dispatch(request).await;
