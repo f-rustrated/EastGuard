@@ -1,8 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-
-use tokio::sync::oneshot;
-
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
     ClientProposalError, CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation,
@@ -10,15 +5,16 @@ use crate::control_plane::consensus::messages::{
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
-use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::metadata::command::RollSegment;
-
-use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
-
 use crate::control_plane::consensus::raft::storage::RaftStorage;
+use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
+use crate::control_plane::metadata::command::RollSegment;
+use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::SegmentAssignmentAck;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use tokio::sync::oneshot;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -152,20 +148,18 @@ impl MultiRaft {
 
         // Genesis peer sets are seeded from each replica's *local* ring
         // snapshot at creation and can diverge on a partially-joined ring
-        // (#133: a follower frozen with peers = {leader} livelocks the group
-        // once that leader dies). Peer sets mutate only through the log, so on
-        // takeover assert the group's ring membership as AddPeer entries:
+        // (#133: livelocks the group once that leader dies).
+        // Peer sets mutate only through the log, so on takeover assert the group's ring membership as AddPeer entries:
         // `apply_add_peer` is idempotent and self-skipping, so healthy
-        // replicas no-op while divergent ones heal. Dead members are skipped —
+        // replicas no-op while divergent ones heal. Dead members are skipped
         // replacement is `reconcile_peers`'s job, rejoin is `add_node`'s.
         let mut membership_asserted = false;
-        let desired = self
+
+        if let Some(members) = self
             .topology
-            .shard_groups_for_node(&self.node_id)
-            .into_iter()
-            .find(|g| g.id == shard_group_id);
-        if let Some(group) = desired {
-            for member in group.members {
+            .resolve_nodes_in_group(&self.node_id, shard_group_id)
+        {
+            for member in members {
                 if member == self.node_id || !live_set.contains(&member) {
                     continue;
                 }

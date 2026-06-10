@@ -75,8 +75,6 @@ pub struct Raft {
     // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
-    peers: HashSet<NodeId>,
-
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
@@ -89,6 +87,8 @@ pub struct Raft {
     /// Tracks who the current leader is — set when this node becomes leader
     /// or when a valid `AppendEntries` is received from a leader.
     current_leader: Option<NodeId>,
+
+    peers: HashSet<NodeId>,
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
@@ -178,7 +178,6 @@ impl Raft {
 
     pub(crate) fn reconcile_peers(
         &mut self,
-
         topology_reader: &TopologyReader,
         live: &HashSet<NodeId>,
     ) -> bool {

@@ -108,6 +108,21 @@ impl TopologyReader {
             .collect()
     }
 
+    pub(crate) fn resolve_nodes_in_group(
+        &self,
+        node_id: &NodeId,
+        shard_group_id: ShardGroupId,
+    ) -> Option<Box<[NodeId]>> {
+        if let Some(group) = self
+            .shard_groups_for_node(node_id)
+            .into_iter()
+            .find(|g| g.id == shard_group_id)
+        {
+            return Some(group.members.into_boxed_slice());
+        };
+        None
+    }
+
     pub(crate) fn ring_replacements_for(
         &self,
         group_id: ShardGroupId,

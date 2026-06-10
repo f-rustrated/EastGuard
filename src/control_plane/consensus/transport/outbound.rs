@@ -164,9 +164,7 @@ impl RaftRpcDispatcher {
         // Mirror `accept`'s tie-break: the connection initiated by
         // the lower NodeId wins, and we initiated this one. Losing the
         // tie-break must not lose the buffered messages — deliver them
-        // over the surviving (accepted) connection instead; otherwise
-        // e.g. a buffered RequestVote silently costs a full election
-        // round (#133).
+        // over the surviving (accepted) connection instead;
         if self.writers.contains_key(&target) && self.node_id > target {
             if !buffered.is_empty() {
                 let _ = self.write_messages_to(&target, &buffered).await;
