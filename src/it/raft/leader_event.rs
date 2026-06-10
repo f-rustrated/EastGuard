@@ -134,7 +134,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     std::iter::once(name).chain(peers.iter().copied()).collect();
                 let topology_reader = super::stub_topology_reader(&all_nodes);
                 MultiRaftActor::spawn(
-                    ticker_tx.clone().into(),
+                    ticker_tx.clone(),
                     raft_mailbox,
                     node_id,
                     election_jitter_seed,

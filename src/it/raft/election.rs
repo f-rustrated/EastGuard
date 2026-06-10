@@ -121,7 +121,7 @@ async fn run_raft_node(
         .collect();
     let topology_reader = super::stub_topology_reader(&all_nodes);
     MultiRaftActor::spawn(
-        ticker_force.clone().into(),
+        ticker_force.clone(),
         raft_mailbox,
         node_id,
         election_jitter_seed,
