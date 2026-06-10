@@ -78,7 +78,7 @@ impl RaftRpcDispatcher {
         tokio::spawn(reader.run(raft_tx.clone()));
     }
 
-    pub(super) async fn send(&mut self, packets: Vec<OutboundRaftPacket>, swim_tx: &SwimSender) {
+    pub(super) async fn send(&mut self, packets: Box<[OutboundRaftPacket]>, swim_tx: &SwimSender) {
         for (target_id, msgs) in self.group_packets(packets) {
             self.send_to_target(target_id, msgs, swim_tx).await;
         }
@@ -86,7 +86,7 @@ impl RaftRpcDispatcher {
 
     fn group_packets(
         &self,
-        packets: Vec<OutboundRaftPacket>,
+        packets: Box<[OutboundRaftPacket]>,
     ) -> BTreeMap<NodeId, Vec<WireRaftMessage>> {
         let mut by_target: BTreeMap<NodeId, Vec<WireRaftMessage>> = BTreeMap::new();
         for pkt in packets {

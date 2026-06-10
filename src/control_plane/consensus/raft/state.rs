@@ -97,8 +97,6 @@ pub struct Raft {
     /// Election-timer generation. Bumped whenever the election timer is
     /// (re)armed or cancelled; a fired `ElectionTimeout` carrying an older
     /// epoch raced its own cancellation in flight and must be ignored
-    /// (#133: a stale fire one tick after a vote grant bumped the term and
-    /// deposed the freshly elected leader).
     election_epoch: u64,
     /// Segments whose data-leader has acked its
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
@@ -418,15 +416,10 @@ impl Raft {
             RaftTimeoutCallback::ElectionTimeout { epoch, .. } => {
                 if epoch == self.election_epoch || epoch == u64::MAX {
                     self.start_election();
-                } else {
-                    tracing::debug!(
-                        node = %self.node_id,
-                        group = self.shard_group_id.0,
-                        stale_epoch = epoch,
-                        epoch = self.election_epoch,
-                        "election: dropped stale election timeout"
-                    );
+                    return;
                 }
+
+                tracing::debug!("election: dropped stale election timeout");
             }
             RaftTimeoutCallback::RpcTimeout { .. } => {
                 self.send_heartbeats();

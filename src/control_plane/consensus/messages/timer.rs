@@ -10,8 +10,6 @@ pub struct RaftTimer {
     pub(crate) shard_group_id: ShardGroupId,
     kind: RaftTimerKind,
     ticks_remaining: u32,
-    /// Election-timer generation (see `Raft::election_epoch`, #133). Only
-    /// meaningful for `RaftTimerKind::Election`; 0 otherwise.
     epoch: u64,
 }
 
@@ -28,10 +26,6 @@ pub enum RaftTimeoutCallback {
     Ignored,
     ElectionTimeout {
         shard_group_id: ShardGroupId,
-        /// Generation of the timer that fired. A `CancelSchedule` cannot
-        /// retract a callback already emitted and in flight to the actor, so
-        /// `Raft::handle_timeout` drops fires whose epoch is stale (#133).
-        /// `u64::MAX` bypasses the check for direct invocations in tests.
         epoch: u64,
     },
     RpcTimeout {

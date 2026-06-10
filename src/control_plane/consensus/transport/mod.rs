@@ -38,13 +38,7 @@ impl RaftTransportActor {
                     dispatcher.accept(stream, &raft_tx).await;
                 }
                 Some(batch) = from_actor.recv() => {
-                    // Aggregate the batch into ONE dispatcher.send() call: the
-                    // actor emits one Send command *per target* (#133), so
-                    // dispatching them in arrival order would let a dial to a
-                    // crashed peer (3s connect timeout, no RST) stall commands
-                    // to reachable peers queued behind it — e.g. the two halves
-                    // of a RequestVote broadcast. Disconnects are applied first
-                    // so same-batch sends already skip removed peers, then
+                    // Disconnects are applied first so same-batch sends already skip removed peers, then
                     // `send()` flushes connected peers before dialing anyone.
                     let mut to_send = Vec::new();
                     for cmd in batch {
@@ -56,7 +50,7 @@ impl RaftTransportActor {
                         }
                     }
                     if !to_send.is_empty() {
-                        dispatcher.send(to_send, &swim_tx).await;
+                        dispatcher.send(to_send.into_boxed_slice(), &swim_tx).await;
                     }
                 }
                 Some(result) = dial_rx.recv() => {
