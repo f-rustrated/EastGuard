@@ -31,7 +31,7 @@ impl MetadataStateMachine {
             .and_then(|id| self.topics.get(id))
     }
 
-    pub(crate) fn topic_names(&self) -> Vec<String> {
+    pub(crate) fn topic_names(&self) -> Box<[String]> {
         self.topic_name_index.keys().cloned().collect()
     }
 
@@ -39,18 +39,18 @@ impl MetadataStateMachine {
         self.topics.len()
     }
 
-    pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
+    pub(crate) fn topic_stats(&self) -> Box<[TopicStats]> {
         self.topics.values().map(|t| t.stats()).collect()
     }
 
-    pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
-        std::mem::take(&mut self.pending_proposals)
+    pub(crate) fn take_pending_proposals(&mut self) -> Box<[MetadataCommand]> {
+        std::mem::take(&mut self.pending_proposals).into_boxed_slice()
     }
 
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segments_for_node(node_id))
@@ -59,7 +59,7 @@ impl MetadataStateMachine {
 
     /// Every active segment across all topics with its replica set and start
     /// offset, for the leader's periodic assignment re-drive.
-    pub(crate) fn active_segment_assignments(&self) -> Vec<(SegmentKey, ReplicaSet, u64)> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segment_assignments())
@@ -71,7 +71,7 @@ impl MetadataStateMachine {
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segments_with_dead_members(live))

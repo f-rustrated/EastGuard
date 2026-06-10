@@ -27,29 +27,37 @@ impl RaftTransportActor {
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
     ) {
-        let mut write_dispatcher = RaftRpcDispatcher::new(node_id);
+        let (dial_tx, mut dial_rx) = mpsc::channel(256);
+        let mut dispatcher = RaftRpcDispatcher::new(node_id, dial_tx);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await; // consume immediate first tick
 
         loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
-                    write_dispatcher.accept(stream, &raft_tx).await;
+                    dispatcher.accept(stream, &raft_tx).await;
                 }
                 Some(batch) = from_actor.recv() => {
+                    // Disconnects are applied first so same-batch sends already skip removed peers, then
+                    // `send()` flushes connected peers before dialing anyone.
+                    let mut to_send = Vec::new();
                     for cmd in batch {
                         match cmd {
-                            RaftTransportCommand::Send(packets) => {
-                                write_dispatcher.send(packets, &raft_tx, &swim_tx).await;
-                            }
+                            RaftTransportCommand::Send(packets) => to_send.extend(packets),
                             RaftTransportCommand::DisconnectPeer(peer_id) => {
-                                write_dispatcher.disconnect(peer_id);
+                                dispatcher.disconnect(peer_id);
                             }
                         }
                     }
+                    if !to_send.is_empty() {
+                        dispatcher.send(to_send, &swim_tx).await;
+                    }
+                }
+                Some(result) = dial_rx.recv() => {
+                    dispatcher.on_dial_result(result, &raft_tx).await;
                 }
                 _ = cleanup_interval.tick() => {
-                    write_dispatcher.cleanup_dead_peers();
+                    dispatcher.cleanup_dead_peers();
                 }
             }
         }
@@ -171,7 +179,8 @@ mod tests {
             let (raft_tx, _raft_rx) =
                 crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
-            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"));
+            let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
+            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"), dial_tx);
 
             let (stream, _) = listener.accept().await?;
             state.accept(stream, &raft_tx).await;
@@ -209,7 +218,8 @@ mod tests {
                 crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
-            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"));
+            let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
+            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"), dial_tx);
 
             // First connection from node-a
             let (stream, _) = listener.accept().await?;

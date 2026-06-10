@@ -18,9 +18,9 @@ pub enum AdminRequest {
 #[derive(Debug, Encode, Decode)]
 pub enum AdminResponse {
     // DescribeCluster
-    ClusterInfo { nodes: Vec<NodeInfo> },
+    ClusterInfo { nodes: Box<[NodeInfo]> },
     // ListHostedTopicsWithStats
-    TopicStats { topics: Vec<TopicStats> },
+    TopicStats { topics: Box<[TopicStats]> },
     // SplitRange
     RangeSplit,
     InvalidSplitPoint,
@@ -37,7 +37,7 @@ pub struct ShardDetail {
     pub shard_group_id: u64,
     pub leader_node_id: Option<String>,
     pub leader_addr: Option<SocketAddr>,
-    pub member_node_ids: Vec<String>,
+    pub member_node_ids: Box<[String]>,
 }
 
 #[derive(Debug, Encode, Decode)]

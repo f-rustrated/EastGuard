@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::channels::BatchSender;
 use crate::control_plane::NodeId;
@@ -21,7 +21,7 @@ pub struct MultiRaftActor {
     scheduler_tx: SchedulerSender<RaftTimer>,
     swim_tx: SwimSender,
     data_transport_tx: BatchSender<DataTransportCommand>,
-    packets_by_target: HashMap<NodeId, Vec<OutboundRaftPacket>>,
+    packets_by_target: BTreeMap<NodeId, Vec<OutboundRaftPacket>>,
     timer_cmds: Vec<TickerCommand<RaftTimer>>,
     transport_cmds: Vec<RaftTransportCommand>,
     data_transport_cmds: Vec<DataTransportCommand>,
@@ -58,7 +58,7 @@ impl MultiRaftActor {
                 scheduler_tx,
                 swim_tx,
                 data_transport_tx: data_transport_tx.into(),
-                packets_by_target: HashMap::new(),
+                packets_by_target: BTreeMap::new(),
                 timer_cmds: Vec::new(),
                 transport_cmds: Vec::new(),
                 data_transport_cmds: Vec::new(),
@@ -95,18 +95,18 @@ impl MultiRaftActor {
                 self.route_event(event).await;
             }
         }
-        for packets in self.packets_by_target.drain() {
+        for packets in std::mem::take(&mut self.packets_by_target) {
             self.transport_cmds
-                .push(RaftTransportCommand::Send(packets.1));
+                .push(RaftTransportCommand::Send(packets.1.into_boxed_slice()));
         }
 
         tokio::join!(
             self.transport_tx
-                .send_batch(std::mem::take(&mut self.transport_cmds)),
+                .send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice()),
             self.scheduler_tx
-                .send_batch(std::mem::take(&mut self.timer_cmds)),
+                .send_batch(std::mem::take(&mut self.timer_cmds).into_boxed_slice()),
             self.data_transport_tx
-                .send_batch(std::mem::take(&mut self.data_transport_cmds)),
+                .send_batch(std::mem::take(&mut self.data_transport_cmds).into_boxed_slice()),
         );
 
         self.store.fire_deferred();
@@ -178,7 +178,7 @@ impl MutlRaftSender {
         recv.await.ok().flatten()
     }
 
-    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Box<[NodeId]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::GetPeers { group_id, reply })
@@ -187,14 +187,14 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
-    pub(crate) async fn get_topics(&self) -> Vec<String> {
+    pub(crate) async fn get_topics(&self) -> Box<[String]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self.send(MultiRaftActorCommand::GetTopics { reply }).await;
 
         recv.await.unwrap_or_default()
     }
 
-    pub(crate) async fn get_topic_stats(&self) -> Vec<TopicStats> {
+    pub(crate) async fn get_topic_stats(&self) -> Box<[TopicStats]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::GetTopicStats { reply })

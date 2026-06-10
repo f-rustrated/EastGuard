@@ -106,7 +106,7 @@ async fn start_raft_node(
     for _ in 0..200 {
         let _ = ticker_tx
             .clone()
-            .send_batch(vec![TickerCommand::ForceTick])
+            .send_batch(Box::new([TickerCommand::ForceTick]))
             .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -118,7 +118,9 @@ async fn start_raft_node(
 
 async fn tick_n(ticker: &SchedulerSender<RaftTimer>, n: usize) {
     for _ in 0..n {
-        let _ = ticker.send_batch(vec![TickerCommand::ForceTick]).await;
+        let _ = ticker
+            .send_batch(Box::new([TickerCommand::ForceTick]))
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;

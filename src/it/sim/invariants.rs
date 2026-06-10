@@ -109,6 +109,53 @@ pub async fn assert_single_leader(
     Ok(())
 }
 
+/// Polls `GetShardLeader` on every node until **all** report the same leader,
+/// which must differ from `crashed` — or panics when `budget` elapses,
+/// printing the last set of views.
+///
+/// Unlike [`assert_single_leader`] with a zero grace, this absorbs *stale*
+/// views: right after a re-election one node can still hold the previous
+/// term's leader in `current_leader`, which is not split-brain. The admin API
+/// exposes no term, so a single snapshot cannot distinguish a stale view from
+/// same-term divergence — persistent disagreement past the deadline is the
+/// observable signal, and that is what this asserts (#133).
+pub async fn assert_leader_converges(
+    nodes: &[(&str, u16)],
+    shard_group_id: u64,
+    crashed: &str,
+    budget: Duration,
+) -> turmoil::Result {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut views: Vec<Option<String>> = Vec::new();
+    loop {
+        views.clear();
+        for &(host, port) in nodes {
+            views.push(
+                query_shard_leader(host, port, shard_group_id)
+                    .await
+                    .ok()
+                    .flatten(),
+            );
+        }
+        let known: Vec<&String> = views.iter().flatten().collect();
+        if known.len() == nodes.len()
+            && known.iter().all(|l| *l == known[0])
+            && known[0].as_str() != crashed
+        {
+            return Ok(());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shard {}: nodes did not converge on a single replacement leader within {:?} (views: {:?}, crashed: {:?})",
+            shard_group_id,
+            budget,
+            views,
+            crashed
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// After `CreateTopic` has been acked, retries `GetTopics` across alive nodes until
 /// a quorum (majority) report the topic or `max_attempts` is exhausted.
 ///
@@ -193,7 +240,7 @@ pub(super) async fn query_shard_info(
     }
 }
 
-pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<TopicSummary>> {
+pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Box<[TopicSummary]>> {
     let stream =
         tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;
     let (read_half, write_half) = stream.into_split();
@@ -209,6 +256,6 @@ pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<T
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
     match response {
         ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),
-        _ => Ok(vec![]),
+        _ => Ok(Box::new([])),
     }
 }

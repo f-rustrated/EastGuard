@@ -1,8 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-
-use tokio::sync::oneshot;
-
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
     ClientProposalError, CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation,
@@ -10,15 +5,16 @@ use crate::control_plane::consensus::messages::{
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
-use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::metadata::command::RollSegment;
-
-use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
-
 use crate::control_plane::consensus::raft::storage::RaftStorage;
+use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
+use crate::control_plane::metadata::command::RollSegment;
+use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::SegmentAssignmentAck;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use tokio::sync::oneshot;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -135,8 +131,11 @@ impl MultiRaft {
         &self.node_id
     }
 
-    /// Invoked on `LeaderChange → self` to close the gap where the previous leader died
-    /// before proposing the removals (or their pairings).
+    /// Invoked on `LeaderChange → self` for takeover reconciliation:
+    /// 1. assert the group's current ring membership into the log, healing
+    ///    replicas whose genesis peer set was seeded from a partial ring;
+    /// 2. close the gap where the previous leader died before proposing the
+    ///    removals (or their pairings) for peers SWIM no longer considers live.
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let Some(raft) = self.groups.get_mut(&shard_group_id) else {
             return;
@@ -146,6 +145,35 @@ impl MultiRaft {
         }
 
         let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
+
+        // Genesis peer sets are seeded from each replica's *local* ring
+        // snapshot at creation and can diverge on a partially-joined ring
+        // (#133: livelocks the group once that leader dies).
+        // Peer sets mutate only through the log, so on takeover assert the group's ring membership as AddPeer entries:
+        // `apply_add_peer` is idempotent and self-skipping, so healthy
+        // replicas no-op while divergent ones heal. Dead members are skipped
+        // replacement is `reconcile_peers`'s job, rejoin is `add_node`'s.
+
+        if let Some(members) = self
+            .topology
+            .resolve_nodes_in_group(&self.node_id, shard_group_id)
+        {
+            for member in members {
+                if member == self.node_id || !live_set.contains(&member) {
+                    continue;
+                }
+
+                if let Err(e) = raft.propose(RaftCommand::AddPeer(member.clone())) {
+                    tracing::warn!(
+                        "Takeover membership assert AddPeer({:?}) on {:?} rejected: {e:?}",
+                        member,
+                        shard_group_id,
+                    )
+                } else {
+                    self.dirty.insert(shard_group_id);
+                }
+            }
+        }
 
         let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
         let segment_reconciled = raft.reconcile_segments(&live_set);
@@ -252,7 +280,7 @@ impl MultiRaft {
 
         let timer_seqs = TimerSeqs {
             election: self.seq_counter.generate(),
-            heartbeat: self.seq_counter.generate(),
+            rpc: self.seq_counter.generate(),
             merge_check: self.seq_counter.generate(),
         };
 
@@ -290,7 +318,7 @@ impl MultiRaft {
         raft.cancel_all_timers();
         self.pending_events.extend(raft.take_events());
 
-        let pending_keys: Vec<_> = self
+        let pending_keys: Box<[_]> = self
             .pending_proposes
             .keys()
             .filter(|(gid, _)| *gid == group_id)
@@ -317,7 +345,7 @@ impl MultiRaft {
     fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,
-            RaftTimeoutCallback::ElectionTimeout { shard_group_id }
+            RaftTimeoutCallback::ElectionTimeout { shard_group_id, .. }
             | RaftTimeoutCallback::RpcTimeout { shard_group_id }
             | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. } => *shard_group_id,
         };
@@ -341,21 +369,21 @@ impl MultiRaft {
             .and_then(|r| r.current_leader().cloned())
     }
 
-    fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+    fn get_peers(&self, group_id: ShardGroupId) -> Box<[NodeId]> {
         self.groups
             .get(&group_id)
             .map(|r| r.peers_iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    fn get_topics(&self) -> Vec<String> {
+    fn get_topics(&self) -> Box<[String]> {
         self.groups
             .values()
             .flat_map(|raft| raft.topic_names())
             .collect()
     }
 
-    fn get_topic_stats(&self) -> Vec<TopicStats> {
+    fn get_topic_stats(&self) -> Box<[TopicStats]> {
         self.groups
             .values()
             .flat_map(|raft| raft.topic_stats())
@@ -452,7 +480,7 @@ impl MultiRaft {
     /// fresh means the join sees the latest cluster shape — including any
     /// topology drift between the SWIM event and this handler running.
     fn add_node(&mut self, node_id: NodeId) {
-        let affected_groups: Vec<ShardGroup> = self.topology.shard_groups_for_node(&node_id);
+        let affected_groups = self.topology.shard_groups_for_node(&node_id);
         if affected_groups.is_empty() {
             return;
         }
@@ -481,7 +509,7 @@ impl MultiRaft {
         }
     }
 
-    fn ensure_new_groups(&mut self, groups: Vec<ShardGroup>) {
+    fn ensure_new_groups(&mut self, groups: Box<[ShardGroup]>) {
         for group in groups {
             if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
                 self.add_group(group);
@@ -651,7 +679,7 @@ impl MultiRaft {
         if mutations.is_empty() {
             return;
         }
-        self.storage.persist_mutations(mutations);
+        self.storage.persist_mutations(mutations.into_boxed_slice());
         for (id, last_log_index) in last_indices {
             if let Some(raft) = self.groups.get_mut(&id) {
                 // Advancing the durability gate re-attempts apply for entries that
@@ -768,6 +796,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
+                epoch: u64::MAX,
             },
         ));
         store.flush();
@@ -801,11 +830,13 @@ mod tests {
             store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
+                    epoch: u64::MAX,
                 },
             ));
             store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(2),
+                    epoch: u64::MAX,
                 },
             ));
             store.flush();
@@ -832,6 +863,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: TEST_GROUP_ID,
+                epoch: u64::MAX,
             },
         ));
     }
@@ -937,7 +969,7 @@ mod tests {
                 leader_id: n2.clone(),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![
+                entries: Box::new([
                     LogEntry {
                         term: 1,
                         index: 1,
@@ -948,7 +980,7 @@ mod tests {
                         index: 2,
                         command: RaftCommand::Noop,
                     },
-                ],
+                ]),
                 leader_commit: 0,
             }),
         });
@@ -972,11 +1004,11 @@ mod tests {
                 leader_id: n2.clone(),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntry {
+                entries: Box::new([LogEntry {
                     term: 2,
                     index: 1,
                     command: RaftCommand::Noop,
-                }],
+                }]),
                 leader_commit: 0,
             }),
         });
@@ -1095,6 +1127,7 @@ mod tests {
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(1),
+                epoch: u64::MAX,
             },
         ));
         store.flush();

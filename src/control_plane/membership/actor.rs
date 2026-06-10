@@ -131,9 +131,9 @@ impl SwimActor {
         }
         tokio::join!(
             self.transport_tx
-                .send_batch(std::mem::take(&mut self.packets)),
+                .send_batch(std::mem::take(&mut self.packets).into_boxed_slice()),
             self.scheduler_tx
-                .send_batch(std::mem::take(&mut self.timer_cmds)),
+                .send_batch(std::mem::take(&mut self.timer_cmds).into_boxed_slice()),
         );
     }
 }

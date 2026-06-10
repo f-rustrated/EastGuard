@@ -197,8 +197,8 @@ impl RaftStorage for MetadataStorage {
         self.take_persistent_state_for(group_id)
     }
 
-    fn persist_mutations(&self, mutations: Vec<(ShardGroupId, LogMutation)>) {
-        let batch: Vec<DbOp> = mutations
+    fn persist_mutations(&self, mutations: Box<[(ShardGroupId, LogMutation)]>) {
+        let batch: Box<[DbOp]> = mutations
             .into_iter()
             .map(|(id, log)| DbOp::from_log(&id, log))
             .collect();
@@ -310,7 +310,7 @@ mod tests {
         let g1 = ShardGroupId(1);
         let g2 = ShardGroupId(2);
 
-        db.persist_mutations(vec![
+        db.persist_mutations(Box::new([
             (g1, LogMutation::Append(noop_entry(1, 1))),
             (
                 g1,
@@ -328,7 +328,7 @@ mod tests {
                     voted_for: Some(NodeId::new("n2")),
                 },
             ),
-        ]);
+        ]));
 
         let state1 = db.load_state(1);
         assert_eq!(state1.log.len(), 1, "group 1 must have exactly 1 entry");
@@ -357,7 +357,7 @@ mod tests {
         let (db, _path) = temp_db();
         let g = ShardGroupId(1);
 
-        db.persist_mutations(vec![
+        db.persist_mutations(Box::new([
             (g, LogMutation::Append(noop_entry(1, 5))),
             (g, LogMutation::Append(noop_entry(2, 5))),
             (g, LogMutation::Append(noop_entry(3, 5))),
@@ -368,14 +368,14 @@ mod tests {
                     voted_for: Some(NodeId::new("n1")),
                 },
             ),
-        ]);
+        ]));
 
         let before = db.load_state(1);
         assert_eq!(before.log.len(), 3);
         assert_eq!(before.term, 5);
         assert_eq!(before.voted_for, Some(NodeId::new("n1")));
 
-        db.persist_mutations(vec![(g, LogMutation::TruncateFrom(2))]);
+        db.persist_mutations(Box::new([(g, LogMutation::TruncateFrom(2))]));
 
         let after = db.load_state(1);
         assert_eq!(after.log.len(), 1, "only entry 1 should remain");

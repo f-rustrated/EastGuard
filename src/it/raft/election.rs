@@ -44,7 +44,9 @@ fn build_address_map(
 
 async fn drive_ticks(ticker: &SchedulerSender<RaftTimer>, count: usize) {
     for _ in 0..count {
-        let _ = ticker.send_batch(vec![TickerCommand::ForceTick]).await;
+        let _ = ticker
+            .send_batch(Box::new([TickerCommand::ForceTick]))
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;
@@ -121,7 +123,7 @@ async fn run_raft_node(
         .collect();
     let topology_reader = super::stub_topology_reader(&all_nodes);
     MultiRaftActor::spawn(
-        ticker_force.clone().into(),
+        ticker_force.clone(),
         raft_mailbox,
         node_id,
         election_jitter_seed,

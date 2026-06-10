@@ -26,7 +26,7 @@ pub struct AppendEntries {
     pub leader_id: NodeId,
     pub prev_log_index: u64,
     pub prev_log_term: u64,
-    pub entries: Vec<LogEntry>,
+    pub entries: Box<[LogEntry]>,
     pub leader_commit: u64,
 }
 

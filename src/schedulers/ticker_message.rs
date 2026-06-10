@@ -29,18 +29,20 @@ impl<T> SchedulerSender<T> {
         (tx.into(), rx)
     }
 
-    pub(crate) async fn send_batch(&self, cmds: Vec<TickerCommand<T>>) {
+    pub(crate) async fn send_batch(&self, cmds: Box<[TickerCommand<T>]>) {
         self.0.send_batch(cmds).await;
     }
 
-    pub(crate) fn blocking_send_batch(&self, cmds: Vec<TimerCommand<T>>) {
-        let ticker_cmds: Vec<TickerCommand<T>> = cmds.into_iter().map(Into::into).collect();
-        self.0.blocking_send_batch(ticker_cmds);
+    pub(crate) fn blocking_send_batch(&self, cmds: Box<[TimerCommand<T>]>) {
+        self.0
+            .blocking_send_batch(cmds.into_iter().map(Into::into).collect());
     }
 
     #[cfg(test)]
     pub(crate) async fn force_tick(&self) {
-        self.0.send_batch(vec![TickerCommand::ForceTick]).await;
+        self.0
+            .send_batch(Box::new([TickerCommand::ForceTick]))
+            .await;
     }
 }
 

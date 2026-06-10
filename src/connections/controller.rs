@@ -611,7 +611,7 @@ mod tests {
     async fn list_hosted_topics() {
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::GetTopics { reply } = cmd {
-                let _ = reply.send(vec!["alpha".into(), "beta".into()]);
+                let _ = reply.send(Box::new(["alpha".into(), "beta".into()]));
             }
         });
         let resp =
@@ -774,7 +774,8 @@ mod tests {
         assert_eq!(d.shard_group_id, 42);
         assert_eq!(d.leader_node_id.as_deref(), Some("n1"));
         assert_eq!(d.leader_addr, Some(addr(8081)));
-        assert_eq!(d.member_node_ids, vec!["node-1"]);
+        assert_eq!(d.member_node_ids[0], "node-1");
+        assert_eq!(d.member_node_ids.len(), 1);
     }
 
     #[tokio::test]
@@ -822,11 +823,11 @@ mod tests {
     async fn list_topic_stats() {
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::GetTopicStats { reply } = cmd {
-                let _ = reply.send(vec![MetadataTopicStats {
+                let _ = reply.send(Box::new([MetadataTopicStats {
                     name: "t1".into(),
                     range_count: 2,
                     total_bytes: 1024,
-                }]);
+                }]));
             }
         });
         let resp =

@@ -99,7 +99,7 @@ impl TopologyReader {
         self.0.load().live_nodes()
     }
 
-    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Vec<ShardGroup> {
+    pub(crate) fn shard_groups_for_node(&self, node_id: &NodeId) -> Box<[ShardGroup]> {
         self.0
             .load()
             .shard_groups_for_node(node_id)
@@ -108,12 +108,27 @@ impl TopologyReader {
             .collect()
     }
 
+    pub(crate) fn resolve_nodes_in_group(
+        &self,
+        node_id: &NodeId,
+        shard_group_id: ShardGroupId,
+    ) -> Option<Box<[NodeId]>> {
+        if let Some(group) = self
+            .shard_groups_for_node(node_id)
+            .into_iter()
+            .find(|g| g.id == shard_group_id)
+        {
+            return Some(group.members.into_boxed_slice());
+        };
+        None
+    }
+
     pub(crate) fn ring_replacements_for(
         &self,
         group_id: ShardGroupId,
         excluded: &HashSet<NodeId>,
         count: usize,
-    ) -> Vec<NodeId> {
+    ) -> Box<[NodeId]> {
         let replacements = self
             .0
             .load()
@@ -342,9 +357,9 @@ impl Topology {
         group_id: ShardGroupId,
         excluded: &HashSet<NodeId>,
         count: usize,
-    ) -> Vec<NodeId> {
+    ) -> Box<[NodeId]> {
         if count == 0 || self.vnodes.is_empty() {
-            return Vec::new();
+            return Box::new([]);
         }
         let anchor = group_id.0 as u32;
         self.collect_distinct_owners_excluding(anchor, count, excluded)
@@ -1031,7 +1046,7 @@ mod tests {
 
         let current: HashSet<NodeId> = group.members.iter().cloned().collect();
         let picks = topology.ring_replacements_for(group.id, &current, 2);
-        assert_eq!(picks.as_slice(), expected_successors);
+        assert_eq!(&*picks, expected_successors);
     }
 
     // --- shard leader map tests ---
