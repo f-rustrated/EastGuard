@@ -1,5 +1,5 @@
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::messages::SealContext;
+use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
@@ -54,7 +54,7 @@ impl SegmentRolled {
             v.push(DataTransportCommand::send_to_targets(
                 vec![ctx.requester],
                 SealResponse {
-                    old_segment_key: ctx.old_segment_key,
+                    old_segment_key: ctx.segment_key,
                     new_segment_id: self.new_segment_key.segment_id,
                     new_replica_set: self.new_replica_set,
                 },

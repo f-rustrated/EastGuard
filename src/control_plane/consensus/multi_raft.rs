@@ -5,9 +5,8 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation, MetadataCommitted,
-    MetadataProposal, MultiRaftActorCommand, ClientProposalError, RaftEvent, RaftProtocolMessage,
-    RaftTimeoutCallback, SealContext,
+    ClientProposalError, CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation,
+    MetadataProposal, MultiRaftActorCommand, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
@@ -32,15 +31,23 @@ pub(crate) struct MultiRaft {
     pending_events: Vec<RaftEvent>,
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
-    pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ClientProposalError>>>,
+    pending_proposes:
+        BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ClientProposalError>>>,
+
     pending_seals: PendingSealTracker,
 
     topology: TopologyReader,
 }
 
+#[derive(Debug)]
+pub(crate) struct SealContext {
+    pub(crate) requester: NodeId,
+    pub(crate) segment_key: SegmentKey,
+}
+// Bookkeeping for in-flight seal proposals.
 #[derive(Default)]
 struct PendingSealTracker {
-    by_group: HashMap<ShardGroupId, BTreeMap<u64, PendingSeal>>,
+    by_group: HashMap<ShardGroupId, BTreeMap<u64, SealContext>>,
     by_key: HashSet<SegmentKey>,
 }
 
@@ -49,14 +56,14 @@ impl PendingSealTracker {
         self.by_key.contains(key)
     }
 
-    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, seal: PendingSeal) {
+    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, seal: SealContext) {
         self.by_key.insert(seal.segment_key);
         self.by_group
             .entry(group_id)
             .or_default()
             .insert(log_index, seal);
     }
-    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<PendingSeal> {
+    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<SealContext> {
         let group_map = self.by_group.get_mut(&group_id)?;
         let seal = group_map.remove(&log_index)?;
 
@@ -69,13 +76,8 @@ impl PendingSealTracker {
         Some(seal)
     }
 
-    fn attach_seal_context(&mut self, group_id: ShardGroupId, committed: &mut MetadataCommitted) {
-        if let Some(seal) = self.remove(group_id, committed.log_index) {
-            committed.seal_context = Some(SealContext {
-                requester: seal.requester,
-                old_segment_key: seal.segment_key,
-            });
-        }
+    fn pop_seal_context(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<SealContext> {
+        self.remove(group_id, log_index)
     }
 
     /// Drop pending seal contexts for `group_id` whose log indices were
@@ -105,11 +107,6 @@ impl PendingSealTracker {
             }
         }
     }
-}
-
-struct PendingSeal {
-    requester: NodeId,
-    segment_key: SegmentKey,
 }
 
 impl MultiRaft {
@@ -430,7 +427,7 @@ impl MultiRaft {
                 self.pending_seals.insert(
                     group_id,
                     log_index,
-                    PendingSeal {
+                    SealContext {
                         requester: seal.from.clone(),
                         segment_key: seal.segment_key,
                     },
@@ -492,7 +489,11 @@ impl MultiRaft {
         }
     }
 
-    fn propose(&mut self, cmd: MetadataProposal, reply: oneshot::Sender<Result<(), ClientProposalError>>) {
+    fn propose(
+        &mut self,
+        cmd: MetadataProposal,
+        reply: oneshot::Sender<Result<(), ClientProposalError>>,
+    ) {
         let gid = cmd.shard_group_id;
         match self.propose_internal(cmd) {
             Ok(index) => {
@@ -578,17 +579,19 @@ impl MultiRaft {
         let Some(raft) = self.groups.get_mut(&id) else {
             return;
         };
-        let is_leader = raft.is_leader();
-        for event in raft.take_events() {
-            match event {
-                RaftEvent::MetadataCommitted(_) if !is_leader => {}
-                RaftEvent::MetadataCommitted(mut committed) => {
-                    self.pending_seals.attach_seal_context(id, &mut committed);
-                    self.pending_events
-                        .push(RaftEvent::MetadataCommitted(committed));
-                }
-                other => self.pending_events.push(other),
+        for mut event in raft.take_events() {
+            if let RaftEvent::MetadataCommitted(_) = event
+                && !raft.is_leader()
+            {
+                continue;
             }
+
+            if let RaftEvent::MetadataCommitted(committed) = &mut event {
+                // For leader to send a SealResponse back to the right client.
+                committed.seal_context =
+                    self.pending_seals.pop_seal_context(id, committed.log_index);
+            }
+            self.pending_events.push(event);
         }
     }
 

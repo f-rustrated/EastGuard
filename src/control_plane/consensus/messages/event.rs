@@ -1,10 +1,10 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::rpc::OutboundRaftPacket;
 use crate::control_plane::consensus::messages::timer::RaftTimer;
+use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::event::ApplyResult;
-use crate::data_plane::SegmentKey;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -14,13 +14,6 @@ pub struct LeaderChange {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
     pub term: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct SealContext {
-    pub requester: NodeId,
-    pub old_segment_key: SegmentKey,
 }
 
 #[allow(dead_code)]

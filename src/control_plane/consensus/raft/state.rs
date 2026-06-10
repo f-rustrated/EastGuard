@@ -92,14 +92,13 @@ pub struct Raft {
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
-    pending_proposals: Vec<MetadataCommand>,
     election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
-
     /// Segments whose data-leader has acked its
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
+    pending_proposals: Vec<MetadataCommand>,
 }
 
 pub(crate) struct TimerSeqs {
