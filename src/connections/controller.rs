@@ -172,7 +172,11 @@ impl ClientController {
         };
 
         Ok(
-            match self.raft_sender.propose(shard_group.id, cmd.into()).await {
+            match self
+                .raft_sender
+                .submit_metadata_command(shard_group.id, cmd.into())
+                .await
+            {
                 Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
                 Err(ClientProposalError::NotLeader(_)) => {
                     ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
@@ -194,17 +198,23 @@ impl ClientController {
             .context("shard group not found")?;
 
         let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
-        Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
-            Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-            Err(ClientProposalError::NotLeader(_)) => {
-                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
-                    "not the leader for this shard group — retry on another node".into(),
-                ))
-            }
-            Err(e) => {
-                ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(format!("{e:?}")))
-            }
-        })
+        Ok(
+            match self
+                .raft_sender
+                .submit_metadata_command(shard_group.id, cmd)
+                .await
+            {
+                Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
+                Err(ClientProposalError::NotLeader(_)) => {
+                    ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                        "not the leader for this shard group — retry on another node".into(),
+                    ))
+                }
+                Err(e) => ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
+                    format!("{e:?}"),
+                )),
+            },
+        )
     }
 
     async fn handle_list_hosted_topics(&self) -> ClientResponse {

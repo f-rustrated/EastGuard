@@ -152,7 +152,7 @@ impl MultiRaftActor {
 pub struct MutlRaftSender(mpsc::Sender<MultiRaftActorCommand>);
 
 impl MutlRaftSender {
-    pub(crate) async fn propose(
+    pub(crate) async fn submit_metadata_command(
         &self,
         shard_group_id: ShardGroupId,
         command: MetadataCommand,
