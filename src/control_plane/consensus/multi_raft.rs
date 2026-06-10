@@ -150,20 +150,14 @@ impl MultiRaft {
 
         let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
 
-        // Each replica seeds its genesis peer set from its *local* ring
-        // snapshot at group-creation time, so the sets can diverge when a node
-        // created the group from a partially-joined ring (#133: a follower
-        // frozen with peers = {leader} can, after that leader dies, neither
-        // win an election — its RequestVotes go only to the corpse — nor grant
-        // one, because its own doomed candidacy self-votes first every round;
-        // the group livelocks leaderless). The peer set only mutates through
-        // the log, so the log must carry the membership at least once: on
-        // every takeover, assert the group's current ring membership as
-        // AddPeer entries. `apply_add_peer` is idempotent and self-skipping,
-        // making this a no-op on healthy replicas while healing divergent
-        // ones. Dead desired-members are deliberately skipped — replacing
-        // them is `reconcile_peers`'s job below, and a rejoining node is
-        // re-added by the join path (`add_node`).
+        // Genesis peer sets are seeded from each replica's *local* ring
+        // snapshot at creation and can diverge on a partially-joined ring
+        // (#133: a follower frozen with peers = {leader} livelocks the group
+        // once that leader dies). Peer sets mutate only through the log, so on
+        // takeover assert the group's ring membership as AddPeer entries:
+        // `apply_add_peer` is idempotent and self-skipping, so healthy
+        // replicas no-op while divergent ones heal. Dead members are skipped —
+        // replacement is `reconcile_peers`'s job, rejoin is `add_node`'s.
         let mut membership_asserted = false;
         let desired = self
             .topology

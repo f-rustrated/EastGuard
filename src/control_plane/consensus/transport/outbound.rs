@@ -84,14 +84,7 @@ impl RaftRpcDispatcher {
         raft_tx: &MutlRaftSender,
         swim_tx: &SwimSender,
     ) {
-        let by_target = self.group_packets(packets);
-        // Dials run on background tasks (see `dial` / `on_dial_result`), so
-        // target order is no longer load-bearing (#133); flushing connected
-        // peers first simply gets wire bytes moving before dial bookkeeping.
-        let (connected, dialing): (Vec<_>, Vec<_>) = by_target
-            .into_iter()
-            .partition(|(target, _)| self.writers.contains_key(target));
-        for (target_id, msgs) in connected.into_iter().chain(dialing) {
+        for (target_id, msgs) in self.group_packets(packets) {
             self.send_to_target(target_id, msgs, raft_tx, swim_tx).await;
         }
     }

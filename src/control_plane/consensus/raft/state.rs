@@ -472,7 +472,7 @@ impl Raft {
 
         self.role = Role::Candidate { votes_received: 1 }; // vote for self
         self.reset_election_timer();
-        tracing::debug!(
+        tracing::trace!(
             node = %self.node_id,
             group = self.shard_group_id.0,
             term = self.current_term,
@@ -1100,7 +1100,7 @@ impl Raft {
                 seq: self.timer_seqs.election,
             }));
         let jitter = self.election_jitter.next();
-        tracing::debug!(
+        tracing::trace!(
             node = %self.node_id,
             group = self.shard_group_id.0,
             epoch = self.election_epoch,
