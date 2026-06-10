@@ -413,12 +413,20 @@ impl Raft {
         match event {
             RaftTimeoutCallback::Ignored => {}
             RaftTimeoutCallback::ElectionTimeout { epoch, .. } => {
+                // u64::MAX bypasses the staleness check for direct
+                // invocations in tests; real timers carry the epoch they
+                // were armed with.
                 if epoch == self.election_epoch || epoch == u64::MAX {
                     self.start_election();
                     return;
                 }
-
-                tracing::debug!("election: dropped stale election timeout");
+                tracing::debug!(
+                    node = %self.node_id,
+                    group = self.shard_group_id.0,
+                    stale_epoch = epoch,
+                    epoch = self.election_epoch,
+                    "election: dropped stale election timeout"
+                );
             }
             RaftTimeoutCallback::RpcTimeout { .. } => {
                 self.send_heartbeats();
@@ -636,19 +644,40 @@ impl Raft {
     }
 
     fn step_down(&mut self, new_term: u64) {
+        debug_assert!(
+            new_term >= self.current_term,
+            "step_down must never regress the term"
+        );
+        let was_leader = self.role == Role::Leader;
+
         tracing::debug!(
             node = %self.node_id,
             group = self.shard_group_id.0,
             new_term,
-            was_leader = self.role == Role::Leader,
+            was_leader,
             "election: stepping down"
         );
 
-        self.current_term = new_term;
-        self.voted_for = None;
-        self.push_hard_state();
+        // Clearing the vote is only safe when the term actually advances;
+        // at an equal term this is a pure demotion that must preserve
+        // `voted_for`, or the node could vote twice in one term — the same
+        // rule `recognize_leader`'s demotion branch follows. All production
+        // callers pass strictly newer terms (guarded `>` at every call
+        // site); tests use equal-term step_down to depose a leader in place.
+        if new_term > self.current_term {
+            self.current_term = new_term;
+            self.voted_for = None;
+            self.push_hard_state();
+        }
+
         self.cancel_leader_timers();
-        if self.role == Role::Leader {
+        if was_leader {
+            // The election timer resets only on a vote grant or
+            // on AppendEntries from the current leader — never on a mere
+            // higher-term message, or a doomed candidate can push back a healthy
+            // follower's deadline every round (the #133 livelock). Followers and
+            // candidates keep their armed deadline; only an ex-leader, which
+            // runs no election timer, arms a fresh one.
             self.reset_election_timer();
         }
         self.role = Role::Follower;

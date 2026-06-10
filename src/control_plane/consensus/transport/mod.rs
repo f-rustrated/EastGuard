@@ -50,7 +50,7 @@ impl RaftTransportActor {
                         }
                     }
                     if !to_send.is_empty() {
-                        dispatcher.send(to_send.into_boxed_slice(), &swim_tx).await;
+                        dispatcher.send(to_send, &swim_tx).await;
                     }
                 }
                 Some(result) = dial_rx.recv() => {

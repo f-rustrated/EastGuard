@@ -12,7 +12,9 @@
 #   scripts/stress_test.sh e2e_swim_raft_cluster_lifecycle 50 90
 #
 # Env:
-#   RUST_LOG   passed through to each run (default: off). e.g.
+#   RUST_LOG   passed through to each run. Defaults to east_guard=debug so
+#              kept failure logs always carry the election flight recorder
+#              (#133); set RUST_LOG= to disable. e.g.
 #              RUST_LOG=east_guard::data_plane::state=warn scripts/stress_test.sh
 #
 # Notes:
@@ -47,7 +49,7 @@ pass=0; fail=0
 for i in $(seq 1 "$N"); do
   log="$OUTDIR/run_$i.log"
   # Run with a wall-clock watchdog so a hung run can't wedge the sweep.
-  RUST_LOG="${RUST_LOG:-}" cargo test --lib "$TEST" >"$log" 2>&1 &
+  RUST_LOG="${RUST_LOG:-east_guard=debug}" cargo test --lib "$TEST" >"$log" 2>&1 &
   pid=$!
   killed=0
   for _ in $(seq 1 "$PER_RUN_TIMEOUT"); do

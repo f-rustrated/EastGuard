@@ -26,10 +26,7 @@ use crate::it::sim::scenario::{
 struct SimTime;
 
 impl tracing_subscriber::fmt::time::FormatTime for SimTime {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         match turmoil::sim_elapsed() {
             Some(t) => write!(w, "[sim {:>9.4}s]", t.as_secs_f64()),
             None => write!(w, "[sim        --]"),
@@ -225,7 +222,8 @@ fn leader_elects_after_kill() -> turmoil::Result {
                     .find(|w| w[0] == w[1])
                     .map(|w| w[0].clone());
             }
-            if agreed_leader.is_some() {
+
+            if topic_acked && agreed_leader.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -239,6 +237,14 @@ fn leader_elects_after_kill() -> turmoil::Result {
                  last views from node-1..3: {last_round:?})"
             )
         });
+
+        assert!(
+            topic_acked,
+            "phase1: CreateTopic never acked within 30s \
+             (shard {shard_group_id}, leader {initial_leader}, \
+             last views from node-1..3: {last_round:?})"
+        );
+
         let victim_idx = (1..=3u8)
             .find(|i| initial_leader.starts_with(node_name(*i).as_str()))
             .unwrap_or_else(|| panic!("leader id {initial_leader:?} maps to no known host"));
@@ -305,8 +311,13 @@ fn leader_elects_after_kill() -> turmoil::Result {
             .zip(survivor_names.iter())
             .map(|(i, n)| (n.as_str(), client_port(*i)))
             .collect();
-        assert_leader_converges(&nodes, shard_group_id, &initial_leader, Duration::from_secs(10))
-            .await?;
+        assert_leader_converges(
+            &nodes,
+            shard_group_id,
+            &initial_leader,
+            Duration::from_secs(10),
+        )
+        .await?;
         // Converged views also satisfy the split-brain invariant by definition.
         assert_single_leader(&nodes, shard_group_id, Duration::ZERO).await?;
         Ok(())

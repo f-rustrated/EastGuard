@@ -162,14 +162,15 @@ impl MultiRaft {
                 if member == self.node_id || !live_set.contains(&member) {
                     continue;
                 }
-                if raft.propose(RaftCommand::AddPeer(member.clone())).is_ok() {
-                    self.dirty.insert(shard_group_id);
-                } else {
+
+                if let Err(e) = raft.propose(RaftCommand::AddPeer(member.clone())) {
                     tracing::warn!(
-                        "Takeover membership assert AddPeer({:?}) on {:?} rejected",
+                        "Takeover membership assert AddPeer({:?}) on {:?} rejected: {e:?}",
                         member,
                         shard_group_id,
-                    );
+                    )
+                } else {
+                    self.dirty.insert(shard_group_id);
                 }
             }
         }
@@ -479,7 +480,7 @@ impl MultiRaft {
     /// fresh means the join sees the latest cluster shape — including any
     /// topology drift between the SWIM event and this handler running.
     fn add_node(&mut self, node_id: NodeId) {
-        let affected_groups: Vec<ShardGroup> = self.topology.shard_groups_for_node(&node_id);
+        let affected_groups = self.topology.shard_groups_for_node(&node_id);
         if affected_groups.is_empty() {
             return;
         }
@@ -508,7 +509,7 @@ impl MultiRaft {
         }
     }
 
-    fn ensure_new_groups(&mut self, groups: Vec<ShardGroup>) {
+    fn ensure_new_groups(&mut self, groups: Box<[ShardGroup]>) {
         for group in groups {
             if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
                 self.add_group(group);
