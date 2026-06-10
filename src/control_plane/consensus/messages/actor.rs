@@ -12,8 +12,6 @@ use super::command::{
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
 
-/// Commands received by the MultiRaftActor from external sources (tokio-dependent).
-
 pub enum MultiRaftActorCommand {
     /// Fire-and-forget: internal Raft protocol messages, timeouts, and SWIM topology updates.
     ProtocolMessage(RaftProtocolMessage),
