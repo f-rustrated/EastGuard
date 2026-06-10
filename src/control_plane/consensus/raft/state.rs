@@ -150,11 +150,11 @@ impl Raft {
         self.timer_seqs.rpc
     }
 
-    pub(crate) fn topic_names(&self) -> Vec<String> {
+    pub(crate) fn topic_names(&self) -> Box<[String]> {
         self.state_machine.topic_names()
     }
 
-    pub(crate) fn topic_stats(&self) -> Vec<TopicStats> {
+    pub(crate) fn topic_stats(&self) -> Box<[TopicStats]> {
         self.state_machine.topic_stats()
     }
 
@@ -165,14 +165,14 @@ impl Raft {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         self.state_machine.active_segments_for_node(node_id)
     }
 
     /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
     /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
     /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
-    pub(crate) fn active_segment_assignments(&self) -> Vec<(SegmentKey, ReplicaSet, u64)> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
         self.state_machine.active_segment_assignments()
     }
 
@@ -287,7 +287,7 @@ impl Raft {
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         self.state_machine.active_segments_with_dead_members(live)
     }
 
@@ -339,12 +339,12 @@ impl Raft {
         self.log.get((index - 1) as usize)
     }
 
-    fn log_entries_from(&self, start_index: u64) -> Vec<LogEntry> {
+    fn log_entries_from(&self, start_index: u64) -> Box<[LogEntry]> {
         let last = self.log_last_index();
         if start_index == 0 || start_index > last {
-            return vec![];
+            return Box::new([]);
         }
-        self.log[(start_index - 1) as usize..].to_vec()
+        self.log[(start_index - 1) as usize..].into()
     }
 
     fn log_append(&mut self, entry: LogEntry) {
@@ -818,7 +818,7 @@ impl Raft {
         local_term != 0 && local_term == prev_log_term
     }
 
-    fn replicate_entries(&mut self, entries: Vec<LogEntry>) {
+    fn replicate_entries(&mut self, entries: Box<[LogEntry]>) {
         for entry in entries {
             let existing_term = self.log_term_at(entry.index);
             if existing_term != 0 && existing_term != entry.term {
@@ -1624,11 +1624,11 @@ mod tests {
             leader_id: NodeId::new("node-1"),
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![LogEntry {
+            entries: Box::new([LogEntry {
                 term: 1,
                 index: 1,
                 command: RaftCommand::Noop,
-            }],
+            }]),
             leader_commit: 0,
         };
         raft.handle_rpc(node("node-1"), ae);
@@ -1654,7 +1654,7 @@ mod tests {
             leader_id: NodeId::new("node-1"),
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![],
+            entries: Default::default(),
             leader_commit: 0,
         };
         raft.handle_rpc(node("node-1"), ae);
@@ -1679,11 +1679,11 @@ mod tests {
             leader_id: NodeId::new("node-1"),
             prev_log_index: 1,
             prev_log_term: 1,
-            entries: vec![LogEntry {
+            entries: Box::new([LogEntry {
                 term: 1,
                 index: 2,
                 command: RaftCommand::Noop,
-            }],
+            }]),
             leader_commit: 0,
         };
         raft.handle_rpc(node("node-1"), ae);
@@ -1756,7 +1756,7 @@ mod tests {
                 leader_id: node("node-1"),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![],
+                entries: Default::default(),
                 leader_commit: 0,
             }),
         );
@@ -1782,11 +1782,11 @@ mod tests {
             leader_id: NodeId::new("node-1"),
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![LogEntry {
+            entries: Box::new([LogEntry {
                 term: 1,
                 index: 1,
                 command: RaftCommand::Noop,
-            }],
+            }]),
             leader_commit: 1,
         };
         raft.handle_rpc(node("node-1"), ae);
@@ -1869,7 +1869,7 @@ mod tests {
             leader_id: NodeId::new("node-3"),
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![],
+            entries: Default::default(),
             leader_commit: 0,
         };
         raft.handle_rpc(node("node-3"), ae);
@@ -1994,7 +1994,7 @@ mod tests {
                 leader_id: node("node-1"),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![],
+                entries: Default::default(),
                 leader_commit: 0,
             },
         );
@@ -2050,7 +2050,7 @@ mod tests {
                 leader_id: node("node-1"),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![],
+                entries: Default::default(),
                 leader_commit: 0,
             },
         );
@@ -2065,7 +2065,7 @@ mod tests {
                 leader_id: node("node-2"),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![],
+                entries: Default::default(),
                 leader_commit: 0,
             },
         );
@@ -2485,11 +2485,11 @@ mod tests {
                 leader_id: node("node-2"),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntry {
+                entries: Box::new([LogEntry {
                     term: 1,
                     index: 1,
                     command: RaftCommand::Noop,
-                }],
+                }]),
                 leader_commit: 0,
             }),
         );

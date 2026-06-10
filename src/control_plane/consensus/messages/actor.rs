@@ -23,7 +23,7 @@ pub enum MultiRaftActorCommand {
 
     GetPeers {
         group_id: ShardGroupId,
-        reply: oneshot::Sender<Vec<NodeId>>,
+        reply: oneshot::Sender<Box<[NodeId]>>,
     },
     /// Propose a command to a shard group's Raft log. Leader-only.
     ClientProposal {
@@ -31,10 +31,12 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Result<(), ClientProposalError>>,
     },
     /// Query all topic names from all shard groups on this node.
-    GetTopics { reply: oneshot::Sender<Vec<String>> },
+    GetTopics {
+        reply: oneshot::Sender<Box<[String]>>,
+    },
     /// Query per-topic stats from all shard groups on this node.
     GetTopicStats {
-        reply: oneshot::Sender<Vec<TopicStats>>,
+        reply: oneshot::Sender<Box<[TopicStats]>>,
     },
     /// Query full metadata for a single topic by name. Returns `None` when the
     /// topic's metadata is not hosted on this node (i.e. this node is not in
@@ -76,12 +78,12 @@ impl_from_variant_via!(
 
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
-    GetPeers(oneshot::Sender<Vec<NodeId>>, Vec<NodeId>),
+    GetPeers(oneshot::Sender<Box<[NodeId]>>, Box<[NodeId]>),
     Propose(
         oneshot::Sender<Result<(), ClientProposalError>>,
         Result<(), ClientProposalError>,
     ),
-    GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
-    GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),
+    GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
+    GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),
     GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Option<TopicMeta>),
 }

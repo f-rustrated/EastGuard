@@ -5,7 +5,7 @@ use crate::impl_from_variant;
 
 #[derive(Debug)]
 pub(crate) struct DataTransportSendToTargets {
-    pub targets: Vec<NodeId>,
+    pub targets: Box<[NodeId]>,
     pub message: DataPlaneInterNodeCommand,
 }
 
@@ -36,7 +36,7 @@ impl DataTransportCommand {
         message: impl Into<DataPlaneInterNodeCommand>,
     ) -> Self {
         Self::SendToTargets(DataTransportSendToTargets {
-            targets,
+            targets: targets.into_boxed_slice(),
             message: message.into(),
         })
     }

@@ -65,7 +65,7 @@ impl DataPlaneOutputs {
         self.batch_scheduler
             .blocking_send_batch(self.batch_timer_cmds.drain(..).collect());
 
-        let repl_cmds: Vec<TimerCommand<ReplicationTimer>> = self
+        let repl_cmds: Box<[TimerCommand<ReplicationTimer>]> = self
             .repl_schedules
             .drain(..)
             .map(|(seq, timer)| TimerCommand::SetSchedule { seq, timer })
@@ -73,7 +73,7 @@ impl DataPlaneOutputs {
 
         self.repl_scheduler.blocking_send_batch(repl_cmds);
         self.transport_tx
-            .blocking_send_batch(std::mem::take(&mut self.transport_cmds));
+            .blocking_send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice());
     }
 
     pub(crate) fn store_transport_cmd(&mut self, cmd: impl Into<DataTransportCommand>) {

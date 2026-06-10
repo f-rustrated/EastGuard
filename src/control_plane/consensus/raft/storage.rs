@@ -18,6 +18,6 @@ impl RaftPersistentState {
 
 pub(crate) trait RaftStorage: Send + Sync {
     fn load_state(&self, group_id: u64) -> RaftPersistentState;
-    fn persist_mutations(&self, mutations: Vec<(ShardGroupId, LogMutation)>);
+    fn persist_mutations(&self, mutations: Box<[(ShardGroupId, LogMutation)]>);
     fn delete_group(&self, group_id: ShardGroupId);
 }

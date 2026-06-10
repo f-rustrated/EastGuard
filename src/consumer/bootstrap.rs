@@ -135,7 +135,7 @@ mod tests {
         TopicDetail {
             name: "t".into(),
             state: TopicState::Active,
-            ranges,
+            ranges: ranges.into_boxed_slice(),
         }
     }
 

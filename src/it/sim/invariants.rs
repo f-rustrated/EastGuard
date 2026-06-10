@@ -240,7 +240,7 @@ pub(super) async fn query_shard_info(
     }
 }
 
-pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<TopicSummary>> {
+pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Box<[TopicSummary]>> {
     let stream =
         tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;
     let (read_half, write_half) = stream.into_split();
@@ -256,6 +256,6 @@ pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Vec<T
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
     match response {
         ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),
-        _ => Ok(vec![]),
+        _ => Ok(Box::new([])),
     }
 }

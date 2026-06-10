@@ -97,16 +97,16 @@ impl MultiRaftActor {
         }
         for packets in std::mem::take(&mut self.packets_by_target) {
             self.transport_cmds
-                .push(RaftTransportCommand::Send(packets.1));
+                .push(RaftTransportCommand::Send(packets.1.into_boxed_slice()));
         }
 
         tokio::join!(
             self.transport_tx
-                .send_batch(std::mem::take(&mut self.transport_cmds)),
+                .send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice()),
             self.scheduler_tx
-                .send_batch(std::mem::take(&mut self.timer_cmds)),
+                .send_batch(std::mem::take(&mut self.timer_cmds).into_boxed_slice()),
             self.data_transport_tx
-                .send_batch(std::mem::take(&mut self.data_transport_cmds)),
+                .send_batch(std::mem::take(&mut self.data_transport_cmds).into_boxed_slice()),
         );
 
         self.store.fire_deferred();
@@ -178,7 +178,7 @@ impl MutlRaftSender {
         recv.await.ok().flatten()
     }
 
-    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+    pub(crate) async fn get_peers(&self, group_id: ShardGroupId) -> Box<[NodeId]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::GetPeers { group_id, reply })
@@ -187,14 +187,14 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
-    pub(crate) async fn get_topics(&self) -> Vec<String> {
+    pub(crate) async fn get_topics(&self) -> Box<[String]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self.send(MultiRaftActorCommand::GetTopics { reply }).await;
 
         recv.await.unwrap_or_default()
     }
 
-    pub(crate) async fn get_topic_stats(&self) -> Vec<TopicStats> {
+    pub(crate) async fn get_topic_stats(&self) -> Box<[TopicStats]> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::GetTopicStats { reply })

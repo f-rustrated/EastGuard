@@ -75,11 +75,11 @@ pub enum DataPlaneResponse {
     RangeSplitting {
         left_range_id: u64,
         right_range_id: u64,
-        split_point: Vec<u8>,
+        split_point: Box<[u8]>,
     },
     // Fetch
     Fetched {
-        entries: Vec<Entry>,
+        entries: Box<[Entry]>,
         next_entry_id: u64,
         progress_signal: RangeProgressSignal,
     },

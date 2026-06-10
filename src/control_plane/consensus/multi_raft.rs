@@ -318,7 +318,7 @@ impl MultiRaft {
         raft.cancel_all_timers();
         self.pending_events.extend(raft.take_events());
 
-        let pending_keys: Vec<_> = self
+        let pending_keys: Box<[_]> = self
             .pending_proposes
             .keys()
             .filter(|(gid, _)| *gid == group_id)
@@ -369,21 +369,21 @@ impl MultiRaft {
             .and_then(|r| r.current_leader().cloned())
     }
 
-    fn get_peers(&self, group_id: ShardGroupId) -> Vec<NodeId> {
+    fn get_peers(&self, group_id: ShardGroupId) -> Box<[NodeId]> {
         self.groups
             .get(&group_id)
             .map(|r| r.peers_iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    fn get_topics(&self) -> Vec<String> {
+    fn get_topics(&self) -> Box<[String]> {
         self.groups
             .values()
             .flat_map(|raft| raft.topic_names())
             .collect()
     }
 
-    fn get_topic_stats(&self) -> Vec<TopicStats> {
+    fn get_topic_stats(&self) -> Box<[TopicStats]> {
         self.groups
             .values()
             .flat_map(|raft| raft.topic_stats())
@@ -679,7 +679,7 @@ impl MultiRaft {
         if mutations.is_empty() {
             return;
         }
-        self.storage.persist_mutations(mutations);
+        self.storage.persist_mutations(mutations.into_boxed_slice());
         for (id, last_log_index) in last_indices {
             if let Some(raft) = self.groups.get_mut(&id) {
                 // Advancing the durability gate re-attempts apply for entries that
@@ -969,7 +969,7 @@ mod tests {
                 leader_id: n2.clone(),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![
+                entries: Box::new([
                     LogEntry {
                         term: 1,
                         index: 1,
@@ -980,7 +980,7 @@ mod tests {
                         index: 2,
                         command: RaftCommand::Noop,
                     },
-                ],
+                ]),
                 leader_commit: 0,
             }),
         });
@@ -1004,11 +1004,11 @@ mod tests {
                 leader_id: n2.clone(),
                 prev_log_index: 0,
                 prev_log_term: 0,
-                entries: vec![LogEntry {
+                entries: Box::new([LogEntry {
                     term: 2,
                     index: 1,
                     command: RaftCommand::Noop,
-                }],
+                }]),
                 leader_commit: 0,
             }),
         });

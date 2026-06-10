@@ -24,6 +24,10 @@ Legitimate `Option` uses: simple lookups where "not found" is the only possible 
 
 Don't pass `bool` parameters to control method behavior. Instead, have the caller check the condition and only call the method when appropriate. Boolean parameters hide branching from the call site and make APIs harder to read.
 
+## `Box<[T]>` over `Vec<T>`
+* Use `Box<[T]>` when the collection has been built and its size will never change again.
+* Use `Vec<T>` when it is mutable state.
+
 ## Compile-time exhaustiveness over runtime defaults
 
 Never use wildcard `_ => {}` or `_ => unreachable!()` in match arms for enum dispatch. List all variants explicitly so the compiler catches new variants at compile time. When splitting a match across sub-functions, the "already handled" arms should be listed explicitly (e.g., `VariantA { .. } | VariantB { .. } => {}`).

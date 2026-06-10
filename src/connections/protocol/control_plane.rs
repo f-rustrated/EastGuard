@@ -43,7 +43,7 @@ pub enum ControlPlaneResponse {
     TopicDeleted,
     TopicNotFound,
     // ListHostedTopics
-    TopicList { topics: Vec<TopicSummary> },
+    TopicList { topics: Box<[TopicSummary]> },
     // DescribeTopic — when this node owns the topic's metadata
     TopicDetail(TopicDetail),
     // DescribeTopic — when this node does not own the topic's metadata.
@@ -72,7 +72,7 @@ pub enum TopicState {
 pub struct TopicDetail {
     pub name: String,
     pub state: TopicState,
-    pub ranges: Vec<RangeDetail>,
+    pub ranges: Box<[RangeDetail]>,
 }
 
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)

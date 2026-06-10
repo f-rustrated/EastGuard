@@ -60,7 +60,7 @@ impl_from_variant!(
 /// Commands sent from MultiRaftActor to RaftTransportActor.
 #[derive(Debug)]
 pub enum RaftTransportCommand {
-    Send(Vec<OutboundRaftPacket>),
+    Send(Box<[OutboundRaftPacket]>),
     DisconnectPeer(NodeId),
 }
 

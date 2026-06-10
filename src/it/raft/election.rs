@@ -44,7 +44,9 @@ fn build_address_map(
 
 async fn drive_ticks(ticker: &SchedulerSender<RaftTimer>, count: usize) {
     for _ in 0..count {
-        let _ = ticker.send_batch(vec![TickerCommand::ForceTick]).await;
+        let _ = ticker
+            .send_batch(Box::new([TickerCommand::ForceTick]))
+            .await;
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         tokio::task::yield_now().await;

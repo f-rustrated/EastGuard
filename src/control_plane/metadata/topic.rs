@@ -91,9 +91,9 @@ impl TopicMeta {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         if self.state != TopicState::Active {
-            return Vec::new();
+            return Box::new([]);
         }
         self.active_ranges
             .iter()
@@ -113,9 +113,9 @@ impl TopicMeta {
     /// the leader's periodic assignment re-drive. Returns `(key, replica_set,
     /// start_offset)` so a re-driven `SegmentAssignment` can recreate a segment
     /// that missed its one-shot delivery with the correct starting offset.
-    pub(crate) fn active_segment_assignments(&self) -> Vec<(SegmentKey, ReplicaSet, u64)> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
         if self.state != TopicState::Active {
-            return Vec::new();
+            return Box::new([]);
         }
         self.active_ranges
             .iter()
@@ -135,9 +135,9 @@ impl TopicMeta {
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &std::collections::HashSet<NodeId>,
-    ) -> Vec<(SegmentKey, ReplicaSet)> {
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
         if self.state != TopicState::Active {
-            return Vec::new();
+            return Box::new([]);
         }
         self.active_ranges
             .iter()
@@ -412,7 +412,7 @@ pub mod props {
             if self.active_ranges.is_empty() {
                 return;
             }
-            let ranges: Vec<&RangeMeta> = self
+            let ranges: Box<[&RangeMeta]> = self
                 .active_ranges
                 .iter()
                 .map(|id| &self.ranges[id])

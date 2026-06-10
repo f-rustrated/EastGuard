@@ -28,8 +28,8 @@ pub enum CursorAction {
     /// The fetched range was sealed and drained; cursors transitioned per
     /// the lineage rule.
     Transitioned {
-        dropped: Vec<RangeId>,
-        added: Vec<RangeCursor>,
+        dropped: Box<[RangeId]>,
+        added: Box<[RangeCursor]>,
     },
 }
 
@@ -109,7 +109,7 @@ impl RangeCursorSet {
                 self.cursors.extend(added.clone());
 
                 CursorAction::Transitioned {
-                    dropped: vec![range_id],
+                    dropped: Box::new([range_id]),
                     added,
                 }
             }
@@ -125,7 +125,7 @@ impl RangeCursorSet {
         &mut self,
         drained: RangeCursor,
         transition: RangeTransition,
-    ) -> Vec<RangeCursor> {
+    ) -> Box<[RangeCursor]> {
         match transition {
             RangeTransition::Split {
                 left_range_id,
@@ -145,7 +145,7 @@ impl RangeCursorSet {
                     .parked_merges
                     .try_complete_merge(merged_range_id, &drained)
                 {
-                    return vec![merged];
+                    return Box::new([merged]);
                 }
 
                 // - (b) Both parents tracked, the other still tracked. Park M pending
@@ -157,7 +157,7 @@ impl RangeCursorSet {
                         merged_id: merged_range_id,
                         drained: vec![drained],
                     });
-                    return Vec::new();
+                    return Box::new([]);
                 }
 
                 // - (c) Only this parent ever tracked
@@ -165,7 +165,7 @@ impl RangeCursorSet {
                 //      P1 [a, b)
                 //      P2 [b, c) -> M [a, c).
                 //  Consumer is reading only [a, b). Their CursorSet has only P1 (P2 was never relevant).
-                vec![drained.into_merged_cursor(merged_range_id)]
+                Box::new([drained.into_merged_cursor(merged_range_id)])
             }
         }
     }
@@ -314,7 +314,7 @@ mod tests {
         );
         match action {
             CursorAction::Transitioned { dropped, added } => {
-                assert_eq!(dropped, vec![RangeId(0)]);
+                assert_eq!(dropped[0], RangeId(0));
                 assert_eq!(added.len(), 2);
                 assert_eq!(added[0], cursor(RangeId(1), 0, b"a", b"b"));
                 assert_eq!(added[1], cursor(RangeId(2), 0, b"b", b"c"));
@@ -342,8 +342,8 @@ mod tests {
         assert_eq!(
             action,
             CursorAction::Transitioned {
-                dropped: vec![RangeId(1)],
-                added: vec![],
+                dropped: Box::new([RangeId(1)]),
+                added: Box::new([]),
             }
         );
         // P1 dropped; P2 still tracked; M not yet a fetchable cursor.
@@ -375,8 +375,8 @@ mod tests {
         assert_eq!(
             action,
             CursorAction::Transitioned {
-                dropped: vec![RangeId(2)],
-                added: vec![cursor(RangeId(3), 0, b"a", b"c")],
+                dropped: Box::new([RangeId(2)]),
+                added: Box::new([cursor(RangeId(3), 0, b"a", b"c")]),
             }
         );
         // Only M remains, spanning both pre-merge keyspaces.

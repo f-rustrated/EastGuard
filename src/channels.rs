@@ -4,15 +4,15 @@ use tokio::sync::mpsc;
 pub(crate) struct BatchSender<T>(mpsc::Sender<Box<[T]>>);
 
 impl<T> BatchSender<T> {
-    pub(crate) async fn send_batch(&self, cmds: Vec<T>) {
+    pub(crate) async fn send_batch(&self, cmds: Box<[T]>) {
         if !cmds.is_empty() {
-            let _ = self.0.send(cmds.into_boxed_slice()).await;
+            let _ = self.0.send(cmds).await;
         }
     }
 
-    pub(crate) fn blocking_send_batch(&self, cmds: Vec<T>) {
+    pub(crate) fn blocking_send_batch(&self, cmds: Box<[T]>) {
         if !cmds.is_empty() {
-            let _ = self.0.blocking_send(cmds.into_boxed_slice());
+            let _ = self.0.blocking_send(cmds);
         }
     }
 }
