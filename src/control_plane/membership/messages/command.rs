@@ -13,7 +13,7 @@ use super::timer::SwimTimer;
 /// Inputs to the Swim state machine (tokio-free, WASM-safe).
 #[derive(Debug)]
 pub(crate) enum SwimCommand {
-    PacketReceived { src: SocketAddr, packet: SwimPacket },
+    InboundRaftRpc { src: SocketAddr, packet: SwimPacket },
     Timeout(SwimTimeOutCallback),
     AnnounceShardLeader(LeaderChange),
 }

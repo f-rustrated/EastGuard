@@ -680,7 +680,7 @@ impl Swim {
 
     pub(crate) fn dispatch_command(&mut self, cmd: SwimCommand) {
         match cmd {
-            SwimCommand::PacketReceived { src, packet } => self.step(src, packet),
+            SwimCommand::InboundRaftRpc { src, packet } => self.step(src, packet),
             SwimCommand::Timeout(event) => self.handle_timeout(event),
             SwimCommand::AnnounceShardLeader(event) => {
                 self.announce_shard_leader(event.shard_group_id, event.leader_node_id, event.term)

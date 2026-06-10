@@ -17,7 +17,7 @@ mpsc::Receiver<SwimCommand>
        Membership → raft_tx (HandleNodeDeath / HandleNodeJoin)
 ```
 
-`SwimCommand` variants: `PacketReceived` (from UDP transport), `Timeout` (from ticker), `Query` (from external callers).
+`SwimCommand` variants: `InboundRaftRpc` (from UDP transport), `Timeout` (from ticker), `Query` (from external callers).
 
 ## Invariants
 

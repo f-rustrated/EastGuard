@@ -6,8 +6,8 @@ use crate::control_plane::metadata::{TopicMeta, TopicStats};
 use crate::data_plane::messages::command::SegmentAssignmentAck;
 
 use super::command::{
-    ConsensusCommand, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, PacketReceived,
-    ProposeError, RaftPropose, RemoveGroup,
+    ClientProposalError, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, InboundRaftRpc,
+    MetadataProposal, RaftProtocolMessage, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
@@ -15,8 +15,8 @@ use crate::impl_from_variant_via;
 /// Commands received by the MultiRaftActor from external sources (tokio-dependent).
 
 pub enum MultiRaftActorCommand {
-    /// Fire-and-forget: no reply channel needed.
-    ConsensusCommand(ConsensusCommand),
+    /// Fire-and-forget: internal Raft protocol messages, timeouts, and SWIM topology updates.
+    ProtocolMessage(RaftProtocolMessage),
     /// Query the current leader of a shard group.
     GetLeader {
         group_id: ShardGroupId,
@@ -28,9 +28,9 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Vec<NodeId>>,
     },
     /// Propose a command to a shard group's Raft log. Leader-only.
-    Propose {
-        propose: RaftPropose,
-        reply: oneshot::Sender<Result<(), ProposeError>>,
+    ClientProposal {
+        propose: MetadataProposal,
+        reply: oneshot::Sender<Result<(), ClientProposalError>>,
     },
     /// Query all topic names from all shard groups on this node.
     GetTopics { reply: oneshot::Sender<Vec<String>> },
@@ -54,22 +54,22 @@ pub enum MultiRaftActorCommand {
     AssignmentAck(SegmentAssignmentAck),
 }
 
-impl From<ConsensusCommand> for MultiRaftActorCommand {
-    fn from(cmd: ConsensusCommand) -> Self {
-        MultiRaftActorCommand::ConsensusCommand(cmd)
+impl From<RaftProtocolMessage> for MultiRaftActorCommand {
+    fn from(cmd: RaftProtocolMessage) -> Self {
+        MultiRaftActorCommand::ProtocolMessage(cmd)
     }
 }
 
 impl From<RaftTimeoutCallback> for MultiRaftActorCommand {
     fn from(cb: RaftTimeoutCallback) -> Self {
-        MultiRaftActorCommand::ConsensusCommand(ConsensusCommand::Timeout(cb))
+        MultiRaftActorCommand::ProtocolMessage(RaftProtocolMessage::Timeout(cb))
     }
 }
 
 impl_from_variant_via!(
     MultiRaftActorCommand,
-    ConsensusCommand,
-    PacketReceived,
+    RaftProtocolMessage,
+    InboundRaftRpc,
     EnsureGroup,
     RemoveGroup,
     NodeDead,
@@ -80,8 +80,8 @@ pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     GetPeers(oneshot::Sender<Vec<NodeId>>, Vec<NodeId>),
     Propose(
-        oneshot::Sender<Result<(), ProposeError>>,
-        Result<(), ProposeError>,
+        oneshot::Sender<Result<(), ClientProposalError>>,
+        Result<(), ClientProposalError>,
     ),
     GetTopics(oneshot::Sender<Vec<String>>, Vec<String>),
     GetTopicStats(oneshot::Sender<Vec<TopicStats>>, Vec<TopicStats>),

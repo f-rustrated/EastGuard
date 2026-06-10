@@ -5,8 +5,8 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    ConsensusCommand, CoordinatorSealRequest, DeferredReply, LogMutation, MetadataCommitted,
-    MultiRaftActorCommand, PacketReceived, ProposeError, RaftEvent, RaftPropose,
+    CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation, MetadataCommitted,
+    MetadataProposal, MultiRaftActorCommand, ClientProposalError, RaftEvent, RaftProtocolMessage,
     RaftTimeoutCallback, SealContext,
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
@@ -32,7 +32,7 @@ pub(crate) struct MultiRaft {
     pending_events: Vec<RaftEvent>,
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
-    pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposeError>>>,
+    pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ClientProposalError>>>,
     pending_seals: PendingSealTracker,
 
     topology: TopologyReader,
@@ -160,7 +160,7 @@ impl MultiRaft {
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
         match cmd {
-            MultiRaftActorCommand::ConsensusCommand(c) => {
+            MultiRaftActorCommand::ProtocolMessage(c) => {
                 self.handle_consensus(c);
             }
             MultiRaftActorCommand::GetLeader { group_id, reply } => {
@@ -171,7 +171,7 @@ impl MultiRaft {
                 let result = self.get_peers(group_id);
                 self.deferred.push(DeferredReply::GetPeers(reply, result));
             }
-            MultiRaftActorCommand::Propose { propose, reply } => {
+            MultiRaftActorCommand::ClientProposal { propose, reply } => {
                 self.propose(propose, reply);
             }
 
@@ -223,14 +223,14 @@ impl MultiRaft {
         }
     }
 
-    pub(crate) fn handle_consensus(&mut self, cmd: impl Into<ConsensusCommand>) {
+    pub(crate) fn handle_consensus(&mut self, cmd: impl Into<RaftProtocolMessage>) {
         match cmd.into() {
-            ConsensusCommand::PacketReceived(cmd) => self.step(cmd),
-            ConsensusCommand::Timeout(cb) => self.handle_timeout(cb),
-            ConsensusCommand::EnsureGroup(cmd) => self.add_group(cmd.group),
-            ConsensusCommand::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
-            ConsensusCommand::HandleNodeDeath(cmd) => self.handle_node_death(cmd.dead_node_id),
-            ConsensusCommand::HandleNodeJoin(cmd) => self.add_node(cmd.new_node_id),
+            RaftProtocolMessage::InboundRaftRpc(cmd) => self.handle_rpc(cmd),
+            RaftProtocolMessage::Timeout(cb) => self.handle_timeout(cb),
+            RaftProtocolMessage::EnsureGroup(cmd) => self.add_group(cmd.group),
+            RaftProtocolMessage::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
+            RaftProtocolMessage::HandleNodeDeath(cmd) => self.handle_node_death(cmd.dead_node_id),
+            RaftProtocolMessage::HandleNodeJoin(cmd) => self.add_node(cmd.new_node_id),
         }
     }
 
@@ -301,7 +301,7 @@ impl MultiRaft {
             .collect();
         for key in pending_keys {
             if let Some(sender) = self.pending_proposes.remove(&key) {
-                let _ = sender.send(Err(ProposeError::ShardGroupRemoved));
+                let _ = sender.send(Err(ClientProposalError::ShardGroupRemoved));
             }
         }
 
@@ -310,9 +310,9 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    fn step(&mut self, cmd: PacketReceived) {
+    fn handle_rpc(&mut self, cmd: InboundRaftRpc) {
         if let Some(raft) = self.groups.get_mut(&cmd.shard_group_id) {
-            raft.step(cmd.from, cmd.rpc);
+            raft.handle_rpc(cmd.from, cmd.rpc);
             self.dirty.insert(cmd.shard_group_id);
         }
     }
@@ -492,7 +492,7 @@ impl MultiRaft {
         }
     }
 
-    fn propose(&mut self, cmd: RaftPropose, reply: oneshot::Sender<Result<(), ProposeError>>) {
+    fn propose(&mut self, cmd: MetadataProposal, reply: oneshot::Sender<Result<(), ClientProposalError>>) {
         let gid = cmd.shard_group_id;
         match self.propose_internal(cmd) {
             Ok(index) => {
@@ -504,14 +504,14 @@ impl MultiRaft {
         }
     }
 
-    fn propose_internal(&mut self, cmd: RaftPropose) -> Result<u64, ProposeError> {
+    fn propose_internal(&mut self, cmd: MetadataProposal) -> Result<u64, ClientProposalError> {
         match self.groups.get_mut(&cmd.shard_group_id) {
             Some(raft) => {
                 let result = raft.propose(cmd.command.into());
                 self.dirty.insert(cmd.shard_group_id);
                 result
             }
-            None => Err(ProposeError::ShardNotFound),
+            None => Err(ClientProposalError::ShardNotFound),
         }
     }
 
@@ -622,7 +622,7 @@ impl MultiRaft {
                     .collect();
                 for key in to_reject {
                     if let Some(sender) = self.pending_proposes.remove(&key) {
-                        let _ = sender.send(Err(ProposeError::NotLeader(None)));
+                        let _ = sender.send(Err(ClientProposalError::NotLeader(None)));
                     }
                 }
             }
@@ -751,7 +751,7 @@ mod tests {
         let mut store = new_store(me.clone(), storage);
 
         store.add_group(shard(42, vec![me.clone()]));
-        store.handle_consensus(ConsensusCommand::Timeout(
+        store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
             },
@@ -784,12 +784,12 @@ mod tests {
             let mut store = new_store(me.clone(), Box::new(db));
             store.add_group(shard(1, vec![me.clone()]));
             store.add_group(shard(2, vec![me.clone()]));
-            store.handle_consensus(ConsensusCommand::Timeout(
+            store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
                 },
             ));
-            store.handle_consensus(ConsensusCommand::Timeout(
+            store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(2),
                 },
@@ -815,7 +815,7 @@ mod tests {
     /// Elect n1 as leader of a single-node shard group. Single-node clusters
     /// become leader immediately on ElectionTimeout (no peers to wait for).
     fn elect_leader(store: &mut MultiRaft) {
-        store.handle_consensus(ConsensusCommand::Timeout(
+        store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: TEST_GROUP_ID,
             },
@@ -915,7 +915,7 @@ mod tests {
         store.flush(); // consume add_group dirty
 
         // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
-        store.handle_consensus(PacketReceived {
+        store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -950,7 +950,7 @@ mod tests {
 
         // n2 re-sends from index 1 at term 2, conflicting with the existing term-1 entries.
         // Raft truncates from index 1 and replaces with the new entry.
-        store.handle_consensus(PacketReceived {
+        store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
             from: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
@@ -1055,7 +1055,7 @@ mod tests {
         });
 
         store
-            .propose_internal(RaftPropose {
+            .propose_internal(MetadataProposal {
                 shard_group_id: TEST_GROUP_ID,
                 command: cmd,
             })
@@ -1078,7 +1078,7 @@ mod tests {
         store.flush();
 
         // Elect leader in group 1 only
-        store.handle_consensus(ConsensusCommand::Timeout(
+        store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(1),
             },
@@ -1127,14 +1127,14 @@ mod tests {
         };
 
         // First proposal succeeds
-        let _ = store.propose_internal(RaftPropose {
+        let _ = store.propose_internal(MetadataProposal {
             shard_group_id: TEST_GROUP_ID,
             command: make_cmd(),
         });
         store.flush();
 
         // Duplicate proposal: must not panic, state machine rejects at apply
-        let _ = store.propose_internal(RaftPropose {
+        let _ = store.propose_internal(MetadataProposal {
             shard_group_id: TEST_GROUP_ID,
             command: make_cmd(),
         });
@@ -1192,7 +1192,7 @@ mod tests {
         let raft = store.groups.get_mut(&TEST_GROUP_ID).unwrap();
         let term = raft.current_term();
         for peer in peers.iter().take(needed) {
-            raft.step(
+            raft.handle_rpc(
                 peer.clone(),
                 RaftRpc::RequestVoteResponse(RequestVoteResponse {
                     term,

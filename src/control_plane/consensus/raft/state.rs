@@ -423,7 +423,7 @@ impl Raft {
         self.assert_invariants();
     }
 
-    pub fn step(&mut self, from: NodeId, rpc: impl Into<RaftRpc>) {
+    pub fn handle_rpc(&mut self, from: NodeId, rpc: impl Into<RaftRpc>) {
         let rpc = rpc.into();
         match rpc {
             RaftRpc::RequestVote(req) => self.handle_request_vote(from, req),
@@ -948,9 +948,9 @@ impl Raft {
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
     /// Returns the log index at which the command was appended on success.
-    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposeError> {
+    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ClientProposalError> {
         if self.role != Role::Leader {
-            return Err(ProposeError::NotLeader(self.current_leader.clone()));
+            return Err(ClientProposalError::NotLeader(self.current_leader.clone()));
         }
 
         self.add_new_entry(command);
@@ -1165,7 +1165,7 @@ mod tests {
     use super::*;
 
     impl Raft {
-        pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposeError> {
+        pub(crate) fn propose_noop(&mut self) -> Result<u64, ClientProposalError> {
             self.propose(RaftCommand::Noop)
         }
 
@@ -1319,7 +1319,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(node("node-1"), req);
+        raft.handle_rpc(node("node-1"), req);
 
         let out = packets(&mut raft);
         assert_eq!(out.len(), 1);
@@ -1344,7 +1344,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(node("node-1"), req1);
+        raft.handle_rpc(node("node-1"), req1);
         drain(&mut raft);
 
         // node-2 asks for vote in same term
@@ -1354,7 +1354,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
         };
-        raft.step(node("node-2"), req2);
+        raft.handle_rpc(node("node-2"), req2);
 
         let out = packets(&mut raft);
         match &out[0].rpc {
@@ -1379,7 +1379,7 @@ mod tests {
             node_id: NodeId::new("node-2"),
             vote_granted: true,
         };
-        raft.step(node("node-2"), resp);
+        raft.handle_rpc(node("node-2"), resp);
 
         assert_eq!(raft.role, Role::Leader);
     }
@@ -1397,7 +1397,7 @@ mod tests {
             node_id: NodeId::new("node-2"),
             vote_granted: false,
         };
-        raft.step(node("node-2"), resp);
+        raft.handle_rpc(node("node-2"), resp);
 
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.current_term, 5);
@@ -1424,7 +1424,7 @@ mod tests {
             last_log_index: 1,
             last_log_term: 1,
         };
-        raft.step(node("node-1"), req);
+        raft.handle_rpc(node("node-1"), req);
 
         let out = packets(&mut raft);
         match &out[0].rpc {
@@ -1447,7 +1447,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RequestVoteResponse {
                 term: 1,
@@ -1470,7 +1470,7 @@ mod tests {
 
         // Peers ack the noop
         for name in ["node-2", "node-3"] {
-            raft.step(
+            raft.handle_rpc(
                 node(name),
                 AppendEntriesResponse {
                     term: 1,
@@ -1513,7 +1513,7 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        raft.step(node("node-1"), ae);
+        raft.handle_rpc(node("node-1"), ae);
 
         let out = packets(&mut raft);
         match &out[0].rpc {
@@ -1539,7 +1539,7 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         };
-        raft.step(node("node-1"), ae);
+        raft.handle_rpc(node("node-1"), ae);
 
         let out = packets(&mut raft);
         match &out[0].rpc {
@@ -1568,7 +1568,7 @@ mod tests {
             }],
             leader_commit: 0,
         };
-        raft.step(node("node-1"), ae);
+        raft.handle_rpc(node("node-1"), ae);
 
         let out = packets(&mut raft);
         match &out[0].rpc {
@@ -1588,7 +1588,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term: 1,
@@ -1611,7 +1611,7 @@ mod tests {
             success: true,
             last_log_index: 2,
         };
-        raft.step(node("node-2"), resp);
+        raft.handle_rpc(node("node-2"), resp);
 
         // Majority achieved (self + node-2 = 2 out of 3)
         assert_eq!(raft.commit_index, 2);
@@ -1622,7 +1622,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
             raft.propose_noop(),
-            Err::<u64, _>(ProposeError::NotLeader(None))
+            Err::<u64, _>(ClientProposalError::NotLeader(None))
         );
     }
 
@@ -1630,7 +1630,7 @@ mod tests {
     fn follower_propose_returns_leader_hint_when_known() {
         let mut raft = three_node_raft("node-2");
         // Receive AppendEntries from node-1 so follower learns who leader is
-        raft.step(
+        raft.handle_rpc(
             node("node-1"),
             RaftRpc::AppendEntries(AppendEntries {
                 term: 1,
@@ -1645,7 +1645,7 @@ mod tests {
 
         assert_eq!(
             raft.propose_noop(),
-            Err::<u64, _>(ProposeError::NotLeader(Some(node("node-1"))))
+            Err::<u64, _>(ClientProposalError::NotLeader(Some(node("node-1"))))
         );
     }
 
@@ -1670,7 +1670,7 @@ mod tests {
             }],
             leader_commit: 1,
         };
-        raft.step(node("node-1"), ae);
+        raft.handle_rpc(node("node-1"), ae);
         drain(&mut raft);
 
         assert_eq!(raft.commit_index, 1);
@@ -1689,7 +1689,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term: 1,
@@ -1710,7 +1710,7 @@ mod tests {
             success: false,
             last_log_index: 0,
         };
-        raft.step(node("node-2"), resp);
+        raft.handle_rpc(node("node-2"), resp);
 
         // Should have retried with decremented next_index
         let out = packets(&mut raft);
@@ -1731,7 +1731,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term: 1,
@@ -1751,7 +1751,7 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
         };
-        raft.step(node("node-3"), ae);
+        raft.handle_rpc(node("node-3"), ae);
 
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.current_term, 3);
@@ -1770,7 +1770,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term: 1,
@@ -1843,7 +1843,7 @@ mod tests {
         });
         drain(&mut raft);
 
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RequestVoteResponse {
                 term: 1,
@@ -1862,7 +1862,7 @@ mod tests {
         let mut raft = three_node_raft("node-2");
         assert_eq!(raft.current_leader(), None);
 
-        raft.step(
+        raft.handle_rpc(
             node("node-1"),
             AppendEntries {
                 term: 1,
@@ -1886,7 +1886,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RequestVoteResponse {
                 term: 1,
@@ -1898,7 +1898,7 @@ mod tests {
         assert_eq!(raft.current_leader(), Some(&node("node-1")));
 
         // Higher-term vote request forces step-down
-        raft.step(
+        raft.handle_rpc(
             node("node-3"),
             RequestVote {
                 term: 5,
@@ -1917,7 +1917,7 @@ mod tests {
         let mut raft = three_node_raft("node-3");
 
         // Learn leader from node-1
-        raft.step(
+        raft.handle_rpc(
             node("node-1"),
             AppendEntries {
                 term: 1,
@@ -1932,7 +1932,7 @@ mod tests {
         assert_eq!(raft.current_leader(), Some(&node("node-1")));
 
         // New leader at higher term
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             AppendEntries {
                 term: 2,
@@ -2083,11 +2083,11 @@ mod tests {
         let vote_reqs = packets(&mut n1);
         for pkt in &vote_reqs {
             if pkt.target == node("node-2") {
-                n2.step(node("node-1"), pkt.rpc.clone());
+                n2.handle_rpc(node("node-1"), pkt.rpc.clone());
             }
         }
         for pkt in packets(&mut n2) {
-            n1.step(node("node-2"), pkt.rpc);
+            n1.handle_rpc(node("node-2"), pkt.rpc);
         }
         assert!(n1.is_leader());
         drain(&mut n1);
@@ -2152,7 +2152,7 @@ mod tests {
         drain(&mut raft);
 
         // Win election
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RequestVoteResponse {
                 term: 1,
@@ -2190,7 +2190,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RequestVoteResponse {
                 term: 1,
@@ -2202,7 +2202,7 @@ mod tests {
         drain(&mut raft); // drain election event
 
         // Step down via higher-term vote request
-        raft.step(
+        raft.handle_rpc(
             node("node-3"),
             RequestVote {
                 term: 5,
@@ -2337,7 +2337,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
 
         // Receive term-1 entry as a follower (simulating replication from a crashed leader)
-        raft.step(
+        raft.handle_rpc(
             node("node-2"),
             RaftRpc::AppendEntries(AppendEntries {
                 term: 1,
@@ -2362,7 +2362,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
         });
         drain(&mut raft);
-        raft.step(
+        raft.handle_rpc(
             node("node-3"),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term: 2,
@@ -2379,7 +2379,7 @@ mod tests {
         assert_eq!(raft.log_term_at(2), 2);
 
         // node-3 acks only the old term-1 entry (index 1) but not the term-2 entry
-        raft.step(
+        raft.handle_rpc(
             node("node-3"),
             AppendEntriesResponse {
                 term: 2,
@@ -2395,7 +2395,7 @@ mod tests {
         );
 
         // node-3 acks the term-2 entry (index 2)
-        raft.step(
+        raft.handle_rpc(
             node("node-3"),
             AppendEntriesResponse {
                 term: 2,
@@ -2485,7 +2485,7 @@ mod tests {
             .expect("three_node_raft must have peers")
             .clone();
         let term = raft.current_term;
-        raft.step(
+        raft.handle_rpc(
             peer.clone(),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
                 term,

@@ -28,7 +28,7 @@ impl SwimTransportActor {
                 Ok((len, src)) = socket.recv_from(&mut buf) => {
                     match bincode::decode_from_slice(&buf[..len], BINCODE_CONFIG) {
                         Ok((packet, _)) => {
-                             let _ = to_actor.send(SwimCommand::PacketReceived { src, packet }).await;
+                             let _ = to_actor.send(SwimCommand::InboundRaftRpc { src, packet }).await;
                         }
                         Err(e) => tracing::error!("Failed to decode packet from {}: {}", src, e),
                     }

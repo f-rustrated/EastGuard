@@ -13,7 +13,7 @@ Actor contains no consensus logic. All decisions live in `Raft`.
 
 ```rust
 pub enum RaftCommand {
-    PacketReceived {
+    InboundRaftRpc {
         shard_group_id: ShardGroupId,
         from: NodeId,
         rpc: RaftRpc,
@@ -42,7 +42,7 @@ pub enum RaftCommand {
 
 | Variant | Source | Action |
 |---|---|---|
-| `PacketReceived` | Transport layer (TCP) | Lookup `Raft` by `shard_group_id`, call `raft.step(from, rpc)` |
+| `InboundRaftRpc` | Transport layer (TCP) | Lookup `Raft` by `shard_group_id`, call `raft.step(from, rpc)` |
 | `Timeout` | Ticker (timer expiry) | Extract `shard_group_id` from callback, call `raft.handle_timeout(cb)` |
 | `EnsureGroup` | SwimActor / HandleNodeJoin | Create `Raft` instance if not exists and this node is member |
 | `RemoveGroup` | External | Shut down and remove `Raft` instance |

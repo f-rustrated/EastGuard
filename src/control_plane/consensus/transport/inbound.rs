@@ -1,5 +1,5 @@
 use crate::control_plane::consensus::actor::MutlRaftSender;
-use crate::control_plane::consensus::messages::PacketReceived;
+use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::control_plane::{BINCODE_CONFIG, NodeId};
 use crate::net::OwnedReadHalf;
@@ -34,7 +34,7 @@ impl RaftRpcListener {
             match self.read_message().await {
                 Ok(msg) => {
                     let _ = tx
-                        .send(PacketReceived {
+                        .send(InboundRaftRpc {
                             shard_group_id: msg.shard_group_id,
                             from: msg.sender,
                             rpc: msg.rpc,

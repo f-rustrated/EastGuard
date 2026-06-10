@@ -63,7 +63,7 @@ impl YourStateMachine {
     /// Lives on the state machine because it's pure sync — no I/O.
     pub fn process(&mut self, event: YourActorCommand) {
         match event {
-            YourActorCommand::PacketReceived { src, data } => self.step(/* ... */),
+            YourActorCommand::InboundRaftRpc { src, data } => self.step(/* ... */),
             YourActorCommand::Timeout(callback) => self.handle_timeout(callback),
             YourActorCommand::Query(cmd) => self.handle_query(cmd),
         }
@@ -90,13 +90,13 @@ Create `messages.rs` (or add to existing one):
 
 ```rust
 pub enum YourActorCommand {
-    PacketReceived { src: SocketAddr, data: YourPacket },
+    InboundRaftRpc { src: SocketAddr, data: YourPacket },
     Timeout(YourTimeoutCallback),
     Query(YourQueryCommand),
 }
 ```
 
-Convention: `PacketReceived` for network input, `Timeout` for timer expiry, `Query` for read-only questions answered via oneshot.
+Convention: `InboundRaftRpc` for network input, `Timeout` for timer expiry, `Query` for read-only questions answered via oneshot.
 
 ### Event enum (what state machine produces)
 

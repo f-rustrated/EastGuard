@@ -5,7 +5,7 @@ use crate::control_plane::metadata::RangeMeta;
 use crate::control_plane::{
     NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
-    consensus::messages::ProposeError,
+    consensus::messages::ClientProposalError,
     membership::{ShardGroupId, actor::SwimSender},
     metadata::{
         RangeId,
@@ -174,7 +174,7 @@ impl ClientController {
         Ok(
             match self.raft_sender.propose(shard_group.id, cmd.into()).await {
                 Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
-                Err(ProposeError::NotLeader(_)) => {
+                Err(ClientProposalError::NotLeader(_)) => {
                     ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                         "not the leader for this shard group — retry on another node".into(),
                     ))
@@ -196,7 +196,7 @@ impl ClientController {
         let cmd = MetadataCommand::DeleteTopic(DeleteTopic { name });
         Ok(match self.raft_sender.propose(shard_group.id, cmd).await {
             Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-            Err(ProposeError::NotLeader(_)) => {
+            Err(ClientProposalError::NotLeader(_)) => {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                     "not the leader for this shard group — retry on another node".into(),
                 ))
@@ -511,7 +511,7 @@ mod tests {
             }
         });
         let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
+            if let MultiRaftActorCommand::ClientProposal { reply, .. } = cmd {
                 let _ = reply.send(Ok(()));
             }
         });
@@ -579,7 +579,7 @@ mod tests {
             }
         });
         let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::Propose { reply, .. } = cmd {
+            if let MultiRaftActorCommand::ClientProposal { reply, .. } = cmd {
                 let _ = reply.send(Ok(()));
             }
         });

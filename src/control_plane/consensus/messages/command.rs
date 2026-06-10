@@ -9,13 +9,13 @@ use crate::data_plane::messages::command::SealRequest;
 use crate::impl_from_variant;
 
 #[derive(Debug, PartialEq, Eq, Decode, Encode)]
-pub enum ProposeError {
+pub enum ClientProposalError {
     NotLeader(Option<NodeId>),
     ShardNotFound,
     ShardGroupRemoved,
 }
 
-pub struct PacketReceived {
+pub struct InboundRaftRpc {
     pub shard_group_id: ShardGroupId,
     pub from: NodeId,
     pub rpc: RaftRpc,
@@ -29,7 +29,7 @@ pub struct RemoveGroup {
     pub group_id: ShardGroupId,
 }
 
-pub struct RaftPropose {
+pub struct MetadataProposal {
     pub shard_group_id: ShardGroupId,
     pub command: MetadataCommand,
 }
@@ -38,9 +38,8 @@ pub struct HandleNodeJoin {
     pub new_node_id: NodeId,
 }
 
-#[allow(dead_code)]
-pub enum ConsensusCommand {
-    PacketReceived(PacketReceived),
+pub enum RaftProtocolMessage {
+    InboundRaftRpc(InboundRaftRpc),
     Timeout(RaftTimeoutCallback),
     EnsureGroup(EnsureGroup),
     RemoveGroup(RemoveGroup),
@@ -49,8 +48,8 @@ pub enum ConsensusCommand {
 }
 
 impl_from_variant!(
-    ConsensusCommand,
-    PacketReceived,
+    RaftProtocolMessage,
+    InboundRaftRpc(InboundRaftRpc),
     Timeout(RaftTimeoutCallback),
     EnsureGroup,
     RemoveGroup,

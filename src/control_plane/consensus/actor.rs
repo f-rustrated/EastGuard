@@ -156,11 +156,11 @@ impl MutlRaftSender {
         &self,
         shard_group_id: ShardGroupId,
         command: MetadataCommand,
-    ) -> Result<(), ProposeError> {
+    ) -> Result<(), ClientProposalError> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
-            .send(MultiRaftActorCommand::Propose {
-                propose: RaftPropose {
+            .send(MultiRaftActorCommand::ClientProposal {
+                propose: MetadataProposal {
                     shard_group_id,
                     command,
                 },
