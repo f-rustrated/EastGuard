@@ -1,8 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::command::RaftCommand;
@@ -20,6 +17,8 @@ use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 const ELECTION_JITTER_RANGE: u32 = 20;
 
@@ -109,6 +108,7 @@ pub(crate) struct TimerSeqs {
     pub election: u64,
     pub rpc: u64,
     pub merge_check: u64,
+    pub ring_check: u64,
 }
 
 impl Raft {
@@ -478,6 +478,9 @@ impl Raft {
             RaftTimeoutCallback::MergeCheckTimeout { now, .. } => {
                 self.evaluate_merges(now);
             }
+            RaftTimeoutCallback::RingCheckTimeout { .. } => {
+                self.reschedule_ring_check();
+            }
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -653,10 +656,11 @@ impl Raft {
             .into(),
         );
 
-        // Cancel election timer, start heartbeat + merge check timers.
+        // Cancel election timer, start heartbeat + merge/ring check timers.
         self.cancel_all_timers();
         self.schedule_rpc_timer();
         self.schedule_merge_check_timer();
+        self.schedule_ring_check_timer();
 
         // next_index is set *before* the noop is appended, so it points
         // at the noop's index — causing the first AppendEntries to carry it.
@@ -1182,6 +1186,26 @@ impl Raft {
             }));
     }
 
+    fn schedule_ring_check_timer(&mut self) {
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
+                seq: self.timer_seqs.ring_check,
+                timer: RaftTimer::ring_check(self.shard_group_id),
+            }));
+    }
+
+    /// Re-arm the periodic ring check (#135 trigger gap). The ring diff
+    /// itself runs in `MultiRaft::reconcile_ring` — it needs the topology
+    /// reader, which lives a layer up — so this Raft-side handler owns only
+    /// the timer lifecycle, leader-gated like `evaluate_merges`: a deposed
+    /// leader lets the timer die (it is re-armed on the next become_leader).
+    pub(crate) fn reschedule_ring_check(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        self.schedule_ring_check_timer();
+    }
+
     pub(crate) fn evaluate_merges(&mut self, now: u64) {
         if self.role != Role::Leader {
             return;
@@ -1195,9 +1219,10 @@ impl Raft {
         self.schedule_merge_check_timer();
     }
 
-    /// Cancels the leader-side timers (heartbeat, merge-check) without
-    /// touching the election timer — used by `step_down` so a follower or
-    /// candidate keeps its currently armed election deadline (#133).
+    /// Cancels the leader-side timers (heartbeat, merge-check, ring-check)
+    /// without touching the election timer — used by `step_down` so a
+    /// follower or candidate keeps its currently armed election deadline
+    /// (#133).
     fn cancel_leader_timers(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
@@ -1206,6 +1231,10 @@ impl Raft {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.merge_check,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.ring_check,
             }));
     }
 
@@ -1222,6 +1251,10 @@ impl Raft {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.merge_check,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.ring_check,
             }));
     }
 }
@@ -1381,6 +1414,7 @@ mod tests {
             election: 0,
             rpc: 1,
             merge_check: 2,
+            ring_check: 3,
         }
     }
 
@@ -2622,6 +2656,85 @@ mod tests {
         assert!(
             merge_check_set,
             "merge_check timer must be scheduled on become_leader"
+        );
+    }
+
+    #[test]
+    fn ring_check_timer_scheduled_on_leadership() {
+        let seqs = test_timer_seqs();
+        let ring_seq = seqs.ring_check;
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            seqs,
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+
+        let events = raft.take_events();
+        let ring_check_set = events.iter().any(|e| match e {
+            RaftEvent::Timer(TimerCommand::SetSchedule { seq, timer }) => {
+                *seq == ring_seq && timer.shard_group_id == TEST_SHARD
+            }
+            _ => false,
+        });
+        assert!(
+            ring_check_set,
+            "ring_check timer must be scheduled on become_leader"
+        );
+    }
+
+    #[test]
+    fn ring_check_rearm_is_leader_gated() {
+        let seqs = test_timer_seqs();
+        let ring_seq = seqs.ring_check;
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            seqs,
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+
+        // Leader: the fired check re-arms itself.
+        raft.handle_timeout(RaftTimeoutCallback::RingCheckTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let rearmed = raft.take_events().iter().any(|e| {
+            matches!(
+                e,
+                RaftEvent::Timer(TimerCommand::SetSchedule { seq, .. }) if *seq == ring_seq
+            )
+        });
+        assert!(rearmed, "leader must re-arm the ring check on fire");
+
+        // Deposed: the timer dies until the next become_leader.
+        let term = raft.current_term();
+        raft.step_down(term);
+        drain(&mut raft);
+        raft.handle_timeout(RaftTimeoutCallback::RingCheckTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let rearmed_after_depose = raft.take_events().iter().any(|e| {
+            matches!(
+                e,
+                RaftEvent::Timer(TimerCommand::SetSchedule { seq, .. }) if *seq == ring_seq
+            )
+        });
+        assert!(
+            !rearmed_after_depose,
+            "a non-leader must let the ring check die"
         );
     }
 

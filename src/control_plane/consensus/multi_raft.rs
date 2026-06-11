@@ -137,51 +137,73 @@ impl MultiRaft {
     /// 2. close the gap where the previous leader died before proposing the
     ///    removals (or their pairings) for peers SWIM no longer considers live.
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
+        let target_members = self
+            .topology
+            .resolve_nodes_in_group(&self.node_id, shard_group_id);
+
+        self.reconcile_shard(shard_group_id, target_members);
+    }
+
+    fn handle_ringcheck_timeout(&mut self, shard_group_id: ShardGroupId) {
+        let Some(raft) = self.groups.get(&shard_group_id) else {
+            return;
+        };
+
+        // Tick-path filter: only chase ring deltas. Asserting already-present
+        // members is the takeover path's genesis-divergence heal (#133/#134);
+        // repeating it every interval would spam the log with no-op AddPeers.
+        // hash_peer() saves recurring log spam, covered by takeover
+        let target_members = self
+            .topology
+            .group_ring_members(shard_group_id)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|m| !raft.has_peer(m))
+                    .cloned()
+                    .collect::<Box<[NodeId]>>()
+            });
+
+        self.reconcile_shard(shard_group_id, target_members);
+    }
+
+    fn reconcile_shard(
+        &mut self,
+        shard_group_id: ShardGroupId,
+        target_members: Option<Box<[NodeId]>>,
+    ) {
         let Some(raft) = self.groups.get_mut(&shard_group_id) else {
             return;
         };
         if !raft.is_leader() {
             return;
         }
-
         let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
+        let mut changed = false;
 
-        // Genesis peer sets are seeded from each replica's *local* ring
-        // snapshot at creation and can diverge on a partially-joined ring
-        // (#133: livelocks the group once that leader dies).
-        // Peer sets mutate only through the log, so on takeover assert the group's ring membership as AddPeer entries:
-        // `apply_add_peer` is idempotent and self-skipping, so healthy
-        // replicas no-op while divergent ones heal. Dead members are skipped
-        // replacement is `reconcile_peers`'s job, rejoin is `add_node`'s.
-
-        if let Some(members) = self
-            .topology
-            .resolve_nodes_in_group(&self.node_id, shard_group_id)
-        {
-            for member in members {
-                if member == self.node_id || !live_set.contains(&member) {
+        if let Some(members) = target_members {
+            for member in members.iter() {
+                if *member == self.node_id || !live_set.contains(member) {
                     continue;
                 }
 
-                if let Err(e) = raft.propose(RaftCommand::AddPeer(member.clone())) {
-                    tracing::warn!(
-                        "Takeover membership assert AddPeer({:?}) on {:?} rejected: {e:?}",
+                match raft.propose(RaftCommand::AddPeer(member.clone())) {
+                    Ok(_) => changed = true,
+                    Err(e) => tracing::warn!(
+                        "AddPeer({:?}) on {:?} rejected: {:?}",
                         member,
                         shard_group_id,
-                    )
-                } else {
-                    self.dirty.insert(shard_group_id);
+                        e
+                    ),
                 }
             }
         }
-
-        let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
-        let segment_reconciled = raft.reconcile_segments(&live_set);
+        changed |= raft.reconcile_peers(&self.topology, &live_set);
+        changed |= raft.reconcile_segments(&live_set);
         raft.log_ring_drift(&self.topology, &live_set);
-
-        if peer_reconciled || segment_reconciled {
+        if changed {
             self.dirty.insert(shard_group_id);
-        };
+        }
     }
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
@@ -283,6 +305,7 @@ impl MultiRaft {
             election: self.seq_counter.generate(),
             rpc: self.seq_counter.generate(),
             merge_check: self.seq_counter.generate(),
+            ring_check: self.seq_counter.generate(),
         };
 
         let raft = Raft::new(
@@ -348,8 +371,16 @@ impl MultiRaft {
             RaftTimeoutCallback::Ignored => return,
             RaftTimeoutCallback::ElectionTimeout { shard_group_id, .. }
             | RaftTimeoutCallback::RpcTimeout { shard_group_id }
-            | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. } => *shard_group_id,
+            | RaftTimeoutCallback::MergeCheckTimeout { shard_group_id, .. }
+            | RaftTimeoutCallback::RingCheckTimeout { shard_group_id } => *shard_group_id,
         };
+
+        // The ring diff needs `self.topology`, which the Raft state machine
+        // deliberately doesn't hold — run it here, then forward the callback
+        // so the leader-gated re-arm stays inside `Raft` like MergeCheck's.
+        if matches!(cb, RaftTimeoutCallback::RingCheckTimeout { .. }) {
+            self.handle_ringcheck_timeout(shard_id);
+        }
 
         if let Some(raft) = self.groups.get_mut(&shard_id) {
             raft.handle_timeout(cb);
@@ -1233,6 +1264,29 @@ mod tests {
         MultiRaft::new(node_id, 0, storage, reader)
     }
 
+    /// `new_store_with_topology`, but the publisher half is kept so the test
+    /// can simulate a rebalance by publishing a fresh snapshot — exactly what
+    /// `SwimActor` does on a membership change.
+    fn new_store_with_topology_publisher(
+        node_id: NodeId,
+        storage: Box<dyn RaftStorage>,
+        all_nodes: &[NodeId],
+    ) -> (
+        MultiRaft,
+        std::sync::Arc<arc_swap::ArcSwap<crate::control_plane::membership::Topology>>,
+    ) {
+        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        let topology = Topology::new(
+            all_nodes.iter().cloned(),
+            TopologyConfig {
+                vnodes_per_pnode: 64,
+                replication_factor: 3,
+            },
+        );
+        let (pub_handle, reader) = topology_channel(topology);
+        (MultiRaft::new(node_id, 0, storage, reader), pub_handle)
+    }
+
     /// Drive `TEST_GROUP_ID` to elect this node as leader by simulating
     /// vote-granted RequestVoteResponses from a majority of `peers`. Mirrors
     /// the pattern used in `raft/state.rs` tests: ElectionTimeout transitions
@@ -1260,6 +1314,36 @@ mod tests {
             );
         }
         store.dirty.insert(TEST_GROUP_ID);
+    }
+
+    /// `elect_leader_with_peers`, but for an arbitrary group id. Ring-derived
+    /// ids (rather than the synthetic `TEST_GROUP_ID`) are needed whenever a
+    /// test must line a Raft group up with a real topology snapshot.
+    fn elect_leader_for(store: &mut MultiRaft, gid: ShardGroupId, peers: &[NodeId]) {
+        use crate::control_plane::consensus::messages::{RaftRpc, RequestVoteResponse};
+
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: gid,
+                epoch: u64::MAX,
+            },
+        ));
+
+        let cluster_size = peers.len() + 1;
+        let needed = cluster_size / 2;
+        let raft = store.groups.get_mut(&gid).unwrap();
+        let term = raft.current_term();
+        for peer in peers.iter().take(needed) {
+            raft.handle_rpc(
+                peer.clone(),
+                RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                    term,
+                    node_id: peer.clone(),
+                    vote_granted: true,
+                }),
+            );
+        }
+        store.dirty.insert(gid);
     }
 
     /// All proposals committed so far on `TEST_GROUP_ID`, in log order.
@@ -1349,6 +1433,72 @@ mod tests {
             proposals,
             vec![RaftCommand::RemovePeer(node("n2"))],
             "exhausted pool must yield only the removal, no paired addition"
+        );
+    }
+
+    #[test]
+    fn ring_check_adds_new_ring_member_under_stable_leader() {
+        use crate::control_plane::membership::{Topology, TopologyConfig};
+
+        // The #135 trigger gap: reconciliation used to run only on takeover
+        // or SWIM join/death *as seen by this handler chain*. Here the leader
+        // stays healthy across a rebalance (n4 joins the ring), so no
+        // takeover ever re-runs the ring diff — the periodic RingCheck alone
+        // must converge the add direction.
+        let (storage, _) = temp_storage();
+        let n1 = node("n1");
+        let old_nodes = [node("n1"), node("n2"), node("n3")];
+        let config = TopologyConfig {
+            vnodes_per_pnode: 64,
+            replication_factor: 3,
+        };
+
+        // Deterministic group pick (murmur3 ring): a group n1 owns in the old
+        // ring whose new-ring assignment includes the joiner n4. With 192
+        // candidate groups and n4 owning a quarter of all vnode positions,
+        // such a group always exists.
+        let old_topology = Topology::new(old_nodes.iter().cloned(), config.clone());
+        let new_topology = Topology::new(
+            old_nodes.iter().cloned().chain([node("n4")]),
+            config.clone(),
+        );
+        let gid = old_topology
+            .shard_groups_for_node(&n1)
+            .into_iter()
+            .map(|g| g.id)
+            .find(|id| {
+                new_topology
+                    .group(*id)
+                    .is_some_and(|g| g.members.contains(&node("n4")))
+            })
+            .expect("some group of n1 must gain n4 after the join");
+
+        let (mut store, publisher) =
+            new_store_with_topology_publisher(n1.clone(), storage, &old_nodes);
+
+        // Old ring is 3 nodes at RF=3, so every group's membership is exactly
+        // {n1, n2, n3}.
+        store.add_group(shard(gid.0, old_nodes.to_vec()));
+        elect_leader_for(&mut store, gid, &[node("n2"), node("n3")]);
+        store.flush();
+
+        // The rebalance lands; the leader is healthy, so no takeover fires.
+        publisher.store(std::sync::Arc::new(new_topology));
+
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: gid,
+            },
+        ));
+        store.flush();
+
+        let log = store.storage.load_state(gid.0).log;
+        assert!(
+            log.iter()
+                .any(|e| e.command == RaftCommand::AddPeer(node("n4"))),
+            "stable-leader ring check must propose AddPeer for the newly \
+             assigned member (log: {:?})",
+            log.iter().map(|e| &e.command).collect::<Vec<_>>()
         );
     }
 }
