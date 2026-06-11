@@ -142,6 +142,7 @@ impl MultiRaft {
     ///    that are still alive but no longer own data (#135). The periodic
     ///    `handle_ringcheck_timeout` function manages the rest of the waiting period
     ///    before the actual eviction happens.
+    #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let target_members = self
             .topology
@@ -150,6 +151,7 @@ impl MultiRaft {
         self.reconcile_shard(shard_group_id, target_members);
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
     fn handle_ringcheck_timeout(&mut self, shard_group_id: ShardGroupId) {
         let Some(raft) = self.groups.get(&shard_group_id) else {
             return;
@@ -373,6 +375,7 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
+    #[tracing::instrument(level = "trace", skip_all, fields(group = cmd.shard_group_id.0, from = %cmd.from))]
     fn handle_rpc(&mut self, cmd: InboundRaftRpc) {
         if let Some(raft) = self.groups.get_mut(&cmd.shard_group_id) {
             raft.handle_rpc(cmd.from, cmd.rpc);
@@ -380,6 +383,7 @@ impl MultiRaft {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all, fields(cb = ?cb))]
     fn handle_timeout(&mut self, cb: RaftTimeoutCallback) {
         let shard_id = match &cb {
             RaftTimeoutCallback::Ignored => return,

@@ -1138,6 +1138,11 @@ impl Raft {
         self.assert_invariants();
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(
+        group = self.shard_group_id.0,
+        from = self.last_applied_index + 1,
+        to = self.commit_index.min(self.stabled_index),
+    ))]
     fn apply_committed_entries(&mut self) {
         while self.last_applied_index < self.commit_index.min(self.stabled_index) {
             self.last_applied_index += 1;
@@ -1238,6 +1243,7 @@ impl Raft {
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
     /// Returns the log index at which the command was appended on success.
+    #[tracing::instrument(level = "trace", skip_all, fields(group = self.shard_group_id.0, command = ?command))]
     pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposalError> {
         if self.role != Role::Leader {
             return Err(ProposalError::NotLeader(self.current_leader.clone()));
@@ -1269,6 +1275,11 @@ impl Raft {
     /// members in one entry without joint consensus, so committing them in
     /// order (each step a one-server change) is what keeps old-config and
     /// new-config majorities overlapping.
+    #[tracing::instrument(level = "debug", skip_all, fields(
+        group = self.shard_group_id.0,
+        remove = %remove,
+        replacement = ?replacement,
+    ))]
     pub(crate) fn propose_replace_peer(
         &mut self,
         remove: NodeId,

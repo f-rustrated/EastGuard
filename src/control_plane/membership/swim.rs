@@ -155,6 +155,7 @@ impl Swim {
     // -----------------------------------------------------------------------
     // Core protocol logic
     // -----------------------------------------------------------------------
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
             SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
@@ -372,6 +373,7 @@ impl Swim {
         self.members.get(node_id).map(|m| m.addr)
     }
 
+    #[tracing::instrument(level = "trace", skip_all, fields(src = %src))]
     pub fn step(&mut self, src: SocketAddr, packet: SwimPacket) {
         self.process_piggybacked_gossip(&packet);
 
