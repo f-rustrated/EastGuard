@@ -71,6 +71,11 @@ impl RaftRpcDispatcher {
         };
 
         if self.writers.contains_key(&peer_id) && peer_id > self.node_id {
+            tracing::debug!(
+                peer = %peer_id,
+                "simultaneous connect: dropping accepted connection, \
+                 our outbound dial wins the tie-break (lower NodeId)",
+            );
             return;
         }
 
@@ -168,6 +173,12 @@ impl RaftRpcDispatcher {
         // tie-break must not lose the buffered messages — deliver them
         // over the surviving (accepted) connection instead;
         if self.writers.contains_key(&target) && self.node_id > target {
+            tracing::debug!(
+                peer = %target,
+                buffered = buffered.len(),
+                "simultaneous connect: discarding our dial, peer's connection \
+                 wins the tie-break (lower NodeId); rerouting buffered messages",
+            );
             if !buffered.is_empty() {
                 let _ = self.write_messages_to(&target, &buffered).await;
             }

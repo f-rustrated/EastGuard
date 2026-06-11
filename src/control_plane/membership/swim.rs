@@ -134,6 +134,7 @@ impl Swim {
         }
     }
     pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
+        tracing::debug!(seed = %attempt.seed_addr, "join attempt: pinging seed");
         let seq = self.next_seq();
         let ping = SwimPacket::Ping(self.generate_swim_header(seq));
         self.pending_events
@@ -246,6 +247,11 @@ impl Swim {
     // indirect probe timeout when we receive a long-running Ack message
     // from the previous direct probe
     fn start_indirect_probe(&mut self, target_node_id: NodeId, seq: u64) {
+        tracing::debug!(
+            target = %target_node_id,
+            seq,
+            "direct probe unacked; escalating to indirect probe",
+        );
         let Some(cluster_addr) = self
             .members
             .get(&target_node_id)
@@ -329,9 +335,23 @@ impl Swim {
             if let Some(seq) = self.last_suspected_seqs.get(&target_node_id)
                 && registered_seq != *seq
             {
+                // The refute -> re-suspect race: an old suspect timer firing
+                // after the node was refuted and suspected again. Only the
+                // timer registered for the *current* suspicion may kill.
+                tracing::debug!(
+                    target = %target_node_id,
+                    registered_seq,
+                    current_seq = *seq,
+                    "stale suspect timer ignored",
+                );
                 return;
             }
 
+            tracing::info!(
+                "Node {} is DEAD(Inc: {})",
+                target_node_id,
+                member.incarnation
+            );
             self.last_suspected_seqs.remove(&target_node_id);
             self.update_member(
                 target_node_id,
@@ -624,6 +644,14 @@ impl Swim {
     }
 
     fn emit_state_change(&mut self, node_id: &NodeId, member: &SwimNode) {
+        // Uniform transition record: covers gossip-driven changes too, which
+        // otherwise reach Raft (NodeAlive/NodeDead) without any local trace.
+        tracing::debug!(
+            node = %node_id,
+            state = ?member.state,
+            incarnation = member.incarnation,
+            "membership state change",
+        );
         match member.state {
             SwimNodeState::Alive => {
                 self.cancel_suspect_timer(node_id);

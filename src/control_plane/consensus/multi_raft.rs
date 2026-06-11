@@ -637,6 +637,14 @@ impl MultiRaft {
             last_indices.insert(*id, raft.log_last_index());
             for log in raft.take_log_mutations() {
                 if let LogMutation::TruncateFrom(from_index) = &log {
+                    // Rare and destructive: a new leader is overwriting this
+                    // replica's conflicting log suffix. Worth a trace — both
+                    // the data loss and the dropped seal contexts.
+                    tracing::debug!(
+                        group = id.0,
+                        from = *from_index,
+                        "log truncation: dropping conflicting suffix and its pending seals",
+                    );
                     self.pending_seals.drop_from(*id, *from_index);
                 }
                 mutations.push((*id, log));
