@@ -123,6 +123,17 @@ impl TopologyReader {
         None
     }
 
+    /// Ring membership of `group_id` in the current snapshot, regardless of
+    /// whether the local node is among the members. `resolve_nodes_in_group`
+    /// resolves through a member node and therefore returns `None` when the
+    /// caller is itself no longer assigned to the group
+    pub(crate) fn group_ring_members(&self, group_id: ShardGroupId) -> Option<Box<[NodeId]>> {
+        self.0
+            .load()
+            .group(group_id)
+            .map(|g| g.members.clone().into_boxed_slice())
+    }
+
     pub(crate) fn ring_replacements_for(
         &self,
         group_id: ShardGroupId,
@@ -326,6 +337,13 @@ impl Topology {
             .get(node_id)
             .map(|ids| ids.iter().filter_map(|id| self.groups.get(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// Snapshot lookup of a shard group by id. Backs
+    /// `TopologyReader::group_ring_members`; see the reader method for why
+    /// this must not go through a member node.
+    pub(crate) fn group(&self, group_id: ShardGroupId) -> Option<&ShardGroup> {
+        self.groups.get(&group_id)
     }
 
     /// Returns the shard group responsible for `key`.

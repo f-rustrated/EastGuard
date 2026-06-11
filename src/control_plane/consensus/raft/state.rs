@@ -208,6 +208,50 @@ impl Raft {
         changed
     }
 
+    /// Live voters that the ring no longer assigns to this group.
+    /// Dead voters are deliberately excluded — they are `reconcile_peers`'
+    /// jurisdiction, mirroring the live-set guard on the add side.
+    pub(crate) fn stale_live_voters(
+        &self,
+        ring_members: &[NodeId],
+        live: &HashSet<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut stale: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|p| live.contains(*p) && !ring_members.contains(p))
+            .cloned()
+            .collect();
+        stale.sort();
+        stale
+    }
+
+    /// Leader-side drift telemetry - detection only, no proposals.
+    /// Warns when the voter set has ratcheted past the ring's assignment
+    /// for this group: live ex-owners present, or more voters than the ring
+    /// names. Catching the ratchet in the wild precedes curing it.
+    pub(crate) fn log_ring_drift(&self, topology_reader: &TopologyReader, live: &HashSet<NodeId>) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let Some(ring_members) = topology_reader.group_ring_members(self.shard_group_id) else {
+            return;
+        };
+        let stale_live = self.stale_live_voters(&ring_members, live);
+        let voter_count = self.peers.len() + 1; // +1 for self
+        if !stale_live.is_empty() || voter_count > ring_members.len() {
+            tracing::warn!(
+                node = %self.node_id,
+                group = self.shard_group_id.0,
+                voters = voter_count,
+                ring_members = ring_members.len(),
+                stale_live = ?stale_live,
+                "ring drift (#135): voter set exceeds the ring's assignment — \
+                 quorum is inflated until the stale members are removed",
+            );
+        }
+    }
+
     /// scan active segments in this group for any whose replica set still names a
     /// node SWIM considers dead, and propose a `RollSegment` to swap in
     /// healthy replacements. Closes the gap where deaths landed during the
@@ -2726,6 +2770,36 @@ mod tests {
             proposals,
             vec![RaftCommand::RemovePeer(node("node-2"))],
             "exhausted pool must yield only the removal, no paired addition"
+        );
+    }
+
+    #[test]
+    fn stale_live_voters_flags_live_ex_owners_only() {
+        // Voters are {node-1 (self), node-2, node-3}; the ring now assigns the
+        // group to {node-1, node-3, node-4}. node-2 is the #135 ratchet case
+        // only while it is alive — once dead it becomes `reconcile_peers`'
+        // jurisdiction and must not be reported here.
+        let raft = three_node_raft("node-1");
+        let ring = [node("node-1"), node("node-3"), node("node-4")];
+
+        let all_live = live_set(&["node-1", "node-2", "node-3", "node-4"]);
+        assert_eq!(
+            raft.stale_live_voters(&ring, &all_live),
+            vec![node("node-2")],
+            "a live voter outside the ring assignment is a stale live voter"
+        );
+
+        let node_2_dead = live_set(&["node-1", "node-3", "node-4"]);
+        assert!(
+            raft.stale_live_voters(&ring, &node_2_dead).is_empty(),
+            "dead ex-owners belong to reconcile_peers, not drift detection"
+        );
+
+        let ring_matches_voters = [node("node-1"), node("node-2"), node("node-3")];
+        assert!(
+            raft.stale_live_voters(&ring_matches_voters, &all_live)
+                .is_empty(),
+            "no drift when voters equal the ring assignment"
         );
     }
 

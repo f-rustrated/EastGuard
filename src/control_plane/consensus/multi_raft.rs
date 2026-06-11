@@ -177,6 +177,7 @@ impl MultiRaft {
 
         let peer_reconciled = raft.reconcile_peers(&self.topology, &live_set);
         let segment_reconciled = raft.reconcile_segments(&live_set);
+        raft.log_ring_drift(&self.topology, &live_set);
 
         if peer_reconciled || segment_reconciled {
             self.dirty.insert(shard_group_id);
@@ -413,6 +414,7 @@ impl MultiRaft {
             if raft.handle_node_death(&dead_node_id, &live_set, &self.topology) {
                 self.dirty.insert(*group_id);
             }
+            raft.log_ring_drift(&self.topology, &live_set);
         }
     }
 
@@ -486,6 +488,15 @@ impl MultiRaft {
         }
         self.add_peer_to_existing_groups(&node_id, &affected_groups);
         self.ensure_new_groups(affected_groups);
+
+        // A join is precisely the moment reassignment can mint a live
+        // ex-owner (#135): the joiner displaces a still-alive member from a
+        // group's ring assignment. Detection only — scan is O(groups × RF)
+        // and joins are rare.
+        let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
+        for raft in self.groups.values() {
+            raft.log_ring_drift(&self.topology, &live_set);
+        }
     }
 
     fn add_peer_to_existing_groups(&mut self, node_id: &NodeId, groups: &[ShardGroup]) {
