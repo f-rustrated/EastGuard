@@ -1,9 +1,10 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    ClientProposalError, CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation,
-    MetadataProposal, MultiRaftActorCommand, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
+    CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
+    MultiRaftActorCommand, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::command::RaftCommand;
+use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
@@ -27,8 +28,7 @@ pub(crate) struct MultiRaft {
     pending_events: Vec<RaftEvent>,
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
-    pending_proposes:
-        BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ClientProposalError>>>,
+    pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposalError>>>,
 
     pending_seals: PendingSealTracker,
 
@@ -131,11 +131,17 @@ impl MultiRaft {
         &self.node_id
     }
 
-    /// Invoked on `LeaderChange → self` for takeover reconciliation:
-    /// 1. assert the group's current ring membership into the log, healing
-    ///    replicas whose genesis peer set was seeded from a partial ring;
-    /// 2. close the gap where the previous leader died before proposing the
-    ///    removals (or their pairings) for peers SWIM no longer considers live.
+    /// This runs a reconciliation process to stabilize the group:
+    ///
+    /// 1. Sync Membership: Commits the current ring membership to the log. This fixes
+    ///    any replicas that were started with incomplete membership data.
+    /// 2. Clean Up Dead Peers: Removes peers that the SWIM protocol has marked as dead.
+    ///    This handles edge cases where the previous leader died before it could
+    ///    propose these removals.
+    /// 3. Track Live Ex-Owners: Records a ring observation to help safely evict peers
+    ///    that are still alive but no longer own data (#135). The periodic
+    ///    `handle_ringcheck_timeout` function manages the rest of the waiting period
+    ///    before the actual eviction happens.
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let target_members = self
             .topology
@@ -200,6 +206,14 @@ impl MultiRaft {
         }
         changed |= raft.reconcile_peers(&self.topology, &live_set);
         changed |= raft.reconcile_segments(&live_set);
+
+        // We record a ring observation every time this runs, whether it's a routine RingCheck or a leadership change.
+        // During a leadership change, actual evictions are paused until future RingChecks.
+        // This delay happens naturally because the system has to wait for a fresh stability window and for the new membership to be committed.
+        // Because of this, we get an "add-before-remove" behavior for free, without having to write special logic to trigger it.
+        changed |= raft
+            .reconcile_stale_live_peers(&self.topology, &live_set)
+            .is_ok();
         raft.log_ring_drift(&self.topology, &live_set);
         if changed {
             self.dirty.insert(shard_group_id);
@@ -275,14 +289,14 @@ impl MultiRaft {
         match cmd.into() {
             RaftProtocolMessage::InboundRaftRpc(cmd) => self.handle_rpc(cmd),
             RaftProtocolMessage::Timeout(cb) => self.handle_timeout(cb),
-            RaftProtocolMessage::EnsureGroup(cmd) => self.add_group(cmd.group),
+            RaftProtocolMessage::EnsureGroup(cmd) => self.add_group(&cmd.group),
             RaftProtocolMessage::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
             RaftProtocolMessage::HandleNodeDeath(cmd) => self.handle_node_death(cmd.dead_node_id),
             RaftProtocolMessage::HandleNodeJoin(cmd) => self.add_node(cmd.new_node_id),
         }
     }
 
-    fn add_group(&mut self, group: ShardGroup) {
+    fn add_group(&mut self, group: &ShardGroup) {
         if self.groups.contains_key(&group.id) {
             return;
         }
@@ -297,7 +311,7 @@ impl MultiRaft {
             .cloned()
             .collect();
 
-        let election_jitter_seed = self.create_election_jitter_seed(&group);
+        let election_jitter_seed = self.create_election_jitter_seed(group);
 
         let persistent = self.storage.load_state(group.id.0);
 
@@ -350,7 +364,7 @@ impl MultiRaft {
             .collect();
         for key in pending_keys {
             if let Some(sender) = self.pending_proposes.remove(&key) {
-                let _ = sender.send(Err(ClientProposalError::ShardGroupRemoved));
+                let _ = sender.send(Err(ProposalError::ShardGroupRemoved));
             }
         }
 
@@ -518,7 +532,6 @@ impl MultiRaft {
             return;
         }
         self.add_peer_to_existing_groups(&node_id, &affected_groups);
-        self.ensure_new_groups(affected_groups);
 
         // A join is precisely the moment reassignment can mint a live
         // ex-owner (#135): the joiner displaces a still-alive member from a
@@ -532,6 +545,7 @@ impl MultiRaft {
 
     fn add_peer_to_existing_groups(&mut self, node_id: &NodeId, groups: &[ShardGroup]) {
         for group in groups {
+            self.add_group(group);
             let Some(raft) = self.groups.get_mut(&group.id) else {
                 continue;
             };
@@ -551,18 +565,10 @@ impl MultiRaft {
         }
     }
 
-    fn ensure_new_groups(&mut self, groups: Box<[ShardGroup]>) {
-        for group in groups {
-            if !self.groups.contains_key(&group.id) && group.members.contains(&self.node_id) {
-                self.add_group(group);
-            }
-        }
-    }
-
     fn propose(
         &mut self,
         cmd: MetadataProposal,
-        reply: oneshot::Sender<Result<(), ClientProposalError>>,
+        reply: oneshot::Sender<Result<(), ProposalError>>,
     ) {
         let gid = cmd.shard_group_id;
         match self.propose_internal(cmd) {
@@ -575,14 +581,14 @@ impl MultiRaft {
         }
     }
 
-    fn propose_internal(&mut self, cmd: MetadataProposal) -> Result<u64, ClientProposalError> {
+    fn propose_internal(&mut self, cmd: MetadataProposal) -> Result<u64, ProposalError> {
         match self.groups.get_mut(&cmd.shard_group_id) {
             Some(raft) => {
                 let result = raft.propose(cmd.command.into());
                 self.dirty.insert(cmd.shard_group_id);
                 result
             }
-            None => Err(ClientProposalError::ShardNotFound),
+            None => Err(ProposalError::ShardNotFound),
         }
     }
 
@@ -706,7 +712,7 @@ impl MultiRaft {
                     };
 
                     if let Some(sender) = self.pending_proposes.remove(&key) {
-                        let _ = sender.send(Err(ClientProposalError::NotLeader(None)));
+                        let _ = sender.send(Err(ProposalError::NotLeader(None)));
                     }
                 }
             }
@@ -808,8 +814,8 @@ mod tests {
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
 
-        store.add_group(shard(1, vec![me.clone(), node("n2")]));
-        store.add_group(shard(2, vec![me.clone(), node("n2")]));
+        store.add_group(&shard(1, vec![me.clone(), node("n2")]));
+        store.add_group(&shard(2, vec![me.clone(), node("n2")]));
 
         let events = store.flush();
         let seqs = timer_seqs(&events);
@@ -823,7 +829,7 @@ mod tests {
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
 
-        store.add_group(shard(42, vec![me.clone(), node("n2")]));
+        store.add_group(&shard(42, vec![me.clone(), node("n2")]));
 
         assert!(store.groups.contains_key(&ShardGroupId(42)));
     }
@@ -834,7 +840,7 @@ mod tests {
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
 
-        store.add_group(shard(42, vec![me.clone()]));
+        store.add_group(&shard(42, vec![me.clone()]));
         store.handle_consensus(RaftProtocolMessage::Timeout(
             RaftTimeoutCallback::ElectionTimeout {
                 shard_group_id: ShardGroupId(42),
@@ -854,7 +860,7 @@ mod tests {
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
 
-        store.add_group(shard(42, vec![node("n2"), node("n3")]));
+        store.add_group(&shard(42, vec![node("n2"), node("n3")]));
 
         assert!(!store.groups.contains_key(&ShardGroupId(42)));
     }
@@ -867,8 +873,8 @@ mod tests {
         {
             let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
-            store.add_group(shard(1, vec![me.clone()]));
-            store.add_group(shard(2, vec![me.clone()]));
+            store.add_group(&shard(1, vec![me.clone()]));
+            store.add_group(&shard(2, vec![me.clone()]));
             store.handle_consensus(RaftProtocolMessage::Timeout(
                 RaftTimeoutCallback::ElectionTimeout {
                     shard_group_id: ShardGroupId(1),
@@ -930,7 +936,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
         store.flush(); // persist election HardState
@@ -948,7 +954,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
         store.flush();
@@ -962,7 +968,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         assert_eq!(store.stabled_for(TEST_GROUP_ID), 0);
 
@@ -985,7 +991,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
         store.flush(); // consume dirty from add_group
 
         // No state changes — flush should be a no-op and return no events.
@@ -999,7 +1005,7 @@ mod tests {
         let me = node("n1");
         let n2 = node("n2");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone(), n2.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone(), n2.clone()]));
         store.flush(); // consume add_group dirty
 
         // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
@@ -1073,7 +1079,7 @@ mod tests {
         {
             let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
-            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
             store.flush();
             propose_noop(&mut store);
@@ -1083,7 +1089,7 @@ mod tests {
 
         let db = MetadataStorage::open(path);
         let mut store = new_store(me.clone(), Box::new(db));
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
         assert_eq!(
@@ -1105,14 +1111,14 @@ mod tests {
         {
             let db = MetadataStorage::open(path.clone());
             let mut store = new_store(me.clone(), Box::new(db));
-            store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+            store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
             elect_leader(&mut store);
             store.flush();
         }
 
         let db = MetadataStorage::open(path);
         let mut store = new_store(me.clone(), Box::new(db));
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
         assert_eq!(raft.current_term(), 1);
         assert_eq!(raft.voted_for(), Some(node("n1")));
@@ -1126,7 +1132,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
         store.flush();
@@ -1161,8 +1167,8 @@ mod tests {
         let mut store = new_store(me.clone(), storage);
 
         // Single-node groups so election succeeds immediately
-        store.add_group(shard(1, vec![me.clone()]));
-        store.add_group(shard(2, vec![me.clone()]));
+        store.add_group(&shard(1, vec![me.clone()]));
+        store.add_group(&shard(2, vec![me.clone()]));
         store.flush();
 
         // Elect leader in group 1 only
@@ -1197,7 +1203,7 @@ mod tests {
         let (storage, _) = temp_storage();
         let me = node("n1");
         let mut store = new_store(me.clone(), storage);
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone()]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
 
         elect_leader(&mut store);
         store.flush();
@@ -1373,7 +1379,7 @@ mod tests {
         let all_nodes = vec![me.clone(), node("n2"), node("n3"), node("n4"), node("n5")];
         let mut store = new_store_with_topology(me.clone(), storage, &all_nodes);
 
-        store.add_group(shard(TEST_GROUP_ID.0, group_members.clone()));
+        store.add_group(&shard(TEST_GROUP_ID.0, group_members.clone()));
         elect_leader_with_peers(&mut store, &peers);
         store.flush();
 
@@ -1421,7 +1427,7 @@ mod tests {
         let all_nodes = vec![me.clone(), node("n2")];
         let mut store = new_store_with_topology(me.clone(), storage, &all_nodes);
 
-        store.add_group(shard(TEST_GROUP_ID.0, vec![me.clone(), node("n2")]));
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone(), node("n2")]));
         elect_leader_with_peers(&mut store, &peers);
         store.flush();
 
@@ -1478,7 +1484,7 @@ mod tests {
 
         // Old ring is 3 nodes at RF=3, so every group's membership is exactly
         // {n1, n2, n3}.
-        store.add_group(shard(gid.0, old_nodes.to_vec()));
+        store.add_group(&shard(gid.0, old_nodes.to_vec()));
         elect_leader_for(&mut store, gid, &[node("n2"), node("n3")]);
         store.flush();
 
@@ -1499,6 +1505,82 @@ mod tests {
             "stable-leader ring check must propose AddPeer for the newly \
              assigned member (log: {:?})",
             log.iter().map(|e| &e.command).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ring_check_evicts_live_ex_owner_after_stability_window() {
+        use crate::control_plane::consensus::messages::{AppendEntriesResponse, RaftRpc};
+        use crate::control_plane::consensus::raft::state::RING_STABLE_OBSERVATIONS;
+
+        // Ring has [n1, n2, n3, n9]; pick a group the ring assigns to
+        // {n1, n2, n3} — n9 is alive (on the ring) but NOT an owner of this
+        // group. Seed the Raft group with n9 as a voter anyway: the #135
+        // ratchet, as left behind by an earlier reassignment.
+        let (storage, _) = temp_storage();
+        let n1 = node("n1");
+        let all_nodes = [node("n1"), node("n2"), node("n3"), node("n9")];
+        let mut store = new_store_with_topology(n1.clone(), storage, &all_nodes);
+
+        let gid = store
+            .topology
+            .shard_groups_for_node(&n1)
+            .iter()
+            .find(|g| !g.members.contains(&node("n9")))
+            .map(|g| g.id)
+            .expect("some group of n1 must exclude n9");
+
+        store.add_group(&shard(gid.0, all_nodes.to_vec()));
+        elect_leader_for(&mut store, gid, &[node("n2"), node("n3"), node("n9")]);
+        store.flush();
+
+        // Ring members confirm replication up to the leader's last entry so
+        // the caught-up gate holds; the stale n9 never acks.
+        {
+            let raft = store.groups.get_mut(&gid).unwrap();
+            let term = raft.current_term();
+            let last = raft.log_last_index();
+            for peer in [node("n2"), node("n3")] {
+                raft.handle_rpc(
+                    peer.clone(),
+                    RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
+                        term,
+                        node_id: peer,
+                        success: true,
+                        last_log_index: last,
+                    }),
+                );
+            }
+            store.dirty.insert(gid);
+        }
+        store.flush();
+
+        // Tick past the stability window, plus extra passes that must park
+        // behind the in-flight removal: exactly one eviction, ever.
+        for _ in 0..RING_STABLE_OBSERVATIONS + 2 {
+            store.handle_consensus(RaftProtocolMessage::Timeout(
+                RaftTimeoutCallback::RingCheckTimeout {
+                    shard_group_id: gid,
+                },
+            ));
+            store.flush();
+        }
+
+        let log = store.storage.load_state(gid.0).log;
+        let removals = log
+            .iter()
+            .filter(|e| e.command == RaftCommand::RemovePeer(node("n9")))
+            .count();
+        assert_eq!(
+            removals,
+            1,
+            "exactly one gated eviction of the live ex-owner (log: {:?})",
+            log.iter().map(|e| &e.command).collect::<Vec<_>>()
+        );
+        assert!(
+            !log.iter()
+                .any(|e| e.command == RaftCommand::AddPeer(node("n9"))),
+            "the eviction must not be paired with an AddPeer"
         );
     }
 }

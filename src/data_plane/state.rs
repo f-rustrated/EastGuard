@@ -505,7 +505,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     pub(crate) fn enqueue_seal_for_aged_segments(&mut self, max_age: std::time::Duration) {
-        let aged: Vec<SegmentKey> = self
+        let aged: Box<[SegmentKey]> = self
             .segments
             .iter()
             .filter(|(_, t)| t.role() == SegmentRole::Leader && t.age_limit_reached(max_age))
