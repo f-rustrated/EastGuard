@@ -326,15 +326,15 @@ impl Raft {
         };
         let ring: BTreeSet<NodeId> = ring_members.iter().cloned().collect();
 
-        // Gate 2: Check leader validity BEFORE doing any work/allocations
-        if !ring.contains(&self.node_id) {
-            return Err(EvictionError::LeaderNotInRing);
-        }
-
-        // Gate 3: consecutive identical observations.
+        // Gate 2: consecutive identical observations.
         let observations = self.record_ring_observation(&ring);
         if observations < RING_STABLE_OBSERVATIONS {
             return Err(EvictionError::WaitingForStability);
+        }
+
+        // Gate 3: Check leader validity BEFORE doing any work/allocations
+        if !ring.contains(&self.node_id) {
+            return Err(EvictionError::LeaderNotInRing);
         }
 
         let victim = self
@@ -360,7 +360,7 @@ impl Raft {
                 continue;
             }
             if !live.contains(member) || !self.peers.contains(member) {
-                return Err(EvictionError::ConfigChangeInFlight);
+                return Err(EvictionError::RingMemberNotReady);
             }
 
             // It checks if a specific node has a complete, up-to-date copy of all permanently saved data.
@@ -377,7 +377,12 @@ impl Raft {
 
         match self.propose(RaftCommand::RemovePeer(victim.clone())) {
             Ok(_) => {
-                tracing::info!("evicting live ex-owner after ring stability window",);
+                tracing::info!(
+                    node = %self.node_id,
+                    group = self.shard_group_id.0,
+                    victim = %victim,
+                    "evicting live ex-owner after ring stability window",
+                );
                 Ok(())
             }
             Err(e) => {

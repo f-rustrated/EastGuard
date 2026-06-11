@@ -20,6 +20,10 @@ pub(crate) enum EvictionError {
     WaitingForStability,
     NoStalePeers,
     ConfigChangeInFlight,
+    /// A ring member is dead or not yet a voter — the post-removal quorum
+    /// cannot be certified. Distinct from `FollowersLagging` (member present
+    /// but behind) and from `ConfigChangeInFlight` (log-ordering gate).
+    RingMemberNotReady,
     FollowersLagging,
     ProposalRejected, // Only allocate a string if it actually errors
 }
