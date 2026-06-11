@@ -4,6 +4,10 @@ use crate::schedulers::timer::TTimer;
 const ELECTION_TIMEOUT_BASE_TICKS: u32 = 50; // 5s base (+ jitter)
 const RAFT_RPC_INTERVAL_TICKS: u32 = 10; // 1s
 const MERGE_CHECK_INTERVAL_TICKS: u32 = 6_000; // 10 minutes
+/// 30s — frequent enough that a rebalance under a stable leader converges
+/// within a minute, slow enough that the O(RF) ring diff per group is noise.
+/// Also paces the consecutive-observation ring-stability gate for stale-peer removal
+const RING_CHECK_INTERVAL_TICKS: u32 = 300;
 
 #[derive(Debug, Clone)]
 pub struct RaftTimer {
@@ -18,6 +22,7 @@ pub enum RaftTimerKind {
     Election,
     Rpc,
     MergeCheck,
+    RingCheck,
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +39,9 @@ pub enum RaftTimeoutCallback {
     MergeCheckTimeout {
         shard_group_id: ShardGroupId,
         now: u64,
+    },
+    RingCheckTimeout {
+        shard_group_id: ShardGroupId,
     },
 }
 
@@ -57,6 +65,9 @@ impl TTimer for RaftTimer {
             RaftTimerKind::MergeCheck => RaftTimeoutCallback::MergeCheckTimeout {
                 shard_group_id: self.shard_group_id,
                 now,
+            },
+            RaftTimerKind::RingCheck => RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: self.shard_group_id,
             },
         }
     }
@@ -91,6 +102,15 @@ impl RaftTimer {
             shard_group_id,
             kind: RaftTimerKind::MergeCheck,
             ticks_remaining: MERGE_CHECK_INTERVAL_TICKS,
+            epoch: 0,
+        }
+    }
+
+    pub fn ring_check(shard_group_id: ShardGroupId) -> Self {
+        Self {
+            shard_group_id,
+            kind: RaftTimerKind::RingCheck,
+            ticks_remaining: RING_CHECK_INTERVAL_TICKS,
             epoch: 0,
         }
     }

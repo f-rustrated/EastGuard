@@ -1,11 +1,9 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::command::RaftCommand;
+use crate::control_plane::consensus::raft::errors::{EvictionError, ProposalError};
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
@@ -20,8 +18,20 @@ use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 const ELECTION_JITTER_RANGE: u32 = 20;
+
+/// #135: The number of consecutive, identical ring observations needed
+/// before we can safely evict a live ex-owner.
+///
+/// Observations happen during routine RingChecks (~every 30s) and during
+/// leadership changes. Requiring 3 observations guarantees about a minute
+/// of ring stability. This buffer ensures we don't accidentally evict a
+/// legitimate owner just because our local snapshot was briefly incorrect
+/// during a rebalance.
+pub(crate) const RING_STABLE_OBSERVATIONS: u32 = 3;
 
 struct ElectionJitter {
     seed: u64,
@@ -103,12 +113,22 @@ pub struct Raft {
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
     pending_proposals: Vec<MetadataCommand>,
+
+    /// Tracks the ring membership seen during the last check, along with a count
+    /// of how many times we've seen this exact membership in a row (#135).
+    ///
+    /// This state is "leader-volatile," meaning it gets wiped clean whenever a
+    /// new leader takes over. This guarantees that a new leader must observe a
+    /// stable ring over time to "re-earn confidence" before it is allowed to
+    /// evict anyone.
+    ring_observation_streak: Option<(BTreeSet<NodeId>, u32)>,
 }
 
 pub(crate) struct TimerSeqs {
     pub election: u64,
     pub rpc: u64,
     pub merge_check: u64,
+    pub ring_check: u64,
 }
 
 impl Raft {
@@ -141,6 +161,7 @@ impl Raft {
             timer_seqs,
             election_epoch: 0,
             confirmed_assignment: HashMap::new(),
+            ring_observation_streak: None,
         };
         raft.reset_election_timer();
         raft
@@ -206,6 +227,174 @@ impl Raft {
         }
 
         changed
+    }
+
+    /// Live voters that the ring no longer assigns to this group.
+    /// Dead voters are deliberately excluded — they are `reconcile_peers`'
+    /// jurisdiction, mirroring the live-set guard on the add side.
+    pub(crate) fn stale_live_voters(
+        &self,
+        ring_members: &[NodeId],
+        live: &HashSet<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut stale: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|p| live.contains(*p) && !ring_members.contains(p))
+            .cloned()
+            .collect();
+        stale.sort();
+        stale
+    }
+
+    /// Leader-side drift telemetry - detection only, no proposals.
+    /// Warns when the voter set has ratcheted past the ring's assignment
+    /// for this group: live ex-owners present, or more voters than the ring
+    /// names. Catching the ratchet in the wild precedes curing it.
+    pub(crate) fn log_ring_drift(&self, topology_reader: &TopologyReader, live: &HashSet<NodeId>) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let Some(ring_members) = topology_reader.group_ring_members(self.shard_group_id) else {
+            return;
+        };
+        let stale_live = self.stale_live_voters(&ring_members, live);
+        let voter_count = self.peers.len() + 1; // +1 for self
+        if !stale_live.is_empty() || voter_count > ring_members.len() {
+            tracing::warn!(
+                node = %self.node_id,
+                group = self.shard_group_id.0,
+                voters = voter_count,
+                ring_members = ring_members.len(),
+                stale_live = ?stale_live,
+                "ring drift (#135): voter set exceeds the ring's assignment — \
+                 quorum is inflated until the stale members are removed",
+            );
+        }
+    }
+
+    /// Returns `true` if there is a pending membership change (`AddPeer` or
+    /// `RemovePeer`) that has been appended to the log but not yet committed.
+    ///
+    /// We only allow one configuration change in flight at a time per group.
+    /// Because of this rule, stale-peer removals must wait in line. This
+    /// naturally enforces our "add-before-remove" ordering: if an `AddPeer`
+    /// is proposed during a check, any `RemovePeer` proposed later in that
+    /// same check is delayed until the add successfully commits.
+    fn has_uncommitted_membership_change(&self) -> bool {
+        (self.commit_index + 1..=self.log_last_index()).any(|i| {
+            matches!(
+                self.log_get(i).map(|e| &e.command),
+                Some(RaftCommand::AddPeer(_) | RaftCommand::RemovePeer(_))
+            )
+        })
+    }
+
+    /// Safely evicts up to one *live* ex-owner per pass (Issue #135).
+    ///
+    /// This function only targets nodes that are alive, currently
+    /// acting as voters, but no longer belong to the ring. Dead peers are
+    /// handled separately by `reconcile_peers`. These two functions can run
+    /// in any order without conflict.
+    ///
+    /// To prevent accidental data loss or instability, all of the following
+    /// safety gates must pass before an eviction occurs:
+    /// 1. The current node is the leader, and the group still exists in the ring.
+    /// 2. The ring membership has been stable for `RING_STABLE_OBSERVATIONS` checks.
+    /// 3. The leader is still a member of the ring (if the leader is the ex-owner, it should transfer leadership, not evict itself).
+    /// 4. There are no uncommitted configuration changes in flight.
+    /// 5. All current ring members are alive, are voters, and have caught up on the log. This ensures we don't drop below our replication factor or strand committed data.
+    /// 6. We only remove one peer per pass, picking the lowest `NodeId` for consistency.
+    ///
+    /// Note on `AddPeer`: Unlike replacing a dead node, this removal is not
+    /// paired with an `AddPeer`. Because gate #5 ensures all current members
+    /// are active voters, this eviction just safely shrinks the group back
+    /// to its standard replication factor.
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) fn reconcile_stale_live_peers(
+        &mut self,
+        topology_reader: &TopologyReader,
+        live: &HashSet<NodeId>,
+    ) -> Result<(), EvictionError> {
+        if self.role != Role::Leader {
+            return Err(EvictionError::NotLeader);
+        }
+
+        let Some(ring_members) = topology_reader.group_ring_members(self.shard_group_id) else {
+            self.ring_observation_streak = None;
+            return Err(EvictionError::GroupNotFound);
+        };
+        let ring: BTreeSet<NodeId> = ring_members.iter().cloned().collect();
+
+        // Gate 2: Check leader validity BEFORE doing any work/allocations
+        if !ring.contains(&self.node_id) {
+            return Err(EvictionError::LeaderNotInRing);
+        }
+
+        // Gate 3: consecutive identical observations.
+        let observations = self.record_ring_observation(&ring);
+        if observations < RING_STABLE_OBSERVATIONS {
+            return Err(EvictionError::WaitingForStability);
+        }
+
+        let victim = self
+            .peers
+            .iter()
+            .filter(|p| live.contains(*p) && !ring.contains(*p))
+            .min()
+            .cloned();
+
+        let Some(victim) = victim else {
+            return Err(EvictionError::NoStalePeers);
+        };
+
+        // Gate 4: Raft only allows one membership change at a time.
+        if self.has_uncommitted_membership_change() {
+            return Err(EvictionError::ConfigChangeInFlight);
+        }
+
+        // Gate 5. Before the leader removes an ex-owner, it must verify that every legitimate member currently in the ring is online,
+        // fully integrated, and has a complete copy of all committed data.
+        for member in &ring {
+            if *member == self.node_id {
+                continue;
+            }
+            if !live.contains(member) || !self.peers.contains(member) {
+                return Err(EvictionError::ConfigChangeInFlight);
+            }
+
+            // It checks if a specific node has a complete, up-to-date copy of all permanently saved data.
+            let in_sync = self
+                .peer_states
+                .get(member)
+                .is_some_and(|ps| ps.match_index >= self.commit_index);
+            if !in_sync {
+                return Err(EvictionError::FollowersLagging);
+            }
+        }
+
+        // Gate 6. Propose the removal of the single victim.
+
+        match self.propose(RaftCommand::RemovePeer(victim.clone())) {
+            Ok(_) => {
+                tracing::info!("evicting live ex-owner after ring stability window",);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(?victim, error = ?e, "Stale-peer RemovePeer rejected");
+                Err(EvictionError::ProposalRejected)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn record_ring_observation(&mut self, ring: &BTreeSet<NodeId>) -> u32 {
+        let observations = match self.ring_observation_streak.take() {
+            Some((prev, n)) if prev == *ring => n.saturating_add(1),
+            _ => 1,
+        };
+        self.ring_observation_streak = Some((ring.clone(), observations));
+        observations
     }
 
     /// scan active segments in this group for any whose replica set still names a
@@ -434,6 +623,9 @@ impl Raft {
             RaftTimeoutCallback::MergeCheckTimeout { now, .. } => {
                 self.evaluate_merges(now);
             }
+            RaftTimeoutCallback::RingCheckTimeout { .. } => {
+                self.reschedule_ring_check();
+            }
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -609,10 +801,11 @@ impl Raft {
             .into(),
         );
 
-        // Cancel election timer, start heartbeat + merge check timers.
+        // Cancel election timer, start heartbeat + merge/ring check timers.
         self.cancel_all_timers();
         self.schedule_rpc_timer();
         self.schedule_merge_check_timer();
+        self.schedule_ring_check_timer();
 
         // next_index is set *before* the noop is appended, so it points
         // at the noop's index — causing the first AppendEntries to carry it.
@@ -620,6 +813,8 @@ impl Raft {
 
         // Peer state tracker needs to be re-initialized on every leadership transition
         self.peer_states.clear();
+        // #135: ring confidence is leader-volatile — re-earn it.
+        self.ring_observation_streak = None;
         for peer_id in self.peers.iter() {
             self.peer_states.insert(
                 peer_id.clone(),
@@ -671,6 +866,8 @@ impl Raft {
         }
 
         self.cancel_leader_timers();
+        // #135: a deposed leader's ring observations die with its term.
+        self.ring_observation_streak = None;
         if was_leader {
             // The election timer resets only on a vote grant or
             // on AppendEntries from the current leader — never on a mere
@@ -1036,9 +1233,9 @@ impl Raft {
     // -> Majority ack -> committed
     // -> Applied to MetadataStateMachine → topic blue exists
     /// Returns the log index at which the command was appended on success.
-    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ClientProposalError> {
+    pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposalError> {
         if self.role != Role::Leader {
-            return Err(ClientProposalError::NotLeader(self.current_leader.clone()));
+            return Err(ProposalError::NotLeader(self.current_leader.clone()));
         }
 
         self.add_new_entry(command);
@@ -1138,6 +1335,26 @@ impl Raft {
             }));
     }
 
+    fn schedule_ring_check_timer(&mut self) {
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
+                seq: self.timer_seqs.ring_check,
+                timer: RaftTimer::ring_check(self.shard_group_id),
+            }));
+    }
+
+    /// Re-arm the periodic ring check (#135 trigger gap). The ring diff
+    /// itself runs in `MultiRaft::reconcile_ring` — it needs the topology
+    /// reader, which lives a layer up — so this Raft-side handler owns only
+    /// the timer lifecycle, leader-gated like `evaluate_merges`: a deposed
+    /// leader lets the timer die (it is re-armed on the next become_leader).
+    pub(crate) fn reschedule_ring_check(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        self.schedule_ring_check_timer();
+    }
+
     pub(crate) fn evaluate_merges(&mut self, now: u64) {
         if self.role != Role::Leader {
             return;
@@ -1151,9 +1368,10 @@ impl Raft {
         self.schedule_merge_check_timer();
     }
 
-    /// Cancels the leader-side timers (heartbeat, merge-check) without
-    /// touching the election timer — used by `step_down` so a follower or
-    /// candidate keeps its currently armed election deadline (#133).
+    /// Cancels the leader-side timers (heartbeat, merge-check, ring-check)
+    /// without touching the election timer — used by `step_down` so a
+    /// follower or candidate keeps its currently armed election deadline
+    /// (#133).
     fn cancel_leader_timers(&mut self) {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
@@ -1162,6 +1380,10 @@ impl Raft {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.merge_check,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.ring_check,
             }));
     }
 
@@ -1178,6 +1400,10 @@ impl Raft {
         self.events
             .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
                 seq: self.timer_seqs.merge_check,
+            }));
+        self.events
+            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
+                seq: self.timer_seqs.ring_check,
             }));
     }
 }
@@ -1276,7 +1502,7 @@ mod tests {
     use super::*;
 
     impl Raft {
-        pub(crate) fn propose_noop(&mut self) -> Result<u64, ClientProposalError> {
+        pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposalError> {
             self.propose(RaftCommand::Noop)
         }
 
@@ -1337,6 +1563,7 @@ mod tests {
             election: 0,
             rpc: 1,
             merge_check: 2,
+            ring_check: 3,
         }
     }
 
@@ -1741,7 +1968,7 @@ mod tests {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
             raft.propose_noop(),
-            Err::<u64, _>(ClientProposalError::NotLeader(None))
+            Err::<u64, _>(ProposalError::NotLeader(None))
         );
     }
 
@@ -1764,7 +1991,7 @@ mod tests {
 
         assert_eq!(
             raft.propose_noop(),
-            Err::<u64, _>(ClientProposalError::NotLeader(Some(node("node-1"))))
+            Err::<u64, _>(ProposalError::NotLeader(Some(node("node-1"))))
         );
     }
 
@@ -2581,6 +2808,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ring_check_timer_scheduled_on_leadership() {
+        let seqs = test_timer_seqs();
+        let ring_seq = seqs.ring_check;
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            seqs,
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+
+        let events = raft.take_events();
+        let ring_check_set = events.iter().any(|e| match e {
+            RaftEvent::Timer(TimerCommand::SetSchedule { seq, timer }) => {
+                *seq == ring_seq && timer.shard_group_id == TEST_SHARD
+            }
+            _ => false,
+        });
+        assert!(
+            ring_check_set,
+            "ring_check timer must be scheduled on become_leader"
+        );
+    }
+
+    #[test]
+    fn ring_check_rearm_is_leader_gated() {
+        let seqs = test_timer_seqs();
+        let ring_seq = seqs.ring_check;
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            seqs,
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+
+        // Leader: the fired check re-arms itself.
+        raft.handle_timeout(RaftTimeoutCallback::RingCheckTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let rearmed = raft.take_events().iter().any(|e| {
+            matches!(
+                e,
+                RaftEvent::Timer(TimerCommand::SetSchedule { seq, .. }) if *seq == ring_seq
+            )
+        });
+        assert!(rearmed, "leader must re-arm the ring check on fire");
+
+        // Deposed: the timer dies until the next become_leader.
+        let term = raft.current_term();
+        raft.step_down(term);
+        drain(&mut raft);
+        raft.handle_timeout(RaftTimeoutCallback::RingCheckTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let rearmed_after_depose = raft.take_events().iter().any(|e| {
+            matches!(
+                e,
+                RaftEvent::Timer(TimerCommand::SetSchedule { seq, .. }) if *seq == ring_seq
+            )
+        });
+        assert!(
+            !rearmed_after_depose,
+            "a non-leader must let the ring check die"
+        );
+    }
+
     // -------------------------------------------------------------------
     // Reconciliation: peer pairing + segment catch-up
     //
@@ -2726,6 +3032,292 @@ mod tests {
             proposals,
             vec![RaftCommand::RemovePeer(node("node-2"))],
             "exhausted pool must yield only the removal, no paired addition"
+        );
+    }
+
+    #[test]
+    fn stale_live_voters_flags_live_ex_owners_only() {
+        // Voters are {node-1 (self), node-2, node-3}; the ring now assigns the
+        // group to {node-1, node-3, node-4}. node-2 is the #135 ratchet case
+        // only while it is alive — once dead it becomes `reconcile_peers`'
+        // jurisdiction and must not be reported here.
+        let raft = three_node_raft("node-1");
+        let ring = [node("node-1"), node("node-3"), node("node-4")];
+
+        let all_live = live_set(&["node-1", "node-2", "node-3", "node-4"]);
+        assert_eq!(
+            raft.stale_live_voters(&ring, &all_live),
+            vec![node("node-2")],
+            "a live voter outside the ring assignment is a stale live voter"
+        );
+
+        let node_2_dead = live_set(&["node-1", "node-3", "node-4"]);
+        assert!(
+            raft.stale_live_voters(&ring, &node_2_dead).is_empty(),
+            "dead ex-owners belong to reconcile_peers, not drift detection"
+        );
+
+        let ring_matches_voters = [node("node-1"), node("node-2"), node("node-3")];
+        assert!(
+            raft.stale_live_voters(&ring_matches_voters, &all_live)
+                .is_empty(),
+            "no drift when voters equal the ring assignment"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #135 stale-live-peer eviction: gate-by-gate coverage.
+    //
+    // The 3-node ring at RF=3 assigns every group all three nodes, so any
+    // real group id taken from the reader has members {node-1..3} — which
+    // lets these tests line a Raft's shard_group_id up with an actual ring
+    // group (the synthetic TEST_SHARD never resolves on the ring).
+    // -------------------------------------------------------------------
+
+    /// Leader over a real ring group plus the named extra "stale" voters.
+    /// Ring peers have granted the election; nothing is acked yet, so
+    /// commit_index is 0 until the test drives `ack_to_last`.
+    fn ring_raft_with_stale(stale_names: &[&str]) -> (Raft, TopologyReader, Vec<NodeId>) {
+        let reader = topology_reader_with(&["node-1", "node-2", "node-3"]);
+        let group = reader
+            .shard_groups_for_node(&node("node-1"))
+            .first()
+            .expect("node-1 must own at least one group")
+            .clone();
+
+        let mut peers: HashSet<NodeId> = group
+            .members
+            .iter()
+            .filter(|m| **m != node("node-1"))
+            .cloned()
+            .collect();
+        for stale in stale_names {
+            peers.insert(node(stale));
+        }
+
+        let mut raft = Raft::new(
+            node("node-1"),
+            peers,
+            RaftPersistentState::default(),
+            0,
+            group.id,
+            test_timer_seqs(),
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: group.id,
+            epoch: u64::MAX,
+        });
+        let term = raft.current_term();
+        for peer in group.members.iter().filter(|m| **m != node("node-1")) {
+            raft.handle_rpc(
+                peer.clone(),
+                RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                    term,
+                    node_id: peer.clone(),
+                    vote_granted: true,
+                }),
+            );
+        }
+        drain(&mut raft);
+        assert_eq!(raft.role, Role::Leader, "must be leader after election");
+
+        let members = group.members.clone();
+        (raft, reader, members)
+    }
+
+    /// Simulate `peer` confirming replication up to the leader's last index.
+    fn ack_to_last(raft: &mut Raft, peer: &NodeId) {
+        let term = raft.current_term();
+        let last = raft.log_last_index();
+        raft.handle_rpc(
+            peer.clone(),
+            RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
+                term,
+                node_id: peer.clone(),
+                success: true,
+                last_log_index: last,
+            }),
+        );
+        drain(raft);
+    }
+
+    fn ring_peers(members: &[NodeId]) -> Vec<NodeId> {
+        members
+            .iter()
+            .filter(|m| **m != node("node-1"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn stale_live_peer_evicted_after_ring_stability_window() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9"]);
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        let live = live_set(&["node-1", "node-2", "node-3", "node-9"]);
+
+        // The window itself parks the eviction…
+        for _ in 0..RING_STABLE_OBSERVATIONS - 1 {
+            assert!(
+                raft.reconcile_stale_live_peers(&topology, &live).is_err(),
+                "no eviction before the stability window completes"
+            );
+        }
+        // …and the pass that completes it evicts exactly the stale member.
+        assert!(raft.reconcile_stale_live_peers(&topology, &live).is_ok());
+
+        assert_eq!(
+            proposals_after_become_leader(&raft),
+            vec![RaftCommand::RemovePeer(node("node-9"))],
+            "pure shrink back to RF: a removal with no paired addition"
+        );
+    }
+
+    #[test]
+    fn eviction_parks_behind_in_flight_config_change_then_proceeds() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9"]);
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        let live = live_set(&["node-1", "node-2", "node-3", "node-9"]);
+
+        for _ in 0..RING_STABLE_OBSERVATIONS - 1 {
+            assert!(raft.reconcile_stale_live_peers(&topology, &live).is_err());
+        }
+
+        // A membership entry is in flight: the window is complete, but the
+        // one-config-change-at-a-time gate must park the eviction.
+        raft.propose(RaftCommand::AddPeer(node("node-7"))).unwrap();
+        assert!(
+            raft.reconcile_stale_live_peers(&topology, &live).is_err(),
+            "uncommitted AddPeer must park the eviction"
+        );
+
+        // Once the add commits (ring peers ack, entry applies), the next
+        // pass may evict — add-before-remove falls out of the gate.
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        assert!(raft.reconcile_stale_live_peers(&topology, &live).is_ok());
+
+        assert_eq!(
+            proposals_after_become_leader(&raft),
+            vec![
+                RaftCommand::AddPeer(node("node-7")),
+                RaftCommand::RemovePeer(node("node-9")),
+            ],
+        );
+    }
+
+    #[test]
+    fn one_eviction_per_pass_smallest_node_first() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9", "node-8"]);
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        let live = live_set(&["node-1", "node-2", "node-3", "node-8", "node-9"]);
+
+        for _ in 0..RING_STABLE_OBSERVATIONS - 1 {
+            assert!(raft.reconcile_stale_live_peers(&topology, &live).is_err());
+        }
+        assert!(raft.reconcile_stale_live_peers(&topology, &live).is_ok());
+
+        // The second stale member must wait: the first removal is in flight.
+        assert!(
+            raft.reconcile_stale_live_peers(&topology, &live).is_err(),
+            "second eviction must park behind the uncommitted first"
+        );
+
+        assert_eq!(
+            proposals_after_become_leader(&raft),
+            vec![RaftCommand::RemovePeer(node("node-8"))],
+            "one eviction per pass, smallest NodeId first"
+        );
+    }
+
+    #[test]
+    fn eviction_parks_while_a_ring_member_lags() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9"]);
+        let peers = ring_peers(&members);
+        let (acked, lagging) = (&peers[0], &peers[1]);
+
+        // Commit advances via the stale member's ack, leaving one ring
+        // member behind the committed prefix.
+        ack_to_last(&mut raft, acked);
+        ack_to_last(&mut raft, &node("node-9"));
+        raft.simulate_flush_and_apply();
+        let live = live_set(&["node-1", "node-2", "node-3", "node-9"]);
+
+        for _ in 0..RING_STABLE_OBSERVATIONS + 2 {
+            assert!(
+                raft.reconcile_stale_live_peers(&topology, &live).is_err(),
+                "a lagging ring member must park the eviction"
+            );
+        }
+
+        // The laggard catches up; the very next pass may evict.
+        ack_to_last(&mut raft, lagging);
+        assert!(raft.reconcile_stale_live_peers(&topology, &live).is_ok());
+        assert_eq!(
+            proposals_after_become_leader(&raft),
+            vec![RaftCommand::RemovePeer(node("node-9"))],
+        );
+    }
+
+    #[test]
+    fn ring_instability_restarts_the_observation_window() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9"]);
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        let live = live_set(&["node-1", "node-2", "node-3", "node-9"]);
+
+        for _ in 0..RING_STABLE_OBSERVATIONS - 1 {
+            assert!(raft.reconcile_stale_live_peers(&topology, &live).is_err());
+        }
+
+        // A divergent snapshot lands mid-window (rebalance in progress):
+        // whatever this group looks like on the shrunken ring — different
+        // membership or vanished outright — confidence must restart.
+        let shrunken = topology_reader_with(&["node-1", "node-2"]);
+        assert!(raft.reconcile_stale_live_peers(&shrunken, &live).is_err());
+
+        // Back on the stable ring, the full window is owed again.
+        for _ in 0..RING_STABLE_OBSERVATIONS - 1 {
+            assert!(
+                raft.reconcile_stale_live_peers(&topology, &live).is_err(),
+                "instability must restart the window, not resume it"
+            );
+        }
+        assert!(raft.reconcile_stale_live_peers(&topology, &live).is_ok());
+        assert_eq!(
+            proposals_after_become_leader(&raft),
+            vec![RaftCommand::RemovePeer(node("node-9"))],
+        );
+    }
+
+    #[test]
+    fn dead_stale_member_is_left_to_reconcile_peers() {
+        let (mut raft, topology, members) = ring_raft_with_stale(&["node-9"]);
+        for peer in ring_peers(&members) {
+            ack_to_last(&mut raft, &peer);
+        }
+        raft.simulate_flush_and_apply();
+        // node-9 is an ex-owner AND dead: not this path's jurisdiction.
+        let live = live_set(&["node-1", "node-2", "node-3"]);
+
+        for _ in 0..RING_STABLE_OBSERVATIONS + 2 {
+            assert!(raft.reconcile_stale_live_peers(&topology, &live).is_err());
+        }
+        assert!(
+            proposals_after_become_leader(&raft).is_empty(),
+            "dead voters belong to reconcile_peers' replace pairing"
         );
     }
 

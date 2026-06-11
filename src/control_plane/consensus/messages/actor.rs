@@ -1,13 +1,14 @@
 use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::{NodeDead, ShardGroupId};
 use crate::control_plane::metadata::{TopicMeta, TopicStats};
 use crate::data_plane::messages::command::SegmentAssignmentAck;
 
 use super::command::{
-    ClientProposalError, CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, InboundRaftRpc,
-    MetadataProposal, RaftProtocolMessage, RemoveGroup,
+    CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, InboundRaftRpc, MetadataProposal,
+    RaftProtocolMessage, RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
@@ -28,7 +29,7 @@ pub enum MultiRaftActorCommand {
     /// Propose a command to a shard group's Raft log. Leader-only.
     ClientProposal {
         propose: MetadataProposal,
-        reply: oneshot::Sender<Result<(), ClientProposalError>>,
+        reply: oneshot::Sender<Result<(), ProposalError>>,
     },
     /// Query all topic names from all shard groups on this node.
     GetTopics {
@@ -80,8 +81,8 @@ pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     GetPeers(oneshot::Sender<Box<[NodeId]>>, Box<[NodeId]>),
     Propose(
-        oneshot::Sender<Result<(), ClientProposalError>>,
-        Result<(), ClientProposalError>,
+        oneshot::Sender<Result<(), ProposalError>>,
+        Result<(), ProposalError>,
     ),
     GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
     GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),

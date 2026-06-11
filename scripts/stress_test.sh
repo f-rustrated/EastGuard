@@ -31,10 +31,12 @@ TEST="${1:-produce_then_fetch_hot}"
 N="${2:-100}"
 PER_RUN_TIMEOUT="${3:-120}"   # seconds; a healthy run is well under this
 
+OUTDIR="$(mktemp -d "$PWD/eg-stress-XXXXXX")"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
-OUTDIR="$(mktemp -d "${TMPDIR:-/tmp}/eg-stress-XXXXXX")"
+
 SUMMARY="$OUTDIR/summary.txt"
 : > "$SUMMARY"
 

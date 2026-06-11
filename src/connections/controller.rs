@@ -1,11 +1,11 @@
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
+use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::RangeMeta;
 use crate::control_plane::{
     NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
-    consensus::messages::ClientProposalError,
     membership::{ShardGroupId, actor::SwimSender},
     metadata::{
         RangeId,
@@ -178,7 +178,7 @@ impl ClientController {
                 .await
             {
                 Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated),
-                Err(ClientProposalError::NotLeader(_)) => {
+                Err(ProposalError::NotLeader(_)) => {
                     ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                         "not the leader for this shard group — retry on another node".into(),
                     ))
@@ -205,7 +205,7 @@ impl ClientController {
                 .await
             {
                 Ok(()) => ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted),
-                Err(ClientProposalError::NotLeader(_)) => {
+                Err(ProposalError::NotLeader(_)) => {
                     ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(
                         "not the leader for this shard group — retry on another node".into(),
                     ))
