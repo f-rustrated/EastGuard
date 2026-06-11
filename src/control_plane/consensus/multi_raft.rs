@@ -457,6 +457,7 @@ impl MultiRaft {
     // The live set is loaded fresh from the topology snapshot — drift between
     // event emission and processing is absorbed naturally, and there's one
     // canonical source of "current cluster shape" (the topology reader).
+    #[tracing::instrument(level = "debug", skip_all, fields(dead = %dead_node_id))]
     fn handle_node_death(&mut self, dead_node_id: NodeId) {
         let live_set: HashSet<NodeId> = self.topology.live_nodes().into_iter().collect();
         for (group_id, raft) in self.groups.iter_mut() {
@@ -530,6 +531,7 @@ impl MultiRaft {
     /// this node already leads and create new groups it newly joins. Loading
     /// fresh means the join sees the latest cluster shape — including any
     /// topology drift between the SWIM event and this handler running.
+    #[tracing::instrument(level = "debug", skip_all, fields(node = %node_id))]
     fn add_node(&mut self, node_id: NodeId) {
         let affected_groups = self.topology.shard_groups_for_node(&node_id);
         if affected_groups.is_empty() {

@@ -87,14 +87,25 @@ impl MultiRaftActor {
         // ! The MAX_FLUSH_ROUNDS = 8 bound is purely defensive
         // ! there's no scenario in the current code that should produce a feedback chain longer than 2 or 3.
         const MAX_FLUSH_ROUNDS: u32 = 8;
+        let mut paused = false;
         for _ in 0..MAX_FLUSH_ROUNDS {
             let events = self.store.flush();
             if events.is_empty() {
+                paused = true;
                 break;
             }
             for event in events {
                 self.route_event(event).await;
             }
+        }
+        if !paused {
+            // Steady state is <= 2 rounds; needing all 8 means a
+            // reconciliation feedback chain the bound is silently masking.
+            tracing::warn!(
+                rounds = MAX_FLUSH_ROUNDS,
+                "flush did not quiesce within the defensive round bound — \
+                 possible event/proposal feedback loop",
+            );
         }
         for packets in std::mem::take(&mut self.packets_by_target) {
             self.transport_cmds
@@ -123,6 +134,12 @@ impl MultiRaftActor {
             }
             RaftEvent::Timer(cmd) => self.timer_cmds.push(cmd.into()),
             RaftEvent::LeaderChange(lc) => {
+                tracing::debug!(
+                    group = lc.shard_group_id.0,
+                    leader = %lc.leader_node_id,
+                    term = lc.term,
+                    "observed leader change",
+                );
                 // On becoming leader, run both halves of takeover reconciliation:
                 // - replace any peer that SWIM no longer considers alive
                 // - roll any active segment whose replica set still names a non-live node
