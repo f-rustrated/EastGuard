@@ -15,6 +15,9 @@ pub(crate) mod checkpoint;
 #[allow(dead_code)]
 pub(crate) mod cold_read;
 pub(crate) mod messages;
+
+#[allow(dead_code)]
+pub(crate) mod recovery;
 pub(crate) mod sparse_index;
 pub(crate) mod state;
 pub(crate) mod states;

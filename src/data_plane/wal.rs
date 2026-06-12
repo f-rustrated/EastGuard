@@ -120,6 +120,15 @@ impl WalRecord {
     }
 }
 
+/// Parses `wal-{seq:06}.log` into its sequence number. Shared by the live
+/// writer's directory scan and crash recovery's discovery (`recovery::wal_scan`).
+pub(crate) fn parse_wal_filename(name: &str) -> Option<u64> {
+    name.strip_prefix("wal-")?
+        .strip_suffix(".log")?
+        .parse::<u64>()
+        .ok()
+}
+
 pub trait WalStorage {
     fn buf(&mut self) -> &mut Vec<u8>;
     fn next_lsn(&self) -> u64;
@@ -199,11 +208,7 @@ impl WalWriter {
             let entry = entry?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(seq_str) = name_str
-                .strip_prefix("wal-")
-                .and_then(|s| s.strip_suffix(".log"))
-                && let Ok(seq) = seq_str.parse::<u64>()
-            {
+            if let Some(seq) = parse_wal_filename(&name_str) {
                 entries.push((seq, entry.path()));
             }
         }
