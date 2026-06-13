@@ -32,7 +32,7 @@ pub(crate) const INDEX_INTERVAL_ENTRIES: u64 = 64;
 /// predicate — stateless in absolute position, so the rebuilt index is
 /// byte-identical to the live one.
 pub(crate) fn is_index_anchor(byte_start: u64, entry_id: u64) -> bool {
-    byte_start == 0 || entry_id % INDEX_INTERVAL_ENTRIES == 0
+    byte_start == 0 || entry_id.is_multiple_of(INDEX_INTERVAL_ENTRIES)
 }
 
 pub trait SparseIndex: Send + Sync + 'static {
