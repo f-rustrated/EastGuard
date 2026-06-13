@@ -96,7 +96,8 @@ impl ColdReadPool {
         req: &ColdReadRequest,
         sparse_index: &dyn SparseIndex,
     ) -> Result<ColdReadRecords, ColdReadError> {
-        let byte_position = sparse_index.seek_index(req.segment_key, req.start_entry_offset);
+        let (anchor_id, byte_position) =
+            sparse_index.seek_index(req.segment_key, req.start_entry_offset);
 
         let file = File::open(&req.segment_file_path).map_err(ColdReadError::FileOpen)?;
         let file_len = file.metadata()?.len();
@@ -104,13 +105,15 @@ impl ColdReadPool {
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(byte_position))?;
 
-        // checkpoint.rs indexes one anchor per entry id, so `seek_index` lands
-        // exactly on `start_offset`'s record. Entries are written in id order,
-        // one `Data` record per entry followed by a `BatchEnd` separator. We
-        // walk forward counting ids, collecting entries in
-        // `[start_offset, end_entry_id]`, capped by `max_bytes`.
+        // The index is sparse, so `seek_index` returns the nearest anchor at or
+        // below `start_offset` — its entry id and byte position. Segment records
+        // are bare (no embedded id), so we count ids positionally: start
+        // `current_offset` at the anchor id, then walk forward one `Data` record
+        // per entry (each followed by a `BatchEnd` separator), skipping ids below
+        // `start_offset` and collecting `[start_offset, end_entry_id]` capped by
+        // `max_bytes`.
         let mut entries: Vec<Arc<CachedEntry>> = Vec::new();
-        let mut current_offset = req.start_entry_offset;
+        let mut current_offset = anchor_id;
         let mut next_offset = req.start_entry_offset;
         let mut bytes_read = 0u64;
 
@@ -216,15 +219,15 @@ mod tests {
         fn put_batch(&self, _entries: Vec<SparseEntry>) -> std::io::Result<()> {
             Ok(())
         }
-        fn seek_index(&self, _segment_key: SegmentKey, target_offset: u64) -> u64 {
-            // Largest indexed offset <= target (seek_for_prev semantics). The
-            // checkpoint indexes every entry, so this lands exactly on target.
+        fn seek_index(&self, _segment_key: SegmentKey, target_offset: u64) -> (u64, u64) {
+            // Nearest anchor at or below target (seek_for_prev semantics),
+            // returned as (anchor_id, byte_position).
             self.positions
                 .iter()
                 .filter(|(o, _)| **o <= target_offset)
                 .max_by_key(|(o, _)| **o)
-                .map(|(_, p)| *p)
-                .unwrap_or(0)
+                .map(|(o, p)| (*o, *p))
+                .unwrap_or((target_offset, 0))
         }
     }
 
@@ -266,6 +269,31 @@ mod tests {
             progress_signal: RangeProgressSignal::Active,
             reply,
         }
+    }
+
+    #[test]
+    fn forward_scans_from_a_sparse_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let positions = write_segment(
+            &path,
+            &[(b"e0", 1), (b"e1", 1), (b"e2", 1), (b"e3", 1), (b"e4", 1)],
+        );
+        // Sparse index: only ids 0 and 3 are anchored.
+        let positions: HashMap<u64, u64> = positions
+            .into_iter()
+            .filter(|(o, _)| *o == 0 || *o == 3)
+            .collect();
+        let idx = FakeIndex { positions };
+
+        // Reading id 4 lands on the id-3 anchor and scans forward past id 3.
+        let req = request(path, 4, 4, 1 << 20);
+        let out = ColdReadPool::process_request(&req, &idx).unwrap();
+
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].entry_id, 4);
+        assert_eq!(out.entries[0].data.to_vec(), b"e4".to_vec());
+        assert_eq!(out.next_offset, 5);
     }
 
     #[test]

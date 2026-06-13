@@ -17,9 +17,35 @@ impl SparseEntry {
     }
 }
 
+/// One index anchor every `INDEX_INTERVAL_ENTRIES` entries. A cold read seeks to
+/// the nearest anchor at or below its target and scans forward at most this many
+/// entries, trading index size against per-read scan cost.
+pub(crate) const INDEX_INTERVAL_ENTRIES: u64 = 64;
+
+/// Whether the batch at byte offset `byte_start` carrying positional `entry_id`
+/// gets an index anchor. The segment's first batch (`byte_start == 0`) is always
+/// anchored so every in-range read resolves to an anchor at or below its target;
+/// otherwise one anchor every [`INDEX_INTERVAL_ENTRIES`] entry ids.
+///
+/// The live checkpoint writer (`checkpoint.rs`) and the recovery rebuild
+/// (`recovery/index_rebuild.rs`) both gate their anchor writes on this single
+/// predicate — stateless in absolute position, so the rebuilt index is
+/// byte-identical to the live one.
+pub(crate) fn is_index_anchor(byte_start: u64, entry_id: u64) -> bool {
+    byte_start == 0 || entry_id % INDEX_INTERVAL_ENTRIES == 0
+}
+
 pub trait SparseIndex: Send + Sync + 'static {
     fn put_batch(&self, entries: Vec<SparseEntry>) -> io::Result<()>;
-    fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> u64;
+
+    /// Resolves `target_offset` to the nearest index anchor at or below it,
+    /// returning `(anchor_entry_id, byte_position)`. The index is sparse, so the
+    /// anchor is usually *below* the target: the caller seeks to `byte_position`
+    /// and scans forward, counting entry ids up from `anchor_entry_id`. When no
+    /// anchor exists at or below the target (only on an unindexed segment — each
+    /// segment's first entry is always anchored), falls back to
+    /// `(target_offset, 0)`.
+    fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> (u64, u64);
 }
 
 impl SparseIndex for rocksdb::DB {
@@ -31,7 +57,7 @@ impl SparseIndex for rocksdb::DB {
         self.write(batch).map_err(io::Error::other)
     }
 
-    fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> u64 {
+    fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> (u64, u64) {
         let seek_key = encode_key(segment_key, target_offset);
 
         let mut iter = self.raw_iterator();
@@ -39,14 +65,16 @@ impl SparseIndex for rocksdb::DB {
 
         if iter.valid()
             && let Some(key) = iter.key()
-            && key.len() >= 24
+            && key.len() == 32
             && key[..24] == seek_key[..24]
             && let Some(value) = iter.value()
             && value.len() == 8
         {
-            return u64::from_be_bytes(value.try_into().unwrap());
+            let anchor_id = u64::from_be_bytes(key[24..32].try_into().unwrap());
+            let byte_position = u64::from_be_bytes(value.try_into().unwrap());
+            return (anchor_id, byte_position);
         }
-        0
+        (target_offset, 0)
     }
 }
 
