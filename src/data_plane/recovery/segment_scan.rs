@@ -17,6 +17,9 @@ use crate::data_plane::wal::{WalRecord, WalRecordType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // staged: first consumed by the cursor map and replay
 pub(crate) struct SegmentScan {
+    /// The segment's first entry id, parsed from its filename. The replay
+    /// appender uses it to build the file path and as the contiguity base.
+    pub(crate) start_offset: u64,
     /// Highest entry id covered by a complete batch, or `None` when no
     /// complete batch survived (empty, missing, or torn-from-the-start file).
     pub(crate) last_entry_id: Option<u64>,
@@ -97,11 +100,52 @@ impl RecoveredSegments {
         }
     }
 
-    /// Byte offset the appender truncates `key`'s file to before its first write
-    ///; an absent segment has nothing verified, so 0.
-    #[allow(dead_code)]
     pub(crate) fn valid_len(&self, key: &SegmentKey) -> u64 {
         self.0.get(key).map_or(0, |scan| scan.valid_len)
+    }
+
+    pub(crate) fn start_offset(&self, key: &SegmentKey) -> Option<u64> {
+        self.0.get(key).map(|scan| scan.start_offset)
+    }
+
+    /// Records that `entry_id` was just appended to `key`'s segment file,
+    /// advancing its cursor.
+    ///
+    /// Enforces the contiguous-prefix invariant: appends are gapless, so `entry_id` must be exactly one past the cursor
+    /// or the segment's `start_offset` for the first append.
+    ///
+    /// A segment absent from the map is inserted, taking `entry_id` as its base.
+    #[allow(dead_code)]
+    pub(crate) fn advance(&mut self, key: SegmentKey, entry_id: u64) {
+        let scan = self.0.entry(key).or_insert(SegmentScan {
+            start_offset: entry_id,
+            last_entry_id: None,
+            valid_len: 0,
+        });
+        let expected = scan
+            .last_entry_id
+            .map_or(scan.start_offset, |last| last + 1);
+        debug_assert_eq!(
+            entry_id, expected,
+            "non-contiguous replay append to {key:?}: expected {expected}, got {entry_id}"
+        );
+        scan.last_entry_id = Some(entry_id);
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_invariants(&self) {
+        for (key, scan) in &self.0 {
+            if let Some(last) = scan.last_entry_id {
+                debug_assert!(
+                    last >= scan.start_offset,
+                    "{key:?}: cursor {last} precedes start_offset {}",
+                    scan.start_offset
+                );
+            }
+        }
     }
 }
 
@@ -136,6 +180,7 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(SegmentScan {
+                start_offset,
                 last_entry_id: None,
                 valid_len: 0,
             });
@@ -178,6 +223,7 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
     // base plus the verified count, less one. No complete batch -> no id.
     let last_entry_id = verified.checked_sub(1).map(|n| start_offset + n);
     Ok(SegmentScan {
+        start_offset,
         last_entry_id,
         valid_len,
     })
@@ -251,6 +297,7 @@ mod tests {
         let (_dir, path) = write_named(3, 100, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
+        assert_eq!(scan.start_offset, 100);
         assert_eq!(scan.last_entry_id, Some(102)); // 100, 101, 102
         assert_eq!(scan.valid_len, len);
     }
@@ -405,8 +452,9 @@ mod tests {
         RoutingHeader::new(seg_key(), entry_id, 1)
     }
 
-    fn scanned(last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
+    fn scanned(start_offset: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
         SegmentScan {
+            start_offset,
             last_entry_id,
             valid_len,
         }
@@ -418,7 +466,7 @@ mod tests {
 
     #[test]
     fn decide_appends_beyond_cursor_skips_within() {
-        let r = recovered_with(&[(seg_key(), scanned(Some(5), 0))]);
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(5), 0))]);
         assert_eq!(r.decide(&routing(6)), Decision::Append);
         assert_eq!(r.decide(&routing(5)), Decision::Skip);
         assert_eq!(r.decide(&routing(3)), Decision::Skip);
@@ -432,22 +480,48 @@ mod tests {
             Decision::Append
         );
         // Present but no verified prefix (last_entry_id None) — same as absent.
-        let r = recovered_with(&[(seg_key(), scanned(None, 0))]);
+        let r = recovered_with(&[(seg_key(), scanned(0, None, 0))]);
         assert_eq!(r.decide(&routing(0)), Decision::Append);
     }
 
     #[test]
     fn decide_cursor_zero_is_distinct_from_absent() {
-        let r = recovered_with(&[(seg_key(), scanned(Some(0), 0))]);
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(0), 0))]);
         assert_eq!(r.decide(&routing(0)), Decision::Skip);
         assert_eq!(r.decide(&routing(1)), Decision::Append);
     }
 
     #[test]
     fn valid_len_is_the_scans_or_zero_when_absent() {
-        let r = recovered_with(&[(seg_key(), scanned(Some(2), 128))]);
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(2), 128))]);
         assert_eq!(r.valid_len(&seg_key()), 128);
         let absent = SegmentKey::new(TopicId(9), RangeId(0), SegmentId(0));
         assert_eq!(r.valid_len(&absent), 0);
+    }
+
+    #[test]
+    fn advance_walks_contiguously() {
+        let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
+        r.advance(seg_key(), 5);
+        r.advance(seg_key(), 6);
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(6));
+    }
+
+    #[test]
+    fn advance_inserts_an_absent_segment_at_its_base() {
+        let mut r = RecoveredSegments::default();
+        r.advance(seg_key(), 7); // first record of a never-checkpointed segment
+        let scan = r.0[&seg_key()];
+        assert_eq!(scan.start_offset, 7);
+        assert_eq!(scan.last_entry_id, Some(7));
+        r.advance(seg_key(), 8);
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(8));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-contiguous")]
+    fn advance_rejects_a_gap() {
+        let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
+        r.advance(seg_key(), 6); // skips 5
     }
 }
