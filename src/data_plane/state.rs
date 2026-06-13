@@ -167,9 +167,11 @@ impl<W: WalStorage> DataPlane<W> {
 
         match read_stat {
             SegmentReadState::Active(key) => self.handle_hot_fetch(cmd, key),
-            SegmentReadState::Sealed { key, end_entry_id } => {
-                self.dispatch_cold_fetch(cmd, key, end_entry_id)
-            }
+            SegmentReadState::Sealed {
+                key,
+                start_entry_id,
+                end_entry_id,
+            } => self.dispatch_cold_fetch(cmd, key, start_entry_id, end_entry_id),
         }
     }
 
@@ -226,10 +228,16 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// Hand a sealed-segment read off to the cold-read pool. The pool owns the
     /// reply channel from here on, so this returns immediately without blocking.
-    fn dispatch_cold_fetch(&self, cmd: Fetch, key: SegmentKey, end_entry_id: u64) {
+    fn dispatch_cold_fetch(
+        &self,
+        cmd: Fetch,
+        key: SegmentKey,
+        start_entry_id: u64,
+        end_entry_id: u64,
+    ) {
         let req = ColdReadRequest {
             segment_key: key,
-            segment_file_path: key.file_path(&self.config.data_dir),
+            segment_file_path: key.file_path(&self.config.data_dir, start_entry_id),
             start_entry_offset: cmd.entry_id,
             end_entry_id,
             max_bytes: cmd.max_bytes as u64,
@@ -346,7 +354,8 @@ impl<W: WalStorage> DataPlane<W> {
     fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
         if !self.segments.contains_key(&cmd.segment_key) {
             let tracker = SegmentTracker::new_with_start_entry_id(
-                cmd.segment_key.file_path(&self.config.data_dir),
+                cmd.segment_key
+                    .file_path(&self.config.data_dir, cmd.start_entry_id),
                 SegmentRole::Leader,
                 cmd.replica_set,
                 cmd.shard_group_id,
@@ -384,7 +393,8 @@ impl<W: WalStorage> DataPlane<W> {
             self.segments.insert_active(
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
-                    cmd.segment_key.file_path(&self.config.data_dir),
+                    cmd.segment_key
+                        .file_path(&self.config.data_dir, cmd.entry_id),
                     SegmentRole::Follower,
                     cmd.replica_set,
                     ShardGroupId(0),
@@ -431,7 +441,7 @@ impl<W: WalStorage> DataPlane<W> {
         let old_end = old_tracker.committed_entry_id();
         let new_start_entry_id = old_end + 1;
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
-            new_segment_key.file_path(&self.config.data_dir),
+            new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
             SegmentRole::Leader,
             cmd.new_replica_set,
             shard_group_id,
@@ -1577,7 +1587,9 @@ mod tests {
 
         let lookup = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
         match lookup {
-            SegmentReadState::Sealed { key, end_entry_id } => {
+            SegmentReadState::Sealed {
+                key, end_entry_id, ..
+            } => {
                 assert_eq!(key, s0);
                 assert_eq!(end_entry_id, 0);
             }
@@ -1637,7 +1649,7 @@ mod tests {
         // Write the segment file + sparse index exactly as the checkpoint worker
         // would (Data + BatchEnd per entry), then seal so the resolver routes
         // offset 0 to the sealed table → cold path.
-        let seg_path = test_key().file_path(dir.path());
+        let seg_path = test_key().file_path(dir.path(), 0);
         if let Some(parent) = seg_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
