@@ -116,7 +116,6 @@ impl SegmentKey {
 /// Parses a segment filename (`{segment_id}-{start_offset}.seg`) into its
 /// parts. Returns `None` for names that don't match — recovery discovery skips
 /// foreign files. Inverse of the filename produced by [`SegmentKey::file_path`].
-#[allow(dead_code)]
 pub(crate) fn parse_segment_filename(name: &str) -> Option<(SegmentId, u64)> {
     let stem = name.strip_suffix(".seg")?;
     let (segment_id, start_offset) = stem.split_once('-')?;
