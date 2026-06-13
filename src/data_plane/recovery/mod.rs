@@ -7,4 +7,5 @@
 //! and stay unused by the running system until the orchestrator wires them
 //! into node startup.
 
+pub(crate) mod segment_scan;
 pub(crate) mod wal_scan;

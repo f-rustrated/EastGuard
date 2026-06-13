@@ -92,11 +92,16 @@ impl SegmentKey {
         }
     }
 
-    pub fn file_path(&self, data_dir: &Path) -> PathBuf {
+    /// Path to this segment's file. The filename encodes the segment's
+    /// `start_offset` (its first entry id) so the file is self-describing for
+    /// crash recovery — discovery derives the base entry id from the name
+    /// alone, no metadata lookup. `start_offset` is immutable, so the name is
+    /// stable for the segment's life (no rename on seal).
+    pub fn file_path(&self, data_dir: &Path, start_offset: u64) -> PathBuf {
         data_dir
             .join(self.topic_id.to_string())
             .join(self.range_id.to_string())
-            .join(format!("{}.seg", *self.segment_id))
+            .join(format!("{}-{}.seg", *self.segment_id, start_offset))
     }
 
     pub fn with_segment_id(&self, segment_id: SegmentId) -> Self {
@@ -106,4 +111,17 @@ impl SegmentKey {
             segment_id,
         }
     }
+}
+
+/// Parses a segment filename (`{segment_id}-{start_offset}.seg`) into its
+/// parts. Returns `None` for names that don't match — recovery discovery skips
+/// foreign files. Inverse of the filename produced by [`SegmentKey::file_path`].
+#[allow(dead_code)]
+pub(crate) fn parse_segment_filename(name: &str) -> Option<(SegmentId, u64)> {
+    let stem = name.strip_suffix(".seg")?;
+    let (segment_id, start_offset) = stem.split_once('-')?;
+    Some((
+        SegmentId(segment_id.parse().ok()?),
+        start_offset.parse().ok()?,
+    ))
 }

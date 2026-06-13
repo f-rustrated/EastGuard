@@ -47,7 +47,11 @@ pub(crate) struct SealedSegmentLocation {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SegmentReadState {
     Active(SegmentKey),
-    Sealed { key: SegmentKey, end_entry_id: u64 },
+    Sealed {
+        key: SegmentKey,
+        start_entry_id: u64,
+        end_entry_id: u64,
+    },
 }
 
 pub(crate) struct SegmentStore {
@@ -187,7 +191,7 @@ impl SegmentStore {
             }
         }
         let sealed = self.sealed_by_range.get(&(topic_id, range_id))?;
-        let (_, slot) = sealed.range(..=offset).next_back()?;
+        let (&start_entry_id, slot) = sealed.range(..=offset).next_back()?;
 
         // ? what would this mean
         if offset > slot.end_entry_id {
@@ -195,6 +199,7 @@ impl SegmentStore {
         }
         Some(SegmentReadState::Sealed {
             key: SegmentKey::new(topic_id, range_id, slot.segment_id),
+            start_entry_id,
             end_entry_id: slot.end_entry_id,
         })
     }
@@ -303,9 +308,11 @@ mod tests {
         match r {
             SegmentReadState::Sealed {
                 key: g,
+                start_entry_id,
                 end_entry_id,
             } => {
                 assert_eq!(g, k);
+                assert_eq!(start_entry_id, 0);
                 assert_eq!(end_entry_id, 42);
             }
             other => panic!("expected Sealed, got {other:?}"),
