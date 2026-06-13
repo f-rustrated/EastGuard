@@ -1,8 +1,11 @@
 //! Segment file scanning for crash recovery.
-use std::fs::File;
+use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io::{self, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::control_plane::metadata::{RangeId, TopicId};
+use crate::data_plane::SegmentKey;
 use crate::data_plane::parse_segment_file;
 use crate::data_plane::wal::{WalRecord, WalRecordType};
 
@@ -100,6 +103,65 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
     })
 }
 
+/// Walks `data_dir` into a per-segment cursor map: every `{topic}/{range}/`
+/// segment file is scanned via [`scan_segment_file`] and keyed by its
+/// [`SegmentKey`] — the inverse of [`SegmentKey::file_path`]'s layout.
+///
+/// Tolerant of junk so recovery never aborts on foreign content:
+/// - a missing `data_dir` yields an empty map;
+/// - the `wal/` sibling and any non-id directories are skipped (`debug!`);
+/// - a file whose name is not `{segment_id}-{start_offset}.seg` is skipped (`warn!`).
+///
+/// Only genuine I/O failures and unreadable real segments propagate.
+#[allow(dead_code)] // staged: first called by the orchestrator (commit 12)
+pub(crate) fn scan_data_dir(data_dir: &Path) -> io::Result<HashMap<SegmentKey, SegmentScan>> {
+    let mut cursors = HashMap::new();
+    for (topic_id, topic_path) in numeric_child_dirs(data_dir)? {
+        for (range_id, range_path) in numeric_child_dirs(&topic_path)? {
+            for entry in fs::read_dir(&range_path)? {
+                let path = entry?.path();
+                let segment_id = match parse_segment_file(&path) {
+                    Ok((segment_id, _start_offset)) => segment_id,
+                    Err(e) => {
+                        tracing::warn!(
+                            file = %path.display(),
+                            error = %e,
+                            "skipping non-segment file in data dir"
+                        );
+                        continue;
+                    }
+                };
+                let key = SegmentKey::new(TopicId(topic_id), RangeId(range_id), segment_id);
+                cursors.insert(key, scan_segment_file(&path)?);
+            }
+        }
+    }
+    Ok(cursors)
+}
+
+/// Immediate child directories of `dir` whose names parse as a `u64` (topic or
+/// range ids). A missing `dir` is an empty list; non-directory entries and
+/// non-numeric names (e.g. the `wal/` sibling) are skipped with a `debug!`.
+fn numeric_child_dirs(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut dirs = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_dir = entry.file_type()?.is_dir();
+        match name.parse::<u64>() {
+            Ok(id) if is_dir => dirs.push((id, entry.path())),
+            _ => tracing::debug!(entry = %name, "skipping non-id entry in data dir"),
+        }
+    }
+    Ok(dirs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -108,6 +170,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::control_plane::metadata::SegmentId;
 
     /// Encodes entries the way `CheckpointWorker::process_job` (`checkpoint.rs`)
     /// does: each entry is a bare-payload `Data` record followed by a `BatchEnd`
@@ -229,5 +292,64 @@ mod tests {
         let scan = scan_segment_file(&path).unwrap();
         assert_eq!(scan.last_entry_id, Some(0)); // only the first batch
         assert_eq!(scan.valid_len, valid);
+    }
+
+    /// Creates parent dirs then writes a segment file at `path` (built from
+    /// `SegmentKey::file_path`), matching the layout recovery walks.
+    fn write_segment_file(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn scan_data_dir_walks_nested_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+
+        let k1 = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        let k2 = SegmentKey::new(TopicId(1), RangeId(2), SegmentId(5));
+        let k3 = SegmentKey::new(TopicId(7), RangeId(0), SegmentId(3));
+        write_segment_file(
+            &k1.file_path(data_dir, 0),
+            &encode_segment(&[("a", 1), ("b", 1)]),
+        );
+        write_segment_file(&k2.file_path(data_dir, 100), &encode_segment(&[("c", 1)]));
+        write_segment_file(
+            &k3.file_path(data_dir, 50),
+            &encode_segment(&[("d", 1), ("e", 1), ("f", 1)]),
+        );
+
+        let cursors = scan_data_dir(data_dir).unwrap();
+        assert_eq!(cursors.len(), 3);
+        assert_eq!(cursors[&k1].last_entry_id, Some(1)); // 0, 1
+        assert_eq!(cursors[&k2].last_entry_id, Some(100)); // 100
+        assert_eq!(cursors[&k3].last_entry_id, Some(52)); // 50, 51, 52
+    }
+
+    #[test]
+    fn scan_data_dir_skips_foreign_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+
+        let real = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        write_segment_file(&real.file_path(data_dir, 0), &encode_segment(&[("a", 1)]));
+
+        // A WAL sibling dir, a non-id topic dir, and a foreign file in a real
+        // range dir — none should abort the walk or land in the map.
+        fs::create_dir_all(data_dir.join("wal")).unwrap();
+        fs::write(data_dir.join("wal").join("wal-000001.log"), b"x").unwrap();
+        fs::create_dir_all(data_dir.join("not-a-topic")).unwrap();
+        fs::write(data_dir.join("1").join("0").join("notes.txt"), b"x").unwrap();
+
+        let cursors = scan_data_dir(data_dir).unwrap();
+        assert_eq!(cursors.len(), 1);
+        assert!(cursors.contains_key(&real));
+    }
+
+    #[test]
+    fn scan_data_dir_missing_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursors = scan_data_dir(&dir.path().join("nonexistent")).unwrap();
+        assert!(cursors.is_empty());
     }
 }
