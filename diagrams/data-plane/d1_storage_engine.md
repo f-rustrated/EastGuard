@@ -33,10 +33,12 @@ Each `Produce` command carries an opaque `EntryPayload` — one pre-serialized b
     wal-000003.log                       # active, being appended to
   {topic_id}/
     {range_id}/
-      {segment_id}.seg                   # append-only, ≤1GB
+      {segment_id}-{start_offset}.seg    # append-only, ≤1GB; name carries the base entry id
 ```
 
 WAL is per-node (single sequential write point), split into fixed-size log files (e.g., 64MB each). When the active file reaches the size limit, it is sealed and a new file is opened. Old WAL files are deleted once all their entries have been durably written to their respective segment files (see WAL Lifecycle below). Segment files organized by ownership hierarchy. Removing a topic's data = `rm -rf {data_dir}/{topic_id}/`.
+
+The segment filename encodes the segment's first entry id (`start_offset`). Because segment records are bare (no per-record routing header), this makes each file self-describing: crash recovery derives a segment's base offset from the directory listing alone, with no metadata lookup. `start_offset` is immutable, so the name never changes (no rename on seal).
 
 ### Record Format
 
