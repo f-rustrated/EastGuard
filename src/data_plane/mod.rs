@@ -114,13 +114,33 @@ impl SegmentKey {
 }
 
 /// Parses a segment filename (`{segment_id}-{start_offset}.seg`) into its
-/// parts. Returns `None` for names that don't match — recovery discovery skips
+/// parts. Returns `Err` for names that don't match — recovery discovery skips
 /// foreign files. Inverse of the filename produced by [`SegmentKey::file_path`].
-pub(crate) fn parse_segment_filename(name: &str) -> Option<(SegmentId, u64)> {
-    let stem = name.strip_suffix(".seg")?;
-    let (segment_id, start_offset) = stem.split_once('-')?;
-    Some((
-        SegmentId(segment_id.parse().ok()?),
-        start_offset.parse().ok()?,
+pub(crate) fn parse_segment_file(path: &Path) -> std::io::Result<(SegmentId, u64)> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid file path for segment",
+            )
+        })?;
+
+    let invalid_format_err = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid segment file format",
+        )
+    };
+    let stem = file_name
+        .strip_suffix(".seg")
+        .ok_or_else(invalid_format_err)?;
+
+    let (segment_id, start_offset) = stem.split_once('-').ok_or_else(invalid_format_err)?;
+
+    Ok((
+        SegmentId(segment_id.parse().map_err(|_| invalid_format_err())?),
+        start_offset.parse().map_err(|_| invalid_format_err())?,
     ))
 }
