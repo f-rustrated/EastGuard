@@ -12,7 +12,7 @@ use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 use super::SegmentKey;
 use super::messages::command::DataPlaneCommand;
 use super::messages::*;
-use super::sparse_index::{SparseEntry, SparseIndex};
+use super::sparse_index::{SparseEntry, SparseIndex, is_index_anchor};
 use super::wal::WalRecord;
 pub struct CheckpointWorker;
 
@@ -66,11 +66,13 @@ impl CheckpointWorker {
             end_record.encode_to(&mut writer)?;
             byte_position += end_record.encoded_size() as u64;
 
-            index_entries.push(SparseEntry::new(
-                job.segment_key,
-                entry.entry_id,
-                entry_start_position.to_be_bytes(),
-            ));
+            if is_index_anchor(entry_start_position, entry.entry_id) {
+                index_entries.push(SparseEntry::new(
+                    job.segment_key,
+                    entry.entry_id,
+                    entry_start_position.to_be_bytes(),
+                ));
+            }
         }
 
         writer.flush()?;
