@@ -27,6 +27,10 @@ impl RoutingHeader {
         }
     }
 
+    pub(crate) fn segment_key(&self) -> SegmentKey {
+        SegmentKey::new(self.topic_id, self.range_id, self.segment_id)
+    }
+
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u64(self.topic_id.0);
         buf.put_u64(*self.range_id);
