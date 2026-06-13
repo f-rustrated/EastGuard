@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::control_plane::metadata::{RangeId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::parse_segment_file;
+use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::{WalRecord, WalRecordType};
 
 /// The CRC-verified prefix of one segment file.
@@ -14,8 +15,11 @@ use crate::data_plane::wal::{WalRecord, WalRecordType};
 /// Built only by [`scan_segment_file`]; callers read the fields, never set
 /// them — the pair always reflects one scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // staged: first consumed by the cursor map (commit 5) and replay (commit 7)
+#[allow(dead_code)] // staged: first consumed by the cursor map and replay
 pub(crate) struct SegmentScan {
+    /// The segment's first entry id, parsed from its filename. The replay
+    /// appender uses it to build the file path and as the contiguity base.
+    pub(crate) start_offset: u64,
     /// Highest entry id covered by a complete batch, or `None` when no
     /// complete batch survived (empty, missing, or torn-from-the-start file).
     pub(crate) last_entry_id: Option<u64>,
@@ -23,6 +27,126 @@ pub(crate) struct SegmentScan {
     /// Replay truncates the file to this length before appending, so a torn
     /// tail is overwritten rather than appended after.
     pub(crate) valid_len: u64,
+}
+
+/// Whether a replayed WAL record should be appended to its segment file or
+/// skipped as already present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // staged: consumed by the replay appender
+pub(crate) enum Decision {
+    /// The segment file already holds this entry (id ≤ its verified cursor).
+    Skip,
+    /// The entry is beyond the verified prefix, or the segment has no local
+    /// data at all — append it.
+    Append,
+}
+
+/// Every locally-scanned segment, keyed by [`SegmentKey`] with its verified
+/// [`SegmentScan`] — the output of walking the data dir and the input to
+/// replay. `decide` reads each segment's cursor; the appender reads
+/// `valid_len` to truncate a damaged tail before its first write.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // staged: built by scan_data_dir, consumed by replay, finalized as the inventory (commit 11)
+pub(crate) struct RecoveredSegments(HashMap<SegmentKey, SegmentScan>);
+
+impl RecoveredSegments {
+    /// Every `{topic}/{range}/` segment file is scanned and keyed by its
+    /// [`SegmentKey`] — the inverse of [`SegmentKey::file_path`]'s layout.
+    ///
+    /// Tolerant of junk so recovery never aborts on foreign content:
+    /// - a missing `data_dir` yields an empty map;
+    /// - the `wal/` sibling and any non-id directories are skipped (`debug!`);
+    /// - a file whose name is not `{segment_id}-{start_offset}.seg` is skipped (`warn!`).
+    ///
+    /// Only genuine I/O failures and unreadable real segments propagate.
+    #[allow(dead_code)]
+    pub(crate) fn scan_data_dir(data_dir: &Path) -> io::Result<Self> {
+        let mut cursors = HashMap::new();
+        for (topic_id, topic_path) in numeric_child_dirs(data_dir)? {
+            for (range_id, range_path) in numeric_child_dirs(&topic_path)? {
+                for entry in fs::read_dir(&range_path)? {
+                    let path = entry?.path();
+                    let segment_id = match parse_segment_file(&path) {
+                        Ok((segment_id, _start_offset)) => segment_id,
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %path.display(),
+                                error = %e,
+                                "skipping non-segment file in data dir"
+                            );
+                            continue;
+                        }
+                    };
+                    let key = SegmentKey::new(TopicId(topic_id), RangeId(range_id), segment_id);
+                    cursors.insert(key, scan_segment_file(&path)?);
+                }
+            }
+        }
+        Ok(RecoveredSegments(cursors))
+    }
+
+    /// Skip if the segment file already holds `header`'s record (its id is at or
+    /// below the verified cursor); append otherwise — including every record of
+    /// a segment that is absent or has no verified prefix.
+    #[allow(dead_code)]
+    pub(crate) fn decide(&self, header: &RoutingHeader) -> Decision {
+        match self
+            .0
+            .get(&header.segment_key())
+            .and_then(|scan| scan.last_entry_id)
+        {
+            Some(cursor) if header.entry_id <= cursor => Decision::Skip,
+            _ => Decision::Append,
+        }
+    }
+
+    pub(crate) fn valid_len(&self, key: &SegmentKey) -> u64 {
+        self.0.get(key).map_or(0, |scan| scan.valid_len)
+    }
+
+    pub(crate) fn start_offset(&self, key: &SegmentKey) -> Option<u64> {
+        self.0.get(key).map(|scan| scan.start_offset)
+    }
+
+    /// Records that `entry_id` was just appended to `key`'s segment file,
+    /// advancing its cursor.
+    ///
+    /// Enforces the contiguous-prefix invariant: appends are gapless, so `entry_id` must be exactly one past the cursor
+    /// or the segment's `start_offset` for the first append.
+    ///
+    /// A segment absent from the map is inserted, taking `entry_id` as its base.
+    #[allow(dead_code)]
+    pub(crate) fn advance(&mut self, key: SegmentKey, entry_id: u64) {
+        let scan = self.0.entry(key).or_insert(SegmentScan {
+            start_offset: entry_id,
+            last_entry_id: None,
+            valid_len: 0,
+        });
+        let expected = scan
+            .last_entry_id
+            .map_or(scan.start_offset, |last| last + 1);
+        debug_assert_eq!(
+            entry_id, expected,
+            "non-contiguous replay append to {key:?}: expected {expected}, got {entry_id}"
+        );
+        scan.last_entry_id = Some(entry_id);
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn assert_invariants(&self) {
+        for (key, scan) in &self.0 {
+            if let Some(last) = scan.last_entry_id {
+                debug_assert!(
+                    last >= scan.start_offset,
+                    "{key:?}: cursor {last} precedes start_offset {}",
+                    scan.start_offset
+                );
+            }
+        }
+    }
 }
 
 /// Scans a segment file to find its last verified cursor position.
@@ -56,6 +180,7 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(SegmentScan {
+                start_offset,
                 last_entry_id: None,
                 valid_len: 0,
             });
@@ -98,45 +223,10 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
     // base plus the verified count, less one. No complete batch -> no id.
     let last_entry_id = verified.checked_sub(1).map(|n| start_offset + n);
     Ok(SegmentScan {
+        start_offset,
         last_entry_id,
         valid_len,
     })
-}
-
-/// Walks `data_dir` into a per-segment cursor map: every `{topic}/{range}/`
-/// segment file is scanned via [`scan_segment_file`] and keyed by its
-/// [`SegmentKey`] — the inverse of [`SegmentKey::file_path`]'s layout.
-///
-/// Tolerant of junk so recovery never aborts on foreign content:
-/// - a missing `data_dir` yields an empty map;
-/// - the `wal/` sibling and any non-id directories are skipped (`debug!`);
-/// - a file whose name is not `{segment_id}-{start_offset}.seg` is skipped (`warn!`).
-///
-/// Only genuine I/O failures and unreadable real segments propagate.
-#[allow(dead_code)] // staged: first called by the orchestrator (commit 12)
-pub(crate) fn scan_data_dir(data_dir: &Path) -> io::Result<HashMap<SegmentKey, SegmentScan>> {
-    let mut cursors = HashMap::new();
-    for (topic_id, topic_path) in numeric_child_dirs(data_dir)? {
-        for (range_id, range_path) in numeric_child_dirs(&topic_path)? {
-            for entry in fs::read_dir(&range_path)? {
-                let path = entry?.path();
-                let segment_id = match parse_segment_file(&path) {
-                    Ok((segment_id, _start_offset)) => segment_id,
-                    Err(e) => {
-                        tracing::warn!(
-                            file = %path.display(),
-                            error = %e,
-                            "skipping non-segment file in data dir"
-                        );
-                        continue;
-                    }
-                };
-                let key = SegmentKey::new(TopicId(topic_id), RangeId(range_id), segment_id);
-                cursors.insert(key, scan_segment_file(&path)?);
-            }
-        }
-    }
-    Ok(cursors)
 }
 
 /// Immediate child directories of `dir` whose names parse as a `u64` (topic or
@@ -207,6 +297,7 @@ mod tests {
         let (_dir, path) = write_named(3, 100, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
+        assert_eq!(scan.start_offset, 100);
         assert_eq!(scan.last_entry_id, Some(102)); // 100, 101, 102
         assert_eq!(scan.valid_len, len);
     }
@@ -319,11 +410,11 @@ mod tests {
             &encode_segment(&[("d", 1), ("e", 1), ("f", 1)]),
         );
 
-        let cursors = scan_data_dir(data_dir).unwrap();
-        assert_eq!(cursors.len(), 3);
-        assert_eq!(cursors[&k1].last_entry_id, Some(1)); // 0, 1
-        assert_eq!(cursors[&k2].last_entry_id, Some(100)); // 100
-        assert_eq!(cursors[&k3].last_entry_id, Some(52)); // 50, 51, 52
+        let recovered = RecoveredSegments::scan_data_dir(data_dir).unwrap();
+        assert_eq!(recovered.0.len(), 3);
+        assert_eq!(recovered.0[&k1].last_entry_id, Some(1)); // 0, 1
+        assert_eq!(recovered.0[&k2].last_entry_id, Some(100)); // 100
+        assert_eq!(recovered.0[&k3].last_entry_id, Some(52)); // 50, 51, 52
     }
 
     #[test]
@@ -341,15 +432,96 @@ mod tests {
         fs::create_dir_all(data_dir.join("not-a-topic")).unwrap();
         fs::write(data_dir.join("1").join("0").join("notes.txt"), b"x").unwrap();
 
-        let cursors = scan_data_dir(data_dir).unwrap();
-        assert_eq!(cursors.len(), 1);
-        assert!(cursors.contains_key(&real));
+        let recovered = RecoveredSegments::scan_data_dir(data_dir).unwrap();
+        assert_eq!(recovered.0.len(), 1);
+        assert!(recovered.0.contains_key(&real));
     }
 
     #[test]
     fn scan_data_dir_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let cursors = scan_data_dir(&dir.path().join("nonexistent")).unwrap();
-        assert!(cursors.is_empty());
+        let recovered = RecoveredSegments::scan_data_dir(&dir.path().join("nonexistent")).unwrap();
+        assert!(recovered.0.is_empty());
+    }
+
+    fn seg_key() -> SegmentKey {
+        SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
+    }
+
+    fn routing(entry_id: u64) -> RoutingHeader {
+        RoutingHeader::new(seg_key(), entry_id, 1)
+    }
+
+    fn scanned(start_offset: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
+        SegmentScan {
+            start_offset,
+            last_entry_id,
+            valid_len,
+        }
+    }
+
+    fn recovered_with(entries: &[(SegmentKey, SegmentScan)]) -> RecoveredSegments {
+        RecoveredSegments(entries.iter().copied().collect())
+    }
+
+    #[test]
+    fn decide_appends_beyond_cursor_skips_within() {
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(5), 0))]);
+        assert_eq!(r.decide(&routing(6)), Decision::Append);
+        assert_eq!(r.decide(&routing(5)), Decision::Skip);
+        assert_eq!(r.decide(&routing(3)), Decision::Skip);
+    }
+
+    #[test]
+    fn decide_absent_or_no_prefix_appends_from_zero() {
+        // Absent segment → append everything, including entry id 0.
+        assert_eq!(
+            RecoveredSegments::default().decide(&routing(0)),
+            Decision::Append
+        );
+        // Present but no verified prefix (last_entry_id None) — same as absent.
+        let r = recovered_with(&[(seg_key(), scanned(0, None, 0))]);
+        assert_eq!(r.decide(&routing(0)), Decision::Append);
+    }
+
+    #[test]
+    fn decide_cursor_zero_is_distinct_from_absent() {
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(0), 0))]);
+        assert_eq!(r.decide(&routing(0)), Decision::Skip);
+        assert_eq!(r.decide(&routing(1)), Decision::Append);
+    }
+
+    #[test]
+    fn valid_len_is_the_scans_or_zero_when_absent() {
+        let r = recovered_with(&[(seg_key(), scanned(0, Some(2), 128))]);
+        assert_eq!(r.valid_len(&seg_key()), 128);
+        let absent = SegmentKey::new(TopicId(9), RangeId(0), SegmentId(0));
+        assert_eq!(r.valid_len(&absent), 0);
+    }
+
+    #[test]
+    fn advance_walks_contiguously() {
+        let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
+        r.advance(seg_key(), 5);
+        r.advance(seg_key(), 6);
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(6));
+    }
+
+    #[test]
+    fn advance_inserts_an_absent_segment_at_its_base() {
+        let mut r = RecoveredSegments::default();
+        r.advance(seg_key(), 7); // first record of a never-checkpointed segment
+        let scan = r.0[&seg_key()];
+        assert_eq!(scan.start_offset, 7);
+        assert_eq!(scan.last_entry_id, Some(7));
+        r.advance(seg_key(), 8);
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(8));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-contiguous")]
+    fn advance_rejects_a_gap() {
+        let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
+        r.advance(seg_key(), 6); // skips 5
     }
 }
