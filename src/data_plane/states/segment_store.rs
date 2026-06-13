@@ -122,43 +122,45 @@ impl SegmentStore {
             .insert(start, key.segment_id);
     }
 
-    /// Move an entry from `active_by_range` to `sealed_by_range` without
-    /// dropping its live tracker. Used by the leader path on seal
-    pub(crate) fn move_active_to_sealed(
-        &mut self,
-        key: SegmentKey,
-        start_entry_id: u64,
-        end_entry_id: u64,
-    ) {
-        if let Some(active) = self.active_by_range.get_mut(&(key.topic_id, key.range_id)) {
-            active.remove(&start_entry_id);
-            if active.is_empty() {
-                self.active_by_range.remove(&(key.topic_id, key.range_id));
-            }
+    pub(crate) fn unindex_active(&mut self, key: SegmentKey, start_entry_id: u64) {
+        let Some(active) = self.active_by_range.get_mut(&(key.topic_id, key.range_id)) else {
+            return;
+        };
+
+        // ! a segment sealed before its first commit shares its start offset with its successor,
+        // ! so a blind remove could evict that successor.
+        let segment_mapped_to_entry_id = active.get(&start_entry_id).copied();
+        if segment_mapped_to_entry_id != Some(key.segment_id) {
+            return;
         }
-        self.sealed_by_range
-            .entry((key.topic_id, key.range_id))
-            .or_default()
-            .insert(
-                start_entry_id,
-                SealedSegmentLocation {
-                    segment_id: key.segment_id,
-                    end_entry_id,
-                },
-            );
+        active.remove(&start_entry_id);
+        if active.is_empty() {
+            self.active_by_range.remove(&(key.topic_id, key.range_id));
+        }
     }
 
-    /// Take the active tracker out (removing it from `by_key`) AND move its
-    /// index entry to sealed in one step. Used by the follower path's
-    /// `SegmentSealed` handler where the tracker is genuinely done — no more
-    /// writes will happen here, so we hand it to the caller (who turns it
-    /// into a checkpoint) and re-index the offsets as sealed so cold reads
-    /// still find them.
+    /// Take the tracker out of `by_key` and re-index it: always dropped from the
+    /// active index, then added to the sealed index if it has committed offsets
+    /// (so cold reads still find it). Caller checkpoints the returned tracker.
     pub(crate) fn take_active_and_seal(&mut self, key: SegmentKey) -> Option<SegmentTracker> {
         let tracker = self.by_key.remove(&key)?;
-        let start = tracker.start_entry_id();
-        let end = tracker.committed_entry_id();
-        self.move_active_to_sealed(key, start, end);
+        let start_entry_id = tracker.start_entry_id();
+        self.unindex_active(key, start_entry_id);
+
+        // Committed offsets stay cold-readable via the sealed index; a segment
+        // that committed nothing owns none, so unindexing is enough.
+        if let Some(end) = tracker.last_committed_entry_id() {
+            self.sealed_by_range
+                .entry((key.topic_id, key.range_id))
+                .or_default()
+                .insert(
+                    start_entry_id,
+                    SealedSegmentLocation {
+                        segment_id: key.segment_id,
+                        end_entry_id: end,
+                    },
+                );
+        }
         Some(tracker)
     }
 
@@ -320,5 +322,46 @@ mod tests {
 
         // Offset past sealed end_entry_id → no segment found.
         assert!(store.resolve(TopicId(1), RangeId(0), 43).is_none());
+    }
+
+    /// A segment sealed before its first commit owns no offsets, so it must end
+    /// up in neither index — a read for its start offset falls through to the
+    /// successor rather than an empty sealed segment.
+    #[test]
+    fn seal_with_nothing_committed_claims_no_offsets() {
+        let mut store = SegmentStore::new();
+        let s0 = key(1, 0, 0);
+        store.insert_active(s0, tracker(0)); // start 0, nothing committed
+
+        let taken = store.take_active_and_seal(s0);
+        assert!(taken.is_some());
+
+        assert!(
+            store.resolve(TopicId(1), RangeId(0), 0).is_none(),
+            "a segment sealed with nothing committed must not claim offset 0",
+        );
+
+        // The successor reuses start 0 and now serves offset 0.
+        let s1 = key(1, 0, 1);
+        store.insert_active(s1, tracker(0));
+        let r = store.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        assert!(matches!(r, SegmentReadState::Active(g) if g == s1));
+    }
+
+    /// `unindex_active` is segment-id-checked: a segment sealed before its first commit shares its start offset with its successor,
+    /// so unindexing the old segment must not evict the successor already holding that slot.
+    #[test]
+    fn unindex_active_only_removes_the_named_segment() {
+        let mut store = SegmentStore::new();
+        let successor = key(1, 0, 1);
+        store.insert_active(successor, tracker(0)); // successor already at start 0
+
+        store.unindex_active(key(1, 0, 0), 0); // try to unindex the OLD segment id
+
+        let r = store.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        assert!(
+            matches!(r, SegmentReadState::Active(g) if g == successor),
+            "unindexing a different segment id must not evict the successor",
+        );
     }
 }

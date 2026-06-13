@@ -177,6 +177,22 @@ impl SegmentTracker {
         self.committed_entry_id
     }
 
+    fn committed_count(&self) -> u64 {
+        self.cache.load_read_cursor()
+    }
+
+    /// Successor starts one past the last committed entry — or at `old_start`
+    /// when nothing committed, so replayed records keep their entry ids.
+    pub(crate) fn successor_start_entry_id(&self) -> u64 {
+        self.start_entry_id() + self.committed_count()
+    }
+
+    /// Last committed entry id, or `None` if nothing committed yet — the seal
+    /// boundary, so a segment sealed before its first commit owns no offsets.
+    pub(crate) fn last_committed_entry_id(&self) -> Option<u64> {
+        (self.committed_count() > 0).then_some(self.committed_entry_id)
+    }
+
     pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,

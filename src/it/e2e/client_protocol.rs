@@ -516,35 +516,52 @@ fn produce_then_fetch_hot() -> turmoil::Result {
             assert!(acked, "produce to leader {leader:?} not acked");
         }
 
-        // Fetch from offset 0 on the leader; poll until committed records land.
-        let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::Fetch(FetchRequest {
-            topic_name: TOPIC.into(),
-            range_id: 0,
-            entry_id: 0,
-            record_index: 0,
-            max_bytes: 1 << 20,
-            keyspace_bound: None,
-        }));
-        let mut result = None;
-        for _ in 0..40 {
+        // Fetch from offset 0, accumulating across next_entry_id. If the range
+        // rolled mid-produce (a replication timeout sealed the active segment),
+        // the records span the sealed segment + its successor, so one fetch
+        // isn't enough — follow next_entry_id across the boundary. A short or
+        // empty response just means "keep polling"; never reaching all three is
+        // a failure.
+        let mut entries = Vec::new();
+        let mut next_entry_id = 0u64;
+        let mut progress_signal = RangeProgressSignal::Active;
+        for _ in 0..80 {
+            let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::Fetch(FetchRequest {
+                topic_name: TOPIC.into(),
+                range_id: 0,
+                entry_id: next_entry_id,
+                record_index: 0,
+                max_bytes: 1 << 20,
+                keyspace_bound: None,
+            }));
             if let ClientResponse::DataPlane(DataPlaneResponse::Fetched {
-                entries,
-                next_entry_id,
-                progress_signal,
-            }) = send_request(leader.0, leader.1, fetch.clone()).await
-                && !entries.is_empty()
+                entries: batch,
+                next_entry_id: next,
+                progress_signal: signal,
+            }) = send_request(leader.0, leader.1, fetch).await
+                && !batch.is_empty()
             {
-                result = Some((entries, next_entry_id, progress_signal));
-                break;
+                progress_signal = signal;
+                next_entry_id = next;
+                entries.extend(batch);
+                if entries.len() >= 3 {
+                    break;
+                }
+                continue;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let (entries, next_entry_id, progress_signal) =
-            result.expect("no records fetched within timeout");
 
-        assert_eq!(entries.len(), 3, "all three produced records should fetch");
+        assert_eq!(
+            entries.len(),
+            3,
+            "all three produced records should fetch, got {}",
+            entries.len()
+        );
         assert_eq!(entries[0].entry_id, 0);
         assert_eq!(entries[0].data, b"rec-0");
+        assert_eq!(entries[1].data, b"rec-1");
+        assert_eq!(entries[2].data, b"rec-2");
         assert_eq!(next_entry_id, 3);
         assert!(
             matches!(progress_signal, RangeProgressSignal::Active),
