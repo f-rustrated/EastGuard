@@ -308,7 +308,7 @@ impl<W: WalStorage> DataPlane<W> {
             C::ReplicaAck(cmd) => self.handle_replica_ack(cmd),
             C::CommitAdvance(cmd) => self.handle_commit_advance(cmd),
             C::SealResponse(cmd) => self.handle_seal_response(cmd),
-            C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd.segment_key),
+            C::SegmentSealed(cmd) => self.retire_old_segment(cmd.segment_key),
 
             // Pass-through to MultiRaftActor — SealRequest is a control plane
             // message that shares the data transport wire format. The
@@ -437,9 +437,8 @@ impl<W: WalStorage> DataPlane<W> {
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
 
         let shard_group_id = old_tracker.shard_group_id();
-        let old_start = old_tracker.start_entry_id();
-        let old_end = old_tracker.committed_entry_id();
-        let new_start_entry_id = old_end + 1;
+
+        let new_start_entry_id = old_tracker.successor_start_entry_id();
         let mut new_tracker = SegmentTracker::new_with_start_entry_id(
             new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
             SegmentRole::Leader,
@@ -456,9 +455,14 @@ impl<W: WalStorage> DataPlane<W> {
         // D5 crash recovery: duplicate WAL data is safe. Old entries route to the sealed
         // segment (bounded by metadata end_offset), new entries route to the new segment.
         // Metadata-first recovery (Raft log before WAL) provides the seal boundary.
+        let mut replayed_bytes = 0usize;
         for (data, record_count) in old_tracker.uncommitted_entries() {
+            replayed_bytes += data.len();
             new_tracker.stage_entry(new_segment_key, data, record_count);
         }
+        // Staged replays count toward pending bytes like a fresh produce, so the
+        // `buffer_byte_count == staged bytes` invariant holds after this command.
+        self.buffer_byte_count += replayed_bytes;
 
         self.replication
             .segment_handoff(cmd.old_segment_key, new_segment_key);
@@ -473,21 +477,16 @@ impl<W: WalStorage> DataPlane<W> {
                 ));
         }
 
+        self.retire_old_segment(cmd.old_segment_key);
+
         self.segments.insert_active(new_segment_key, new_tracker);
-        // The leader's old tracker stays in self.segments (no remove here —
-        // that happens via the follower-side SegmentSealed path). But the
-        // resolver index now points at the new active segment for the range;
-        // the old one moves to sealed so cold reads still find it.
-        self.segments
-            .move_active_to_sealed(cmd.old_segment_key, old_start, old_end);
         self.dirty_segments.push(new_segment_key);
         self.needs_flush = true;
     }
 
-    fn handle_segment_sealed(&mut self, segment_key: SegmentKey) {
-        // On followers this is where the seal is first observed; the store
-        // captures end_entry_id from the tracker's own committed boundary.
-        // a duplicate migrate would be harmless (the sealed entry is immutable by construction).
+    // Drop the sealed segment's live tracker and checkpoint its committed
+    // records so cold reads can still serve them.
+    fn retire_old_segment(&mut self, segment_key: SegmentKey) {
         if let Some(tracker) = self.segments.take_active_and_seal(segment_key) {
             self.out.store_checkpoint(tracker.checkpoint(segment_key));
         }
@@ -1598,6 +1597,67 @@ mod tests {
 
         let active = dp.segments.resolve(TopicId(1), RangeId(0), 1).unwrap();
         assert!(matches!(active, SegmentReadState::Active(k) if k == s1));
+    }
+
+    /// Seal before the first commit: the uncommitted record is replayed into the
+    /// successor at the same id, the old (empty) segment is dropped from the
+    /// resolver, and a fetch from offset 0 resolves to the active successor.
+    #[test]
+    fn seal_before_first_commit_keeps_offset_zero_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let follower = NodeId::new("follower-1");
+
+        // Assign with a follower so the produce does NOT auto-commit: entry 0
+        // is published (write cursor 1) but uncommitted (read cursor 0).
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        process_and_flush(
+            &mut dp,
+            DataPlaneCommand::DataPlaneTimeoutCallback(
+                DataPlaneTimeoutCallback::BatchFlushDeadline,
+            ),
+        );
+        assert_eq!(
+            dp.segments
+                .get(&test_key())
+                .unwrap()
+                .cache()
+                .load_read_cursor(),
+            0,
+            "precondition: nothing committed before the seal",
+        );
+
+        // Replication-timeout failover seals the never-committed segment.
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            SealResponse {
+                old_segment_key: test_key(),
+                new_segment_id: SegmentId(1),
+                new_replica_set: vec![test_node_id()],
+            }
+            .into(),
+        ));
+
+        let s1 = test_key().with_segment_id(SegmentId(1));
+
+        // Offset 0 resolves to the active successor (which reuses start 0), not
+        // an empty sealed segment — the old segment owned no committed offsets.
+        let resolved = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        assert!(
+            matches!(resolved, SegmentReadState::Active(k) if k == s1),
+            "offset 0 must resolve to the active successor, got {resolved:?}",
+        );
+        assert_eq!(dp.segments.get(&s1).unwrap().start_entry_id(), 0);
+
+        // The replayed record commits on flush (single replica) and is readable
+        // at offset 0 — proving no record was stranded by the seal.
+        dp.flush_batch();
+        assert_eq!(
+            dp.segments.get(&s1).unwrap().cache().load_read_cursor(),
+            1,
+            "replayed record must commit at offset 0 on the successor",
+        );
     }
 
     /// End-to-end cold read through `DataPlane`: a sealed segment's data lives on
