@@ -32,6 +32,7 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::topology_channel;
 use crate::data_plane::actor::{DataPlaneActor, DataPlaneSender};
 use crate::data_plane::checkpoint::CheckpointWorker;
+use crate::data_plane::recovery;
 use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
@@ -85,6 +86,14 @@ impl StartUp {
         // Single-writer / many-readers via ArcSwap — no locks, no contention.
         let (topology_pub, topology_reader) = topology_channel(state.topology.clone());
 
+        // Recover local durable state before this node serves or joins the
+        // cluster: scan + replay the WAL into the segment files, then clear the
+        // old WAL. Runs before any transport serves and before the SWIM join, so
+        // the node only becomes visible to the cluster once it is recovered.
+        let data_config = self.env.data_node_config();
+        let sparse_index = self.env.sparse_index_db();
+        let recovery_output = recovery::run(data_config.data_dir.clone(), &*sparse_index)?;
+
         // Transports
         tokio::spawn(SwimTransportActor::run(
             udp_socket,
@@ -109,16 +118,15 @@ impl StartUp {
             topology_pub,
         );
 
-        // Data plane (spawns its own three schedulers + crossbeam bridge internally).
-        let sparse_index = self.env.sparse_index_db();
         let (checkpoint_tx, checkpoint_rx) = crossbeam_channel::bounded(64);
         let data_plane_tx = DataPlaneActor::spawn(
             node_id.clone(),
-            self.env.data_node_config(),
+            data_config,
             checkpoint_tx,
             data_transport_tx.clone().into(),
             raft_tx.clone(),
             sparse_index.clone(),
+            recovery_output,
         );
         CheckpointWorker::spawn(sparse_index, checkpoint_rx, data_plane_tx.clone());
 

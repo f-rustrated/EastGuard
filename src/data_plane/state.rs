@@ -5,6 +5,7 @@ use super::messages::command::DataPlaneInterNodeCommand;
 use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
+use super::recovery::inventory::LocalInventory;
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
 use super::states::segment_store::SegmentStore;
@@ -51,6 +52,11 @@ pub struct DataPlane<W: WalStorage> {
     cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
 
     out: DataPlaneOutputs,
+
+    /// The verified local inventory recovery handed us (segment → highest durable entry id).
+    /// Held for boundary confirmation and segment registration (not read yet).
+    #[allow(dead_code)]
+    recovered: LocalInventory,
 }
 
 impl<W: WalStorage> DataPlane<W> {
@@ -60,6 +66,7 @@ impl<W: WalStorage> DataPlane<W> {
         wal: W,
         cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
         out: DataPlaneOutputs,
+        recovered: LocalInventory,
     ) -> Self {
         DataPlane {
             node_id,
@@ -73,6 +80,7 @@ impl<W: WalStorage> DataPlane<W> {
             pending_seal_requests: HashMap::new(),
             cold_read_handoff_sender,
             out,
+            recovered,
         }
     }
 
@@ -776,6 +784,7 @@ mod tests {
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::cold_read::DEFAULT_POOL_SIZE;
+    use crate::data_plane::recovery::segment_scan::RecoveredSegments;
     use crate::data_plane::wal::WalWriter;
     use tokio::sync::oneshot;
 
@@ -808,6 +817,12 @@ mod tests {
         }
     }
 
+    /// A trivial empty-dir recovery: nothing on disk → an empty inventory. The
+    /// same shape production builds `DataPlane` with, just with no segments.
+    fn empty_inventory() -> LocalInventory {
+        LocalInventory::from_recovered(&RecoveredSegments::default())
+    }
+
     fn make_data_plane(dir: &tempfile::TempDir) -> DataPlane<WalWriter> {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
         let out = DataPlaneOutputs::test();
@@ -821,6 +836,7 @@ mod tests {
             wal,
             cold_read_tx,
             out,
+            empty_inventory(),
         )
     }
 
@@ -1690,6 +1706,7 @@ mod tests {
             wal,
             cold_read_tx,
             DataPlaneOutputs::test(),
+            empty_inventory(),
         );
 
         // Assign + produce 3 records (single replica → commit inline on flush).
