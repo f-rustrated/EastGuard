@@ -1,6 +1,7 @@
 use super::checkpoint::CheckpointJob;
 use super::cold_read::ColdReadPool;
 use super::messages::pending::DataPlaneOutputs;
+use super::recovery::inventory::RecoveryOutput;
 use super::sparse_index::SparseIndex;
 use super::state::DataPlane;
 use super::timer::SegmentAgeTimer;
@@ -34,6 +35,7 @@ impl DataPlaneActor {
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
         sparse_index: Arc<dyn SparseIndex>,
+        recovery: RecoveryOutput,
     ) -> DataPlaneSender {
         let (timer_tx, mut timer_rx) = mpsc::channel::<DataPlaneCommand>(64);
 
@@ -68,7 +70,14 @@ impl DataPlaneActor {
         thread::Builder::new()
             .name("data-plane-worker".into())
             .spawn(move || {
-                let wal = match WalWriter::new(config.data_dir.clone()) {
+                // Recovery ran in bootstrap (before this node joined the cluster);
+                // it left the WAL dir empty and handed us the verified inventory.
+                // Open the fresh WAL in the dir it cleared.
+                let RecoveryOutput {
+                    inventory,
+                    data_dir,
+                } = recovery;
+                let wal = match WalWriter::new(data_dir) {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::error!("Failed to initialize WAL: {e}");
@@ -82,7 +91,7 @@ impl DataPlaneActor {
                     data_transport_tx,
                     coordinator_tx,
                 );
-                let mut state = DataPlane::new(node_id, config, wal, cold_read_tx, out);
+                let mut state = DataPlane::new(node_id, config, wal, cold_read_tx, out, inventory);
 
                 while let Ok(msg) = mailbox.recv() {
                     state.process(msg);

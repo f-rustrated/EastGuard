@@ -242,6 +242,18 @@ impl WalScanner {
             }
         }
     }
+
+    /// Deletes every discovered WAL file, consuming the scanner. The caller must
+    /// have made the WAL's contents durable in the segment files first (recovery
+    /// does this via `ReplayWriter::finish`) — only then is the WAL superseded
+    /// and safe to remove.
+    pub(crate) fn delete_files(mut self) -> io::Result<()> {
+        self.current = None; // close any still-open reader before unlinking
+        for file in &self.files {
+            fs::remove_file(&file.path)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
