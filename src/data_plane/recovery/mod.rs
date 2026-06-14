@@ -78,9 +78,16 @@ pub(crate) fn run(
 
     let output = writer.finish()?;
     index.put_batch(output.suffix_index.into_vec())?;
+    let inventory = LocalInventory::from_recovered(&output.recovered);
+
+    // The WAL's contents are now durable in the segment files (finish fsynced
+    // them), so the WAL is superseded — delete it. The fresh WAL is created
+    // later by the serving side (DataPlane, commit 14), leaving the dir empty in
+    // between (an empty WAL just means nothing to replay).
+    scanner.delete_files()?;
 
     Ok(RecoveryOutput {
-        inventory: LocalInventory::from_recovered(&output.recovered),
+        inventory,
         data_dir,
     })
 }
@@ -209,8 +216,9 @@ mod tests {
         run(data_dir.clone(), &db).unwrap();
         let after_first = fs::read(a.file_path(&data_dir, 0)).unwrap();
 
-        // Commit 12 leaves the WAL in place, so a second run replays the same
-        // records — every one now dedups, leaving the file byte-identical.
+        // Commit 13 deletes the WAL after the first run, so the second run finds
+        // an empty WAL dir and rebuilds the inventory from the segment files
+        // alone — still byte-identical, still cursor 2.
         let output = run(data_dir.clone(), &db).unwrap();
         assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), after_first);
         assert_eq!(output.inventory.get(&a), Some(2));
@@ -235,5 +243,54 @@ mod tests {
         let output = run(data_dir.clone(), &db).unwrap();
         assert_eq!(output.inventory.get(&a), Some(0));
         assert_eq!(last_id(&data_dir, a, 0), Some(0));
+    }
+
+    #[test]
+    fn recovery_clears_the_wal_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        write_wal(&data_dir, 1, &wal_batch(&[wal_data(a, 0, 1, "a0")]));
+        write_wal(&data_dir, 2, &wal_batch(&[wal_data(a, 1, 1, "a1")]));
+
+        let (_db_dir, db) = open_db();
+        run(data_dir.clone(), &db).unwrap();
+
+        // Every discovered WAL file is deleted; the dir is left empty (the fresh
+        // WAL is the serving side's job, commit 14).
+        let remaining: Vec<_> = fs::read_dir(data_dir.join("wal"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(remaining.is_empty(), "WAL dir not empty: {remaining:?}");
+        // The data itself survived in the segment file.
+        assert_eq!(last_id(&data_dir, a, 0), Some(1));
+    }
+
+    #[test]
+    fn converges_after_a_partial_wal_deletion() {
+        // Simulates a crash mid-deletion: the segment already holds entries 0 and
+        // 1, one old WAL file was already deleted, and only the survivor remains.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        write_segment(
+            &data_dir,
+            a,
+            0,
+            &[seg_batch("a0", 1), seg_batch("a1", 1)].concat(),
+        );
+        // The survivor re-presents entry 1 — already on disk, so it dedups.
+        write_wal(&data_dir, 2, &wal_batch(&[wal_data(a, 1, 1, "a1")]));
+        let before = fs::read(a.file_path(&data_dir, 0)).unwrap();
+
+        let (_db_dir, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+
+        // Zero appends (the survivor dedups), the segment is byte-identical, and
+        // the already-deleted half's data was safe in the segment all along.
+        assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), before);
+        assert_eq!(output.inventory.get(&a), Some(1));
+        assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
     }
 }

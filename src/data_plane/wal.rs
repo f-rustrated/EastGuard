@@ -198,56 +198,6 @@ impl WalWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn open_existing(data_dir: PathBuf, next_lsn: u64) -> io::Result<Self> {
-        let wal_dir = data_dir.join("wal");
-        fs::create_dir_all(&wal_dir)?;
-
-        let mut entries: Vec<(u64, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&wal_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Some(seq) = parse_wal_filename(&name_str) {
-                entries.push((seq, entry.path()));
-            }
-        }
-        entries.sort_by_key(|e| e.0);
-
-        let mut files = VecDeque::new();
-
-        for (seq, path) in &entries {
-            let meta = fs::metadata(path)?;
-            files.push_back(WalFileEntry {
-                seq: *seq,
-                min_lsn: 0,
-                max_lsn: 0,
-                size: meta.len(),
-                path: path.clone(),
-            });
-        }
-
-        let mut writer = WalWriter {
-            files,
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
-            next_lsn,
-            data_dir,
-            next_seq: entries.last().map(|(max_seq, _)| *max_seq).unwrap_or(0) + 1,
-            active_writer: None,
-            batch_buf: Vec::new(),
-        };
-
-        if writer.files.is_empty() {
-            writer.open_new_file()?;
-        } else {
-            let active = writer.files.back().expect("non-empty files");
-            let file = OpenOptions::new().append(true).open(&active.path)?;
-            writer.active_writer = Some(BufWriter::new(file));
-        }
-
-        Ok(writer)
-    }
-
     fn active_entry_mut(&mut self) -> &mut WalFileEntry {
         self.files.back_mut().expect("invariant: files non-empty")
     }
