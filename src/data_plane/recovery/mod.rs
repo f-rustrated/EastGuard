@@ -13,11 +13,12 @@ pub(crate) mod replay;
 pub(crate) mod segment_scan;
 pub(crate) mod wal_scan;
 use self::inventory::{LocalInventory, RecoveryOutput};
-use self::replay::ReplayWriter;
+use self::replay::{ReplayOutput, ReplayWriter};
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
 use crate::data_plane::sparse_index::SparseIndex;
 use crate::data_plane::states::segment::record::RoutingHeader;
+use std::io;
 use std::path::PathBuf;
 
 /// Fatal recovery failure. WAL *corruption* is deliberately not a variant: it is
@@ -30,66 +31,103 @@ pub(crate) enum RecoveryError {
 }
 
 /// Runs crash recovery and returns the verified local inventory.
+/// It is a small type-state pipeline so the order is enforced by the compiler, not by convention:
 ///
-/// This is the non-destructive half: safe on any disk, since it only reads the WAL and appends the records
-/// the segment files are missing. Pipeline:
-///
-/// 1. scan the segment files into a cursor map — what is already durable,
-/// 2. replay the WAL's un-checkpointed suffix into them, skipping duplicates,
-/// 3. re-index just that appended suffix (full rebuild stays the fallback),
-/// 4. freeze the post-replay cursors into a [`LocalInventory`].
-///
-/// WAL corruption is not fatal: a [`ScanError::Corrupt`] stops replay at the
-/// last verified batch, and recovery proceeds with what was already durable —
-/// it never aborts.
+// ! The safety-critical edge is that the WAL must not be deleted before the segment files are fsynced.
+// ! ```text
+// ! Replaying --replay_wal--> Durable --commit--> RecoveryOutput
+// ! ```
+// ! `commit` is the only thing that deletes the WAL - lives on [`Durable`], and the only way to reach `Durable` is `replay_wal`,
+// ! which fsyncs via `ReplayWriter::finish`. So "delete only after durable" is a compile-time fact, and each state has a narrow API: `Replaying` cannot
+// ! delete, `Durable` cannot replay.
 pub(crate) fn run(
     data_dir: PathBuf,
     index: &dyn SparseIndex,
 ) -> Result<RecoveryOutput, RecoveryError> {
-    let recovered = RecoveredSegments::scan_data_dir(&data_dir)?;
-    let mut writer = ReplayWriter::new(data_dir.clone(), recovered);
-    let mut scanner = WalScanner::open(&data_dir)?;
+    Ok(Replaying::start(data_dir)?.replay_wal()?.commit(index)?)
+}
 
-    loop {
-        match scanner.next_batch() {
-            Ok(Some(batch)) => {
-                for record in &batch.records {
-                    // ! Fail only if a record that already passed the WAL CRC has a payload shorter than the 36-byte header
-                    let (header, entry_data) = RoutingHeader::split_wal_payload(&record.payload)?;
+struct Replaying {
+    data_dir: PathBuf,
+    writer: ReplayWriter,
+    scanner: WalScanner,
+}
 
-                    // ! fails only on a real disk error
-                    writer.replay(&header, entry_data)?;
-                }
-            }
-            Ok(None) => break,
-            Err(ScanError::Corrupt { file, valid_bytes }) => {
-                tracing::warn!(
-                    file = %file.display(),
-                    valid_bytes,
-                    "WAL corruption: stopping replay, keeping what was verified before it",
-                );
-                // ! expected crash artifact (torn/CRC-bad) this is only "recover... only what you can" case
-                break;
-            }
-            // ! Genuine I/O failure, fatal
-            Err(ScanError::Io(e)) => return Err(e.into()),
-        }
+impl Replaying {
+    fn start(data_dir: PathBuf) -> io::Result<Self> {
+        let recovered = RecoveredSegments::scan_data_dir(&data_dir)?;
+        let writer = ReplayWriter::new(data_dir.clone(), recovered);
+        let scanner = WalScanner::open(&data_dir)?;
+        Ok(Self {
+            data_dir,
+            writer,
+            scanner,
+        })
     }
 
-    let output = writer.finish()?;
-    index.put_batch(output.suffix_index.into_vec())?;
-    let inventory = LocalInventory::from_recovered(&output.recovered);
+    /// Replays every WAL batch into the segment files (skipping duplicates) and
+    /// fsyncs them via [`ReplayWriter::finish`] — only after which is the WAL
+    /// deletable.
+    // ! WAL corruption is not fatal: it stops replay at the last verified batch
+    // ! and proceeds with what was already durable.
+    fn replay_wal(mut self) -> io::Result<Durable> {
+        loop {
+            match self.scanner.next_batch() {
+                Ok(Some(batch)) => {
+                    for record in &batch.records {
+                        // Fails only if a record that already passed the WAL CRC
+                        // has a payload shorter than the 36-byte routing header.
+                        let (header, entry_data) =
+                            RoutingHeader::split_wal_payload(&record.payload)?;
+                        // Fails only on a real disk error.
+                        self.writer.replay(&header, entry_data)?;
+                    }
+                }
+                Ok(None) => break,
+                Err(ScanError::Corrupt { file, valid_bytes }) => {
+                    // Expected crash artifact (torn / CRC-bad tail) — the only
+                    // "recover what you can" case.
+                    tracing::warn!(
+                        file = %file.display(),
+                        valid_bytes,
+                        "WAL corruption: stopping replay, keeping what was verified before it",
+                    );
+                    break;
+                }
+                // Genuine I/O failure — fatal.
+                Err(ScanError::Io(e)) => return Err(e),
+            }
+        }
 
-    // The WAL's contents are now durable in the segment files (finish fsynced
-    // them), so the WAL is superseded — delete it. The fresh WAL is created
-    // later by the serving side (DataPlane, commit 14), leaving the dir empty in
-    // between (an empty WAL just means nothing to replay).
-    scanner.delete_files()?;
+        let output = self.writer.finish()?;
+        Ok(Durable {
+            data_dir: self.data_dir,
+            scanner: self.scanner,
+            output,
+        })
+    }
+}
 
-    Ok(RecoveryOutput {
-        inventory,
-        data_dir,
-    })
+struct Durable {
+    data_dir: PathBuf,
+    scanner: WalScanner,
+    output: ReplayOutput,
+}
+
+impl Durable {
+    /// Re-indexes the replayed suffix, freezes the cursors into a
+    /// [`LocalInventory`], then DELETEs the now-superseded WAL. The fresh WAL is
+    /// the serving side's job (commit 14), leaving the dir empty in between — an
+    /// empty WAL just means nothing to replay.
+    fn commit(self, index: &dyn SparseIndex) -> io::Result<RecoveryOutput> {
+        index.put_batch(self.output.suffix_index.into_vec())?;
+        let inventory = LocalInventory::from_recovered(&self.output.recovered);
+        self.scanner.delete_files()?;
+        Ok(RecoveryOutput {
+            inventory,
+            data_dir: self.data_dir,
+        })
+    }
 }
 
 #[cfg(test)]
