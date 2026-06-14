@@ -141,7 +141,7 @@ mod tests {
     use super::*;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::SegmentKey;
-    use crate::data_plane::wal::WalRecord;
+    use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
 
     /// One bare-payload `(Data, BatchEnd)` batch — the segment-file framing the
     /// checkpoint worker writes (no routing header).
@@ -330,5 +330,102 @@ mod tests {
         assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), before);
         assert_eq!(output.inventory.get(&a), Some(1));
         assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Crash simulation: produce through the real WAL writer,
+    // "kill" the process at a chosen point, recover, and assert the recovered
+    // state equals exactly what was ACKed — no more, no less.
+    // ---------------------------------------------------------------
+
+    /// Produces entries through the real `WalWriter` — one fsynced batch per
+    /// inner slice, exactly like the live produce path — then drops it. Dropping
+    /// with no graceful shutdown or WAL cleanup *is* the crash: the fsynced files
+    /// stay on disk as they were the instant the process died.
+    fn produce_and_crash(data_dir: &Path, batches: &[&[(SegmentKey, u64, &str)]]) {
+        let mut wal = WalWriter::new(data_dir.to_path_buf()).unwrap();
+        for batch in batches {
+            for &(key, entry_id, payload) in *batch {
+                let wp = RoutingHeader::new(key, entry_id, 1).build_wal_payload(payload.as_bytes());
+                WalRecord::data(wp, 1).encode_to(wal.buf()).unwrap();
+            }
+            WalRecord::batch_end().encode_to(wal.buf()).unwrap();
+            wal.flush_batch().unwrap();
+        }
+    }
+
+    /// Appends a half-written record to the single WAL file — bytes that were in
+    /// flight when the crash struck and never reached their fsync.
+    fn append_torn_tail(data_dir: &Path, key: SegmentKey, entry_id: u64) {
+        let mut torn = wal_batch(&[wal_data(key, entry_id, 1, "torn")]);
+        torn.truncate(torn.len() - 4);
+        let path = data_dir.join("wal").join("wal-000001.log");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &torn).unwrap();
+    }
+
+    #[test]
+    fn crash_mid_batch_recovers_acked_and_drops_the_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+
+        // ACKed: entries 0 and 1 (two fsynced batches). Then a torn write of 2
+        // that the crash interrupted before its fsync.
+        produce_and_crash(&data_dir, &[&[(a, 0, "a0")], &[(a, 1, "a1")]]);
+        append_torn_tail(&data_dir, a, 2);
+
+        let (_db, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+
+        // Exactly the ACKed prefix survives; the never-fsynced entry 2 is gone.
+        assert_eq!(output.inventory.get(&a), Some(1));
+        assert_eq!(last_id(&data_dir, a, 0), Some(1));
+    }
+
+    #[test]
+    fn crash_after_checkpoint_recovers_the_uncheckpointed_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+
+        // The checkpoint worker had flushed entry 0 to the segment file...
+        write_segment(&data_dir, a, 0, &seg_batch("a0", 1));
+        // ...but the WAL (entries 0..=2, all ACKed) was not yet deleted at the crash.
+        produce_and_crash(&data_dir, &[&[(a, 0, "a0"), (a, 1, "a1"), (a, 2, "a2")]]);
+
+        let (_db, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+
+        // Entry 0 dedups against the checkpoint; 1 and 2 are replayed from the WAL.
+        assert_eq!(output.inventory.get(&a), Some(2));
+        assert_eq!(last_id(&data_dir, a, 0), Some(2));
+        assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn crash_mid_recovery_truncates_torn_segment_then_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+
+        // The WAL holds ACKed entries 0 and 1.
+        produce_and_crash(&data_dir, &[&[(a, 0, "a0"), (a, 1, "a1")]]);
+        // A previous recovery had begun appending to the segment but crashed
+        // mid-write: entry 0 is complete, followed by a half-written fragment.
+        let mut seg = seg_batch("a0", 1);
+        seg.extend_from_slice(b"torn-half-written-entry");
+        write_segment(&data_dir, a, 0, &seg);
+
+        let (_db, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+
+        // The torn segment tail is truncated to the verified prefix, then entry 1
+        // is re-replayed from the WAL — converging to the full ACKed sequence.
+        assert_eq!(output.inventory.get(&a), Some(1));
+        assert_eq!(last_id(&data_dir, a, 0), Some(1));
     }
 }
