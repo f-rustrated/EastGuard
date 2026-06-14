@@ -62,6 +62,15 @@ impl RoutingHeader {
             record_count: u32::from_be_bytes(data[32..36].try_into().unwrap()),
         })
     }
+
+    /// Splits a WAL record payload (as built by [`RoutingHeader::build_wal_payload`])
+    /// back into its routing header and the bare entry data that follows it — the
+    /// inverse of `build_wal_payload`. Recovery replay uses it to route a WAL
+    /// record by its header while writing only the bare data the segment keeps.
+    pub(crate) fn split_wal_payload(payload: &[u8]) -> io::Result<(Self, &[u8])> {
+        let header = Self::decode(payload)?;
+        Ok((header, &payload[ROUTING_HEADER_SIZE..]))
+    }
 }
 
 pub(crate) struct StagedEntry {

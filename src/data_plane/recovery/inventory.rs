@@ -13,6 +13,12 @@ impl LocalInventory {
     pub(crate) fn from_recovered(recovered: &RecoveredSegments) -> Self {
         Self(recovered.cursors().collect())
     }
+
+    /// Highest verified entry id held for `key`, or `None` if the segment holds
+    /// no verified data locally.
+    pub(crate) fn get(&self, key: &SegmentKey) -> Option<u64> {
+        self.0.get(key).copied()
+    }
 }
 
 // [`RecoveryOutput`] bundles [`LocalInventory`] with the data dir and is what `DataPlane::new`
