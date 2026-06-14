@@ -108,6 +108,16 @@ impl RecoveredSegments {
         self.0.get(key).map(|scan| scan.start_offset)
     }
 
+    /// `(segment, highest verified entry id)` for every segment that has a
+    /// verified prefix. Segments with no complete batch (`last_entry_id` is
+    /// `None`) are omitted — they hold no durable data. This post-replay cursor
+    /// map is what the local inventory (`inventory.rs`) is built from.
+    pub(crate) fn cursors(&self) -> impl Iterator<Item = (SegmentKey, u64)> + '_ {
+        self.0
+            .iter()
+            .filter_map(|(key, scan)| scan.last_entry_id.map(|id| (*key, id)))
+    }
+
     /// Records that `entry_id` was just appended to `key`'s segment file,
     /// advancing its cursor.
     ///
@@ -523,5 +533,19 @@ mod tests {
     fn advance_rejects_a_gap() {
         let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
         r.advance(seg_key(), 6); // skips 5
+    }
+
+    #[test]
+    fn cursors_yields_only_verified_segments() {
+        let verified = seg_key();
+        let unverified = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(9));
+        let r = recovered_with(&[
+            (verified, scanned(10, Some(14), 256)),
+            (unverified, scanned(0, None, 0)),
+        ]);
+
+        let cursors: std::collections::HashMap<SegmentKey, u64> = r.cursors().collect();
+        assert_eq!(cursors.len(), 1); // the unverified segment is omitted
+        assert_eq!(cursors.get(&verified), Some(&14));
     }
 }
