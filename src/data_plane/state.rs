@@ -336,8 +336,22 @@ impl<W: WalStorage> DataPlane<W> {
                 self.out
                     .store_coordinator_cmd(MultiRaftActorCommand::AssignmentAck(cmd));
             }
+
+            // Catch-ups — re-replicate a sealed segment to a newly assigned replica.
+            // routing exist now so the wire is stable.
+            C::CatchUpAssignment(cmd) => self.handle_catch_up_assignment(cmd),
+            C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
+            C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
+            C::CatchUpDone(cmd) => self.handle_catch_up_done(cmd),
         }
     }
+    fn handle_catch_up_assignment(&mut self, _cmd: CatchUpAssignment) {}
+
+    fn handle_catch_up_request(&mut self, _cmd: CatchUpRequest) {}
+
+    fn handle_catch_up_chunk(&mut self, _cmd: CatchUpChunk) {}
+
+    fn handle_catch_up_done(&mut self, _cmd: CatchUpDone) {}
 
     fn handle_replica_ack(&mut self, cmd: ReplicaAck) {
         let Some(committed) = self.replication.process_ack(&cmd.segment_key, &cmd.from) else {

@@ -81,6 +81,62 @@ pub struct SegmentSealed {
     pub segment_key: SegmentKey,
 }
 
+// Catch-up: re-replicate a sealed segment to a newly assigned replica
+//
+// When a node is assigned a sealed segment it does not yet hold completely (a death-driven reassignment, or recovered data reclaimed via the catch-up lottery),
+// it brings its local copy up to the sealed end by fetching the missing suffix from a healthy replica. Four messages, all riding the
+// `DataPlaneInterNodeCommand` wire (bounded by `DATA_FRAME_MAX`):
+//
+//   coordinator ─CatchUpAssignment─▶ replacement  "you own `key`; fetch from `source`"
+//   replacement ─CatchUpRequest────▶ source       "I have through `local_end`; send the rest"
+//   source      ─CatchUpChunk(s)───▶ replacement  bounded batches of entries
+//   source      ─CatchUpDone───────▶ replacement  end of stream; verify, then report complete
+//
+// This commit defines the types, encoding, and routing only — handlers are
+// stubbed; the source side lands in commit 20 and the replacement side
+// (inventory-aware, per the implementation plan §25) in commit 21.
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpAssignment {
+    pub segment_key: SegmentKey,
+    /// Base entry id of the sealed segment — lets the replacement create and
+    /// position the segment file when it holds no local copy at all.
+    pub start_offset: u64,
+    /// Committed end entry id of the sealed segment: the catch-up target.
+    pub sealed_end: u64,
+    /// A healthy replica to fetch the missing suffix from.
+    pub source: NodeId,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpRequest {
+    pub segment_key: SegmentKey,
+    /// Highest entry id already held locally; the source streams entries with
+    /// `entry_id > local_end`. `None` means nothing is held locally — stream
+    /// from the segment's start (avoids underflow when `start_offset == 0`).
+    pub local_end: Option<u64>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpEntry {
+    pub entry_id: u64,
+    pub data: EntryPayload,
+    pub record_count: u32,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpChunk {
+    pub segment_key: SegmentKey,
+    /// Contiguous entries in ascending `entry_id` order. The source caps each
+    /// chunk so the encoded frame stays under `DATA_FRAME_MAX`.
+    pub entries: Vec<CatchUpEntry>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpDone {
+    pub segment_key: SegmentKey,
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
@@ -91,6 +147,10 @@ pub enum DataPlaneInterNodeCommand {
     SealRequest(SealRequest),
     SealResponse(SealResponse),
     SegmentSealed(SegmentSealed),
+    CatchUpAssignment(CatchUpAssignment),
+    CatchUpRequest(CatchUpRequest),
+    CatchUpChunk(CatchUpChunk),
+    CatchUpDone(CatchUpDone),
 }
 
 impl_from_variant!(
@@ -103,6 +163,10 @@ impl_from_variant!(
     SealRequest,
     SealResponse,
     SegmentSealed,
+    CatchUpAssignment,
+    CatchUpRequest,
+    CatchUpChunk,
+    CatchUpDone,
 );
 
 #[derive(Debug)]
