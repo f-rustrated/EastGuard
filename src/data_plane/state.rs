@@ -1,5 +1,6 @@
 use super::SegmentKey;
-use super::cold_read::ColdReadRequest;
+use super::actor::DataPlaneSender;
+use super::cold_read::{CatchUpReadReply, ColdReadReply, ColdReadRequest};
 use super::messages::DataPlaneMessage;
 use super::messages::command::DataPlaneInterNodeCommand;
 use super::messages::command::*;
@@ -26,6 +27,10 @@ use crate::schedulers::ticker_message::TimerCommand;
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashMap;
 
+/// Same rational as the Raft transport's 4MiB cap, Per-`CatchUpChunk` read cap.
+/// A large segment streams as several chunks via the read-complete re-arm loop.
+const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 struct PendingSealRequest {
     sent_at: std::time::Instant,
     failed_nodes: Vec<NodeId>,
@@ -50,7 +55,7 @@ pub struct DataPlane<W: WalStorage> {
     /// reads the segment file and fulfils the consumer's reply directly, so this
     /// synchronous worker never blocks on disk I/O.
     cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
-
+    self_tx: DataPlaneSender,
     out: DataPlaneOutputs,
 
     /// The verified local inventory recovery handed us (segment → highest durable entry id).
@@ -65,6 +70,7 @@ impl<W: WalStorage> DataPlane<W> {
         config: DataNodeConfig,
         wal: W,
         cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+        self_tx: DataPlaneSender,
         out: DataPlaneOutputs,
         recovered: LocalInventory,
     ) -> Self {
@@ -79,6 +85,7 @@ impl<W: WalStorage> DataPlane<W> {
             replication: ReplicationState::default(),
             pending_seal_requests: HashMap::new(),
             cold_read_handoff_sender,
+            self_tx,
             out,
             recovered,
         }
@@ -103,6 +110,9 @@ impl<W: WalStorage> DataPlane<W> {
             }
             DataPlaneCommand::DataPlaneInterNodeCommand(inter) => {
                 self.process_inter_node(inter);
+            }
+            DataPlaneCommand::CatchUpReadComplete(cmd) => {
+                self.handle_catch_up_read_complete(cmd);
             }
         }
 
@@ -249,13 +259,17 @@ impl<W: WalStorage> DataPlane<W> {
             start_entry_offset: cmd.entry_id,
             end_entry_id,
             max_bytes: cmd.max_bytes as u64,
-            progress_signal: cmd.progress_signal,
-            reply: cmd.reply,
+            reply: ColdReadReply::Consumer {
+                reply: cmd.reply,
+                progress_signal: cmd.progress_signal,
+            },
         };
         if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req) {
-            let _ = req.reply.send(FetchResult::InternalError(
-                "cold-read pool unavailable".into(),
-            ));
+            if let ColdReadReply::Consumer { reply, .. } = req.reply {
+                let _ = reply.send(FetchResult::InternalError(
+                    "cold-read pool unavailable".into(),
+                ));
+            }
         }
     }
 
@@ -337,21 +351,112 @@ impl<W: WalStorage> DataPlane<W> {
                     .store_coordinator_cmd(MultiRaftActorCommand::AssignmentAck(cmd));
             }
 
-            // Catch-ups — re-replicate a sealed segment to a newly assigned replica.
-            // routing exist now so the wire is stable.
+            // Catch-ups: re-replicate a sealed segment to a newly assigned replica.
             C::CatchUpAssignment(cmd) => self.handle_catch_up_assignment(cmd),
             C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
             C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
             C::CatchUpDone(cmd) => self.handle_catch_up_done(cmd),
         }
     }
-    fn handle_catch_up_assignment(&mut self, _cmd: CatchUpAssignment) {}
 
-    fn handle_catch_up_request(&mut self, _cmd: CatchUpRequest) {}
+    // Replacement-side handlers
+    fn handle_catch_up_assignment(&mut self, _cmd: CatchUpAssignment) {}
 
     fn handle_catch_up_chunk(&mut self, _cmd: CatchUpChunk) {}
 
     fn handle_catch_up_done(&mut self, _cmd: CatchUpDone) {}
+
+    /// Source side: a peer wants `cmd.segment_key` brought up to its local end.
+    fn handle_catch_up_request(&mut self, cmd: CatchUpRequest) {
+        let Some((start_offset, sealed_end)) = self.segments.sealed_bounds(&cmd.segment_key) else {
+            tracing::warn!(
+                "catch-up source has no sealed segment {:?}; dropping request",
+                cmd.segment_key
+            );
+            return;
+        };
+        let start = cmd.local_end.map_or(start_offset, |held| held + 1);
+        if start > sealed_end {
+            // The requester is already at or past OUR committed end — nothing to
+            // stream. Confirm completion immediately and skip a pointless cold-read
+            // dispatch.
+            self.send_catch_up_done(cmd.from, cmd.segment_key);
+            return;
+        }
+        self.dispatch_catch_up_read(cmd.from, cmd.segment_key, start_offset, sealed_end, start);
+    }
+
+    /// Hand one bounded segment read to the cold-read pool, routed back to this
+    /// worker (not a consumer) via `ColdReadReply::CatchUp`.
+    fn dispatch_catch_up_read(
+        &self,
+        requester: NodeId,
+        segment_key: SegmentKey,
+        start_offset: u64, // Segment base — names the file (`{segment_id}-{start_offset}.seg`)
+        sealed_end: u64,
+        read_from: u64,
+    ) {
+        let req = ColdReadRequest {
+            segment_key,
+            segment_file_path: segment_key.file_path(&self.config.data_dir, start_offset),
+            start_entry_offset: read_from,
+            end_entry_id: sealed_end,
+            max_bytes: CATCH_UP_CHUNK_MAX_BYTES,
+            reply: ColdReadReply::CatchUp(CatchUpReadReply {
+                requester,
+                start_offset,
+                sealed_end,
+                mailbox: self.self_tx.clone(),
+            }),
+        };
+        if self.cold_read_handoff_sender.send(req).is_err() {
+            tracing::warn!("cold-read pool unavailable; catch-up for {segment_key:?} dropped");
+        }
+    }
+
+    /// The cold-read pool finished one batch for a catch-up source read. Emit it
+    /// as a `CatchUpChunk` to the requester, then re-arm the next read until the
+    /// sealed end is reached, at which point send `CatchUpDone`.
+    fn handle_catch_up_read_complete(&mut self, cmd: CatchUpReadComplete) {
+        let has_entry = cmd.entries.is_empty();
+        if !has_entry {
+            let entries = cmd
+                .entries
+                .into_iter()
+                .map(CatchUpEntry::from_cache)
+                .collect();
+            self.out
+                .store_transport_cmd(DataTransportCommand::send_to_targets(
+                    vec![cmd.requester.clone()],
+                    CatchUpChunk {
+                        segment_key: cmd.segment_key,
+                        entries,
+                    },
+                ));
+        }
+
+        // Re-arm only while a non-empty batch left more below the sealed end;
+        // `next_offset` strictly advances per non-empty batch, so this terminates.
+        if !has_entry && cmd.next_offset <= cmd.sealed_end {
+            self.dispatch_catch_up_read(
+                cmd.requester,
+                cmd.segment_key,
+                cmd.start_offset,
+                cmd.sealed_end,
+                cmd.next_offset,
+            );
+        } else {
+            self.send_catch_up_done(cmd.requester, cmd.segment_key);
+        }
+    }
+
+    fn send_catch_up_done(&mut self, requester: NodeId, segment_key: SegmentKey) {
+        self.out
+            .store_transport_cmd(DataTransportCommand::send_to_targets(
+                vec![requester],
+                CatchUpDone { segment_key },
+            ));
+    }
 
     fn handle_replica_ack(&mut self, cmd: ReplicaAck) {
         let Some(committed) = self.replication.process_ack(&cmd.segment_key, &cmd.from) else {
@@ -844,11 +949,14 @@ mod tests {
         // whose receiver we leak keeps any dispatched request from panicking.
         let (cold_read_tx, _cold_read_rx) = crossbeam_channel::unbounded();
         std::mem::forget(_cold_read_rx);
+        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        std::mem::forget(_self_rx);
         DataPlane::new(
             test_node_id(),
             test_config(dir.path().to_path_buf()),
             wal,
             cold_read_tx,
+            DataPlaneSender(self_tx),
             out,
             empty_inventory(),
         )
@@ -1714,11 +1822,14 @@ mod tests {
         let cold_read_tx = ColdReadPool::spawn(DEFAULT_POOL_SIZE, Arc::clone(&sparse));
 
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
+        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
             test_config(dir.path().to_path_buf()),
             wal,
             cold_read_tx,
+            DataPlaneSender(self_tx),
             DataPlaneOutputs::test(),
             empty_inventory(),
         );
@@ -1806,5 +1917,231 @@ mod tests {
             "cold read must restore payloads AND record_counts from disk"
         );
         assert_eq!(next_entry_id, 3);
+    }
+
+    // ── Catch-up source side (commit 20) ──────────────────────────────────
+
+    /// Build a data plane that captures cold-read dispatches and already holds a
+    /// sealed segment `test_key()` spanning `[0, 10]` — a stand-in for a healthy
+    /// catch-up source resolving its own committed bounds.
+    fn source_with_sealed_segment(
+        dir: &tempfile::TempDir,
+    ) -> (
+        DataPlane<WalWriter>,
+        crossbeam_channel::Receiver<ColdReadRequest>,
+    ) {
+        let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
+        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        std::mem::forget(_self_rx);
+        let mut dp = DataPlane::new(
+            test_node_id(),
+            test_config(dir.path().to_path_buf()),
+            wal,
+            cold_read_tx,
+            DataPlaneSender(self_tx),
+            DataPlaneOutputs::test(),
+            empty_inventory(),
+        );
+        let mut tracker = SegmentTracker::new_with_start_entry_id(
+            dir.path().to_path_buf(),
+            SegmentRole::Leader,
+            vec![],
+            ShardGroupId(1),
+            0,
+        );
+        tracker.commit_entry(10);
+        dp.segments.insert_active(test_key(), tracker);
+        dp.segments.take_active_and_seal(test_key());
+        (dp, cold_read_rx)
+    }
+
+    /// The source resolves the read window from its OWN committed bounds (not
+    /// values relayed by the requester) plus the requester's `local_end`, then
+    /// hands the read to the pool routed back here.
+    #[test]
+    fn catch_up_request_dispatches_read_from_its_own_sealed_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
+
+        let requester = NodeId::new("replacement");
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpRequest {
+                segment_key: test_key(),
+                from: requester.clone(),
+                local_end: Some(4),
+            }
+            .into(),
+        ));
+
+        let req = cold_read_rx.try_recv().expect("dispatched cold read");
+        assert_eq!(req.start_entry_offset, 5); // requester's local_end + 1
+        assert_eq!(req.end_entry_id, 10); // the source's own sealed end
+        assert!(matches!(
+            req.reply,
+            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == 10
+        ));
+    }
+
+    /// A requester already at (or past) the source's committed end gets an
+    /// immediate `CatchUpDone` and no read is dispatched — the source short-
+    /// circuits on its OWN `sealed_end`, not on anything the requester relayed.
+    #[test]
+    fn catch_up_request_already_caught_up_sends_done_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
+
+        let requester = NodeId::new("replacement");
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpRequest {
+                segment_key: test_key(),
+                from: requester.clone(),
+                local_end: Some(10), // == the source's sealed end
+            }
+            .into(),
+        ));
+
+        // Nothing handed to the pool...
+        assert!(cold_read_rx.try_recv().is_err());
+        // ...and a CatchUpDone went straight back to the requester.
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert_eq!(s.targets[0], requester);
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpDone(d) if d.segment_key == test_key()
+        ));
+    }
+
+    /// A batch whose `next_offset` is past the sealed end emits one `CatchUpChunk`
+    /// (entries intact, with `record_count`) followed by `CatchUpDone` — no re-arm.
+    #[test]
+    fn catch_up_read_complete_emits_chunk_then_done() {
+        use crate::data_plane::states::segment::cache::CachedEntry;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let requester = NodeId::new("replacement");
+
+        let entries = vec![
+            Arc::new(CachedEntry {
+                data: Bytes::copy_from_slice(b"a").into(),
+                record_count: 1,
+                entry_id: 0,
+                lsn: 0,
+            }),
+            Arc::new(CachedEntry {
+                data: Bytes::copy_from_slice(b"bb").into(),
+                record_count: 2,
+                entry_id: 1,
+                lsn: 0,
+            }),
+            Arc::new(CachedEntry {
+                data: Bytes::copy_from_slice(b"ccc").into(),
+                record_count: 3,
+                entry_id: 2,
+                lsn: 0,
+            }),
+        ];
+        dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
+            requester: requester.clone(),
+            segment_key: test_key(),
+            start_offset: 0,
+            sealed_end: 2,
+            entries,
+            next_offset: 3,
+        }));
+
+        assert_eq!(dp.out.transport_cmds.len(), 2);
+
+        let DataTransportCommand::SendToTargets(chunk) = &dp.out.transport_cmds[0] else {
+            panic!("expected chunk SendToTargets");
+        };
+        assert_eq!(chunk.targets[0], requester);
+        let DataPlaneInterNodeCommand::CatchUpChunk(c) = &chunk.message else {
+            panic!("expected CatchUpChunk");
+        };
+        assert_eq!(c.segment_key, test_key());
+        let got: Vec<(u64, u32, Vec<u8>)> = c
+            .entries
+            .iter()
+            .map(|e| (e.entry_id, e.record_count, e.data.to_vec()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, b"a".to_vec()),
+                (1, 2, b"bb".to_vec()),
+                (2, 3, b"ccc".to_vec()),
+            ]
+        );
+
+        let DataTransportCommand::SendToTargets(done) = &dp.out.transport_cmds[1] else {
+            panic!("expected done SendToTargets");
+        };
+        assert!(matches!(
+            &done.message,
+            DataPlaneInterNodeCommand::CatchUpDone(_)
+        ));
+    }
+
+    /// A batch that ends below the sealed end emits its chunk and re-arms the next
+    /// read against the pool, resuming at `next_offset` — no `CatchUpDone` yet.
+    #[test]
+    fn catch_up_read_complete_re_arms_until_sealed_end() {
+        use crate::data_plane::states::segment::cache::CachedEntry;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
+        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        std::mem::forget(_self_rx);
+        let mut dp = DataPlane::new(
+            test_node_id(),
+            test_config(dir.path().to_path_buf()),
+            wal,
+            cold_read_tx,
+            DataPlaneSender(self_tx),
+            DataPlaneOutputs::test(),
+            empty_inventory(),
+        );
+        let requester = NodeId::new("replacement");
+
+        dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
+            requester: requester.clone(),
+            segment_key: test_key(),
+            start_offset: 0,
+            sealed_end: 9,
+            entries: vec![Arc::new(CachedEntry {
+                data: Bytes::copy_from_slice(b"x").into(),
+                record_count: 1,
+                entry_id: 4,
+                lsn: 0,
+            })],
+            next_offset: 5,
+        }));
+
+        // One chunk, no Done yet.
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToTargets(chunk) = &dp.out.transport_cmds[0] else {
+            panic!("expected chunk SendToTargets");
+        };
+        assert!(matches!(
+            &chunk.message,
+            DataPlaneInterNodeCommand::CatchUpChunk(_)
+        ));
+
+        // The next read was re-armed against the pool, resuming at next_offset.
+        let req = cold_read_rx.try_recv().expect("re-armed cold read");
+        assert_eq!(req.start_entry_offset, 5);
+        assert_eq!(req.end_entry_id, 9);
+        assert!(matches!(
+            req.reply,
+            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == 9
+        ));
     }
 }

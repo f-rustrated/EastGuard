@@ -206,6 +206,21 @@ impl SegmentStore {
         })
     }
 
+    /// Look up a sealed segment's `(start_entry_id, end_entry_id)` by key.
+    /// The catch-up source path uses this to stream `(local_end, end]` from its own
+    /// committed bounds rather than bounds relayed by the requester — so it always
+    /// clips to its own end.
+    ///
+    /// `None` if this node holds no sealed segment with that id (GC'd, never had it, or a race), in
+    /// which case the source declines and the requester re-drives. O(n) in the
+    /// range's sealed segments; catch-up is death-driven and rare.
+    pub(crate) fn sealed_bounds(&self, key: &SegmentKey) -> Option<(u64, u64)> {
+        let sealed = self.sealed_by_range.get(&(key.topic_id, key.range_id))?;
+        sealed.iter().find_map(|(&start, loc)| {
+            (loc.segment_id == key.segment_id).then_some((start, loc.end_entry_id))
+        })
+    }
+
     // ── Invariants ────────────────────────────────────────────────────────
 
     /// D4 invariants on the (range, offset) → segment resolver indexes.
@@ -363,5 +378,21 @@ mod tests {
             matches!(r, SegmentReadState::Active(g) if g == successor),
             "unindexing a different segment id must not evict the successor",
         );
+    }
+
+    #[test]
+    fn sealed_bounds_finds_start_and_end_by_key() {
+        let mut store = SegmentStore::new();
+        let k = key(1, 0, 7);
+        let mut t = tracker(20);
+        t.commit_entry(99);
+        store.insert_active(k, t);
+        store.take_active_and_seal(k);
+
+        assert_eq!(store.sealed_bounds(&k), Some((20, 99)));
+        // Same range, a segment id this node never sealed → None.
+        assert_eq!(store.sealed_bounds(&key(1, 0, 8)), None);
+        // A range with no sealed segments at all → None.
+        assert_eq!(store.sealed_bounds(&key(2, 0, 7)), None);
     }
 }

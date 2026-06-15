@@ -1,12 +1,15 @@
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use bincode::{Decode, Encode};
+use std::borrow::Borrow;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
     control_plane::metadata::SegmentId,
+    data_plane::states::segment::cache::CachedEntry,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
@@ -15,6 +18,9 @@ pub enum DataPlaneCommand {
     CheckpointComplete(CheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
+    /// Internal (not a wire message): the cold-read pool's reply for a catch-up
+    /// source read. The worker turns it into `CatchUpChunk`s on the transport.
+    CatchUpReadComplete(CatchUpReadComplete),
 }
 
 pub struct Produce {
@@ -111,25 +117,34 @@ pub struct CatchUpAssignment {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpRequest {
     pub segment_key: SegmentKey,
-    /// Highest entry id already held locally; the source streams entries with
-    /// `entry_id > local_end`. `None` means nothing is held locally — stream
-    /// from the segment's start (avoids underflow when `start_offset == 0`).
+    /// The requesting node — the source streams its `CatchUpChunk`s back here.
+    pub from: NodeId,
+    /// Highest entry id the requester already holds locally; the source streams
+    /// `(local_end, sealed_end]`. `None` means nothing is held.
     pub local_end: Option<u64>,
 }
 
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpChunk {
+    pub segment_key: SegmentKey,
+    /// Contiguous entries in ascending `entry_id` order.
+    pub entries: Box<[CatchUpEntry]>,
+}
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpEntry {
     pub entry_id: u64,
     pub data: EntryPayload,
     pub record_count: u32,
 }
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct CatchUpChunk {
-    pub segment_key: SegmentKey,
-    /// Contiguous entries in ascending `entry_id` order. The source caps each
-    /// chunk so the encoded frame stays under `DATA_FRAME_MAX`.
-    pub entries: Vec<CatchUpEntry>,
+impl CatchUpEntry {
+    pub(crate) fn from_cache(cache: impl Borrow<CachedEntry>) -> Self {
+        let cache = cache.borrow();
+        CatchUpEntry {
+            entry_id: cache.entry_id,
+            data: cache.data.clone(),
+            record_count: cache.record_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -186,10 +201,21 @@ pub struct CheckpointComplete {
     pub checkpointed_lsn: u64,
 }
 
+/// The cold-read pool's reply for a catch-up *source* read.
+pub struct CatchUpReadComplete {
+    pub requester: NodeId,
+    pub segment_key: SegmentKey,
+    pub start_offset: u64,
+    pub sealed_end: u64,
+    pub entries: Vec<Arc<CachedEntry>>,
+    pub next_offset: u64,
+}
+
 impl_from_variant!(
     DataPlaneCommand,
     Produce,
     CheckpointComplete,
+    CatchUpReadComplete,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );
@@ -199,15 +225,7 @@ use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentA
 impl_from_variant_via!(
     DataPlaneCommand,
     DataPlaneTimeoutCallback,
-    BatchFlushCallback
-);
-impl_from_variant_via!(
-    DataPlaneCommand,
-    DataPlaneTimeoutCallback,
-    ReplicationCallback
-);
-impl_from_variant_via!(
-    DataPlaneCommand,
-    DataPlaneTimeoutCallback,
+    BatchFlushCallback,
+    ReplicationCallback,
     SegmentAgeCallback
 );
