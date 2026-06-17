@@ -478,11 +478,17 @@ impl Raft {
         self.peers_iter().filter(|p| !live.contains(*p))
     }
 
+    /// Active segments across all topics whose `replica_set` contains at
+    /// least one non-live member.
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
     ) -> Box<[(SegmentKey, ReplicaSet)]> {
-        self.state_machine.active_segments_with_dead_members(live)
+        self.state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.active_segments_with_dead_members(live))
+            .collect()
     }
 
     pub(crate) fn has_topic(&self, topic_id: &crate::control_plane::metadata::TopicId) -> bool {

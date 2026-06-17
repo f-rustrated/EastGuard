@@ -7,14 +7,12 @@ use crate::control_plane::metadata::{RangeId, SegmentId, TopicId, error::Metadat
 use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-
 use MetadataError::*;
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct MetadataStateMachine {
-    topics: HashMap<TopicId, TopicMeta>,
+    pub(crate) topics: HashMap<TopicId, TopicMeta>,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
     pending_proposals: Vec<MetadataCommand>,
@@ -63,18 +61,6 @@ impl MetadataStateMachine {
         self.topics
             .values()
             .flat_map(|t| t.active_segment_assignments())
-            .collect()
-    }
-
-    /// Active segments across all topics whose `replica_set` contains at
-    /// least one non-live member.
-    pub(crate) fn active_segments_with_dead_members(
-        &self,
-        live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
-        self.topics
-            .values()
-            .flat_map(|t| t.active_segments_with_dead_members(live))
             .collect()
     }
 
