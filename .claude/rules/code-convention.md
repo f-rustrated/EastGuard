@@ -50,3 +50,24 @@ In such cases:
 - Log the read-only failure instead of propagating it, if the mutation was the primary intent and succeeded.
 - Or restructure so that the fallible read-only check runs *before* the mutation.
 - Never let a post-mutation diagnostic failure abort the operation that already committed.
+
+## Prefer a declarative model over delta changes
+
+When a coordinator/leader drives a change across other components, publish the
+**desired end state** and let each receiver idempotently reconcile its local
+reality against it — don't compute an imperative diff (what changed, who-does-what)
+and dispatch tailored per-receiver instructions.
+
+Why: the declarative form is idempotent by construction (re-publishing the same
+desired state is a no-op for already-converged receivers), so it self-heals across
+re-drives and lost messages; and it puts decisions (e.g. which peer to copy from)
+on the receiver, which has the freshest local context and can retry. Imperative
+diffs re-derive relationships already known at construction, are fragile to
+recompute, and can't recover from a dropped message.
+
+When you must still reject stale, duplicate, or out-of-order application, reach for
+**versioning** before bespoke diff logic: tag the state with a monotonic version and
+accept an operation only if its version is strictly newer. With a single writer (the
+Raft leader, the segment leader), a lower-version operation is *naturally* a no-op —
+the same mechanism the topology shard-leader map (term-monotonic, `topology.md` #6)
+and segment seals already rely on.
