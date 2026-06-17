@@ -12,8 +12,9 @@ pub(crate) mod inventory;
 pub(crate) mod replay;
 pub(crate) mod segment_scan;
 pub(crate) mod wal_scan;
+use self::index_rebuild::rebuild_sparse_entries;
 use self::inventory::{LocalInventory, RecoveryOutput};
-use self::replay::{ReplayOutput, ReplayWriter};
+use self::replay::ReplayWriter;
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
 use crate::data_plane::sparse_index::SparseIndex;
@@ -99,11 +100,11 @@ impl Replaying {
             }
         }
 
-        let output = self.writer.finish()?;
+        let recovered = self.writer.finish()?;
         Ok(Durable {
             data_dir: self.data_dir,
             scanner: self.scanner,
-            output,
+            recovered,
         })
     }
 }
@@ -111,7 +112,7 @@ impl Replaying {
 struct Durable {
     data_dir: PathBuf,
     scanner: WalScanner,
-    output: ReplayOutput,
+    recovered: RecoveredSegments,
 }
 
 impl Durable {
@@ -120,8 +121,19 @@ impl Durable {
     /// the serving side's job (commit 14), leaving the dir empty in between — an
     /// empty WAL just means nothing to replay.
     fn commit(self, index: &dyn SparseIndex) -> io::Result<RecoveryOutput> {
-        index.put_batch(self.output.suffix_index.into_vec())?;
-        let inventory = LocalInventory::from_recovered(&self.output.recovered);
+        // The sparse index is derived, and recovered segments are served only as
+        // cold reads — which depend on it. Rebuild each one from its now-final,
+        // fsynced segment file rather than trusting whatever index survived the
+        // crash; recovery already read these files to find the cursors.
+        for (key, _last) in self.recovered.cursors() {
+            let Some(start_offset) = self.recovered.start_entry_id(&key) else {
+                continue;
+            };
+            let path = key.file_path(&self.data_dir, start_offset);
+            index.put_batch(rebuild_sparse_entries(&path, key)?)?;
+        }
+
+        let inventory = LocalInventory::from_recovered(&self.recovered);
         self.scanner.delete_files()?;
         Ok(RecoveryOutput {
             inventory,
@@ -330,6 +342,39 @@ mod tests {
         assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), before);
         assert_eq!(output.inventory.get(&a), Some(1));
         assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_sparse_index_from_segment_files() {
+        use crate::data_plane::recovery::index_rebuild::rebuild_sparse_entries;
+        use crate::data_plane::sparse_index::{INDEX_INTERVAL_ENTRIES, SparseIndex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+
+        // A checkpointed segment spanning more than one index interval (so a full
+        // rebuild yields a base AND an interior anchor), with no WAL and an empty
+        // index — recovery rebuilds the index from the segment file.
+        let n = INDEX_INTERVAL_ENTRIES;
+        let body: Vec<u8> = (0..=n + 2)
+            .flat_map(|i| seg_batch(&format!("e{i}"), 1))
+            .collect();
+        write_segment(&data_dir, a, 0, &body);
+
+        let (_db_dir, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+        assert_eq!(output.inventory.get(&a), Some(n + 2));
+
+        // The rebuilt index resolves byte-identically to a from-scratch rebuild for
+        // every id — in particular the interior anchor resolves, instead of
+        // collapsing to the byte-0 fallback that would mislabel a cold read.
+        let (_full_dir, full) = open_db();
+        full.put_batch(rebuild_sparse_entries(&a.file_path(&data_dir, 0), a).unwrap())
+            .unwrap();
+        for id in 0..=n + 2 {
+            assert_eq!(db.seek_index(a, id), full.seek_index(a, id));
+        }
     }
 
     // ---------------------------------------------------------------

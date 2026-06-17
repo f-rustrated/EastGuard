@@ -6,10 +6,10 @@
 //! aren't. It opens one appender per segment lazily — truncating any damaged
 //! tail to `valid_len` before the first write — and re-encodes each record in
 //! the checkpoint's `(Data, BatchEnd)` framing with the **bare** entry payload
-//! (the routing header is WAL-only), tracking the byte offset of each appended
-//! record so it can hand back the index anchors for the suffix it wrote.
-//! [`ReplayWriter::finish`] fsyncs every file before the cursors become the
-//! inventory: nothing is reported durable until it is on disk.
+//! (the routing header is WAL-only). [`ReplayWriter::finish`] fsyncs every file
+//! before the cursors become the inventory: nothing is reported durable until it
+//! is on disk. The sparse index is rebuilt from the finished segment files by the
+//! orchestrator, so replay never touches it.
 
 use std::collections::HashMap;
 use std::io;
@@ -20,7 +20,6 @@ use bytes::Bytes;
 use super::segment_scan::{Decision, RecoveredSegments};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::segment_writer::SegmentAppender;
-use crate::data_plane::sparse_index::SparseEntry;
 use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::WalRecord;
 
@@ -34,17 +33,6 @@ pub(crate) struct ReplayWriter {
     data_dir: PathBuf,
     writers: HashMap<SegmentKey, SegmentAppender>,
     recovered: RecoveredSegments,
-    index_entries: Vec<SparseEntry>,
-}
-
-/// What [`ReplayWriter::finish`] produces: the advanced cursors (which become
-/// the local inventory) and the index anchors for the suffix replay appended.
-/// The orchestrator feeds `suffix_index` through `SparseIndex::put_batch`, so
-/// only the replayed suffix is re-indexed — the checkpointed prefix the live
-/// index already covers is left untouched.
-pub(crate) struct ReplayOutput {
-    pub(crate) recovered: RecoveredSegments,
-    pub(crate) suffix_index: Box<[SparseEntry]>,
 }
 
 impl ReplayWriter {
@@ -53,7 +41,6 @@ impl ReplayWriter {
             data_dir,
             recovered,
             writers: HashMap::new(),
-            index_entries: Vec::new(),
         }
     }
 
@@ -71,29 +58,22 @@ impl ReplayWriter {
             return Ok(Decision::Skip);
         }
         let key = header.segment_key();
-        let anchor = self.writer_for(key, header.entry_id)?.append_entry(
+        self.writer_for(key, header.entry_id)?.append_entry(
             header.entry_id,
             WalRecord::data(Bytes::copy_from_slice(entry_data), header.record_count),
         )?;
-        if let Some(anchor) = anchor {
-            self.index_entries.push(anchor);
-        }
         self.recovered.advance(key, header.entry_id);
         Ok(Decision::Append)
     }
 
     /// Flushes and fsyncs every open segment file, then returns the advanced
-    /// cursors (which become the local inventory) together with the index
-    /// anchors for the suffix it appended. Nothing replay appended is durable
-    /// until this returns `Ok`.
-    pub(crate) fn finish(mut self) -> io::Result<ReplayOutput> {
+    /// cursors (which become the local inventory). Nothing replay appended is
+    /// durable until this returns `Ok`.
+    pub(crate) fn finish(mut self) -> io::Result<RecoveredSegments> {
         for appender in self.writers.values_mut() {
             appender.flush_and_sync()?;
         }
-        Ok(ReplayOutput {
-            recovered: self.recovered,
-            suffix_index: self.index_entries.into_boxed_slice(),
-        })
+        Ok(self.recovered)
     }
 
     /// The open appender for `key`, created on first use:
@@ -105,7 +85,10 @@ impl ReplayWriter {
         first_entry_id: u64,
     ) -> io::Result<&mut SegmentAppender> {
         if !self.writers.contains_key(&key) {
-            let start_offset = self.recovered.start_offset(&key).unwrap_or(first_entry_id);
+            let start_offset = self
+                .recovered
+                .start_entry_id(&key)
+                .unwrap_or(first_entry_id);
             let valid_len = self.recovered.valid_len(&key);
             let path = key.file_path(&self.data_dir, start_offset);
             self.writers.insert(
@@ -300,61 +283,5 @@ mod tests {
         w.finish().unwrap();
 
         assert_eq!(fs::read(s.file_path(&data_dir, 0)).unwrap(), before);
-    }
-
-    fn open_db() -> (tempfile::TempDir, rocksdb::DB) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = rocksdb::DB::open_default(dir.path()).unwrap();
-        (dir, db)
-    }
-
-    /// The live index (checkpoint-written prefix) plus the anchors replay emits
-    /// for the suffix must resolve identically to a full rebuild of the final
-    /// file — replay re-indexes only what it appended, never the prefix.
-    #[test]
-    fn suffix_index_plus_live_prefix_equals_full_rebuild() {
-        use crate::data_plane::recovery::index_rebuild::rebuild_entries;
-        use crate::data_plane::sparse_index::{INDEX_INTERVAL_ENTRIES, SparseIndex};
-
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().to_path_buf();
-        let path = key().file_path(&data_dir, 0);
-
-        // A checkpointed prefix on disk: ids 0..n, so the first interval anchor
-        // past the base (id n) falls in the replayed suffix below.
-        let n = INDEX_INTERVAL_ENTRIES;
-        let prefix: Vec<u8> = (0..n)
-            .flat_map(|i| encode_batch(&format!("e{i}"), 1))
-            .collect();
-        write_segment(&path, &prefix);
-        // Checkpoint and rebuild share `is_index_anchor`, so rebuilding the
-        // prefix-only file == what the live index already holds for that prefix.
-        let prefix_index = rebuild_entries(&path, key()).unwrap();
-
-        // Replay re-presents the whole prefix (skipped) then appends ids n..=n+3.
-        let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
-        let mut w = ReplayWriter::new(data_dir.clone(), recovered);
-        for i in 0..=n + 3 {
-            w.replay(&RoutingHeader::new(key(), i, 1), format!("e{i}").as_bytes())
-                .unwrap();
-        }
-        let out = w.finish().unwrap();
-        // The suffix crossed an interval boundary (id n), so it indexed an anchor.
-        assert!(!out.suffix_index.is_empty());
-
-        // live prefix + replayed suffix
-        let (_combined_dir, combined) = open_db();
-        combined.put_batch(prefix_index).unwrap();
-        combined.put_batch(out.suffix_index.into_vec()).unwrap();
-
-        // full rebuild of the final (prefix + suffix) file
-        let (_full_dir, full) = open_db();
-        full.put_batch(rebuild_entries(&path, key()).unwrap())
-            .unwrap();
-
-        // Identical resolution for every id across the prefix/suffix boundary.
-        for id in 0..=n + 4 {
-            assert_eq!(combined.seek_index(key(), id), full.seek_index(key(), id));
-        }
     }
 }

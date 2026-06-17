@@ -35,7 +35,7 @@ What recovery deliberately does **not** do:
 |---|---|---|
 | WAL files | Source of truth for everything not yet checkpointed | Replayed forward, then discarded |
 | Segment files | Checkpointed prefix of each segment | Kept; replay appends the missing suffix |
-| Sparse index (RocksDB) | Derived read accelerator | Kept if present; rebuilt from segment files if missing or doubtful |
+| Sparse index (RocksDB) | Derived read accelerator | Rebuilt from the segment files on every recovery — not authoritative, never trusted across a crash |
 | Everything in memory | Caches, cursors, trackers, pending replies | Gone; nothing to recover — all derived or client-owned |
 
 The oldest WAL file still on disk marks the checkpoint boundary: WAL files are deleted only once every segment has checkpointed past them. No separate checkpoint file exists or is needed — "what's left in the WAL directory" *is* the record of what might not have reached segment files.
@@ -50,7 +50,7 @@ Recovery runs entirely before the node opens any port:
 1. Scan WAL directory          oldest surviving file → forward
 2. Replay into segment files   route each record by its header, skip duplicates
 3. Verify + build inventory    per segment: "I have entries up to N, CRC-checked"
-4. Rebuild sparse index        for everything appended in step 2
+4. Rebuild sparse index        re-derived from the segment files
 5. Delete old WAL files        everything recovered now lives in segment files
 6. Start fresh                 new WAL, new NodeId, join SWIM
 7. Wait                        serve catch-up / cold reads when the coordinator asks
@@ -166,7 +166,7 @@ A restarted node has a fresh NodeId, so the cluster's replica sets name *none* o
 |---|---|
 | Crash during replay | Re-run from step 1. Dedup makes replay idempotent — entries already appended are skipped. |
 | Crash after replay, before WAL deletion | Same: re-run, everything dedups, files get deleted this time. |
-| Sparse index missing or corrupt | Rebuild by scanning segment files. The index is derived; it can always be reconstructed. |
+| Sparse index missing or corrupt | Recovery always rebuilds it from the segment files — it's a derived cold-read accelerator (and a restarted node serves its sealed segments only via cold reads), so it's never trusted across a crash. The segment files are the source of truth; the index can always be reconstructed from them. |
 | Segment file corrupt mid-stream | Inventory credits the segment only up to the last verified entry. Repair fills the rest. |
 | Entire disk lost | Recovery degenerates to: join as a truly empty new member. Every assignment is a full copy. Correct, just slow. |
 | WAL torn tail | Discard back to the last complete batch — those entries were never fsync-confirmed, hence never ACKed. |
