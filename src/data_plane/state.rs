@@ -7,9 +7,9 @@ use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
 use super::recovery::inventory::LocalInventory;
-use super::recovery::replay::SegmentAppender;
 use super::recovery::segment_scan::scan_segment_file;
-use super::sparse_index::{SparseEntry, is_index_anchor};
+use super::segment_writer::SegmentAppender;
+use super::sparse_index::SparseEntry;
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
 use super::states::segment_store::SegmentStore;
@@ -280,12 +280,12 @@ impl<W: WalStorage> DataPlane<W> {
                 progress_signal: cmd.progress_signal,
             },
         };
-        if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req) {
-            if let ColdReadReply::Consumer { reply, .. } = req.reply {
-                let _ = reply.send(FetchResult::InternalError(
-                    "cold-read pool unavailable".into(),
-                ));
-            }
+        if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req)
+            && let ColdReadReply::Consumer { reply, .. } = req.reply
+        {
+            let _ = reply.send(FetchResult::InternalError(
+                "cold-read pool unavailable".into(),
+            ));
         }
     }
 
@@ -385,7 +385,7 @@ impl<W: WalStorage> DataPlane<W> {
         let path = cmd
             .segment_key
             .file_path(&self.config.data_dir, cmd.start_offset);
-        let appender = match SegmentAppender::create(&path) {
+        let appender = match SegmentAppender::create(cmd.segment_key, &path) {
             Ok(appender) => appender,
             Err(e) => {
                 tracing::warn!("catch-up: cannot open segment file {path:?}: {e}");
@@ -425,19 +425,11 @@ impl<W: WalStorage> DataPlane<W> {
         };
         let mut failed = false;
         for entry in &cmd.entries {
-            match pending
-                .appender
-                .append_batch(&entry.data, entry.record_count)
-            {
-                Ok(byte_start) => {
-                    if is_index_anchor(byte_start, entry.entry_id) {
-                        pending.anchors.push(SparseEntry::new(
-                            cmd.segment_key,
-                            entry.entry_id,
-                            byte_start.to_be_bytes(),
-                        ));
-                    }
-                }
+            match pending.appender.append_batch(
+                entry.entry_id,
+                WalRecord::data((*entry.data).clone(), entry.record_count),
+            ) {
+                Ok(anchor) => pending.anchors.extend(anchor),
                 Err(e) => {
                     tracing::warn!(
                         "catch-up: append failed for {:?}: {e}; aborting receive",
@@ -482,9 +474,9 @@ impl<W: WalStorage> DataPlane<W> {
                 return;
             }
         };
-        if !scan
+        if scan
             .last_entry_id
-            .is_some_and(|last| last >= pending.sealed_end)
+            .is_none_or(|last| last < pending.sealed_end)
         {
             tracing::warn!(
                 "catch-up incomplete for {:?}: have {:?}, need {}; not registering",

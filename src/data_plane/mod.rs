@@ -18,6 +18,7 @@ pub(crate) mod messages;
 
 #[allow(dead_code)]
 pub(crate) mod recovery;
+pub(crate) mod segment_writer;
 pub(crate) mod sparse_index;
 pub(crate) mod state;
 pub(crate) mod states;

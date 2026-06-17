@@ -1,5 +1,3 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -8,12 +6,13 @@ use crossbeam_channel::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
+use crate::data_plane::wal::WalRecord;
 
 use super::SegmentKey;
 use super::messages::command::DataPlaneCommand;
 use super::messages::*;
-use super::sparse_index::{SparseEntry, SparseIndex, is_index_anchor};
-use super::wal::WalRecord;
+use super::segment_writer::SegmentAppender;
+use super::sparse_index::{SparseEntry, SparseIndex};
 pub struct CheckpointWorker;
 
 impl CheckpointWorker {
@@ -62,44 +61,17 @@ impl CheckpointWorker {
             return Ok(());
         }
 
-        let mut byte_position = fs::metadata(&job.segment_file_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        let mut writer = job.get_writer()?;
+        let mut appender = SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
         let mut index_entries = Vec::with_capacity(checkpoint.batches.len());
-
         for entry in &checkpoint.batches {
-            let entry_start_position = byte_position;
-
-            let record = WalRecord::data((*entry.data).clone(), entry.record_count);
-            record.encode_to(&mut writer)?;
-            byte_position += record.encoded_size() as u64;
-
-            let end_record = WalRecord::batch_end();
-            end_record.encode_to(&mut writer)?;
-            byte_position += end_record.encoded_size() as u64;
-
-            if is_index_anchor(entry_start_position, entry.entry_id) {
-                index_entries.push(SparseEntry::new(
-                    job.segment_key,
-                    entry.entry_id,
-                    entry_start_position.to_be_bytes(),
-                ));
+            if let Some(anchor) = appender.append_batch(
+                entry.entry_id,
+                WalRecord::data((*entry.data).clone(), entry.record_count),
+            )? {
+                index_entries.push(anchor);
             }
         }
-
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = writer.get_ref().as_raw_fd();
-            unsafe {
-                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
-        }
+        appender.flush_sync_and_release()?;
 
         sparse_index.put_batch(index_entries)?;
         job.cache.advance_eviction_frontier(checkpoint.new_frontier);
@@ -129,17 +101,4 @@ pub struct CheckpointJob {
     pub segment_key: SegmentKey,
     pub cache: Arc<SegmentRingBuffer>,
     pub segment_file_path: PathBuf,
-}
-impl CheckpointJob {
-    fn get_writer(&self) -> Result<BufWriter<File>, std::io::Error> {
-        if let Some(parent) = self.segment_file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.segment_file_path)?;
-        Ok(BufWriter::new(file))
-    }
 }
