@@ -148,16 +148,16 @@ impl SegmentRingBuffer {
             "eviction_frontier ({frontier}) > read_cursor ({commit})"
         );
 
-        let mut batches = Vec::new();
+        let mut entries = Vec::new();
         for pos in frontier..commit {
             let idx: usize = self.slot_index(pos);
-            if let Some(batch) = self.batches[idx].load_full() {
-                batches.push(batch);
+            if let Some(entry) = self.batches[idx].load_full() {
+                entries.push(entry);
             }
         }
 
         CheckpointBatch {
-            batches,
+            entries,
             new_frontier: commit,
         }
     }
@@ -169,17 +169,17 @@ impl SegmentRingBuffer {
 }
 
 pub(crate) struct CheckpointBatch {
-    pub batches: Vec<Arc<CachedEntry>>,
+    pub entries: Vec<Arc<CachedEntry>>,
     pub new_frontier: u64,
 }
 
 impl CheckpointBatch {
     pub(crate) fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.entries.is_empty()
     }
 
     pub(crate) fn last_lsn(&self) -> u64 {
-        self.batches.last().map(|b| b.lsn).unwrap_or(0)
+        self.entries.last().map(|e| e.lsn).unwrap_or(0)
     }
 }
 
@@ -291,7 +291,7 @@ mod tests {
         cache.advance_read_cursor(3);
 
         let checkpoint = cache.drain_for_checkpoint();
-        assert_eq!(checkpoint.batches.len(), 3);
+        assert_eq!(checkpoint.entries.len(), 3);
         assert_eq!(checkpoint.new_frontier, 3);
     }
 

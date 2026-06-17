@@ -425,7 +425,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
         let mut failed = false;
         for entry in &cmd.entries {
-            match pending.appender.append_batch(
+            match pending.appender.append_entry(
                 entry.entry_id,
                 WalRecord::data((*entry.data).clone(), entry.record_count),
             ) {

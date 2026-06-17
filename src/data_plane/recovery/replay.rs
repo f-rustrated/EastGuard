@@ -71,7 +71,7 @@ impl ReplayWriter {
             return Ok(Decision::Skip);
         }
         let key = header.segment_key();
-        let anchor = self.writer_for(key, header.entry_id)?.append_batch(
+        let anchor = self.writer_for(key, header.entry_id)?.append_entry(
             header.entry_id,
             WalRecord::data(Bytes::copy_from_slice(entry_data), header.record_count),
         )?;

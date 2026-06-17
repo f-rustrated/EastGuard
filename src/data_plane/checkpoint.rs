@@ -62,9 +62,9 @@ impl CheckpointWorker {
         }
 
         let mut appender = SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
-        let mut index_entries = Vec::with_capacity(checkpoint.batches.len());
-        for entry in &checkpoint.batches {
-            if let Some(anchor) = appender.append_batch(
+        let mut index_entries = Vec::with_capacity(checkpoint.entries.len());
+        for entry in &checkpoint.entries {
+            if let Some(anchor) = appender.append_entry(
                 entry.entry_id,
                 WalRecord::data((*entry.data).clone(), entry.record_count),
             )? {

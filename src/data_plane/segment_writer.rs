@@ -104,12 +104,13 @@ impl SegmentAppender {
         Ok(())
     }
 
-    /// Write one `(Data, BatchEnd)` batch with the bare `data` payload, returning
-    /// the sparse-index anchor for this batch when its start offset / entry id
-    /// lands on an index interval — callers just collect the `Some`s. The anchor
-    /// is keyed to the appender's own segment. Takes an owned `Bytes` so callers
-    /// pass their cheapest form (an Arc-backed clone) rather than forcing a copy.
-    pub(crate) fn append_batch(
+    /// Append one entry: the data `record` followed by a `BatchEnd` terminator
+    /// (the `(Data, BatchEnd)` framing). Returns the sparse-index anchor for the
+    /// entry when its start offset / entry id lands on an index interval —
+    /// callers just collect the `Some`s. The anchor is keyed to the appender's
+    /// own segment. The caller forms the `WalRecord` so it can hand over its
+    /// cheapest payload form (an Arc-backed clone) rather than forcing a copy.
+    pub(crate) fn append_entry(
         &mut self,
         entry_id: u64,
         record: WalRecord,
