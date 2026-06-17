@@ -550,8 +550,8 @@ impl<W: WalStorage> DataPlane<W> {
     /// as a `CatchUpChunk` to the requester, then re-arm the next read until the
     /// sealed end is reached, at which point send `CatchUpDone`.
     fn handle_catch_up_read_complete(&mut self, cmd: CatchUpReadComplete) {
-        let has_entry = cmd.entries.is_empty();
-        if !has_entry {
+        let has_entries = !cmd.entries.is_empty();
+        if has_entries {
             let entries = cmd
                 .entries
                 .into_iter()
@@ -569,7 +569,7 @@ impl<W: WalStorage> DataPlane<W> {
 
         // Re-arm only while a non-empty batch left more below the sealed end;
         // `next_offset` strictly advances per non-empty batch, so this terminates.
-        if !has_entry && cmd.next_offset <= cmd.sealed_end {
+        if has_entries && cmd.next_offset <= cmd.sealed_end {
             self.dispatch_catch_up_read(
                 cmd.requester,
                 cmd.segment_key,

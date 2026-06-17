@@ -46,6 +46,9 @@ pub trait SparseIndex: Send + Sync + 'static {
     /// segment's first entry is always anchored), falls back to
     /// `(target_offset, 0)`.
     fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> (u64, u64);
+
+    /// The byte position of the anchor stored at *exactly* `entry_id`, or `None`
+    fn anchor_at(&self, segment_key: SegmentKey, entry_id: u64) -> Option<u64>;
 }
 
 impl SparseIndex for rocksdb::DB {
@@ -75,6 +78,24 @@ impl SparseIndex for rocksdb::DB {
             return (anchor_id, byte_position);
         }
         (target_offset, 0)
+    }
+
+    fn anchor_at(&self, segment_key: SegmentKey, entry_id: u64) -> Option<u64> {
+        let key = encode_key(segment_key, entry_id);
+        match self.get(&key) {
+            Ok(Some(value)) => value.as_slice().try_into().ok().map(u64::from_be_bytes),
+            Ok(None) => None,
+            Err(e) => {
+                // A read error means the index is unhealthy — treat the anchor as
+                // absent so recovery rebuilds it (the safe direction).
+                tracing::warn!(
+                    ?segment_key,
+                    entry_id,
+                    "sparse index read failed; treating anchor as absent: {e}"
+                );
+                None
+            }
+        }
     }
 }
 

@@ -166,7 +166,7 @@ A restarted node has a fresh NodeId, so the cluster's replica sets name *none* o
 |---|---|
 | Crash during replay | Re-run from step 1. Dedup makes replay idempotent — entries already appended are skipped. |
 | Crash after replay, before WAL deletion | Same: re-run, everything dedups, files get deleted this time. |
-| Sparse index missing or corrupt | Rebuild by scanning segment files. The index is derived; it can always be reconstructed. |
+| Sparse index missing or corrupt | Rebuilt from segment files. Recovery normally re-indexes only the replayed suffix, falling back to a full per-segment rebuild precisely when the index has lost the entry for that segment's first batch — the position a cold read seeks to when nothing sits below its target, hence the only loss that would resolve a read to the wrong place. The index is derived; it can always be reconstructed. |
 | Segment file corrupt mid-stream | Inventory credits the segment only up to the last verified entry. Repair fills the rest. |
 | Entire disk lost | Recovery degenerates to: join as a truly empty new member. Every assignment is a full copy. Correct, just slow. |
 | WAL torn tail | Discard back to the last complete batch — those entries were never fsync-confirmed, hence never ACKed. |
