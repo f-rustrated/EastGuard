@@ -1,4 +1,4 @@
-use super::checkpoint::CheckpointJob;
+use super::checkpoint::CheckpointTask;
 use super::cold_read::ColdReadPool;
 use super::messages::pending::DataPlaneOutputs;
 use super::recovery::inventory::RecoveryOutput;
@@ -31,7 +31,7 @@ impl DataPlaneActor {
     pub fn spawn(
         node_id: NodeId,
         config: DataNodeConfig,
-        checkpoint_tx: Sender<Box<[CheckpointJob]>>,
+        checkpoint_tx: Sender<Box<[CheckpointTask]>>,
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
         sparse_index: Arc<dyn SparseIndex>,

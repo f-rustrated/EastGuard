@@ -19,18 +19,32 @@ pub struct CheckpointWorker;
 impl CheckpointWorker {
     pub(crate) fn spawn(
         sparse_index: Arc<dyn SparseIndex>,
-        mailbox: Receiver<Box<[CheckpointJob]>>,
+        mailbox: Receiver<Box<[CheckpointTask]>>,
         data_plane_tx: DataPlaneSender,
     ) {
         thread::Builder::new()
             .name("checkpoint-worker".into())
             .spawn(move || {
                 while let Ok(batch) = mailbox.recv() {
-                    for job in batch {
-                        if let Err(e) =
-                            Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
-                        {
-                            tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
+                    for task in batch {
+                        match task {
+                            CheckpointTask::Checkpoint(job) => {
+                                if let Err(e) =
+                                    Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
+                                {
+                                    tracing::error!(
+                                        "Checkpoint failed for {:?}: {e}",
+                                        job.segment_key
+                                    );
+                                }
+                            }
+                            CheckpointTask::PutAnchors(entries) => {
+                                // Catch-up receive's anchors (replacement side):
+                                // the worker is the sole runtime sparse-index writer.
+                                if let Err(e) = sparse_index.put_batch(entries.into_vec()) {
+                                    tracing::error!("Catch-up anchor index write failed: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -99,6 +113,16 @@ impl CheckpointWorker {
 
         Ok(())
     }
+}
+
+/// A unit of work for the checkpoint worker — the sole runtime writer of segment
+/// files and the sparse index.
+pub(crate) enum CheckpointTask {
+    /// Drain a segment's cache into its file and index the new anchors.
+    Checkpoint(CheckpointJob),
+    /// Persist the sparse-index anchors for a segment the catch-up receive wrote
+    /// directly (replacement side); the worker just `put_batch`es them.
+    PutAnchors(Box<[SparseEntry]>),
 }
 
 pub struct CheckpointJob {

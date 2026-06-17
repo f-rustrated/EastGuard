@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
@@ -48,16 +48,39 @@ pub(crate) struct ReplayOutput {
 }
 
 /// One open segment appender plus the absolute byte offset of its next write —
-/// the position an index anchor would point at.
-struct SegmentAppender {
+/// the position an index anchor would point at. Used by recovery replay and,
+/// for the same `(Data, BatchEnd)` framing, by the catch-up receive path.
+pub(crate) struct SegmentAppender {
     writer: BufWriter<File>,
     next_pos: u64,
 }
 
 impl SegmentAppender {
+    /// Opens a fresh segment file at `path` for appending from offset 0,
+    /// truncating any stale partial left by an earlier interrupted write. Used
+    /// by the catch-up receive (which streams a whole sealed segment); recovery
+    /// builds its appenders via `writer_for`, preserving existing files.
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            next_pos: 0,
+        })
+    }
+
+    /// Flushes the buffer and fsyncs the file — the durability boundary for a
+    /// received segment before it is verified and registered.
+    pub(crate) fn flush_and_sync(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()
+    }
+
     /// Writes one `(Data, BatchEnd)` batch with the bare `entry_data` payload and
     /// returns the absolute byte offset where the `Data` record begins.
-    fn append_batch(&mut self, entry_data: &[u8], record_count: u32) -> io::Result<u64> {
+    pub(crate) fn append_batch(&mut self, entry_data: &[u8], record_count: u32) -> io::Result<u64> {
         let data_start = self.next_pos;
         let data = WalRecord::data(Bytes::copy_from_slice(entry_data), record_count);
         data.encode_to(&mut self.writer)?;

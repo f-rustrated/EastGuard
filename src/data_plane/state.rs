@@ -7,6 +7,9 @@ use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
 use super::recovery::inventory::LocalInventory;
+use super::recovery::replay::SegmentAppender;
+use super::recovery::segment_scan::scan_segment_file;
+use super::sparse_index::{SparseEntry, is_index_anchor};
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
 use super::states::segment_store::SegmentStore;
@@ -36,6 +39,16 @@ struct PendingSealRequest {
     failed_nodes: Vec<NodeId>,
 }
 
+/// An in-progress catch-up receive (replacement side): the open segment-file
+/// appender, the sealed bounds being filled toward, and the sparse anchors
+/// accumulated as chunks land — flushed to the index once the file verifies.
+struct PendingCatchUp {
+    appender: SegmentAppender,
+    start_offset: u64,
+    sealed_end: u64,
+    anchors: Vec<SparseEntry>,
+}
+
 pub struct DataPlane<W: WalStorage> {
     node_id: NodeId,
     config: DataNodeConfig,
@@ -49,6 +62,8 @@ pub struct DataPlane<W: WalStorage> {
 
     replication: ReplicationState,
     pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+    /// In-progress catch-up receives (replacement side), keyed by segment.
+    pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
 
     /// Hand-off channel to the cold-read thread pool. A fetch that resolves to a
     /// sealed segment (whose live tracker is gone) is forwarded here; the pool
@@ -84,6 +99,7 @@ impl<W: WalStorage> DataPlane<W> {
             needs_flush: false,
             replication: ReplicationState::default(),
             pending_seal_requests: HashMap::new(),
+            pending_catch_ups: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
             out,
@@ -359,12 +375,136 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    // Replacement-side handlers
-    fn handle_catch_up_assignment(&mut self, _cmd: CatchUpAssignment) {}
+    // ── Replacement-side catch-up: receive → verify → register ────────────
 
-    fn handle_catch_up_chunk(&mut self, _cmd: CatchUpChunk) {}
+    /// The coordinator assigned us this sealed segment. Open a fresh segment file
+    /// and ask the source for the whole thing. (Inventory-aware delta/skip — only
+    /// fetching what we're missing — is the §25 upgrade; here we always request
+    /// from the start.) Track the receive in `pending_catch_ups` until done.
+    fn handle_catch_up_assignment(&mut self, cmd: CatchUpAssignment) {
+        let path = cmd
+            .segment_key
+            .file_path(&self.config.data_dir, cmd.start_offset);
+        let appender = match SegmentAppender::create(&path) {
+            Ok(appender) => appender,
+            Err(e) => {
+                tracing::warn!("catch-up: cannot open segment file {path:?}: {e}");
+                return;
+            }
+        };
+        self.pending_catch_ups.insert(
+            cmd.segment_key,
+            PendingCatchUp {
+                appender,
+                start_offset: cmd.start_offset,
+                sealed_end: cmd.sealed_end,
+                anchors: Vec::new(),
+            },
+        );
+        self.out
+            .store_transport_cmd(DataTransportCommand::send_to_targets(
+                vec![cmd.source],
+                CatchUpRequest {
+                    segment_key: cmd.segment_key,
+                    from: self.node_id.clone(),
+                    local_end: None,
+                },
+            ));
+    }
 
-    fn handle_catch_up_done(&mut self, _cmd: CatchUpDone) {}
+    /// Append a streamed batch to the in-progress receive, building sparse-index
+    /// anchors as we go (same predicate the checkpoint/recovery paths use).
+    /// A write failure aborts the receive — the source/coordinator re-drive.
+    fn handle_catch_up_chunk(&mut self, cmd: CatchUpChunk) {
+        let Some(pending) = self.pending_catch_ups.get_mut(&cmd.segment_key) else {
+            tracing::debug!(
+                "catch-up chunk for an unknown receive {:?}; dropping",
+                cmd.segment_key
+            );
+            return;
+        };
+        let mut failed = false;
+        for entry in &cmd.entries {
+            match pending
+                .appender
+                .append_batch(&entry.data, entry.record_count)
+            {
+                Ok(byte_start) => {
+                    if is_index_anchor(byte_start, entry.entry_id) {
+                        pending.anchors.push(SparseEntry::new(
+                            cmd.segment_key,
+                            entry.entry_id,
+                            byte_start.to_be_bytes(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "catch-up: append failed for {:?}: {e}; aborting receive",
+                        cmd.segment_key
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            self.pending_catch_ups.remove(&cmd.segment_key);
+        }
+    }
+
+    /// End of stream. Fsync, then re-scan the file (commit 4's verifier) to
+    /// confirm it reaches `sealed_end`. Only on success do we index the anchors
+    /// and register the segment cold-readable. Reporting completion to the
+    /// coordinator is Phase 8; here the segment simply becomes locally serveable.
+    fn handle_catch_up_done(&mut self, cmd: CatchUpDone) {
+        let Some(mut pending) = self.pending_catch_ups.remove(&cmd.segment_key) else {
+            tracing::debug!(
+                "catch-up done for an unknown receive {:?}; dropping",
+                cmd.segment_key
+            );
+            return;
+        };
+        if let Err(e) = pending.appender.flush_and_sync() {
+            tracing::warn!("catch-up: fsync failed for {:?}: {e}", cmd.segment_key);
+            return;
+        }
+        let path = cmd
+            .segment_key
+            .file_path(&self.config.data_dir, pending.start_offset);
+        let scan = match scan_segment_file(&path) {
+            Ok(scan) => scan,
+            Err(e) => {
+                tracing::warn!(
+                    "catch-up: verify scan failed for {:?}: {e}",
+                    cmd.segment_key
+                );
+                return;
+            }
+        };
+        if !scan
+            .last_entry_id
+            .is_some_and(|last| last >= pending.sealed_end)
+        {
+            tracing::warn!(
+                "catch-up incomplete for {:?}: have {:?}, need {}; not registering",
+                cmd.segment_key,
+                scan.last_entry_id,
+                pending.sealed_end
+            );
+            return;
+        }
+        // Verified through `sealed_end`. Hand the suffix anchors to the checkpoint
+        // worker (the sole runtime sparse-index writer) and register the segment
+        // so the cold-read resolver can serve it. The anchor write is async — cold
+        // reads fall back to a byte-0 scan until it lands.
+        self.out.store_put_anchors(pending.anchors);
+        self.segments.insert_sealed_from_catch_up(
+            cmd.segment_key,
+            pending.start_offset,
+            pending.sealed_end,
+        );
+    }
 
     /// Source side: a peer wants `cmd.segment_key` brought up to its local end.
     fn handle_catch_up_request(&mut self, cmd: CatchUpRequest) {
@@ -793,7 +933,7 @@ impl<W: WalStorage> DataPlane<W> {
             }
 
             if tracker.size_limit_reached(self.config.segment_size_limit) {
-                self.out.checkpoint_jobs.push(tracker.checkpoint(key));
+                self.out.store_checkpoint(tracker.checkpoint(key));
                 self.enqueue_seal_request(key);
             }
         }
@@ -834,7 +974,7 @@ impl<W: WalStorage> DataPlane<W> {
         if let Some((key, _)) = candidates.first()
             && let Some(tracker) = self.segments.get(key)
         {
-            self.out.checkpoint_jobs.push(tracker.checkpoint(*key));
+            self.out.store_checkpoint(tracker.checkpoint(*key));
         }
     }
 
@@ -2143,5 +2283,147 @@ mod tests {
             req.reply,
             ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == 9
         ));
+    }
+
+    // ── Replacement side: receive → verify → register (commit 21) ──────────
+
+    /// End-to-end loopback: an assignment triggers a request, streamed chunks are
+    /// written, and `Done` verifies the file to `sealed_end`, indexes the anchors,
+    /// and registers the segment cold-readable.
+    #[test]
+    fn catch_up_receive_writes_verifies_and_registers() {
+        use crate::data_plane::checkpoint::CheckpointTask;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        // Coordinator assigns this node the sealed segment [0, 2].
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                start_offset: 0,
+                sealed_end: 2,
+                source: source.clone(),
+            }
+            .into(),
+        ));
+
+        // → a request-all (`local_end: None`) to the source.
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert_eq!(s.targets[0], source);
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpRequest(r)
+                if r.segment_key == test_key() && r.local_end.is_none()
+        ));
+
+        // Source streams the three entries, then signals end of stream.
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpChunk {
+                segment_key: test_key(),
+                entries: vec![
+                    CatchUpEntry {
+                        entry_id: 0,
+                        data: b"a".to_vec().into(),
+                        record_count: 1,
+                    },
+                    CatchUpEntry {
+                        entry_id: 1,
+                        data: b"bb".to_vec().into(),
+                        record_count: 2,
+                    },
+                    CatchUpEntry {
+                        entry_id: 2,
+                        data: b"ccc".to_vec().into(),
+                        record_count: 3,
+                    },
+                ]
+                .into(),
+            }
+            .into(),
+        ));
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpDone {
+                segment_key: test_key(),
+            }
+            .into(),
+        ));
+
+        // Registered cold-readable at its sealed bounds...
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
+        // ...the file verifies through the sealed end...
+        let scan = scan_segment_file(&test_key().file_path(dir.path(), 0)).unwrap();
+        assert_eq!(scan.last_entry_id, Some(2));
+        // ...and the suffix anchors were handed to the checkpoint worker (entry 0
+        // at byte 0 is always an anchor).
+        assert!(
+            dp.out.checkpoint_tasks.iter().any(|t| {
+                matches!(t, CheckpointTask::PutAnchors(anchors) if !anchors.is_empty())
+            })
+        );
+    }
+
+    /// A stream that stops short of `sealed_end` fails verification, so the
+    /// segment is NOT registered — the coordinator re-drives with another source.
+    #[test]
+    fn catch_up_receive_short_of_sealed_end_does_not_register() {
+        use crate::data_plane::checkpoint::CheckpointTask;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                start_offset: 0,
+                sealed_end: 5, // need through 5...
+                source: NodeId::new("source"),
+            }
+            .into(),
+        ));
+        // ...but only 0..=2 arrive.
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpChunk {
+                segment_key: test_key(),
+                entries: vec![
+                    CatchUpEntry {
+                        entry_id: 0,
+                        data: b"a".to_vec().into(),
+                        record_count: 1,
+                    },
+                    CatchUpEntry {
+                        entry_id: 1,
+                        data: b"b".to_vec().into(),
+                        record_count: 1,
+                    },
+                    CatchUpEntry {
+                        entry_id: 2,
+                        data: b"c".to_vec().into(),
+                        record_count: 1,
+                    },
+                ]
+                .into(),
+            }
+            .into(),
+        ));
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpDone {
+                segment_key: test_key(),
+            }
+            .into(),
+        ));
+
+        // Verification failed (have 2, need 5) → not registered, no anchors handed off.
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), None);
+        assert!(
+            !dp.out
+                .checkpoint_tasks
+                .iter()
+                .any(|t| matches!(t, CheckpointTask::PutAnchors(_)))
+        );
     }
 }

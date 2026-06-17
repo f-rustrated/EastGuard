@@ -4,21 +4,22 @@ use tokio::sync::oneshot;
 use crate::channels::BatchSender;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
-use crate::data_plane::checkpoint::CheckpointJob;
+use crate::data_plane::checkpoint::{CheckpointJob, CheckpointTask};
 use crate::data_plane::messages::command::ProduceAck;
+use crate::data_plane::sparse_index::SparseEntry;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TimerCommand};
 
 pub(crate) struct DataPlaneOutputs {
-    checkpoint_tx: Sender<Box<[CheckpointJob]>>,
+    checkpoint_tx: Sender<Box<[CheckpointTask]>>,
     batch_scheduler: SchedulerSender<BatchFlushTimer>,
     repl_scheduler: SchedulerSender<ReplicationTimer>,
     transport_tx: BatchSender<DataTransportCommand>,
     coordinator_tx: MutlRaftSender,
 
     pub(crate) transport_cmds: Vec<DataTransportCommand>,
-    pub(crate) checkpoint_jobs: Vec<CheckpointJob>,
+    pub(crate) checkpoint_tasks: Vec<CheckpointTask>,
     pub(crate) batch_timer_cmds: Vec<TimerCommand<BatchFlushTimer>>,
     pub(crate) repl_schedules: Vec<(u64, ReplicationTimer)>,
     pub(crate) coordinator_cmds: Vec<MultiRaftActorCommand>,
@@ -29,7 +30,7 @@ pub(crate) struct DataPlaneOutputs {
 
 impl DataPlaneOutputs {
     pub(crate) fn new(
-        checkpoint_tx: Sender<Box<[CheckpointJob]>>,
+        checkpoint_tx: Sender<Box<[CheckpointTask]>>,
         batch_scheduler: SchedulerSender<BatchFlushTimer>,
         repl_scheduler: SchedulerSender<ReplicationTimer>,
         transport_tx: BatchSender<DataTransportCommand>,
@@ -42,7 +43,7 @@ impl DataPlaneOutputs {
             transport_tx,
             coordinator_tx,
             transport_cmds: Vec::new(),
-            checkpoint_jobs: Vec::new(),
+            checkpoint_tasks: Vec::new(),
             batch_timer_cmds: Vec::new(),
             repl_schedules: Vec::new(),
             coordinator_cmds: Vec::new(),
@@ -58,9 +59,9 @@ impl DataPlaneOutputs {
             let _ = reply.send(ProduceAck::Ok { entry_id });
         }
 
-        let checkpoint_jobs = std::mem::take(&mut self.checkpoint_jobs);
-        if !checkpoint_jobs.is_empty() {
-            let _ = self.checkpoint_tx.send(checkpoint_jobs.into_boxed_slice());
+        let checkpoint_tasks = std::mem::take(&mut self.checkpoint_tasks);
+        if !checkpoint_tasks.is_empty() {
+            let _ = self.checkpoint_tx.send(checkpoint_tasks.into_boxed_slice());
         }
         self.batch_scheduler
             .blocking_send_batch(self.batch_timer_cmds.drain(..).collect());
@@ -88,7 +89,12 @@ impl DataPlaneOutputs {
         self.batch_timer_cmds.push(timer);
     }
     pub(crate) fn store_checkpoint(&mut self, job: CheckpointJob) {
-        self.checkpoint_jobs.push(job);
+        self.checkpoint_tasks.push(CheckpointTask::Checkpoint(job));
+    }
+
+    pub(crate) fn store_put_anchors(&mut self, anchors: Vec<SparseEntry>) {
+        self.checkpoint_tasks
+            .push(CheckpointTask::PutAnchors(anchors.into_boxed_slice()));
     }
 
     #[cfg(test)]
