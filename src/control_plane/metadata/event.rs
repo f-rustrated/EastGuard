@@ -3,7 +3,7 @@ use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{SealResponse, SegmentAssignment};
+use crate::data_plane::messages::command::{CatchUpAssignment, SealResponse, SegmentAssignment};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 
@@ -67,7 +67,34 @@ impl SegmentRolled {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentReassigned {
     pub segment_key: SegmentKey,
+    pub start_entry_id: u64,
+    /// Committed end = the catch-up target. `None` only for a segment whose end
+    /// was never established; those aren't selected for reassignment, so the
+    /// dispatch just emits nothing.
+    pub sealed_end: Option<u64>,
     pub new_replica_set: Vec<NodeId>,
+}
+
+impl SegmentReassigned {
+    pub fn into_catch_up_commands(self) -> Vec<DataTransportCommand> {
+        let Some(sealed_end) = self.sealed_end else {
+            return vec![];
+        };
+        self.new_replica_set
+            .iter()
+            .map(|member| {
+                DataTransportCommand::send_to_targets(
+                    vec![member.clone()],
+                    CatchUpAssignment {
+                        segment_key: self.segment_key,
+                        start_entry_id: self.start_entry_id,
+                        sealed_end_entry_id: sealed_end,
+                        replica_set: self.new_replica_set.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

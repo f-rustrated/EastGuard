@@ -19,8 +19,8 @@ pub struct SegmentMeta {
     pub state: SegmentMetaState,
     pub replica_set: ReplicaSet,
     pub size_bytes: u64,
-    pub start_offset: u64,
-    pub end_offset: Option<u64>,
+    pub start_entry_id: u64,
+    pub end_entry_id: Option<u64>,
     pub created_at: u64,
     pub sealed_at: Option<u64>,
 }
@@ -29,7 +29,7 @@ impl SegmentMeta {
     pub(crate) fn new(
         segment_id: SegmentId,
         replica_set: ReplicaSet,
-        start_offset: u64,
+        start_entry_id: u64,
         created_at: u64,
     ) -> Self {
         SegmentMeta {
@@ -37,15 +37,15 @@ impl SegmentMeta {
             state: SegmentMetaState::Active,
             replica_set,
             size_bytes: 0,
-            start_offset,
-            end_offset: None,
+            start_entry_id,
+            end_entry_id: None,
             created_at,
             sealed_at: None,
         }
     }
     pub(crate) fn seal(
         &mut self,
-        end_offset: Option<u64>,
+        end_entry_id: Option<u64>,
         sealed_at: u64,
     ) -> Result<(), MetadataError> {
         if self.state != SegmentMetaState::Active {
@@ -53,7 +53,7 @@ impl SegmentMeta {
         }
 
         self.state = SegmentMetaState::Sealed;
-        self.end_offset = end_offset;
+        self.end_entry_id = end_entry_id;
         self.sealed_at = Some(sealed_at);
 
         Ok(())

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::constants::*;
 use super::*;
@@ -124,7 +124,7 @@ impl TopicMeta {
                 Some((
                     SegmentKey::new(self.id, *range_id, seg.segment_id),
                     seg.replica_set.clone(),
-                    seg.start_offset,
+                    seg.start_entry_id,
                 ))
             })
             .collect()
@@ -152,6 +152,34 @@ impl TopicMeta {
                 })
             })
             .collect()
+    }
+
+    /// Sealed segments with a known committed end (`end_offset = Some`) whose
+    /// `replica_set` still names a non-`live` node — the candidates for D5
+    /// sealed-segment repair (re-replicate to a fresh node via catch-up).
+    ///
+    /// Boundary-unknown seals (`end_offset = None`, left by a leader-crash or
+    /// idle-segment SWIM seal) are excluded: catch-up can't verify against an
+    /// unknown end. See `diagrams/data-plane/leader_crash_seal_boundary.md`.
+    pub(crate) fn sealed_segments_with_dead_members(
+        &self,
+        live: &HashSet<NodeId>,
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+        let mut out = Vec::new();
+        for range in self.ranges.values() {
+            for seg in range.segments.values() {
+                if seg.state == SegmentMetaState::Sealed
+                    && seg.end_entry_id.is_some()
+                    && seg.replica_set.iter().any(|n| !live.contains(n))
+                {
+                    out.push((
+                        SegmentKey::new(self.id, range.range_id, seg.segment_id),
+                        seg.replica_set.clone(),
+                    ));
+                }
+            }
+        }
+        out.into_boxed_slice()
     }
 
     /// Route a partition key to the active range that owns it. Active ranges

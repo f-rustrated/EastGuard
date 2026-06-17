@@ -125,13 +125,13 @@ impl RangeMeta {
         let Some(seg) = self.segments.get_mut(&segment_id) else {
             return;
         };
-        if seg.state != SegmentMetaState::Sealed || seg.end_offset.is_some() {
+        if seg.state != SegmentMetaState::Sealed || seg.end_entry_id.is_some() {
             return;
         }
-        seg.end_offset = Some(end_entry_id);
+        seg.end_entry_id = Some(end_entry_id);
         self.next_offset = end_entry_id + 1;
         if let Some(active_seg) = self.segments.get_mut(&active_seg_id) {
-            active_seg.start_offset = end_entry_id + 1;
+            active_seg.start_entry_id = end_entry_id + 1;
         }
     }
 
@@ -405,16 +405,16 @@ pub mod props {
             segs.sort_by_key(|s| s.segment_id.0);
             for window in segs.windows(2) {
                 let (prev, next) = (&window[0], &window[1]);
-                if let Some(end) = prev.end_offset {
+                if let Some(end) = prev.end_entry_id {
                     assert_eq!(
                         end + 1,
-                        next.start_offset,
+                        next.start_entry_id,
                         "range {:?} offset gap: seg {:?} end_offset+1={} != seg {:?} start_offset={}",
                         self.range_id,
                         prev.segment_id,
                         end + 1,
                         next.segment_id,
-                        next.start_offset,
+                        next.start_entry_id,
                     );
                 }
             }
@@ -422,11 +422,11 @@ pub mod props {
                 && let Some(active_seg) = self.segments.get(&active_seg_id)
             {
                 assert!(
-                    self.next_offset >= active_seg.start_offset,
+                    self.next_offset >= active_seg.start_entry_id,
                     "range {:?} next_offset ({}) < active segment start_offset ({})",
                     self.range_id,
                     self.next_offset,
-                    active_seg.start_offset,
+                    active_seg.start_entry_id,
                 );
             }
         }

@@ -173,8 +173,8 @@ impl SegmentDetail {
             .collect();
         SegmentDetail {
             segment_id: seg.segment_id.0,
-            start_offset: seg.start_offset,
-            end_offset: seg.end_offset,
+            start_offset: seg.start_entry_id,
+            end_offset: seg.end_entry_id,
             replica_set,
         }
     }

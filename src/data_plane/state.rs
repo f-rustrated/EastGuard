@@ -74,8 +74,8 @@ pub struct DataPlane<W: WalStorage> {
     out: DataPlaneOutputs,
 
     /// The verified local inventory recovery handed us (segment → highest durable entry id).
-    /// Held for boundary confirmation and segment registration (not read yet).
-    #[allow(dead_code)]
+    /// Consulted on a catch-up assignment to decide full-match / delta /
+    /// full-copy and to skip transfer when we already hold the segment.
     recovered: LocalInventory,
 }
 
@@ -377,15 +377,43 @@ impl<W: WalStorage> DataPlane<W> {
 
     // ── Replacement-side catch-up: receive → verify → register ────────────
 
-    /// The coordinator assigned us this sealed segment. Open a fresh segment file
-    /// and ask the source for the whole thing. (Inventory-aware delta/skip — only
-    /// fetching what we're missing — is the §25 upgrade; here we always request
-    /// from the start.) Track the receive in `pending_catch_ups` until done.
+    /// The coordinator announced our (new) membership of this sealed segment.
+    /// Reconcile against local state — declarative and idempotent:
+    /// - already hold it through `sealed_end` → register it if a recovered-from-disk copy isn't in the live store yet, then transfer nothing (the catch-up "lottery" win,
+    ///   and the no-op every survivor takes when re-announced);
+    /// - already reconciling it → a re-drive is a no-op;
+    /// - otherwise fetch `(local, sealed_end]` from a peer we pick — a delta when we
+    ///   hold a partial prefix, a full copy when we hold nothing.
     fn handle_catch_up_assignment(&mut self, cmd: CatchUpAssignment) {
+        if self.pending_catch_ups.contains_key(&cmd.segment_key) {
+            return;
+        }
+        let local = self.local_sealed_progress(&cmd.segment_key);
+        if local.is_some_and(|end| end >= cmd.sealed_end_entry_id) {
+            // Full match: verified locally through the sealed end. Make sure the
+            // cold-read resolver can serve it (a restarted node's recovered data
+            // isn't in the live store yet), then transfer nothing.
+            if self.segments.sealed_bounds(&cmd.segment_key).is_none() {
+                self.segments.insert_sealed_from_catch_up(
+                    cmd.segment_key,
+                    cmd.start_entry_id,
+                    cmd.sealed_end_entry_id,
+                );
+            }
+            return;
+        }
+        let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
+            tracing::warn!(
+                "catch-up: no source peer in {:?} for {:?}",
+                cmd.replica_set,
+                cmd.segment_key
+            );
+            return;
+        };
         let path = cmd
             .segment_key
-            .file_path(&self.config.data_dir, cmd.start_offset);
-        let appender = match SegmentAppender::create(cmd.segment_key, &path) {
+            .file_path(&self.config.data_dir, cmd.start_entry_id);
+        let appender = match Self::open_catch_up_appender(cmd.segment_key, &path, local) {
             Ok(appender) => appender,
             Err(e) => {
                 tracing::warn!("catch-up: cannot open segment file {path:?}: {e}");
@@ -396,20 +424,57 @@ impl<W: WalStorage> DataPlane<W> {
             cmd.segment_key,
             PendingCatchUp {
                 appender,
-                start_offset: cmd.start_offset,
-                sealed_end: cmd.sealed_end,
+                start_offset: cmd.start_entry_id,
+                sealed_end: cmd.sealed_end_entry_id,
                 anchors: Vec::new(),
             },
         );
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
-                vec![cmd.source],
+                vec![source],
                 CatchUpRequest {
                     segment_key: cmd.segment_key,
                     from: self.node_id.clone(),
-                    local_end: None,
+                    local_end: local,
                 },
             ));
+    }
+
+    /// Highest verified entry id we already hold for this sealed segment — from the
+    /// live sealed store (a survivor or a prior catch-up) or the recovered inventory
+    /// (a restarted node's on-disk data). `None` if we hold nothing.
+    fn local_sealed_progress(&self, key: &SegmentKey) -> Option<u64> {
+        let registered = self.segments.sealed_bounds(key).map(|(_, end)| end);
+        registered.max(self.recovered.get(key))
+    }
+
+    /// A peer to fetch from: any replica that isn't us, preferring one that isn't
+    /// the (former) write leader at `replica_set[0]` so repair reads don't pile on
+    /// it. Falls back to any non-self peer; `None` if we're the only member.
+    fn pick_catch_up_source(replica_set: &[NodeId], me: &NodeId) -> Option<NodeId> {
+        let leader = replica_set.first();
+        replica_set
+            .iter()
+            .find(|n| *n != me && Some(*n) != leader)
+            .or_else(|| replica_set.iter().find(|n| *n != me))
+            .cloned()
+    }
+
+    /// Open the appender for an incoming catch-up: keep the verified prefix and
+    /// append the delta when we hold a partial copy, or create a fresh file when we
+    /// hold nothing.
+    fn open_catch_up_appender(
+        key: SegmentKey,
+        path: &std::path::Path,
+        local: Option<u64>,
+    ) -> std::io::Result<SegmentAppender> {
+        match local {
+            None => SegmentAppender::create(key, path),
+            Some(_) => {
+                let valid_len = scan_segment_file(path)?.valid_len;
+                SegmentAppender::open_truncating(key, path, valid_len)
+            }
+        }
     }
 
     /// Append a streamed batch to the in-progress receive, building sparse-index
@@ -1075,6 +1140,13 @@ mod tests {
     }
 
     fn make_data_plane(dir: &tempfile::TempDir) -> DataPlane<WalWriter> {
+        make_data_plane_with(dir, empty_inventory())
+    }
+
+    fn make_data_plane_with(
+        dir: &tempfile::TempDir,
+        recovered: LocalInventory,
+    ) -> DataPlane<WalWriter> {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
         let out = DataPlaneOutputs::test();
         // Tests don't exercise the cold-read path; an unbounded sink channel
@@ -1090,8 +1162,33 @@ mod tests {
             cold_read_tx,
             DataPlaneSender(self_tx),
             out,
-            empty_inventory(),
+            recovered,
         )
+    }
+
+    /// A `LocalInventory` reporting `key` verified through `local_end` — as if
+    /// recovery had scanned a local copy of that prefix off disk.
+    fn inventory_with(key: SegmentKey, local_end: u64) -> LocalInventory {
+        let mut recovered = RecoveredSegments::default();
+        for id in 0..=local_end {
+            recovered.advance(key, id);
+        }
+        LocalInventory::from_recovered(&recovered)
+    }
+
+    /// Write a segment file in the checkpoint framing (one `(Data, BatchEnd)` batch
+    /// per entry, bare payloads) so a catch-up's partial path can scan it.
+    fn write_seg_file(path: &std::path::Path, entries: &[(&[u8], u32)]) {
+        use crate::data_plane::wal::WalRecord;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut buf = Vec::new();
+        for &(data, record_count) in entries {
+            WalRecord::data(Bytes::copy_from_slice(data), record_count)
+                .encode_to(&mut buf)
+                .unwrap();
+            WalRecord::batch_end().encode_to(&mut buf).unwrap();
+        }
+        std::fs::write(path, buf).unwrap();
     }
 
     fn process_and_flush(dp: &mut DataPlane<WalWriter>, cmd: DataPlaneCommand) {
@@ -2294,9 +2391,9 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
-                start_offset: 0,
-                sealed_end: 2,
-                source: source.clone(),
+                start_entry_id: 0,
+                sealed_end_entry_id: 2,
+                replica_set: vec![test_node_id(), source.clone()],
             }
             .into(),
         ));
@@ -2371,9 +2468,9 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
-                start_offset: 0,
-                sealed_end: 5, // need through 5...
-                source: NodeId::new("source"),
+                start_entry_id: 0,
+                sealed_end_entry_id: 5, // need through 5...
+                replica_set: vec![test_node_id(), NodeId::new("source")],
             }
             .into(),
         ));
@@ -2416,6 +2513,92 @@ mod tests {
                 .checkpoint_tasks
                 .iter()
                 .any(|t| matches!(t, CheckpointTask::PutAnchors(_)))
+        );
+    }
+
+    /// Full match (the catch-up "lottery"): the recovered inventory already holds
+    /// the segment through the sealed end. The announcement registers it
+    /// cold-readable and transfers nothing.
+    #[test]
+    fn catch_up_full_match_registers_without_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Recovered from disk through entry 5 — past the sealed end of 2.
+        let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 5));
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                start_entry_id: 0,
+                sealed_end_entry_id: 2,
+                replica_set: vec![test_node_id(), NodeId::new("peer")],
+            }
+            .into(),
+        ));
+
+        // Zero transfer — no CatchUpRequest dispatched...
+        assert!(dp.out.transport_cmds.is_empty());
+        // ...and the segment is now registered cold-readable at the sealed bounds.
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
+    }
+
+    /// Partial match: a local prefix on disk (entries 0..=1) means the receiver
+    /// asks only for the delta after its local end, not a full copy.
+    #[test]
+    fn catch_up_partial_requests_only_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        // A partial local copy on disk plus the matching inventory cursor.
+        write_seg_file(
+            &test_key().file_path(dir.path(), 0),
+            &[(b"a", 1), (b"b", 1)],
+        );
+        let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                start_entry_id: 0,
+                sealed_end_entry_id: 4,
+                replica_set: vec![test_node_id(), NodeId::new("source")],
+            }
+            .into(),
+        ));
+
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpRequest(r) if r.local_end == Some(1)
+        ));
+    }
+
+    /// Source selection is the receiver's call: it fetches from a non-leader peer
+    /// (not `replica_set[0]`) so repair reads stay off the former write leader.
+    #[test]
+    fn catch_up_picks_a_non_leader_peer_as_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir); // empty inventory → needs a full copy
+        let leader = NodeId::new("leader");
+        let follower = NodeId::new("follower");
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                start_entry_id: 0,
+                sealed_end_entry_id: 2,
+                // self (test-node) is a follower here; `leader` is replica_set[0].
+                replica_set: vec![leader.clone(), test_node_id(), follower.clone()],
+            }
+            .into(),
+        ));
+
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert_eq!(
+            s.targets[0], follower,
+            "should fetch from the non-leader peer, not {leader:?}"
         );
     }
 }

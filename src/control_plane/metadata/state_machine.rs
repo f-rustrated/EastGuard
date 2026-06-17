@@ -153,9 +153,13 @@ impl MetadataStateMachine {
             .ok_or(TopicNotFound(cmd.segment_key.topic_id))?
             .get_mut(cmd.segment_key)?;
 
+        // The dispatch announces the desired replica set; receivers reconcile, so
+        // we only carry the sealed bounds (the catch-up target) alongside it.
         if segment.reassign(cmd.new_replica_set.clone())? {
             Ok(SegmentReassigned {
                 segment_key: cmd.segment_key,
+                start_entry_id: segment.start_entry_id,
+                sealed_end: segment.end_entry_id,
                 new_replica_set: cmd.new_replica_set,
             }
             .into())
@@ -519,8 +523,8 @@ mod tests {
         assert_eq!(range.next_offset, 0);
 
         let seg = &range.segments[&SegmentId(0)];
-        assert_eq!(seg.start_offset, 0);
-        assert_eq!(seg.end_offset, None);
+        assert_eq!(seg.start_entry_id, 0);
+        assert_eq!(seg.end_entry_id, None);
     }
 
     #[test]
@@ -1142,9 +1146,9 @@ mod tests {
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         let sealed = &range.segments[&SegmentId(0)];
-        assert_eq!(sealed.end_offset, Some(42000));
+        assert_eq!(sealed.end_entry_id, Some(42000));
         let new_seg = &range.segments[&SegmentId(1)];
-        assert_eq!(new_seg.start_offset, 42001);
+        assert_eq!(new_seg.start_entry_id, 42001);
     }
 
     // --- D3: end-offset correction ---
@@ -1163,7 +1167,7 @@ mod tests {
         }));
 
         assert_eq!(
-            sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_offset,
+            sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_entry_id,
             None
         );
 
@@ -1177,8 +1181,8 @@ mod tests {
         assert!(result.is_ok());
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.segments[&SegmentId(0)].end_offset, Some(42000));
-        assert_eq!(range.segments[&SegmentId(1)].start_offset, 42001);
+        assert_eq!(range.segments[&SegmentId(0)].end_entry_id, Some(42000));
+        assert_eq!(range.segments[&SegmentId(1)].start_entry_id, 42001);
     }
 
     #[test]

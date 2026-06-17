@@ -93,8 +93,8 @@ pub struct SegmentSealed {
 // it brings its local copy up to the sealed end by fetching the missing suffix from a healthy replica. Four messages, all riding the
 // `DataPlaneInterNodeCommand` wire (bounded by `DATA_FRAME_MAX`):
 //
-//   coordinator ─CatchUpAssignment─▶ replacement  "you own `key`; fetch from `source`"
-//   replacement ─CatchUpRequest────▶ source       "I have through `local_end`; send the rest"
+//   coordinator ─CatchUpAssignment─▶ each replica "own `key` [start, sealed_end]; reconcile vs your inventory"
+//   replacement ─CatchUpRequest────▶ a peer        "I have through `local_end`; send the rest"
 //   source      ─CatchUpChunk(s)───▶ replacement  bounded batches of entries
 //   source      ─CatchUpDone───────▶ replacement  end of stream; verify, then report complete
 //
@@ -105,13 +105,9 @@ pub struct SegmentSealed {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpAssignment {
     pub segment_key: SegmentKey,
-    /// Base entry id of the sealed segment — lets the replacement create and
-    /// position the segment file when it holds no local copy at all.
-    pub start_offset: u64,
-    /// Committed end entry id of the sealed segment: the catch-up target.
-    pub sealed_end: u64,
-    /// A healthy replica to fetch the missing suffix from.
-    pub source: NodeId,
+    pub start_entry_id: u64,
+    pub sealed_end_entry_id: u64,
+    pub replica_set: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
