@@ -65,6 +65,8 @@ impl MetadataCommitted {
                 vec![rm.into_command(sgid)]
             }
             ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
+            // dispatches the `CatchUpAssignment` here;
+            ApplyResult::SegmentReassigned(_) => vec![],
         }
     }
 }

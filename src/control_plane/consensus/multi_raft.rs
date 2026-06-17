@@ -485,7 +485,7 @@ impl MultiRaft {
             return;
         };
 
-        let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
+        let Some(old_replica_set) = raft.get_active_replica_set(&seal.segment_key) else {
             tracing::warn!("SealRequest for unknown segment {:?}", seal.segment_key);
             return;
         };

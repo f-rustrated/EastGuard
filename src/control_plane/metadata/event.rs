@@ -65,6 +65,12 @@ impl SegmentRolled {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentReassigned {
+    pub segment_key: SegmentKey,
+    pub new_replica_set: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeSplit {
     pub topic_id: TopicId,
     pub children: [(RangeId, SegmentId, Vec<NodeId>); 2],
@@ -117,6 +123,7 @@ pub enum ApplyResult {
     SegmentRolled(SegmentRolled),
     RangeSplit(RangeSplit),
     RangeMerged(RangeMerged),
+    SegmentReassigned(SegmentReassigned),
     TopicDeleted,
     Noop,
 }
@@ -126,5 +133,6 @@ impl_from_variant!(
     TopicCreated,
     SegmentRolled,
     RangeSplit,
-    RangeMerged
+    RangeMerged,
+    SegmentReassigned
 );

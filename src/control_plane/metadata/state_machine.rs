@@ -99,6 +99,7 @@ impl MetadataStateMachine {
             SplitRange(cmd) => self.split_range(cmd)?.into(),
             MergeRange(cmd) => self.merge_range(cmd)?.into(),
             DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted)?,
+            ReassignSegment(cmd) => self.reassign_segment(cmd)?,
         };
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -154,6 +155,27 @@ impl MetadataStateMachine {
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
         })
+    }
+
+    /// Re-points a sealed segment's replica set.
+    /// `Noop` when the set is unchanged, otherwise `SegmentReassigned`.
+    /// The segment must be sealed; an active/deleting/unknown one is rejected.
+    fn reassign_segment(&mut self, cmd: ReassignSegment) -> Result<ApplyResult, MetadataError> {
+        let segment = self
+            .topics
+            .get_mut(&cmd.segment_key.topic_id)
+            .ok_or(TopicNotFound(cmd.segment_key.topic_id))?
+            .get_mut(cmd.segment_key)?;
+
+        if segment.reassign(cmd.new_replica_set.clone())? {
+            Ok(SegmentReassigned {
+                segment_key: cmd.segment_key,
+                new_replica_set: cmd.new_replica_set,
+            }
+            .into())
+        } else {
+            Ok(ApplyResult::Noop)
+        }
     }
 
     fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
@@ -364,6 +386,97 @@ mod tests {
             ApplyResult::RangeMerged(rm) => rm.segment_key.range_id,
             other => panic!("expected RangeMerged, got {:?}", other),
         }
+    }
+
+    /// A surviving subset plus a fresh replacement — what the coordinator picks
+    /// when a replica of a sealed segment dies (node-3 → node-4 here).
+    fn replacement_set() -> Vec<NodeId> {
+        vec![
+            NodeId::new("node-1"),
+            NodeId::new("node-2"),
+            NodeId::new("node-4"),
+        ]
+    }
+
+    // --- ReassignSegment ---
+
+    #[test]
+    fn reassign_swaps_a_sealed_segments_replica_set() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        // Roll so SegmentId(0) becomes Sealed (SegmentId(1) is the new write head).
+        roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
+        let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        let result = sm
+            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: sealed,
+                new_replica_set: replacement_set(),
+            }))
+            .unwrap();
+
+        match result {
+            ApplyResult::SegmentReassigned(r) => {
+                assert_eq!(r.segment_key, sealed);
+                assert_eq!(r.new_replica_set, replacement_set());
+            }
+            other => panic!("expected SegmentReassigned, got {other:?}"),
+        }
+
+        let seg = &sm.get_topic(&topic_id).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)];
+        assert_eq!(seg.replica_set, replacement_set());
+        assert_eq!(seg.state, SegmentMetaState::Sealed); // stays sealed
+    }
+
+    #[test]
+    fn reassign_same_set_is_a_noop() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
+        let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: sealed,
+            new_replica_set: replacement_set(),
+        }))
+        .unwrap();
+
+        // Re-applying the identical set (duplicate death detection / re-proposal)
+        // changes nothing.
+        let again = sm
+            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: sealed,
+                new_replica_set: replacement_set(),
+            }))
+            .unwrap();
+        assert_eq!(again, ApplyResult::Noop);
+    }
+
+    #[test]
+    fn reassign_rejects_an_active_segment() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        // SegmentId(0) is the active write head — no roll yet.
+        let active = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: active,
+            new_replica_set: replacement_set(),
+        }));
+        assert!(matches!(result, Err(MetadataError::SegmentNotSealed)));
+    }
+
+    #[test]
+    fn reassign_rejects_an_unknown_segment() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        let unknown = SegmentKey::new(topic_id, RangeId(0), SegmentId(99));
+
+        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: unknown,
+            new_replica_set: replacement_set(),
+        }));
+        assert!(matches!(result, Err(MetadataError::SegmentNotFound)));
     }
 
     // --- CreateTopic ---

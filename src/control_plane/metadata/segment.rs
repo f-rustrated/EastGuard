@@ -9,7 +9,6 @@ use crate::control_plane::{
 pub enum SegmentMetaState {
     Active,
     Sealed,
-    Reassigning { from: NodeId, to: NodeId },
     Deleting,
 }
 
@@ -58,5 +57,21 @@ impl SegmentMeta {
         self.sealed_at = Some(sealed_at);
 
         Ok(())
+    }
+
+    /// Re-points a **sealed** segment's replica set.
+    /// Per invariant, `replica_set` is the only field that may change after seal;
+    /// the state stays `Sealed`. Returns whether the set actually changed:
+    /// an identical set is an idempotent no-op, tolerating duplicate death detection
+    /// and no-leader re-proposals (cf. `RollSegment` idempotency).
+    pub(crate) fn reassign(&mut self, new_replica_set: ReplicaSet) -> Result<bool, MetadataError> {
+        if self.state != SegmentMetaState::Sealed {
+            return Err(MetadataError::SegmentNotSealed);
+        }
+        if self.replica_set == new_replica_set {
+            return Ok(false);
+        }
+        self.replica_set = new_replica_set;
+        Ok(true)
     }
 }

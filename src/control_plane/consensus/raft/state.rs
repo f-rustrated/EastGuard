@@ -489,7 +489,7 @@ impl Raft {
         self.state_machine.get_topic(topic_id).is_some()
     }
 
-    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
+    pub(crate) fn get_active_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
         let topic = self.state_machine.get_topic(&key.topic_id)?;
         let seg = topic.get_active_segment(&key.range_id)?;
         Some(seg.replica_set.clone())
