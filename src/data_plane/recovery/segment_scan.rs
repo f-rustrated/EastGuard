@@ -17,9 +17,10 @@ use crate::data_plane::wal::{WalRecord, WalRecordType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // staged: first consumed by the cursor map and replay
 pub(crate) struct SegmentScan {
-    /// The segment's first entry id, parsed from its filename. The replay
-    /// appender uses it to build the file path and as the contiguity base.
-    pub(crate) start_offset: u64,
+    /// The segment's first entry id — the `start_offset` encoded in its filename.
+    /// The replay appender uses it to build the file path and as the contiguity
+    /// base.
+    pub(crate) start_entry_id: u64,
     /// Highest entry id covered by a complete batch, or `None` when no
     /// complete batch survived (empty, missing, or torn-from-the-start file).
     pub(crate) last_entry_id: Option<u64>,
@@ -104,8 +105,8 @@ impl RecoveredSegments {
         self.0.get(key).map_or(0, |scan| scan.valid_len)
     }
 
-    pub(crate) fn start_offset(&self, key: &SegmentKey) -> Option<u64> {
-        self.0.get(key).map(|scan| scan.start_offset)
+    pub(crate) fn start_entry_id(&self, key: &SegmentKey) -> Option<u64> {
+        self.0.get(key).map(|scan| scan.start_entry_id)
     }
 
     /// `(segment, highest verified entry id)` for every segment that has a
@@ -122,19 +123,19 @@ impl RecoveredSegments {
     /// advancing its cursor.
     ///
     /// Enforces the contiguous-prefix invariant: appends are gapless, so `entry_id` must be exactly one past the cursor
-    /// or the segment's `start_offset` for the first append.
+    /// or the segment's `start_entry_id` for the first append.
     ///
     /// A segment absent from the map is inserted, taking `entry_id` as its base.
     #[allow(dead_code)]
     pub(crate) fn advance(&mut self, key: SegmentKey, entry_id: u64) {
         let scan = self.0.entry(key).or_insert(SegmentScan {
-            start_offset: entry_id,
+            start_entry_id: entry_id,
             last_entry_id: None,
             valid_len: 0,
         });
         let expected = scan
             .last_entry_id
-            .map_or(scan.start_offset, |last| last + 1);
+            .map_or(scan.start_entry_id, |last| last + 1);
         debug_assert_eq!(
             entry_id, expected,
             "non-contiguous replay append to {key:?}: expected {expected}, got {entry_id}"
@@ -150,9 +151,9 @@ impl RecoveredSegments {
         for (key, scan) in &self.0 {
             if let Some(last) = scan.last_entry_id {
                 debug_assert!(
-                    last >= scan.start_offset,
-                    "{key:?}: cursor {last} precedes start_offset {}",
-                    scan.start_offset
+                    last >= scan.start_entry_id,
+                    "{key:?}: cursor {last} precedes start_entry_id {}",
+                    scan.start_entry_id
                 );
             }
         }
@@ -173,7 +174,7 @@ impl RecoveredSegments {
 ///   WAL (deleted only after a checkpoint completes).
 ///
 /// # The base entry id
-/// The segment's first entry id (`start_offset`) is parsed from the filename
+/// The segment's first entry id (`start_entry_id`) is parsed from the filename
 /// (`{segment_id}-{start_offset}.seg`) — segment records are bare, so the name
 /// is the only place the base lives. Entry ids are contiguous, so the last
 /// verified id is computed positionally from it.
@@ -185,12 +186,12 @@ impl RecoveredSegments {
 /// * Genuine I/O failures propagate.
 #[allow(dead_code)]
 pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
-    let (_segment_id, start_offset) = parse_segment_file(path)?;
+    let (_segment_id, start_entry_id) = parse_segment_file(path)?;
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(SegmentScan {
-                start_offset,
+                start_entry_id,
                 last_entry_id: None,
                 valid_len: 0,
             });
@@ -231,9 +232,9 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
 
     // Entry ids are contiguous within a segment, so the last verified id is the
     // base plus the verified count, less one. No complete batch -> no id.
-    let last_entry_id = verified.checked_sub(1).map(|n| start_offset + n);
+    let last_entry_id = verified.checked_sub(1).map(|n| start_entry_id + n);
     Ok(SegmentScan {
-        start_offset,
+        start_entry_id,
         last_entry_id,
         valid_len,
     })
@@ -307,7 +308,7 @@ mod tests {
         let (_dir, path) = write_named(3, 100, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
-        assert_eq!(scan.start_offset, 100);
+        assert_eq!(scan.start_entry_id, 100);
         assert_eq!(scan.last_entry_id, Some(102)); // 100, 101, 102
         assert_eq!(scan.valid_len, len);
     }
@@ -462,9 +463,9 @@ mod tests {
         RoutingHeader::new(seg_key(), entry_id, 1)
     }
 
-    fn scanned(start_offset: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
+    fn scanned(start_entry_id: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
         SegmentScan {
-            start_offset,
+            start_entry_id,
             last_entry_id,
             valid_len,
         }
@@ -522,7 +523,7 @@ mod tests {
         let mut r = RecoveredSegments::default();
         r.advance(seg_key(), 7); // first record of a never-checkpointed segment
         let scan = r.0[&seg_key()];
-        assert_eq!(scan.start_offset, 7);
+        assert_eq!(scan.start_entry_id, 7);
         assert_eq!(scan.last_entry_id, Some(7));
         r.advance(seg_key(), 8);
         assert_eq!(r.0[&seg_key()].last_entry_id, Some(8));

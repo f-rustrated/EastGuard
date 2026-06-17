@@ -22,8 +22,7 @@ use crate::data_plane::parse_segment_file;
 use crate::data_plane::sparse_index::{SparseEntry, is_index_anchor};
 use crate::data_plane::wal::{WalRecord, WalRecordType};
 
-/// Re-derives the sparse-index entries for the segment file at `path`
-pub(crate) fn rebuild_entries(path: &Path, key: SegmentKey) -> io::Result<Vec<SparseEntry>> {
+pub(crate) fn rebuild_sparse_entries(path: &Path, key: SegmentKey) -> io::Result<Vec<SparseEntry>> {
     let (_segment_id, start_offset) = parse_segment_file(path)?;
     let file = match File::open(path) {
         Ok(file) => file,
@@ -121,7 +120,7 @@ mod tests {
         let path = key().file_path(dir.path(), 0);
         write_segment(&path, &batches.concat());
 
-        let entries = rebuild_entries(&path, key()).unwrap();
+        let entries = rebuild_sparse_entries(&path, key()).unwrap();
         // Anchored: id 0 (the base) and id n (a multiple of the interval). The
         // ids in between, and id n+1, are skipped.
         assert_eq!(entries.len(), 2);
@@ -152,7 +151,7 @@ mod tests {
             .concat(),
         );
 
-        let entries = rebuild_entries(&path, key()).unwrap();
+        let entries = rebuild_sparse_entries(&path, key()).unwrap();
         assert_eq!(entries.len(), 1);
 
         let (_db_dir, db) = open_db();
@@ -171,7 +170,7 @@ mod tests {
         let path = key().file_path(dir.path(), 0);
         write_segment(&path, &bytes);
 
-        let entries = rebuild_entries(&path, key()).unwrap();
+        let entries = rebuild_sparse_entries(&path, key()).unwrap();
         assert_eq!(entries.len(), 1); // the base batch; torn tail ignored
     }
 }

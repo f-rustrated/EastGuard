@@ -105,7 +105,10 @@ impl ReplayWriter {
         first_entry_id: u64,
     ) -> io::Result<&mut SegmentAppender> {
         if !self.writers.contains_key(&key) {
-            let start_offset = self.recovered.start_offset(&key).unwrap_or(first_entry_id);
+            let start_offset = self
+                .recovered
+                .start_entry_id(&key)
+                .unwrap_or(first_entry_id);
             let valid_len = self.recovered.valid_len(&key);
             let path = key.file_path(&self.data_dir, start_offset);
             self.writers.insert(
@@ -313,7 +316,7 @@ mod tests {
     /// file — replay re-indexes only what it appended, never the prefix.
     #[test]
     fn suffix_index_plus_live_prefix_equals_full_rebuild() {
-        use crate::data_plane::recovery::index_rebuild::rebuild_entries;
+        use crate::data_plane::recovery::index_rebuild::rebuild_sparse_entries;
         use crate::data_plane::sparse_index::{INDEX_INTERVAL_ENTRIES, SparseIndex};
 
         let dir = tempfile::tempdir().unwrap();
@@ -329,7 +332,7 @@ mod tests {
         write_segment(&path, &prefix);
         // Checkpoint and rebuild share `is_index_anchor`, so rebuilding the
         // prefix-only file == what the live index already holds for that prefix.
-        let prefix_index = rebuild_entries(&path, key()).unwrap();
+        let prefix_index = rebuild_sparse_entries(&path, key()).unwrap();
 
         // Replay re-presents the whole prefix (skipped) then appends ids n..=n+3.
         let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
@@ -349,7 +352,7 @@ mod tests {
 
         // full rebuild of the final (prefix + suffix) file
         let (_full_dir, full) = open_db();
-        full.put_batch(rebuild_entries(&path, key()).unwrap())
+        full.put_batch(rebuild_sparse_entries(&path, key()).unwrap())
             .unwrap();
 
         // Identical resolution for every id across the prefix/suffix boundary.
