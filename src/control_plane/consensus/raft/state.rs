@@ -10,7 +10,7 @@ use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    MetadataCommand, ReplicaSet, RollSegment, TopicMeta, TopicStats,
+    MetadataCommand, ReassignSegment, ReplicaSet, RollSegment, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{SegmentAssignment, SegmentAssignmentAck};
@@ -402,42 +402,71 @@ impl Raft {
         observations
     }
 
-    /// scan active segments in this group for any whose replica set still names a
-    /// node SWIM considers dead, and propose a `RollSegment` to swap in
-    /// healthy replacements. Closes the gap where deaths landed during the
-    /// no-leader window — the live-leader path (`handle_node_death`) catches
-    /// those per-event, this is the backfill sweep on takeover.
+    /// Reconcile this group's under-replicated segments — any whose replica set
+    /// still names a node SWIM considers dead.
+    ///
+    /// Active segments are sealed and reopened with a healthy set (`RollSegment`);
+    /// Sealed segments with a known committed end have their replica set swapped in place (`ReassignSegment`, re-replicated by catch-up).
+    ///
+    /// Closes the gap where deaths landed during the no-leader window — the live-leader path (`handle_node_death`) catches
+    /// those per-event; this is the backfill sweep on takeover. Both triggers share this one method.
     pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
+        let active = self.active_segments_with_dead_members(live_set);
+        let sealed = self.sealed_segments_with_dead_members(live_set);
         let mut changed = false;
 
-        let live_nodes: Vec<NodeId> = live_set.clone().into_iter().collect();
+        // Active: seal + reopen with a healthy set. `end_entry_id = None` — a
+        // death/takeover doesn't know the committed offset; it's corrected later.
+        changed |= self.repair_segments(active, live_set, |segment_key, new_replica_set| {
+            RollSegment {
+                segment_key,
+                sealed_at: now_ms(),
+                new_replica_set,
+                end_entry_id: None,
+            }
+            .into()
+        });
 
-        for (segment_key, old_replica_set) in self.active_segments_with_dead_members(live_set) {
-            let dead_in_set: Vec<NodeId> = old_replica_set
+        // Sealed (known-end): swap the replica set in place; catch-up re-replicates
+        // to the new node. Boundary-unknown seals are excluded by the scan — see
+        // `diagrams/data-plane/leader_crash_seal_boundary.md`.
+        changed |= self.repair_segments(sealed, live_set, |segment_key, new_replica_set| {
+            ReassignSegment {
+                segment_key,
+                new_replica_set,
+            }
+            .into()
+        });
+        changed
+    }
+
+    fn repair_segments<F>(
+        &mut self,
+        segments: Box<[(SegmentKey, ReplicaSet)]>,
+        live_set: &HashSet<NodeId>,
+        build_cmd: F,
+    ) -> bool
+    where
+        F: Fn(SegmentKey, Vec<NodeId>) -> MetadataCommand,
+    {
+        let live_nodes: Vec<NodeId> = live_set.iter().cloned().collect();
+        let mut changed = false;
+        for (segment_key, curr_rs) in segments {
+            let dead_in_set: Vec<NodeId> = curr_rs
                 .iter()
                 .filter(|n| !live_set.contains(*n))
                 .cloned()
                 .collect();
             let new_replica_set =
-                compute_replacement_replica_set(&old_replica_set, &dead_in_set, &live_nodes);
-            // end_entry_id = None: takeover doesn't know the committed offset.
-            // The sealed segment's end_offset is corrected later (D5 repair or
-            // by the segment leader's subsequent SealRequest carrying it).
-            let cmd = RollSegment {
-                segment_key,
-                sealed_at: now_ms(),
-                new_replica_set,
-                end_entry_id: None,
-            };
-            if let Err(e) = self.propose(cmd.into()) {
-                tracing::warn!(
-                    "Takeover-triggered RollSegment for {:?} on {:?} failed: {:?}",
+                compute_replacement_replica_set(&curr_rs, &dead_in_set, &live_nodes);
+            match self.propose(build_cmd(segment_key, new_replica_set).into()) {
+                Ok(_) => changed = true,
+                Err(e) => tracing::warn!(
+                    "segment repair for {:?} on {:?} rejected: {:?}",
                     segment_key,
                     self.shard_group_id,
                     e
-                );
-            } else {
-                changed = true;
+                ),
             }
         }
         changed
@@ -478,18 +507,37 @@ impl Raft {
         self.peers_iter().filter(|p| !live.contains(*p))
     }
 
+    /// Active segments across all topics whose `replica_set` contains at
+    /// least one non-live member.
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
     ) -> Box<[(SegmentKey, ReplicaSet)]> {
-        self.state_machine.active_segments_with_dead_members(live)
+        self.state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.active_segments_with_dead_members(live))
+            .collect()
+    }
+
+    /// Sealed (known-end) segments across all topics whose `replica_set` names a
+    /// non-live member — D5 sealed-segment repair candidates.
+    pub(crate) fn sealed_segments_with_dead_members(
+        &self,
+        live: &HashSet<NodeId>,
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+        self.state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.sealed_segments_with_dead_members(live))
+            .collect()
     }
 
     pub(crate) fn has_topic(&self, topic_id: &crate::control_plane::metadata::TopicId) -> bool {
         self.state_machine.get_topic(topic_id).is_some()
     }
 
-    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
+    pub(crate) fn get_active_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
         let topic = self.state_machine.get_topic(&key.topic_id)?;
         let seg = topic.get_active_segment(&key.range_id)?;
         Some(seg.replica_set.clone())
@@ -3400,6 +3448,103 @@ mod tests {
             after.len(),
             before,
             "reconcile_segments must be a no-op when all replicas are live (got tail: {:?})",
+            &after[before..]
+        );
+    }
+
+    #[test]
+    fn reconcile_reassigns_sealed_segments_with_dead_replicas() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+
+        // Single-node leader so CreateTopic + RollSegment commit and apply
+        // trivially (quorum = 1).
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+
+        // Seal segment 0 with a KNOWN end, handing the new (active) segment a LIVE
+        // replica set — so afterward only the sealed segment is under-replicated.
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1")],
+                end_entry_id: Some(100),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        raft.simulate_flush_and_apply();
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = live_set(&["node-1"]); // x/y/z dead; the active segment's node-1 lives
+        raft.reconcile_segments(&live);
+        let after = proposals_after_become_leader(&raft);
+
+        let reassigns: Vec<_> = after[before..]
+            .iter()
+            .filter_map(|c| match c {
+                RaftCommand::Metadata(MetadataCommand::ReassignSegment(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reassigns.len(),
+            1,
+            "exactly one ReassignSegment for the sealed segment (tail: {:?})",
+            &after[before..]
+        );
+        assert_eq!(reassigns[0].segment_key, seg0);
+        for member in &reassigns[0].new_replica_set {
+            assert!(
+                live.contains(member),
+                "reassigned replica_set must be all-live, found {:?}",
+                member
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_skips_sealed_segment_with_unknown_end() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+
+        // Same shape, but seal with end_entry_id = None — a SWIM-death-style seal
+        // whose committed end the coordinator never learned.
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1")],
+                end_entry_id: None,
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        raft.simulate_flush_and_apply();
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = live_set(&["node-1"]);
+        raft.reconcile_segments(&live);
+        let after = proposals_after_become_leader(&raft);
+
+        // Dead replicas, but an unknown end → excluded from repair
+        // (`leader_crash_seal_boundary.md`). Nothing proposed for it.
+        let reassigns = after[before..]
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RaftCommand::Metadata(MetadataCommand::ReassignSegment(_))
+                )
+            })
+            .count();
+        assert_eq!(
+            reassigns,
+            0,
+            "boundary-unknown sealed segment must not be reassigned (tail: {:?})",
             &after[before..]
         );
     }

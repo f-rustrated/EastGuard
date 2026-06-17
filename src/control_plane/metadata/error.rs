@@ -10,6 +10,7 @@ pub enum MetadataError {
     RangeNotActive,
     SegmentNotFound,
     SegmentNotActive,
+    SegmentNotSealed,
     SplitNotAllowed(TopicId),
     RangesNotAdjacent,
     InvalidSplitPoint,

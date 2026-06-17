@@ -148,7 +148,7 @@ impl MultiRaft {
             .topology
             .resolve_nodes_in_group(&self.node_id, shard_group_id);
 
-        self.reconcile_shard(shard_group_id, target_members);
+        self.reconcile_membership(shard_group_id, target_members);
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
@@ -172,10 +172,10 @@ impl MultiRaft {
                     .collect::<Box<[NodeId]>>()
             });
 
-        self.reconcile_shard(shard_group_id, target_members);
+        self.reconcile_membership(shard_group_id, target_members);
     }
 
-    fn reconcile_shard(
+    fn reconcile_membership(
         &mut self,
         shard_group_id: ShardGroupId,
         target_members: Option<Box<[NodeId]>>,
@@ -485,7 +485,7 @@ impl MultiRaft {
             return;
         };
 
-        let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
+        let Some(old_replica_set) = raft.get_active_replica_set(&seal.segment_key) else {
             tracing::warn!("SealRequest for unknown segment {:?}", seal.segment_key);
             return;
         };

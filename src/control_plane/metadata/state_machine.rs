@@ -7,14 +7,12 @@ use crate::control_plane::metadata::{RangeId, SegmentId, TopicId, error::Metadat
 use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-
 use MetadataError::*;
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct MetadataStateMachine {
-    topics: HashMap<TopicId, TopicMeta>,
+    pub(crate) topics: HashMap<TopicId, TopicMeta>,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
     pending_proposals: Vec<MetadataCommand>,
@@ -66,18 +64,6 @@ impl MetadataStateMachine {
             .collect()
     }
 
-    /// Active segments across all topics whose `replica_set` contains at
-    /// least one non-live member.
-    pub(crate) fn active_segments_with_dead_members(
-        &self,
-        live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
-        self.topics
-            .values()
-            .flat_map(|t| t.active_segments_with_dead_members(live))
-            .collect()
-    }
-
     pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<ApplyResult, MetadataError> {
         use MetadataCommand::*;
         let result = match command {
@@ -99,6 +85,7 @@ impl MetadataStateMachine {
             SplitRange(cmd) => self.split_range(cmd)?.into(),
             MergeRange(cmd) => self.merge_range(cmd)?.into(),
             DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted)?,
+            ReassignSegment(cmd) => self.reassign_segment(cmd)?,
         };
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -154,6 +141,31 @@ impl MetadataStateMachine {
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
         })
+    }
+
+    /// Re-points a sealed segment's replica set.
+    /// `Noop` when the set is unchanged, otherwise `SegmentReassigned`.
+    /// The segment must be sealed; an active/deleting/unknown one is rejected.
+    fn reassign_segment(&mut self, cmd: ReassignSegment) -> Result<ApplyResult, MetadataError> {
+        let segment = self
+            .topics
+            .get_mut(&cmd.segment_key.topic_id)
+            .ok_or(TopicNotFound(cmd.segment_key.topic_id))?
+            .get_mut(cmd.segment_key)?;
+
+        // The dispatch announces the desired replica set; receivers reconcile, so
+        // we only carry the sealed bounds (the catch-up target) alongside it.
+        if segment.reassign(cmd.new_replica_set.clone())? {
+            Ok(SegmentReassigned {
+                segment_key: cmd.segment_key,
+                start_entry_id: segment.start_entry_id,
+                sealed_end: segment.end_entry_id,
+                new_replica_set: cmd.new_replica_set,
+            }
+            .into())
+        } else {
+            Ok(ApplyResult::Noop)
+        }
     }
 
     fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
@@ -366,6 +378,97 @@ mod tests {
         }
     }
 
+    /// A surviving subset plus a fresh replacement — what the coordinator picks
+    /// when a replica of a sealed segment dies (node-3 → node-4 here).
+    fn replacement_set() -> Vec<NodeId> {
+        vec![
+            NodeId::new("node-1"),
+            NodeId::new("node-2"),
+            NodeId::new("node-4"),
+        ]
+    }
+
+    // --- ReassignSegment ---
+
+    #[test]
+    fn reassign_swaps_a_sealed_segments_replica_set() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        // Roll so SegmentId(0) becomes Sealed (SegmentId(1) is the new write head).
+        roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
+        let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        let result = sm
+            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: sealed,
+                new_replica_set: replacement_set(),
+            }))
+            .unwrap();
+
+        match result {
+            ApplyResult::SegmentReassigned(r) => {
+                assert_eq!(r.segment_key, sealed);
+                assert_eq!(r.new_replica_set, replacement_set());
+            }
+            other => panic!("expected SegmentReassigned, got {other:?}"),
+        }
+
+        let seg = &sm.get_topic(&topic_id).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)];
+        assert_eq!(seg.replica_set, replacement_set());
+        assert_eq!(seg.state, SegmentMetaState::Sealed); // stays sealed
+    }
+
+    #[test]
+    fn reassign_same_set_is_a_noop() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
+        let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: sealed,
+            new_replica_set: replacement_set(),
+        }))
+        .unwrap();
+
+        // Re-applying the identical set (duplicate death detection / re-proposal)
+        // changes nothing.
+        let again = sm
+            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: sealed,
+                new_replica_set: replacement_set(),
+            }))
+            .unwrap();
+        assert_eq!(again, ApplyResult::Noop);
+    }
+
+    #[test]
+    fn reassign_rejects_an_active_segment() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        // SegmentId(0) is the active write head — no roll yet.
+        let active = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
+
+        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: active,
+            new_replica_set: replacement_set(),
+        }));
+        assert!(matches!(result, Err(MetadataError::SegmentNotSealed)));
+    }
+
+    #[test]
+    fn reassign_rejects_an_unknown_segment() {
+        let mut sm = MetadataStateMachine::default();
+        let topic_id = create_topic(&mut sm, "blue");
+        let unknown = SegmentKey::new(topic_id, RangeId(0), SegmentId(99));
+
+        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
+            segment_key: unknown,
+            new_replica_set: replacement_set(),
+        }));
+        assert!(matches!(result, Err(MetadataError::SegmentNotFound)));
+    }
+
     // --- CreateTopic ---
 
     #[test]
@@ -420,8 +523,8 @@ mod tests {
         assert_eq!(range.next_offset, 0);
 
         let seg = &range.segments[&SegmentId(0)];
-        assert_eq!(seg.start_offset, 0);
-        assert_eq!(seg.end_offset, None);
+        assert_eq!(seg.start_entry_id, 0);
+        assert_eq!(seg.end_entry_id, None);
     }
 
     #[test]
@@ -1043,9 +1146,9 @@ mod tests {
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         let sealed = &range.segments[&SegmentId(0)];
-        assert_eq!(sealed.end_offset, Some(42000));
+        assert_eq!(sealed.end_entry_id, Some(42000));
         let new_seg = &range.segments[&SegmentId(1)];
-        assert_eq!(new_seg.start_offset, 42001);
+        assert_eq!(new_seg.start_entry_id, 42001);
     }
 
     // --- D3: end-offset correction ---
@@ -1064,7 +1167,7 @@ mod tests {
         }));
 
         assert_eq!(
-            sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_offset,
+            sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_entry_id,
             None
         );
 
@@ -1078,8 +1181,8 @@ mod tests {
         assert!(result.is_ok());
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.segments[&SegmentId(0)].end_offset, Some(42000));
-        assert_eq!(range.segments[&SegmentId(1)].start_offset, 42001);
+        assert_eq!(range.segments[&SegmentId(0)].end_entry_id, Some(42000));
+        assert_eq!(range.segments[&SegmentId(1)].start_entry_id, 42001);
     }
 
     #[test]

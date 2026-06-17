@@ -77,13 +77,11 @@ Segment
 ├─ segment_id:     SegmentId
 ├─ range_id:       RangeId
 ├─ topic_id:       u64
-├─ state:          Active | Sealed | Reassigning | Deleting
+├─ state:          Active | Sealed | Deleting
 ├─ replica_set:    Vec<NodeId>
 ├─ size_bytes:     u64
 ├─ created_at:     Timestamp
 └─ sealed_at:      Option<Timestamp>
-
-Reassigning state carries: { from: NodeId, to: NodeId }
 ```
 
 ---

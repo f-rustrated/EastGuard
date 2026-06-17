@@ -53,12 +53,19 @@ pub struct DeleteTopic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct ReassignSegment {
+    pub segment_key: SegmentKey,
+    pub new_replica_set: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum MetadataCommand {
     CreateTopic(CreateTopic),
     RollSegment(RollSegment),
     SplitRange(SplitRange),
     MergeRange(MergeRange),
     DeleteTopic(DeleteTopic),
+    ReassignSegment(ReassignSegment),
 }
 
 impl_from_variant!(
@@ -67,5 +74,6 @@ impl_from_variant!(
     RollSegment,
     SplitRange,
     MergeRange,
-    DeleteTopic
+    DeleteTopic,
+    ReassignSegment
 );
