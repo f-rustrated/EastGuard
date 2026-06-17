@@ -270,9 +270,6 @@ mod tests {
                 .map(|(o, p)| (*o, *p))
                 .unwrap_or((target_offset, 0))
         }
-        fn anchor_at(&self, _segment_key: SegmentKey, entry_id: u64) -> Option<u64> {
-            self.positions.get(&entry_id).copied()
-        }
     }
 
     fn key() -> SegmentKey {
