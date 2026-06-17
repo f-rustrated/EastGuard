@@ -164,6 +164,32 @@ impl SegmentStore {
         Some(tracker)
     }
 
+    /// Register a sealed segment received whole via catch-up. It was never active
+    /// on this node (no tracker to seal), so it goes straight into the sealed
+    /// index, where the cold-read resolver and `sealed_bounds` will find it. The
+    /// segment must not be active here — caught-up segments never were.
+    pub(crate) fn insert_sealed_from_catch_up(
+        &mut self,
+        key: SegmentKey,
+        start_entry_id: u64,
+        end_entry_id: u64,
+    ) {
+        debug_assert!(
+            !self.by_key.contains_key(&key),
+            "catch-up sealed segment {key:?} must not be active"
+        );
+        self.sealed_by_range
+            .entry((key.topic_id, key.range_id))
+            .or_default()
+            .insert(
+                start_entry_id,
+                SealedSegmentLocation {
+                    segment_id: key.segment_id,
+                    end_entry_id,
+                },
+            );
+    }
+
     /// Map `(range, offset)` to the segment that holds it. Active segments
     /// win (most fetches land on the write head); falls back to the sealed
     /// table for historical offsets. Returns `None` when no locally-hosted
@@ -203,6 +229,21 @@ impl SegmentStore {
             key: SegmentKey::new(topic_id, range_id, slot.segment_id),
             start_entry_id,
             end_entry_id: slot.end_entry_id,
+        })
+    }
+
+    /// Look up a sealed segment's `(start_entry_id, end_entry_id)` by key.
+    /// The catch-up source path uses this to stream `(local_end, end]` from its own
+    /// committed bounds rather than bounds relayed by the requester — so it always
+    /// clips to its own end.
+    ///
+    /// `None` if this node holds no sealed segment with that id (GC'd, never had it, or a race), in
+    /// which case the source declines and the requester re-drives. O(n) in the
+    /// range's sealed segments; catch-up is death-driven and rare.
+    pub(crate) fn sealed_bounds(&self, key: &SegmentKey) -> Option<(u64, u64)> {
+        let sealed = self.sealed_by_range.get(&(key.topic_id, key.range_id))?;
+        sealed.iter().find_map(|(&start, loc)| {
+            (loc.segment_id == key.segment_id).then_some((start, loc.end_entry_id))
         })
     }
 
@@ -363,5 +404,44 @@ mod tests {
             matches!(r, SegmentReadState::Active(g) if g == successor),
             "unindexing a different segment id must not evict the successor",
         );
+    }
+
+    #[test]
+    fn sealed_bounds_finds_start_and_end_by_key() {
+        let mut store = SegmentStore::new();
+        let k = key(1, 0, 7);
+        let mut t = tracker(20);
+        t.commit_entry(99);
+        store.insert_active(k, t);
+        store.take_active_and_seal(k);
+
+        assert_eq!(store.sealed_bounds(&k), Some((20, 99)));
+        // Same range, a segment id this node never sealed → None.
+        assert_eq!(store.sealed_bounds(&key(1, 0, 8)), None);
+        // A range with no sealed segments at all → None.
+        assert_eq!(store.sealed_bounds(&key(2, 0, 7)), None);
+    }
+
+    #[test]
+    fn insert_sealed_from_catch_up_makes_segment_cold_readable() {
+        let mut store = SegmentStore::new();
+        let k = key(1, 0, 5);
+        // Received whole via catch-up — never active here.
+        store.insert_sealed_from_catch_up(k, 100, 142);
+
+        assert_eq!(store.sealed_bounds(&k), Some((100, 142)));
+        // And the resolver routes an in-range offset to it (cold path).
+        match store.resolve(TopicId(1), RangeId(0), 120).unwrap() {
+            SegmentReadState::Sealed {
+                key: g,
+                start_entry_id,
+                end_entry_id,
+            } => {
+                assert_eq!(g, k);
+                assert_eq!(start_entry_id, 100);
+                assert_eq!(end_entry_id, 142);
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
     }
 }

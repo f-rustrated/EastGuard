@@ -1,4 +1,4 @@
-use super::checkpoint::CheckpointJob;
+use super::checkpoint::CheckpointTask;
 use super::cold_read::ColdReadPool;
 use super::messages::pending::DataPlaneOutputs;
 use super::recovery::inventory::RecoveryOutput;
@@ -31,7 +31,7 @@ impl DataPlaneActor {
     pub fn spawn(
         node_id: NodeId,
         config: DataNodeConfig,
-        checkpoint_tx: Sender<Box<[CheckpointJob]>>,
+        checkpoint_tx: Sender<Box<[CheckpointTask]>>,
         data_transport_tx: BatchSender<DataTransportCommand>,
         coordinator_tx: MutlRaftSender,
         sparse_index: Arc<dyn SparseIndex>,
@@ -67,6 +67,8 @@ impl DataPlaneActor {
             }
         });
 
+        let self_tx = DataPlaneSender(tx.clone());
+
         thread::Builder::new()
             .name("data-plane-worker".into())
             .spawn(move || {
@@ -91,7 +93,8 @@ impl DataPlaneActor {
                     data_transport_tx,
                     coordinator_tx,
                 );
-                let mut state = DataPlane::new(node_id, config, wal, cold_read_tx, out, inventory);
+                let mut state =
+                    DataPlane::new(node_id, config, wal, cold_read_tx, self_tx, out, inventory);
 
                 while let Ok(msg) = mailbox.recv() {
                     state.process(msg);

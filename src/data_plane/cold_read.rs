@@ -8,10 +8,13 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::SegmentKey;
+use super::actor::DataPlaneSender;
 use super::sparse_index::SparseIndex;
 use super::states::segment::cache::CachedEntry;
 use super::wal::{WalRecord, WalRecordType};
 use crate::connections::protocol::RangeProgressSignal;
+use crate::control_plane::NodeId;
+use crate::data_plane::messages::command::CatchUpReadComplete;
 use crate::data_plane::messages::query::FetchResult;
 
 pub const DEFAULT_POOL_SIZE: usize = 4;
@@ -26,28 +29,41 @@ pub(crate) enum ColdReadError {
     Decode(std::io::Error),
 }
 
-/// A cold read of a sealed segment file. The request carries the consumer's
-/// fetch reply channel directly: the pool worker reads the records off disk and
-/// fulfils the `FetchResult` itself, so the synchronous data-plane thread never
-/// has to bridge an async cold read (it just hands the request off and moves on).
 pub(crate) struct ColdReadRequest {
     pub(crate) segment_key: SegmentKey,
     pub(crate) segment_file_path: PathBuf,
-    /// First entry id the consumer wants (inclusive).
+    /// First entry id wanted (inclusive).
     pub(crate) start_entry_offset: u64,
     /// Last entry id stored in this sealed segment (inclusive). Reads never
     /// cross past this even if the file has a trailing partial write.
     pub(crate) end_entry_id: u64,
     pub(crate) max_bytes: u64,
-    /// Echoed back to the consumer on the response — the in-band seal/lineage
-    /// signal computed by the broker (see d4_consumer_range_tracking.md).
-    pub(crate) progress_signal: RangeProgressSignal,
-    pub(crate) reply: oneshot::Sender<FetchResult>,
+    pub(crate) reply: ColdReadReply,
+}
+
+/// Where a finished cold read is delivered.
+pub(crate) enum ColdReadReply {
+    Consumer {
+        reply: oneshot::Sender<FetchResult>,
+        progress_signal: RangeProgressSignal,
+    },
+    CatchUp(CatchUpReadReply),
+}
+
+/// Routing context for a catch-up source read (the [`ColdReadReply::CatchUp`] arm).
+pub(crate) struct CatchUpReadReply {
+    /// The node that requested the catch-up — chunks are addressed here.
+    pub(crate) requester: NodeId,
+    /// Echoed into `CatchUpReadComplete` so the worker can re-arm the next read
+    /// and decide when the sealed end is reached.
+    pub(crate) start_offset: u64,
+    pub(crate) sealed_end: u64,
+    pub(crate) mailbox: DataPlaneSender,
 }
 
 /// Records read off a sealed segment file, already paired with their entry ids
 /// and per-entry `record_count` (restored from the on-disk `WalRecord`).
-struct ColdReadRecords {
+pub(crate) struct ColdReadRecords {
     entries: Vec<Arc<CachedEntry>>,
     next_offset: u64,
 }
@@ -77,18 +93,50 @@ impl ColdReadPool {
 
     fn worker_loop(mailbox: Receiver<ColdReadRequest>, sparse_index: &dyn SparseIndex) {
         while let Ok(req) = mailbox.recv() {
-            let result = match Self::process_request(&req, sparse_index) {
-                Ok(records) => FetchResult::Records {
-                    entries: records.entries,
-                    next_entry_id: records.next_offset,
-                    progress_signal: req.progress_signal,
+            let result = Self::process_request(&req, sparse_index);
+            let ColdReadRequest {
+                segment_key, reply, ..
+            } = req;
+
+            match result {
+                Ok(records) => match reply {
+                    ColdReadReply::Consumer {
+                        reply,
+                        progress_signal,
+                    } => {
+                        let _ = reply.send(FetchResult::Records {
+                            entries: records.entries,
+                            next_entry_id: records.next_offset,
+                            progress_signal,
+                        });
+                    }
+                    ColdReadReply::CatchUp(cu) => {
+                        let done = CatchUpReadComplete {
+                            requester: cu.requester,
+                            segment_key,
+                            start_offset: cu.start_offset,
+                            sealed_end: cu.sealed_end,
+                            entries: records.entries,
+                            next_offset: records.next_offset,
+                        };
+
+                        let _ = cu.mailbox.send(done);
+                    }
                 },
-                Err(e) => {
-                    tracing::warn!("cold read failed for {:?}: {e}", req.segment_key);
-                    FetchResult::InternalError(format!("cold read failed: {e}"))
-                }
-            };
-            let _ = req.reply.send(result);
+
+                Err(e) => match reply {
+                    ColdReadReply::Consumer { reply, .. } => {
+                        tracing::warn!("cold read failed for {segment_key:?}: {e}");
+                        let err_msg = format!("cold read failed: {e}");
+                        let _ = reply.send(FetchResult::InternalError(err_msg));
+                    }
+                    ColdReadReply::CatchUp(_) => {
+                        // Source-side read failed; nothing durable changed. The
+                        // replacement times out and the coordinator re-drives, so just drop with a log.
+                        tracing::warn!("catch-up source read failed for {segment_key:?}: {e}");
+                    }
+                },
+            }
         }
     }
 
@@ -105,13 +153,6 @@ impl ColdReadPool {
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(byte_position))?;
 
-        // The index is sparse, so `seek_index` returns the nearest anchor at or
-        // below `start_offset` — its entry id and byte position. Segment records
-        // are bare (no embedded id), so we count ids positionally: start
-        // `current_offset` at the anchor id, then walk forward one `Data` record
-        // per entry (each followed by a `BatchEnd` separator), skipping ids below
-        // `start_offset` and collecting `[start_offset, end_entry_id]` capped by
-        // `max_bytes`.
         let mut entries: Vec<Arc<CachedEntry>> = Vec::new();
         let mut current_offset = anchor_id;
         let mut next_offset = req.start_entry_offset;
@@ -266,8 +307,10 @@ mod tests {
             start_entry_offset: start_offset,
             end_entry_id,
             max_bytes,
-            progress_signal: RangeProgressSignal::Active,
-            reply,
+            reply: ColdReadReply::Consumer {
+                reply,
+                progress_signal: RangeProgressSignal::Active,
+            },
         }
     }
 

@@ -12,15 +12,15 @@
 //! inventory: nothing is reported durable until it is on disk.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io;
 use std::path::PathBuf;
 
 use bytes::Bytes;
 
 use super::segment_scan::{Decision, RecoveredSegments};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::sparse_index::{SparseEntry, is_index_anchor};
+use crate::data_plane::segment_writer::SegmentAppender;
+use crate::data_plane::sparse_index::SparseEntry;
 use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::WalRecord;
 
@@ -47,27 +47,6 @@ pub(crate) struct ReplayOutput {
     pub(crate) suffix_index: Box<[SparseEntry]>,
 }
 
-/// One open segment appender plus the absolute byte offset of its next write —
-/// the position an index anchor would point at.
-struct SegmentAppender {
-    writer: BufWriter<File>,
-    next_pos: u64,
-}
-
-impl SegmentAppender {
-    /// Writes one `(Data, BatchEnd)` batch with the bare `entry_data` payload and
-    /// returns the absolute byte offset where the `Data` record begins.
-    fn append_batch(&mut self, entry_data: &[u8], record_count: u32) -> io::Result<u64> {
-        let data_start = self.next_pos;
-        let data = WalRecord::data(Bytes::copy_from_slice(entry_data), record_count);
-        data.encode_to(&mut self.writer)?;
-        let end = WalRecord::batch_end();
-        end.encode_to(&mut self.writer)?;
-        self.next_pos += data.encoded_size() as u64 + end.encoded_size() as u64;
-        Ok(data_start)
-    }
-}
-
 impl ReplayWriter {
     pub(crate) fn new(data_dir: PathBuf, recovered: RecoveredSegments) -> Self {
         Self {
@@ -92,15 +71,12 @@ impl ReplayWriter {
             return Ok(Decision::Skip);
         }
         let key = header.segment_key();
-        let data_start = self
-            .writer_for(key, header.entry_id)?
-            .append_batch(entry_data, header.record_count)?;
-        if is_index_anchor(data_start, header.entry_id) {
-            self.index_entries.push(SparseEntry::new(
-                key,
-                header.entry_id,
-                data_start.to_be_bytes(),
-            ));
+        let anchor = self.writer_for(key, header.entry_id)?.append_entry(
+            header.entry_id,
+            WalRecord::data(Bytes::copy_from_slice(entry_data), header.record_count),
+        )?;
+        if let Some(anchor) = anchor {
+            self.index_entries.push(anchor);
         }
         self.recovered.advance(key, header.entry_id);
         Ok(Decision::Append)
@@ -112,8 +88,7 @@ impl ReplayWriter {
     /// until this returns `Ok`.
     pub(crate) fn finish(mut self) -> io::Result<ReplayOutput> {
         for appender in self.writers.values_mut() {
-            appender.writer.flush()?;
-            appender.writer.get_ref().sync_all()?;
+            appender.flush_and_sync()?;
         }
         Ok(ReplayOutput {
             recovered: self.recovered,
@@ -133,26 +108,9 @@ impl ReplayWriter {
             let start_offset = self.recovered.start_offset(&key).unwrap_or(first_entry_id);
             let valid_len = self.recovered.valid_len(&key);
             let path = key.file_path(&self.data_dir, start_offset);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            // `truncate(false)` on purpose: opening must NOT zero an existing segment
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)?;
-
-            // * truncate torn-tail
-            file.set_len(valid_len)?;
-            let mut writer = BufWriter::new(file);
-            writer.seek(SeekFrom::Start(valid_len))?;
             self.writers.insert(
                 key,
-                SegmentAppender {
-                    writer,
-                    next_pos: valid_len,
-                },
+                SegmentAppender::open_truncating(key, &path, valid_len)?,
             );
         }
 
@@ -165,11 +123,13 @@ impl ReplayWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use super::*;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::recovery::segment_scan::scan_segment_file;
+    use crate::data_plane::wal::WalRecord;
 
     fn key() -> SegmentKey {
         SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))

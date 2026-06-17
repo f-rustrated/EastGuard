@@ -1,12 +1,15 @@
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use bincode::{Decode, Encode};
+use std::borrow::Borrow;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
     control_plane::metadata::SegmentId,
+    data_plane::states::segment::cache::CachedEntry,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 
@@ -15,6 +18,9 @@ pub enum DataPlaneCommand {
     CheckpointComplete(CheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
+    /// Internal (not a wire message): the cold-read pool's reply for a catch-up
+    /// source read. The worker turns it into `CatchUpChunk`s on the transport.
+    CatchUpReadComplete(CatchUpReadComplete),
 }
 
 pub struct Produce {
@@ -81,6 +87,71 @@ pub struct SegmentSealed {
     pub segment_key: SegmentKey,
 }
 
+// Catch-up: re-replicate a sealed segment to a newly assigned replica
+//
+// When a node is assigned a sealed segment it does not yet hold completely (a death-driven reassignment, or recovered data reclaimed via the catch-up lottery),
+// it brings its local copy up to the sealed end by fetching the missing suffix from a healthy replica. Four messages, all riding the
+// `DataPlaneInterNodeCommand` wire (bounded by `DATA_FRAME_MAX`):
+//
+//   coordinator ─CatchUpAssignment─▶ replacement  "you own `key`; fetch from `source`"
+//   replacement ─CatchUpRequest────▶ source       "I have through `local_end`; send the rest"
+//   source      ─CatchUpChunk(s)───▶ replacement  bounded batches of entries
+//   source      ─CatchUpDone───────▶ replacement  end of stream; verify, then report complete
+//
+// This commit defines the types, encoding, and routing only — handlers are
+// stubbed; the source side lands in commit 20 and the replacement side
+// (inventory-aware, per the implementation plan §25) in commit 21.
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpAssignment {
+    pub segment_key: SegmentKey,
+    /// Base entry id of the sealed segment — lets the replacement create and
+    /// position the segment file when it holds no local copy at all.
+    pub start_offset: u64,
+    /// Committed end entry id of the sealed segment: the catch-up target.
+    pub sealed_end: u64,
+    /// A healthy replica to fetch the missing suffix from.
+    pub source: NodeId,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpRequest {
+    pub segment_key: SegmentKey,
+    /// The requesting node — the source streams its `CatchUpChunk`s back here.
+    pub from: NodeId,
+    /// Highest entry id the requester already holds locally; the source streams
+    /// `(local_end, sealed_end]`. `None` means nothing is held.
+    pub local_end: Option<u64>,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpChunk {
+    pub segment_key: SegmentKey,
+    /// Contiguous entries in ascending `entry_id` order.
+    pub entries: Box<[CatchUpEntry]>,
+}
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpEntry {
+    pub entry_id: u64,
+    pub data: EntryPayload,
+    pub record_count: u32,
+}
+impl CatchUpEntry {
+    pub(crate) fn from_cache(cache: impl Borrow<CachedEntry>) -> Self {
+        let cache = cache.borrow();
+        CatchUpEntry {
+            entry_id: cache.entry_id,
+            data: cache.data.clone(),
+            record_count: cache.record_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpDone {
+    pub segment_key: SegmentKey,
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
@@ -91,6 +162,10 @@ pub enum DataPlaneInterNodeCommand {
     SealRequest(SealRequest),
     SealResponse(SealResponse),
     SegmentSealed(SegmentSealed),
+    CatchUpAssignment(CatchUpAssignment),
+    CatchUpRequest(CatchUpRequest),
+    CatchUpChunk(CatchUpChunk),
+    CatchUpDone(CatchUpDone),
 }
 
 impl_from_variant!(
@@ -103,6 +178,10 @@ impl_from_variant!(
     SealRequest,
     SealResponse,
     SegmentSealed,
+    CatchUpAssignment,
+    CatchUpRequest,
+    CatchUpChunk,
+    CatchUpDone,
 );
 
 #[derive(Debug)]
@@ -122,10 +201,21 @@ pub struct CheckpointComplete {
     pub checkpointed_lsn: u64,
 }
 
+/// The cold-read pool's reply for a catch-up *source* read.
+pub struct CatchUpReadComplete {
+    pub requester: NodeId,
+    pub segment_key: SegmentKey,
+    pub start_offset: u64,
+    pub sealed_end: u64,
+    pub entries: Vec<Arc<CachedEntry>>,
+    pub next_offset: u64,
+}
+
 impl_from_variant!(
     DataPlaneCommand,
     Produce,
     CheckpointComplete,
+    CatchUpReadComplete,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );
@@ -135,15 +225,7 @@ use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentA
 impl_from_variant_via!(
     DataPlaneCommand,
     DataPlaneTimeoutCallback,
-    BatchFlushCallback
-);
-impl_from_variant_via!(
-    DataPlaneCommand,
-    DataPlaneTimeoutCallback,
-    ReplicationCallback
-);
-impl_from_variant_via!(
-    DataPlaneCommand,
-    DataPlaneTimeoutCallback,
+    BatchFlushCallback,
+    ReplicationCallback,
     SegmentAgeCallback
 );

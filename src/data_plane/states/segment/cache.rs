@@ -41,7 +41,7 @@ const DEFAULT_CAPACITY: usize = 1024;
 //     is logically evicted (readers rejected by frontier check) but the
 //     memory is reclaimed when the publisher physically reaches that slot.
 pub(crate) struct SegmentRingBuffer {
-    batches: Box<[ArcSwapOption<CachedEntry>]>,
+    entries: Box<[ArcSwapOption<CachedEntry>]>,
     capacity: usize,
     write_cursor: AtomicU64,
     read_cursor: AtomicU64,
@@ -59,13 +59,13 @@ impl SegmentRingBuffer {
         // division with bitwise AND — a single-cycle CPU instruction
         assert!(capacity > 0 && capacity.is_power_of_two());
 
-        let batches = std::iter::repeat_with(|| ArcSwapOption::new(None))
+        let entries = std::iter::repeat_with(|| ArcSwapOption::new(None))
             .take(capacity)
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         SegmentRingBuffer {
-            batches,
+            entries,
             capacity,
             write_cursor: AtomicU64::new(0),
             read_cursor: AtomicU64::new(0),
@@ -83,7 +83,7 @@ impl SegmentRingBuffer {
     pub(super) fn publish(&self, entry: Arc<CachedEntry>) {
         let tail = self.write_cursor.load(Ordering::Acquire);
         let idx = self.slot_index(tail);
-        self.batches[idx].store(Some(entry));
+        self.entries[idx].store(Some(entry));
 
         // ! SAFETY: why not self.write_cursor.fetch_add(1)?
         // ! because there is only one writer thread
@@ -119,7 +119,7 @@ impl SegmentRingBuffer {
         }
 
         let idx = self.slot_index(position);
-        self.batches[idx].load_full()
+        self.entries[idx].load_full()
     }
 
     /// Internal read: returns any published entry (committed or uncommitted).
@@ -132,7 +132,7 @@ impl SegmentRingBuffer {
         }
 
         let idx = self.slot_index(position);
-        self.batches[idx].load_full()
+        self.entries[idx].load_full()
     }
 
     pub(super) fn load_eviction_frontier(&self) -> u64 {
@@ -148,16 +148,16 @@ impl SegmentRingBuffer {
             "eviction_frontier ({frontier}) > read_cursor ({commit})"
         );
 
-        let mut batches = Vec::new();
+        let mut entries = Vec::new();
         for pos in frontier..commit {
             let idx: usize = self.slot_index(pos);
-            if let Some(batch) = self.batches[idx].load_full() {
-                batches.push(batch);
+            if let Some(entry) = self.entries[idx].load_full() {
+                entries.push(entry);
             }
         }
 
         CheckpointBatch {
-            batches,
+            entries,
             new_frontier: commit,
         }
     }
@@ -169,17 +169,17 @@ impl SegmentRingBuffer {
 }
 
 pub(crate) struct CheckpointBatch {
-    pub batches: Vec<Arc<CachedEntry>>,
+    pub entries: Vec<Arc<CachedEntry>>,
     pub new_frontier: u64,
 }
 
 impl CheckpointBatch {
     pub(crate) fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.entries.is_empty()
     }
 
     pub(crate) fn last_lsn(&self) -> u64 {
-        self.batches.last().map(|b| b.lsn).unwrap_or(0)
+        self.entries.last().map(|e| e.lsn).unwrap_or(0)
     }
 }
 
@@ -199,7 +199,7 @@ impl TAssertInvariant for SegmentRingBuffer {
         for pos in frontier..tail {
             let idx = self.slot_index(pos);
             assert!(
-                self.batches[idx].load().is_some(),
+                self.entries[idx].load().is_some(),
                 "empty slot at position {pos} (between frontier and tail)"
             );
         }
@@ -291,7 +291,7 @@ mod tests {
         cache.advance_read_cursor(3);
 
         let checkpoint = cache.drain_for_checkpoint();
-        assert_eq!(checkpoint.batches.len(), 3);
+        assert_eq!(checkpoint.entries.len(), 3);
         assert_eq!(checkpoint.new_frontier, 3);
     }
 

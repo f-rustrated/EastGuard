@@ -27,5 +27,6 @@ impl_from_variant_via!(
     Produce,
     CheckpointComplete,
     DataPlaneTimeoutCallback,
-    DataPlaneInterNodeCommand
+    DataPlaneInterNodeCommand,
+    CatchUpReadComplete
 );
