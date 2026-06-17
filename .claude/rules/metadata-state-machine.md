@@ -33,6 +33,7 @@ MetadataStateMachine (one per shard group)
 | `SplitRange` | `apply_split_range()` | Seals parent range, creates two child ranges with new segments |
 | `MergeRange` | `apply_merge_range()` | Seals both source ranges, creates merged range with new segment |
 | `DeleteTopic` | `apply_delete_topic()` | Cascades Deleting state to all ranges and segments |
+| `ReassignSegment` | `apply_reassign_segment()` | Swaps a **sealed** segment's `replica_set` (D5 repair); state stays Sealed |
 
 ## Invariants
 
@@ -40,7 +41,7 @@ MetadataStateMachine (one per shard group)
 
 2. **Single active segment per range.** Each Active range has exactly one Active segment (the write head). Sealed/Deleting ranges have zero (`active_segment = None`). Two active segments per range would admit concurrent writes with conflicting offsets.
 
-3. **Segment immutability after seal.** Once `state = Sealed`, the segment's data, `size_bytes`, `end_offset`, and `sealed_at` never change. Only `replica_set` can change (via Reassigning). Reads against sealed segments are safe to cache.
+3. **Segment immutability after seal.** Once `state = Sealed`, the segment's data, `size_bytes`, `end_offset`, and `sealed_at` never change. Only `replica_set` can change — via `ReassignSegment` (D5 sealed-segment repair), which leaves the segment `Sealed`. Reads against sealed segments stay safe to cache: `replica_set` is *where* a copy lives, not *what* the segment holds.
 
 4. **Lineage is write-once.** `split_into`, `merged_from`, and `merged_into` are set on seal and never modified. A range cannot be both split and merged. The lineage tree is append-only.
 
@@ -74,4 +75,6 @@ MetadataStateMachine (one per shard group)
 
 19. **`RollSegment` is idempotent.** Re-applying a `RollSegment` for a segment that is no longer active returns `ApplyResult::Noop` rather than an error. Tolerates the race where both the write-path timeout and SWIM node death fire `RollSegment` for the same failure.
 
-20. **An entity's state never reverts.** Topic: Active → Sealed → Deleted. Range: Active → Sealed → Deleting. Segment: Active → Sealed (→ Reassigning → Sealed) → Deleting. No backward transitions. Once a segment is Sealed, it never becomes Active again.
+20. **An entity's state never reverts.** Topic: Active → Sealed → Deleted. Range: Active → Sealed → Deleting. Segment: Active → Sealed → Deleting. No backward transitions. Once a segment is Sealed it never becomes Active again — `ReassignSegment` swaps its `replica_set` but keeps it `Sealed`.
+
+21. **`ReassignSegment` only re-points a sealed segment.** `apply_reassign_segment()` accepts only a `Sealed` segment, swaps `replica_set`, and changes nothing else — state stays `Sealed`; data, offsets, lineage, and timestamps stay frozen (invariant 3). An active, deleting, or unknown segment is rejected (`SegmentNotSealed` / `SegmentNotFound`), logged but not fatal (invariant 11). Re-applying with the same `replica_set` returns `ApplyResult::Noop`, tolerating duplicate death detection and no-leader re-proposals (cf. invariant 19). The swap runs through `apply`, so the umbrella `assert_invariants` re-checks every other invariant afterward — a reassignment cannot leave the machine inconsistent.

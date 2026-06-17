@@ -171,6 +171,18 @@ impl TopicMeta {
         Some(seg)
     }
 
+    pub(crate) fn get_mut(
+        &mut self,
+        segment_key: SegmentKey,
+    ) -> Result<&mut SegmentMeta, MetadataError> {
+        self.ranges
+            .get_mut(&segment_key.range_id)
+            .ok_or(MetadataError::RangeNotFound)?
+            .segments
+            .get_mut(&segment_key.segment_id)
+            .ok_or(MetadataError::SegmentNotFound)
+    }
+
     pub(crate) fn route_active_segment_key(&self, key: &[u8]) -> Option<SegmentKey> {
         let range = self.route_active_range(key)?;
         Some(SegmentKey::new(
