@@ -457,7 +457,7 @@ impl MultiRaft {
 
         // Across every group we just reconciled, drop gathers whose segment is no
         // longer leaderless — a group left with none drops all of its gathers.
-        self.seal_recovery.drop_reconciled(&reconciled);
+        self.seal_recovery.drop_stale_reconciled(&reconciled);
         for (shard_group_id, leaderless) in reconciled {
             if !leaderless.is_empty() {
                 self.drive_seal_end_recovery(shard_group_id, leaderless);

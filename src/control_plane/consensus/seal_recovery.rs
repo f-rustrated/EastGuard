@@ -222,7 +222,9 @@ impl SealEndRecovery {
         });
     }
 
-    pub(crate) fn drop_reconciled(
+    /// Drop gathers whose segment is no longer leaderless, across every group in
+    /// `reconciled` — a group reconciled with an empty set drops all its gathers.
+    pub(crate) fn drop_stale_reconciled(
         &mut self,
         reconciled: &HashMap<ShardGroupId, LeaderlessSegments>,
     ) {
@@ -354,7 +356,7 @@ mod tests {
         assert!(recovery.contains(&seg));
 
         // Group 1 reconciled with no leaderless segments → its gather is dropped.
-        recovery.drop_reconciled(&HashMap::from([(ShardGroupId(1), vec![])]));
+        recovery.drop_stale_reconciled(&HashMap::from([(ShardGroupId(1), vec![])]));
         assert!(recovery.is_empty());
     }
 }
