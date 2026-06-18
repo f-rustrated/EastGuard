@@ -71,7 +71,7 @@ MetadataStateMachine (one per shard group)
 
 17. **Children of a split carry a cooldown anchor.** Child ranges created by `apply_split_range()` always have `seal_history.created_by_split_at` set to the split's `created_at` timestamp. Enforces `SPLIT_COOLDOWN_MS` before children can be re-split — prevents split storms from transient load.
 
-18. **`correct_end_offset` is write-once.** Updates the sealed segment's `end_offset` only when the current value is `None` AND the incoming `end_entry_id` is `Some`. Simultaneously sets the active segment's `start_offset` to `end_entry_id + 1`. Re-application is a no-op. Restores invariant 8 after a death-triggered roll.
+18. **`correct_end_offset` is write-once.** Updates the sealed segment's `end_offset` only when the current value is `None` AND the incoming `end_entry_id` is `Some`. Simultaneously sets the active segment's `start_offset` to `end_entry_id + 1`. Re-application is a no-op. Restores invariant 8 after a death-triggered roll. This is now the **fallback** correction — for the follower-death race (the live leader's write-path seal arrives after a reconcile `None`-roll) and the unknown-end fallback. The leader-crash path no longer relies on it: it recovers the committed end *before* rolling (`raft-actor.md` #6), so the successor opens at `min+1` directly rather than at 0-then-corrected.
 
 19. **`RollSegment` is idempotent.** Re-applying a `RollSegment` for a segment that is no longer active returns `ApplyResult::Noop` rather than an error. Tolerates the race where both the write-path timeout and SWIM node death fire `RollSegment` for the same failure.
 

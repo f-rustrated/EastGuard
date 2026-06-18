@@ -50,6 +50,10 @@ pub enum RaftEvent {
     /// delivery (the original send is fire-and-forget) self-heals. The data plane
     /// drops re-drives for segments it already hosts.
     RedriveAssignments(Vec<DataTransportCommand>),
+    /// Leader-crash `SealBoundaryQuery` fan-out to a segment's survivors.
+    /// A coordinator-initiated data-plane send not tied to a committed entry.
+    /// The actor just forwards these to the data transport.
+    SealBoundaryQueries(Vec<DataTransportCommand>),
 }
 
 impl MetadataCommitted {

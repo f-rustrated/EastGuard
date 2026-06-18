@@ -193,6 +193,14 @@ impl SegmentTracker {
         (self.committed_count() > 0).then_some(self.committed_entry_id)
     }
 
+    /// Highest entry id this replica has fsync'd, or `None` if it holds nothing.
+    /// `next_entry_id` only advances in `publish_staged` (after `wal.flush_batch()`),
+    /// so `next_entry_id - 1` is durable — and can run ahead of the notified
+    /// `committed_entry_id`.
+    pub(crate) fn durable_end_entry_id(&self) -> Option<u64> {
+        (self.next_entry_id > self.start_entry_id).then(|| self.next_entry_id - 1)
+    }
+
     pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,
