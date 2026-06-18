@@ -372,7 +372,28 @@ impl<W: WalStorage> DataPlane<W> {
             C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
             C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
             C::CatchUpDone(cmd) => self.handle_catch_up_done(cmd),
+
+            C::SealBoundaryQuery(cmd) => self.handle_seal_boundary_query(cmd),
+            // Pass-through to the local MultiRaftActor
+            C::SealBoundaryReport(cmd) => {
+                self.out
+                    .store_coordinator_cmd(MultiRaftActorCommand::SealBoundaryReport(cmd));
+            }
         }
+    }
+
+    fn handle_seal_boundary_query(&mut self, cmd: SealBoundaryQuery) {
+        let durable_end = self.durable_end(&cmd.segment_key);
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id: cmd.shard_group_id,
+                message: SealBoundaryReport {
+                    segment_key: cmd.segment_key,
+                    from: self.node_id.clone(),
+                    durable_end,
+                }
+                .into(),
+            });
     }
 
     // ── Replacement-side catch-up: receive → verify → register ────────────
@@ -446,6 +467,22 @@ impl<W: WalStorage> DataPlane<W> {
     fn local_sealed_progress(&self, key: &SegmentKey) -> Option<u64> {
         let registered = self.segments.sealed_bounds(key).map(|(_, end)| end);
         registered.max(self.recovered.get(key))
+    }
+
+    /// Highest durable (fsync'd) entry id this node holds for `key`, across every
+    /// place a copy can live: a live tracker (the active segment a survivor is
+    /// still following), the sealed store, or the recovered inventory. `None` if
+    /// we hold nothing. Reported in a `SealBoundaryReport` so the coordinator can seal
+    /// a leader-crashed segment at the `min` of survivors' durable extents.
+    fn durable_end(&self, key: &SegmentKey) -> Option<u64> {
+        let live = self
+            .segments
+            .get(key)
+            .and_then(|t| t.durable_end_entry_id());
+        [live, self.local_sealed_progress(key)]
+            .into_iter()
+            .flatten()
+            .max()
     }
 
     /// A peer to fetch from: any replica that isn't us, preferring one that isn't
@@ -2600,5 +2637,90 @@ mod tests {
             s.targets[0], follower,
             "should fetch from the non-leader peer, not {leader:?}"
         );
+    }
+
+    // --- Leader-crash boundary recovery: durable extent + query handler -----
+
+    /// A follower publishes (fsyncs) entries on flush but isn't told of the
+    /// commit until a `CommitAdvance` — so `durable_end` (the fsync'd extent)
+    /// runs ahead of `committed_entry_id`. Boundary recovery reads the former.
+    #[test]
+    fn durable_end_reports_published_extent_not_commit_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let leader = NodeId::new("leader-node");
+
+        for entry_id in 0..3 {
+            dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+                ReplicaAppend {
+                    segment_key: test_key(),
+                    replica_set: vec![leader.clone(), test_node_id()],
+                    data: b"x".to_vec().into(),
+                    record_count: 1,
+                    entry_id,
+                }
+                .into(),
+            ));
+        }
+        dp.flush_batch(); // publishes 0,1,2 past the WAL fsync; no CommitAdvance yet
+
+        assert_eq!(
+            dp.segments.get(&test_key()).unwrap().committed_entry_id(),
+            0,
+            "follower hasn't been told of any commit"
+        );
+        assert_eq!(
+            dp.durable_end(&test_key()),
+            Some(2),
+            "durable extent is the highest fsync'd entry, ahead of the commit cursor"
+        );
+    }
+
+    /// With no live tracker, `durable_end` falls back to the sealed store, then
+    /// the recovered inventory, then `None`.
+    #[test]
+    fn durable_end_falls_back_to_sealed_then_recovered() {
+        // Sealed store: a sealed segment with bounds (0, 10).
+        let sealed_dir = tempfile::tempdir().unwrap();
+        let (sealed_dp, _rx) = source_with_sealed_segment(&sealed_dir);
+        assert_eq!(sealed_dp.durable_end(&test_key()), Some(10));
+
+        // Recovered inventory only (restarted node, not yet in the live store).
+        let recovered_dir = tempfile::tempdir().unwrap();
+        let recovered_dp = make_data_plane_with(&recovered_dir, inventory_with(test_key(), 7));
+        assert_eq!(recovered_dp.durable_end(&test_key()), Some(7));
+
+        // Hold nothing → None.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty_dp = make_data_plane(&empty_dir);
+        assert_eq!(empty_dp.durable_end(&test_key()), None);
+    }
+
+    /// A `SealBoundaryQuery` is answered with our durable extent, addressed back to
+    /// the coordinator of the query's shard group.
+    #[test]
+    fn seal_boundary_query_replies_with_durable_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 4));
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            SealBoundaryQuery {
+                segment_key: test_key(),
+                shard_group_id: ShardGroupId(9),
+            }
+            .into(),
+        ));
+
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
+            panic!("boundary report must route to the coordinator");
+        };
+        assert_eq!(s.shard_group_id, ShardGroupId(9));
+        let DataPlaneInterNodeCommand::SealBoundaryReport(report) = &s.message else {
+            panic!("expected a SealBoundaryReport");
+        };
+        assert_eq!(report.segment_key, test_key());
+        assert_eq!(report.from, test_node_id());
+        assert_eq!(report.durable_end, Some(4));
     }
 }

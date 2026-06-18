@@ -33,6 +33,9 @@ const ELECTION_JITTER_RANGE: u32 = 20;
 /// during a rebalance.
 pub(crate) const RING_STABLE_OBSERVATIONS: u32 = 3;
 
+/// Segments whose write leader crashed (sole death),
+pub(crate) type LeaderlessSegments = Vec<(SegmentKey, Vec<NodeId>)>;
+
 struct ElectionJitter {
     seed: u64,
     counter: u64,
@@ -114,6 +117,8 @@ pub struct Raft {
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
     pending_proposals: Vec<MetadataCommand>,
 
+    leaderless_segments: LeaderlessSegments,
+
     /// Tracks the ring membership seen during the last check, along with a count
     /// of how many times we've seen this exact membership in a row (#135).
     ///
@@ -156,6 +161,7 @@ impl Raft {
             current_leader: None,
             state_machine: MetadataStateMachine::default(),
             pending_proposals: Vec::new(),
+            leaderless_segments: Vec::new(),
             peer_states: HashMap::new(),
             election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
@@ -195,6 +201,62 @@ impl Raft {
     /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
     pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
         self.state_machine.active_segment_assignments()
+    }
+
+    /// Full reconciliation against the current topology: assert the ring-assigned
+    /// peers, replace dead peers, repair segments, evict stale live ex-owners
+    /// (#135), and log ring drift. Returns whether anything was proposed (the
+    /// caller marks the group dirty);
+    ///
+    /// leaderless segments are stashed for the caller to drain (`take_leaderless_segments`) and drive.
+    ///
+    /// Run on takeover and the periodic ring check.
+    ///
+    /// `target_members` is the ring members to assert as peers via `AddPeer` (only the live, non-self ones are proposed).
+    ///
+    /// The caller picks the shape:
+    /// - **takeover** passes the group's *full* member set — re-assert everything
+    ///   to heal genesis divergence (#133/#134);
+    /// - the **ring check** passes only members *not already peers* — just the
+    ///   delta, so re-asserting present members doesn't spam the log;
+    /// - **`None`** skips the add step (the group is no longer in the ring
+    ///   snapshot); the rest of the reconcile still runs.
+    pub(crate) fn reconcile(
+        &mut self,
+        topology: &TopologyReader,
+        // Ring members to assert as peers (see doc above); `None` skips the add step.
+        target_members: Option<Box<[NodeId]>>,
+    ) -> bool {
+        let mut changed = false;
+        let live_set: HashSet<NodeId> = topology.live_nodes().into_iter().collect();
+        if let Some(members) = target_members {
+            for member in members.iter() {
+                // skip self && dead peer
+                if *member == self.node_id || !live_set.contains(member) {
+                    continue;
+                }
+                match self.propose(RaftCommand::AddPeer(member.clone())) {
+                    Ok(_) => changed = true,
+                    Err(e) => tracing::warn!(
+                        "AddPeer({:?}) on {:?} rejected: {:?}",
+                        member,
+                        self.shard_group_id,
+                        e
+                    ),
+                }
+            }
+        }
+        changed |= self.reconcile_peers(topology, &live_set);
+        changed |= self.reconcile_segments(&live_set);
+
+        // Record a ring observation every run, whether routine RingCheck or
+        // leadership change. During a leadership change, evictions are paused
+        // until future RingChecks — the system waits for a fresh stability window
+        // and for the new membership to commit. That delay gives "add-before-
+        // remove" for free, with no special logic.
+        changed |= self.reconcile_stale_live_peers(topology, &live_set).is_ok();
+        self.log_ring_drift(topology, &live_set);
+        changed
     }
 
     pub(crate) fn reconcile_peers(
@@ -402,30 +464,44 @@ impl Raft {
         observations
     }
 
-    /// Reconcile this group's under-replicated segments — any whose replica set
-    /// still names a node SWIM considers dead.
+    /// Repair this group's segments whose replica set still names a dead node:
+    ///   - active, only the leader died → stash for seal-end recovery (rolled later)
+    ///   - active, any other death → roll now with an unknown end (`RollSegment`)
+    ///   - sealed (known end) → swap the replica set (`ReassignSegment`); catch-up refills
     ///
-    /// Active segments are sealed and reopened with a healthy set (`RollSegment`);
-    /// Sealed segments with a known committed end have their replica set swapped in place (`ReassignSegment`, re-replicated by catch-up).
-    ///
-    /// Closes the gap where deaths landed during the no-leader window — the live-leader path (`handle_node_death`) catches
-    /// those per-event; this is the backfill sweep on takeover. Both triggers share this one method.
+    /// Runs per-death (`handle_node_death`) and as the takeover backfill sweep.
     pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
-        let active = self.active_segments_with_dead_members(live_set);
+        let mut to_roll: Vec<(SegmentKey, ReplicaSet)> = Vec::new();
+        for (key, rs) in self.active_segments_with_dead_members(live_set).into_vec() {
+            if Self::only_leader_dead(&rs, live_set) {
+                let survivors = rs
+                    .iter()
+                    .filter(|n| live_set.contains(*n))
+                    .cloned()
+                    .collect();
+                self.leaderless_segments.push((key, survivors));
+            } else {
+                to_roll.push((key, rs));
+            }
+        }
         let sealed = self.sealed_segments_with_dead_members(live_set);
         let mut changed = false;
 
-        // Active: seal + reopen with a healthy set. `end_entry_id = None` — a
-        // death/takeover doesn't know the committed offset; it's corrected later.
-        changed |= self.repair_segments(active, live_set, |segment_key, new_replica_set| {
-            RollSegment {
-                segment_key,
-                sealed_at: now_ms(),
-                new_replica_set,
-                end_entry_id: None,
-            }
-            .into()
-        });
+        // Roll the others: seal + reopen with a healthy set. `end_entry_id = None`
+        // — a follower-death/takeover roll doesn't know the committed offset.
+        changed |= self.repair_segments(
+            to_roll.into_boxed_slice(),
+            live_set,
+            |segment_key, new_replica_set| {
+                RollSegment {
+                    segment_key,
+                    sealed_at: now_ms(),
+                    new_replica_set,
+                    end_entry_id: None,
+                }
+                .into()
+            },
+        );
 
         // Sealed (known-end): swap the replica set in place; catch-up re-replicates
         // to the new node. Boundary-unknown seals are excluded by the scan — see
@@ -533,6 +609,15 @@ impl Raft {
             .collect()
     }
 
+    /// True when the write leader (`replica_set[0]`) is dead and it is the *only*
+    /// dead member — the recoverable case (a leaderless segment) that seal-end recovery
+    /// handles. A follower death (leader alive) or a multi-death is not.
+    fn only_leader_dead(replica_set: &[NodeId], live: &HashSet<NodeId>) -> bool {
+        let dead = replica_set.iter().filter(|n| !live.contains(*n)).count();
+        let leader_dead = replica_set.first().is_some_and(|l| !live.contains(l));
+        leader_dead && (dead == 1)
+    }
+
     pub(crate) fn has_topic(&self, topic_id: &crate::control_plane::metadata::TopicId) -> bool {
         self.state_machine.get_topic(topic_id).is_some()
     }
@@ -553,6 +638,12 @@ impl Raft {
 
     pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
         std::mem::take(&mut self.pending_proposals)
+    }
+
+    /// Drain the leaderless segments found by `reconcile_segments` — the actor
+    /// drives seal-end recovery (poll survivors, seal at the recovered end).
+    pub(crate) fn take_leaderless_segments(&mut self) -> Vec<(SegmentKey, Vec<NodeId>)> {
+        std::mem::take(&mut self.leaderless_segments)
     }
 
     pub(crate) fn last_applied_index(&self) -> u64 {
@@ -3546,6 +3637,88 @@ mod tests {
             0,
             "boundary-unknown sealed segment must not be reassigned (tail: {:?})",
             &after[before..]
+        );
+    }
+
+    #[test]
+    fn only_leader_dead_classifies_the_death() {
+        let rs = vec![node("x"), node("y"), node("z")]; // x is the write leader
+        assert!(
+            Raft::only_leader_dead(&rs, &live_set(&["y", "z"])),
+            "only the leader (x) died → recoverable leader crash"
+        );
+        assert!(
+            !Raft::only_leader_dead(&rs, &live_set(&["x", "z"])),
+            "a follower (y) died, leader alive → not a leader crash"
+        );
+        assert!(
+            !Raft::only_leader_dead(&rs, &live_set(&["z"])),
+            "leader x and follower y died → multi-death, not a sole crash"
+        );
+    }
+
+    #[test]
+    fn reconcile_segments_defers_leaderless_to_recovery() {
+        // Active segment 0 has replica_set [x, y, z]; x is the write leader.
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = live_set(&["node-1", "y", "z"]); // leader x crashed
+        raft.reconcile_segments(&live);
+
+        // No immediate roll — the segment is stashed for seal-end recovery.
+        let after = proposals_after_become_leader(&raft);
+        let rolls = after[before..]
+            .iter()
+            .filter(|c| matches!(c, RaftCommand::Metadata(MetadataCommand::RollSegment(_))))
+            .count();
+        assert_eq!(
+            rolls,
+            0,
+            "leaderless segment is deferred, not rolled (tail: {:?})",
+            &after[before..]
+        );
+
+        let candidates = raft.take_leaderless_segments();
+        assert_eq!(candidates.len(), 1, "the leaderless segment is stashed");
+        assert_eq!(
+            candidates[0].1,
+            vec![node("y"), node("z")],
+            "with its surviving replicas in replica-set order"
+        );
+    }
+
+    #[test]
+    fn reconcile_segments_rolls_active_on_multi_death() {
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = live_set(&["node-1", "z"]); // x and y dead → multi-death
+        raft.reconcile_segments(&live);
+        let after = proposals_after_become_leader(&raft);
+
+        let rolls: Vec<_> = after[before..]
+            .iter()
+            .filter_map(|c| match c {
+                RaftCommand::Metadata(MetadataCommand::RollSegment(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rolls.len(),
+            1,
+            "multi-death falls back to the unknown-end roll (tail: {:?})",
+            &after[before..]
+        );
+        assert_eq!(
+            rolls[0].end_entry_id, None,
+            "fallback roll has no known end"
+        );
+        assert!(
+            raft.take_leaderless_segments().is_empty(),
+            "multi-death is not a sole-leader-crash candidate"
         );
     }
 }

@@ -108,25 +108,9 @@ impl TopologyReader {
             .collect()
     }
 
-    pub(crate) fn resolve_nodes_in_group(
-        &self,
-        node_id: &NodeId,
-        shard_group_id: ShardGroupId,
-    ) -> Option<Box<[NodeId]>> {
-        if let Some(group) = self
-            .shard_groups_for_node(node_id)
-            .into_iter()
-            .find(|g| g.id == shard_group_id)
-        {
-            return Some(group.members.into_boxed_slice());
-        };
-        None
-    }
-
     /// Ring membership of `group_id` in the current snapshot, regardless of
-    /// whether the local node is among the members. `resolve_nodes_in_group`
-    /// resolves through a member node and therefore returns `None` when the
-    /// caller is itself no longer assigned to the group
+    /// whether the local node is among the members. `None` when the group is
+    /// not in the snapshot at all.
     pub(crate) fn group_ring_members(&self, group_id: ShardGroupId) -> Option<Box<[NodeId]>> {
         self.0
             .load()

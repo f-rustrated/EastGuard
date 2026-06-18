@@ -148,6 +148,33 @@ pub struct CatchUpDone {
     pub segment_key: SegmentKey,
 }
 
+// Leader-crash boundary recovery: establish a sealed segment's committed end.
+//
+// When an active segment's write leader crashes, no surviving node knows the
+// committed end (the leader was the one tracking it). The coordinator gathers
+// each survivor's durable (fsync'd) extent and seals at their `min` — the
+// highest offset present on every survivor, hence committed (commit requires
+// all-replica ack). Two messages on the `DataPlaneInterNodeCommand` wire:
+//
+//   coordinator ─SealBoundaryQuery──▶ each survivor  "what's your durable extent for `key`?"
+//   survivor    ─SealBoundaryReport─▶ coordinator    durable end (or `None` if it holds nothing)
+//
+// `shard_group_id` rides the query so the survivor can address the report back
+// to the coordinator (a follower's tracker doesn't carry the real group id).
+// See `diagrams/data-plane/leader_crash_seal_boundary.md`.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SealBoundaryQuery {
+    pub segment_key: SegmentKey,
+    pub shard_group_id: ShardGroupId,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SealBoundaryReport {
+    pub segment_key: SegmentKey,
+    pub from: NodeId,
+    pub durable_end: Option<u64>,
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
@@ -162,6 +189,8 @@ pub enum DataPlaneInterNodeCommand {
     CatchUpRequest(CatchUpRequest),
     CatchUpChunk(CatchUpChunk),
     CatchUpDone(CatchUpDone),
+    SealBoundaryQuery(SealBoundaryQuery),
+    SealBoundaryReport(SealBoundaryReport),
 }
 
 impl_from_variant!(
@@ -178,6 +207,8 @@ impl_from_variant!(
     CatchUpRequest,
     CatchUpChunk,
     CatchUpDone,
+    SealBoundaryQuery,
+    SealBoundaryReport,
 );
 
 #[derive(Debug)]
