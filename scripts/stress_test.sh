@@ -43,7 +43,7 @@ SUMMARY="$OUTDIR/summary.txt"
 echo "stress: test=$TEST runs=$N per_run_timeout=${PER_RUN_TIMEOUT}s"
 echo "logs:   $OUTDIR"
 echo "building once..."
-if ! cargo test --lib "$TEST" --no-run >/dev/null 2>&1; then
+if ! cargo nextest run --no-run --lib "$TEST" >/dev/null 2>&1; then
   echo "BUILD FAILED"; exit 1
 fi
 
@@ -51,7 +51,7 @@ pass=0; fail=0
 for i in $(seq 1 "$N"); do
   log="$OUTDIR/run_$i.log"
   # Run with a wall-clock watchdog so a hung run can't wedge the sweep.
-  RUST_LOG="${RUST_LOG:-east_guard=debug}" cargo test --lib "$TEST" >"$log" 2>&1 &
+  RUST_LOG="${RUST_LOG:-east_guard=debug}" cargo nextest run --lib "$TEST" >"$log" 2>&1 &
   pid=$!
   killed=0
   for _ in $(seq 1 "$PER_RUN_TIMEOUT"); do
@@ -63,13 +63,16 @@ for i in $(seq 1 "$N"); do
     pkill -9 -f "deps/east_guard-" 2>/dev/null
     killed=1
   fi
-  wait "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null; status=$?
 
+  # nextest exits non-zero on any failure (it doesn't print libtest's
+  # "test result: FAILED"), so categorize off the exit code. The kept log still
+  # carries the failed test's captured panic/seed output for the breakdown below.
   if [ "$killed" = 1 ]; then
     fail=$((fail+1))
     echo "run=$i TIMEOUT-HANG" >> "$SUMMARY"
     echo "  run $i: TIMEOUT-HANG (kept $log)"
-  elif grep -q "test result: FAILED" "$log"; then
+  elif [ "$status" -ne 0 ]; then
     fail=$((fail+1))
     mode=$(grep -oE "client_protocol.rs:[0-9]+" "$log" | head -1)
     [ -z "$mode" ] && mode=$(grep -oE "phase[0-9]: [a-zA-Z0-9 -]+" "$log" | head -1)
