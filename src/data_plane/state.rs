@@ -821,9 +821,15 @@ impl<W: WalStorage> DataPlane<W> {
             replayed_bytes += data.len();
             new_tracker.stage_entry(new_segment_key, data, record_count);
         }
-        // Staged replays count toward pending bytes like a fresh produce, so the
-        // `buffer_byte_count == staged bytes` invariant holds after this command.
+        // Published-uncommitted records were cleared from `buffer_byte_count` when
+        // they flushed, so re-staging them re-adds their bytes here.
         self.buffer_byte_count += replayed_bytes;
+
+        // Staged-but-unflushed produces (staged after the last flush) must also
+        // carry to the successor
+        for (data, record_count) in old_tracker.staged_for_replay() {
+            new_tracker.stage_entry(new_segment_key, data, record_count);
+        }
 
         self.replication
             .segment_handoff(cmd.old_segment_key, new_segment_key);
@@ -1258,6 +1264,21 @@ mod tests {
         (cmd.into(), rx)
     }
 
+    fn seal_response(
+        old: SegmentKey,
+        new_segment_id: SegmentId,
+        new_replica_set: Vec<NodeId>,
+    ) -> DataPlaneCommand {
+        DataPlaneCommand::DataPlaneInterNodeCommand(
+            SealResponse {
+                old_segment_key: old,
+                new_segment_id,
+                new_replica_set,
+            }
+            .into(),
+        )
+    }
+
     #[test]
     fn has_segment_returns_false_for_unknown() {
         let dir = tempfile::tempdir().unwrap();
@@ -1447,6 +1468,34 @@ mod tests {
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
         assert!(!dp.has_buffered_data());
+    }
+
+    /// A seal that arrives while the active segment still holds a staged-but-
+    /// unflushed produce must carry that produce into the successor. The old
+    /// tracker is retired (removed from the leader-staged sum), so dropping its
+    /// staged entry would strand `buffer_byte_count` above the real staged bytes
+    /// and trip `assert_invariants`. Regression for the `produce_then_fetch_hot`
+    /// flake (worker panic at the `buffer_byte_count` invariant).
+    #[test]
+    fn seal_carries_unflushed_staged_into_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        // Produce — staged into the active segment, no flush yet.
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        assert!(dp.has_buffered_data());
+
+        // Seal arrives before the batch flush. `handle_command` runs
+        // `assert_invariants` afterwards — pre-fix this panics on the stranded
+        // counter.
+        dp.handle_command(seal_response(test_key(), SegmentId(1), vec![]));
+
+        // The staged produce moved to the successor; the counter still matches.
+        let successor = test_key().with_segment_id(SegmentId(1));
+        assert!(dp.segments.get(&successor).unwrap().has_staged());
+        assert!(dp.has_buffered_data());
     }
 
     #[test]

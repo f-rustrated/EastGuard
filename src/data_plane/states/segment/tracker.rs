@@ -142,6 +142,17 @@ impl SegmentTracker {
         })
     }
 
+    /// Staged-but-unpublished records, for replay into a successor on seal.
+    /// Unlike `uncommitted_entries` (the published cache), these never reached
+    /// the WAL, so a seal must carry them forward too — and they are already
+    /// counted in the data plane's `buffer_byte_count`, so the caller must not
+    /// re-count them.
+    pub(crate) fn staged_for_replay(&self) -> impl Iterator<Item = (EntryPayload, u32)> + '_ {
+        self.staged_entries
+            .iter()
+            .map(|s| (s.data.clone(), s.record_count))
+    }
+
     pub(crate) fn checkpoint(&self, key: SegmentKey) -> CheckpointJob {
         CheckpointJob {
             segment_key: key,
