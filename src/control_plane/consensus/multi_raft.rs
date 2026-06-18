@@ -138,22 +138,11 @@ impl MultiRaft {
         &self.node_id
     }
 
-    /// This runs a reconciliation process to stabilize the group:
-    ///
-    /// 1. Sync Membership: Commits the current ring membership to the log. This fixes
-    ///    any replicas that were started with incomplete membership data.
-    /// 2. Clean Up Dead Peers: Removes peers that the SWIM protocol has marked as dead.
-    ///    This handles edge cases where the previous leader died before it could
-    ///    propose these removals.
-    /// 3. Track Live Ex-Owners: Records a ring observation to help safely evict peers
-    ///    that are still alive but no longer own data (#135). The periodic
-    ///    `handle_ringcheck_timeout` function manages the rest of the waiting period
-    ///    before the actual eviction happens.
+    /// This runs a reconciliation process to stabilize the group.
+    /// Importantly, takeover does NOT trust its own peer set.
     #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
-        let target_members = self
-            .topology
-            .resolve_nodes_in_group(&self.node_id, shard_group_id);
+        let target_members = self.topology.group_ring_members(shard_group_id);
 
         self.reconcile_membership(shard_group_id, target_members);
     }
@@ -164,10 +153,10 @@ impl MultiRaft {
             return;
         };
 
-        // Tick-path filter: only chase ring deltas. Asserting already-present
-        // members is the takeover path's genesis-divergence heal (#133/#134);
-        // repeating it every interval would spam the log with no-op AddPeers.
-        // hash_peer() saves recurring log spam, covered by takeover
+        // * Tick-path filter: only chase ring deltas. Asserting already-present
+        // * members is the takeover path's genesis-divergence heal (#133/#134);
+        // * repeating it every interval would spam the log with no-op AddPeers.
+        // * hash_peer() saves recurring log spam, covered by takeover
         let target_members = self
             .topology
             .group_ring_members(shard_group_id)

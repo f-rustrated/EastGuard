@@ -219,8 +219,8 @@ impl Raft {
     ///   to heal genesis divergence (#133/#134);
     /// - the **ring check** passes only members *not already peers* — just the
     ///   delta, so re-asserting present members doesn't spam the log;
-    /// - **`None`** skips the add step (this node isn't in the group's ring
-    ///   assignment); the rest of the reconcile still runs.
+    /// - **`None`** skips the add step (the group is no longer in the ring
+    ///   snapshot); the rest of the reconcile still runs.
     pub(crate) fn reconcile(
         &mut self,
         topology: &TopologyReader,
@@ -231,6 +231,7 @@ impl Raft {
         let live_set: HashSet<NodeId> = topology.live_nodes().into_iter().collect();
         if let Some(members) = target_members {
             for member in members.iter() {
+                // skip self && dead peer
                 if *member == self.node_id || !live_set.contains(member) {
                     continue;
                 }
