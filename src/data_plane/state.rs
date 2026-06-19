@@ -34,6 +34,10 @@ use std::collections::HashMap;
 /// A large segment streams as several chunks via the read-complete re-arm loop.
 const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Re-drives without an append before the receiver treats a receive as stalled
+/// and re-requests from a fresh source. A grace window for slow transfers.
+const CATCH_UP_IDLE_REDRIVES: u32 = 2;
+
 struct PendingSealRequest {
     sent_at: std::time::Instant,
     failed_nodes: Vec<NodeId>,
@@ -47,6 +51,11 @@ struct PendingCatchUp {
     shard_group_id: ShardGroupId,
     start_offset: u64,
     sealed_end: u64,
+    /// Highest entry id written so far; `None` until the first append. A resume
+    /// re-requests `(last_written, sealed_end]`.
+    last_written: Option<u64>,
+    /// Re-drives since the last append — the stall detector. Reset on append.
+    idle_rounds: u32,
     anchors: Vec<SparseEntry>,
 }
 
@@ -407,22 +416,39 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// The coordinator announced our (new) membership of this sealed segment.
     /// Reconcile against local state — declarative and idempotent:
-    /// - already hold it through `sealed_end` → register it if a recovered-from-disk copy isn't in the live store yet, then transfer nothing (the catch-up "lottery" win,
-    ///   and the no-op every survivor takes when re-announced);
-    /// - already reconciling it → a re-drive is a no-op;
-    /// - otherwise fetch `(local, sealed_end]` from a peer we pick — a delta when we
-    ///   hold a partial prefix, a full copy when we hold nothing.
+    /// - already hold it through `sealed_end` → register if needed, transfer nothing;
+    /// - already reconciling → no-op while progressing, resume if stalled;
+    /// - else fetch `(local, sealed_end]` from a peer — a delta or a full copy.
     fn handle_catch_up_assignment(&mut self, cmd: CatchUpAssignment) {
-        if self.pending_catch_ups.contains_key(&cmd.segment_key) {
+        if let Some(pending) = self.pending_catch_ups.get_mut(&cmd.segment_key) {
+            // A receive is already in flight: no-op while it appends; once stalled
+            // (no append across `CATCH_UP_IDLE_REDRIVES` re-drives) re-request the
+            // rest from a fresh source, resuming from `last_written`.
+            pending.idle_rounds += 1;
+            if pending.idle_rounds < CATCH_UP_IDLE_REDRIVES {
+                return;
+            }
+            pending.idle_rounds = 0;
+            let local_end = pending.last_written;
+            let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
+                return;
+            };
+            self.out
+                .store_transport_cmd(DataTransportCommand::send_to_targets(
+                    vec![source],
+                    CatchUpRequest {
+                        segment_key: cmd.segment_key,
+                        from: self.node_id.clone(),
+                        local_end,
+                    },
+                ));
             return;
         }
         let local = self.local_sealed_progress(&cmd.segment_key);
         if local.is_some_and(|end| end >= cmd.sealed_end_entry_id) {
-            // Full match: verified locally through the sealed end. Make sure the
-            // cold-read resolver can serve it (a restarted node's recovered data
-            // isn't in the live store yet), confirm to the coordinator, then
-            // transfer nothing. The ack fires even when already registered so a
-            // re-driven assignment re-confirms.
+            // Full match: already hold it through `sealed_end`. Register it if the
+            // resolver doesn't have it yet, ack the coordinator, transfer nothing.
+            // The ack fires even if already registered, so a re-drive re-confirms.
             if self.segments.sealed_bounds(&cmd.segment_key).is_none() {
                 self.segments.insert_sealed_from_catch_up(
                     cmd.segment_key,
@@ -458,6 +484,8 @@ impl<W: WalStorage> DataPlane<W> {
                 shard_group_id: cmd.shard_group_id,
                 start_offset: cmd.start_entry_id,
                 sealed_end: cmd.sealed_end_entry_id,
+                last_written: local,
+                idle_rounds: 0,
                 anchors: Vec::new(),
             },
         );
@@ -538,11 +566,22 @@ impl<W: WalStorage> DataPlane<W> {
         };
         let mut failed = false;
         for entry in &cmd.entries {
+            // Append only the strictly-next id; skip duplicates / out-of-order. A
+            // resume can overlap a stalled stream's tail, and a double append would
+            // overstate the verified prefix.
+            let next = pending.last_written.map_or(pending.start_offset, |w| w + 1);
+            if entry.entry_id != next {
+                continue;
+            }
             match pending.appender.append_entry(
                 entry.entry_id,
                 WalRecord::data((*entry.data).clone(), entry.record_count),
             ) {
-                Ok(anchor) => pending.anchors.extend(anchor),
+                Ok(anchor) => {
+                    pending.anchors.extend(anchor);
+                    pending.last_written = Some(entry.entry_id);
+                    pending.idle_rounds = 0;
+                }
                 Err(e) => {
                     tracing::warn!(
                         "catch-up: append failed for {:?}: {e}; aborting receive",
@@ -558,10 +597,8 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    /// End of stream. Fsync, then re-scan the file (the recovery verifier) to
-    /// confirm it reaches `sealed_end`. Only on success do we index the anchors,
-    /// register the segment cold-readable, and confirm completion to the
-    /// coordinator (`CatchUpAck`) so it stops re-driving the assignment.
+    /// End of stream. Fsync, re-scan to verify it reaches `sealed_end`, then on
+    /// success index the anchors, register the segment, and ack the coordinator.
     fn handle_catch_up_stream_end(&mut self, cmd: CatchUpStreamEnd) {
         let Some(mut pending) = self.pending_catch_ups.remove(&cmd.segment_key) else {
             tracing::debug!(
@@ -612,10 +649,8 @@ impl<W: WalStorage> DataPlane<W> {
         self.send_catch_up_ack(pending.shard_group_id, cmd.segment_key);
     }
 
-    /// Confirm to the coordinator that this node holds the reassigned sealed
-    /// segment through its sealed end, so the coordinator's heartbeat sweep stops
-    /// re-announcing the assignment. Routed to the group's coordinator via
-    /// `SendToCoordinator`, mirroring `SegmentAssignmentAck`.
+    /// Tell the coordinator we hold this segment, so its sweep stops re-announcing.
+    /// Routed via `SendToCoordinator`, mirroring `SegmentAssignmentAck`.
     fn send_catch_up_ack(&mut self, shard_group_id: ShardGroupId, segment_key: SegmentKey) {
         self.out
             .store_transport_cmd(DataTransportSendToCoordinator {
@@ -2740,6 +2775,123 @@ mod tests {
             s.targets[0], follower,
             "should fetch from the non-leader peer, not {leader:?}"
         );
+    }
+
+    // ── Re-drive rescues a stalled in-flight receive ───────────────────────
+
+    fn catch_up_assignment_to(source: &NodeId, sealed_end: u64) -> DataPlaneCommand {
+        DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
+                start_entry_id: 0,
+                sealed_end_entry_id: sealed_end,
+                replica_set: vec![test_node_id(), source.clone()],
+            }
+            .into(),
+        )
+    }
+
+    fn catch_up_chunk_of(ids: &[u64]) -> DataPlaneCommand {
+        DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpChunk {
+                segment_key: test_key(),
+                entries: ids
+                    .iter()
+                    .map(|&entry_id| CatchUpEntry {
+                        entry_id,
+                        data: b"x".to_vec().into(),
+                        record_count: 1,
+                    })
+                    .collect(),
+            }
+            .into(),
+        )
+    }
+
+    /// A receive that makes no progress is re-requested (resumed) once it has gone
+    /// `CATCH_UP_IDLE_REDRIVES` re-drives without an append — not before.
+    #[test]
+    fn catch_up_redrive_resumes_a_stalled_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 5)); // initial request
+        dp.out.transport_cmds.clear();
+
+        // Within the grace window the re-drive is silent.
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+            assert!(
+                dp.out.transport_cmds.is_empty(),
+                "no re-request within grace"
+            );
+        }
+        // At the budget: a resume request to the source, from local_end = None
+        // (nothing written yet).
+        dp.handle_command(catch_up_assignment_to(&source, 5));
+        assert_eq!(dp.out.transport_cmds.len(), 1, "stalled → resume request");
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert_eq!(s.targets[0], source);
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpRequest(r)
+                if r.segment_key == test_key() && r.local_end.is_none()
+        ));
+    }
+
+    /// Progress (an appended chunk) resets the stall counter, so a steadily
+    /// advancing receive is never re-requested.
+    #[test]
+    fn catch_up_redrive_is_a_noop_while_progressing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 5));
+        // Bring the counter to the brink...
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+        }
+        // ...a chunk resets it...
+        dp.handle_command(catch_up_chunk_of(&[0]));
+        dp.out.transport_cmds.clear();
+        // ...so the same run of re-drives again still doesn't trip a resume.
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+        }
+        assert!(
+            dp.out.transport_cmds.is_empty(),
+            "progress reset the stall counter; no resume"
+        );
+    }
+
+    /// A resume can re-stream entries already written; the chunk handler appends
+    /// only the strictly-next id, so duplicates never inflate the verified prefix.
+    #[test]
+    fn catch_up_chunk_skips_a_resume_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 4));
+        dp.handle_command(catch_up_chunk_of(&[0, 1, 2]));
+        // Overlap: 1,2 are duplicates (skipped), 3,4 are new (appended).
+        dp.handle_command(catch_up_chunk_of(&[1, 2, 3, 4]));
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpStreamEnd {
+                segment_key: test_key(),
+            }
+            .into(),
+        ));
+
+        // Verified exactly through the sealed end — no duplicate inflation.
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 4)));
+        let scan = scan_segment_file(&test_key().file_path(dir.path(), 0)).unwrap();
+        assert_eq!(scan.last_entry_id, Some(4));
     }
 
     // --- Leader-crash boundary recovery: durable extent + query handler -----

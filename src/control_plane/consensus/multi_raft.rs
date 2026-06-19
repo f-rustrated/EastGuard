@@ -528,10 +528,8 @@ impl MultiRaft {
         }
     }
 
-    /// A replica confirmed it holds a reassigned sealed segment through its sealed
-    /// end. Route it to the owning group's `Raft`, which clears the member from the
-    /// catch-up re-drive (and prunes the repair once every member confirms).
-    /// Mirrors `handle_assignment_ack`.
+    /// Route a catch-up confirmation to the owning group's `Raft`, which clears the
+    /// member and prunes the repair once all confirm. Mirrors `handle_assignment_ack`.
     fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;

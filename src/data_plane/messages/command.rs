@@ -87,30 +87,24 @@ pub struct SegmentSealed {
     pub segment_key: SegmentKey,
 }
 
-// Catch-up: re-replicate a sealed segment to a newly assigned replica
+// Catch-up: re-replicate a sealed segment to a newly assigned replica.
 //
-// When a node is assigned a sealed segment it does not yet hold completely (a death-driven reassignment, or recovered data reclaimed via the catch-up lottery),
-// it brings its local copy up to the sealed end by fetching the missing suffix from a healthy replica. Four messages, all riding the
-// `DataPlaneInterNodeCommand` wire (bounded by `DATA_FRAME_MAX`):
+// A node assigned a sealed segment it doesn't fully hold fetches the missing
+// suffix from a healthy peer. Messages on the `DataPlaneInterNodeCommand` wire:
 //
-//   coordinator ─CatchUpAssignment─▶ each replica  "own `key` [start, sealed_end]; reconcile vs your inventory"
+//   coordinator ─CatchUpAssignment─▶ each replica  "own `key` [start, sealed_end]"
 //   replacement ─CatchUpRequest────▶ a peer         "I have through `local_end`; send the rest"
-//   source      ─CatchUpChunk(s)───▶ replacement   bounded batches of entries
-//   source      ─CatchUpStreamEnd──▶ replacement   end of stream; the replacement then verifies
-//   replacement ─CatchUpAck────────▶ coordinator   "verified + registered through `sealed_end`"
+//   source      ─CatchUpChunk(s)───▶ replacement   batches of entries
+//   source      ─CatchUpStreamEnd──▶ replacement   end of stream
+//   replacement ─CatchUpAck────────▶ coordinator   "have it through `sealed_end`"
 //
-// `CatchUpAssignment`/`CatchUpAck` are the coordinator↔replica control pair
-// (mirroring `SegmentAssignment`/`SegmentAssignmentAck`); `CatchUpRequest`/
-// `CatchUpChunk`/`CatchUpStreamEnd` are the replacement↔source transfer. The ack
-// confirms a member holds the segment so the coordinator can stop re-driving the
-// assignment — without it a dropped assignment strands the repair (the receiver
-// is idempotent, but nothing re-drives it).
+// `CatchUpAssignment`/`CatchUpAck` are the coordinator↔replica pair; the rest is
+// the replacement↔source transfer. The ack lets the coordinator stop re-driving.
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpAssignment {
     pub segment_key: SegmentKey,
-    /// The owning shard group — echoed into the `CatchUpAck` so the replacement
-    /// can address its confirmation back to this group's coordinator.
+    /// Echoed into the `CatchUpAck` so the reply reaches this group's coordinator.
     pub shard_group_id: ShardGroupId,
     pub start_entry_id: u64,
     pub sealed_end_entry_id: u64,
@@ -155,11 +149,9 @@ pub struct CatchUpStreamEnd {
     pub segment_key: SegmentKey,
 }
 
-/// Replacement → coordinator: this node now holds and has verified the segment
-/// locally through `sealed_end`. The coordinator↔replica counterpart of
-/// `CatchUpAssignment` (mirroring `SegmentAssignment`/`SegmentAssignmentAck`).
-/// Sent both after a transfer verifies and on a zero-transfer full match, so a
-/// re-driven assignment to an already-complete member re-confirms idempotently.
+/// Replacement → coordinator: "I hold this segment through `sealed_end`." Lets the
+/// coordinator stop re-driving. Sent after a transfer verifies, and on a
+/// zero-transfer full match so a re-drive re-confirms.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpAck {
     pub segment_key: SegmentKey,

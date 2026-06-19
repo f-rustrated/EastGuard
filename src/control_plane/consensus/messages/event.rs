@@ -45,11 +45,9 @@ pub enum RaftEvent {
     DisconnectPeer(NodeId),
     #[allow(dead_code)]
     MetadataCommitted(MetadataCommitted),
-    /// Idempotent re-delivery of assignment messages the leader emits each
-    /// heartbeat so a lost one-shot, fire-and-forget delivery self-heals: active-
-    /// segment `SegmentAssignment`s (`maybe_redrive_segment_assignments`) and
-    /// sealed-segment `CatchUpAssignment`s (`maybe_redrive_catch_ups`). The data
-    /// plane handles re-drives idempotently. The actor forwards them to the data
+    /// Idempotent re-delivery of assignment messages each heartbeat, so a lost
+    /// fire-and-forget send self-heals: active-segment `SegmentAssignment`s and
+    /// sealed-segment `CatchUpAssignment`s. The actor forwards them to the data
     /// transport.
     RedriveAssignments(Vec<DataTransportCommand>),
     /// Leader-crash `SealBoundaryQuery` fan-out to a segment's survivors.

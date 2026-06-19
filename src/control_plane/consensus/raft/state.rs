@@ -118,10 +118,8 @@ pub struct Raft {
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
-    /// In-flight sealed-segment catch-ups (D5 repair), keyed by segment. Seeded
-    /// at `ReassignSegment` apply; the heartbeat sweep re-drives `CatchUpAssignment`
-    /// to each unconfirmed member until it acks. Leader-volatile — cleared on
-    /// step-down, like `confirmed_assignment`.
+    /// In-flight sealed-segment repairs. Seeded at `ReassignSegment` apply; the
+    /// heartbeat sweep re-drives until acked. Leader-volatile — cleared on step-down.
     catch_up_repairs: HashMap<SegmentKey, CatchUpRepair>,
     pending_proposals: Vec<MetadataCommand>,
 
@@ -144,11 +142,9 @@ pub(crate) struct TimerSeqs {
     pub ring_check: u64,
 }
 
-/// Leader-only bookkeeping for an in-flight sealed-segment catch-up (D5 repair).
-/// Seeded when a `ReassignSegment` applies; the heartbeat sweep re-drives a
-/// `CatchUpAssignment` to every member still in `pending` until it replies
-/// `CatchUpAck`. Holds the full `replica_set` (the assignment carries it so the
-/// receiver can pick a source) plus the not-yet-confirmed `pending` subset.
+/// One in-flight sealed-segment repair: re-drive each member in `pending` until
+/// it acks. `replica_set` is the full set (the assignment carries it so the
+/// receiver picks its own source).
 struct CatchUpRepair {
     start_entry_id: u64,
     sealed_end: u64,
@@ -1106,12 +1102,9 @@ impl Raft {
         self.confirmed_assignment.insert(ack.segment_key, ack.from);
     }
 
-    /// Re-drive `CatchUpAssignment` to every member of an in-flight sealed-segment
-    /// repair that hasn't yet confirmed. The original dispatch (via the committed
-    /// `SegmentReassigned`) is one-shot and fire-and-forget; this leader heartbeat
-    /// sweep re-announces until convergence, idempotent on the receiver. The
-    /// sealed-segment analogue of `maybe_redrive_segment_assignments`. See
-    /// `.claude/rules/raft-actor.md` #9.
+    /// Re-drive `CatchUpAssignment` to each unconfirmed member of an in-flight
+    /// repair — the sealed-segment analogue of `maybe_redrive_segment_assignments`.
+    /// See `.claude/rules/raft-actor.md` #9.
     fn maybe_redrive_catch_ups(&mut self) {
         let mut redrives = Vec::new();
         for (segment_key, repair) in &self.catch_up_repairs {
@@ -1133,10 +1126,9 @@ impl Raft {
         }
     }
 
-    /// Seed/refresh the catch-up tracker for a just-applied reassignment so the
-    /// heartbeat sweep re-drives it. A reassignment with no committed end carries
-    /// no catch-up (the dispatch emits nothing), so it isn't tracked. Re-tracking
-    /// overwrites — a newer replica set supersedes the old and resets confirmations.
+    /// Track a just-applied reassignment so the heartbeat sweep re-drives it. One
+    /// with no committed end carries no catch-up, so skip it. Re-tracking overwrites
+    /// — a newer replica set wins and resets confirmations.
     fn track_catch_up_repair(&mut self, r: &SegmentReassigned) {
         let Some(sealed_end) = r.sealed_end else {
             return;
@@ -1152,9 +1144,8 @@ impl Raft {
         );
     }
 
-    /// A replica confirmed it holds a reassigned sealed segment through its sealed
-    /// end. Drop it from the pending set; once every member confirms, the repair
-    /// is done and its tracker entry is pruned so the sweep stops re-driving it.
+    /// A member confirmed it holds the segment; drop it from `pending`, and prune
+    /// the repair (stopping the sweep) once every member has confirmed.
     pub(crate) fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
         let Some(repair) = self.catch_up_repairs.get_mut(&ack.segment_key) else {
             return;
