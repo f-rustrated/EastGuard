@@ -66,6 +66,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 All warnings = errors (`-D warnings`). No `#[allow(...)]` to suppress legitimate warnings — fix underlying issue. Use `#[allow(dead_code)]` only for code intentionally kept for future use or used only in test targets.
 
+## Invariants vs. Rules
+
+Before calling something an invariant, make sure it is one — don't reach for "invariant" to dignify an ordinary behavioral guarantee.
+
+- **Invariant** — a *structural* property: a predicate over current state that is **always** true and checkable on a snapshot, with no notion of time or order. This is exactly what `assert_invariants()` asserts. E.g. "each active range has exactly one active segment"; "`last_applied ≤ commit_index ≤ stabled_index`". If you can't write it as an assertion over present state, it isn't an invariant.
+- **Rule** — everything else: behavioral, liveness, and ordering guarantees about what the system *does over time*. E.g. "every event is followed by a flush"; "a seal's end is recovered before the roll"; "catch-up is re-driven until the replica confirms". These have no checkable snapshot — they're enforced by construction or protocol and live in `.claude/rules/`. They do **not** go in `assert_invariants()`.
+
+The confirmation gate below is for **invariants** — they ride in every test via `assert_invariants`, so adding one touches every contributor. Rules are ordinary design: document them, don't gate on them, and don't dress them up as invariants.
+
 ## Invariant Checking
 State machines (e.g., `MetadataStateMachine`, `Raft`, `Topology`, `MetadataStorage`) have `#[cfg(test)] fn assert_invariants(&self)` methods that verify documented invariants at runtime. These are called automatically after every state-changing operation.
 
