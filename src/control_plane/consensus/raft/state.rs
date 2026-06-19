@@ -1106,6 +1106,24 @@ impl Raft {
         self.catch_up.confirm(ack.segment_key, ack.from);
     }
 
+    /// Takeover backstop: re-seed catch-up for every known-end sealed segment this
+    /// node leads. The tracker is leader-volatile (empty after takeover), so a
+    /// repair in flight when leadership changed would otherwise be stranded; the
+    /// heartbeat sweep re-drives the re-seeded set (already-complete members
+    /// full-match-ack cheaply). See `.claude/rules/raft-actor.md` #9.
+    pub(crate) fn reseed_catch_up(&mut self) {
+        let sealed: Vec<_> = self
+            .state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.known_end_sealed_segments())
+            .collect();
+        for (segment_key, start, end, replica_set) in sealed {
+            self.catch_up
+                .track_sealed(segment_key, start, end, replica_set);
+        }
+    }
+
     fn send_append_entries(&mut self, peer_id: NodeId) {
         let peer_state = match self.peer_states.get(&peer_id) {
             Some(ps) => ps,
@@ -3709,6 +3727,33 @@ mod tests {
         raft.step_down(raft.current_term + 1);
         assert!(raft.catch_up.is_empty());
         assert!(drain_catch_up_redrives(&mut raft).is_empty());
+    }
+
+    #[test]
+    fn reseed_catch_up_reconstructs_the_tracker_on_takeover() {
+        let members = vec![node("node-1"), node("y"), node("z")];
+        let (mut raft, seg0) = raft_with_seeded_catch_up(members.clone());
+
+        // Simulate the takeover gap: the leader-volatile tracker is empty, but the
+        // sealed segment is still under-replicated in the state machine.
+        raft.catch_up.clear();
+        assert!(drain_catch_up_redrives(&mut raft).is_empty());
+
+        raft.reseed_catch_up();
+
+        let redrives = drain_catch_up_redrives(&mut raft);
+        for (_, a) in &redrives {
+            assert_eq!(a.segment_key, seg0);
+            assert_eq!(a.sealed_end_entry_id, 100);
+        }
+        let mut targets: Vec<NodeId> = redrives.iter().map(|(t, _)| t.clone()).collect();
+        targets.sort();
+        let mut expected = members;
+        expected.sort();
+        assert_eq!(
+            targets, expected,
+            "reseed re-drives every member of the sealed segment"
+        );
     }
 
     #[test]

@@ -182,6 +182,28 @@ impl TopicMeta {
         out.into_boxed_slice()
     }
 
+    /// Every known-end sealed segment, with the data a `CatchUpAssignment` needs.
+    /// The takeover reseed (raft-actor.md #9) tracks these so a repair in flight
+    /// when leadership changed isn't stranded.
+    pub(crate) fn known_end_sealed_segments(&self) -> Vec<(SegmentKey, u64, u64, ReplicaSet)> {
+        let mut out = Vec::new();
+        for range in self.ranges.values() {
+            for seg in range.segments.values() {
+                if seg.state == SegmentMetaState::Sealed
+                    && let Some(end) = seg.end_entry_id
+                {
+                    out.push((
+                        SegmentKey::new(self.id, range.range_id, seg.segment_id),
+                        seg.start_entry_id,
+                        end,
+                        seg.replica_set.clone(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Route a partition key to the active range that owns it. Active ranges
     /// tile `[KEYSPACE_MIN, KEYSPACE_MAX]` contiguously (invariant 1), so the
     /// owner is the active range with the greatest `keyspace_start <= key`.

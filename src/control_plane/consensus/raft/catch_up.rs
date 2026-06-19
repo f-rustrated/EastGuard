@@ -33,18 +33,36 @@ pub(crate) struct CatchUpRepairs {
 
 impl CatchUpRepairs {
     /// Track a just-applied reassignment. One with no committed end carries no
-    /// catch-up, so skip it. Re-tracking overwrites — a newer replica set wins.
+    /// catch-up, so skip it.
     pub(crate) fn track(&mut self, r: &SegmentReassigned) {
-        let Some(sealed_end) = r.sealed_end else {
-            return;
-        };
-        self.repairs.insert(
-            r.segment_key,
-            CatchUpRepair {
-                start_entry_id: r.start_entry_id,
+        if let Some(sealed_end) = r.sealed_end {
+            self.track_sealed(
+                r.segment_key,
+                r.start_entry_id,
                 sealed_end,
-                replica_set: r.new_replica_set.clone(),
-                pending: r.new_replica_set.iter().cloned().collect(),
+                r.new_replica_set.clone(),
+            );
+        }
+    }
+
+    /// Seed/refresh a repair for a known-end sealed segment — used by the apply
+    /// path (`track`) and the takeover reseed. Re-tracking overwrites: a newer
+    /// replica set wins and resets confirmations.
+    pub(crate) fn track_sealed(
+        &mut self,
+        segment_key: SegmentKey,
+        start_entry_id: u64,
+        sealed_end: u64,
+        replica_set: Vec<NodeId>,
+    ) {
+        let pending = replica_set.iter().cloned().collect();
+        self.repairs.insert(
+            segment_key,
+            CatchUpRepair {
+                start_entry_id,
+                sealed_end,
+                replica_set,
+                pending,
             },
         );
     }

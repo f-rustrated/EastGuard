@@ -145,6 +145,15 @@ impl MultiRaft {
         let target_members = self.topology.group_ring_members(shard_group_id);
 
         self.reconcile_membership(shard_group_id, target_members);
+
+        // Takeover backstop: the catch-up tracker is leader-volatile, so a repair
+        // in flight when leadership changed left it empty here. Re-seed it; the
+        // heartbeat sweep re-drives until each member confirms.
+        if let Some(raft) = self.groups.get_mut(&shard_group_id)
+            && raft.is_leader()
+        {
+            raft.reseed_catch_up();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
