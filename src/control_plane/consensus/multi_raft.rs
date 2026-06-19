@@ -1007,6 +1007,64 @@ mod tests {
         assert!(!store.groups.contains_key(&ShardGroupId(42)));
     }
 
+    /// The ring-check re-announces shard leadership (the #135 backstop for the
+    /// one-shot `AnnounceShardLeader`) only when this node leads the group — a
+    /// follower's ring-check emits nothing.
+    #[test]
+    fn ring_check_re_announces_leadership_only_when_leader() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        // Group 1: single-node → leader on election. Group 2: two-node, no
+        // election → this node stays a follower.
+        store.add_group(&shard(1, vec![me.clone()]));
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: ShardGroupId(1),
+                epoch: u64::MAX,
+            },
+        ));
+        store.add_group(&shard(2, vec![me.clone(), node("n2")]));
+        store.flush(); // drain the initial LeaderChange + add_group dirt
+
+        // Leader's ring-check → exactly one re-announce, for its group.
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: ShardGroupId(1),
+            },
+        ));
+        assert_eq!(
+            shard_leader_refreshes(&store.flush()),
+            vec![(ShardGroupId(1), me.clone())],
+            "leader re-announces its shard leadership on the ring-check"
+        );
+
+        // Follower's ring-check → nothing.
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: ShardGroupId(2),
+            },
+        ));
+        assert!(
+            shard_leader_refreshes(&store.flush()).is_empty(),
+            "a follower does not re-announce"
+        );
+    }
+
+    fn shard_leader_refreshes(events: &[RaftEvent]) -> Vec<(ShardGroupId, NodeId)> {
+        events
+            .iter()
+            .filter_map(|e| {
+                if let RaftEvent::ShardLeaderRefresh(lc) = e {
+                    Some((lc.shard_group_id, lc.leader_node_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn restart_recovers_persisted_state() {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
