@@ -529,16 +529,14 @@ impl MultiRaft {
     }
 
     /// A replica confirmed it holds a reassigned sealed segment through its sealed
-    /// end. The catch-up re-drive tracker that consumes this — to stop re-announcing
-    /// the `CatchUpAssignment` once every member confirms — lands in the next commit;
-    /// for now the confirmation is observed only.
+    /// end. Route it to the owning group's `Raft`, which clears the member from the
+    /// catch-up re-drive (and prunes the repair once every member confirms).
+    /// Mirrors `handle_assignment_ack`.
     fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
-        tracing::debug!(
-            segment = ?ack.segment_key,
-            group = ack.shard_group_id.0,
-            from = %ack.from,
-            "catch-up confirmed by replica",
-        );
+        let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
+            return;
+        };
+        raft.handle_catch_up_ack(ack);
     }
 
     fn execute_seal_step(&mut self, step: SealEndStep) {

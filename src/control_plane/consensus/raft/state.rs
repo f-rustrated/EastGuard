@@ -8,12 +8,15 @@ use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
+use crate::control_plane::metadata::event::{ApplyResult, SegmentReassigned};
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
     MetadataCommand, ReassignSegment, ReplicaSet, RollSegment, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{SegmentAssignment, SegmentAssignmentAck};
+use crate::data_plane::messages::command::{
+    CatchUpAck, CatchUpAssignment, SegmentAssignment, SegmentAssignmentAck,
+};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -115,6 +118,11 @@ pub struct Raft {
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
+    /// In-flight sealed-segment catch-ups (D5 repair), keyed by segment. Seeded
+    /// at `ReassignSegment` apply; the heartbeat sweep re-drives `CatchUpAssignment`
+    /// to each unconfirmed member until it acks. Leader-volatile — cleared on
+    /// step-down, like `confirmed_assignment`.
+    catch_up_repairs: HashMap<SegmentKey, CatchUpRepair>,
     pending_proposals: Vec<MetadataCommand>,
 
     leaderless_segments: LeaderlessSegments,
@@ -134,6 +142,18 @@ pub(crate) struct TimerSeqs {
     pub rpc: u64,
     pub merge_check: u64,
     pub ring_check: u64,
+}
+
+/// Leader-only bookkeeping for an in-flight sealed-segment catch-up (D5 repair).
+/// Seeded when a `ReassignSegment` applies; the heartbeat sweep re-drives a
+/// `CatchUpAssignment` to every member still in `pending` until it replies
+/// `CatchUpAck`. Holds the full `replica_set` (the assignment carries it so the
+/// receiver can pick a source) plus the not-yet-confirmed `pending` subset.
+struct CatchUpRepair {
+    start_entry_id: u64,
+    sealed_end: u64,
+    replica_set: Vec<NodeId>,
+    pending: HashSet<NodeId>,
 }
 
 impl Raft {
@@ -167,6 +187,7 @@ impl Raft {
             timer_seqs,
             election_epoch: 0,
             confirmed_assignment: HashMap::new(),
+            catch_up_repairs: HashMap::new(),
             ring_observation_streak: None,
         };
         raft.reset_election_timer();
@@ -1025,6 +1046,7 @@ impl Raft {
         self.current_leader = None;
         self.peer_states.clear();
         self.confirmed_assignment.clear();
+        self.catch_up_repairs.clear();
     }
 
     // -------------------------------------------------------------------
@@ -1044,6 +1066,7 @@ impl Raft {
 
         self.schedule_rpc_timer();
         self.maybe_redrive_segment_assignments();
+        self.maybe_redrive_catch_ups();
     }
 
     fn maybe_redrive_segment_assignments(&mut self) {
@@ -1081,6 +1104,65 @@ impl Raft {
 
     pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
         self.confirmed_assignment.insert(ack.segment_key, ack.from);
+    }
+
+    /// Re-drive `CatchUpAssignment` to every member of an in-flight sealed-segment
+    /// repair that hasn't yet confirmed. The original dispatch (via the committed
+    /// `SegmentReassigned`) is one-shot and fire-and-forget; this leader heartbeat
+    /// sweep re-announces until convergence, idempotent on the receiver. The
+    /// sealed-segment analogue of `maybe_redrive_segment_assignments`. See
+    /// `.claude/rules/raft-actor.md` #9.
+    fn maybe_redrive_catch_ups(&mut self) {
+        let mut redrives = Vec::new();
+        for (segment_key, repair) in &self.catch_up_repairs {
+            for member in &repair.pending {
+                redrives.push(DataTransportCommand::send_to_targets(
+                    vec![member.clone()],
+                    CatchUpAssignment {
+                        segment_key: *segment_key,
+                        shard_group_id: self.shard_group_id,
+                        start_entry_id: repair.start_entry_id,
+                        sealed_end_entry_id: repair.sealed_end,
+                        replica_set: repair.replica_set.clone(),
+                    },
+                ));
+            }
+        }
+        if !redrives.is_empty() {
+            self.events.push(RaftEvent::RedriveAssignments(redrives));
+        }
+    }
+
+    /// Seed/refresh the catch-up tracker for a just-applied reassignment so the
+    /// heartbeat sweep re-drives it. A reassignment with no committed end carries
+    /// no catch-up (the dispatch emits nothing), so it isn't tracked. Re-tracking
+    /// overwrites — a newer replica set supersedes the old and resets confirmations.
+    fn track_catch_up_repair(&mut self, r: &SegmentReassigned) {
+        let Some(sealed_end) = r.sealed_end else {
+            return;
+        };
+        self.catch_up_repairs.insert(
+            r.segment_key,
+            CatchUpRepair {
+                start_entry_id: r.start_entry_id,
+                sealed_end,
+                replica_set: r.new_replica_set.clone(),
+                pending: r.new_replica_set.iter().cloned().collect(),
+            },
+        );
+    }
+
+    /// A replica confirmed it holds a reassigned sealed segment through its sealed
+    /// end. Drop it from the pending set; once every member confirms, the repair
+    /// is done and its tracker entry is pruned so the sweep stops re-driving it.
+    pub(crate) fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+        let Some(repair) = self.catch_up_repairs.get_mut(&ack.segment_key) else {
+            return;
+        };
+        repair.pending.remove(&ack.from);
+        if repair.pending.is_empty() {
+            self.catch_up_repairs.remove(&ack.segment_key);
+        }
     }
 
     fn send_append_entries(&mut self, peer_id: NodeId) {
@@ -1311,6 +1393,12 @@ impl Raft {
                     index,
                     result
                 );
+
+                if self.is_leader()
+                    && let ApplyResult::SegmentReassigned(r) = &result
+                {
+                    self.track_catch_up_repair(r);
+                }
                 self.events.push(
                     MetadataCommitted {
                         shard_group_id: self.shard_group_id,
@@ -3593,6 +3681,140 @@ mod tests {
                 member
             );
         }
+    }
+
+    // ── Catch-up re-drive: seed at ReassignSegment apply, sweep until acked ──
+
+    /// Create a topic, seal segment 0 at a known end, reassign it to `new_set`,
+    /// and apply — leaving one in-flight catch-up repair seeded in the leader's
+    /// tracker (the heartbeat sweep will re-drive it).
+    fn raft_with_seeded_catch_up(new_set: Vec<NodeId>) -> (Raft, SegmentKey) {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1")],
+                end_entry_id: Some(100),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        raft.simulate_flush_and_apply();
+        raft.propose(
+            MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: seg0,
+                new_replica_set: new_set,
+            })
+            .into(),
+        )
+        .expect("ReassignSegment propose failed");
+        raft.simulate_flush_and_apply();
+        (raft, seg0)
+    }
+
+    /// Run the catch-up re-drive sweep and collect (target, assignment) pairs.
+    fn drain_catch_up_redrives(raft: &mut Raft) -> Vec<(NodeId, CatchUpAssignment)> {
+        use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+        raft.maybe_redrive_catch_ups();
+        let mut out = Vec::new();
+        for event in raft.take_events() {
+            let RaftEvent::RedriveAssignments(cmds) = event else {
+                continue;
+            };
+            for cmd in cmds {
+                if let DataTransportCommand::SendToTargets(s) = cmd {
+                    let target = s.targets[0].clone();
+                    if let DataPlaneInterNodeCommand::CatchUpAssignment(a) = s.message {
+                        out.push((target, a));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn catch_up_redrives_to_every_unconfirmed_member() {
+        let members = vec![node("node-1"), node("y"), node("z")];
+        let (mut raft, seg0) = raft_with_seeded_catch_up(members.clone());
+
+        let redrives = drain_catch_up_redrives(&mut raft);
+        let mut targets: Vec<NodeId> = redrives.iter().map(|(t, _)| t.clone()).collect();
+        targets.sort();
+        let mut expected = members.clone();
+        expected.sort();
+        assert_eq!(targets, expected, "re-drive reaches every member");
+
+        // Each assignment carries the segment's sealed bounds + full replica set
+        // (the receiver picks its own source from it).
+        for (_, a) in &redrives {
+            assert_eq!(a.segment_key, seg0);
+            assert_eq!(a.shard_group_id, TEST_SHARD);
+            assert_eq!(a.start_entry_id, 0);
+            assert_eq!(a.sealed_end_entry_id, 100);
+            assert_eq!(a.replica_set, members);
+        }
+    }
+
+    #[test]
+    fn catch_up_ack_clears_member_then_prunes_when_all_confirm() {
+        let (mut raft, seg0) =
+            raft_with_seeded_catch_up(vec![node("node-1"), node("y"), node("z")]);
+
+        // node-1 confirms → only y and z are still re-driven.
+        raft.handle_catch_up_ack(CatchUpAck {
+            segment_key: seg0,
+            shard_group_id: TEST_SHARD,
+            from: node("node-1"),
+        });
+        let mut targets: Vec<NodeId> = drain_catch_up_redrives(&mut raft)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec![node("y"), node("z")]);
+
+        // The remaining two confirm → repair pruned, sweep emits nothing.
+        for n in ["y", "z"] {
+            raft.handle_catch_up_ack(CatchUpAck {
+                segment_key: seg0,
+                shard_group_id: TEST_SHARD,
+                from: node(n),
+            });
+        }
+        assert!(
+            drain_catch_up_redrives(&mut raft).is_empty(),
+            "a fully-confirmed repair is pruned and no longer re-driven"
+        );
+    }
+
+    #[test]
+    fn catch_up_repairs_dropped_on_step_down() {
+        let (mut raft, _) = raft_with_seeded_catch_up(vec![node("node-1"), node("y")]);
+        // A higher term deposes the leader → leader-volatile tracker is cleared.
+        raft.step_down(raft.current_term + 1);
+        assert!(raft.catch_up_repairs.is_empty());
+        assert!(drain_catch_up_redrives(&mut raft).is_empty());
+    }
+
+    #[test]
+    fn track_catch_up_repair_ignores_unknown_end() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        let mut raft = single_node_raft_as_leader();
+        let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        // A reassignment with no committed end dispatched no catch-up, so there is
+        // nothing to re-drive — it must not be tracked.
+        raft.track_catch_up_repair(&SegmentReassigned {
+            segment_key: seg,
+            start_entry_id: 0,
+            sealed_end: None,
+            new_replica_set: vec![node("a"), node("b")],
+        });
+        assert!(raft.catch_up_repairs.is_empty());
     }
 
     #[test]
