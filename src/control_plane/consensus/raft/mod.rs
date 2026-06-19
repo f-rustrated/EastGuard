@@ -1,5 +1,6 @@
 use crate::control_plane::NodeId;
 
+pub(crate) mod catch_up;
 pub(crate) mod command;
 pub(crate) mod errors;
 pub(crate) mod log;

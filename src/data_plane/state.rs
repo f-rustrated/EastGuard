@@ -12,6 +12,7 @@ use super::segment_writer::SegmentAppender;
 use super::sparse_index::SparseEntry;
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
+use super::states::seal_request::PendingSealRequests;
 use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
@@ -37,11 +38,6 @@ const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Re-drives without an append before the receiver treats a receive as stalled
 /// and re-requests from a fresh source. A grace window for slow transfers.
 const CATCH_UP_IDLE_REDRIVES: u32 = 2;
-
-struct PendingSealRequest {
-    sent_at: std::time::Instant,
-    failed_nodes: Vec<NodeId>,
-}
 
 /// An in-progress catch-up receive (replacement side): the open segment-file
 /// appender, the sealed bounds being filled toward, and the sparse anchors
@@ -71,7 +67,7 @@ pub struct DataPlane<W: WalStorage> {
     needs_flush: bool,
 
     replication: ReplicationState,
-    pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+    pending_seal_requests: PendingSealRequests,
     /// In-progress catch-up receives (replacement side), keyed by segment.
     pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
 
@@ -108,7 +104,7 @@ impl<W: WalStorage> DataPlane<W> {
             buffer_byte_count: 0,
             needs_flush: false,
             replication: ReplicationState::default(),
-            pending_seal_requests: HashMap::new(),
+            pending_seal_requests: PendingSealRequests::default(),
             pending_catch_ups: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
@@ -854,7 +850,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_seal_response(&mut self, cmd: SealResponse) {
-        self.pending_seal_requests.remove(&cmd.old_segment_key);
+        self.pending_seal_requests.clear(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
         };
@@ -979,17 +975,12 @@ impl<W: WalStorage> DataPlane<W> {
                 }
                 .into(),
             });
-        self.pending_seal_requests.insert(
-            segment_key,
-            PendingSealRequest {
-                sent_at: std::time::Instant::now(),
-                failed_nodes,
-            },
-        );
+        self.pending_seal_requests
+            .track(segment_key, failed_nodes, std::time::Instant::now());
     }
 
     fn enqueue_seal_request(&mut self, segment_key: SegmentKey) {
-        if self.pending_seal_requests.contains_key(&segment_key) {
+        if self.pending_seal_requests.is_tracked(&segment_key) {
             return;
         }
         let Some(tracker) = self.segments.get(&segment_key) else {
@@ -1009,13 +1000,8 @@ impl<W: WalStorage> DataPlane<W> {
                 }
                 .into(),
             });
-        self.pending_seal_requests.insert(
-            segment_key,
-            PendingSealRequest {
-                sent_at: std::time::Instant::now(),
-                failed_nodes: vec![],
-            },
-        );
+        self.pending_seal_requests
+            .track(segment_key, vec![], std::time::Instant::now());
     }
 
     fn should_flush(&self) -> bool {
@@ -1143,32 +1129,27 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn enqueue_timed_out_seal_retries(&mut self) {
-        let now = std::time::Instant::now();
-        let timeout = self.config.seal_request_timeout;
-
-        for (key, pending) in &mut self.pending_seal_requests {
-            if now.duration_since(pending.sent_at) < timeout {
-                continue;
-            }
-            let Some(tracker) = self.segments.get(key) else {
+        let due = self
+            .pending_seal_requests
+            .take_due(std::time::Instant::now(), self.config.seal_request_timeout);
+        for (segment_key, failed_nodes) in due {
+            let Some(tracker) = self.segments.get(&segment_key) else {
                 continue;
             };
             if tracker.role() != SegmentRole::Leader {
                 continue;
             }
-
             self.out
                 .store_transport_cmd(DataTransportSendToCoordinator {
                     shard_group_id: tracker.shard_group_id(),
                     message: SealRequest {
                         from: self.node_id.clone(),
-                        segment_key: *key,
-                        failed_nodes: pending.failed_nodes.clone(),
+                        segment_key,
+                        failed_nodes,
                         end_entry_id: tracker.committed_entry_id(),
                     }
                     .into(),
                 });
-            pending.sent_at = now;
         }
     }
 }
@@ -1909,8 +1890,8 @@ mod tests {
         let seq = dp.out.repl_schedules[0].0;
         dp.handle_replication_timeout(test_key(), seq);
 
-        let pending = dp.pending_seal_requests.get(&test_key()).unwrap();
-        assert!(pending.failed_nodes.contains(&follower));
+        let failed = dp.pending_seal_requests.failed_nodes(&test_key()).unwrap();
+        assert!(failed.contains(&follower));
     }
 
     #[test]
@@ -1984,7 +1965,7 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
         );
-        assert!(dp.pending_seal_requests.contains_key(&test_key()));
+        assert!(dp.pending_seal_requests.is_tracked(&test_key()));
     }
 
     #[test]
@@ -2032,7 +2013,7 @@ mod tests {
         dp.enqueue_seal_request(test_key());
 
         assert!(dp.out.transport_cmds.is_empty());
-        assert!(!dp.pending_seal_requests.contains_key(&test_key()));
+        assert!(!dp.pending_seal_requests.is_tracked(&test_key()));
     }
 
     #[test]
