@@ -69,7 +69,7 @@ impl MetadataCommitted {
                 vec![rm.into_command(sgid)]
             }
             ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
-            ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(),
+            ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
         }
     }
 }

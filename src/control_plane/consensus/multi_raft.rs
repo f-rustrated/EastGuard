@@ -14,7 +14,7 @@ use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
+    CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -233,6 +233,9 @@ impl MultiRaft {
             }
             MultiRaftActorCommand::SealBoundaryReport(report) => {
                 self.handle_seal_boundary_report(report);
+            }
+            MultiRaftActorCommand::CatchUpAck(ack) => {
+                self.handle_catch_up_ack(ack);
             }
         }
     }
@@ -523,6 +526,19 @@ impl MultiRaft {
         {
             self.execute_seal_step(step);
         }
+    }
+
+    /// A replica confirmed it holds a reassigned sealed segment through its sealed
+    /// end. The catch-up re-drive tracker that consumes this — to stop re-announcing
+    /// the `CatchUpAssignment` once every member confirms — lands in the next commit;
+    /// for now the confirmation is observed only.
+    fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+        tracing::debug!(
+            segment = ?ack.segment_key,
+            group = ack.shard_group_id.0,
+            from = %ack.from,
+            "catch-up confirmed by replica",
+        );
     }
 
     fn execute_seal_step(&mut self, step: SealEndStep) {

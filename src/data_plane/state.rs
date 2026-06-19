@@ -44,6 +44,7 @@ struct PendingSealRequest {
 /// accumulated as chunks land — flushed to the index once the file verifies.
 struct PendingCatchUp {
     appender: SegmentAppender,
+    shard_group_id: ShardGroupId,
     start_offset: u64,
     sealed_end: u64,
     anchors: Vec<SparseEntry>,
@@ -371,7 +372,13 @@ impl<W: WalStorage> DataPlane<W> {
             C::CatchUpAssignment(cmd) => self.handle_catch_up_assignment(cmd),
             C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
             C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
-            C::CatchUpDone(cmd) => self.handle_catch_up_done(cmd),
+            C::CatchUpStreamEnd(cmd) => self.handle_catch_up_stream_end(cmd),
+            // Pass-through to the local MultiRaftActor (we coordinate this group):
+            // a replica's confirmation that it finished catching up.
+            C::CatchUpAck(cmd) => {
+                self.out
+                    .store_coordinator_cmd(MultiRaftActorCommand::CatchUpAck(cmd));
+            }
 
             C::SealBoundaryQuery(cmd) => self.handle_seal_boundary_query(cmd),
             // Pass-through to the local MultiRaftActor
@@ -413,7 +420,9 @@ impl<W: WalStorage> DataPlane<W> {
         if local.is_some_and(|end| end >= cmd.sealed_end_entry_id) {
             // Full match: verified locally through the sealed end. Make sure the
             // cold-read resolver can serve it (a restarted node's recovered data
-            // isn't in the live store yet), then transfer nothing.
+            // isn't in the live store yet), confirm to the coordinator, then
+            // transfer nothing. The ack fires even when already registered so a
+            // re-driven assignment re-confirms.
             if self.segments.sealed_bounds(&cmd.segment_key).is_none() {
                 self.segments.insert_sealed_from_catch_up(
                     cmd.segment_key,
@@ -421,6 +430,7 @@ impl<W: WalStorage> DataPlane<W> {
                     cmd.sealed_end_entry_id,
                 );
             }
+            self.send_catch_up_ack(cmd.shard_group_id, cmd.segment_key);
             return;
         }
         let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
@@ -445,6 +455,7 @@ impl<W: WalStorage> DataPlane<W> {
             cmd.segment_key,
             PendingCatchUp {
                 appender,
+                shard_group_id: cmd.shard_group_id,
                 start_offset: cmd.start_entry_id,
                 sealed_end: cmd.sealed_end_entry_id,
                 anchors: Vec::new(),
@@ -547,11 +558,11 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    /// End of stream. Fsync, then re-scan the file (commit 4's verifier) to
-    /// confirm it reaches `sealed_end`. Only on success do we index the anchors
-    /// and register the segment cold-readable. Reporting completion to the
-    /// coordinator is Phase 8; here the segment simply becomes locally serveable.
-    fn handle_catch_up_done(&mut self, cmd: CatchUpDone) {
+    /// End of stream. Fsync, then re-scan the file (the recovery verifier) to
+    /// confirm it reaches `sealed_end`. Only on success do we index the anchors,
+    /// register the segment cold-readable, and confirm completion to the
+    /// coordinator (`CatchUpAck`) so it stops re-driving the assignment.
+    fn handle_catch_up_stream_end(&mut self, cmd: CatchUpStreamEnd) {
         let Some(mut pending) = self.pending_catch_ups.remove(&cmd.segment_key) else {
             tracing::debug!(
                 "catch-up done for an unknown receive {:?}; dropping",
@@ -598,6 +609,24 @@ impl<W: WalStorage> DataPlane<W> {
             pending.start_offset,
             pending.sealed_end,
         );
+        self.send_catch_up_ack(pending.shard_group_id, cmd.segment_key);
+    }
+
+    /// Confirm to the coordinator that this node holds the reassigned sealed
+    /// segment through its sealed end, so the coordinator's heartbeat sweep stops
+    /// re-announcing the assignment. Routed to the group's coordinator via
+    /// `SendToCoordinator`, mirroring `SegmentAssignmentAck`.
+    fn send_catch_up_ack(&mut self, shard_group_id: ShardGroupId, segment_key: SegmentKey) {
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id,
+                message: CatchUpAck {
+                    segment_key,
+                    shard_group_id,
+                    from: self.node_id.clone(),
+                }
+                .into(),
+            });
     }
 
     /// Source side: a peer wants `cmd.segment_key` brought up to its local end.
@@ -614,7 +643,7 @@ impl<W: WalStorage> DataPlane<W> {
             // The requester is already at or past OUR committed end — nothing to
             // stream. Confirm completion immediately and skip a pointless cold-read
             // dispatch.
-            self.send_catch_up_done(cmd.from, cmd.segment_key);
+            self.send_catch_up_stream_end(cmd.from, cmd.segment_key);
             return;
         }
         self.dispatch_catch_up_read(cmd.from, cmd.segment_key, start_offset, sealed_end, start);
@@ -650,7 +679,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// The cold-read pool finished one batch for a catch-up source read. Emit it
     /// as a `CatchUpChunk` to the requester, then re-arm the next read until the
-    /// sealed end is reached, at which point send `CatchUpDone`.
+    /// sealed end is reached, at which point send `CatchUpStreamEnd`.
     fn handle_catch_up_read_complete(&mut self, cmd: CatchUpReadComplete) {
         let has_entries = !cmd.entries.is_empty();
         if has_entries {
@@ -680,15 +709,15 @@ impl<W: WalStorage> DataPlane<W> {
                 cmd.next_offset,
             );
         } else {
-            self.send_catch_up_done(cmd.requester, cmd.segment_key);
+            self.send_catch_up_stream_end(cmd.requester, cmd.segment_key);
         }
     }
 
-    fn send_catch_up_done(&mut self, requester: NodeId, segment_key: SegmentKey) {
+    fn send_catch_up_stream_end(&mut self, requester: NodeId, segment_key: SegmentKey) {
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
                 vec![requester],
-                CatchUpDone { segment_key },
+                CatchUpStreamEnd { segment_key },
             ));
     }
 
@@ -2299,7 +2328,7 @@ mod tests {
     }
 
     /// A requester already at (or past) the source's committed end gets an
-    /// immediate `CatchUpDone` and no read is dispatched — the source short-
+    /// immediate `CatchUpStreamEnd` and no read is dispatched — the source short-
     /// circuits on its OWN `sealed_end`, not on anything the requester relayed.
     #[test]
     fn catch_up_request_already_caught_up_sends_done_without_reading() {
@@ -2318,7 +2347,7 @@ mod tests {
 
         // Nothing handed to the pool...
         assert!(cold_read_rx.try_recv().is_err());
-        // ...and a CatchUpDone went straight back to the requester.
+        // ...and a CatchUpStreamEnd went straight back to the requester.
         assert_eq!(dp.out.transport_cmds.len(), 1);
         let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("expected SendToTargets");
@@ -2326,12 +2355,12 @@ mod tests {
         assert_eq!(s.targets[0], requester);
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpDone(d) if d.segment_key == test_key()
+            DataPlaneInterNodeCommand::CatchUpStreamEnd(d) if d.segment_key == test_key()
         ));
     }
 
     /// A batch whose `next_offset` is past the sealed end emits one `CatchUpChunk`
-    /// (entries intact, with `record_count`) followed by `CatchUpDone` — no re-arm.
+    /// (entries intact, with `record_count`) followed by `CatchUpStreamEnd` — no re-arm.
     #[test]
     fn catch_up_read_complete_emits_chunk_then_done() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -2399,12 +2428,12 @@ mod tests {
         };
         assert!(matches!(
             &done.message,
-            DataPlaneInterNodeCommand::CatchUpDone(_)
+            DataPlaneInterNodeCommand::CatchUpStreamEnd(_)
         ));
     }
 
     /// A batch that ends below the sealed end emits its chunk and re-arms the next
-    /// read against the pool, resuming at `next_offset` — no `CatchUpDone` yet.
+    /// read against the pool, resuming at `next_offset` — no `CatchUpStreamEnd` yet.
     #[test]
     fn catch_up_read_complete_re_arms_until_sealed_end() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -2477,6 +2506,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 replica_set: vec![test_node_id(), source.clone()],
@@ -2522,7 +2552,7 @@ mod tests {
             .into(),
         ));
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpDone {
+            CatchUpStreamEnd {
                 segment_key: test_key(),
             }
             .into(),
@@ -2540,6 +2570,12 @@ mod tests {
                 matches!(t, CheckpointTask::PutAnchors(anchors) if !anchors.is_empty())
             })
         );
+        // ...and a CatchUpAck confirmed completion back to the coordinator.
+        assert!(dp.out.transport_cmds.iter().any(|c| matches!(
+            c,
+            DataTransportCommand::SendToCoordinator(coord)
+                if matches!(&coord.message, DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key())
+        )));
     }
 
     /// A stream that stops short of `sealed_end` fails verification, so the
@@ -2554,6 +2590,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 5, // need through 5...
                 replica_set: vec![test_node_id(), NodeId::new("source")],
@@ -2586,7 +2623,7 @@ mod tests {
             .into(),
         ));
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpDone {
+            CatchUpStreamEnd {
                 segment_key: test_key(),
             }
             .into(),
@@ -2600,6 +2637,12 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, CheckpointTask::PutAnchors(_)))
         );
+        // ...and NO CatchUpAck — an unverified receive must not confirm completion.
+        assert!(!dp.out.transport_cmds.iter().any(|c| matches!(
+            c,
+            DataTransportCommand::SendToCoordinator(s)
+                if matches!(&s.message, DataPlaneInterNodeCommand::CatchUpAck(_))
+        )));
     }
 
     /// Full match (the catch-up "lottery"): the recovered inventory already holds
@@ -2614,6 +2657,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 replica_set: vec![test_node_id(), NodeId::new("peer")],
@@ -2621,8 +2665,16 @@ mod tests {
             .into(),
         ));
 
-        // Zero transfer — no CatchUpRequest dispatched...
-        assert!(dp.out.transport_cmds.is_empty());
+        // Zero transfer — no CatchUpRequest dispatched, only a CatchUpAck back to
+        // the coordinator so its re-drive stops re-announcing the assignment.
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToCoordinator");
+        };
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key()
+        ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
         assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
     }
@@ -2642,6 +2694,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 4,
                 replica_set: vec![test_node_id(), NodeId::new("source")],
@@ -2671,6 +2724,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 // self (test-node) is a follower here; `leader` is replica_set[0].

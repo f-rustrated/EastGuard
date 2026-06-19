@@ -93,18 +93,25 @@ pub struct SegmentSealed {
 // it brings its local copy up to the sealed end by fetching the missing suffix from a healthy replica. Four messages, all riding the
 // `DataPlaneInterNodeCommand` wire (bounded by `DATA_FRAME_MAX`):
 //
-//   coordinator ─CatchUpAssignment─▶ each replica "own `key` [start, sealed_end]; reconcile vs your inventory"
-//   replacement ─CatchUpRequest────▶ a peer        "I have through `local_end`; send the rest"
-//   source      ─CatchUpChunk(s)───▶ replacement  bounded batches of entries
-//   source      ─CatchUpDone───────▶ replacement  end of stream; verify, then report complete
+//   coordinator ─CatchUpAssignment─▶ each replica  "own `key` [start, sealed_end]; reconcile vs your inventory"
+//   replacement ─CatchUpRequest────▶ a peer         "I have through `local_end`; send the rest"
+//   source      ─CatchUpChunk(s)───▶ replacement   bounded batches of entries
+//   source      ─CatchUpStreamEnd──▶ replacement   end of stream; the replacement then verifies
+//   replacement ─CatchUpAck────────▶ coordinator   "verified + registered through `sealed_end`"
 //
-// This commit defines the types, encoding, and routing only — handlers are
-// stubbed; the source side lands in commit 20 and the replacement side
-// (inventory-aware, per the implementation plan §25) in commit 21.
+// `CatchUpAssignment`/`CatchUpAck` are the coordinator↔replica control pair
+// (mirroring `SegmentAssignment`/`SegmentAssignmentAck`); `CatchUpRequest`/
+// `CatchUpChunk`/`CatchUpStreamEnd` are the replacement↔source transfer. The ack
+// confirms a member holds the segment so the coordinator can stop re-driving the
+// assignment — without it a dropped assignment strands the repair (the receiver
+// is idempotent, but nothing re-drives it).
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CatchUpAssignment {
     pub segment_key: SegmentKey,
+    /// The owning shard group — echoed into the `CatchUpAck` so the replacement
+    /// can address its confirmation back to this group's coordinator.
+    pub shard_group_id: ShardGroupId,
     pub start_entry_id: u64,
     pub sealed_end_entry_id: u64,
     pub replica_set: Vec<NodeId>,
@@ -144,8 +151,20 @@ impl CatchUpEntry {
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct CatchUpDone {
+pub struct CatchUpStreamEnd {
     pub segment_key: SegmentKey,
+}
+
+/// Replacement → coordinator: this node now holds and has verified the segment
+/// locally through `sealed_end`. The coordinator↔replica counterpart of
+/// `CatchUpAssignment` (mirroring `SegmentAssignment`/`SegmentAssignmentAck`).
+/// Sent both after a transfer verifies and on a zero-transfer full match, so a
+/// re-driven assignment to an already-complete member re-confirms idempotently.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct CatchUpAck {
+    pub segment_key: SegmentKey,
+    pub shard_group_id: ShardGroupId,
+    pub from: NodeId,
 }
 
 // Leader-crash boundary recovery: establish a sealed segment's committed end.
@@ -188,7 +207,8 @@ pub enum DataPlaneInterNodeCommand {
     CatchUpAssignment(CatchUpAssignment),
     CatchUpRequest(CatchUpRequest),
     CatchUpChunk(CatchUpChunk),
-    CatchUpDone(CatchUpDone),
+    CatchUpStreamEnd(CatchUpStreamEnd),
+    CatchUpAck(CatchUpAck),
     SealBoundaryQuery(SealBoundaryQuery),
     SealBoundaryReport(SealBoundaryReport),
 }
@@ -206,7 +226,8 @@ impl_from_variant!(
     CatchUpAssignment,
     CatchUpRequest,
     CatchUpChunk,
-    CatchUpDone,
+    CatchUpStreamEnd,
+    CatchUpAck,
     SealBoundaryQuery,
     SealBoundaryReport,
 );

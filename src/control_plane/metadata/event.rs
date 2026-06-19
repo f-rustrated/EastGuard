@@ -76,7 +76,7 @@ pub struct SegmentReassigned {
 }
 
 impl SegmentReassigned {
-    pub fn into_catch_up_commands(self) -> Vec<DataTransportCommand> {
+    pub fn into_catch_up_commands(self, shard_group_id: ShardGroupId) -> Vec<DataTransportCommand> {
         let Some(sealed_end) = self.sealed_end else {
             return vec![];
         };
@@ -87,6 +87,7 @@ impl SegmentReassigned {
                     vec![member.clone()],
                     CatchUpAssignment {
                         segment_key: self.segment_key,
+                        shard_group_id,
                         start_entry_id: self.start_entry_id,
                         sealed_end_entry_id: sealed_end,
                         replica_set: self.new_replica_set.clone(),
