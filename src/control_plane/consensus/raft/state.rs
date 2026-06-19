@@ -1124,6 +1124,19 @@ impl Raft {
         }
     }
 
+    /// The periodic shard-leader re-announce for the ring-check backstop (#135
+    /// class) — `None` unless this node leads the group. Announce-only: the actor
+    /// forwards it to SWIM, never reconcile.
+    pub(crate) fn shard_leader_refresh(&self) -> Option<RaftEvent> {
+        self.is_leader().then(|| {
+            RaftEvent::ShardLeaderRefresh(LeaderChange {
+                shard_group_id: self.shard_group_id,
+                leader_node_id: self.node_id.clone(),
+                term: self.current_term,
+            })
+        })
+    }
+
     fn send_append_entries(&mut self, peer_id: NodeId) {
         let peer_state = match self.peer_states.get(&peer_id) {
             Some(ps) => ps,

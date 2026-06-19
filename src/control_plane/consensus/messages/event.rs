@@ -42,8 +42,12 @@ pub enum RaftEvent {
     OutboundRaftPacket(OutboundRaftPacket),
     Timer(TimerCommand<RaftTimer>),
     LeaderChange(LeaderChange),
+    /// Periodic re-announce of this node's shard leadership — the ring-check
+    /// backstop for the one-shot `AnnounceShardLeader` gossip (#135 class), so a
+    /// node that missed it converges. The actor forwards it to SWIM only; unlike
+    /// `LeaderChange` it does NOT reconcile (that would re-run the takeover sweep).
+    ShardLeaderRefresh(LeaderChange),
     DisconnectPeer(NodeId),
-    #[allow(dead_code)]
     MetadataCommitted(MetadataCommitted),
     /// Idempotent re-delivery of assignment messages each heartbeat, so a lost
     /// fire-and-forget send self-heals: active-segment `SegmentAssignment`s and

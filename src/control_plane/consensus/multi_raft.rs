@@ -178,6 +178,20 @@ impl MultiRaft {
             });
 
         self.reconcile_membership(shard_group_id, target_members);
+
+        // Backstop the one-shot `AnnounceShardLeader` (#135 class): re-announce our
+        // leadership each ring check so a node that missed the original gossip
+        // converges (without it, its empty shard-leader map drops every
+        // `SendToCoordinator` — seals, catch-up acks — forever). Spread across
+        // groups by the per-group timer; receivers that already know it no-op
+        // (term-monotonic). Announce-only — emphatically not a reconcile.
+        if let Some(event) = self
+            .groups
+            .get(&shard_group_id)
+            .and_then(|g| g.shard_leader_refresh())
+        {
+            self.pending_events.push(event);
+        }
     }
 
     fn reconcile_membership(

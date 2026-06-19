@@ -856,57 +856,56 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
-
         let shard_group_id = old_tracker.shard_group_id();
-
         let new_start_entry_id = old_tracker.successor_start_entry_id();
-        let mut new_tracker = SegmentTracker::new_with_start_entry_id(
-            new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
-            SegmentRole::Leader,
-            cmd.new_replica_set,
-            shard_group_id,
-            new_start_entry_id,
-        );
 
-        // Replay uncommitted records into the new tracker's staged_records.
-        // They reach cache via the normal flush path: staged_records → WAL → publish_uncommitted.
-        // Records are re-WAL'd with new routing headers; old WAL entries are cleaned up
-        // by normal file deletion once the checkpoint watermark advances past them.
-        //
-        // D5 crash recovery: duplicate WAL data is safe. Old entries route to the sealed
-        // segment (bounded by metadata end_offset), new entries route to the new segment.
-        // Metadata-first recovery (Raft log before WAL) provides the seal boundary.
-        let mut replayed_bytes = 0usize;
-        for (data, record_count) in old_tracker.uncommitted_entries() {
-            replayed_bytes += data.len();
-            new_tracker.stage_entry(new_segment_key, data, record_count);
-        }
-        // Published-uncommitted records were cleared from `buffer_byte_count` when
-        // they flushed, so re-staging them re-adds their bytes here.
-        self.buffer_byte_count += replayed_bytes;
+        // Collect the tail to carry into the successor (owned) so the `old_tracker`
+        // borrow ends before we mutate the successor. Re-staged records reach cache
+        // via the normal flush path and are re-WAL'd with new headers; on recovery,
+        // metadata's seal boundary clips any duplicate. `uncommitted` (published)
+        // records were cleared from `buffer_byte_count` at flush, so re-staging
+        // re-adds their bytes; `staged` records are still counted, so they don't.
+        let uncommitted: Vec<_> = old_tracker.uncommitted_entries().collect();
+        let staged: Vec<_> = old_tracker.staged_for_replay().collect();
+        let followers = old_tracker.followers().to_vec();
+        let replayed_bytes: usize = uncommitted.iter().map(|(data, _)| data.len()).sum();
 
-        // Staged-but-unflushed produces (staged after the last flush) must also
-        // carry to the successor
-        for (data, record_count) in old_tracker.staged_for_replay() {
-            new_tracker.stage_entry(new_segment_key, data, record_count);
-        }
-
-        self.replication
-            .segment_handoff(cmd.old_segment_key, new_segment_key);
-
-        if !old_tracker.followers().is_empty() {
+        if !followers.is_empty() {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
-                    old_tracker.followers().to_vec(),
+                    followers,
                     SegmentSealed {
                         segment_key: cmd.old_segment_key,
                     },
                 ));
         }
 
+        self.replication
+            .segment_handoff(cmd.old_segment_key, new_segment_key);
         self.retire_old_segment(cmd.old_segment_key);
 
-        self.segments.insert_active(new_segment_key, new_tracker);
+        // The successor may already exist: on a roll the coordinator co-dispatches a
+        // `SegmentAssignment` for the new active segment alongside this `SealResponse`,
+        // and it can win the race (creating the successor empty). Carry the tail onto
+        // the existing tracker rather than a fresh one that `insert_active` would
+        // silently refuse — which would drop the records (data loss) and strand the
+        // counter.
+        if self.segments.get(&new_segment_key).is_none() {
+            let new_tracker = SegmentTracker::new_with_start_entry_id(
+                new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
+                SegmentRole::Leader,
+                cmd.new_replica_set,
+                shard_group_id,
+                new_start_entry_id,
+            );
+            self.segments.insert_active(new_segment_key, new_tracker);
+        }
+        if let Some(successor) = self.segments.get_mut(&new_segment_key) {
+            for (data, record_count) in uncommitted.into_iter().chain(staged) {
+                successor.stage_entry(new_segment_key, data, record_count);
+            }
+        }
+        self.buffer_byte_count += replayed_bytes;
         self.dirty_segments.push(new_segment_key);
         self.needs_flush = true;
     }
@@ -1171,9 +1170,18 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
             .map(|e| e.byte_len())
             .sum();
         assert_eq!(
-            self.buffer_byte_count, actual_byte_count,
-            "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count})",
-            self.buffer_byte_count
+            self.buffer_byte_count,
+            actual_byte_count,
+            "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count}); \
+             segments(id,role,staged_bytes)={:?}",
+            self.buffer_byte_count,
+            self.segments
+                .iter()
+                .map(|(k, t)| {
+                    let staged: usize = t.staged_entries().iter().map(|e| e.byte_len()).sum();
+                    (k.segment_id.0, t.role(), staged)
+                })
+                .collect::<Vec<_>>()
         );
 
         self.segments.assert_invariants();
@@ -1539,6 +1547,37 @@ mod tests {
 
         // The staged produce moved to the successor; the counter still matches.
         let successor = test_key().with_segment_id(SegmentId(1));
+        assert!(dp.segments.get(&successor).unwrap().has_staged());
+        assert!(dp.has_buffered_data());
+    }
+
+    /// On a roll the coordinator co-dispatches a `SegmentAssignment` for the new
+    /// active segment alongside the `SealResponse`. If the assignment wins the race
+    /// (creating the successor empty first), the seal handoff must still carry the
+    /// old segment's staged tail onto that existing successor — not build a fresh
+    /// tracker that `insert_active` refuses, dropping the records (data loss) and
+    /// stranding `buffer_byte_count`. Regression for the age-seal stress flake.
+    #[test]
+    fn seal_handoff_carries_into_a_successor_already_created_by_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        // Produce — staged into the active segment, unflushed.
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        assert!(dp.has_buffered_data());
+
+        // The successor's SegmentAssignment wins the race: seg1 is created empty.
+        let successor = test_key().with_segment_id(SegmentId(1));
+        dp.handle_command(assign_segment(successor, vec![]));
+
+        // The SealResponse handoff arrives second. Pre-fix `insert_active` refuses
+        // (seg1 already active) → the staged produce is dropped and `buffer_byte_count`
+        // strands, tripping `assert_invariants` after the command.
+        dp.handle_command(seal_response(test_key(), SegmentId(1), vec![]));
+
+        // The staged produce was carried onto the pre-existing successor, not lost.
         assert!(dp.segments.get(&successor).unwrap().has_staged());
         assert!(dp.has_buffered_data());
     }

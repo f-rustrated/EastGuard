@@ -6,7 +6,7 @@ use crate::StartUp;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
     ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchRequest, NodeState,
-    ProduceRequest, RangeProgressSignal,
+    ProduceRequest, RangeProgressSignal, TopicDetail,
 };
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::{default_env, send_request};
@@ -574,6 +574,99 @@ fn produce_then_fetch_hot() -> turmoil::Result {
     sim.run()
 }
 
+/// Prerequisite for sealed-segment repair: the leader-initiated seal pipeline must
+/// commit a `RollSegment` end-to-end. Produce a few records, let the segment age
+/// out, and confirm the active segment rolls to a successor whose `start_offset`
+/// advanced past 0 — which only a *known-end* seal produces (an unknown-end roll
+/// opens the successor at 0). Without a known-end sealed segment there is nothing
+/// for repair to reassign, so this gates the repair e2e.
+#[test]
+#[serial_test::serial]
+fn age_seal_rolls_the_active_segment() -> turmoil::Result {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(180))
+        .tcp_capacity(4096)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+    ] {
+        sim.host(name, move || async move {
+            let me = turmoil::lookup(name);
+            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
+                .iter()
+                .filter(|(n, _)| *n != name)
+                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+                .collect();
+            let mut env = default_env(idx, name.to_string(), cp, rp);
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            // Force a fast age-based seal.
+            env.max_segment_age_secs = 5;
+            env.segment_age_check_interval_secs = 1;
+            StartUp::with_env(env, 0).run().await?;
+            Ok(())
+        });
+    }
+
+    sim.client("test-client", async {
+        const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        const TOPIC: &str = "age-seal";
+
+        wait_for_cluster(&NODES, 3).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        // Real committed data so the seal carries a meaningful known end.
+        let leader = produce_until_acked(TOPIC, b"rec-0", &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = format!("rec-{i}").into_bytes();
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked by {leader:?}");
+        }
+
+        // The segment ages past `max_segment_age_secs`; the leader enqueues a
+        // SealRequest, the coordinator commits a RollSegment, and the active
+        // segment rolls. Poll DescribeTopic until the successor's start_offset
+        // advances past 0 (the known-end seal landed).
+        let mut rolled_start = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail.ranges.first().and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                rolled_start = Some(seg.start_offset);
+                break;
+            }
+        }
+        assert!(
+            rolled_start.is_some(),
+            "active segment never rolled — the leader-initiated seal pipeline did not \
+             commit a RollSegment e2e (start_offset stayed 0)"
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
 // ── produce/fetch e2e helpers ──────────────────────────────────────────────
 
 /// Wait until every node sees `expected` alive members. Topic creation emits the
@@ -666,4 +759,26 @@ async fn produce_to(topic: &str, payload: &[u8], node: (&str, u16)) -> bool {
         send_request(node.0, node.1, req).await,
         ClientResponse::DataPlane(DataPlaneResponse::Produced { .. })
     )
+}
+
+/// Fetch a topic's metadata, following a `TopicMetadataRedirect` to the owner.
+async fn describe_topic(topic: &str, nodes: &[(&str, u16)]) -> Option<TopicDetail> {
+    let req =
+        ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic { name: topic.into() });
+    for &(host, port) in nodes {
+        match send_request(host, port, req.clone()).await {
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) => return Some(d),
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect { owner }) => {
+                if let Some(&(owner_host, owner_port)) =
+                    nodes.iter().find(|(n, _)| owner.node_id.starts_with(n))
+                    && let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) =
+                        send_request(owner_host, owner_port, req.clone()).await
+                {
+                    return Some(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
