@@ -2,9 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 
-use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::SegmentKey;
@@ -74,69 +72,92 @@ impl ColdReadPool {
     pub(crate) fn spawn(
         pool_size: usize,
         sparse_index: Arc<dyn SparseIndex>,
-    ) -> Sender<ColdReadRequest> {
-        let (tx, rx) = crossbeam_channel::bounded::<ColdReadRequest>(256);
+    ) -> flume::Sender<ColdReadRequest> {
+        let (tx, rx) = flume::bounded::<ColdReadRequest>(256);
 
-        for i in 0..pool_size {
+        for _ in 0..pool_size {
             let rx = rx.clone();
             let index = Arc::clone(&sparse_index);
-            thread::Builder::new()
-                .name(format!("cold-read-{i}"))
+
+            #[cfg(not(test))]
+            std::thread::Builder::new()
+                .name("cold-read".into())
                 .spawn(move || {
-                    Self::worker_loop(rx, &*index);
+                    while let Ok(req) = rx.recv() {
+                        Self::handle_request(req, &*index);
+                    }
                 })
                 .expect("failed to spawn cold-read thread");
+
+            // e2e (turmoil) spawns the pool from inside the sim runtime — run as a
+            // task so cold reads share the sim's cooperative scheduling. Sync
+            // state-machine tests have no runtime — fall back to a thread.
+            #[cfg(test)]
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    while let Ok(req) = rx.recv_async().await {
+                        Self::handle_request(req, &*index);
+                    }
+                });
+            } else {
+                std::thread::Builder::new()
+                    .name("cold-read".into())
+                    .spawn(move || {
+                        while let Ok(req) = rx.recv() {
+                            Self::handle_request(req, &*index);
+                        }
+                    })
+                    .expect("failed to spawn cold-read thread");
+            }
         }
 
         tx
     }
 
-    fn worker_loop(mailbox: Receiver<ColdReadRequest>, sparse_index: &dyn SparseIndex) {
-        while let Ok(req) = mailbox.recv() {
-            let result = Self::process_request(&req, sparse_index);
-            let ColdReadRequest {
-                segment_key, reply, ..
-            } = req;
+    fn handle_request(req: ColdReadRequest, sparse_index: &dyn SparseIndex) {
+        let result = Self::process_request(&req, sparse_index);
+        let ColdReadRequest {
+            segment_key, reply, ..
+        } = req;
 
-            match result {
-                Ok(records) => match reply {
-                    ColdReadReply::Consumer {
-                        reply,
+        match result {
+            Ok(records) => match reply {
+                ColdReadReply::Consumer {
+                    reply,
+                    progress_signal,
+                } => {
+                    let _ = reply.send(FetchResult::Records {
+                        entries: records.entries,
+                        next_entry_id: records.next_offset,
                         progress_signal,
-                    } => {
-                        let _ = reply.send(FetchResult::Records {
-                            entries: records.entries,
-                            next_entry_id: records.next_offset,
-                            progress_signal,
-                        });
-                    }
-                    ColdReadReply::CatchUp(cu) => {
-                        let done = CatchUpReadComplete {
-                            requester: cu.requester,
-                            segment_key,
-                            start_offset: cu.start_offset,
-                            sealed_end: cu.sealed_end,
-                            entries: records.entries,
-                            next_offset: records.next_offset,
-                        };
+                    });
+                }
+                ColdReadReply::CatchUp(cu) => {
+                    let done = CatchUpReadComplete {
+                        requester: cu.requester,
+                        segment_key,
+                        start_offset: cu.start_offset,
+                        sealed_end: cu.sealed_end,
+                        entries: records.entries,
+                        next_offset: records.next_offset,
+                    };
 
-                        let _ = cu.mailbox.send(done);
-                    }
-                },
+                    let _ = cu.mailbox.send(done);
+                }
+            },
 
-                Err(e) => match reply {
-                    ColdReadReply::Consumer { reply, .. } => {
-                        tracing::warn!("cold read failed for {segment_key:?}: {e}");
-                        let err_msg = format!("cold read failed: {e}");
-                        let _ = reply.send(FetchResult::InternalError(err_msg));
-                    }
-                    ColdReadReply::CatchUp(_) => {
-                        // Source-side read failed; nothing durable changed. The
-                        // replacement times out and the coordinator re-drives, so just drop with a log.
-                        tracing::warn!("catch-up source read failed for {segment_key:?}: {e}");
-                    }
-                },
-            }
+            Err(e) => match reply {
+                ColdReadReply::Consumer { reply, .. } => {
+                    tracing::warn!("cold read failed for {segment_key:?}: {e}");
+                    let err_msg = format!("cold read failed: {e}");
+                    let _ = reply.send(FetchResult::InternalError(err_msg));
+                }
+                ColdReadReply::CatchUp(_) => {
+                    // Source-side read failed; nothing durable changed. The
+                    // replacement times out and the coordinator re-drives, so just drop with a log.
+                    tracing::warn!("catch-up source read failed for {segment_key:?}: {e}");
+                }
+            },
         }
     }
 

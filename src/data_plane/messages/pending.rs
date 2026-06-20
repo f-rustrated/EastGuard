@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use flume::Sender;
 use tokio::sync::oneshot;
 
 use crate::channels::BatchSender;
@@ -51,7 +51,7 @@ impl DataPlaneOutputs {
         }
     }
 
-    pub(crate) fn flush(&mut self) {
+    pub(crate) async fn flush(&mut self) {
         for cmd in self.coordinator_cmds.drain(..) {
             let _ = self.coordinator_tx.try_send(cmd);
         }
@@ -64,7 +64,8 @@ impl DataPlaneOutputs {
             let _ = self.checkpoint_tx.send(checkpoint_tasks.into_boxed_slice());
         }
         self.batch_scheduler
-            .blocking_send_batch(self.batch_timer_cmds.drain(..).collect());
+            .send_timer_batch(self.batch_timer_cmds.drain(..).collect())
+            .await;
 
         let repl_cmds: Box<[TimerCommand<ReplicationTimer>]> = self
             .repl_schedules
@@ -72,9 +73,10 @@ impl DataPlaneOutputs {
             .map(|(seq, timer)| TimerCommand::SetSchedule { seq, timer })
             .collect();
 
-        self.repl_scheduler.blocking_send_batch(repl_cmds);
+        self.repl_scheduler.send_timer_batch(repl_cmds).await;
         self.transport_tx
-            .blocking_send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice());
+            .send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice())
+            .await;
     }
 
     pub(crate) fn store_transport_cmd(&mut self, cmd: impl Into<DataTransportCommand>) {
@@ -100,7 +102,7 @@ impl DataPlaneOutputs {
     #[cfg(test)]
     pub(crate) fn test() -> Self {
         use crate::control_plane::consensus::actor::MultiRaftActor;
-        let (checkpoint_tx, _) = crossbeam_channel::bounded(1);
+        let (checkpoint_tx, _) = flume::bounded(1);
         let (batch_tx, _) = tokio::sync::mpsc::channel(1);
         let (repl_tx, _) = tokio::sync::mpsc::channel(1);
         let (transport_tx, _) = tokio::sync::mpsc::channel(1);

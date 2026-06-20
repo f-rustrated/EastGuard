@@ -9,12 +9,6 @@ impl<T> BatchSender<T> {
             let _ = self.0.send(cmds).await;
         }
     }
-
-    pub(crate) fn blocking_send_batch(&self, cmds: Box<[T]>) {
-        if !cmds.is_empty() {
-            let _ = self.0.blocking_send(cmds);
-        }
-    }
 }
 
 impl<T> From<mpsc::Sender<Box<[T]>>> for BatchSender<T> {

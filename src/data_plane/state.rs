@@ -75,7 +75,7 @@ pub struct DataPlane<W: WalStorage> {
     /// sealed segment (whose live tracker is gone) is forwarded here; the pool
     /// reads the segment file and fulfils the consumer's reply directly, so this
     /// synchronous worker never blocks on disk I/O.
-    cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+    cold_read_handoff_sender: flume::Sender<ColdReadRequest>,
     self_tx: DataPlaneSender,
     out: DataPlaneOutputs,
 
@@ -90,7 +90,7 @@ impl<W: WalStorage> DataPlane<W> {
         node_id: NodeId,
         config: DataNodeConfig,
         wal: W,
-        cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+        cold_read_handoff_sender: flume::Sender<ColdReadRequest>,
         self_tx: DataPlaneSender,
         out: DataPlaneOutputs,
         recovered: LocalInventory,
@@ -149,12 +149,12 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    pub(crate) fn flush_and_dispatch(&mut self) {
+    pub(crate) async fn flush_and_dispatch(&mut self) {
         if self.should_flush() {
             self.flush_batch();
         }
         self.enqueue_timed_out_seal_retries();
-        self.out.flush();
+        self.out.flush().await;
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -286,7 +286,7 @@ impl<W: WalStorage> DataPlane<W> {
                 progress_signal: cmd.progress_signal,
             },
         };
-        if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req)
+        if let Err(flume::SendError(req)) = self.cold_read_handoff_sender.send(req)
             && let ColdReadReply::Consumer { reply, .. } = req.reply
         {
             let _ = reply.send(FetchResult::InternalError(
@@ -975,7 +975,7 @@ impl<W: WalStorage> DataPlane<W> {
                 .into(),
             });
         self.pending_seal_requests
-            .track(segment_key, failed_nodes, std::time::Instant::now());
+            .track(segment_key, failed_nodes, tokio::time::Instant::now());
     }
 
     fn enqueue_seal_request(&mut self, segment_key: SegmentKey) {
@@ -1000,7 +1000,7 @@ impl<W: WalStorage> DataPlane<W> {
                 .into(),
             });
         self.pending_seal_requests
-            .track(segment_key, vec![], std::time::Instant::now());
+            .track(segment_key, vec![], tokio::time::Instant::now());
     }
 
     fn should_flush(&self) -> bool {
@@ -1128,9 +1128,10 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn enqueue_timed_out_seal_retries(&mut self) {
-        let due = self
-            .pending_seal_requests
-            .take_due(std::time::Instant::now(), self.config.seal_request_timeout);
+        let due = self.pending_seal_requests.take_due(
+            tokio::time::Instant::now(),
+            self.config.seal_request_timeout,
+        );
         for (segment_key, failed_nodes) in due {
             let Some(tracker) = self.segments.get(&segment_key) else {
                 continue;
@@ -1247,9 +1248,9 @@ mod tests {
         let out = DataPlaneOutputs::test();
         // Tests don't exercise the cold-read path; an unbounded sink channel
         // whose receiver we leak keeps any dispatched request from panicking.
-        let (cold_read_tx, _cold_read_rx) = crossbeam_channel::unbounded();
+        let (cold_read_tx, _cold_read_rx) = flume::unbounded();
         std::mem::forget(_cold_read_rx);
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         DataPlane::new(
             test_node_id(),
@@ -2221,7 +2222,7 @@ mod tests {
         let cold_read_tx = ColdReadPool::spawn(DEFAULT_POOL_SIZE, Arc::clone(&sparse));
 
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
@@ -2325,13 +2326,10 @@ mod tests {
     /// catch-up source resolving its own committed bounds.
     fn source_with_sealed_segment(
         dir: &tempfile::TempDir,
-    ) -> (
-        DataPlane<WalWriter>,
-        crossbeam_channel::Receiver<ColdReadRequest>,
-    ) {
+    ) -> (DataPlane<WalWriter>, flume::Receiver<ColdReadRequest>) {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (cold_read_tx, cold_read_rx) = flume::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
@@ -2496,8 +2494,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (cold_read_tx, cold_read_rx) = flume::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),

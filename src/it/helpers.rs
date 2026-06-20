@@ -23,6 +23,7 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
             .to_string_lossy()
             .into_owned(),
         node_id_prefix: Some(node_id),
+        node_id_suffix: None,
         client_port,
         cluster_port,
         host: "0.0.0.0".into(),

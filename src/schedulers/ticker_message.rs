@@ -33,9 +33,10 @@ impl<T> SchedulerSender<T> {
         self.0.send_batch(cmds).await;
     }
 
-    pub(crate) fn blocking_send_batch(&self, cmds: Box<[TimerCommand<T>]>) {
+    pub(crate) async fn send_timer_batch(&self, cmds: Box<[TimerCommand<T>]>) {
         self.0
-            .blocking_send_batch(cmds.into_iter().map(Into::into).collect());
+            .send_batch(cmds.into_iter().map(Into::into).collect())
+            .await;
     }
 
     #[cfg(test)]

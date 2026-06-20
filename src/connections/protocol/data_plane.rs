@@ -25,6 +25,7 @@ use crate::{
 pub enum ClientDataPlaneRequest {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
+    FetchById(FetchByIdRequest),
     ListOffsets(ListOffsetsRequest),
 }
 
@@ -32,6 +33,7 @@ impl_from_variant!(
     ClientDataPlaneRequest,
     Produce(ProduceRequest),
     Fetch(FetchRequest),
+    FetchById(FetchByIdRequest),
     ListOffsets(ListOffsetsRequest),
 );
 
@@ -58,6 +60,18 @@ pub struct FetchRequest {
     /// A future consumer-group layer will enable server-side narrowing without a
     /// wire-format break. See d4_consumer_range_tracking.md.
     pub keyspace_bound: Option<KeyspaceBound>,
+}
+
+/// Consumer fetch addressed by resolved `topic_id` (from a prior `DescribeTopic`)
+/// rather than by name. Lets any replica holding the segment serve it without
+/// resolving the topic name — i.e. without being a metadata peer. The client owns
+/// resolution; the server never proxies.
+#[derive(Clone, Encode, Decode)]
+pub struct FetchByIdRequest {
+    pub topic_id: u64,
+    pub range_id: u64,
+    pub entry_id: u64,
+    pub max_bytes: u32,
 }
 
 #[derive(Clone, Encode, Decode)]

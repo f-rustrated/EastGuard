@@ -6,7 +6,12 @@
 //! plane (it reads the live tracker's committed end).
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// tokio's runtime-aware Instant: real time in prod, virtualized under turmoil so
+// the retry timeout fires on the sim clock (the data-plane worker runs on a tokio
+// runtime in both — see CLAUDE.md "Testing"). Falls back to real time with no
+// runtime, so the sync tests below still work.
+use tokio::time::Instant;
 
 use crate::control_plane::NodeId;
 use crate::data_plane::SegmentKey;
@@ -30,8 +35,13 @@ impl PendingSealRequests {
 
     /// Record a just-sent request.
     pub(crate) fn track(&mut self, key: SegmentKey, failed_nodes: Vec<NodeId>, now: Instant) {
-        self.requests
-            .insert(key, PendingSealRequest { sent_at: now, failed_nodes });
+        self.requests.insert(
+            key,
+            PendingSealRequest {
+                sent_at: now,
+                failed_nodes,
+            },
+        );
     }
 
     /// Drop a request once its `SealResponse` lands.

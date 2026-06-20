@@ -118,7 +118,7 @@ impl StartUp {
             topology_pub,
         );
 
-        let (checkpoint_tx, checkpoint_rx) = crossbeam_channel::bounded(64);
+        let (checkpoint_tx, checkpoint_rx) = flume::bounded(64);
         let data_plane_tx = DataPlaneActor::spawn(
             node_id.clone(),
             data_config,

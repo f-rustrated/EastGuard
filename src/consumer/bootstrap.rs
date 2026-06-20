@@ -133,6 +133,7 @@ mod tests {
 
     fn topic(ranges: Vec<RangeDetail>) -> TopicDetail {
         TopicDetail {
+            topic_id: 0,
             name: "t".into(),
             state: TopicState::Active,
             ranges: ranges.into_boxed_slice(),

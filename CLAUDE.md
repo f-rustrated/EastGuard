@@ -86,3 +86,17 @@ When adding or modifying a state-changing method on any state machine:
 This makes every existing and future test an invariant test automatically — no separate invariant tests needed.
 
 If a code change introduces a new invariant (or modifies an existing one), **always ask the user for confirmation before proceeding** — regardless of the permission mode (auto, plan, default, etc.). Invariants are system-level contracts; adding or changing one affects every test and every future contributor.
+
+## Testing: the data plane under turmoil
+
+turmoil runs SWIM + DS-RSM as cooperative tasks on **one thread under a virtual clock it controls** — the basis of deterministic e2e. In **production** the data plane runs on its **own OS thread** (`DataPlaneActor` → `thread::Builder` + a dedicated current-thread runtime; likewise the cold-read pool and checkpoint worker), doing blocking I/O (WAL/fsync). A real OS thread runs in real wall-time outside turmoil's clock + scheduling — so e2e assertions on its effects would race the virtual clock (the sim fast-forwards virtual time while the real thread still needs real seconds).
+
+So **in `#[cfg(test)]` builds the data-plane workers run as tasks on turmoil's runtime** — the spawn is `#[cfg]`'d (prod = OS thread + own runtime; test = `tokio::spawn`) — sharing the sim's virtual clock and cooperative scheduling, which makes their effects deterministic. Requirements:
+
+1. **Async dispatch, never `blocking_send`.** tokio's `blocking_send` panics inside a runtime, so the worker's flush awaits (`send_batch` / `send_timer_batch`). The worker mailbox is `flume` — sync `recv()` on the prod thread, `recv_async()` on the test task (one channel type).
+2. **Every real OS thread in the tested path gets the same `#[cfg]` treatment.** The data-plane worker and the cold-read pool (serves cold/sealed fetches *and* the catch-up source read) both run as tasks under test; a leftover real thread reintroduces the race.
+3. **turmoil virtualizes `tokio::time`, NOT `std::time`.** A data-plane timer that must be deterministic uses `tokio::time::Instant` (virtualized on the sim runtime; the seal-retry timeout does). `std::time` stays real wall-time even on the sim runtime — segment `created_at` still uses it — so **drive tests by size-based seal (`size_bytes >= limit`, checked on commit) and event-driven catch-up, never by age** (`created_at.elapsed()` is real-time).
+4. Data-plane *logic* is also covered by synchronous `DataPlane` state-machine tests (`src/data_plane/state.rs`) — no clock, no threads, fully deterministic.
+5. **A multi-node e2e must pin every nondeterministic input** or the sim isn't reproducible: the turmoil RNG (`Builder::rng_seed` — randomly seeded by default), node ids (`node_id_suffix` — the default is `{prefix}::{Uuid::new_v4()}`, OS-random, which shuffles the hash ring), and keep **`vnodes_per_node` low** (e.g. 16). At 256 the ~1000 Raft groups pressure SWIM's one-shot shard-leader gossip, so the seal's coordinator can stay `MAP-EMPTY` — and whether it does turns on per-process `HashMap` order (Rust's `RandomState` is process-random and can't be pinned, so keep order-dependent logic out of the asserted path). `sealed_segment_repair_catches_up_the_spare` is the worked example.
+
+Also: `crate::net` is `turmoil::net` under `#[cfg(test)]`, so an in-binary `#[tokio::test]` gets simulated sockets — a real-socket harness would need `tests/` (lib links non-test → real `tokio::net`).

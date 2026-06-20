@@ -107,10 +107,8 @@ mod tests {
             let path = entry.expect("dir entry failed").path();
             if path.extension().is_some_and(|e| e == "json") {
                 let json = std::fs::read_to_string(&path).expect("read json failed");
-                let scenario: SimScenario =
-                    serde_json::from_str(&json).expect("parse json failed");
-                run_for_scenario(&scenario)
-                    .unwrap_or_else(|e| panic!("{path:?} regressed: {e}"));
+                let scenario: SimScenario = serde_json::from_str(&json).expect("parse json failed");
+                run_for_scenario(&scenario).unwrap_or_else(|e| panic!("{path:?} regressed: {e}"));
             }
         }
     }

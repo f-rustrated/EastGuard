@@ -8,7 +8,7 @@ use crate::control_plane::{
     consensus::actor::MutlRaftSender,
     membership::{ShardGroupId, actor::SwimSender},
     metadata::{
-        RangeId,
+        RangeId, TopicId,
         command::{CreateTopic, DeleteTopic, MetadataCommand},
         strategy::StoragePolicy,
     },
@@ -236,6 +236,7 @@ impl ClientController {
         let res = match request {
             ClientDataPlaneRequest::Produce(req) => self.handle_produce(req).await,
             ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
+            ClientDataPlaneRequest::FetchById(req) => self.handle_fetch_by_id(req).await,
             ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
         };
         match res {
@@ -308,6 +309,32 @@ impl ClientController {
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             progress_signal,
+            reply: reply_tx,
+        });
+        if self.data_plane_tx.send(query).is_err() {
+            return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
+        }
+        let result = reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("data plane dropped reply"))?;
+        Ok(DataPlaneResponse::from_fetch_result(result).into())
+    }
+
+    /// Consume read path addressed by resolved `topic_id` (the client resolved the
+    /// name via `DescribeTopic`). Serves straight from this node's local segment
+    /// store, so a replica that holds the segment but isn't a metadata peer can
+    /// serve it. No proxying: a miss returns `SegmentNotLocal` and the client
+    /// retries another replica.
+    async fn handle_fetch_by_id(&self, req: FetchByIdRequest) -> anyhow::Result<ClientResponse> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let query = DataPlaneQuery::Fetch(Fetch {
+            topic_id: TopicId(req.topic_id),
+            range_id: RangeId(req.range_id),
+            entry_id: req.entry_id,
+            max_bytes: req.max_bytes,
+            // The by-id consumer already has the range lineage from DescribeTopic,
+            // so the response's progress signal isn't authoritative here.
+            progress_signal: RangeProgressSignal::Active,
             reply: reply_tx,
         });
         if self.data_plane_tx.send(query).is_err() {
@@ -509,7 +536,7 @@ mod tests {
     /// data plane path, so a dropped-receiver channel is fine — sends would
     /// fail, but the tested code paths never send.
     fn dp_stub() -> DataPlaneSender {
-        let (tx, _) = crossbeam_channel::bounded(1);
+        let (tx, _) = flume::bounded(1);
         DataPlaneSender(tx)
     }
 
