@@ -722,12 +722,10 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
             // (the default UUID is OS-random, which turmoil can't seed). This test
             // never restarts a node, so a fixed id is safe. See CLAUDE.md "Testing".
             env.node_id_suffix = Some("sim".to_string());
-            // Few vnodes → few Raft groups (~64 not ~1000), so SWIM has little
-            // shard-leader gossip to disseminate and the seal coordinator resolves
-            // reliably. At 256 the one-shot shard-leader announce can be evicted
-            // under gossip pressure before reaching a node (MAP-EMPTY) — a #135-class
-            // gap whose timing varies with per-process HashMap order. This test
-            // exercises repair, not gossip-under-load. See CLAUDE.md "Testing".
+            // Low vnodes → few Raft groups → fast sim. This is a *speed* choice: the
+            // #135 MAP-EMPTY gossip gap that once forced it is fixed by the data-plane
+            // topology fallback (the coordinator-crash test runs at 256 to guard that),
+            // so it's no longer a correctness workaround. See CLAUDE.md "Testing".
             env.vnodes_per_node = 16;
             // Seal by SIZE, not age: the size check is a pure byte-count on commit
             // (deterministic), whereas age uses real wall-clock (`std::time::Instant`),
@@ -918,6 +916,8 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
             env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = seeds;
             env.node_id_suffix = Some("sim".to_string());
+            // Low vnodes for sim speed; #135 MAP-EMPTY is fixed (topology fallback) —
+            // the coordinator-crash test runs at 256 to guard the fix.
             env.vnodes_per_node = 16;
             // Huge size limit so one ~1 KiB record never rolls: the segment must stay
             // *active* at kill time, so the only thing that can seal it is the
@@ -1120,7 +1120,13 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
             env.advertise_host = Some(me.to_string());
             env.join_seed_nodes = seeds;
             env.node_id_suffix = Some("sim".to_string());
-            env.vnodes_per_node = 16;
+            // Realistic scale (256 vnodes ⇒ ~1000 groups): deliberately exercises the
+            // gossip pressure that exposed #135 — the one-shot shard-leader announce
+            // gets evicted before reaching every node → MAP-EMPTY → coordinator
+            // unresolvable. The data-plane topology fallback recovers resolution from
+            // MAP-EMPTY (broadcast to the ring's members), so the repair still completes
+            // at scale. This test guards that fix — and the learner model — end to end.
+            env.vnodes_per_node = 256;
             env.segment_size_limit_bytes = 2048;
             StartUp::with_env(env, 0).run().await?;
             Ok(())

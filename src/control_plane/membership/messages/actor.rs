@@ -1,5 +1,5 @@
+use crate::control_plane::membership::ShardGroup;
 use crate::control_plane::membership::topology::ShardLeaderEntry;
-use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::{NodeAddress, NodeId, SwimNode};
 
 use super::command::{SwimCommand, SwimTimeOutCallback};
@@ -27,10 +27,6 @@ pub enum QueryCommand {
     GetShardInfo {
         key: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Option<(ShardGroup, Option<ShardLeaderEntry>)>>,
-    },
-    ResolveShardLeader {
-        shard_group_id: ShardGroupId,
-        reply: tokio::sync::oneshot::Sender<Option<ShardLeaderEntry>>,
     },
 }
 

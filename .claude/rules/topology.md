@@ -28,6 +28,6 @@ Topology
 
 6. **Shard leader map is term-monotonic.** An update is accepted only if its term is strictly higher than the existing entry. Equal or lower terms rejected. Prevents a deposed leader from re-installing itself via stale gossip.
 
-7. **Leader map entries persist until overwritten.** A node's death does not clear its leader entries; they're only replaced by a higher-term claim from a re-election. Avoids a window where "no leader is known" — clients would fail to route during the gap.
+7. **Leader map entries persist until overwritten.** A node's death does not clear its leader entries; they're only replaced by a higher-term claim from a re-election. Avoids a window where "no leader is known" — clients would fail to route during the gap. The map is a **cache, not the source of truth**: shard-leader entries arrive via one-shot epidemic gossip and can be missed under load (a node never receives the announce → `MAP-EMPTY` for that group, #135). So coordinator resolution treats a miss as recoverable — the data-plane `SendToCoordinator` falls back to the **ring's group members** (always available locally) and broadcasts to them; the Raft leader acts, followers no-op. The ring is the durable membership; the leader map only accelerates the common case.
 
 8. **Suspect does not mutate the ring.** Only `Alive` (insert) and `Dead` (remove) change topology. Suspect leaves the node in place — the node may refute. Otherwise topology would churn on every flap.

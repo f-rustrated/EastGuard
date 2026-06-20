@@ -118,6 +118,12 @@ impl TopologyReader {
             .map(|g| g.members.clone().into_boxed_slice())
     }
 
+    /// The current shard-leader entry for `group_id` from the lock-free snapshot, or
+    /// `None` if the gossiped map has no entry yet (the caller falls back to the ring).
+    pub(crate) fn shard_leader(&self, group_id: ShardGroupId) -> Option<ShardLeaderEntry> {
+        self.0.load().shard_leader(group_id).cloned()
+    }
+
     pub(crate) fn ring_replacements_for(
         &self,
         group_id: ShardGroupId,

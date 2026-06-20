@@ -203,19 +203,6 @@ impl SwimSender {
         Ok(None)
     }
 
-    pub(crate) async fn resolve_shard_leader(
-        &self,
-        shard_group_id: ShardGroupId,
-    ) -> anyhow::Result<Option<ShardLeaderEntry>> {
-        let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(QueryCommand::ResolveShardLeader {
-            shard_group_id,
-            reply: send,
-        })
-        .await?;
-        Ok(recv.await?)
-    }
-
     pub(crate) async fn list_all_node_addresses(
         &self,
     ) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
