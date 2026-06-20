@@ -21,6 +21,20 @@ pub enum DataPlaneCommand {
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
     /// source read. The worker turns it into `CatchUpChunk`s on the transport.
     CatchUpReadComplete(CatchUpReadComplete),
+    OrphanGcCheck(OrphanGcCheck),
+}
+
+/// What the orphan-GC handler replies to the ticker: keep ticking while strays remain, or
+/// stop once `recovered` is drained.
+pub enum OrphanGcSignal {
+    KeepTicking,
+    Stop,
+}
+
+/// The ticker's periodic prompt, carrying the mpsc sender (back to the ticker) the handler
+/// replies on. Internal — never serialized.
+pub struct OrphanGcCheck {
+    pub reply: tokio::sync::mpsc::Sender<OrphanGcSignal>,
 }
 
 pub struct Produce {
@@ -256,6 +270,7 @@ impl_from_variant!(
     Produce,
     CheckpointComplete,
     CatchUpReadComplete,
+    OrphanGcCheck,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );

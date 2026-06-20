@@ -57,6 +57,15 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+# Two replica sets (don't conflate)
+
+EastGuard has two distinct "replica sets", chosen by different mechanisms and **decoupled** — they drift apart and must not be confused:
+
+- **Raft replica set** — a shard group's *consensus peers* (`Raft::peers`: voters + learners). Who replicates the group's *metadata log*. Changes via committed `AddPeer`/`RemovePeer` (see `raft.md`).
+- **Data replica set** — a *segment's* `replica_set` (`SegmentMeta.replica_set`). Where the segment *bytes* live. Changes via committed `RollSegment`/`ReassignSegment`, decided by the owning Raft group's leader (see `metadata-state-machine.md`, `raft-actor.md`).
+
+A node can be in one without the other. "Is node N a data replica of segment S?" is answered only by S's owning Raft group's committed `replica_set` — **never** by whether N hosts that group or is one of its Raft peers. A node that holds S's bytes on disk but isn't in S's data replica set is a stray, regardless of its Raft membership.
+
 # Code Quality
 
 ## Clippy

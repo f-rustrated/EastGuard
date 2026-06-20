@@ -1,6 +1,7 @@
 use bincode::{Decode, Encode};
 
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::ReassignSegment;
 use crate::control_plane::metadata::command::{
     CreateTopic, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
 };
@@ -26,5 +27,6 @@ impl_from_variant_via!(
     RollSegment,
     SplitRange,
     MergeRange,
-    DeleteTopic
+    DeleteTopic,
+    ReassignSegment
 );

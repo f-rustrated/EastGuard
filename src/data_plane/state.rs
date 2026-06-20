@@ -7,6 +7,7 @@ use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult};
 use super::recovery::inventory::LocalInventory;
+use super::recovery::orphan::OrphanCandidate;
 use super::recovery::segment_scan::scan_segment_file;
 use super::segment_writer::SegmentAppender;
 use super::sparse_index::SparseEntry;
@@ -38,6 +39,10 @@ const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Re-drives without an append before the receiver treats a receive as stalled
 /// and re-requests from a fresh source. A grace window for slow transfers.
 const CATCH_UP_IDLE_REDRIVES: u32 = 2;
+
+/// Max stray files deleted per orphan-GC sweep — a large backlog drains over several
+/// sweeps, not one burst.
+const ORPHAN_GC_BATCH: usize = 64;
 
 /// An in-progress catch-up receive (replacement side): the open segment-file
 /// appender, the sealed bounds being filled toward, and the sparse anchors
@@ -136,6 +141,7 @@ impl<W: WalStorage> DataPlane<W> {
             DataPlaneCommand::CatchUpReadComplete(cmd) => {
                 self.handle_catch_up_read_complete(cmd);
             }
+            DataPlaneCommand::OrphanGcCheck(check) => self.handle_orphan_gc_check(check),
         }
 
         #[cfg(any(test, debug_assertions))]
@@ -342,6 +348,43 @@ impl<W: WalStorage> DataPlane<W> {
                 self.enqueue_seal_for_aged_segments(self.config.max_segment_age);
             }
         }
+    }
+
+    /// Handle the orphan-GC ticker's prompt: sweep, then tell the ticker whether to keep
+    /// going. The ticker stops once we report `Stop` (nothing left to reclaim), so it goes
+    /// quiet when the work is done — recovery fills `recovered` once; it only shrinks.
+    fn handle_orphan_gc_check(&mut self, check: OrphanGcCheck) {
+        // Reclaim recovered segments the cluster never made this node a data replica of.
+        //
+        // we classify each recovered segment by how the owning group's decision shows up locally:
+        // - registered (`sealed_bounds`) → reused via catch-up, the lottery → keep, prune;
+        // - mid-catch-up (`pending_catch_ups`) → about to register → skip, don't race it;
+        // - neither → never assigned here → stray → delete, prune.
+        //
+        // Deletes are bounded per sweep; a large backlog drains over several.
+        let mut deletes = 0usize;
+        for (key, start_offset) in self.recovered.orphan_candidates().collect::<Vec<_>>() {
+            if self.segments.sealed_bounds(&key).is_some() {
+                self.recovered.remove(&key); // reused (lottery won) → live, no longer an orphan
+            } else if self.pending_catch_ups.contains_key(&key) {
+                continue; // catch-up in flight → it will register; don't delete under it
+            } else if deletes < ORPHAN_GC_BATCH
+                && OrphanCandidate::new(key, start_offset)
+                    .delete(&self.config.data_dir)
+                    .inspect_err(|e| tracing::warn!("orphan GC: deleting {key:?} failed: {e}"))
+                    .is_ok()
+            {
+                self.recovered.remove(&key);
+                deletes += 1;
+            }
+        }
+
+        let signal = if self.recovered.is_empty() {
+            OrphanGcSignal::Stop
+        } else {
+            OrphanGcSignal::KeepTicking
+        };
+        let _ = check.reply.try_send(signal);
     }
 
     fn process_inter_node(&mut self, cmd: DataPlaneInterNodeCommand) {
@@ -1226,6 +1269,7 @@ mod tests {
             segment_size_limit: 1024 * 1024 * 1024,
             batch_max_bytes: TEST_BATCH_MAX_BYTES,
             seal_request_timeout: std::time::Duration::from_secs(5),
+            orphan_gc_interval: std::time::Duration::from_secs(300),
             data_dir: dir,
         }
     }
@@ -2730,6 +2774,100 @@ mod tests {
         ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
         assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
+    }
+
+    #[test]
+    fn orphan_gc_deletes_strays_and_keeps_reused() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        let dir = tempfile::tempdir().unwrap();
+
+        let stray = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        let reused = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
+
+        // Recovery found both on disk (start_offset 0, verified through 0).
+        let mut recovered = RecoveredSegments::default();
+        recovered.advance(stray, 0);
+        recovered.advance(reused, 0);
+        let mut dp = make_data_plane_with(&dir, LocalInventory::from_recovered(&recovered));
+
+        let stray_path = stray.file_path(dir.path(), 0);
+        let reused_path = reused.file_path(dir.path(), 0);
+        write_seg_file(&stray_path, &[(b"x", 1)]);
+        write_seg_file(&reused_path, &[(b"y", 1)]);
+
+        // The owning group reassigned `reused` here and its catch-up registered it (the
+        // lottery won) — now a live sealed segment. `stray` was never assigned here.
+        dp.segments.insert_sealed_from_catch_up(reused, 0, 0);
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        dp.handle_orphan_gc_check(OrphanGcCheck { reply: reply_tx });
+
+        // Stray: not a data replica → file reclaimed, dropped from the inventory.
+        assert!(!stray_path.exists(), "stray segment file must be deleted");
+        assert_eq!(
+            dp.recovered.get(&stray),
+            None,
+            "stray pruned from inventory"
+        );
+
+        // Reused: registered → file kept, and dropped from the inventory (no longer an orphan).
+        assert!(reused_path.exists(), "reused segment file must be kept");
+        assert!(
+            dp.segments.sealed_bounds(&reused).is_some(),
+            "reused stays registered"
+        );
+        assert_eq!(
+            dp.recovered.get(&reused),
+            None,
+            "reused pruned from inventory"
+        );
+
+        // recovered is drained → the handler tells the ticker to stop (self-terminating).
+        assert!(
+            matches!(reply_rx.try_recv(), Ok(OrphanGcSignal::Stop)),
+            "ticker told to stop once every orphan is resolved"
+        );
+    }
+
+    #[test]
+    fn orphan_gc_skips_a_segment_with_an_in_flight_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        // A partial local copy + matching cursor → a real in-flight (delta) catch-up.
+        let path = test_key().file_path(dir.path(), 0);
+        write_seg_file(&path, &[(b"a", 1), (b"b", 1)]);
+        let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
+                start_entry_id: 0,
+                sealed_end_entry_id: 4,
+                replica_set: vec![test_node_id(), NodeId::new("source")],
+            }
+            .into(),
+        ));
+        assert!(
+            dp.pending_catch_ups.contains_key(&test_key()),
+            "catch-up must be in flight"
+        );
+
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        dp.handle_orphan_gc_check(OrphanGcCheck { reply: reply_tx });
+
+        // The sweep must not delete out from under an in-flight catch-up — that catch-up
+        // is the group reassigning the segment here; let it register.
+        assert!(
+            path.exists(),
+            "file must survive while its catch-up is in flight"
+        );
+        assert_eq!(dp.recovered.get(&test_key()), Some(1), "kept in inventory");
+
+        // an orphan still pending → the handler tells the ticker to keep going.
+        assert!(
+            matches!(reply_rx.try_recv(), Ok(OrphanGcSignal::KeepTicking)),
+            "ticker told to keep going while an orphan is pending"
+        );
     }
 
     /// Partial match: a local prefix on disk (entries 0..=1) means the receiver

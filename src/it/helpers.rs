@@ -40,6 +40,9 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
         segment_size_limit_bytes: 1024 * 1024 * 1024,
         batch_max_bytes: 10 * 1024 * 1024,
         seal_request_timeout_secs: 5,
+        // Short in tests so the orphan-GC sweep actually fires within a sim run; still
+        // comfortably longer than re-fill + catch-up, so the lottery completes first.
+        orphan_gc_interval_secs: 60,
     }
 }
 
@@ -129,6 +132,25 @@ pub async fn check_dead_or_not_exist(host: &str, port: u16, target: &str) -> boo
 /// `send_request` has no other escape, since the data plane can legitimately
 /// park a reply until commit.
 const SEND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Best-effort request: `None` on any failure (connect refused, timeout, I/O), with a
+/// short timeout — for polling a node that may be down (e.g. mid-bounce/restart) without
+/// `send_request`'s 30s panic-timeout stalling on a crashed host.
+pub async fn try_send_request(host: &str, port: u16, req: ClientRequest) -> Option<ClientResponse> {
+    let exchange = async {
+        let stream = TcpStream::connect((host, port)).await.ok()?;
+        let (read_half, write_half) = stream.into_split();
+        let mut writer = ClientRawWriter::new(write_half);
+        let mut reader = ClientStreamReader::new(read_half);
+        writer.write(0, &req).await.ok()?;
+        let (_, response) = reader.read_request().await.ok()?;
+        Some(response)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), exchange)
+        .await
+        .ok()
+        .flatten()
+}
 
 pub async fn send_request(host: &str, port: u16, req: ClientRequest) -> ClientResponse {
     let exchange = async {

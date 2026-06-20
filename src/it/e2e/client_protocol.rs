@@ -9,7 +9,7 @@ use crate::connections::protocol::{
     NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
 };
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
-use crate::it::helpers::{default_env, send_request};
+use crate::it::helpers::{default_env, send_request, try_send_request};
 use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
 
 /// CreateTopic eventually succeeds when tried across all nodes (exactly one is the leader),
@@ -1492,6 +1492,195 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
         sim.elapsed().as_secs()
     );
     sim.crash(victim_node);
+
+    sim.run()
+}
+
+/// End-to-end recovery lottery (D5). A node holding a sealed segment is hard-killed and
+/// restarted with the **same data dir** but a **fresh NodeId** (SWIM's rejoin model).
+/// On restart it recovers the segment from disk into its inventory — an orphan candidate
+/// (no replica set names the fresh id). Then, because the cluster is back to 3 live
+/// identities at RF=3, the coordinator reassigns the segment to the restarted node, whose
+/// catch-up is a **zero-transfer full match** against the recovered inventory
+/// (`catch_up_full_match_registers_without_transfer`). The node then serves the old data.
+/// This is "the recovery payoff is observable only as a zero-transfer catch-up": the
+/// restarted node's on-disk copy is *reused* rather than re-downloaded, and orphan GC's
+/// confirmation-typed deletion (`recovery::orphan`) spares it because it is, by delete
+/// time, named again. See `diagrams/data-plane/d5_crash_recovery.md` § "Orphaned Data
+/// Cleanup".
+///
+/// Specifically exercises the **capacity-return re-fill** (raft-actor.md #10), the harder
+/// path: the driver does *not* race the restart against death detection. It waits for the
+/// cluster to detect node-3 dead and **shrink** the sealed segment to its two survivors
+/// (a death with no live replacement at RF=3), and only then restarts node-3 with a fresh
+/// id. The shrunk segment names none of node-3's identities, so a death-only repair would
+/// never revisit it — the segment has no dead member left to flag. The periodic ring check
+/// re-fills it back toward RF, reassigns it to the rejoined node (now a ring member again),
+/// and that node's catch-up is the zero-transfer full match. Without the re-fill this test
+/// would hang forever.
+#[test]
+#[serial_test::serial]
+fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result {
+    use std::sync::{Arc, Mutex};
+
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(600))
+        .tcp_capacity(4096)
+        .rng_seed(1)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // Per-run-unique but bounce-stable data dirs: the restarted node must find its own
+    // segments on disk. `node_id_suffix` is left unset so the bounce mints a fresh id
+    // (D5's "restart = new member"); only the data dir is pinned.
+    let run_id = uuid::Uuid::new_v4().to_string();
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+    ] {
+        let run_id = run_id.clone();
+        sim.host(name, move || {
+            let run_id = run_id.clone();
+            async move {
+                let me = turmoil::lookup(name);
+                let seeds: Vec<String> =
+                    [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
+                        .iter()
+                        .filter(|(n, _)| *n != name)
+                        .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+                        .collect();
+                let mut env = default_env(idx, name.to_string(), cp, rp);
+                env.advertise_host = Some(me.to_string());
+                env.join_seed_nodes = seeds;
+                env.vnodes_per_node = 16;
+                env.segment_size_limit_bytes = 2048;
+                // Pin only the data dir (survives the bounce → recovery finds segments).
+                env.data_dir = std::env::temp_dir()
+                    .join(format!("eg-lottery-{run_id}-{idx}"))
+                    .to_string_lossy()
+                    .into_owned();
+                StartUp::with_env(env, 0).run().await?;
+                Ok(())
+            }
+        });
+    }
+
+    // The client seals a segment, then signals the driver it's safe to crash node-3.
+    let ready = Arc::new(Mutex::new(false));
+    let ready_w = ready.clone();
+
+    sim.client("test-client", async move {
+        const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        const VICTIM: (&str, u16) = ("node-3", 8083);
+        const TOPIC: &str = "lottery";
+
+        wait_for_cluster(&NODES, 3).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        let rec = |i: usize| -> Vec<u8> {
+            let mut v = format!("rec-{i}").into_bytes();
+            v.resize(1024, b'-');
+            v
+        };
+        let leader = produce_until_acked(TOPIC, &rec(0), &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = rec(i);
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked");
+        }
+
+        // Wait for the segment to seal (RF=3 → node-3 holds it).
+        let mut topic_id = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail
+                    .ranges
+                    .first()
+                    .and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                topic_id = Some(detail.topic_id);
+                break;
+            }
+        }
+        let topic_id = topic_id.expect("segment never sealed");
+
+        // Give the checkpoint worker time to write node-3's sealed segment file to disk
+        // (so recovery has something to find after the restart).
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        *ready_w.lock().unwrap() = true;
+
+        // After the driver crashes + bounces node-3, it comes back with a fresh id, no
+        // Raft state, but its recovered segment on disk. The cluster reassigns the
+        // segment to it; its catch-up is a zero-transfer full match, then it serves rec-0.
+        // Poll tolerantly — node-3 is unreachable during the crash/bounce window.
+        let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
+            topic_id,
+            range_id: 0,
+            entry_id: 0,
+            max_bytes: 1 << 20,
+        }));
+        let mut served = false;
+        for _ in 0..180 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. })) =
+                try_send_request(VICTIM.0, VICTIM.1, fetch.clone()).await
+                && !entries.is_empty()
+                && entries[0].data[..] == rec(0)[..]
+            {
+                served = true;
+                break;
+            }
+        }
+        assert!(
+            served,
+            "restarted node-3 never served rec-0 — recovered segment was not reused on reassignment"
+        );
+
+        Ok(())
+    });
+
+    // Driver: step until the segment is sealed + checkpointed, then crash node-3 and,
+    // after the death is detected, bounce it (restart → recover with a fresh id).
+    while !*ready.lock().unwrap() {
+        assert!(
+            sim.elapsed() < Duration::from_secs(250),
+            "client never signalled ready"
+        );
+        sim.step()?;
+    }
+    tracing::info!("[LOTTERY] crashing node-3 at {}s", sim.elapsed().as_secs());
+    sim.crash("node-3");
+    // Deliberately wait out SWIM death detection + the leader's death-repair, which shrinks
+    // the sealed segment to the two survivors (no live replacement at RF=3 with 2 nodes).
+    // Only *after* the shrink do we restart node-3 — so what brings its data back is the
+    // capacity-return re-fill (next ring check grows the segment toward RF and reassigns it
+    // to the rejoined node), not a race-win. 35s comfortably exceeds detection + a possible
+    // leader election; it's virtual time, so wall-clock cost is negligible.
+    let crash_at = sim.elapsed();
+    while sim.elapsed() < crash_at + Duration::from_secs(35) {
+        sim.step()?;
+    }
+    tracing::info!(
+        "[LOTTERY] restarting node-3 at {}s",
+        sim.elapsed().as_secs()
+    );
+    sim.bounce("node-3");
 
     sim.run()
 }
