@@ -12,6 +12,7 @@ use super::segment_writer::SegmentAppender;
 use super::sparse_index::SparseEntry;
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
+use super::states::seal_request::PendingSealRequests;
 use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
@@ -34,18 +35,23 @@ use std::collections::HashMap;
 /// A large segment streams as several chunks via the read-complete re-arm loop.
 const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-struct PendingSealRequest {
-    sent_at: std::time::Instant,
-    failed_nodes: Vec<NodeId>,
-}
+/// Re-drives without an append before the receiver treats a receive as stalled
+/// and re-requests from a fresh source. A grace window for slow transfers.
+const CATCH_UP_IDLE_REDRIVES: u32 = 2;
 
 /// An in-progress catch-up receive (replacement side): the open segment-file
 /// appender, the sealed bounds being filled toward, and the sparse anchors
 /// accumulated as chunks land — flushed to the index once the file verifies.
 struct PendingCatchUp {
     appender: SegmentAppender,
+    shard_group_id: ShardGroupId,
     start_offset: u64,
     sealed_end: u64,
+    /// Highest entry id written so far; `None` until the first append. A resume
+    /// re-requests `(last_written, sealed_end]`.
+    last_written: Option<u64>,
+    /// Re-drives since the last append — the stall detector. Reset on append.
+    idle_rounds: u32,
     anchors: Vec<SparseEntry>,
 }
 
@@ -61,7 +67,7 @@ pub struct DataPlane<W: WalStorage> {
     needs_flush: bool,
 
     replication: ReplicationState,
-    pending_seal_requests: HashMap<SegmentKey, PendingSealRequest>,
+    pending_seal_requests: PendingSealRequests,
     /// In-progress catch-up receives (replacement side), keyed by segment.
     pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
 
@@ -69,7 +75,7 @@ pub struct DataPlane<W: WalStorage> {
     /// sealed segment (whose live tracker is gone) is forwarded here; the pool
     /// reads the segment file and fulfils the consumer's reply directly, so this
     /// synchronous worker never blocks on disk I/O.
-    cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+    cold_read_handoff_sender: flume::Sender<ColdReadRequest>,
     self_tx: DataPlaneSender,
     out: DataPlaneOutputs,
 
@@ -84,7 +90,7 @@ impl<W: WalStorage> DataPlane<W> {
         node_id: NodeId,
         config: DataNodeConfig,
         wal: W,
-        cold_read_handoff_sender: crossbeam_channel::Sender<ColdReadRequest>,
+        cold_read_handoff_sender: flume::Sender<ColdReadRequest>,
         self_tx: DataPlaneSender,
         out: DataPlaneOutputs,
         recovered: LocalInventory,
@@ -98,7 +104,7 @@ impl<W: WalStorage> DataPlane<W> {
             buffer_byte_count: 0,
             needs_flush: false,
             replication: ReplicationState::default(),
-            pending_seal_requests: HashMap::new(),
+            pending_seal_requests: PendingSealRequests::default(),
             pending_catch_ups: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
@@ -143,12 +149,12 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    pub(crate) fn flush_and_dispatch(&mut self) {
+    pub(crate) async fn flush_and_dispatch(&mut self) {
         if self.should_flush() {
             self.flush_batch();
         }
         self.enqueue_timed_out_seal_retries();
-        self.out.flush();
+        self.out.flush().await;
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -280,7 +286,7 @@ impl<W: WalStorage> DataPlane<W> {
                 progress_signal: cmd.progress_signal,
             },
         };
-        if let Err(crossbeam_channel::SendError(req)) = self.cold_read_handoff_sender.send(req)
+        if let Err(flume::SendError(req)) = self.cold_read_handoff_sender.send(req)
             && let ColdReadReply::Consumer { reply, .. } = req.reply
         {
             let _ = reply.send(FetchResult::InternalError(
@@ -371,7 +377,13 @@ impl<W: WalStorage> DataPlane<W> {
             C::CatchUpAssignment(cmd) => self.handle_catch_up_assignment(cmd),
             C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
             C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
-            C::CatchUpDone(cmd) => self.handle_catch_up_done(cmd),
+            C::CatchUpStreamEnd(cmd) => self.handle_catch_up_stream_end(cmd),
+            // Pass-through to the local MultiRaftActor (we coordinate this group):
+            // a replica's confirmation that it finished catching up.
+            C::CatchUpAck(cmd) => {
+                self.out
+                    .store_coordinator_cmd(MultiRaftActorCommand::CatchUpAck(cmd));
+            }
 
             C::SealBoundaryQuery(cmd) => self.handle_seal_boundary_query(cmd),
             // Pass-through to the local MultiRaftActor
@@ -400,20 +412,39 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// The coordinator announced our (new) membership of this sealed segment.
     /// Reconcile against local state — declarative and idempotent:
-    /// - already hold it through `sealed_end` → register it if a recovered-from-disk copy isn't in the live store yet, then transfer nothing (the catch-up "lottery" win,
-    ///   and the no-op every survivor takes when re-announced);
-    /// - already reconciling it → a re-drive is a no-op;
-    /// - otherwise fetch `(local, sealed_end]` from a peer we pick — a delta when we
-    ///   hold a partial prefix, a full copy when we hold nothing.
+    /// - already hold it through `sealed_end` → register if needed, transfer nothing;
+    /// - already reconciling → no-op while progressing, resume if stalled;
+    /// - else fetch `(local, sealed_end]` from a peer — a delta or a full copy.
     fn handle_catch_up_assignment(&mut self, cmd: CatchUpAssignment) {
-        if self.pending_catch_ups.contains_key(&cmd.segment_key) {
+        if let Some(pending) = self.pending_catch_ups.get_mut(&cmd.segment_key) {
+            // A receive is already in flight: no-op while it appends; once stalled
+            // (no append across `CATCH_UP_IDLE_REDRIVES` re-drives) re-request the
+            // rest from a fresh source, resuming from `last_written`.
+            pending.idle_rounds += 1;
+            if pending.idle_rounds < CATCH_UP_IDLE_REDRIVES {
+                return;
+            }
+            pending.idle_rounds = 0;
+            let local_end = pending.last_written;
+            let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
+                return;
+            };
+            self.out
+                .store_transport_cmd(DataTransportCommand::send_to_targets(
+                    vec![source],
+                    CatchUpRequest {
+                        segment_key: cmd.segment_key,
+                        from: self.node_id.clone(),
+                        local_end,
+                    },
+                ));
             return;
         }
         let local = self.local_sealed_progress(&cmd.segment_key);
         if local.is_some_and(|end| end >= cmd.sealed_end_entry_id) {
-            // Full match: verified locally through the sealed end. Make sure the
-            // cold-read resolver can serve it (a restarted node's recovered data
-            // isn't in the live store yet), then transfer nothing.
+            // Full match: already hold it through `sealed_end`. Register it if the
+            // resolver doesn't have it yet, ack the coordinator, transfer nothing.
+            // The ack fires even if already registered, so a re-drive re-confirms.
             if self.segments.sealed_bounds(&cmd.segment_key).is_none() {
                 self.segments.insert_sealed_from_catch_up(
                     cmd.segment_key,
@@ -421,6 +452,7 @@ impl<W: WalStorage> DataPlane<W> {
                     cmd.sealed_end_entry_id,
                 );
             }
+            self.send_catch_up_ack(cmd.shard_group_id, cmd.segment_key);
             return;
         }
         let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
@@ -445,8 +477,11 @@ impl<W: WalStorage> DataPlane<W> {
             cmd.segment_key,
             PendingCatchUp {
                 appender,
+                shard_group_id: cmd.shard_group_id,
                 start_offset: cmd.start_entry_id,
                 sealed_end: cmd.sealed_end_entry_id,
+                last_written: local,
+                idle_rounds: 0,
                 anchors: Vec::new(),
             },
         );
@@ -527,11 +562,22 @@ impl<W: WalStorage> DataPlane<W> {
         };
         let mut failed = false;
         for entry in &cmd.entries {
+            // Append only the strictly-next id; skip duplicates / out-of-order. A
+            // resume can overlap a stalled stream's tail, and a double append would
+            // overstate the verified prefix.
+            let next = pending.last_written.map_or(pending.start_offset, |w| w + 1);
+            if entry.entry_id != next {
+                continue;
+            }
             match pending.appender.append_entry(
                 entry.entry_id,
                 WalRecord::data((*entry.data).clone(), entry.record_count),
             ) {
-                Ok(anchor) => pending.anchors.extend(anchor),
+                Ok(anchor) => {
+                    pending.anchors.extend(anchor);
+                    pending.last_written = Some(entry.entry_id);
+                    pending.idle_rounds = 0;
+                }
                 Err(e) => {
                     tracing::warn!(
                         "catch-up: append failed for {:?}: {e}; aborting receive",
@@ -547,11 +593,9 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    /// End of stream. Fsync, then re-scan the file (commit 4's verifier) to
-    /// confirm it reaches `sealed_end`. Only on success do we index the anchors
-    /// and register the segment cold-readable. Reporting completion to the
-    /// coordinator is Phase 8; here the segment simply becomes locally serveable.
-    fn handle_catch_up_done(&mut self, cmd: CatchUpDone) {
+    /// End of stream. Fsync, re-scan to verify it reaches `sealed_end`, then on
+    /// success index the anchors, register the segment, and ack the coordinator.
+    fn handle_catch_up_stream_end(&mut self, cmd: CatchUpStreamEnd) {
         let Some(mut pending) = self.pending_catch_ups.remove(&cmd.segment_key) else {
             tracing::debug!(
                 "catch-up done for an unknown receive {:?}; dropping",
@@ -598,6 +642,22 @@ impl<W: WalStorage> DataPlane<W> {
             pending.start_offset,
             pending.sealed_end,
         );
+        self.send_catch_up_ack(pending.shard_group_id, cmd.segment_key);
+    }
+
+    /// Tell the coordinator we hold this segment, so its sweep stops re-announcing.
+    /// Routed via `SendToCoordinator`, mirroring `SegmentAssignmentAck`.
+    fn send_catch_up_ack(&mut self, shard_group_id: ShardGroupId, segment_key: SegmentKey) {
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id,
+                message: CatchUpAck {
+                    segment_key,
+                    shard_group_id,
+                    from: self.node_id.clone(),
+                }
+                .into(),
+            });
     }
 
     /// Source side: a peer wants `cmd.segment_key` brought up to its local end.
@@ -614,7 +674,7 @@ impl<W: WalStorage> DataPlane<W> {
             // The requester is already at or past OUR committed end — nothing to
             // stream. Confirm completion immediately and skip a pointless cold-read
             // dispatch.
-            self.send_catch_up_done(cmd.from, cmd.segment_key);
+            self.send_catch_up_stream_end(cmd.from, cmd.segment_key);
             return;
         }
         self.dispatch_catch_up_read(cmd.from, cmd.segment_key, start_offset, sealed_end, start);
@@ -650,7 +710,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// The cold-read pool finished one batch for a catch-up source read. Emit it
     /// as a `CatchUpChunk` to the requester, then re-arm the next read until the
-    /// sealed end is reached, at which point send `CatchUpDone`.
+    /// sealed end is reached, at which point send `CatchUpStreamEnd`.
     fn handle_catch_up_read_complete(&mut self, cmd: CatchUpReadComplete) {
         let has_entries = !cmd.entries.is_empty();
         if has_entries {
@@ -680,15 +740,15 @@ impl<W: WalStorage> DataPlane<W> {
                 cmd.next_offset,
             );
         } else {
-            self.send_catch_up_done(cmd.requester, cmd.segment_key);
+            self.send_catch_up_stream_end(cmd.requester, cmd.segment_key);
         }
     }
 
-    fn send_catch_up_done(&mut self, requester: NodeId, segment_key: SegmentKey) {
+    fn send_catch_up_stream_end(&mut self, requester: NodeId, segment_key: SegmentKey) {
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
                 vec![requester],
-                CatchUpDone { segment_key },
+                CatchUpStreamEnd { segment_key },
             ));
     }
 
@@ -790,63 +850,62 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_seal_response(&mut self, cmd: SealResponse) {
-        self.pending_seal_requests.remove(&cmd.old_segment_key);
+        self.pending_seal_requests.clear(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
         };
 
         let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
-
         let shard_group_id = old_tracker.shard_group_id();
-
         let new_start_entry_id = old_tracker.successor_start_entry_id();
-        let mut new_tracker = SegmentTracker::new_with_start_entry_id(
-            new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
-            SegmentRole::Leader,
-            cmd.new_replica_set,
-            shard_group_id,
-            new_start_entry_id,
-        );
 
-        // Replay uncommitted records into the new tracker's staged_records.
-        // They reach cache via the normal flush path: staged_records → WAL → publish_uncommitted.
-        // Records are re-WAL'd with new routing headers; old WAL entries are cleaned up
-        // by normal file deletion once the checkpoint watermark advances past them.
-        //
-        // D5 crash recovery: duplicate WAL data is safe. Old entries route to the sealed
-        // segment (bounded by metadata end_offset), new entries route to the new segment.
-        // Metadata-first recovery (Raft log before WAL) provides the seal boundary.
-        let mut replayed_bytes = 0usize;
-        for (data, record_count) in old_tracker.uncommitted_entries() {
-            replayed_bytes += data.len();
-            new_tracker.stage_entry(new_segment_key, data, record_count);
-        }
-        // Published-uncommitted records were cleared from `buffer_byte_count` when
-        // they flushed, so re-staging them re-adds their bytes here.
-        self.buffer_byte_count += replayed_bytes;
+        // Collect the tail to carry into the successor (owned) so the `old_tracker`
+        // borrow ends before we mutate the successor. Re-staged records reach cache
+        // via the normal flush path and are re-WAL'd with new headers; on recovery,
+        // metadata's seal boundary clips any duplicate. `uncommitted` (published)
+        // records were cleared from `buffer_byte_count` at flush, so re-staging
+        // re-adds their bytes; `staged` records are still counted, so they don't.
+        let uncommitted: Vec<_> = old_tracker.uncommitted_entries().collect();
+        let staged: Vec<_> = old_tracker.staged_for_replay().collect();
+        let followers = old_tracker.followers().to_vec();
+        let replayed_bytes: usize = uncommitted.iter().map(|(data, _)| data.len()).sum();
 
-        // Staged-but-unflushed produces (staged after the last flush) must also
-        // carry to the successor
-        for (data, record_count) in old_tracker.staged_for_replay() {
-            new_tracker.stage_entry(new_segment_key, data, record_count);
-        }
-
-        self.replication
-            .segment_handoff(cmd.old_segment_key, new_segment_key);
-
-        if !old_tracker.followers().is_empty() {
+        if !followers.is_empty() {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
-                    old_tracker.followers().to_vec(),
+                    followers,
                     SegmentSealed {
                         segment_key: cmd.old_segment_key,
                     },
                 ));
         }
 
+        self.replication
+            .segment_handoff(cmd.old_segment_key, new_segment_key);
         self.retire_old_segment(cmd.old_segment_key);
 
-        self.segments.insert_active(new_segment_key, new_tracker);
+        // The successor may already exist: on a roll the coordinator co-dispatches a
+        // `SegmentAssignment` for the new active segment alongside this `SealResponse`,
+        // and it can win the race (creating the successor empty). Carry the tail onto
+        // the existing tracker rather than a fresh one that `insert_active` would
+        // silently refuse — which would drop the records (data loss) and strand the
+        // counter.
+        if self.segments.get(&new_segment_key).is_none() {
+            let new_tracker = SegmentTracker::new_with_start_entry_id(
+                new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
+                SegmentRole::Leader,
+                cmd.new_replica_set,
+                shard_group_id,
+                new_start_entry_id,
+            );
+            self.segments.insert_active(new_segment_key, new_tracker);
+        }
+        if let Some(successor) = self.segments.get_mut(&new_segment_key) {
+            for (data, record_count) in uncommitted.into_iter().chain(staged) {
+                successor.stage_entry(new_segment_key, data, record_count);
+            }
+        }
+        self.buffer_byte_count += replayed_bytes;
         self.dirty_segments.push(new_segment_key);
         self.needs_flush = true;
     }
@@ -915,17 +974,12 @@ impl<W: WalStorage> DataPlane<W> {
                 }
                 .into(),
             });
-        self.pending_seal_requests.insert(
-            segment_key,
-            PendingSealRequest {
-                sent_at: std::time::Instant::now(),
-                failed_nodes,
-            },
-        );
+        self.pending_seal_requests
+            .track(segment_key, failed_nodes, tokio::time::Instant::now());
     }
 
     fn enqueue_seal_request(&mut self, segment_key: SegmentKey) {
-        if self.pending_seal_requests.contains_key(&segment_key) {
+        if self.pending_seal_requests.is_tracked(&segment_key) {
             return;
         }
         let Some(tracker) = self.segments.get(&segment_key) else {
@@ -945,13 +999,8 @@ impl<W: WalStorage> DataPlane<W> {
                 }
                 .into(),
             });
-        self.pending_seal_requests.insert(
-            segment_key,
-            PendingSealRequest {
-                sent_at: std::time::Instant::now(),
-                failed_nodes: vec![],
-            },
-        );
+        self.pending_seal_requests
+            .track(segment_key, vec![], tokio::time::Instant::now());
     }
 
     fn should_flush(&self) -> bool {
@@ -1079,32 +1128,28 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn enqueue_timed_out_seal_retries(&mut self) {
-        let now = std::time::Instant::now();
-        let timeout = self.config.seal_request_timeout;
-
-        for (key, pending) in &mut self.pending_seal_requests {
-            if now.duration_since(pending.sent_at) < timeout {
-                continue;
-            }
-            let Some(tracker) = self.segments.get(key) else {
+        let due = self.pending_seal_requests.take_due(
+            tokio::time::Instant::now(),
+            self.config.seal_request_timeout,
+        );
+        for (segment_key, failed_nodes) in due {
+            let Some(tracker) = self.segments.get(&segment_key) else {
                 continue;
             };
             if tracker.role() != SegmentRole::Leader {
                 continue;
             }
-
             self.out
                 .store_transport_cmd(DataTransportSendToCoordinator {
                     shard_group_id: tracker.shard_group_id(),
                     message: SealRequest {
                         from: self.node_id.clone(),
-                        segment_key: *key,
-                        failed_nodes: pending.failed_nodes.clone(),
+                        segment_key,
+                        failed_nodes,
                         end_entry_id: tracker.committed_entry_id(),
                     }
                     .into(),
                 });
-            pending.sent_at = now;
         }
     }
 }
@@ -1126,9 +1171,18 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
             .map(|e| e.byte_len())
             .sum();
         assert_eq!(
-            self.buffer_byte_count, actual_byte_count,
-            "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count})",
-            self.buffer_byte_count
+            self.buffer_byte_count,
+            actual_byte_count,
+            "buffer_byte_count ({}) != actual leader staged bytes ({actual_byte_count}); \
+             segments(id,role,staged_bytes)={:?}",
+            self.buffer_byte_count,
+            self.segments
+                .iter()
+                .map(|(k, t)| {
+                    let staged: usize = t.staged_entries().iter().map(|e| e.byte_len()).sum();
+                    (k.segment_id.0, t.role(), staged)
+                })
+                .collect::<Vec<_>>()
         );
 
         self.segments.assert_invariants();
@@ -1194,9 +1248,9 @@ mod tests {
         let out = DataPlaneOutputs::test();
         // Tests don't exercise the cold-read path; an unbounded sink channel
         // whose receiver we leak keeps any dispatched request from panicking.
-        let (cold_read_tx, _cold_read_rx) = crossbeam_channel::unbounded();
+        let (cold_read_tx, _cold_read_rx) = flume::unbounded();
         std::mem::forget(_cold_read_rx);
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         DataPlane::new(
             test_node_id(),
@@ -1494,6 +1548,37 @@ mod tests {
 
         // The staged produce moved to the successor; the counter still matches.
         let successor = test_key().with_segment_id(SegmentId(1));
+        assert!(dp.segments.get(&successor).unwrap().has_staged());
+        assert!(dp.has_buffered_data());
+    }
+
+    /// On a roll the coordinator co-dispatches a `SegmentAssignment` for the new
+    /// active segment alongside the `SealResponse`. If the assignment wins the race
+    /// (creating the successor empty first), the seal handoff must still carry the
+    /// old segment's staged tail onto that existing successor — not build a fresh
+    /// tracker that `insert_active` refuses, dropping the records (data loss) and
+    /// stranding `buffer_byte_count`. Regression for the age-seal stress flake.
+    #[test]
+    fn seal_handoff_carries_into_a_successor_already_created_by_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        // Produce — staged into the active segment, unflushed.
+        let (cmd, _rx) = produce(test_key());
+        dp.handle_command(cmd);
+        assert!(dp.has_buffered_data());
+
+        // The successor's SegmentAssignment wins the race: seg1 is created empty.
+        let successor = test_key().with_segment_id(SegmentId(1));
+        dp.handle_command(assign_segment(successor, vec![]));
+
+        // The SealResponse handoff arrives second. Pre-fix `insert_active` refuses
+        // (seg1 already active) → the staged produce is dropped and `buffer_byte_count`
+        // strands, tripping `assert_invariants` after the command.
+        dp.handle_command(seal_response(test_key(), SegmentId(1), vec![]));
+
+        // The staged produce was carried onto the pre-existing successor, not lost.
         assert!(dp.segments.get(&successor).unwrap().has_staged());
         assert!(dp.has_buffered_data());
     }
@@ -1845,8 +1930,8 @@ mod tests {
         let seq = dp.out.repl_schedules[0].0;
         dp.handle_replication_timeout(test_key(), seq);
 
-        let pending = dp.pending_seal_requests.get(&test_key()).unwrap();
-        assert!(pending.failed_nodes.contains(&follower));
+        let failed = dp.pending_seal_requests.failed_nodes(&test_key()).unwrap();
+        assert!(failed.contains(&follower));
     }
 
     #[test]
@@ -1920,7 +2005,7 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
         );
-        assert!(dp.pending_seal_requests.contains_key(&test_key()));
+        assert!(dp.pending_seal_requests.is_tracked(&test_key()));
     }
 
     #[test]
@@ -1968,7 +2053,7 @@ mod tests {
         dp.enqueue_seal_request(test_key());
 
         assert!(dp.out.transport_cmds.is_empty());
-        assert!(!dp.pending_seal_requests.contains_key(&test_key()));
+        assert!(!dp.pending_seal_requests.is_tracked(&test_key()));
     }
 
     #[test]
@@ -2137,7 +2222,7 @@ mod tests {
         let cold_read_tx = ColdReadPool::spawn(DEFAULT_POOL_SIZE, Arc::clone(&sparse));
 
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
@@ -2241,13 +2326,10 @@ mod tests {
     /// catch-up source resolving its own committed bounds.
     fn source_with_sealed_segment(
         dir: &tempfile::TempDir,
-    ) -> (
-        DataPlane<WalWriter>,
-        crossbeam_channel::Receiver<ColdReadRequest>,
-    ) {
+    ) -> (DataPlane<WalWriter>, flume::Receiver<ColdReadRequest>) {
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (cold_read_tx, cold_read_rx) = flume::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
@@ -2299,7 +2381,7 @@ mod tests {
     }
 
     /// A requester already at (or past) the source's committed end gets an
-    /// immediate `CatchUpDone` and no read is dispatched — the source short-
+    /// immediate `CatchUpStreamEnd` and no read is dispatched — the source short-
     /// circuits on its OWN `sealed_end`, not on anything the requester relayed.
     #[test]
     fn catch_up_request_already_caught_up_sends_done_without_reading() {
@@ -2318,7 +2400,7 @@ mod tests {
 
         // Nothing handed to the pool...
         assert!(cold_read_rx.try_recv().is_err());
-        // ...and a CatchUpDone went straight back to the requester.
+        // ...and a CatchUpStreamEnd went straight back to the requester.
         assert_eq!(dp.out.transport_cmds.len(), 1);
         let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("expected SendToTargets");
@@ -2326,12 +2408,12 @@ mod tests {
         assert_eq!(s.targets[0], requester);
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpDone(d) if d.segment_key == test_key()
+            DataPlaneInterNodeCommand::CatchUpStreamEnd(d) if d.segment_key == test_key()
         ));
     }
 
     /// A batch whose `next_offset` is past the sealed end emits one `CatchUpChunk`
-    /// (entries intact, with `record_count`) followed by `CatchUpDone` — no re-arm.
+    /// (entries intact, with `record_count`) followed by `CatchUpStreamEnd` — no re-arm.
     #[test]
     fn catch_up_read_complete_emits_chunk_then_done() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -2399,12 +2481,12 @@ mod tests {
         };
         assert!(matches!(
             &done.message,
-            DataPlaneInterNodeCommand::CatchUpDone(_)
+            DataPlaneInterNodeCommand::CatchUpStreamEnd(_)
         ));
     }
 
     /// A batch that ends below the sealed end emits its chunk and re-arms the next
-    /// read against the pool, resuming at `next_offset` — no `CatchUpDone` yet.
+    /// read against the pool, resuming at `next_offset` — no `CatchUpStreamEnd` yet.
     #[test]
     fn catch_up_read_complete_re_arms_until_sealed_end() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -2412,8 +2494,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
-        let (cold_read_tx, cold_read_rx) = crossbeam_channel::unbounded::<ColdReadRequest>();
-        let (self_tx, _self_rx) = crossbeam_channel::unbounded::<DataPlaneMessage>();
+        let (cold_read_tx, cold_read_rx) = flume::unbounded::<ColdReadRequest>();
+        let (self_tx, _self_rx) = flume::unbounded::<DataPlaneMessage>();
         std::mem::forget(_self_rx);
         let mut dp = DataPlane::new(
             test_node_id(),
@@ -2477,6 +2559,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 replica_set: vec![test_node_id(), source.clone()],
@@ -2522,7 +2605,7 @@ mod tests {
             .into(),
         ));
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpDone {
+            CatchUpStreamEnd {
                 segment_key: test_key(),
             }
             .into(),
@@ -2540,6 +2623,12 @@ mod tests {
                 matches!(t, CheckpointTask::PutAnchors(anchors) if !anchors.is_empty())
             })
         );
+        // ...and a CatchUpAck confirmed completion back to the coordinator.
+        assert!(dp.out.transport_cmds.iter().any(|c| matches!(
+            c,
+            DataTransportCommand::SendToCoordinator(coord)
+                if matches!(&coord.message, DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key())
+        )));
     }
 
     /// A stream that stops short of `sealed_end` fails verification, so the
@@ -2554,6 +2643,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 5, // need through 5...
                 replica_set: vec![test_node_id(), NodeId::new("source")],
@@ -2586,7 +2676,7 @@ mod tests {
             .into(),
         ));
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpDone {
+            CatchUpStreamEnd {
                 segment_key: test_key(),
             }
             .into(),
@@ -2600,6 +2690,12 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, CheckpointTask::PutAnchors(_)))
         );
+        // ...and NO CatchUpAck — an unverified receive must not confirm completion.
+        assert!(!dp.out.transport_cmds.iter().any(|c| matches!(
+            c,
+            DataTransportCommand::SendToCoordinator(s)
+                if matches!(&s.message, DataPlaneInterNodeCommand::CatchUpAck(_))
+        )));
     }
 
     /// Full match (the catch-up "lottery"): the recovered inventory already holds
@@ -2614,6 +2710,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 replica_set: vec![test_node_id(), NodeId::new("peer")],
@@ -2621,8 +2718,16 @@ mod tests {
             .into(),
         ));
 
-        // Zero transfer — no CatchUpRequest dispatched...
-        assert!(dp.out.transport_cmds.is_empty());
+        // Zero transfer — no CatchUpRequest dispatched, only a CatchUpAck back to
+        // the coordinator so its re-drive stops re-announcing the assignment.
+        assert_eq!(dp.out.transport_cmds.len(), 1);
+        let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToCoordinator");
+        };
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key()
+        ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
         assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
     }
@@ -2642,6 +2747,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 4,
                 replica_set: vec![test_node_id(), NodeId::new("source")],
@@ -2671,6 +2777,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CatchUpAssignment {
                 segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
                 start_entry_id: 0,
                 sealed_end_entry_id: 2,
                 // self (test-node) is a follower here; `leader` is replica_set[0].
@@ -2686,6 +2793,123 @@ mod tests {
             s.targets[0], follower,
             "should fetch from the non-leader peer, not {leader:?}"
         );
+    }
+
+    // ── Re-drive rescues a stalled in-flight receive ───────────────────────
+
+    fn catch_up_assignment_to(source: &NodeId, sealed_end: u64) -> DataPlaneCommand {
+        DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpAssignment {
+                segment_key: test_key(),
+                shard_group_id: ShardGroupId(1),
+                start_entry_id: 0,
+                sealed_end_entry_id: sealed_end,
+                replica_set: vec![test_node_id(), source.clone()],
+            }
+            .into(),
+        )
+    }
+
+    fn catch_up_chunk_of(ids: &[u64]) -> DataPlaneCommand {
+        DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpChunk {
+                segment_key: test_key(),
+                entries: ids
+                    .iter()
+                    .map(|&entry_id| CatchUpEntry {
+                        entry_id,
+                        data: b"x".to_vec().into(),
+                        record_count: 1,
+                    })
+                    .collect(),
+            }
+            .into(),
+        )
+    }
+
+    /// A receive that makes no progress is re-requested (resumed) once it has gone
+    /// `CATCH_UP_IDLE_REDRIVES` re-drives without an append — not before.
+    #[test]
+    fn catch_up_redrive_resumes_a_stalled_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 5)); // initial request
+        dp.out.transport_cmds.clear();
+
+        // Within the grace window the re-drive is silent.
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+            assert!(
+                dp.out.transport_cmds.is_empty(),
+                "no re-request within grace"
+            );
+        }
+        // At the budget: a resume request to the source, from local_end = None
+        // (nothing written yet).
+        dp.handle_command(catch_up_assignment_to(&source, 5));
+        assert_eq!(dp.out.transport_cmds.len(), 1, "stalled → resume request");
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
+            panic!("expected SendToTargets");
+        };
+        assert_eq!(s.targets[0], source);
+        assert!(matches!(
+            &s.message,
+            DataPlaneInterNodeCommand::CatchUpRequest(r)
+                if r.segment_key == test_key() && r.local_end.is_none()
+        ));
+    }
+
+    /// Progress (an appended chunk) resets the stall counter, so a steadily
+    /// advancing receive is never re-requested.
+    #[test]
+    fn catch_up_redrive_is_a_noop_while_progressing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 5));
+        // Bring the counter to the brink...
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+        }
+        // ...a chunk resets it...
+        dp.handle_command(catch_up_chunk_of(&[0]));
+        dp.out.transport_cmds.clear();
+        // ...so the same run of re-drives again still doesn't trip a resume.
+        for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
+            dp.handle_command(catch_up_assignment_to(&source, 5));
+        }
+        assert!(
+            dp.out.transport_cmds.is_empty(),
+            "progress reset the stall counter; no resume"
+        );
+    }
+
+    /// A resume can re-stream entries already written; the chunk handler appends
+    /// only the strictly-next id, so duplicates never inflate the verified prefix.
+    #[test]
+    fn catch_up_chunk_skips_a_resume_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let source = NodeId::new("source");
+
+        dp.handle_command(catch_up_assignment_to(&source, 4));
+        dp.handle_command(catch_up_chunk_of(&[0, 1, 2]));
+        // Overlap: 1,2 are duplicates (skipped), 3,4 are new (appended).
+        dp.handle_command(catch_up_chunk_of(&[1, 2, 3, 4]));
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            CatchUpStreamEnd {
+                segment_key: test_key(),
+            }
+            .into(),
+        ));
+
+        // Verified exactly through the sealed end — no duplicate inflation.
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 4)));
+        let scan = scan_segment_file(&test_key().file_path(dir.path(), 0)).unwrap();
+        assert_eq!(scan.last_entry_id, Some(4));
     }
 
     // --- Leader-crash boundary recovery: durable extent + query handler -----

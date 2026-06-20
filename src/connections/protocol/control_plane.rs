@@ -70,6 +70,9 @@ pub enum TopicState {
 /// historical ancestor forward through splits and merges.
 #[derive(Debug, Encode, Decode)]
 pub struct TopicDetail {
+    /// Resolved id, so a consumer can fetch by id directly from a holding replica
+    /// (no name re-resolution on the data node). See `FetchByIdRequest`.
+    pub topic_id: u64,
     pub name: String,
     pub state: TopicState,
     pub ranges: Box<[RangeDetail]>,
@@ -128,6 +131,7 @@ impl TopicDetail {
             .map(|range| RangeDetail::from_meta(range, addresses))
             .collect();
         TopicDetail {
+            topic_id: meta.id.0,
             name: meta.name,
             state: match meta.state {
                 MetaTopicState::Active => TopicState::Active,

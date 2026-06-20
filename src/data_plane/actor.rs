@@ -17,9 +17,8 @@ use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{TICK_PERIOD_10_MS, TICK_PERIOD_100_MS};
 
-use crossbeam_channel::{SendError, Sender};
+use flume::Sender;
 use std::sync::Arc;
-use std::thread;
 use tokio::sync::mpsc;
 
 pub struct DataPlaneActor;
@@ -27,7 +26,7 @@ pub struct DataPlaneActor;
 impl DataPlaneActor {
     /// Spawn the data-plane worker thread together with its three schedulers
     /// (batch-flush, replication, segment-age) and the bridge that forwards
-    /// scheduler callbacks (tokio mpsc) into the worker's crossbeam mailbox.
+    /// scheduler callbacks (tokio mpsc) into the worker's flume mailbox.
     pub fn spawn(
         node_id: NodeId,
         config: DataNodeConfig,
@@ -55,9 +54,9 @@ impl DataPlaneActor {
             Some(config.age_check_ticks()),
         );
 
-        let (tx, mailbox) = crossbeam_channel::bounded::<DataPlaneMessage>(4096);
+        let (tx, mailbox) = flume::bounded::<DataPlaneMessage>(4096);
 
-        // Timer bridge: schedulers send via tokio mpsc, bridge forwards to crossbeam
+        // Timer bridge: schedulers send via tokio mpsc, bridge forwards to the mailbox.
         let bridge_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(cmd) = timer_rx.recv().await {
@@ -69,57 +68,68 @@ impl DataPlaneActor {
 
         let self_tx = DataPlaneSender(tx.clone());
 
-        thread::Builder::new()
+        // Built in the worker context: recovery ran in bootstrap (before this node joined the cluster),
+        // leaving the WAL dir empty with a verified inventory; open the fresh WAL in that dir.
+        let RecoveryOutput {
+            inventory,
+            data_dir,
+        } = recovery;
+        // A node that can't open its WAL cannot serve the data plane — fail hard
+        // rather than silently leaving the worker dead.
+        let wal = WalWriter::new(data_dir).expect("data-plane WAL init failed");
+        let out = DataPlaneOutputs::new(
+            checkpoint_tx,
+            batch_scheduler_tx,
+            repl_scheduler_tx,
+            data_transport_tx,
+            coordinator_tx,
+        );
+
+        // The worker loop is async — its dispatch awaits channel capacity rather than
+        // blocking (tokio's `blocking_send` panics inside a runtime).
+        let worker = async move {
+            let mut state =
+                DataPlane::new(node_id, config, wal, cold_read_tx, self_tx, out, inventory);
+            while let Ok(msg) = mailbox.recv_async().await {
+                state.process(msg);
+                while let Ok(next) = mailbox.try_recv() {
+                    state.process(next);
+                }
+                state.flush_and_dispatch().await;
+            }
+        };
+
+        // Production: a dedicated OS thread with its own current-thread runtime, so
+        // the data plane's blocking I/O (WAL/fsync) never stalls the main runtime.
+        #[cfg(not(test))]
+        std::thread::Builder::new()
             .name("data-plane-worker".into())
             .spawn(move || {
-                // Recovery ran in bootstrap (before this node joined the cluster);
-                // it left the WAL dir empty and handed us the verified inventory.
-                // Open the fresh WAL in the dir it cleared.
-                let RecoveryOutput {
-                    inventory,
-                    data_dir,
-                } = recovery;
-                let wal = match WalWriter::new(data_dir) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!("Failed to initialize WAL: {e}");
-                        return;
-                    }
-                };
-                let out = DataPlaneOutputs::new(
-                    checkpoint_tx,
-                    batch_scheduler_tx,
-                    repl_scheduler_tx,
-                    data_transport_tx,
-                    coordinator_tx,
-                );
-                let mut state =
-                    DataPlane::new(node_id, config, wal, cold_read_tx, self_tx, out, inventory);
-
-                while let Ok(msg) = mailbox.recv() {
-                    state.process(msg);
-
-                    while let Ok(next) = mailbox.try_recv() {
-                        state.process(next);
-                    }
-
-                    state.flush_and_dispatch();
-                }
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("data-plane worker runtime")
+                    .block_on(worker);
             })
             .expect("failed to spawn data-plane thread");
 
+        // Test: run the worker as a task on turmoil's runtime so it shares the sim's
+        // virtual clock and cooperative scheduling — a real OS thread runs in real
+        // wall-time outside turmoil and races virtual-time assertions
+        #[cfg(test)]
+        tokio::spawn(worker);
         DataPlaneSender(tx)
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct DataPlaneSender(pub crossbeam_channel::Sender<DataPlaneMessage>);
+pub(crate) struct DataPlaneSender(pub flume::Sender<DataPlaneMessage>);
 
 impl DataPlaneSender {
     pub fn send(
         &self,
         msg: impl Into<DataPlaneMessage>,
-    ) -> Result<(), SendError<DataPlaneMessage>> {
+    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
         self.0.send(msg.into())
     }
 }

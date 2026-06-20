@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 
-use crossbeam_channel::Receiver;
+use flume::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
@@ -21,34 +20,48 @@ impl CheckpointWorker {
         mailbox: Receiver<Box<[CheckpointTask]>>,
         data_plane_tx: DataPlaneSender,
     ) {
-        thread::Builder::new()
+        // Prod: a dedicated OS thread (blocking segment-file + index writes stay off
+        // the main runtime). Test: a task on turmoil's runtime so it shares the sim's
+        // cooperative scheduling — a real OS thread runs in real wall-time outside
+        // turmoil (CLAUDE.md "Testing").
+        #[cfg(not(test))]
+        std::thread::Builder::new()
             .name("checkpoint-worker".into())
             .spawn(move || {
                 while let Ok(batch) = mailbox.recv() {
-                    for task in batch {
-                        match task {
-                            CheckpointTask::Checkpoint(job) => {
-                                if let Err(e) =
-                                    Self::process_job(sparse_index.as_ref(), &job, &data_plane_tx)
-                                {
-                                    tracing::error!(
-                                        "Checkpoint failed for {:?}: {e}",
-                                        job.segment_key
-                                    );
-                                }
-                            }
-                            CheckpointTask::PutAnchors(entries) => {
-                                // Catch-up receive's anchors (replacement side):
-                                // the worker is the sole runtime sparse-index writer.
-                                if let Err(e) = sparse_index.put_batch(entries.into_vec()) {
-                                    tracing::error!("Catch-up anchor index write failed: {e}");
-                                }
-                            }
-                        }
-                    }
+                    Self::process_batch(batch, sparse_index.as_ref(), &data_plane_tx);
                 }
             })
             .expect("failed to spawn checkpoint thread");
+
+        #[cfg(test)]
+        tokio::spawn(async move {
+            while let Ok(batch) = mailbox.recv_async().await {
+                Self::process_batch(batch, sparse_index.as_ref(), &data_plane_tx);
+            }
+        });
+    }
+
+    fn process_batch(
+        batch: Box<[CheckpointTask]>,
+        sparse_index: &dyn SparseIndex,
+        data_plane_tx: &DataPlaneSender,
+    ) {
+        for task in batch {
+            match task {
+                CheckpointTask::Checkpoint(job) => {
+                    if let Err(e) = Self::process_job(sparse_index, &job, data_plane_tx) {
+                        tracing::error!("Checkpoint failed for {:?}: {e}", job.segment_key);
+                    }
+                }
+                CheckpointTask::PutAnchors(entries) => {
+                    // Catch-up receive's anchors (replacement side)
+                    if let Err(e) = sparse_index.put_batch(entries.into_vec()) {
+                        tracing::error!("Catch-up anchor index write failed: {e}");
+                    }
+                }
+            }
+        }
     }
 
     fn process_job(

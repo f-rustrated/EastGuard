@@ -151,6 +151,14 @@ impl MultiRaftActor {
                     .send(SwimCommand::AnnounceShardLeader(lc))
                     .await;
             }
+            RaftEvent::ShardLeaderRefresh(lc) => {
+                // Re-announce only — the periodic backstop. No reconcile (that
+                // would re-run the takeover sweep + catch-up reseed every tick).
+                let _ = self
+                    .swim_tx
+                    .send(SwimCommand::AnnounceShardLeader(lc))
+                    .await;
+            }
             RaftEvent::DisconnectPeer(node_id) => {
                 self.transport_cmds
                     .push(RaftTransportCommand::DisconnectPeer(node_id));

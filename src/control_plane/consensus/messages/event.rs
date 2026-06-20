@@ -42,13 +42,17 @@ pub enum RaftEvent {
     OutboundRaftPacket(OutboundRaftPacket),
     Timer(TimerCommand<RaftTimer>),
     LeaderChange(LeaderChange),
+    /// Periodic re-announce of this node's shard leadership — the ring-check
+    /// backstop for the one-shot `AnnounceShardLeader` gossip (#135 class), so a
+    /// node that missed it converges. The actor forwards it to SWIM only; unlike
+    /// `LeaderChange` it does NOT reconcile (that would re-run the takeover sweep).
+    ShardLeaderRefresh(LeaderChange),
     DisconnectPeer(NodeId),
-    #[allow(dead_code)]
     MetadataCommitted(MetadataCommitted),
-    /// Idempotent re-delivery of active-segment `SegmentAssignment`s, emitted by
-    /// the leader on each heartbeat so a `SegmentAssignment` lost on its one-shot
-    /// delivery (the original send is fire-and-forget) self-heals. The data plane
-    /// drops re-drives for segments it already hosts.
+    /// Idempotent re-delivery of assignment messages each heartbeat, so a lost
+    /// fire-and-forget send self-heals: active-segment `SegmentAssignment`s and
+    /// sealed-segment `CatchUpAssignment`s. The actor forwards them to the data
+    /// transport.
     RedriveAssignments(Vec<DataTransportCommand>),
     /// Leader-crash `SealBoundaryQuery` fan-out to a segment's survivors.
     /// A coordinator-initiated data-plane send not tied to a committed entry.
@@ -69,7 +73,7 @@ impl MetadataCommitted {
                 vec![rm.into_command(sgid)]
             }
             ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
-            ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(),
+            ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
         }
     }
 }

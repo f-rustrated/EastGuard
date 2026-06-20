@@ -111,6 +111,12 @@ pub struct Environment {
 
     #[arg(long, env = "SEAL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
     pub seal_request_timeout_secs: u64,
+
+    /// Test-only: pin the node-id suffix so the hash-ring placement is deterministic
+    /// under the turmoil sim. Unset in prod, where each start gets a fresh UUID so a
+    /// restarted node is a distinct identity. See `resolve_node_id` + CLAUDE.md.
+    #[arg(skip)]
+    pub node_id_suffix: Option<String>,
 }
 
 impl Environment {
@@ -199,7 +205,15 @@ impl Environment {
     /// - Without a prefix: returns a bare UUID.
     pub fn resolve_node_id(&self) -> String {
         match &self.node_id_prefix {
-            Some(prefix) => format!("{}::{}", prefix, Uuid::new_v4()),
+            // A test can pin the suffix (deterministic hash-ring placement across
+            // sim runs); otherwise a fresh UUID per start keeps a restarted node a
+            // distinct identity. `Uuid::new_v4` draws OS randomness turmoil can't
+            // seed, so an unpinned suffix makes every sim run a different topology
+            // (intermittently exposing convergence gaps). See CLAUDE.md "Testing".
+            Some(prefix) => match &self.node_id_suffix {
+                Some(suffix) => format!("{prefix}::{suffix}"),
+                None => format!("{}::{}", prefix, Uuid::new_v4()),
+            },
             None => Uuid::new_v4().to_string(),
         }
     }
@@ -316,6 +330,7 @@ mod tests {
             data_dir: "./eastguard/data".into(),
             meta_dir: "./eastguard/meta".into(),
             node_id_prefix: None,
+            node_id_suffix: None,
             client_port: 2921,
             cluster_port: 2922,
             data_port: 2923,

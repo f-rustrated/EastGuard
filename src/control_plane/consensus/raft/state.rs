@@ -2,18 +2,20 @@
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
+use crate::control_plane::consensus::raft::catch_up::CatchUpRepairs;
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::{EvictionError, ProposalError};
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
+use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
     MetadataCommand, ReassignSegment, ReplicaSet, RollSegment, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{SegmentAssignment, SegmentAssignmentAck};
+use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -115,6 +117,9 @@ pub struct Raft {
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
+    /// In-flight sealed-segment repairs. Seeded at `ReassignSegment` apply; the
+    /// heartbeat sweep re-drives until acked. Leader-volatile — cleared on step-down.
+    catch_up: CatchUpRepairs,
     pending_proposals: Vec<MetadataCommand>,
 
     leaderless_segments: LeaderlessSegments,
@@ -167,6 +172,7 @@ impl Raft {
             timer_seqs,
             election_epoch: 0,
             confirmed_assignment: HashMap::new(),
+            catch_up: CatchUpRepairs::default(),
             ring_observation_streak: None,
         };
         raft.reset_election_timer();
@@ -1025,6 +1031,7 @@ impl Raft {
         self.current_leader = None;
         self.peer_states.clear();
         self.confirmed_assignment.clear();
+        self.catch_up.clear();
     }
 
     // -------------------------------------------------------------------
@@ -1044,6 +1051,7 @@ impl Raft {
 
         self.schedule_rpc_timer();
         self.maybe_redrive_segment_assignments();
+        self.maybe_redrive_catch_ups();
     }
 
     fn maybe_redrive_segment_assignments(&mut self) {
@@ -1081,6 +1089,52 @@ impl Raft {
 
     pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
         self.confirmed_assignment.insert(ack.segment_key, ack.from);
+    }
+
+    /// Re-drive the catch-up sweep — the sealed-segment analogue of
+    /// `maybe_redrive_segment_assignments`. See `.claude/rules/raft-actor.md` #9.
+    fn maybe_redrive_catch_ups(&mut self) {
+        let redrives = self.catch_up.redrives(self.shard_group_id);
+        if !redrives.is_empty() {
+            self.events.push(RaftEvent::RedriveAssignments(redrives));
+        }
+    }
+
+    /// A member confirmed it holds a reassigned sealed segment; routed here from
+    /// `MultiRaft`.
+    pub(crate) fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+        self.catch_up.confirm(ack.segment_key, ack.from);
+    }
+
+    /// Takeover backstop: re-seed catch-up for every known-end sealed segment this
+    /// node leads. The tracker is leader-volatile (empty after takeover), so a
+    /// repair in flight when leadership changed would otherwise be stranded; the
+    /// heartbeat sweep re-drives the re-seeded set (already-complete members
+    /// full-match-ack cheaply). See `.claude/rules/raft-actor.md` #9.
+    pub(crate) fn reseed_catch_up(&mut self) {
+        let sealed: Vec<_> = self
+            .state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.known_end_sealed_segments())
+            .collect();
+        for (segment_key, start, end, replica_set) in sealed {
+            self.catch_up
+                .track_sealed(segment_key, start, end, replica_set);
+        }
+    }
+
+    /// The periodic shard-leader re-announce for the ring-check backstop (#135
+    /// class) — `None` unless this node leads the group. Announce-only: the actor
+    /// forwards it to SWIM, never reconcile.
+    pub(crate) fn shard_leader_refresh(&self) -> Option<RaftEvent> {
+        self.is_leader().then(|| {
+            RaftEvent::ShardLeaderRefresh(LeaderChange {
+                shard_group_id: self.shard_group_id,
+                leader_node_id: self.node_id.clone(),
+                term: self.current_term,
+            })
+        })
     }
 
     fn send_append_entries(&mut self, peer_id: NodeId) {
@@ -1311,6 +1365,12 @@ impl Raft {
                     index,
                     result
                 );
+
+                if self.is_leader()
+                    && let ApplyResult::SegmentReassigned(r) = &result
+                {
+                    self.catch_up.track(r);
+                }
                 self.events.push(
                     MetadataCommitted {
                         shard_group_id: self.shard_group_id,
@@ -1655,6 +1715,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_plane::messages::command::CatchUpAssignment;
 
     impl Raft {
         pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposalError> {
@@ -3593,6 +3654,119 @@ mod tests {
                 member
             );
         }
+    }
+
+    // ── Catch-up re-drive: seed at ReassignSegment apply, sweep until acked ──
+
+    /// Create a topic, seal segment 0 at a known end, reassign it to `new_set`,
+    /// and apply — leaving one in-flight catch-up repair seeded in the leader's
+    /// tracker (the heartbeat sweep will re-drive it).
+    fn raft_with_seeded_catch_up(new_set: Vec<NodeId>) -> (Raft, SegmentKey) {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("x"), node("y"), node("z")]);
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1")],
+                end_entry_id: Some(100),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        raft.simulate_flush_and_apply();
+        raft.propose(
+            MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: seg0,
+                new_replica_set: new_set,
+            })
+            .into(),
+        )
+        .expect("ReassignSegment propose failed");
+        raft.simulate_flush_and_apply();
+        (raft, seg0)
+    }
+
+    /// Run the catch-up re-drive sweep and collect (target, assignment) pairs.
+    fn drain_catch_up_redrives(raft: &mut Raft) -> Vec<(NodeId, CatchUpAssignment)> {
+        use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+        raft.maybe_redrive_catch_ups();
+        let mut out = Vec::new();
+        for event in raft.take_events() {
+            let RaftEvent::RedriveAssignments(cmds) = event else {
+                continue;
+            };
+            for cmd in cmds {
+                if let DataTransportCommand::SendToTargets(s) = cmd {
+                    let target = s.targets[0].clone();
+                    if let DataPlaneInterNodeCommand::CatchUpAssignment(a) = s.message {
+                        out.push((target, a));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn catch_up_redrives_to_every_unconfirmed_member() {
+        let members = vec![node("node-1"), node("y"), node("z")];
+        let (mut raft, seg0) = raft_with_seeded_catch_up(members.clone());
+
+        let redrives = drain_catch_up_redrives(&mut raft);
+        let mut targets: Vec<NodeId> = redrives.iter().map(|(t, _)| t.clone()).collect();
+        targets.sort();
+        let mut expected = members.clone();
+        expected.sort();
+        assert_eq!(targets, expected, "re-drive reaches every member");
+
+        // Each assignment carries the segment's sealed bounds + full replica set
+        // (the receiver picks its own source from it).
+        for (_, a) in &redrives {
+            assert_eq!(a.segment_key, seg0);
+            assert_eq!(a.shard_group_id, TEST_SHARD);
+            assert_eq!(a.start_entry_id, 0);
+            assert_eq!(a.sealed_end_entry_id, 100);
+            assert_eq!(a.replica_set, members);
+        }
+    }
+
+    #[test]
+    fn catch_up_repairs_dropped_on_step_down() {
+        let (mut raft, _) = raft_with_seeded_catch_up(vec![node("node-1"), node("y")]);
+        // A higher term deposes the leader → leader-volatile tracker is cleared.
+        raft.step_down(raft.current_term + 1);
+        assert!(raft.catch_up.is_empty());
+        assert!(drain_catch_up_redrives(&mut raft).is_empty());
+    }
+
+    #[test]
+    fn reseed_catch_up_reconstructs_the_tracker_on_takeover() {
+        let members = vec![node("node-1"), node("y"), node("z")];
+        let (mut raft, seg0) = raft_with_seeded_catch_up(members.clone());
+
+        // Simulate the takeover gap: the leader-volatile tracker is empty, but the
+        // sealed segment is still under-replicated in the state machine.
+        raft.catch_up.clear();
+        assert!(drain_catch_up_redrives(&mut raft).is_empty());
+
+        raft.reseed_catch_up();
+
+        let redrives = drain_catch_up_redrives(&mut raft);
+        for (_, a) in &redrives {
+            assert_eq!(a.segment_key, seg0);
+            assert_eq!(a.sealed_end_entry_id, 100);
+        }
+        let mut targets: Vec<NodeId> = redrives.iter().map(|(t, _)| t.clone()).collect();
+        targets.sort();
+        let mut expected = members;
+        expected.sort();
+        assert_eq!(
+            targets, expected,
+            "reseed re-drives every member of the sealed segment"
+        );
     }
 
     #[test]

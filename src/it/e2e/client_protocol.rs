@@ -5,8 +5,8 @@ use turmoil::Builder;
 use crate::StartUp;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
-    ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchRequest, NodeState,
-    ProduceRequest, RangeProgressSignal,
+    ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, FetchRequest,
+    NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
 };
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::{default_env, send_request};
@@ -574,6 +574,302 @@ fn produce_then_fetch_hot() -> turmoil::Result {
     sim.run()
 }
 
+/// Prerequisite for sealed-segment repair: the leader-initiated seal pipeline must
+/// commit a `RollSegment` end-to-end. Produce a few records, let the segment age
+/// out, and confirm the active segment rolls to a successor whose `start_offset`
+/// advanced past 0 — which only a *known-end* seal produces (an unknown-end roll
+/// opens the successor at 0). Without a known-end sealed segment there is nothing
+/// for repair to reassign, so this gates the repair e2e.
+#[test]
+#[serial_test::serial]
+fn age_seal_rolls_the_active_segment() -> turmoil::Result {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(180))
+        .tcp_capacity(4096)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+    ] {
+        sim.host(name, move || async move {
+            let me = turmoil::lookup(name);
+            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
+                .iter()
+                .filter(|(n, _)| *n != name)
+                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+                .collect();
+            let mut env = default_env(idx, name.to_string(), cp, rp);
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            // Force a fast age-based seal.
+            env.max_segment_age_secs = 5;
+            env.segment_age_check_interval_secs = 1;
+            StartUp::with_env(env, 0).run().await?;
+            Ok(())
+        });
+    }
+
+    sim.client("test-client", async {
+        const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        const TOPIC: &str = "age-seal";
+
+        wait_for_cluster(&NODES, 3).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        // Real committed data so the seal carries a meaningful known end.
+        let leader = produce_until_acked(TOPIC, b"rec-0", &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = format!("rec-{i}").into_bytes();
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked by {leader:?}");
+        }
+
+        // The segment ages past `max_segment_age_secs`; the leader enqueues a
+        // SealRequest, the coordinator commits a RollSegment, and the active
+        // segment rolls. Poll DescribeTopic until the successor's start_offset
+        // advances past 0 (the known-end seal landed).
+        let mut rolled_start = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail
+                    .ranges
+                    .first()
+                    .and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                rolled_start = Some(seg.start_offset);
+                break;
+            }
+        }
+        assert!(
+            rolled_start.is_some(),
+            "active segment never rolled — the leader-initiated seal pipeline did not \
+             commit a RollSegment e2e (start_offset stayed 0)"
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// End-to-end sealed-segment repair. Produce + age-seal a segment, kill one of its
+/// replicas, and confirm the coordinator reassigns the segment to the spare node,
+/// which catches up and serves the old data on a cold fetch. Exercises the whole
+/// loop: SWIM death → reconcile → `ReassignSegment` → `CatchUpAssignment` →
+/// catch-up → cold-serve, across the control/data-plane seam.
+#[test]
+#[serial_test::serial]
+fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
+    use std::sync::{Arc, Mutex};
+
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(300))
+        .tcp_capacity(4096)
+        // Pin turmoil's RNG: it's randomly seeded by default, so network
+        // latency/ordering — and thus gossip-convergence timing — varies per run,
+        // making this multi-node test flaky. A fixed seed + deterministic node ids
+        // make the sim reproducible (CLAUDE.md "Testing").
+        .rng_seed(1)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // 4 nodes, RF=3 → the topic lands on 3, leaving one spare for the reassign.
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+        ("node-4", 4, 8084, 18004),
+    ] {
+        sim.host(name, move || async move {
+            let me = turmoil::lookup(name);
+            let seeds: Vec<String> = [
+                ("node-1", 18001u16),
+                ("node-2", 18002),
+                ("node-3", 18003),
+                ("node-4", 18004),
+            ]
+            .iter()
+            .filter(|(n, _)| *n != name)
+            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+            .collect();
+            let mut env = default_env(idx, name.to_string(), cp, rp);
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            // Pin the node-id suffix → deterministic hash-ring placement across runs
+            // (the default UUID is OS-random, which turmoil can't seed). This test
+            // never restarts a node, so a fixed id is safe. See CLAUDE.md "Testing".
+            env.node_id_suffix = Some("sim".to_string());
+            // Few vnodes → few Raft groups (~64 not ~1000), so SWIM has little
+            // shard-leader gossip to disseminate and the seal coordinator resolves
+            // reliably. At 256 the one-shot shard-leader announce can be evicted
+            // under gossip pressure before reaching a node (MAP-EMPTY) — a #135-class
+            // gap whose timing varies with per-process HashMap order. This test
+            // exercises repair, not gossip-under-load. See CLAUDE.md "Testing".
+            env.vnodes_per_node = 16;
+            // Seal by SIZE, not age: the size check is a pure byte-count on commit
+            // (deterministic), whereas age uses real wall-clock (`std::time::Instant`),
+            // which turmoil doesn't virtualize (CLAUDE.md "Testing"). 2 KiB rolls the
+            // ~1 KiB records once; a tiny limit would roll per-record into a storm.
+            env.segment_size_limit_bytes = 2048;
+            StartUp::with_env(env, 0).run().await?;
+            Ok(())
+        });
+    }
+
+    // The victim must be a *replica* of the sealed segment, but placement is
+    // ring-determined — only the client knows it at runtime. It picks one and
+    // hands it to the driver to crash.
+    let victim = Arc::new(Mutex::new(None::<String>));
+    let victim_w = victim.clone();
+
+    sim.client("test-client", async move {
+        const NODES: [(&str, u16); 4] = [
+            ("node-1", 8081),
+            ("node-2", 8082),
+            ("node-3", 8083),
+            ("node-4", 8084),
+        ];
+        const TOPIC: &str = "repair";
+
+        wait_for_cluster(&NODES, 4).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        // Produce three ~1 KiB records; with a 2 KiB size limit they roll the
+        // segment once (not per-record), sealing rec-0..2 into a known-end segment.
+        let rec = |i: usize| -> Vec<u8> {
+            let mut v = format!("rec-{i}").into_bytes();
+            v.resize(1024, b'-');
+            v
+        };
+        let leader = produce_until_acked(TOPIC, &rec(0), &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = rec(i);
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked");
+        }
+
+        // The age-seal rolls the segment; rec-0..2 now live in a sealed segment
+        // whose replica set the successor still carries. Capture the topic id too —
+        // the consumer reads the reassigned replica by id, not by name (it isn't a
+        // metadata peer), so a DescribeTopic resolves the id once up front.
+        let mut sealed = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail
+                    .ranges
+                    .first()
+                    .and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                let replicas = seg
+                    .replica_set
+                    .iter()
+                    .map(|r| r.node_id.clone())
+                    .collect::<Vec<String>>();
+                sealed = Some((detail.topic_id, replicas));
+                break;
+            }
+        }
+        let (topic_id, replicas) = sealed.expect("segment never sealed");
+        assert_eq!(replicas.len(), 3, "RF=3");
+
+        // Spare = the node not in the replica set; victim = a replica to kill.
+        let spare = NODES
+            .iter()
+            .copied()
+            .find(|(n, _)| !replicas.iter().any(|r| r.starts_with(n)))
+            .expect("a spare node");
+        let victim_node = NODES
+            .iter()
+            .map(|(n, _)| *n)
+            .find(|n| replicas.iter().any(|r| r.starts_with(n)))
+            .expect("a replica to kill");
+        tracing::info!(
+            "[REPAIR] sealed replicas={replicas:?} spare={spare:?} victim={victim_node}"
+        );
+        *victim_w.lock().unwrap() = Some(victim_node.to_string());
+
+        // The driver crashes the victim; the coordinator then reassigns the sealed
+        // segment to the spare, which catches up. Poll a cold by-id fetch against
+        // the spare — it holds the bytes but isn't a metadata peer, so a by-name
+        // fetch couldn't resolve there — until it serves the old data.
+        let mut served = false;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let fetch =
+                ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
+                    topic_id,
+                    range_id: 0,
+                    entry_id: 0,
+                    max_bytes: 1 << 20,
+                }));
+            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+                send_request(spare.0, spare.1, fetch).await
+                && !entries.is_empty()
+                && entries[0].data[..] == rec(0)[..]
+            {
+                served = true;
+                break;
+            }
+        }
+        assert!(
+            served,
+            "spare {spare:?} never caught up and served the reassigned sealed segment"
+        );
+
+        Ok(())
+    });
+
+    // Driver: step until the client has chosen a victim, crash it, then run out.
+    while victim.lock().unwrap().is_none() {
+        assert!(
+            sim.elapsed() < Duration::from_secs(150),
+            "client never chose a victim"
+        );
+        sim.step()?;
+    }
+    let victim_node = victim.lock().unwrap().clone().unwrap();
+    tracing::info!(
+        "[REPAIR] crashing {victim_node} at {}s",
+        sim.elapsed().as_secs()
+    );
+    sim.crash(victim_node);
+
+    sim.run()
+}
+
 // ── produce/fetch e2e helpers ──────────────────────────────────────────────
 
 /// Wait until every node sees `expected` alive members. Topic creation emits the
@@ -666,4 +962,26 @@ async fn produce_to(topic: &str, payload: &[u8], node: (&str, u16)) -> bool {
         send_request(node.0, node.1, req).await,
         ClientResponse::DataPlane(DataPlaneResponse::Produced { .. })
     )
+}
+
+/// Fetch a topic's metadata, following a `TopicMetadataRedirect` to the owner.
+async fn describe_topic(topic: &str, nodes: &[(&str, u16)]) -> Option<TopicDetail> {
+    let req =
+        ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic { name: topic.into() });
+    for &(host, port) in nodes {
+        match send_request(host, port, req.clone()).await {
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) => return Some(d),
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect { owner }) => {
+                if let Some(&(owner_host, owner_port)) =
+                    nodes.iter().find(|(n, _)| owner.node_id.starts_with(n))
+                    && let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) =
+                        send_request(owner_host, owner_port, req.clone()).await
+                {
+                    return Some(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

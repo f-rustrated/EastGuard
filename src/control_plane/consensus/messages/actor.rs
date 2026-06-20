@@ -4,7 +4,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::{NodeDead, ShardGroupId};
 use crate::control_plane::metadata::{TopicMeta, TopicStats};
-use crate::data_plane::messages::command::{SealBoundaryReport, SegmentAssignmentAck};
+use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
 
 use super::command::{
     CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, InboundRaftRpc, MetadataProposal,
@@ -56,6 +56,10 @@ pub enum MultiRaftActorCommand {
     /// A survivor's reply to a leader-crash `SealBoundaryQuery` — its durable extent
     /// for the segment, gathered to recover the committed seal end.
     SealBoundaryReport(SealBoundaryReport),
+    /// A replica's confirmation that it holds a reassigned sealed segment through
+    /// `sealed_end`. Clears the member from the coordinator's catch-up re-drive so
+    /// the heartbeat sweep stops re-announcing the assignment.
+    CatchUpAck(CatchUpAck),
 }
 
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {

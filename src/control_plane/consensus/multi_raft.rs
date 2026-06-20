@@ -14,7 +14,7 @@ use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
+    CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -145,6 +145,15 @@ impl MultiRaft {
         let target_members = self.topology.group_ring_members(shard_group_id);
 
         self.reconcile_membership(shard_group_id, target_members);
+
+        // Takeover backstop: the catch-up tracker is leader-volatile, so a repair
+        // in flight when leadership changed left it empty here. Re-seed it; the
+        // heartbeat sweep re-drives until each member confirms.
+        if let Some(raft) = self.groups.get_mut(&shard_group_id)
+            && raft.is_leader()
+        {
+            raft.reseed_catch_up();
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
@@ -169,6 +178,20 @@ impl MultiRaft {
             });
 
         self.reconcile_membership(shard_group_id, target_members);
+
+        // Backstop the one-shot `AnnounceShardLeader` (#135 class): re-announce our
+        // leadership each ring check so a node that missed the original gossip
+        // converges (without it, its empty shard-leader map drops every
+        // `SendToCoordinator` — seals, catch-up acks — forever). Spread across
+        // groups by the per-group timer; receivers that already know it no-op
+        // (term-monotonic). Announce-only — emphatically not a reconcile.
+        if let Some(event) = self
+            .groups
+            .get(&shard_group_id)
+            .and_then(|g| g.shard_leader_refresh())
+        {
+            self.pending_events.push(event);
+        }
     }
 
     fn reconcile_membership(
@@ -233,6 +256,9 @@ impl MultiRaft {
             }
             MultiRaftActorCommand::SealBoundaryReport(report) => {
                 self.handle_seal_boundary_report(report);
+            }
+            MultiRaftActorCommand::CatchUpAck(ack) => {
+                self.handle_catch_up_ack(ack);
             }
         }
     }
@@ -523,6 +549,15 @@ impl MultiRaft {
         {
             self.execute_seal_step(step);
         }
+    }
+
+    /// Route a catch-up confirmation to the owning group's `Raft`, which clears the
+    /// member and prunes the repair once all confirm. Mirrors `handle_assignment_ack`.
+    fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+        let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
+            return;
+        };
+        raft.handle_catch_up_ack(ack);
     }
 
     fn execute_seal_step(&mut self, step: SealEndStep) {
@@ -970,6 +1005,64 @@ mod tests {
         store.add_group(&shard(42, vec![node("n2"), node("n3")]));
 
         assert!(!store.groups.contains_key(&ShardGroupId(42)));
+    }
+
+    /// The ring-check re-announces shard leadership (the #135 backstop for the
+    /// one-shot `AnnounceShardLeader`) only when this node leads the group — a
+    /// follower's ring-check emits nothing.
+    #[test]
+    fn ring_check_re_announces_leadership_only_when_leader() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+
+        // Group 1: single-node → leader on election. Group 2: two-node, no
+        // election → this node stays a follower.
+        store.add_group(&shard(1, vec![me.clone()]));
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::ElectionTimeout {
+                shard_group_id: ShardGroupId(1),
+                epoch: u64::MAX,
+            },
+        ));
+        store.add_group(&shard(2, vec![me.clone(), node("n2")]));
+        store.flush(); // drain the initial LeaderChange + add_group dirt
+
+        // Leader's ring-check → exactly one re-announce, for its group.
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: ShardGroupId(1),
+            },
+        ));
+        assert_eq!(
+            shard_leader_refreshes(&store.flush()),
+            vec![(ShardGroupId(1), me.clone())],
+            "leader re-announces its shard leadership on the ring-check"
+        );
+
+        // Follower's ring-check → nothing.
+        store.handle_consensus(RaftProtocolMessage::Timeout(
+            RaftTimeoutCallback::RingCheckTimeout {
+                shard_group_id: ShardGroupId(2),
+            },
+        ));
+        assert!(
+            shard_leader_refreshes(&store.flush()).is_empty(),
+            "a follower does not re-announce"
+        );
+    }
+
+    fn shard_leader_refreshes(events: &[RaftEvent]) -> Vec<(ShardGroupId, NodeId)> {
+        events
+            .iter()
+            .filter_map(|e| {
+                if let RaftEvent::ShardLeaderRefresh(lc) = e {
+                    Some((lc.shard_group_id, lc.leader_node_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]

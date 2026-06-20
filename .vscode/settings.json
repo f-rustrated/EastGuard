@@ -1,0 +1,7 @@
+{
+    // Stops rust-analyzer from dimming out #[cfg(not(test))] 
+    // and other feature-gated blocks.
+    "rust-analyzer.diagnostics.disabled": [
+        "inactive-code"
+    ]
+}

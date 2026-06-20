@@ -41,9 +41,17 @@ impl DataTransportActor {
                                 state.send(&cmd.targets, &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                             }
                             DataTransportCommand::SendToCoordinator(cmd) => {
-                                let Ok(Some(entry)) = swim_tx.resolve_shard_leader(cmd.shard_group_id).await else {
-                                    tracing::debug!("No shard leader for {:?}, SealRequest will retry via timeout", cmd.shard_group_id);
-                                    continue;
+                                // DIAGNOSTIC: split the drop into map-empty vs query-error.
+                                let entry = match swim_tx.resolve_shard_leader(cmd.shard_group_id).await {
+                                    Ok(Some(entry)) => entry,
+                                    Ok(None) => {
+                                        tracing::debug!("coordinator resolve MAP-EMPTY for {:?}, will retry via timeout", cmd.shard_group_id);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("coordinator resolve QUERY-ERR for {:?}: {e}, will retry via timeout", cmd.shard_group_id);
+                                        continue;
+                                    }
                                 };
                                 state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                             }
