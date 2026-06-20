@@ -112,6 +112,12 @@ pub struct Environment {
     #[arg(long, env = "SEAL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
     pub seal_request_timeout_secs: u64,
 
+    /// Orphan-GC sweep interval, and the grace before a recovered segment is eligible for
+    /// reclaim: a restarted node keeps its on-disk segments for this long so re-fill can
+    /// reassign and reuse them (the lottery) before the sweep deletes the ones it didn't.
+    #[arg(long, env = "ORPHAN_GC_INTERVAL_SECS", default_value_t = 300)]
+    pub orphan_gc_interval_secs: u64,
+
     /// Test-only: pin the node-id suffix so the hash-ring placement is deterministic
     /// under the turmoil sim. Unset in prod, where each start gets a fresh UUID so a
     /// restarted node is a distinct identity. See `resolve_node_id` + CLAUDE.md.
@@ -295,6 +301,7 @@ impl Environment {
             segment_size_limit: self.segment_size_limit_bytes,
             batch_max_bytes: self.batch_max_bytes,
             seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
+            orphan_gc_interval: std::time::Duration::from_secs(self.orphan_gc_interval_secs),
             data_dir: self.data_dir_path(),
         }
     }
@@ -308,6 +315,7 @@ pub struct DataNodeConfig {
     pub segment_size_limit: u64,
     pub batch_max_bytes: usize,
     pub seal_request_timeout: std::time::Duration,
+    pub orphan_gc_interval: std::time::Duration,
     pub data_dir: PathBuf,
 }
 
@@ -347,6 +355,7 @@ mod tests {
             segment_size_limit_bytes: 1024 * 1024 * 1024,
             batch_max_bytes: 10 * 1024 * 1024,
             seal_request_timeout_secs: 5,
+            orphan_gc_interval_secs: 300,
         }
     }
 

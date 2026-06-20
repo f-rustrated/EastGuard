@@ -119,6 +119,16 @@ impl RecoveredSegments {
             .filter_map(|(key, scan)| scan.last_entry_id.map(|id| (*key, id)))
     }
 
+    /// `(segment, start_offset, highest verified entry id)` for every segment with a
+    /// verified prefix — the local inventory carries `start_offset` (the filename base)
+    /// alongside the cursor so orphan GC can locate the file to delete.
+    pub(crate) fn inventory(&self) -> impl Iterator<Item = (SegmentKey, u64, u64)> + '_ {
+        self.0.iter().filter_map(|(key, scan)| {
+            scan.last_entry_id
+                .map(|end| (*key, scan.start_entry_id, end))
+        })
+    }
+
     /// Records that `entry_id` was just appended to `key`'s segment file,
     /// advancing its cursor.
     ///

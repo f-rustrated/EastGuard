@@ -12,21 +12,22 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::data_plane::cold_read::DEFAULT_POOL_SIZE;
 use crate::data_plane::messages::DataPlaneMessage;
-use crate::data_plane::messages::command::DataPlaneCommand;
+use crate::data_plane::messages::command::{DataPlaneCommand, OrphanGcCheck, OrphanGcSignal};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{TICK_PERIOD_10_MS, TICK_PERIOD_100_MS};
 
 use flume::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct DataPlaneActor;
 
 impl DataPlaneActor {
-    /// Spawn the data-plane worker thread together with its three schedulers
-    /// (batch-flush, replication, segment-age) and the bridge that forwards
-    /// scheduler callbacks (tokio mpsc) into the worker's flume mailbox.
+    /// Spawn the data-plane worker thread together with its three schedulers (batch-flush,
+    /// replication, segment-age) and the bridge that forwards scheduler callbacks (tokio
+    /// mpsc) into the worker's flume mailbox, plus a self-contained orphan-GC ticker.
     pub fn spawn(
         node_id: NodeId,
         config: DataNodeConfig,
@@ -65,6 +66,8 @@ impl DataPlaneActor {
                 }
             }
         });
+
+        run_orphan_gc(config.orphan_gc_interval, &tx);
 
         let self_tx = DataPlaneSender(tx.clone());
 
@@ -120,6 +123,35 @@ impl DataPlaneActor {
         tokio::spawn(worker);
         DataPlaneSender(tx)
     }
+}
+
+// Self-contained orphan-GC ticker: every interval it prompts the worker on the worker's own mailbox (an `OrphanGcCheck` carrying an mpsc sender back to here) and
+// awaits the reply. The worker replies `Stop` once there are no strays left, ending
+// the ticker — so a node with nothing to reclaim ticks at most once. The interval
+// doubles as the recovery grace: re-fill has run by the first tick.
+fn run_orphan_gc(internal: Duration, tx: &Sender<DataPlaneMessage>) {
+    let gc_tx = tx.clone();
+
+    tokio::spawn(async move {
+        let (reply_tx, mut reply_rx) = mpsc::channel::<OrphanGcSignal>(1);
+        loop {
+            tokio::time::sleep(internal).await;
+            let check = OrphanGcCheck {
+                reply: reply_tx.clone(),
+            };
+            if gc_tx
+                .send_async(DataPlaneMessage::Command(check.into()))
+                .await
+                .is_err()
+            {
+                break; // worker mailbox closed
+            }
+            match reply_rx.recv().await {
+                Some(OrphanGcSignal::KeepTicking) => {}
+                Some(OrphanGcSignal::Stop) | None => break,
+            }
+        }
+    });
 }
 
 #[derive(Clone)]

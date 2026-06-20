@@ -4,20 +4,59 @@ use std::path::PathBuf;
 use super::segment_scan::RecoveredSegments;
 use crate::data_plane::SegmentKey;
 
-/// Built only by [`LocalInventory::from_recovered`];
-/// maps each locally-held segment to the highest entry id a CRC-complete batch put on disk
+/// What recovery verified for one on-disk segment: its `start_offset` (the filename base,
+/// needed to locate the file) and `verified_end` (the highest entry id a CRC-complete batch
+/// put on disk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InventoryEntry {
+    pub(crate) start_offset: u64,
+    pub(crate) verified_end: u64,
+}
+
+/// Built only by [`LocalInventory::from_recovered`]; maps each locally-held segment to what
+/// recovery verified for it.
 #[derive(Debug)]
-pub(crate) struct LocalInventory(HashMap<SegmentKey, u64>);
+pub(crate) struct LocalInventory(HashMap<SegmentKey, InventoryEntry>);
 
 impl LocalInventory {
     pub(crate) fn from_recovered(recovered: &RecoveredSegments) -> Self {
-        Self(recovered.cursors().collect())
+        Self(
+            recovered
+                .inventory()
+                .map(|(key, start_offset, verified_end)| {
+                    (
+                        key,
+                        InventoryEntry {
+                            start_offset,
+                            verified_end,
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Highest verified entry id held for `key`, or `None` if the segment holds
     /// no verified data locally.
     pub(crate) fn get(&self, key: &SegmentKey) -> Option<u64> {
-        self.0.get(key).copied()
+        self.0.get(key).map(|e| e.verified_end)
+    }
+
+    /// `(segment, start_offset)` for every recovered segment — the orphan-GC sweep's
+    /// candidate set. Each is a stray until the cluster (re)assigns it here.
+    pub(crate) fn orphan_candidates(&self) -> impl Iterator<Item = (SegmentKey, u64)> + '_ {
+        self.0.iter().map(|(key, e)| (*key, e.start_offset))
+    }
+
+    /// No recovered segments remain — orphan GC is done and need not re-arm.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drop a segment from the inventory — either reused (now a live registered segment) or
+    /// deleted as a stray. Once dropped it is no longer an orphan candidate.
+    pub(crate) fn remove(&mut self, key: &SegmentKey) {
+        self.0.remove(key);
     }
 }
 
@@ -39,26 +78,41 @@ mod tests {
     }
 
     #[test]
-    fn inventory_is_exactly_the_post_replay_cursors() {
+    fn inventory_carries_start_offset_and_verified_end() {
         let a = seg(1, 0);
         let b = seg(2, 0);
         let mut recovered = RecoveredSegments::default();
-        recovered.advance(a, 5); // from-nothing segment, base/cursor 5
+        recovered.advance(a, 5); // from-nothing segment, base 5 / cursor 5
         recovered.advance(b, 0);
-        recovered.advance(b, 1); // cursor 1
+        recovered.advance(b, 1); // base 0 / cursor 1
 
         let inv = LocalInventory::from_recovered(&recovered);
-        let cursors: HashMap<SegmentKey, u64> = recovered.cursors().collect();
-        assert_eq!(inv.0, cursors);
-        assert_eq!(inv.0.get(&a), Some(&5));
-        assert_eq!(inv.0.get(&b), Some(&1));
+        // `get` exposes the verified end (unchanged semantics).
+        assert_eq!(inv.get(&a), Some(5));
+        assert_eq!(inv.get(&b), Some(1));
+        // orphan candidates expose the start_offset (the filename base).
+        let candidates: HashMap<SegmentKey, u64> = inv.orphan_candidates().collect();
+        assert_eq!(candidates.get(&a), Some(&5));
+        assert_eq!(candidates.get(&b), Some(&0));
     }
 
     #[test]
     fn empty_recovery_yields_an_empty_inventory() {
         // The empty-disk path commit 14 constructs through.
         let inv = LocalInventory::from_recovered(&RecoveredSegments::default());
-        assert!(inv.0.is_empty());
+        assert_eq!(inv.orphan_candidates().count(), 0);
+    }
+
+    #[test]
+    fn remove_drops_the_candidate() {
+        let a = seg(1, 0);
+        let mut recovered = RecoveredSegments::default();
+        recovered.advance(a, 0);
+        let mut inv = LocalInventory::from_recovered(&recovered);
+        assert_eq!(inv.get(&a), Some(0));
+        inv.remove(&a);
+        assert_eq!(inv.get(&a), None);
+        assert_eq!(inv.orphan_candidates().count(), 0);
     }
 
     #[test]
@@ -68,7 +122,7 @@ mod tests {
             inventory: inv,
             data_dir: PathBuf::from("/var/lib/eastguard/data"),
         };
-        assert!(output.inventory.0.is_empty());
+        assert_eq!(output.inventory.orphan_candidates().count(), 0);
         assert_eq!(output.data_dir, PathBuf::from("/var/lib/eastguard/data"));
     }
 }

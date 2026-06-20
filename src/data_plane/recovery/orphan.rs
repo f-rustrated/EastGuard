@@ -10,7 +10,6 @@
 //! Only an unnamed segment is deleted — destruction is cluster-confirmed and last.
 //!
 //! See `diagrams/data-plane/d5_crash_recovery.md` § "Orphaned Data Cleanup".
-#![allow(dead_code)] // staged: OrphanCandidate + delete are complete; the live GC trigger is wired later
 
 use std::io;
 use std::path::Path;
@@ -26,6 +25,13 @@ pub(crate) struct OrphanCandidate {
 }
 
 impl OrphanCandidate {
+    pub(crate) fn new(segment_key: SegmentKey, start_offset: u64) -> Self {
+        Self {
+            segment_key,
+            start_offset,
+        }
+    }
+
     /// Delete this orphan's segment file. Precondition (the GC handler's): the coordinator
     /// has just answered that no replica set names this node for the segment — destruction
     /// is cluster-confirmed and last. Returns the key so the caller can drop its inventory
