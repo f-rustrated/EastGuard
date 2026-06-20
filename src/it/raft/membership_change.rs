@@ -255,26 +255,21 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
     sim.run()
 }
 
-/// 4-node-aware cluster (3 hosts + 1 ring-known spare), RF=3. The group
-/// starts as [n1, n2, n3]; n4 exists in the topology (so the ring will pick
-/// it as a replacement) but doesn't run a Raft host. Crash n3 — the
-/// leader's reconciliation must propose RemovePeer(n3) **paired** with
-/// AddPeer(n4), and the surviving leaders' view of group membership must
-/// converge to include n4 in place of n3.
+/// 4-node-aware cluster (3 hosts + 1 ring-known spare), RF=3. The group starts as
+/// [n1, n2, n3]; n4 exists in the topology (ring-eligible) but doesn't run a Raft host.
+/// Crash n3 — the leader proposes a committed RemovePeer(n3) and **stages n4 as a
+/// non-voting learner** (the learner model). n4 is promoted to a voter only once it has
+/// caught up — but n4 isn't a real host, so it never acks, never catches up, and never
+/// becomes a voter. The surviving leaders' voter set converges to [n1, n2]: n3 dropped,
+/// n4 NOT a voter. This is exactly what the learner model protects against — a staged
+/// replacement that can't participate never joins the quorum, so it can't freeze it.
 ///
-/// `sim.crash("node-3")` actually kills the host so its Raft loop stops
-/// responding (returning early from the test function doesn't — the
-/// `tokio::spawn`'d Raft tasks would otherwise keep elections cycling). The
-/// surviving hosts inject `NodeDead(n3)` after the crash so the leader's
+/// `sim.crash("node-3")` actually kills the host so its Raft loop stops responding.
+/// The surviving hosts inject `NodeDead(n3)` after the crash so the leader's
 /// `handle_node_death` runs with an actually-unreachable n3.
-///
-/// n4 is intentionally not a sim host — production would route n4 into the
-/// group via a SWIM `HandleNodeJoin`, but the mock SWIM here doesn't
-/// propagate joins. We verify the consensus-side outcome (n4 in the leaders'
-/// peer sets) without requiring n4 to functionally replicate.
 #[test]
 #[serial_test::serial]
-fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
+fn node_death_removes_dead_voter_unreachable_spare_stays_non_voting() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(1))
         .simulation_duration(Duration::from_secs(360))
@@ -358,23 +353,26 @@ fn node_death_triggers_pair_remove_and_add_with_spare() -> turmoil::Result {
 
         assert!(
             !n1_peers.contains(&n3),
-            "node-1 peers should not include node-3 after reconciliation, got peers={:?} n2_peers={:?}",
-            n1_peers, n2_peers
+            "node-1 must drop the dead node-3, got peers={:?} n2_peers={:?}",
+            n1_peers,
+            n2_peers
         );
         assert!(
             !n2_peers.contains(&n3),
-            "node-2 peers should not include node-3 after reconciliation, got {:?}",
+            "node-2 must drop the dead node-3, got {:?}",
             n2_peers
         );
 
+        // n4 is staged as a learner but never catches up (not a real host), so it is
+        // never promoted to a voter — the voter set stays [n1, n2].
         assert!(
-            n1_peers.contains(&n4),
-            "node-1 peers should include node-4 after paired AddPeer, got {:?}",
+            !n1_peers.contains(&n4),
+            "node-1 must NOT promote the unreachable spare node-4 to a voter, got {:?}",
             n1_peers
         );
         assert!(
-            n2_peers.contains(&n4),
-            "node-2 peers should include node-4 after paired AddPeer, got {:?}",
+            !n2_peers.contains(&n4),
+            "node-2 must NOT promote the unreachable spare node-4 to a voter, got {:?}",
             n2_peers
         );
 

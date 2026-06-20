@@ -3,7 +3,6 @@ use crate::control_plane::consensus::messages::{
     CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
     MultiRaftActorCommand, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
-use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{LeaderlessSegments, Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::storage::RaftStorage;
@@ -682,16 +681,11 @@ impl MultiRaft {
             if !raft.is_leader() || raft.has_peer(node_id) {
                 continue;
             }
-            if let Err(e) = raft.propose(RaftCommand::AddPeer(node_id.clone())) {
-                tracing::warn!(
-                    "Join-triggered AddPeer({:?}) on {:?} rejected: {:?}",
-                    node_id,
-                    group.id,
-                    e
-                );
-                continue;
+            // Stage the joining node as a non-voting learner; it's promoted to a voter
+            // once it has caught up (never added straight to the quorum).
+            if raft.stage_learner(node_id.clone()) {
+                self.dirty.insert(group.id);
             }
-            self.dirty.insert(group.id);
         }
     }
 
@@ -1565,11 +1559,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_node_death_pairs_remove_with_ring_aware_add() {
-        // Cluster has 5 nodes on the ring; the test group has 3 of them.
-        // After the leader processes the death of one member, it must propose
-        // RemovePeer for the dead node AND AddPeer for a ring-picked replacement
-        // chosen from the 2 non-member nodes.
+    fn handle_node_death_removes_voter_and_stages_replacement_as_learner() {
+        // 5 nodes on the ring, group has 3. On a member's death the leader proposes
+        // ONLY RemovePeer (committed); the ring-picked replacement is **staged as a
+        // non-voting learner**, not added straight to the voting quorum (which would
+        // freeze commits if it can't yet participate). It's promoted via AddPeer only
+        // once caught up — which can't happen in this no-replication unit test, so it
+        // stays a learner.
         let (storage, _) = temp_storage();
         let me = node("me");
         let peers = vec![node("n2"), node("n3")];
@@ -1586,41 +1582,32 @@ mod tests {
         store.handle_node_death(node("n2"));
         store.flush();
 
+        // Log carries only the removal — no immediate AddPeer.
         let proposals = proposals_after_become_leader(&store);
         assert_eq!(
-            proposals.len(),
-            2,
-            "death of a peer must propose exactly RemovePeer + paired AddPeer (got {:?})",
+            proposals,
+            vec![RaftCommand::RemovePeer(node("n2"))],
+            "death proposes only RemovePeer; the replacement is staged as a learner (got {:?})",
             proposals
         );
-        assert_eq!(proposals[0], RaftCommand::RemovePeer(node("n2")));
 
-        let add_target = match &proposals[1] {
-            RaftCommand::AddPeer(t) => t.clone(),
-            other => panic!("expected AddPeer paired with RemovePeer, got {:?}", other),
-        };
-        let current: HashSet<NodeId> = group_members.iter().cloned().collect();
-        assert!(
-            !current.contains(&add_target),
-            "AddPeer target {:?} must not be a current group member",
-            add_target
-        );
-        assert_ne!(
-            add_target,
-            node("n2"),
-            "AddPeer target must not be the just-removed peer"
+        // The ring-picked replacement (n4 or n5) is a non-voting learner, not a voter.
+        let raft = store.groups.get(&TEST_GROUP_ID).expect("group exists");
+        assert_eq!(
+            raft.learner_count(),
+            1,
+            "exactly one ring replacement staged as a learner"
         );
         assert!(
-            add_target == node("n4") || add_target == node("n5"),
-            "AddPeer target must be one of the ring's non-member nodes, got {:?}",
-            add_target
+            raft.is_learner(&node("n4")) || raft.is_learner(&node("n5")),
+            "a ring non-member must be staged as a learner"
         );
     }
 
     #[test]
     fn handle_node_death_degrades_when_pool_exhausted() {
-        // Cluster is exactly [me, n2] — once n2 dies, no replacement is
-        // available. RemovePeer must still be proposed; AddPeer must not.
+        // Cluster is exactly [me, n2] — once n2 dies, no replacement is available.
+        // RemovePeer must still be proposed; nothing is staged.
         let (storage, _) = temp_storage();
         let me = node("me");
         let peers = vec![node("n2")];
@@ -1638,7 +1625,13 @@ mod tests {
         assert_eq!(
             proposals,
             vec![RaftCommand::RemovePeer(node("n2"))],
-            "exhausted pool must yield only the removal, no paired addition"
+            "exhausted pool must yield only the removal"
+        );
+        let raft = store.groups.get(&TEST_GROUP_ID).expect("group exists");
+        assert_eq!(
+            raft.learner_count(),
+            0,
+            "no replacement available → nothing staged"
         );
     }
 
@@ -1698,12 +1691,20 @@ mod tests {
         ));
         store.flush();
 
+        // The learner model stages the newly-assigned member as a non-voting learner
+        // (catch-up before promotion) rather than adding it straight to the voting
+        // quorum. It's promoted via AddPeer once caught up — which can't happen for a
+        // node with no real replica here — so it stays a learner, never a voter.
+        let raft = store.groups.get(&gid).expect("group exists");
+        assert!(
+            raft.is_learner(&node("n4")),
+            "stable-leader ring check must stage the newly assigned member as a learner"
+        );
         let log = store.storage.load_state(gid.0).log;
         assert!(
-            log.iter()
+            !log.iter()
                 .any(|e| e.command == RaftCommand::AddPeer(node("n4"))),
-            "stable-leader ring check must propose AddPeer for the newly \
-             assigned member (log: {:?})",
+            "the learner must not be added straight to the quorum (no immediate AddPeer, log: {:?})",
             log.iter().map(|e| &e.command).collect::<Vec<_>>()
         );
     }

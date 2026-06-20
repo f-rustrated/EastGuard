@@ -10,6 +10,7 @@ use crate::connections::protocol::{
 };
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::{default_env, send_request};
+use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
 
 /// CreateTopic eventually succeeds when tried across all nodes (exactly one is the leader),
 /// and DescribeCluster returns a non-empty node list from every node.
@@ -1072,6 +1073,241 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
     sim.crash(victim_node);
 
     sim.run()
+}
+
+/// End-to-end: a sealed-segment repair survives the *coordinator* dying. We seal a
+/// segment (like the sibling repair test), then crash the topic shard group's *metadata
+/// leader* — the node that would otherwise drive the reassign. Its death opens a
+/// no-leader window (ds-rsm #10); a new leader is elected and its takeover backstop
+/// (raft-actor #2, #6) re-runs reconcile, reassigns the dead member's sealed segment to
+/// the spare, and drives the catch-up to completion. The spare then serves the old data
+/// by id — proving the repair is not stranded by losing the coordinator.
+#[test]
+#[serial_test::serial]
+fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
+    use std::sync::{Arc, Mutex};
+
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(600))
+        .tcp_capacity(4096)
+        .rng_seed(1)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+        ("node-4", 4, 8084, 18004),
+    ] {
+        sim.host(name, move || async move {
+            let me = turmoil::lookup(name);
+            let seeds: Vec<String> = [
+                ("node-1", 18001u16),
+                ("node-2", 18002),
+                ("node-3", 18003),
+                ("node-4", 18004),
+            ]
+            .iter()
+            .filter(|(n, _)| *n != name)
+            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+            .collect();
+            let mut env = default_env(idx, name.to_string(), cp, rp);
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            env.node_id_suffix = Some("sim".to_string());
+            env.vnodes_per_node = 16;
+            env.segment_size_limit_bytes = 2048;
+            StartUp::with_env(env, 0).run().await?;
+            Ok(())
+        });
+    }
+
+    // The metadata leader is ring-/election-determined; only the client learns it at
+    // runtime. It seals a segment, resolves the leader, and hands it to the driver.
+    let victim = Arc::new(Mutex::new(None::<String>));
+    let victim_w = victim.clone();
+
+    sim.client("test-client", async move {
+        const NODES: [(&str, u16); 4] = [
+            ("node-1", 8081),
+            ("node-2", 8082),
+            ("node-3", 8083),
+            ("node-4", 8084),
+        ];
+        const TOPIC: &str = "coordcrash";
+
+        wait_for_cluster(&NODES, 4).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        // Seal a segment: three ~1 KiB records roll once under the 2 KiB limit, sealing
+        // rec-0 (entry id 0) into a known-end segment.
+        let rec = |i: usize| -> Vec<u8> {
+            let mut v = format!("rec-{i}").into_bytes();
+            v.resize(1024, b'-');
+            v
+        };
+        let leader = produce_until_acked(TOPIC, &rec(0), &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = rec(i);
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked");
+        }
+
+        let mut sealed = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail
+                    .ranges
+                    .first()
+                    .and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                let replicas = seg
+                    .replica_set
+                    .iter()
+                    .map(|r| r.node_id.clone())
+                    .collect::<Vec<String>>();
+                sealed = Some((detail.topic_id, replicas));
+                break;
+            }
+        }
+        let (topic_id, replicas) = sealed.expect("segment never sealed");
+        assert_eq!(replicas.len(), 3, "RF=3");
+
+        // Resolve the topic shard group's metadata leader — the coordinator we crash.
+        let (shard_group_id, leader_id) = metadata_leader(TOPIC, &NODES)
+            .await
+            .expect("metadata leader never resolved");
+        let victim_node = NODES
+            .iter()
+            .map(|(n, _)| *n)
+            .find(|n| leader_id.starts_with(n))
+            .expect("leader maps to a node");
+        // The leader must hold the sealed segment, so its death actually needs a repair.
+        assert!(
+            replicas.contains(&leader_id),
+            "metadata leader {leader_id} not in sealed replica set {replicas:?}"
+        );
+        let spare = NODES
+            .iter()
+            .copied()
+            .find(|(n, _)| !replicas.iter().any(|r| r.starts_with(n)))
+            .expect("a spare node");
+        tracing::info!(
+            "[COORDCRASH] shard={shard_group_id} leader/victim={leader_id} spare={spare:?}"
+        );
+        *victim_w.lock().unwrap() = Some(victim_node.to_string());
+
+        // Survivors only — a connect to the crashed coordinator would hang to timeout.
+        let live: Vec<(&str, u16)> = NODES
+            .iter()
+            .copied()
+            .filter(|(n, _)| *n != victim_node)
+            .collect();
+
+        // A new metadata leader (≠ the crashed one) must emerge — the repair below can
+        // only be driven by it. Any one survivor's view suffices (non-members reply None).
+        let mut took_over = false;
+        'lead: for _ in 0..150 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for &(h, p) in &live {
+                if let Ok(Some(new_leader)) = query_shard_leader(h, p, shard_group_id).await
+                    && new_leader != leader_id
+                {
+                    took_over = true;
+                    break 'lead;
+                }
+            }
+        }
+        assert!(
+            took_over,
+            "no new metadata leader after crashing {leader_id} — takeover did not happen"
+        );
+
+        // The new leader's takeover backstop reassigns the dead coordinator's sealed
+        // segment to the spare, which catches up and serves rec-0 by id.
+        let mut served = false;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let fetch =
+                ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
+                    topic_id,
+                    range_id: 0,
+                    entry_id: 0,
+                    max_bytes: 1 << 20,
+                }));
+            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+                send_request(spare.0, spare.1, fetch).await
+                && !entries.is_empty()
+                && entries[0].data[..] == rec(0)[..]
+            {
+                served = true;
+                break;
+            }
+        }
+        assert!(
+            served,
+            "repair stranded: spare {spare:?} never caught up and served rec-0 after the coordinator crash"
+        );
+
+        Ok(())
+    });
+
+    while victim.lock().unwrap().is_none() {
+        assert!(
+            sim.elapsed() < Duration::from_secs(200),
+            "client never chose a victim"
+        );
+        sim.step()?;
+    }
+    let victim_node = victim.lock().unwrap().clone().unwrap();
+    tracing::info!(
+        "[COORDCRASH] crashing metadata leader {victim_node} at {}s",
+        sim.elapsed().as_secs()
+    );
+    sim.crash(victim_node);
+
+    sim.run()
+}
+
+/// Resolve the topic shard group's metadata leader: `(shard_group_id, leader node id)`.
+/// Reads the group + members from any node (a ring lookup), then polls members for an
+/// authoritative Raft leader (a non-member's `GetShardLeader` is `None`).
+async fn metadata_leader(topic: &str, nodes: &[(&str, u16)]) -> Option<(u64, String)> {
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut info = None;
+        for &(h, p) in nodes {
+            if let Ok(Some(d)) = query_shard_info(h, p, topic.as_bytes()).await {
+                info = Some(d);
+                break;
+            }
+        }
+        let Some(d) = info else { continue };
+        for member in d.member_node_ids.iter() {
+            if let Some(&(h, p)) = nodes.iter().find(|(n, _)| member.starts_with(n))
+                && let Ok(Some(leader)) = query_shard_leader(h, p, d.shard_group_id).await
+            {
+                return Some((d.shard_group_id, leader));
+            }
+        }
+    }
+    None
 }
 
 // ── produce/fetch e2e helpers ──────────────────────────────────────────────

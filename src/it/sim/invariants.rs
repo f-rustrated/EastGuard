@@ -192,7 +192,7 @@ pub async fn assert_topic_visible_on_quorum(
     );
 }
 
-pub(super) async fn query_shard_leader(
+pub(in crate::it) async fn query_shard_leader(
     host: &str,
     port: u16,
     shard_group_id: u64,
@@ -216,7 +216,7 @@ pub(super) async fn query_shard_leader(
     }
 }
 
-pub(super) async fn query_shard_info(
+pub(in crate::it) async fn query_shard_info(
     host: &str,
     port: u16,
     key: &[u8],
