@@ -260,6 +260,7 @@ impl Raft {
         }
         changed |= self.reconcile_peers(topology, &live_set);
         changed |= self.reconcile_segments(&live_set);
+        changed |= self.refill_under_replicated_segments(topology);
 
         // Record a ring observation every run, whether routine RingCheck or
         // leadership change. During a leadership change, evictions are paused
@@ -521,7 +522,7 @@ impl Raft {
         changed |= self.repair_segments(sealed, live_set, |segment_key, new_replica_set| {
             ReassignSegment {
                 segment_key,
-                new_replica_set,
+                replica_set: new_replica_set,
             }
             .into()
         });
@@ -556,6 +557,44 @@ impl Raft {
                     e
                 ),
             }
+        }
+        changed
+    }
+
+    /// Re-fill known-end sealed segments left under-replicated by an earlier death
+    fn refill_under_replicated_segments(&mut self, topology: &TopologyReader) -> bool {
+        let under_replicated_sealed_segments: Box<[(SegmentKey, Vec<NodeId>)]> = self
+            .state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.under_replicated_sealed_segments(topology.replication_factor()))
+            .collect();
+
+        let mut changed = false;
+        for (segment_key, mut replica_set) in under_replicated_sealed_segments {
+            let excluded: HashSet<NodeId> = replica_set.iter().cloned().collect();
+            let need = topology.replication_factor() - replica_set.len(); // > 0 by the query's `len < rf` filter
+            let additions = topology.ring_replacements_for(self.shard_group_id, &excluded, need);
+            if additions.is_empty() {
+                continue; // ring can't grow it yet — retried on the next ring check
+            }
+
+            replica_set.extend(additions.iter().cloned());
+            let cmd = ReassignSegment {
+                segment_key,
+                replica_set,
+            };
+
+            if let Err(e) = self.propose(cmd.into()) {
+                tracing::warn!(
+                    "under-replication re-fill for {:?} on {:?} rejected: {:?}",
+                    segment_key,
+                    self.shard_group_id,
+                    e
+                );
+                continue;
+            }
+            changed = true;
         }
         changed
     }
@@ -3744,13 +3783,162 @@ mod tests {
             &after[before..]
         );
         assert_eq!(reassigns[0].segment_key, seg0);
-        for member in &reassigns[0].new_replica_set {
+        for member in &reassigns[0].replica_set {
             assert!(
                 live.contains(member),
                 "reassigned replica_set must be all-live, found {:?}",
                 member
             );
         }
+    }
+
+    // ── Capacity-return re-fill of under-replicated sealed segments (raft-actor.md #10) ──
+
+    /// Single-node leader of a *real* ring group id, so `ring_replacements_for` resolves
+    /// against the topology (unlike `single_node_raft_as_leader`'s synthetic `TEST_SHARD`).
+    /// Single-node → quorum 1, so CreateTopic / RollSegment commit and apply trivially.
+    fn single_node_leader_of(group_id: ShardGroupId) -> Raft {
+        let mut raft = Raft::new(
+            node("node-1"),
+            HashSet::new(),
+            RaftPersistentState::default(),
+            0,
+            group_id,
+            test_timer_seqs(),
+        );
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: group_id,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+        assert_eq!(raft.role, Role::Leader);
+        raft
+    }
+
+    /// Topic "t" in `raft` with segment 0 sealed at a known end carrying `sealed_set`
+    /// (plus a fresh active segment on the same set) — so only the sealed segment's
+    /// replication level is under test.
+    fn seal_segment_zero_with(raft: &mut Raft, sealed_set: Vec<NodeId>) -> SegmentKey {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        create_topic_in_raft(raft, "t", sealed_set.clone());
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: sealed_set,
+                end_entry_id: Some(100),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        raft.simulate_flush_and_apply();
+        seg0
+    }
+
+    fn reassigns_in(proposals: &[RaftCommand]) -> Vec<(SegmentKey, ReplicaSet)> {
+        proposals
+            .iter()
+            .filter_map(|c| match c {
+                RaftCommand::Metadata(MetadataCommand::ReassignSegment(r)) => {
+                    Some((r.segment_key, r.replica_set.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refill_grows_under_replicated_sealed_segment_to_a_ring_member() {
+        // A sealed segment shrunk to [node-1, node-2] (len 2 < RF 3) with NO dead member —
+        // exactly what an earlier death-with-no-replacement leaves behind. The ring for the
+        // group is {node-1, node-2, node-3}, so re-fill must reassign it to add node-3.
+        let reader = topology_reader_with(&["node-1", "node-2", "node-3"]);
+        let group = reader
+            .shard_groups_for_node(&node("node-1"))
+            .first()
+            .expect("node-1 must own a group")
+            .clone();
+        let mut raft = single_node_leader_of(group.id);
+        let seg0 = seal_segment_zero_with(&mut raft, vec![node("node-1"), node("node-2")]);
+
+        let before = proposals_after_become_leader(&raft).len();
+        assert!(
+            raft.refill_under_replicated_segments(&reader),
+            "an under-replicated sealed segment with a ring member to spare must re-fill"
+        );
+        let after = proposals_after_become_leader(&raft);
+        let reassigns = reassigns_in(&after[before..]);
+
+        assert_eq!(
+            reassigns.len(),
+            1,
+            "exactly one ReassignSegment (tail: {:?})",
+            &after[before..]
+        );
+        let (key, new_set) = &reassigns[0];
+        assert_eq!(*key, seg0, "the re-fill must target the sealed segment");
+        assert_eq!(new_set.len(), 3, "grown back to RF");
+        for n in ["node-1", "node-2", "node-3"] {
+            assert!(
+                new_set.contains(&node(n)),
+                "{n} must be in the re-filled set {new_set:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refill_is_a_noop_for_a_segment_already_at_rf() {
+        // Sealed at full RF (3 members) → not under-replicated → nothing proposed. This is
+        // what stops ordinary ring drift from churning well-replicated segments.
+        let reader = topology_reader_with(&["node-1", "node-2", "node-3"]);
+        let group = reader
+            .shard_groups_for_node(&node("node-1"))
+            .first()
+            .expect("node-1 must own a group")
+            .clone();
+        let mut raft = single_node_leader_of(group.id);
+        seal_segment_zero_with(
+            &mut raft,
+            vec![node("node-1"), node("node-2"), node("node-3")],
+        );
+
+        let before = proposals_after_become_leader(&raft).len();
+        assert!(
+            !raft.refill_under_replicated_segments(&reader),
+            "a segment already at RF must not be re-filled"
+        );
+        assert_eq!(
+            proposals_after_become_leader(&raft).len(),
+            before,
+            "no proposal for an at-RF segment"
+        );
+    }
+
+    #[test]
+    fn refill_is_a_noop_when_the_ring_cannot_grow_the_set() {
+        // Under-replicated [node-1, node-2] (len 2 < RF 3) but the ring has only those two
+        // nodes — every ring member is already in the set, so there is nothing to add.
+        // Re-fill proposes nothing; the segment waits for capacity (next ring check).
+        let reader = topology_reader_with(&["node-1", "node-2"]);
+        let group = reader
+            .shard_groups_for_node(&node("node-1"))
+            .first()
+            .expect("node-1 must own a group")
+            .clone();
+        let mut raft = single_node_leader_of(group.id);
+        seal_segment_zero_with(&mut raft, vec![node("node-1"), node("node-2")]);
+
+        let before = proposals_after_become_leader(&raft).len();
+        assert!(
+            !raft.refill_under_replicated_segments(&reader),
+            "no ring member outside the set → no proposal"
+        );
+        assert_eq!(
+            proposals_after_become_leader(&raft).len(),
+            before,
+            "segment stays under-replicated until the ring grows"
+        );
     }
 
     // ── Catch-up re-drive: seed at ReassignSegment apply, sweep until acked ──
@@ -3777,7 +3965,7 @@ mod tests {
         raft.propose(
             MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: seg0,
-                new_replica_set: new_set,
+                replica_set: new_set,
             })
             .into(),
         )

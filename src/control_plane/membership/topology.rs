@@ -118,6 +118,12 @@ impl TopologyReader {
             .map(|g| g.members.clone().into_boxed_slice())
     }
 
+    /// The cluster's configured replication factor — the target replica-set size a
+    /// segment converges back toward after a death shrank it (capacity-return re-fill).
+    pub(crate) fn replication_factor(&self) -> usize {
+        self.0.load().replication_factor()
+    }
+
     /// The current shard-leader entry for `group_id` from the lock-free snapshot, or
     /// `None` if the gossiped map has no entry yet (the caller falls back to the ring).
     pub(crate) fn shard_leader(&self, group_id: ShardGroupId) -> Option<ShardLeaderEntry> {

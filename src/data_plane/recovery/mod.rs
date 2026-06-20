@@ -9,6 +9,7 @@
 
 pub(crate) mod index_rebuild;
 pub(crate) mod inventory;
+pub(crate) mod orphan;
 pub(crate) mod replay;
 pub(crate) mod segment_scan;
 pub(crate) mod wal_scan;

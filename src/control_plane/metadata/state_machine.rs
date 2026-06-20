@@ -155,12 +155,12 @@ impl MetadataStateMachine {
 
         // The dispatch announces the desired replica set; receivers reconcile, so
         // we only carry the sealed bounds (the catch-up target) alongside it.
-        if segment.reassign(cmd.new_replica_set.clone())? {
+        if segment.reassign(cmd.replica_set.clone())? {
             Ok(SegmentReassigned {
                 segment_key: cmd.segment_key,
                 start_entry_id: segment.start_entry_id,
                 sealed_end: segment.end_entry_id,
-                new_replica_set: cmd.new_replica_set,
+                new_replica_set: cmd.replica_set,
             }
             .into())
         } else {
@@ -401,7 +401,7 @@ mod tests {
         let result = sm
             .apply(MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: sealed,
-                new_replica_set: replacement_set(),
+                replica_set: replacement_set(),
             }))
             .unwrap();
 
@@ -427,7 +427,7 @@ mod tests {
 
         sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
             segment_key: sealed,
-            new_replica_set: replacement_set(),
+            replica_set: replacement_set(),
         }))
         .unwrap();
 
@@ -436,7 +436,7 @@ mod tests {
         let again = sm
             .apply(MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: sealed,
-                new_replica_set: replacement_set(),
+                replica_set: replacement_set(),
             }))
             .unwrap();
         assert_eq!(again, ApplyResult::Noop);
@@ -451,7 +451,7 @@ mod tests {
 
         let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
             segment_key: active,
-            new_replica_set: replacement_set(),
+            replica_set: replacement_set(),
         }));
         assert!(matches!(result, Err(MetadataError::SegmentNotSealed)));
     }
@@ -464,7 +464,7 @@ mod tests {
 
         let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
             segment_key: unknown,
-            new_replica_set: replacement_set(),
+            replica_set: replacement_set(),
         }));
         assert!(matches!(result, Err(MetadataError::SegmentNotFound)));
     }

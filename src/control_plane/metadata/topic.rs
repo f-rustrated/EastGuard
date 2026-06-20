@@ -182,6 +182,27 @@ impl TopicMeta {
         out.into_boxed_slice()
     }
 
+    pub(crate) fn under_replicated_sealed_segments(
+        &self,
+        replication_factor: usize,
+    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+        self.ranges
+            .values()
+            .flat_map(|range| {
+                range
+                    .segments
+                    .values()
+                    .filter(|seg| seg.is_sealed_and_under_replicated(replication_factor))
+                    .map(|seg| {
+                        (
+                            SegmentKey::new(self.id, range.range_id, seg.segment_id),
+                            seg.replica_set.clone(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     /// Every known-end sealed segment, with the data a `CatchUpAssignment` needs.
     /// The takeover reseed (raft-actor.md #9) tracks these so a repair in flight
     /// when leadership changed isn't stranded.

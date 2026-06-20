@@ -74,4 +74,10 @@ impl SegmentMeta {
         self.replica_set = new_replica_set;
         Ok(true)
     }
+
+    pub(crate) fn is_sealed_and_under_replicated(&self, replication_factor: usize) -> bool {
+        self.state == SegmentMetaState::Sealed
+            && self.end_entry_id.is_some()
+            && self.replica_set.len() < replication_factor
+    }
 }

@@ -55,7 +55,7 @@ pub struct DeleteTopic {
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct ReassignSegment {
     pub segment_key: SegmentKey,
-    pub new_replica_set: Vec<NodeId>,
+    pub replica_set: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
