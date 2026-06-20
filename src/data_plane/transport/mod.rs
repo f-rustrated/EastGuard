@@ -5,6 +5,7 @@ mod writers;
 use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::membership::TopologyReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
 
@@ -22,6 +23,7 @@ impl DataTransportActor {
         data_plane_tx: DataPlaneSender,
         mut from_actor: mpsc::Receiver<Box<[DataTransportCommand]>>,
         swim_tx: SwimSender,
+        topology: TopologyReader,
     ) {
         let mut state = TransportState::new(node_id);
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -41,19 +43,21 @@ impl DataTransportActor {
                                 state.send(&cmd.targets, &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                             }
                             DataTransportCommand::SendToCoordinator(cmd) => {
-                                // DIAGNOSTIC: split the drop into map-empty vs query-error.
-                                let entry = match swim_tx.resolve_shard_leader(cmd.shard_group_id).await {
-                                    Ok(Some(entry)) => entry,
-                                    Ok(None) => {
-                                        tracing::debug!("coordinator resolve MAP-EMPTY for {:?}, will retry via timeout", cmd.shard_group_id);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("coordinator resolve QUERY-ERR for {:?}: {e}, will retry via timeout", cmd.shard_group_id);
-                                        continue;
-                                    }
-                                };
-                                state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
+                                // Resolve the coordinator from the lock-free topology snapshot — no
+                                // actor round-trip. The shard-leader map is a cache; on a miss
+                                // (MAP-EMPTY, #135) fall back to the ring's members and broadcast —
+                                // the Raft leader acts, followers no-op (propose → NotLeader). The
+                                // ring is the durable group membership; the map only accelerates the
+                                // common case.
+                                if let Some(entry) = topology.shard_leader(cmd.shard_group_id) {
+                                    state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
+                                } else if let Some(members) = topology.group_ring_members(cmd.shard_group_id)
+                                    && !members.is_empty()
+                                {
+                                    state.send(&members, &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
+                                } else {
+                                    tracing::debug!("coordinator unresolved for {:?} (no leader, no ring members); will retry via timeout", cmd.shard_group_id);
+                                }
                             }
                             DataTransportCommand::DisconnectPeer(peer_id) => {
                                 state.disconnect(peer_id);

@@ -136,6 +136,7 @@ impl StartUp {
             data_plane_tx.clone(),
             data_transport_rx,
             swim_sender.clone(),
+            topology_reader.clone(),
         ));
 
         MultiRaftActor::spawn(
