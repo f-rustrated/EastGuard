@@ -106,6 +106,14 @@ pub struct Raft {
     peers: HashSet<NodeId>,
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
+    /// LEADER-ONLY: non-voting members the leader is catching up before promotion.
+    /// Replicated to (like peers) but **excluded from the commit quorum** — a node
+    /// that can't yet participate (e.g. a freshly ring-assigned host without a local
+    /// instance) is staged here and never counted, so it can't freeze the group. It is
+    /// promoted to a voting peer via a committed `AddPeer` only once caught up
+    /// (`maybe_promote_learner`). Re-derived on takeover (leader-volatile). Disjoint
+    /// from `peers`; empty on followers.
+    learner_states: HashMap<NodeId, PeerState>,
     state_machine: MetadataStateMachine,
     election_jitter: ElectionJitter,
     timer_seqs: TimerSeqs,
@@ -168,6 +176,7 @@ impl Raft {
             pending_proposals: Vec::new(),
             leaderless_segments: Vec::new(),
             peer_states: HashMap::new(),
+            learner_states: HashMap::new(),
             election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
             election_epoch: 0,
@@ -241,14 +250,11 @@ impl Raft {
                 if *member == self.node_id || !live_set.contains(member) {
                     continue;
                 }
-                match self.propose(RaftCommand::AddPeer(member.clone())) {
-                    Ok(_) => changed = true,
-                    Err(e) => tracing::warn!(
-                        "AddPeer({:?}) on {:?} rejected: {:?}",
-                        member,
-                        self.shard_group_id,
-                        e
-                    ),
+                // Stage the ring member as a non-voting learner; it's promoted to a
+                // voter once caught up. Never added straight to the quorum — an
+                // un-participating ring member would otherwise freeze commits.
+                if self.stage_learner(member.clone()) {
+                    changed = true;
                 }
             }
         }
@@ -733,6 +739,17 @@ impl Raft {
         self.peers.contains(node_id)
     }
 
+    /// A node the leader is catching up as a non-voting learner (not yet a voter).
+    #[cfg(test)]
+    pub(crate) fn is_learner(&self, node_id: &NodeId) -> bool {
+        self.learner_states.contains_key(node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn learner_count(&self) -> usize {
+        self.learner_states.len()
+    }
+
     /// Minimum number of nodes needed for a majority (strict majority).
     /// For N nodes: N/2 + 1. Examples: 3→2, 4→3, 5→3.
     fn quorum(&self) -> u32 {
@@ -963,6 +980,8 @@ impl Raft {
 
         // Peer state tracker needs to be re-initialized on every leadership transition
         self.peer_states.clear();
+        // Learners are leader-volatile catch-up state; reconcile re-stages them.
+        self.learner_states.clear();
         // #135: ring confidence is leader-volatile — re-earn it.
         self.ring_observation_streak = None;
         for peer_id in self.peers.iter() {
@@ -1030,6 +1049,7 @@ impl Raft {
         self.role = Role::Follower;
         self.current_leader = None;
         self.peer_states.clear();
+        self.learner_states.clear();
         self.confirmed_assignment.clear();
         self.catch_up.clear();
     }
@@ -1043,7 +1063,7 @@ impl Raft {
             return;
         }
 
-        let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
+        let peers: Vec<NodeId> = self.replication_targets();
 
         for peer_id in peers {
             self.send_append_entries(peer_id);
@@ -1137,8 +1157,61 @@ impl Raft {
         })
     }
 
+    /// Everyone the leader replicates to: voting peers plus catching-up learners.
+    fn replication_targets(&self) -> Vec<NodeId> {
+        self.peer_states
+            .keys()
+            .chain(self.learner_states.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Stage a node as a non-voting learner the leader catches up before promoting it
+    /// to a voter. No-op if it's self, already a voter, or already a learner. Starts
+    /// catch-up immediately. Excluded from the commit quorum until promoted, so a node
+    /// that never participates (e.g. a freshly ring-assigned host with no local group
+    /// instance yet) can never freeze the group. Leader-only.
+    pub(crate) fn stage_learner(&mut self, node: NodeId) -> bool {
+        if self.role != Role::Leader
+            || node == self.node_id
+            || self.peers.contains(&node)
+            || self.learner_states.contains_key(&node)
+        {
+            return false;
+        }
+        self.learner_states.insert(
+            node.clone(),
+            PeerState {
+                next_index: self.log_last_index() + 1,
+                match_index: 0,
+            },
+        );
+        self.send_append_entries(node);
+        true
+    }
+
+    /// Once a learner has replicated every committed entry, promote it to a voting peer
+    /// via a committed `AddPeer` (apply moves it out of `learner_states`). Gated by the
+    /// one-conf-change-at-a-time rule. A learner that never catches up (match stays 0)
+    /// never reaches the bar, so it stays a non-voter and never blocks quorum.
+    fn maybe_promote_learner(&mut self, node: &NodeId) {
+        if self.has_uncommitted_membership_change() {
+            return;
+        }
+        let Some(ls) = self.learner_states.get(node) else {
+            return;
+        };
+        if self.commit_index > 0 && ls.match_index >= self.commit_index {
+            let _ = self.propose(RaftCommand::AddPeer(node.clone()));
+        }
+    }
+
     fn send_append_entries(&mut self, peer_id: NodeId) {
-        let peer_state = match self.peer_states.get(&peer_id) {
+        let peer_state = match self
+            .peer_states
+            .get(&peer_id)
+            .or_else(|| self.learner_states.get(&peer_id))
+        {
             Some(ps) => ps,
             None => return,
         };
@@ -1193,6 +1266,7 @@ impl Raft {
         } else if self.role != Role::Follower {
             self.role = Role::Follower;
             self.peer_states.clear();
+            self.learner_states.clear();
         }
         self.current_leader = Some(req.leader_id.clone());
         self.reset_election_timer();
@@ -1245,15 +1319,27 @@ impl Raft {
             return;
         }
 
-        if let Some(peer_state) = self.peer_states.get_mut(&resp.node_id) {
+        // The responder may be a voting peer or a catching-up learner.
+        let node_id = resp.node_id.clone();
+        let is_voter = self.peer_states.contains_key(&node_id);
+        let peer_state = if is_voter {
+            self.peer_states.get_mut(&node_id)
+        } else {
+            self.learner_states.get_mut(&node_id)
+        };
+        if let Some(peer_state) = peer_state {
             if resp.success {
                 peer_state.match_index = resp.last_log_index;
                 peer_state.next_index = resp.last_log_index + 1;
                 self.try_advance_commit_index();
+                // A caught-up learner graduates to a voting peer.
+                if !is_voter {
+                    self.maybe_promote_learner(&node_id);
+                }
             } else {
                 // Decrement next_index and retry.
                 peer_state.next_index = peer_state.next_index.saturating_sub(1).max(1);
-                self.send_append_entries(resp.node_id);
+                self.send_append_entries(node_id);
             }
         }
     }
@@ -1402,14 +1488,15 @@ impl Raft {
         if node_id == self.node_id {
             return;
         }
+        // Promotion: a learner graduating to a voter carries its catch-up progress, so
+        // the new voter isn't reset to match_index 0 (which would stall commits anew).
+        let carried = self.learner_states.remove(&node_id);
         if self.peers.insert(node_id.clone()) && self.role == Role::Leader {
-            self.peer_states.insert(
-                node_id,
-                PeerState {
-                    next_index: self.log_last_index() + 1,
-                    match_index: 0,
-                },
-            );
+            let state = carried.unwrap_or(PeerState {
+                next_index: self.log_last_index() + 1,
+                match_index: 0,
+            });
+            self.peer_states.insert(node_id, state);
         }
     }
 
@@ -1417,6 +1504,7 @@ impl Raft {
     /// `RemovePeer` log entry commits. Never call directly — the peer set is part
     /// of the replicated state machine and must only mutate through the log.
     fn apply_remove_peer(&mut self, node_id: NodeId) {
+        self.learner_states.remove(&node_id);
         if self.peers.remove(&node_id) {
             self.peer_states.remove(&node_id);
             self.events.push(RaftEvent::DisconnectPeer(node_id));
@@ -1452,7 +1540,7 @@ impl Raft {
         let index = self.log_last_index();
 
         // Immediately replicate to all peers.
-        let peers: Vec<NodeId> = self.peers.iter().cloned().collect();
+        let peers: Vec<NodeId> = self.replication_targets();
         for peer_id in peers {
             self.send_append_entries(peer_id);
         }
@@ -1467,13 +1555,13 @@ impl Raft {
         Ok(index)
     }
 
-    /// Replace a peer at the *intent* level: propose `RemovePeer(remove)`
-    /// then a paired `AddPeer(replacement)`, or degrade-and-proceed when no
-    /// replacement is available. The two stay as separate log entries —
-    /// Raft's single-server-change rule means we cannot atomically swap two
-    /// members in one entry without joint consensus, so committing them in
-    /// order (each step a one-server change) is what keeps old-config and
-    /// new-config majorities overlapping.
+    /// Replace a dead peer: propose a committed `RemovePeer(remove)` (a single-server
+    /// change the live majority can always commit), then **stage** the replacement as a
+    /// non-voting learner rather than adding it straight to the quorum. The learner is
+    /// promoted to a voter via a committed `AddPeer` only once it has caught up
+    /// (`maybe_promote_learner`) — so a replacement that can't yet participate (e.g. no
+    /// local group instance) never joins the quorum and can't freeze the group.
+    /// Degrades to remove-only when no replacement is available.
     #[tracing::instrument(level = "debug", skip_all, fields(
         group = self.shard_group_id.0,
         remove = %remove,
@@ -1486,7 +1574,7 @@ impl Raft {
     ) -> bool {
         if let Err(e) = self.propose(RaftCommand::RemovePeer(remove.clone())) {
             tracing::debug!(
-                "RemovePeer({:?}) on {:?} rejected: {:?} — skipping paired AddPeer",
+                "RemovePeer({:?}) on {:?} rejected: {:?} — skipping replacement staging",
                 remove,
                 self.shard_group_id,
                 e
@@ -1501,14 +1589,9 @@ impl Raft {
             );
             return true;
         };
-        if let Err(e) = self.propose(RaftCommand::AddPeer(replacement.clone())) {
-            tracing::warn!(
-                "Paired AddPeer({:?}) on {:?} rejected: {:?}",
-                replacement,
-                self.shard_group_id,
-                e
-            );
-        }
+        // Stage the replacement as a non-voting learner (promoted once caught up), not
+        // added straight to the quorum alongside the just-removed dead node.
+        self.stage_learner(replacement);
 
         true
     }
@@ -1680,6 +1763,17 @@ impl crate::test_traits::TAssertInvariant for Raft {
                     self.peer_states.len(),
                     self.peers.len(),
                 );
+                // Invariant: learners are non-voting and disjoint from voters — a node
+                // is never both — and self is never a learner. Learners are replicated
+                // to but excluded from the commit quorum until promoted via `AddPeer`.
+                for learner in self.learner_states.keys() {
+                    assert!(
+                        !self.peers.contains(learner),
+                        "node {:?} is both a voter and a learner",
+                        learner,
+                    );
+                    assert_ne!(learner, &self.node_id, "self staged as a learner");
+                }
                 // Invariant: at most one leader per term. A snapshot can only check
                 // the local fragment of this: a leader must have voted for itself this
                 // term (and is therefore the only node that could have won this term).
@@ -1696,6 +1790,11 @@ impl crate::test_traits::TAssertInvariant for Raft {
                     self.peer_states.is_empty(),
                     "non-leader carries peer_states ({} entries)",
                     self.peer_states.len(),
+                );
+                assert!(
+                    self.learner_states.is_empty(),
+                    "non-leader carries learner_states ({} entries)",
+                    self.learner_states.len(),
                 );
             }
         }
@@ -3206,11 +3305,11 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_peers_pairs_each_dead_with_replacement() {
+    fn reconcile_peers_removes_dead_and_stages_replacement_as_learner() {
         // 3-node raft as node-1 (peers = [node-2, node-3]). Topology has
-        // [node-1, node-3, node-4] — so node-2 is dead per SWIM, and node-4
-        // is the ring-eligible replacement. Reconciliation must propose
-        // RemovePeer(node-2) + AddPeer(node-4).
+        // [node-1, node-3, node-4] — node-2 is dead, node-4 is the ring replacement.
+        // Reconciliation proposes RemovePeer(node-2) and **stages node-4 as a learner**
+        // (promoted to a voter only once caught up), never a paired AddPeer.
         let mut raft = three_node_raft_as_leader("node-1");
         let topology = topology_reader_with(&["node-1", "node-3", "node-4"]);
         let live = live_set(&["node-1", "node-3", "node-4"]);
@@ -3219,16 +3318,14 @@ mod tests {
 
         let proposals = proposals_after_become_leader(&raft);
         assert_eq!(
-            proposals.len(),
-            2,
-            "reconciliation must propose RemovePeer + AddPeer (got {:?})",
+            proposals,
+            vec![RaftCommand::RemovePeer(node("node-2"))],
+            "reconciliation proposes only RemovePeer; node-4 is staged as a learner (got {:?})",
             proposals
         );
-        assert_eq!(proposals[0], RaftCommand::RemovePeer(node("node-2")));
-        assert_eq!(
-            proposals[1],
-            RaftCommand::AddPeer(node("node-4")),
-            "node-4 is the only ring-eligible node not already in the group"
+        assert!(
+            raft.is_learner(&node("node-4")),
+            "node-4 (the ring replacement) must be staged as a non-voting learner"
         );
     }
 
