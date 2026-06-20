@@ -1291,6 +1291,211 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
     sim.run()
 }
 
+/// End-to-end catch-up redrive under message loss. Seal a segment, then **partition
+/// the spare from the coordinator** before killing one of the segment's replicas (a
+/// *non-coordinator* one, so the coordinator survives to drive the repair). With the
+/// link down, the coordinator's `CatchUpAssignment` to the spare — and every heartbeat
+/// redrive of it — are dropped. After a window we heal the link; the next redrive
+/// delivers, the spare pulls the segment from a surviving source (never partitioned),
+/// and serves the old data. Guards the redrive hardening (`raft-actor.md` #9): a lost
+/// assignment can't strand the repair. A single-link partition doesn't kill the spare —
+/// SWIM refutes the resulting suspicion via indirect ping.
+#[test]
+#[serial_test::serial]
+fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
+    use std::sync::{Arc, Mutex};
+
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(400))
+        .tcp_capacity(4096)
+        .rng_seed(1)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    for (name, idx, cp, rp) in [
+        ("node-1", 1u32, 8081u16, 18001u16),
+        ("node-2", 2, 8082, 18002),
+        ("node-3", 3, 8083, 18003),
+        ("node-4", 4, 8084, 18004),
+    ] {
+        sim.host(name, move || async move {
+            let me = turmoil::lookup(name);
+            let seeds: Vec<String> = [
+                ("node-1", 18001u16),
+                ("node-2", 18002),
+                ("node-3", 18003),
+                ("node-4", 18004),
+            ]
+            .iter()
+            .filter(|(n, _)| *n != name)
+            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
+            .collect();
+            let mut env = default_env(idx, name.to_string(), cp, rp);
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            env.node_id_suffix = Some("sim".to_string());
+            env.vnodes_per_node = 16;
+            env.segment_size_limit_bytes = 2048;
+            StartUp::with_env(env, 0).run().await?;
+            Ok(())
+        });
+    }
+
+    // The victim (a non-coordinator replica) is ring-determined; the client picks it at
+    // runtime and hands it to the driver to crash.
+    let victim = Arc::new(Mutex::new(None::<String>));
+    let victim_w = victim.clone();
+
+    sim.client("test-client", async move {
+        const NODES: [(&str, u16); 4] = [
+            ("node-1", 8081),
+            ("node-2", 8082),
+            ("node-3", 8083),
+            ("node-4", 8084),
+        ];
+        const TOPIC: &str = "redrive";
+
+        wait_for_cluster(&NODES, 4).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+
+        let rec = |i: usize| -> Vec<u8> {
+            let mut v = format!("rec-{i}").into_bytes();
+            v.resize(1024, b'-');
+            v
+        };
+        let leader = produce_until_acked(TOPIC, &rec(0), &NODES)
+            .await
+            .expect("first produce never acked");
+        for i in 1..3 {
+            let payload = rec(i);
+            let mut acked = false;
+            for _ in 0..40 {
+                if produce_to(TOPIC, &payload, leader).await {
+                    acked = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert!(acked, "produce {i} not acked");
+        }
+
+        let mut sealed = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(detail) = describe_topic(TOPIC, &NODES).await
+                && let Some(seg) = detail
+                    .ranges
+                    .first()
+                    .and_then(|r| r.active_segment.as_ref())
+                && seg.start_offset > 0
+            {
+                let replicas = seg
+                    .replica_set
+                    .iter()
+                    .map(|r| r.node_id.clone())
+                    .collect::<Vec<String>>();
+                sealed = Some((detail.topic_id, replicas));
+                break;
+            }
+        }
+        let (topic_id, replicas) = sealed.expect("segment never sealed");
+        assert_eq!(replicas.len(), 3, "RF=3");
+
+        // The coordinator (metadata leader) drives the repair; crash a *different*
+        // replica so it survives, and partition the spare from it.
+        let (_group, leader_id) = metadata_leader(TOPIC, &NODES)
+            .await
+            .expect("metadata leader never resolved");
+        let coordinator = NODES
+            .iter()
+            .map(|(n, _)| *n)
+            .find(|n| leader_id.starts_with(n))
+            .expect("coordinator host");
+        let victim_node = NODES
+            .iter()
+            .map(|(n, _)| *n)
+            .find(|n| *n != coordinator && replicas.iter().any(|r| r.starts_with(n)))
+            .expect("a non-coordinator replica to kill");
+        let spare = NODES
+            .iter()
+            .copied()
+            .find(|(n, _)| !replicas.iter().any(|r| r.starts_with(n)))
+            .expect("a spare node");
+        tracing::info!("[REDRIVE] coordinator={coordinator} victim={victim_node} spare={spare:?}");
+
+        // Drop the coordinator→spare link, then trigger the repair: the assignment and
+        // its redrives are lost while partitioned.
+        turmoil::partition(spare.0, coordinator);
+        *victim_w.lock().unwrap() = Some(victim_node.to_string());
+
+        let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
+            topic_id,
+            range_id: 0,
+            entry_id: 0,
+            max_bytes: 1 << 20,
+        }));
+
+        // The death is detected, the segment reassigned, and the assignment (re)driven —
+        // all dropped while partitioned. Confirm the spare can't serve: with the
+        // assignment lost it has nothing to catch up from. (If it serves here, the
+        // partition didn't actually drop the assignment — the test would be vacuous.)
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        for _ in 0..5 {
+            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+                send_request(spare.0, spare.1, fetch.clone()).await
+            {
+                assert!(
+                    entries.is_empty() || entries[0].data[..] != rec(0)[..],
+                    "spare served rec-0 while partitioned — the catch-up assignment wasn't dropped"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        // Heal: the next redrive delivers; the spare pulls from a surviving source
+        // (never partitioned) and serves rec-0.
+        turmoil::repair(spare.0, coordinator);
+        let mut served = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+                send_request(spare.0, spare.1, fetch.clone()).await
+                && !entries.is_empty()
+                && entries[0].data[..] == rec(0)[..]
+            {
+                served = true;
+                break;
+            }
+        }
+        assert!(
+            served,
+            "redrive did not recover the dropped assignment: spare {spare:?} never served rec-0"
+        );
+
+        Ok(())
+    });
+
+    while victim.lock().unwrap().is_none() {
+        assert!(
+            sim.elapsed() < Duration::from_secs(200),
+            "client never chose a victim"
+        );
+        sim.step()?;
+    }
+    let victim_node = victim.lock().unwrap().clone().unwrap();
+    tracing::info!(
+        "[REDRIVE] crashing {victim_node} at {}s",
+        sim.elapsed().as_secs()
+    );
+    sim.crash(victim_node);
+
+    sim.run()
+}
+
 /// Resolve the topic shard group's metadata leader: `(shard_group_id, leader node id)`.
 /// Reads the group + members from any node (a ring lookup), then polls members for an
 /// authoritative Raft leader (a non-member's `GetShardLeader` is `None`).
