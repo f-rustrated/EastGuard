@@ -240,7 +240,8 @@ Port layout:
 | [D3: Segment Lifecycle Integration](d3_segment_roll_integration.md) | Size/time/failure seal triggers, lifecycle events | D2, metadata Phase 6 | Connect storage to metadata |
 | [D4: Consumer Range Tracking](d4_consumer_range_tracking.md) | Follow split/merge/seal transitions | D3 | Consumer discovers range changes |
 | [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
-| [D6: Produce/Consume API](d6_produce_consume_api.md) | Client produce/consume protocol, routing, connection management | D4, D5 | Client-facing protocol layer |
+| [D6: Produce/Consume API](d6_produce_consume_api.md) | Server-side produce/consume routing via redirects | D4, D5 | Server routing (client SDK: see clients/) |
+| [D7: Retention GC](d7_retention_gc.md) | Optional per-topic **age** retention; expire sealed segments oldest-first, reclaim files | D3, D5 | Opt-in, logical (time); keep-forever is the default. Disk capacity is a separate node-level concern |
 
 D1 defines the storage primitives (WAL, segment files, sparse index) and the threading model that drives them: DataPlaneActor on a dedicated OS thread (WAL + cache publish), lock-free per-segment `SegmentRingBuffer` (concurrent consumer reads without locking), and I/O thread pools (checkpoint writes + cold reads). D2–D5 extend the D1 foundation with replication, metadata integration, consumer tracking, and crash recovery. D6 adds the client-facing protocol layer (produce/consume wire format, connection management) — consumer tasks on tokio read directly from `SegmentRingBuffer`.
 
@@ -259,10 +260,14 @@ D3 (Segment Roll)   |
  v                  |
 D4 (Range Tracking) |
  |                  |
- ├──────────────────┘
- v
-D6 (Produce/Consume API)
+ ├──────────────────┤
+ v                  v
+D6 (Produce API)   D7 (Retention GC)   ← D7 also depends on D3
 ```
+
+D6 completes the **server-side** routing. The **client SDK** (producer, consumer,
+admin) that consumes those redirects is its own track — see
+[clients/client_roadmap.md](../clients/client_roadmap.md).
 
 ---
 
@@ -284,9 +289,6 @@ D6 (Produce/Consume API)
 ### Exactly-Once Semantics
 Producer idempotency keys, deduplication at segment leader. Requires producer session tracking.
 
-### Segment GC / Retention
-Deleting sealed segments past `retention_ms`. Triggered by periodic ticker, cascades `Deleting` state through metadata.
-
 ### Consumer Groups
 Multiple consumers sharing work across ranges. Offset commit tracking. Rebalancing on consumer join/leave. Consumer offset storage is a separate system concern — not part of the log storage layer.
 
@@ -304,6 +306,9 @@ Cold segments offloaded to object storage (S3). Hot segments on local disk. Cons
 
 ### Storage Health Heartbeat
 Periodic fsync-and-ack between segment replicas. Catches disk failure on idle segments (the one gap in the current failure detection model — see coverage matrix above).
+
+### Node Capacity / Write Backpressure
+Physical disk bounding, distinct from logical retention (D7). The data plane watches its own disk and, on crossing a high-water mark, stops taking new writes while still serving reads: in-flight segments it leads seal-and-relocate via the existing write-path failure path, and the node advertises an at-capacity bit (SWIM gossip) so capacity-aware placement excludes it from new segments. Decision-maker is the data plane (only it sees disk); the coordinator reacts in placement. Tiered storage is the relief valve for cold data instead of deletion.
 
 ---
 
