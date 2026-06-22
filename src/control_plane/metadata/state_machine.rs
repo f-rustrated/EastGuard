@@ -188,18 +188,19 @@ impl MetadataStateMachine {
         if deleted_ids.is_empty() {
             return Ok(ApplyResult::Noop);
         }
-        let deletions = deleted_ids
-            .iter()
-            .filter_map(|sid| {
-                range.segments.get(sid).map(|seg| {
-                    (
-                        SegmentKey::new(cmd.topic_id, cmd.range_id, *sid),
-                        seg.replica_set.clone(),
-                    )
-                })
-            })
-            .collect();
-        Ok(SegmentsDeleted { deletions }.into())
+        // Group the deleted segments by replica_set here.
+        let mut groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)> = Vec::new();
+        for sid in &deleted_ids {
+            let Some(seg) = range.segments.get(sid) else {
+                continue;
+            };
+            let key = SegmentKey::new(cmd.topic_id, cmd.range_id, *sid);
+            match groups.iter_mut().find(|(rs, _)| rs == &seg.replica_set) {
+                Some((_, keys)) => keys.push(key),
+                None => groups.push((seg.replica_set.clone(), vec![key])),
+            }
+        }
+        Ok(SegmentsDeleted { groups }.into())
     }
 
     fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
@@ -433,7 +434,9 @@ mod tests {
         let ApplyResult::SegmentsDeleted(d) = result else {
             panic!("expected SegmentsDeleted, got {result:?}");
         };
-        assert_eq!(d.deletions.len(), 2);
+        // All three sealed segments share one replica_set → a single group of 2 keys.
+        assert_eq!(d.groups.len(), 1);
+        assert_eq!(d.groups[0].1.len(), 2);
         assert_eq!(seg_state(&sm, t, SegmentId(0)), SegmentMetaState::Deleting);
         assert_eq!(seg_state(&sm, t, SegmentId(1)), SegmentMetaState::Deleting);
         assert_eq!(seg_state(&sm, t, SegmentId(2)), SegmentMetaState::Sealed);
@@ -450,7 +453,8 @@ mod tests {
         else {
             panic!("expected SegmentsDeleted");
         };
-        assert_eq!(d.deletions.len(), 3);
+        let total_keys: usize = d.groups.iter().map(|(_, keys)| keys.len()).sum();
+        assert_eq!(total_keys, 3);
         assert_eq!(seg_state(&sm, t, SegmentId(3)), SegmentMetaState::Active);
     }
 
