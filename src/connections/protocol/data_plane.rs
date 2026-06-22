@@ -86,11 +86,6 @@ pub enum DataPlaneResponse {
     Produced {
         entry_id: u64,
     },
-    RangeSplitting {
-        left_range_id: u64,
-        right_range_id: u64,
-        split_point: Box<[u8]>,
-    },
     // Fetch
     Fetched {
         entries: Box<[Entry]>,
@@ -105,12 +100,13 @@ pub enum DataPlaneResponse {
         start_entry_id: u64,
         committed_entry_id: u64,
     },
-    // Redirect errors — client reconnects and retries on the indicated node
-    NotLeader {
+    // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
+    // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
+    NotWriteLeader {
         leader_addr: Option<SocketAddr>,
     },
     ShardNotLocal {
-        hint_node: SocketAddr,
+        hint_node: Option<SocketAddr>,
     },
     TopicNotFound,
     InternalError(String),

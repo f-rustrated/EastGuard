@@ -1,11 +1,17 @@
 //! Control-plane wire types — topic lifecycle and metadata lookups.
 //!
-//! The server resolves the correct destination internally and forwards the
-//! request at most once. Clients never need to retry on a different node — on
-//! forwarding failure a generic error is returned. The one exception is
-//! `DescribeTopic`, which uses a redirect response rather than server-side
-//! proxying so the consumer ends up talking directly to a member of the
-//! topic's metadata shard group (see d4_consumer_range_tracking.md §Bootstrap).
+//! The server never forwards or proxies; it redirects and the client retries on
+//! the indicated node. Two redirect shapes, by what's wrong:
+//! - `TopicMetadataRedirect` — this node doesn't host the topic's metadata shard
+//!   group (wrong host). Returned by `DescribeTopic` and by the writes when not a
+//!   member; points at a member.
+//! - `NotRaftLeader` — a member but not the metadata Raft leader (wrong role).
+//!   Returned by `CreateTopic` / `DeleteTopic`; points at the leader (or `None`
+//!   until it's known).
+//!
+//! Both are retriable: addresses come from SWIM, which converges eventually, so a
+//! stale or absent target costs a retry, never correctness. See
+//! d4_consumer_range_tracking.md §Bootstrap and d6_produce_consume_api.md.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -43,11 +49,20 @@ pub enum ControlPlaneResponse {
     TopicDeleted,
     TopicNotFound,
     // ListHostedTopics
-    TopicList { topics: Box<[TopicSummary]> },
+    TopicList {
+        topics: Box<[TopicSummary]>,
+    },
     // DescribeTopic — when this node owns the topic's metadata
     TopicDetail(TopicDetail),
     // DescribeTopic — when this node does not own the topic's metadata.
-    TopicMetadataRedirect { owner: NodeAddressInfo },
+    TopicMetadataRedirect {
+        owner: NodeAddressInfo,
+    },
+    // Write landed on a member that isn't the metadata Raft leader — client retries
+    // there. `None` when the leader isn't yet known.
+    NotRaftLeader {
+        leader_addr: Option<NodeAddressInfo>,
+    },
     // All control plane operations
     InternalError(String),
 }

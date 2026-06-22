@@ -138,6 +138,16 @@ impl SwimActor {
     }
 }
 
+/// Where a key routes relative to a node, resolved against the SWIM ring.
+pub(crate) enum ShardRouting {
+    /// This node hosts the key's shard group — proceed locally. Carries the group
+    /// for callers that need its members/id (control-plane writes).
+    Local(ShardGroup),
+    /// Not local; redirect the client to a member. `None` until the ring/addresses
+    /// converge here — still retriable.
+    Redirect(Option<(NodeId, NodeAddress)>),
+}
+
 #[derive(Clone, Debug)]
 pub struct SwimSender(mpsc::Sender<SwimActorCommand>);
 impl SwimSender {
@@ -201,6 +211,23 @@ impl SwimSender {
             }
         }
         Ok(None)
+    }
+
+    /// Route a key relative to `node_id`: `Local` if it hosts the key's shard group,
+    /// else a `Redirect` to a resolvable member (no hint until the ring converges).
+    pub(crate) async fn resolve_shard_routing(
+        &self,
+        key: Vec<u8>,
+        node_id: &NodeId,
+    ) -> anyhow::Result<ShardRouting> {
+        let Some(group) = self.resolve_shard_group(key).await? else {
+            return Ok(ShardRouting::Redirect(None));
+        };
+        if group.members.contains(node_id) {
+            return Ok(ShardRouting::Local(group));
+        }
+        let member = self.resolve_any(&group.members).await?;
+        Ok(ShardRouting::Redirect(member))
     }
 
     pub(crate) async fn list_all_node_addresses(

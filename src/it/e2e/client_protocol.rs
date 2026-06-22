@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use turmoil::Builder;
@@ -1746,7 +1747,16 @@ async fn wait_for_cluster(nodes: &[(&str, u16)], expected: usize) {
     }
 }
 
-/// Create a topic by trying every node until one acks.
+/// Map a redirect address back to a test node by client port (unique per node).
+fn redirect_addr_to_node<'a>(
+    addr: SocketAddr,
+    nodes: &'a [(&'a str, u16)],
+) -> Option<(&'a str, u16)> {
+    nodes.iter().copied().find(|&(_, port)| port == addr.port())
+}
+
+/// Create a topic, following the `NotRaftLeader` redirect to the leader. Sweeps all
+/// nodes too — a fresh cluster may have no leader yet.
 async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_factor: u64) {
     let req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
         name: topic.into(),
@@ -1762,6 +1772,21 @@ async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_f
             match send_request(host, port, req.clone()).await {
                 ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
                 | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => return,
+                ClientResponse::ControlPlane(ControlPlaneResponse::NotRaftLeader {
+                    leader_addr: Some(info),
+                }) => {
+                    if let Some((lh, lp)) = redirect_addr_to_node(info.client_addr, nodes)
+                        && matches!(
+                            send_request(lh, lp, req.clone()).await,
+                            ClientResponse::ControlPlane(
+                                ControlPlaneResponse::TopicCreated
+                                    | ControlPlaneResponse::AlreadyExists
+                            )
+                        )
+                    {
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1769,8 +1794,9 @@ async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_f
     panic!("CreateTopic({topic}) not acked by any node");
 }
 
-/// Produce one record, retrying across all nodes until acked. Returns the node
-/// that accepted it (the segment's data-leader).
+/// Produce one record, following a redirect to the segment's write leader; returns
+/// the acking leader. Sweeps all nodes so it's robust when any node is down
+/// (crash/repair tests).
 async fn produce_until_acked<'a>(
     topic: &str,
     payload: &[u8],
@@ -1781,8 +1807,19 @@ async fn produce_until_acked<'a>(
     // delivery + first commit can take a while on a slow interleaving.
     for _ in 0..80 {
         for &(host, port) in nodes {
-            if produce_to(topic, payload, (host, port)).await {
-                return Some((host, port));
+            match produce_once(topic, payload, (host, port)).await {
+                ProduceOutcome::Acked => return Some((host, port)),
+                ProduceOutcome::Redirect(addr) => {
+                    if let Some(leader) = redirect_addr_to_node(addr, nodes)
+                        && matches!(
+                            produce_once(topic, payload, leader).await,
+                            ProduceOutcome::Acked
+                        )
+                    {
+                        return Some(leader);
+                    }
+                }
+                ProduceOutcome::Retry => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1790,18 +1827,40 @@ async fn produce_until_acked<'a>(
     None
 }
 
+enum ProduceOutcome {
+    Acked,
+    /// Redirect to the write leader at this address.
+    Redirect(SocketAddr),
+    /// Transient (not-yet-leader, mid-split, error) — back off and retry.
+    Retry,
+}
+
 /// Produce one record to a specific node. Returns true if it was accepted.
 async fn produce_to(topic: &str, payload: &[u8], node: (&str, u16)) -> bool {
+    matches!(
+        produce_once(topic, payload, node).await,
+        ProduceOutcome::Acked
+    )
+}
+
+/// Send one produce to a specific node and classify the response.
+async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> ProduceOutcome {
     let req = ClientRequest::DataPlane(ClientDataPlaneRequest::Produce(ProduceRequest {
         topic_name: topic.into(),
         routing_key: b"k".to_vec(),
         data: payload.to_vec(),
         record_count: 1,
     }));
-    matches!(
-        send_request(node.0, node.1, req).await,
-        ClientResponse::DataPlane(DataPlaneResponse::Produced { .. })
-    )
+    match send_request(node.0, node.1, req).await {
+        ClientResponse::DataPlane(DataPlaneResponse::Produced { .. }) => ProduceOutcome::Acked,
+        ClientResponse::DataPlane(DataPlaneResponse::NotWriteLeader {
+            leader_addr: Some(addr),
+        }) => ProduceOutcome::Redirect(addr),
+        ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
+            hint_node: Some(addr),
+        }) => ProduceOutcome::Redirect(addr),
+        _ => ProduceOutcome::Retry,
+    }
 }
 
 /// Fetch a topic's metadata, following a `TopicMetadataRedirect` to the owner.
