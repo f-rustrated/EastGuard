@@ -3,7 +3,9 @@ use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{CatchUpAssignment, SealResponse, SegmentAssignment};
+use crate::data_plane::messages::command::{
+    CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment,
+};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 
@@ -145,6 +147,40 @@ impl RangeMerged {
     }
 }
 
+/// Retention deletion (D7). Carries each deleted segment's key + its `replica_set`
+/// so the leader fans out a per-segment file delete to that segment's own replicas —
+/// segments in a range can sit on different replica sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentsDeleted {
+    pub deletions: Vec<(SegmentKey, Vec<NodeId>)>,
+}
+
+impl SegmentsDeleted {
+    /// One `DeleteSegments` per distinct `replica_set`, batching that set's segments
+    /// into a single message. Grouping is order-preserving (linear over a small
+    /// per-range prefix), so the dispatch is deterministic.
+    pub fn into_commands(self) -> Vec<DataTransportCommand> {
+        let mut groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)> = Vec::new();
+        for (segment_key, replica_set) in self.deletions {
+            match groups.iter_mut().find(|(rs, _)| *rs == replica_set) {
+                Some((_, keys)) => keys.push(segment_key),
+                None => groups.push((replica_set, vec![segment_key])),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(replica_set, keys)| {
+                DataTransportCommand::send_to_targets(
+                    replica_set,
+                    DeleteSegments {
+                        segment_keys: keys.into_boxed_slice(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyResult {
     TopicCreated(TopicCreated),
@@ -152,6 +188,7 @@ pub enum ApplyResult {
     RangeSplit(RangeSplit),
     RangeMerged(RangeMerged),
     SegmentReassigned(SegmentReassigned),
+    SegmentsDeleted(SegmentsDeleted),
     TopicDeleted,
     Noop,
 }
@@ -162,5 +199,6 @@ impl_from_variant!(
     SegmentRolled,
     RangeSplit,
     RangeMerged,
-    SegmentReassigned
+    SegmentReassigned,
+    SegmentsDeleted
 );

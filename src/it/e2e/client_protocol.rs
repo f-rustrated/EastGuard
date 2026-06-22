@@ -53,7 +53,7 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
         let req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "test-topic".to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -136,7 +136,7 @@ fn delete_topic() -> turmoil::Result {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "del-test".to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -274,7 +274,7 @@ fn list_topic_stats_after_create() -> turmoil::Result {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "stats-test".to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -364,7 +364,7 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
             name: "describe-test".into(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -1761,7 +1761,7 @@ async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_f
     let req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
         name: topic.into(),
         storage_policy: StoragePolicy {
-            retention_ms: 3_600_000,
+            retention_ms: Some(3_600_000),
             replication_factor,
             partition_strategy: PartitionStrategy::AutoSplit,
         },

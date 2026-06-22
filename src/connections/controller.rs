@@ -618,7 +618,7 @@ mod tests {
             vec![node_id(leader)],
             0,
             StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 1,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -765,7 +765,7 @@ mod tests {
                     ControlPlaneRequest::CreateTopic {
                         name: "t1".into(),
                         storage_policy: StoragePolicy {
-                            retention_ms: 3_600_000,
+                            retention_ms: Some(3_600_000),
                             replication_factor: 1,
                             partition_strategy: PartitionStrategy::AutoSplit,
                         },
@@ -799,7 +799,7 @@ mod tests {
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
                     storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
-                        retention_ms: 3_600_000,
+                        retention_ms: Some(3_600_000),
                         replication_factor: 1,
                         partition_strategy:
                             crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
@@ -833,7 +833,7 @@ mod tests {
             ControlPlaneRequest::CreateTopic {
                 name: "t1".into(),
                 storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
-                    retention_ms: 3_600_000,
+                    retention_ms: Some(3_600_000),
                     replication_factor: 1,
                     partition_strategy:
                         crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,

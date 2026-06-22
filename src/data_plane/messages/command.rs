@@ -200,6 +200,17 @@ pub struct SealBoundaryReport {
     pub durable_end: Option<u64>,
 }
 
+/// Retention (D7): the coordinator tells replicas to reclaim sealed segments —
+/// delete the file, drop the cache, and remove the sparse-index entries. Sent per
+/// distinct `replica_set` (segments in a range can sit on different sets), batching
+/// all of that set's expired segments into one message. Idempotent per key: a node
+/// that no longer holds one (already gone / never had it) skips it; orphan GC is the
+/// backstop.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct DeleteSegments {
+    pub segment_keys: Box<[SegmentKey]>,
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
@@ -217,6 +228,7 @@ pub enum DataPlaneInterNodeCommand {
     CatchUpAck(CatchUpAck),
     SealBoundaryQuery(SealBoundaryQuery),
     SealBoundaryReport(SealBoundaryReport),
+    DeleteSegments(DeleteSegments),
 }
 
 impl_from_variant!(
@@ -236,6 +248,7 @@ impl_from_variant!(
     CatchUpAck,
     SealBoundaryQuery,
     SealBoundaryReport,
+    DeleteSegments,
 );
 
 #[derive(Debug)]

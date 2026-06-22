@@ -60,6 +60,12 @@ impl CheckpointWorker {
                         tracing::error!("Catch-up anchor index write failed: {e}");
                     }
                 }
+                CheckpointTask::DeleteSegmentIndex(segment_key) => {
+                    // Retention (D7): the segment's file was reclaimed; drop its index.
+                    if let Err(e) = sparse_index.delete_segment_entries(segment_key) {
+                        tracing::warn!("retention index delete failed for {segment_key:?}: {e}");
+                    }
+                }
             }
         }
     }
@@ -108,6 +114,8 @@ pub(crate) enum CheckpointTask {
     /// Persist the sparse-index anchors for a segment the catch-up receive wrote
     /// directly (replacement side); the worker just `put_batch`es them.
     PutAnchors(Box<[SparseEntry]>),
+    /// Retention (D7): remove a reclaimed segment's sparse-index entries.
+    DeleteSegmentIndex(SegmentKey),
 }
 
 pub struct CheckpointJob {

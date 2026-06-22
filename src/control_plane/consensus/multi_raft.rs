@@ -1334,7 +1334,7 @@ mod tests {
         let cmd = MetadataCommand::CreateTopic(CreateTopic {
             name: "test-topic".to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -1406,7 +1406,7 @@ mod tests {
             MetadataCommand::CreateTopic(CreateTopic {
                 name: "blue".to_string(),
                 storage_policy: StoragePolicy {
-                    retention_ms: 3_600_000,
+                    retention_ms: Some(3_600_000),
                     replication_factor: 3,
                     partition_strategy: PartitionStrategy::AutoSplit,
                 },
@@ -1797,7 +1797,7 @@ mod tests {
                 command: MetadataCommand::CreateTopic(CreateTopic {
                     name: name.to_string(),
                     storage_policy: StoragePolicy {
-                        retention_ms: 3_600_000,
+                        retention_ms: Some(3_600_000),
                         replication_factor: rf,
                         partition_strategy: PartitionStrategy::AutoSplit,
                     },

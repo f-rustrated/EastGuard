@@ -273,6 +273,22 @@ impl TopicMeta {
         self.ranges.get(&range_id).and_then(|m| m.merged_from)
     }
 
+    /// Retention (D7): per-range oldest-first prefixes of sealed segments expired
+    /// under this topic's policy as of `now`. Empty when the topic has no retention
+    /// set (`retention_ms = None`, the default — keep everything).
+    pub(crate) fn expired_segment_prefixes(&self, now: u64) -> Vec<(RangeId, Box<[SegmentId]>)> {
+        let Some(retention_ms) = self.storage_policy.retention_ms else {
+            return Vec::new();
+        };
+        self.ranges
+            .values()
+            .filter_map(|range| {
+                let ids = range.expired_sealed_prefix(now, retention_ms);
+                (!ids.is_empty()).then(|| (range.range_id, ids.into_boxed_slice()))
+            })
+            .collect()
+    }
+
     pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
         if !self.is_merge_eligible() {
             return None;
@@ -516,7 +532,7 @@ mod routing_tests {
 
     fn policy() -> StoragePolicy {
         StoragePolicy {
-            retention_ms: 1000,
+            retention_ms: Some(1000),
             replication_factor: 1,
             partition_strategy: PartitionStrategy::AutoSplit,
         }

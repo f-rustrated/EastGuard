@@ -281,6 +281,9 @@ mod tests {
         fn put_batch(&self, _entries: Vec<SparseEntry>) -> std::io::Result<()> {
             Ok(())
         }
+        fn delete_segment_entries(&self, _segment_key: SegmentKey) -> std::io::Result<()> {
+            Ok(())
+        }
         fn seek_index(&self, _segment_key: SegmentKey, target_offset: u64) -> (u64, u64) {
             // Nearest anchor at or below target (seek_for_prev semantics),
             // returned as (anchor_id, byte_position).

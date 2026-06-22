@@ -3,7 +3,7 @@ use bincode::{Decode, Encode};
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::ReassignSegment;
 use crate::control_plane::metadata::command::{
-    CreateTopic, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
+    CreateTopic, DeleteSegments, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
 };
 use crate::{impl_from_variant, impl_from_variant_via};
 
@@ -28,5 +28,6 @@ impl_from_variant_via!(
     SplitRange,
     MergeRange,
     DeleteTopic,
-    ReassignSegment
+    ReassignSegment,
+    DeleteSegments
 );

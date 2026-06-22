@@ -9,10 +9,12 @@ use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
+use crate::control_plane::metadata::command::DeleteSegments;
 use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    MetadataCommand, ReassignSegment, ReplicaSet, RollSegment, TopicMeta, TopicStats,
+    MetadataCommand, RangeId, ReassignSegment, ReplicaSet, RollSegment, SegmentId, TopicId,
+    TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
@@ -261,6 +263,7 @@ impl Raft {
         changed |= self.reconcile_peers(topology, &live_set);
         changed |= self.reconcile_segments(&live_set);
         changed |= self.refill_under_replicated_segments(topology);
+        changed |= self.reconcile_retention_deletes();
 
         // Record a ring observation every run, whether routine RingCheck or
         // leadership change. During a leadership change, evictions are paused
@@ -589,6 +592,47 @@ impl Raft {
                 tracing::warn!(
                     "under-replication re-fill for {:?} on {:?} rejected: {:?}",
                     segment_key,
+                    self.shard_group_id,
+                    e
+                );
+                continue;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Retention sweep (D7): leader-only, on the ring-check cadence. For each owned
+    /// range compute the oldest-first prefix of sealed segments expired under the
+    /// topic's `retention_ms` (against the wall clock, the one age-based decision —
+    /// leader-only so cross-node skew can't diverge replicas), and propose
+    /// `DeleteSegments`. Topics with no retention policy contribute nothing.
+    fn reconcile_retention_deletes(&mut self) -> bool {
+        let now = now_ms();
+        let targets: Vec<(TopicId, RangeId, Box<[SegmentId]>)> = self
+            .state_machine
+            .topics
+            .values()
+            .flat_map(|t| {
+                let topic_id = t.id;
+                t.expired_segment_prefixes(now)
+                    .into_iter()
+                    .map(move |(range_id, ids)| (topic_id, range_id, ids))
+            })
+            .collect();
+
+        let mut changed = false;
+        for (topic_id, range_id, segment_ids) in targets {
+            let cmd = DeleteSegments {
+                topic_id,
+                range_id,
+                segment_ids,
+            };
+            if let Err(e) = self.propose(cmd.into()) {
+                tracing::warn!(
+                    "retention delete for {:?}/{:?} on {:?} rejected: {:?}",
+                    topic_id,
+                    range_id,
                     self.shard_group_id,
                     e
                 );
@@ -2838,7 +2882,7 @@ mod tests {
         let cmd = MetadataCommand::CreateTopic(CreateTopic {
             name: "blue".to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -2968,7 +3012,7 @@ mod tests {
         MetadataCommand::CreateTopic(CreateTopic {
             name: name.to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
@@ -3330,7 +3374,7 @@ mod tests {
         let cmd: RaftCommand = MetadataCommand::CreateTopic(CreateTopic {
             name: name.to_string(),
             storage_policy: StoragePolicy {
-                retention_ms: 3_600_000,
+                retention_ms: Some(3_600_000),
                 replication_factor: rf as u64,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
