@@ -293,7 +293,7 @@ Producer idempotency keys, deduplication at segment leader. Requires producer se
 Multiple consumers sharing work across ranges. Offset commit tracking. Rebalancing on consumer join/leave. Consumer offset storage is a separate system concern — not part of the log storage layer.
 
 ### Batching / Compression
-Batch multiple records into a single write. Compress batches (LZ4/Snappy). Reduces I/O and network.
+Batch multiple records into a single write. Compress batches (Zstd). Reduces I/O and network.
 
 ### Zero-Copy Reads
 `sendfile()` / `splice()` from segment file directly to TCP socket. Eliminates kernel-to-userspace copy on consume path.
