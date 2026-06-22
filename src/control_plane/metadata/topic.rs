@@ -79,10 +79,9 @@ impl TopicMeta {
         &mut self,
         range_id: &RangeId,
     ) -> Result<&mut RangeMeta, MetadataError> {
-        Ok(self
-            .ranges
+        self.ranges
             .get_mut(range_id)
-            .ok_or(MetadataError::RangeNotFound)?)
+            .ok_or(MetadataError::RangeNotFound)
     }
 
     pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
