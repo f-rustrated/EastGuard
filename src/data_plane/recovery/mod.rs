@@ -1,7 +1,6 @@
 //! Crash recovery: rebuild local state from disk before serving.
 //!
-//! Design: `diagrams/data-plane/d5_crash_recovery.md`. Commit-by-commit
-//! plan: `diagrams/data-plane/d5_implementation_plan.md`.
+//! Design: `diagrams/data-plane/d5_crash_recovery.md`.
 //!
 //! Staged module: pieces land bottom-up (scanners → replay → orchestrator)
 //! and stay unused by the running system until the orchestrator wires them

@@ -1,200 +1,390 @@
 # Phase D5: Crash Recovery
 
-A node crashes and restarts. Its memory is gone; its disk is not. D5 defines what the node does with that disk before it rejoins the cluster.
+A node crashes and restarts. Its memory is gone; its disk is not. D5 covers two
+things: what the node does with that disk before it rejoins, and how the cluster
+puts the surviving data back to use.
 
-Depends on D1 (storage engine). Repair flows depend on D2 (replication).
-
----
-
-## Conceptual Goal
-
-Two facts shape the whole design:
-
-**1. The durability promise lives in the WAL.** A producer was ACKed only after its entry was fsynced to the WAL on *every* replica and committed. So anything the cluster promised is in at least one healthy replica's WAL or segment files. Recovery on a single node never has to reconstruct a promise alone — it has to make its *local* data usable again so the cluster can count it.
-
-**2. A restarted node is a new cluster member.** NodeIds are regenerated on startup. The cluster watched the old identity die (SWIM), sealed every active segment it touched, and moved on. The restarted node does not resume any leadership, any followership, or any active segment. It joins fresh — with a disk full of data from its previous life.
-
-Together these give recovery a simple job description:
-
-> **Make the local data honest, then let the cluster decide what it's worth.**
-
-"Honest" means: every byte the node later claims to have must be complete and verified. Recovery never needs to be *complete* — anything missing or doubtful is filled by copying from a healthy replica (the repair path). Understating what you have costs network transfer; overstating it costs correctness. So every rule below errs toward dropping data, never toward claiming it.
-
-What recovery deliberately does **not** do:
-
-- It does not resume in-flight produces. Un-ACKed entries are the producer's problem — producers retry. ACKed entries are safe by the durability promise.
-- It does not warm caches. The node restarts cold; caches refill from traffic.
-- It does not track consumer positions. Those are client-owned (D4).
-- It does not announce its data to the cluster. The node stays quiet until the coordinator assigns it something; only then does it mention what it already has.
+**Depends on:** D1 (storage engine) for the WAL and segment files; the repair
+flows depend on D2 (replication).
 
 ---
 
-## What Survives a Crash
+## Two facts that shape everything
+
+**1. The durability promise lives in the WAL.** A producer is ACKed only after
+its entry is fsynced to the WAL on *every* replica and committed. So anything the
+cluster promised is on at least one healthy replica's disk. A single node
+recovering never has to reconstruct a promise alone — it only has to make its
+*own* data usable again so the cluster can count it. Anything missing or doubtful
+can be copied back from a healthy replica.
+
+**2. A restarted node is a new member.** NodeIds are regenerated on startup. SWIM
+already saw the old identity die, the cluster sealed every active segment it
+touched, and moved on. The restarted node resumes no leadership, no followership,
+and no active segment. It joins fresh, with a disk full of data from its previous
+life. (`Dead` is terminal in SWIM — a restart is never the old identity revived.)
+
+Together these give recovery one job:
+
+> Make the local data honest, then let the cluster decide what it's worth.
+
+"Honest" means every byte the node later claims must be complete and CRC-verified.
+Recovery never has to be *complete*: understating what you hold costs a little
+network transfer (repair copies the rest); overstating it costs correctness. So
+every rule below errs toward dropping data, never toward claiming it.
+
+Recovery deliberately does **not**:
+
+- resume in-flight produces — un-ACKed entries are the producer's to retry; ACKed
+  ones are safe by fact 1,
+- warm caches — they refill from traffic,
+- track consumer positions — client-owned (D4),
+- announce its data — the node stays quiet until the coordinator assigns it
+  something, and only then mentions what it already has.
+
+---
+
+## What survives a crash
 
 | On disk | Role | Recovery treatment |
 |---|---|---|
-| WAL files | Source of truth for everything not yet checkpointed | Replayed forward, then discarded |
+| WAL files | Source of truth for anything not yet checkpointed | Replayed forward, then deleted |
 | Segment files | Checkpointed prefix of each segment | Kept; replay appends the missing suffix |
-| Sparse index (RocksDB) | Derived read accelerator | Rebuilt from the segment files on every recovery — not authoritative, never trusted across a crash |
-| Everything in memory | Caches, cursors, trackers, pending replies | Gone; nothing to recover — all derived or client-owned |
+| Sparse index | Derived read accelerator | Rebuilt from the segment files every recovery — never trusted across a crash |
+| Memory (caches, cursors, trackers, pending replies) | — | Gone; all derived or client-owned |
 
-The oldest WAL file still on disk marks the checkpoint boundary: WAL files are deleted only once every segment has checkpointed past them. No separate checkpoint file exists or is needed — "what's left in the WAL directory" *is* the record of what might not have reached segment files.
+There is no separate checkpoint file. "What's left in the WAL directory" *is* the
+record of what might not have reached segment files: a WAL file is deleted only
+once every segment has checkpointed past it.
 
 ---
 
-## Recovery Sequence
+## Single-node recovery
 
-Recovery runs entirely before the node opens any port:
+Recovery runs to completion before the node opens any port or joins SWIM:
 
 ```
-1. Scan WAL directory          oldest surviving file → forward
-2. Replay into segment files   route each record by its header, skip duplicates
-3. Verify + build inventory    per segment: "I have entries up to N, CRC-checked"
-4. Rebuild sparse index        re-derived from the segment files
-5. Delete old WAL files        everything recovered now lives in segment files
+1. Scan the WAL directory      oldest surviving file → newest
+2. Replay into segment files   route each record, skip duplicates, append the rest
+3. Build the inventory         per segment: highest CRC-verified entry id held
+4. Rebuild the sparse index    re-derived from the segment files
+5. Delete the old WAL files    everything recovered now lives in segment files
 6. Start fresh                 new WAL, new NodeId, join SWIM
-7. Wait                        serve catch-up / cold reads when the coordinator asks
 ```
 
-Steps 1–5 are idempotent: a crash *during* recovery just runs the same sequence again. Replay skips what already reached segment files, so re-running converges to the same result.
+Steps 1–5 are idempotent: a crash *during* recovery just runs the same sequence
+again, and replay skips whatever already reached segment files, so a re-run
+converges to the same result.
 
----
+### WAL replay
 
-## WAL Replay
-
-The WAL is one shared, interleaved stream: entries from all segments on the node, in fsync order. Each data record carries a small routing header — which topic, which range, which segment, which entry id. Replay is a single forward scan that demultiplexes this stream back into per-segment files:
+The WAL is one shared, interleaved stream — entries from every segment on the
+node, in fsync order. Each data record carries a small routing header (topic,
+range, segment, entry id). Replay is a single forward scan that splits the stream
+back into per-segment files:
 
 ```
 for each WAL file, oldest → newest:
     for each record:
         CRC check
         route by header to its segment
-        skip if the segment file already has this entry_id   (dedup)
-        otherwise append to the segment file
+        skip if the segment file already holds this entry id   (dedup)
+        otherwise append
 ```
 
-**Deduplication.** A WAL file is only deleted after *all* its entries are checkpointed, so the surviving files usually overlap with segment file contents. The rule is per segment: determine the last entry id the segment file already holds, then append only WAL entries beyond it. Segment records are bare — they carry no entry id of their own (the routing header is a WAL-only concept) — so that last id is *derived*, not read from a per-record header: the segment's `start_offset` — parsed from the filename, `{segment_id}-{start_offset}.seg` — plus the count of CRC-verified records, minus one. Entry ids are contiguous and ordered within a segment, so this is a single comparison.
+**Deduplication.** Surviving WAL files usually overlap with what's already in
+segment files (a WAL file is deleted only after all its entries checkpoint). The
+rule is per segment: find the last entry id the segment file already holds, append
+only WAL entries beyond it. Segment records are bare — no per-record id — so that
+last id is *derived*: the segment's base offset (parsed from its filename) plus
+the count of CRC-verified records, minus one. Entry ids are contiguous and ordered
+within a segment, so this is a single comparison. No log-sequence-number is needed
+to know how far the file got: checkpoint appends strictly in id order with no gaps
+(D1), so base + verified-count − 1 *is* the checkpoint frontier, and fsync
+ordering guarantees the WAL covers the rest.
 
-Note that no LSN is needed to know "how far the segment file got": checkpoint appends to a segment file strictly in entry-id order with no gaps (D1 invariant 4), so `start_offset + verified-record-count - 1` *is* the checkpoint frontier. The fsync ordering guarantees the WAL always covers the rest — segment files are fsynced before checkpoint reports, and WAL files are deleted only after.
+**The torn tail.** A crash mid-write leaves the last file ending in a partial
+batch. Batches are written and fsynced as a unit, ending with an end-of-batch
+marker; a missing or corrupt marker means the fsync never completed, so nothing in
+that batch was ever ACKed. Replay stops at the last complete batch of the last
+file and discards the rest. Safe by construction.
 
-**The torn tail.** A crash mid-write leaves the last file ending in a partial batch. Batches are written as a unit and fsynced as a unit, with an end-of-batch marker as the last record — so a missing or corrupt marker means the fsync never completed, which means nothing in that batch was ever ACKed. Replay stops at the last complete batch of the last file and discards the rest. Safe by construction.
+**Corruption elsewhere.** A CRC failure in the *middle* of the stream is real
+damage, not a torn write. Replay does not try to be clever: it stops crediting
+that segment at the last verified entry and lets repair treat the rest as missing.
+Other replicas have healthier copies.
 
-**Corruption anywhere else** is a different story: a CRC failure in the middle of the stream is real damage, not a torn write. Replay does not try to be clever. It stops crediting the affected segment at the last verified entry and lets the repair path treat everything after as missing. The cluster has healthier copies; honesty beats heroics.
+**Surplus for sealed segments.** Some replayed entries may belong to segments the
+cluster sealed while the node was down — including entries past the sealed end (a
+crashed leader may have fsynced uncommitted entries). Metadata bounds this: once
+the node learns a segment's sealed end, anything local past it is surplus and
+ignored at read time. The control plane recovers its own Raft log independently
+and is the authority on where each sealed segment ends.
 
-**Entries for sealed segments.** Some replayed entries may belong to segments the cluster sealed while this node was down — including entries beyond the sealed boundary (the crashed leader may have fsynced entries that were never committed). These are bounded by metadata: when the node later learns a segment's sealed end offset, anything local past it is surplus and ignored. This is why duplicate or surplus WAL data is harmless — every entry is routed by its header and clipped by the metadata boundary. The control plane recovers its Raft log independently and first; metadata is the authority on where every sealed segment ends.
+### A fresh WAL, not a resumed one
 
----
+After replay, the old WAL files are deleted and the node starts a brand-new WAL
+from sequence one. Reopening the old WAL would require recovering the exact batch
+sequence number at the crash point (which the format does not store) and buys
+nothing: batch sequence numbers are node-local, the identity has already
+restarted, and everything the old WAL held now lives in segment files.
 
-## A Fresh WAL, Not a Resumed One
+This keeps the WAL's lifecycle trivial — one WAL per node lifetime, born empty,
+deleted at the next recovery. A second recovery can't be confused by the sequence
+restart: old-WAL deletion finishes before the new WAL is created, and even if a
+crash lands in that window, a new lifetime only writes newly assigned segments
+(old ones were sealed and never resume), so leftover old files and new files
+reference disjoint segments and dedup handles the rest. Segment files persist
+across lifetimes on purpose — they are the inventory.
 
-After replay, the old WAL files are deleted and the node starts a brand-new WAL from sequence one.
+### The inventory
 
-The alternative — reopening the old WAL and continuing where it left off — would require recovering the exact batch sequence number at the point of the crash, which the current format does not store per batch (and would need a file header or a stamped batch marker to support). That bookkeeping buys nothing: batch sequence numbers are node-local, the node's identity has already restarted, and everything the old WAL contained now lives in segment files. Resuming a dead identity's WAL is complexity in service of nothing.
-
-This also keeps the WAL's lifecycle rule trivial: a WAL belongs to one node lifetime. Born empty at startup, deleted at the next recovery.
-
-Restarting at sequence one cannot confuse a *second* recovery, for two stacked reasons. First, ordering: old-WAL deletion completes before the new WAL is created, so the directory never holds two lifetimes at once. Second, even if a crash lands inside that deletion window, the lifetimes cannot collide — a new lifetime only writes entries for newly assigned segments (old ones were sealed and never resume), so leftover old files and new files reference disjoint segments, and dedup by entry id handles the rest. Segment files, unlike the WAL, persist across lifetimes on purpose: they are the inventory.
-
----
-
-## Local Segment Inventory
-
-The output of recovery is one table, kept in memory:
-
-```
-(topic, range, segment)  →  highest verified entry id present locally
-```
-
-"Verified" is doing the work in that sentence: an inventory entry is only made after the segment file's records pass CRC. A segment with damage past entry N is listed as having N, not as having what the file size suggests.
-
-The inventory is **passive**. The node never broadcasts it. It is consulted exactly once per segment, at the moment the coordinator assigns this node to that segment's replica set and the node would otherwise copy the whole thing:
-
-- **Full match** — local data reaches the segment's sealed end offset. Verify, report complete. Zero bytes transferred.
-- **Partial match** — local data reaches entry N, segment ends later. Request only entries after N from a healthy replica.
-- **No match** — full copy, the default path. Recovery added nothing, and nothing breaks.
-
-The node does not need to know it used to be "the F in that replica set." It just has files that happen to match. All the identity problems that plague systems with stable node IDs — zombies, stale claims, split identities — are absent because the cluster never has to decide whether this node *is* the old one. It isn't. It merely has some of the old one's bytes, and the bytes are checked on their own merits.
-
----
-
-## Rejoining the Cluster
-
-The node joins SWIM as a new member and does nothing else. In particular:
-
-**No active segment resumes.** Every segment this node was actively writing or following was sealed by the cluster when SWIM declared the old identity dead — that is the seal-on-failure model doing its job (D2). Active segments always start fresh, on freshly assigned replica sets, with the leader's uncommitted tail replayed forward by the *surviving* leader, not by this node. The restarted node's local data is therefore only ever relevant to **sealed** segments — which are immutable, which is exactly why byte-level reuse is safe.
-
-**Work arrives, it is not taken.** The coordinator (the metadata leader for each shard group) discovers under-replicated sealed segments on node death and picks replacements by placement policy. A freshly restarted node is simply a candidate like any other — one that happens to win the data-transfer lottery when assigned segments it already holds.
-
----
-
-## Sealed Segment Repair
-
-The cluster-side counterpart (defined in D2, summarized here because recovery plugs into it):
+Recovery's output is one in-memory table:
 
 ```
-Coordinator           Raft            Healthy replica     Restarted node
-    │                  │                    │                   │
-    │  reassign sealed segment's            │                   │
-    │  replica set: dead → new ──► commit   │                   │
-    │                  │                    │                   │
-    │  catch-up assignment ────────────────────────────────────►│
-    │                  │                    │     check local   │
-    │                  │                    │     inventory     │
-    │                  │                    │◄─── "have up to N"│
-    │                  │                    │                   │
-    │                  │                    │  stream entries   │
-    │                  │                    │  after N ────────►│
-    │                  │                    │                   │
-    │                  │                    │        verify, report complete
+(topic, range, segment)  →  highest CRC-verified entry id held locally
 ```
 
-Repair is the safety net that lets every other rule in this document be conservative. Dropped a doubtful WAL tail? Repair copies it from a healthy replica. Understated the inventory? Repair transfers a few more bytes. The only unforgivable error is the opposite one — claiming entries the node cannot actually serve — and the CRC-before-inventory rule exists to make that impossible.
+"Verified" is the load-bearing word: an entry is recorded only after the file's
+records pass CRC. A segment damaged past entry N is listed as holding N, not as
+holding whatever the file size suggests.
+
+The inventory is **passive** — never broadcast. It is consulted only when the
+coordinator later assigns this node to a segment's replica set and the node would
+otherwise copy the whole thing (see catch-up). The node doesn't need to know it
+used to be in that replica set; it just has files that happen to match, checked on
+their own merits. The identity problems that plague stable-NodeId systems
+(zombies, stale claims, split identities) don't arise here, because the cluster
+never has to decide whether this node *is* the old one. It isn't — it merely holds
+some of the old one's bytes.
 
 ---
 
-## Orphaned Data Cleanup
+## Rejoining the cluster
 
-A restarted node has a fresh NodeId, so the cluster's replica sets name *none* of its on-disk segments — at recovery time **every** inventoried segment is an orphan candidate. Some stay orphaned forever (the cluster repaired around the old identity while it was down, or the topic was deleted); others the coordinator may later hand back through ordinary placement (a rebalance, another death elsewhere), at which point catch-up turns the on-disk copy into a no-op or a delta. The node does **not** query the coordinator at startup to sort these out — under a fresh identity it is a replica of nothing, so there is nothing to confirm, register, or serve. Classification is implicit (everything is a candidate); resolution is lazy — a candidate is either reclaimed by a future assignment (catch-up reuse) or background-deleted.
+The node joins SWIM as a new member and otherwise waits.
 
-**Deletion is deliberately lazy: triggered by disk pressure or a retention-scale TTL, never at recovery time.** An orphaned-but-intact segment is a free lottery ticket: if the coordinator later assigns this node that segment (a rebalance, another death elsewhere), local data turns a full copy into a delta or a no-op. Eager cleanup converts future cheap catch-ups into full transfers and saves nothing but disk space that nobody asked for. (Making placement actively prefer nodes that already hold a segment's data would push this further — that is a future optimization; the inventory stays passive in D5.)
+**No active segment resumes.** Every segment the node was writing or following was
+sealed when SWIM declared the old identity dead (the seal-on-failure model, D2).
+Active segments restart fresh on freshly assigned replica sets, with the leader's
+uncommitted tail replayed by the *surviving* leader — not by this node. So the
+restarted node's local data is only ever relevant to *sealed* segments, which are
+immutable. That immutability is exactly why byte-level reuse is safe.
+
+**Work arrives; it is not taken.** The coordinator (the metadata leader for each
+shard group) decides which nodes hold which sealed segments. A restarted node is
+just another placement candidate — one that gets a zero-transfer shortcut when
+it's assigned a segment it already holds.
 
 ---
 
-## Failure Cases During Recovery
+## How the surviving data gets used
+
+A restarted node's disk only pays off if the cluster reassigns it segments it
+holds. Three mechanisms make that happen and reliable, plus the catch-up that does
+the actual reuse. (The contracts for these live in `.claude/rules/raft-actor.md`
+and `.claude/rules/metadata-state-machine.md`.)
+
+### Catch-up: the reuse
+
+When a node is told to hold a sealed segment, it reconciles what it already has
+against the segment's sealed end:
+
+```
+Coordinator        Healthy peer          Assigned node
+    │                   │                       │
+    │  hold this sealed segment [start, end] ──►│
+    │                   │           check inventory / local store
+    │                   │◄─── "I have up to N"──│
+    │                   │   stream entries > N─►│
+    │                   │                       │  append, verify to end
+    │◄──────────────────────────  "have it through end"  (ack)
+```
+
+- **Full match** — local data already reaches the sealed end. Verify, ack.
+  **Zero bytes transferred.** This is the restarted node's payoff.
+- **Partial** — local data reaches N, the segment ends later. Request only entries
+  after N from a healthy peer (a non-leader, to keep repair reads off the write
+  leader) and append onto the verified prefix.
+- **None** — full copy, the default path. Recovery added nothing; nothing breaks.
+
+The assignment is re-driven until the node acks, so a dropped message or a stalled
+transfer is retried, not stranded. The ack is what lets the coordinator stop
+re-driving.
+
+### Sealed-segment repair on death
+
+When a node dies, the coordinator finds sealed segments whose replica set named
+the dead node and reassigns them to replacements chosen by placement. The
+reassignment is a single committed metadata change: it swaps the replica set and
+leaves the segment sealed — data, offsets, and lineage stay frozen; only *where
+the copies live* changes. It then tells each member of the new set to make sure it
+holds the segment, via catch-up.
+
+Only segments with a *known* sealed end are repaired this way — catch-up needs an
+end to verify against. Segments left with an unknown end by a leader crash are
+handled first by boundary recovery (below).
+
+### Capacity-return re-fill
+
+Death-triggered repair has a gap. When a death shrinks a sealed segment to its
+survivors and no replacement is available *at that moment* (the cluster is too
+small, or the right node is down), the segment is left under-replicated — and the
+death scan never revisits it, because it now has no dead member to flag. That
+segment would sit one death away from data loss, and a restarted node would never
+be offered it back.
+
+The periodic ring check closes this. Alongside repairing dead-member segments, it
+re-fills sealed segments that are below the replication factor whenever the ring
+can now supply a member — including the restarted node once it has rejoined and
+re-entered the ring. This is the capacity-*return* counterpart to death-triggered
+repair: when capacity comes back, segments grow back toward full replication, and
+the added member catches up — **zero-transfer if it already holds the data.** This
+is what makes the restarted-node payoff reliable rather than incidental; it is the
+mechanism behind "a zero-transfer shortcut" above. It is scoped to under-filled
+segments only (never a rebalance of well-replicated ones), so it adds no churn in
+steady state.
+
+### Leader-crash boundary recovery
+
+When the crashed node was a segment's *write leader*, no survivor knows the
+committed end — the leader was the one tracking it. Before reassigning such a
+segment, the coordinator asks each surviving replica for its durable (fsync'd)
+extent and seals at their **minimum** — the highest offset present on *every*
+survivor, which is therefore committed (commit requires an all-replica ack). The
+successor opens at that end + 1, so the offset chain stays continuous, and the
+now-known-end segment is picked up by ordinary repair. The most-complete survivor
+becomes the new write leader. Multi-death and total-loss cases fall back to an
+unknown end (no worse than before). Full rationale:
+[`leader_crash_seal_boundary.md`](leader_crash_seal_boundary.md) and the
+boundary-recovery rules in `.claude/rules/raft-actor.md`.
+
+---
+
+## Orphaned data cleanup
+
+A restarted node's fresh identity is in *no* replica set, so at recovery time
+**every** inventoried segment is an orphan candidate. Some stay orphaned forever
+(the cluster repaired around the old identity, or the topic was deleted); others
+get handed back by re-fill or a later death elsewhere, at which point catch-up
+reuses the on-disk copy. Classification is implicit — everything is a candidate —
+and resolution is lazy.
+
+**The node cannot ask the coordinator "is this segment still mine?"** It knows a
+segment only by its ids, but a topic's owning shard group is found by hashing the
+topic *name*, which a recovered node doesn't have — so it can't even route such a
+query. It doesn't need to. The cluster's decision *reaches* the node anyway, as a
+**registration**: when the coordinator reassigns a segment to this node, catch-up
+runs and the segment enters the live store. The data replica set is the owning
+Raft group's committed decision — which this node, not hosting that group, can't
+read directly (see CLAUDE.md "Two replica sets") — but the node observes the
+*result* of that decision locally. So "did the cluster make me a replica of this?"
+is answered by "did this segment get registered?"
+
+Cleanup is a periodic local sweep. For each segment still in the orphan set:
+
+- **registered** — catch-up brought it into the live store; the reuse happened. It
+  is no longer an orphan: drop it from the set, keep the file.
+- **mid-catch-up** — a transfer is in flight. Leave it; it is about to register.
+- **neither** — the cluster never made this node a replica of it. It is a stray:
+  delete the file, drop it from the set.
+
+Deletes are bounded per pass, so a large backlog drains over several sweeps rather
+than in one burst.
+
+**Why a delay before deleting.** The sweep's interval doubles as a grace period. A
+restarted node's segments only become "registered" *after* re-fill reassigns them
+and catch-up completes; deleting before that would throw away a free reuse and
+force a full transfer later. The grace lets re-fill and catch-up claim the
+reusable segments first; whatever is left unclaimed after it is genuinely a stray.
+Getting the timing wrong is bounded: a mistimed delete just means a later catch-up
+copies the bytes instead of reusing them — it can never lose data, because a stray
+is by definition a segment the cluster does not count on this node for.
+
+**Why local-and-lazy.** An orphaned-but-intact segment is worth keeping — it can
+be reused cheaply later, and eager deletion converts a future cheap catch-up into
+a full transfer to save nothing but disk. The orphan set is also *bounded*: a node
+recovers only what it held before crashing, and the set only shrinks (reused or
+deleted), so it can't grow without limit and there's no runaway forcing urgent
+reclamation. (Disk-pressure-driven deletion was considered and deferred for this
+reason; the design left room to add it.)
+
+The sweep is **self-terminating**: each pass reports whether any orphans remain,
+and the timer stops once the set is empty (recovery fills it once; it only
+shrinks). A node that recovered nothing sweeps at most once and then goes quiet.
+
+---
+
+## Failure cases during recovery
 
 | Case | Handling |
 |---|---|
-| Crash during replay | Re-run from step 1. Dedup makes replay idempotent — entries already appended are skipped. |
-| Crash after replay, before WAL deletion | Same: re-run, everything dedups, files get deleted this time. |
-| Sparse index missing or corrupt | Recovery always rebuilds it from the segment files — it's a derived cold-read accelerator (and a restarted node serves its sealed segments only via cold reads), so it's never trusted across a crash. The segment files are the source of truth; the index can always be reconstructed from them. |
-| Segment file corrupt mid-stream | Inventory credits the segment only up to the last verified entry. Repair fills the rest. |
-| Entire disk lost | Recovery degenerates to: join as a truly empty new member. Every assignment is a full copy. Correct, just slow. |
-| WAL torn tail | Discard back to the last complete batch — those entries were never fsync-confirmed, hence never ACKed. |
+| Crash during replay | Re-run from step 1; dedup makes replay idempotent. |
+| Crash after replay, before WAL deletion | Re-run; everything dedups, files get deleted this time. |
+| Sparse index missing or corrupt | Always rebuilt from the segment files — a derived accelerator, never trusted across a crash. |
+| Segment file corrupt mid-stream | Inventory credits only up to the last verified entry; repair fills the rest. |
+| Entire disk lost | Degenerates to joining as an empty new member; every assignment is a full copy. Correct, just slow. |
+| WAL torn tail | Discard back to the last complete batch — never fsync-confirmed, never ACKed. |
 
-The common thread: there is no recovery failure mode that requires operator intervention to preserve correctness. Worst case is always "copy more bytes from a healthy replica."
+The common thread: no recovery failure needs operator intervention to stay
+correct. The worst case is always "copy more bytes from a healthy replica."
 
 ---
 
 ## Invariants
 
-These are predicates over on-disk and in-memory state — checkable at any moment, suitable for `assert_invariants`-style verification and property tests, in the same spirit as the control-plane state machines.
+Predicates over on-disk and in-memory state, checkable at any moment (in the
+spirit of the control-plane `assert_invariants` methods):
 
-1. **No batch is partially applied.** For every segment file, the entries present are exactly a prefix of the segment's entry-id sequence — contiguous from the start, no gaps. (A torn or corrupt WAL batch contributes nothing, never a fragment.)
+1. **No batch is partially applied.** Every segment file holds exactly a
+   contiguous prefix of its entry-id sequence — no gaps. A torn or corrupt WAL
+   batch contributes nothing, never a fragment. Without this, a reader could serve
+   a hole.
 
-2. **Replay is idempotent.** Running recovery N times over the same disk produces byte-identical segment files as running it once. Directly property-testable: recover, snapshot, recover again, compare.
+2. **Replay is idempotent.** Running recovery N times over the same disk produces
+   byte-identical segment files to running it once. This is what makes a crash
+   *during* recovery safe — re-running just converges. Directly property-testable:
+   recover, snapshot, recover again, compare.
 
-3. **The inventory never overstates.** For every inventory entry `(segment → N)`, entries 1…N exist in the local segment file and pass CRC. The inventory is always ≤ the verified prefix, never beyond it.
+3. **The inventory never overstates.** For every entry `(segment → N)`, entries up
+   to N exist locally and pass CRC; the inventory is always ≤ the verified prefix.
+   Overstating is the one unforgivable error — it would have the node claim entries
+   it can't serve — so CRC is checked before anything enters the inventory.
 
-4. **Inventory entries reference only sealed segments.** No active segment ever appears — guaranteed because a restarted identity is in no active replica set, so every local segment predates the restart and was sealed by the cluster.
+4. **The inventory references only sealed segments.** No active segment ever
+   appears, because a restarted identity is in no active replica set, so every
+   local segment predates the restart and was sealed by the cluster. This is why
+   byte-level reuse is safe: sealed segments are immutable.
 
-5. **At most one WAL lifetime exists once the node serves.** After recovery completes, every WAL file on disk was written by the current process. (During the deletion window this may transiently be false; the disjoint-segment argument above makes that window harmless.)
+5. **At most one WAL lifetime exists once the node serves.** After recovery, every
+   WAL file on disk was written by the current process. (Transiently false inside
+   the deletion window; the disjoint-segment argument above makes that harmless.)
 
-## Rules Enforced by Construction
+## Rules enforced by construction
 
-The remaining guarantees are ordering rules, not state predicates — there is no snapshot of state in which they can be checked, only a sequence that must not be reordered. Testing them against a description is oracle testing; the better treatment is to make violating them inexpressible in the code's shape:
+These are ordering rules, not state predicates — there is no snapshot in which to
+check them, only a sequence that must not be reordered. The better treatment is to
+make violating them inexpressible in the code's shape:
 
-- **Metadata before data.** Sealed-segment boundaries come from the control plane, which recovers its Raft log independently. The data plane clips local surplus by those boundaries at serve time, so it never needs to have replayed "correctly" with respect to seals — the clip is in the read path, not in recovery discipline. Each segment's base entry id — its immutable `start_offset` — is encoded in the filename (`{segment_id}-{start_offset}.seg`), so recovery turns a segment file's CRC-verified record *count* into absolute entry ids with no metadata lookup at all. Only the mutable sealed *end* needs the coordinator (it may have advanced via seals or reassignments after the node died); the *start* is fixed at creation and lives in the name.
+- **Metadata before data.** Sealed-segment ends come from the control plane, which
+  recovers its Raft log independently. The data plane clips local surplus by those
+  ends at read time, so recovery never has to replay "correctly" with respect to
+  seals — the clip is in the read path, not in recovery discipline. A segment's
+  base offset is in its filename, so recovery turns a verified record *count* into
+  absolute entry ids with no metadata lookup at all; only the mutable sealed *end*
+  needs the coordinator.
 
-- **Recovery before serving.** Rather than asserting "ports open only after inventory is built," make the serving components constructible only *from* the recovery output (the inventory and recovered segment state are constructor arguments). The rule then holds because no code path can produce a serving node without first producing a finished recovery.
+- **Recovery before serving.** Rather than asserting "ports open only after the
+  inventory is built," the serving side is constructible only *from* the recovery
+  output — the inventory is a required constructor input. No code path can produce
+  a serving node without first producing a finished recovery.
 
-- **Destruction is cluster-confirmed and last.** Orphan GC is the only step that deletes segment data, and it takes the coordinator's answer as a required input — same pattern: the delete function's signature demands the confirmation, instead of a convention demanding the call order.
+- **Destruction is last, and never deletes what the cluster counts on.** Orphan GC
+  is the only step that deletes segment data. It deletes a segment only when the
+  node is not a data replica of it — judged *locally*, by the segment never having
+  been registered through the reassign-and-catch-up path — and only after the grace
+  period that lets reuse happen first. The guard is local observation plus the
+  grace, not a per-delete cluster round-trip (which a fresh identity couldn't even
+  route).
+
+---
