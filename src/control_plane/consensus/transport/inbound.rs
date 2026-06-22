@@ -1,7 +1,7 @@
+use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
-use crate::control_plane::NodeId;
 use crate::net::OwnedReadHalf;
 use tokio::io::AsyncReadExt;
 

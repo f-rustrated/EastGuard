@@ -5,8 +5,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::NodeId;
+use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::{OwnedWriteHalf, TcpStream};

@@ -31,6 +31,11 @@ turmoil = { version = "0.7.2", package = "turmoil" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# RocksDB compiles ~750MB of C++ debug symbols per build fingerprint; we never
+# debug into it, so drop them — shrinks each artifact copy to a fraction.
+[profile.dev.package.librocksdb-sys]
+debug = false
+
 [lints.clippy]
 shadow_unrelated = "deny"
 
