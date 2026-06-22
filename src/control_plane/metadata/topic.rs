@@ -254,15 +254,6 @@ impl TopicMeta {
             .ok_or(MetadataError::SegmentNotFound)
     }
 
-    pub(crate) fn route_active_segment_key(&self, key: &[u8]) -> Option<SegmentKey> {
-        let range = self.route_active_range(key)?;
-        Some(SegmentKey::new(
-            self.id,
-            range.range_id,
-            range.active_segment?,
-        ))
-    }
-
     pub(crate) fn stats(&self) -> TopicStats {
         let range_count = self.ranges.len() as u32;
         let total_bytes: u64 = self

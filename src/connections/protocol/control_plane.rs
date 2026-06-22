@@ -43,11 +43,20 @@ pub enum ControlPlaneResponse {
     TopicDeleted,
     TopicNotFound,
     // ListHostedTopics
-    TopicList { topics: Box<[TopicSummary]> },
+    TopicList {
+        topics: Box<[TopicSummary]>,
+    },
     // DescribeTopic — when this node owns the topic's metadata
     TopicDetail(TopicDetail),
     // DescribeTopic — when this node does not own the topic's metadata.
-    TopicMetadataRedirect { owner: NodeAddressInfo },
+    TopicMetadataRedirect {
+        owner: NodeAddressInfo,
+    },
+    // Write landed on a member that isn't the metadata Raft leader — client retries
+    // there. `None` when the leader isn't yet known.
+    NotRaftLeader {
+        leader_addr: Option<NodeAddressInfo>,
+    },
     // All control plane operations
     InternalError(String),
 }

@@ -2,8 +2,8 @@
 
 **Goal:** finish the small server-side piece the produce/consume API still needs.
 When a write lands on the wrong node, the server resolves the right node and returns
-it as a **redirect** (`NotLeader` / `ShardNotLocal`); the client retries there. The
-server never forwards or proxies the request.
+it as a **redirect** (`NotWriteLeader` / `ShardNotLocal`); the client retries there.
+The server never forwards or proxies the request.
 
 **Depends on:** D4 (consumer range tracking), D5 (crash recovery).
 
@@ -20,8 +20,8 @@ The produce/consume API has two sides, and most of it is not server work:
   routing/metadata cache, connection management, redirect-following + retry, and
   turning the consumer cursor library (already built, `src/consumer/`) into an actual
   consumer. A client SDK, unbuilt, no current doc. It rides on the redirects this
-  phase delivers (cache metadata, follow `NotLeader` / `ShardNotLocal`, refresh on
-  staleness — the Kafka model). Consumer groups and durable offsets are further out.
+  phase delivers (cache metadata, follow `NotWriteLeader` / `ShardNotLocal`, refresh
+  on staleness — the Kafka model). Consumer groups and durable offsets are further out.
 
 ## The model: redirects, not proxy
 
@@ -41,45 +41,57 @@ active segment); **control-plane writes** → the shard group's Raft leader.
 
 1. **Produce redirects** — rewrite the produce handler to be membership-first
    (mirroring the DescribeTopic redirect), returning, in order:
-   - shard group not found in SWIM → `TopicNotFound`; this node not a member →
-     `ShardNotLocal { hint_node }` (a resolved member address);
+   - ring can't map the key (topology not converged here) → `ShardNotLocal` with no
+     hint — retriable, *not* `TopicNotFound`;
+   - this node not a member → `ShardNotLocal` with a member's address (no hint yet if
+     SWIM hasn't resolved one — still retriable);
    - metadata lookup absent (authoritative now we know we're a member) → `TopicNotFound`
      — the SWIM membership check **must** come first, because the metadata lookup
      can't tell "topic absent" from "not hosted here";
-   - routing key routes to a range with no active segment, mid-split →
-     `RangeSplitting { left, right, split_point }`;
-   - active segment's `replica_set[0]` ≠ this node → `NotLeader { leader_addr }`
+   - routing key finds no active range (the topic isn't active — being torn down) →
+     `TopicNotFound`. An active topic's ranges tile the whole keyspace, so an active
+     topic always hits;
+   - active segment's `replica_set[0]` ≠ this node → `NotWriteLeader { leader_addr }`
      (`None` if a just-dead leader can't be resolved);
    - otherwise dispatch to the data plane and map the ack to `Produced`. Map the data
      plane's transient "not leader / segment not found" rejection (metadata names us
      leader but the assignment hasn't applied yet) to a **retriable**
-     `NotLeader { leader_addr: None }`, not `InternalError`.
+     `NotWriteLeader { leader_addr: None }`, not `InternalError`.
 
-   The leadership check lives at the connection layer, from the metadata it already
+   Both redirect variants — `ShardNotLocal` (wrong host) and `NotWriteLeader` (wrong
+   role) — carry an *optional* address and are uniformly retriable: addresses come from
+   SWIM, which converges eventually, so "no hint yet" means back off and retry. The
+   leadership check lives at the connection layer, from the metadata it already
    fetches — a misroute returns a redirect with no data-plane round-trip; the data
-   plane's own role check stays as the not-ready backstop.
+   plane's own role check stays as the not-ready backstop. (There is deliberately no
+   "mid-split" redirect: a split applies atomically, so a produce simply routes to
+   the active child.)
 
 2. **Address resolution (reuse).** Use the SWIM `NodeId → client address` resolution
    the DescribeTopic redirect already uses (resolve-one and resolve-any). Both return
-   an optional address, which fits `NotLeader { leader_addr: Option<_> }`. No new code.
+   an optional address, matching the optional hint both redirect variants carry. No
+   new code.
 
 3. **Control-plane write redirects** (separable; land after produce). CreateTopic /
-   DeleteTopic return `InternalError` on a non-leader today. Mirror DescribeTopic:
-   not a member → redirect to a member; not the Raft leader → redirect to the leader;
-   else propose. Adds one response variant — a control-plane `NotLeader { leader_addr }`,
-   distinct from the read-oriented metadata redirect.
+   DeleteTopic return `InternalError` on a non-leader today. Mirror the two planes'
+   wrong-host vs wrong-role split: not a member → `TopicMetadataRedirect` (the same
+   structural redirect DescribeTopic already returns); a member but not the Raft
+   leader → a new control-plane `NotRaftLeader { leader_addr }` — named to keep it
+   distinct from the data plane's `NotWriteLeader` (segment write leader, not Raft).
+   Every proposal failure (not leader, group not ready/removed here) collapses to
+   that retriable redirect.
 
 4. **Tests.**
    - Replace the produce-to-every-node test helpers with a **redirect-follower**:
-     `Produced` → done; `NotLeader` / `ShardNotLocal` → map the address to a node and
-     retry there; `RangeSplitting` or a transient error → brief backoff and retry.
-     Mirrors the existing DescribeTopic redirect-follower.
+     `Produced` → done; `NotWriteLeader` / `ShardNotLocal` with an address → retry
+     there; no address or a transient error → brief backoff and retry. Sweeps all
+     nodes too, so it stays robust when a node is down (crash/repair tests).
    - Collapse the create-topic retry-all loops to "send to any node, follow the
      redirect."
    - **Keep** the replication-lag / cluster-visibility polling loops — they wait on
      eventual state, not routing.
-   - Unit tests on the produce handler: `TopicNotFound`, `ShardNotLocal`, `NotLeader`,
-     dispatches-when-leader.
+   - Unit tests on the produce handler: ring-unresolved, not-a-member, not-leader,
+     dispatches-when-leader; plus a control-plane redirect.
 
 ## Decision: no routing cache on the server
 
@@ -98,4 +110,4 @@ redirect. It's a client-SDK concern (future work), needing nothing further here.
   describe, delete-topic, and the repair tests that produce) exercise the
   redirect-follower.
 - Reasoning check: on a 3-node fresh topic, a produce to a non-leader returns
-  `NotLeader` carrying the leader's client address, and the second hop lands `Produced`.
+  `NotWriteLeader` carrying the leader's client address, and the second hop lands `Produced`.
