@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 use crate::channels::BatchSender;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+use crate::data_plane::SegmentKey;
 use crate::data_plane::checkpoint::{CheckpointJob, CheckpointTask};
 use crate::data_plane::messages::command::ProduceAck;
 use crate::data_plane::sparse_index::SparseEntry;
@@ -97,6 +98,11 @@ impl DataPlaneOutputs {
     pub(crate) fn store_put_anchors(&mut self, anchors: Vec<SparseEntry>) {
         self.checkpoint_tasks
             .push(CheckpointTask::PutAnchors(anchors.into_boxed_slice()));
+    }
+
+    pub(crate) fn store_delete_segment_index(&mut self, segment_key: SegmentKey) {
+        self.checkpoint_tasks
+            .push(CheckpointTask::DeleteSegmentIndex(segment_key));
     }
 
     #[cfg(test)]

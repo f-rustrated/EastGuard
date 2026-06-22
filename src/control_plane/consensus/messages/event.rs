@@ -74,6 +74,7 @@ impl MetadataCommitted {
             }
             ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
             ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
+            ApplyResult::SegmentsDeleted(d) => d.into_commands(),
         }
     }
 }

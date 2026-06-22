@@ -71,9 +71,7 @@ impl MetadataStateMachine {
             RollSegment(cmd) => {
                 let range = self
                     .get_active_topic_mut(cmd.segment_key.topic_id)?
-                    .ranges
-                    .get_mut(&cmd.segment_key.range_id)
-                    .ok_or(RangeNotFound)?;
+                    .get_range_mut(&cmd.segment_key.range_id)?;
 
                 if !range.is_active_segment(cmd.segment_key.segment_id)? {
                     range.correct_end_offset(cmd.segment_key.segment_id, cmd.end_entry_id);
@@ -86,6 +84,7 @@ impl MetadataStateMachine {
             MergeRange(cmd) => self.merge_range(cmd)?.into(),
             DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted)?,
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
+            DeleteSegments(cmd) => self.delete_segments(cmd)?,
         };
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -117,10 +116,7 @@ impl MetadataStateMachine {
     fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentRolled, MetadataError> {
         let topic = self.get_active_topic_mut(cmd.segment_key.topic_id)?;
         let can_split = topic.can_split();
-        let range = topic
-            .ranges
-            .get_mut(&cmd.segment_key.range_id)
-            .ok_or(RangeNotFound)?;
+        let range = topic.get_range_mut(&cmd.segment_key.range_id)?;
 
         let new_segment_id = range.roll_segment(cmd.clone())?;
 
@@ -166,6 +162,37 @@ impl MetadataStateMachine {
         } else {
             Ok(ApplyResult::Noop)
         }
+    }
+
+    /// Retention: mark an oldest-first prefix of a range's sealed segments `Deleting`.
+    /// `Noop` when nothing transitions (all named ids already `Deleting`/absent), else
+    /// `SegmentsDeleted` carrying the deleted segments grouped by `replica_set` for
+    /// batched dispatch. Uses plain `get_mut` (not `validate_active`) so a command
+    /// applied after the topic is being deleted is a harmless no-op (already `Deleting`).
+    fn delete_segments(&mut self, cmd: DeleteSegments) -> Result<ApplyResult, MetadataError> {
+        let range = self
+            .topics
+            .get_mut(&cmd.topic_id)
+            .ok_or(TopicNotFound(cmd.topic_id))?
+            .get_range_mut(&cmd.range_id)?;
+
+        let deleted_ids = range.delete_segments(&cmd.segment_ids);
+        if deleted_ids.is_empty() {
+            return Ok(ApplyResult::Noop);
+        }
+        // Group the deleted segments by replica_set here.
+        let mut groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)> = Vec::new();
+        for sid in &deleted_ids {
+            let Some(seg) = range.segments.get(sid) else {
+                continue;
+            };
+            let key = SegmentKey::new(cmd.topic_id, cmd.range_id, *sid);
+            match groups.iter_mut().find(|(rs, _)| rs == &seg.replica_set) {
+                Some((_, keys)) => keys.push(key),
+                None => groups.push((seg.replica_set.clone(), vec![key])),
+            }
+        }
+        Ok(SegmentsDeleted { groups }.into())
     }
 
     fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
@@ -286,7 +313,7 @@ mod tests {
 
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
-            retention_ms: 3_600_000,
+            retention_ms: Some(3_600_000),
             replication_factor: 3,
             partition_strategy: PartitionStrategy::AutoSplit,
         }
@@ -294,7 +321,7 @@ mod tests {
 
     fn fixed_policy() -> StoragePolicy {
         StoragePolicy {
-            retention_ms: 3_600_000,
+            retention_ms: Some(3_600_000),
             replication_factor: 3,
             partition_strategy: PartitionStrategy::Fixed,
         }
@@ -335,6 +362,161 @@ mod tests {
             end_entry_id: None,
         }));
         assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
+    }
+
+    // ── D7 retention ───────────────────────────────────────────────────────
+
+    /// Roll the active segment, sealing it at `end_entry_id` / `sealed_at` so the
+    /// resulting sealed segment has a known end and seal time (unlike the death-roll
+    /// `roll_segment` helper above which seals with `None`).
+    fn roll_with_end(
+        sm: &mut MetadataStateMachine,
+        topic_id: TopicId,
+        segment_id: SegmentId,
+        end_entry_id: u64,
+        sealed_at: u64,
+    ) {
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
+            segment_key: SegmentKey::new(topic_id, RangeId(0), segment_id),
+            sealed_at,
+            new_replica_set: replica_set(),
+            end_entry_id: Some(end_entry_id),
+        }));
+        assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
+    }
+
+    fn seg_state(
+        sm: &MetadataStateMachine,
+        topic_id: TopicId,
+        segment_id: SegmentId,
+    ) -> SegmentMetaState {
+        sm.get_topic(&topic_id).unwrap().ranges[&RangeId(0)].segments[&segment_id]
+            .state
+            .clone()
+    }
+
+    /// Build a topic with sealed segments 0,1,2 (ends 9/19/29, sealed at 100/200/300)
+    /// and an active head 3.
+    fn topic_with_three_sealed(sm: &mut MetadataStateMachine) -> TopicId {
+        let t = create_topic(sm, "t");
+        roll_with_end(sm, t, SegmentId(0), 9, 100);
+        roll_with_end(sm, t, SegmentId(1), 19, 200);
+        roll_with_end(sm, t, SegmentId(2), 29, 300);
+        t
+    }
+
+    fn delete_segments(
+        sm: &mut MetadataStateMachine,
+        topic_id: TopicId,
+        ids: &[u64],
+    ) -> Result<ApplyResult, MetadataError> {
+        sm.apply(MetadataCommand::DeleteSegments(DeleteSegments {
+            topic_id,
+            range_id: RangeId(0),
+            segment_ids: ids.iter().map(|&i| SegmentId(i)).collect(),
+        }))
+    }
+
+    #[test]
+    fn delete_segments_marks_oldest_prefix_deleting() {
+        let mut sm = MetadataStateMachine::default();
+        let t = topic_with_three_sealed(&mut sm);
+
+        let result = delete_segments(&mut sm, t, &[0, 1]).unwrap();
+        let ApplyResult::SegmentsDeleted(d) = result else {
+            panic!("expected SegmentsDeleted, got {result:?}");
+        };
+        // All three sealed segments share one replica_set → a single group of 2 keys.
+        assert_eq!(d.groups.len(), 1);
+        assert_eq!(d.groups[0].1.len(), 2);
+        assert_eq!(seg_state(&sm, t, SegmentId(0)), SegmentMetaState::Deleting);
+        assert_eq!(seg_state(&sm, t, SegmentId(1)), SegmentMetaState::Deleting);
+        assert_eq!(seg_state(&sm, t, SegmentId(2)), SegmentMetaState::Sealed);
+        assert_eq!(seg_state(&sm, t, SegmentId(3)), SegmentMetaState::Active);
+    }
+
+    #[test]
+    fn delete_segments_skips_the_active_head() {
+        let mut sm = MetadataStateMachine::default();
+        let t = topic_with_three_sealed(&mut sm);
+        // Naming the active head (seg 3) alongside the sealed prefix: only the sealed
+        // ones transition; the write head is skipped, never deleted.
+        let ApplyResult::SegmentsDeleted(d) = delete_segments(&mut sm, t, &[0, 1, 2, 3]).unwrap()
+        else {
+            panic!("expected SegmentsDeleted");
+        };
+        let total_keys: usize = d.groups.iter().map(|(_, keys)| keys.len()).sum();
+        assert_eq!(total_keys, 3);
+        assert_eq!(seg_state(&sm, t, SegmentId(3)), SegmentMetaState::Active);
+    }
+
+    /// The no-hole property is a structural invariant, not a hot-path check: a
+    /// non-prefix deletion (seg 1 while seg 0 survives) trips `assert_retention_prefix`.
+    #[test]
+    #[should_panic(expected = "not an oldest-first prefix")]
+    fn delete_segments_non_prefix_trips_invariant() {
+        let mut sm = MetadataStateMachine::default();
+        let t = topic_with_three_sealed(&mut sm);
+        let _ = delete_segments(&mut sm, t, &[1]);
+    }
+
+    #[test]
+    fn delete_segments_is_idempotent() {
+        let mut sm = MetadataStateMachine::default();
+        let t = topic_with_three_sealed(&mut sm);
+        assert!(matches!(
+            delete_segments(&mut sm, t, &[0]).unwrap(),
+            ApplyResult::SegmentsDeleted(_)
+        ));
+        // Re-applying for an already-Deleting segment is a no-op.
+        assert!(matches!(
+            delete_segments(&mut sm, t, &[0]).unwrap(),
+            ApplyResult::Noop
+        ));
+    }
+
+    #[test]
+    fn expired_prefix_selects_by_age_oldest_first() {
+        let mut sm = MetadataStateMachine::default();
+        let t = topic_with_three_sealed(&mut sm); // sealed_at 100/200/300, retention 3_600_000
+        let topic = sm.get_topic(&t).unwrap();
+
+        // now such that segs 0,1 are past the window but seg 2 isn't.
+        let now = 200 + 3_600_000 + 1;
+        let prefixes = topic.expired_segment_prefixes(now);
+        assert_eq!(prefixes.len(), 1);
+        let (range_id, ids) = &prefixes[0];
+        assert_eq!(*range_id, RangeId(0));
+        assert_eq!(ids.as_ref(), &[SegmentId(0), SegmentId(1)]);
+    }
+
+    #[test]
+    fn expired_prefix_empty_without_retention() {
+        let mut sm = MetadataStateMachine::default();
+        let t = sm
+            .apply(MetadataCommand::CreateTopic(CreateTopic {
+                name: "no-retention".into(),
+                storage_policy: StoragePolicy {
+                    retention_ms: None,
+                    replication_factor: 3,
+                    partition_strategy: PartitionStrategy::AutoSplit,
+                },
+                replica_set: replica_set(),
+                created_at: 1000,
+            }))
+            .map(|r| match r {
+                ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
+                other => panic!("{other:?}"),
+            })
+            .unwrap();
+        roll_with_end(&mut sm, t, SegmentId(0), 9, 100);
+        // Far past any window, but no policy → nothing expires.
+        assert!(
+            sm.get_topic(&t)
+                .unwrap()
+                .expired_segment_prefixes(u64::MAX)
+                .is_empty()
+        );
     }
 
     fn split_range(

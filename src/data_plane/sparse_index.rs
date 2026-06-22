@@ -46,6 +46,11 @@ pub trait SparseIndex: Send + Sync + 'static {
     /// segment's first entry is always anchored), falls back to
     /// `(target_offset, 0)`.
     fn seek_index(&self, segment_key: SegmentKey, target_offset: u64) -> (u64, u64);
+
+    /// Retention (D7): remove every anchor for a segment (the 24-byte
+    /// topic/range/segment prefix). Called when the segment's file is reclaimed, so
+    /// the index doesn't leak entries for data that no longer exists.
+    fn delete_segment_entries(&self, segment_key: SegmentKey) -> io::Result<()>;
 }
 
 impl SparseIndex for rocksdb::DB {
@@ -75,6 +80,25 @@ impl SparseIndex for rocksdb::DB {
             return (anchor_id, byte_position);
         }
         (target_offset, 0)
+    }
+
+    fn delete_segment_entries(&self, segment_key: SegmentKey) -> io::Result<()> {
+        let mut prefix = Vec::with_capacity(24);
+        prefix.extend_from_slice(&segment_key.topic_id.to_be_bytes());
+        prefix.extend_from_slice(&segment_key.range_id.to_be_bytes());
+        prefix.extend_from_slice(&segment_key.segment_id.to_be_bytes());
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut iter = self.raw_iterator();
+        iter.seek(&prefix);
+        while iter.valid()
+            && let Some(key) = iter.key()
+            && key.starts_with(&prefix)
+        {
+            batch.delete(key);
+            iter.next();
+        }
+        self.write(batch).map_err(io::Error::other)
     }
 }
 

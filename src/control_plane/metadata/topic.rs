@@ -75,6 +75,15 @@ impl TopicMeta {
         Ok(vec_ranges.try_into().unwrap())
     }
 
+    pub(crate) fn get_range_mut(
+        &mut self,
+        range_id: &RangeId,
+    ) -> Result<&mut RangeMeta, MetadataError> {
+        self.ranges
+            .get_mut(range_id)
+            .ok_or(MetadataError::RangeNotFound)
+    }
+
     pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
         (self.state == TopicState::Active)
             .then_some(())
@@ -271,6 +280,22 @@ impl TopicMeta {
 
     pub(crate) fn merged_from(&self, range_id: RangeId) -> Option<[RangeId; 2]> {
         self.ranges.get(&range_id).and_then(|m| m.merged_from)
+    }
+
+    /// Retention (D7): per-range oldest-first prefixes of sealed segments expired
+    /// under this topic's policy as of `now`. Empty when the topic has no retention
+    /// set (`retention_ms = None`, the default — keep everything).
+    pub(crate) fn expired_segment_prefixes(&self, now: u64) -> Vec<(RangeId, Box<[SegmentId]>)> {
+        let Some(retention_ms) = self.storage_policy.retention_ms else {
+            return Vec::new();
+        };
+        self.ranges
+            .values()
+            .filter_map(|range| {
+                let ids = range.expired_sealed_prefix(now, retention_ms);
+                (!ids.is_empty()).then(|| (range.range_id, ids.into_boxed_slice()))
+            })
+            .collect()
     }
 
     pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
@@ -516,7 +541,7 @@ mod routing_tests {
 
     fn policy() -> StoragePolicy {
         StoragePolicy {
-            retention_ms: 1000,
+            retention_ms: Some(1000),
             replication_factor: 1,
             partition_strategy: PartitionStrategy::AutoSplit,
         }

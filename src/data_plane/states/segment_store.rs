@@ -232,6 +232,30 @@ impl SegmentStore {
         })
     }
 
+    /// Retention (D7): drop a segment this node holds, returning its `start_entry_id`
+    /// (needed to build the on-disk file path) so the caller can delete the file and
+    /// its sparse-index entries. Removes the live tracker (active) or the sealed-index
+    /// slot, whichever holds it. `None` if this node doesn't track it — already gone
+    /// or never had it; the caller no-ops and orphan GC is the backstop.
+    pub(crate) fn remove_segment(&mut self, key: &SegmentKey) -> Option<u64> {
+        if let Some(tracker) = self.by_key.remove(key) {
+            let start = tracker.start_entry_id();
+            self.unindex_active(*key, start);
+            return Some(start);
+        }
+        let sealed = self
+            .sealed_by_range
+            .get_mut(&(key.topic_id, key.range_id))?;
+        let start = sealed
+            .iter()
+            .find_map(|(&start, loc)| (loc.segment_id == key.segment_id).then_some(start))?;
+        sealed.remove(&start);
+        if sealed.is_empty() {
+            self.sealed_by_range.remove(&(key.topic_id, key.range_id));
+        }
+        Some(start)
+    }
+
     /// Look up a sealed segment's `(start_entry_id, end_entry_id)` by key.
     /// The catch-up source path uses this to stream `(local_end, end]` from its own
     /// committed bounds rather than bounds relayed by the requester — so it always

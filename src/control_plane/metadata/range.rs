@@ -280,6 +280,51 @@ impl RangeMeta {
         }
     }
 
+    /// Retention: mark the named segments `Deleting`, returning the ids actually
+    /// transitioned. Only `Sealed → Deleting` — an `Active` (write head) or an
+    /// already-`Deleting`/absent id is skipped, so the call is idempotent and can
+    /// never delete the write head. Callers pass an oldest-first prefix (the sweep
+    /// does so by construction); that no-hole property is a structural invariant
+    /// (`assert_retention_prefix`, d7 #2), not re-checked on the hot path.
+    pub(crate) fn delete_segments(&mut self, segment_ids: &[SegmentId]) -> Vec<SegmentId> {
+        let mut deleted = Vec::new();
+        for sid in segment_ids {
+            if let Some(seg) = self.segments.get_mut(sid)
+                && seg.state == SegmentMetaState::Sealed
+            {
+                seg.state = SegmentMetaState::Deleting;
+                deleted.push(*sid);
+            }
+        }
+        deleted
+    }
+
+    /// Retention: sealed segments expired under `retention_ms` as of `now`
+    /// (`sealed_at + retention_ms < now`), as an oldest-first prefix by segment_id.
+    /// Take-while semantics — stops at the first non-expired sealed segment (or the
+    /// active head) so the result is always a contiguous prefix, never a hole.
+    pub(crate) fn expired_sealed_prefix(&self, now: u64, retention_ms: u64) -> Vec<SegmentId> {
+        let mut segs: Vec<&SegmentMeta> = self.segments.values().collect();
+        segs.sort_by_key(|s| s.segment_id.0);
+        let mut out = Vec::new();
+        for seg in segs {
+            match seg.state {
+                // Already gone from the live prefix; keep scanning newer segments.
+                SegmentMetaState::Deleting => continue,
+                SegmentMetaState::Sealed => match seg.sealed_at {
+                    Some(sealed_at) if sealed_at.saturating_add(retention_ms) < now => {
+                        out.push(seg.segment_id)
+                    }
+                    // First non-expired (or unknown sealed_at) → stop: prefix only.
+                    _ => break,
+                },
+                // Reached the write head.
+                SegmentMetaState::Active => break,
+            }
+        }
+        out
+    }
+
     /// Compute the midpoint of two byte-slice keyspace bounds.
     pub fn compute_midpoint(&self) -> Vec<u8> {
         let len = self
@@ -370,6 +415,7 @@ pub mod props {
             );
             self.assert_seal_history();
             self.assert_offset_chain();
+            self.assert_retention_prefix();
         }
     }
 
@@ -442,6 +488,45 @@ pub mod props {
             let ts = &self.seal_history.seal_timestamps;
             for i in 1..ts.len() {
                 assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
+            }
+        }
+
+        /// D7 retention invariants: (#1) the active head is never `Deleting`, so a
+        /// range under retention can still be written; (#2) `Deleting` segments form
+        /// an oldest-first prefix by segment_id — every survivor has a higher
+        /// segment_id, so survivors are a contiguous suffix and a forward reader
+        /// crosses the retained boundary exactly once (no hole).
+        fn assert_retention_prefix(&self) {
+            if let Some(active_id) = self.active_segment
+                && let Some(seg) = self.segments.get(&active_id)
+            {
+                assert_ne!(
+                    seg.state,
+                    SegmentMetaState::Deleting,
+                    "range {:?}: active segment is Deleting",
+                    self.range_id,
+                );
+            }
+            let max_deleting = self
+                .segments
+                .values()
+                .filter(|s| s.state == SegmentMetaState::Deleting)
+                .map(|s| s.segment_id.0)
+                .max();
+            let min_surviving = self
+                .segments
+                .values()
+                .filter(|s| s.state != SegmentMetaState::Deleting)
+                .map(|s| s.segment_id.0)
+                .min();
+            if let (Some(md), Some(ms)) = (max_deleting, min_surviving) {
+                assert!(
+                    md < ms,
+                    "range {:?}: Deleting segment_id {} >= surviving {} (not an oldest-first prefix)",
+                    self.range_id,
+                    md,
+                    ms,
+                );
             }
         }
 

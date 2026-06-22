@@ -3,7 +3,9 @@ use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{CatchUpAssignment, SealResponse, SegmentAssignment};
+use crate::data_plane::messages::command::{
+    CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment,
+};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 
@@ -145,6 +147,31 @@ impl RangeMerged {
     }
 }
 
+/// Retention deletion (D7). The deleted segments are pre-grouped by `replica_set`
+/// (in `delete_segments`, which already reads each segment's set) — one group becomes
+/// one batched `DeleteSegments` to that set's nodes. Segments in a range can sit on
+/// different replica sets, so there may be several groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentsDeleted {
+    pub groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)>,
+}
+
+impl SegmentsDeleted {
+    pub fn into_commands(self) -> Vec<DataTransportCommand> {
+        self.groups
+            .into_iter()
+            .map(|(replica_set, keys)| {
+                DataTransportCommand::send_to_targets(
+                    replica_set,
+                    DeleteSegments {
+                        segment_keys: keys.into_boxed_slice(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyResult {
     TopicCreated(TopicCreated),
@@ -152,6 +179,7 @@ pub enum ApplyResult {
     RangeSplit(RangeSplit),
     RangeMerged(RangeMerged),
     SegmentReassigned(SegmentReassigned),
+    SegmentsDeleted(SegmentsDeleted),
     TopicDeleted,
     Noop,
 }
@@ -162,5 +190,6 @@ impl_from_variant!(
     SegmentRolled,
     RangeSplit,
     RangeMerged,
-    SegmentReassigned
+    SegmentReassigned,
+    SegmentsDeleted
 );

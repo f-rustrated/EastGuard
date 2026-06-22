@@ -174,7 +174,7 @@ pub(super) fn make_create_topic_req(name: &str) -> ClientRequest {
     ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
         name: name.to_string(),
         storage_policy: StoragePolicy {
-            retention_ms: 3_600_000,
+            retention_ms: Some(3_600_000),
             replication_factor: 3,
             partition_strategy: PartitionStrategy::AutoSplit,
         },

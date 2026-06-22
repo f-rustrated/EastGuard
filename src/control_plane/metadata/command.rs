@@ -3,7 +3,7 @@ use bincode::{Decode, Encode};
 use crate::{
     control_plane::{
         NodeId,
-        metadata::{RangeId, TopicId, strategy::StoragePolicy},
+        metadata::{RangeId, SegmentId, TopicId, strategy::StoragePolicy},
     },
     data_plane::SegmentKey,
     impl_from_variant,
@@ -58,6 +58,17 @@ pub struct ReassignSegment {
     pub replica_set: Vec<NodeId>,
 }
 
+/// Retention: mark an oldest-first **prefix** of one range's sealed segments
+/// `Deleting`. Plural by nature — a retention sweep expires a run of old segments,
+/// not one. See `diagrams/data-plane/d7_retention_gc.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct DeleteSegments {
+    pub topic_id: TopicId,
+    pub range_id: RangeId,
+    /// Oldest-first prefix of the range's sealed segments to delete.
+    pub segment_ids: Box<[SegmentId]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum MetadataCommand {
     CreateTopic(CreateTopic),
@@ -66,6 +77,7 @@ pub enum MetadataCommand {
     MergeRange(MergeRange),
     DeleteTopic(DeleteTopic),
     ReassignSegment(ReassignSegment),
+    DeleteSegments(DeleteSegments),
 }
 
 impl_from_variant!(
@@ -75,5 +87,6 @@ impl_from_variant!(
     SplitRange,
     MergeRange,
     DeleteTopic,
-    ReassignSegment
+    ReassignSegment,
+    DeleteSegments
 );

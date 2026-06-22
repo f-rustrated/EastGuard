@@ -434,6 +434,26 @@ impl<W: WalStorage> DataPlane<W> {
                 self.out
                     .store_coordinator_cmd(MultiRaftActorCommand::SealBoundaryReport(cmd));
             }
+
+            C::DeleteSegments(cmd) => self.handle_delete_segments(cmd),
+        }
+    }
+
+    /// Retention (D7): reclaim the named sealed segments the coordinator expired — for
+    /// each, drop the tracker/sealed-index slot, delete the file, and remove its
+    /// sparse-index entries. Idempotent per key: a segment this node no longer holds
+    /// (already gone, never had it) is skipped, and orphan GC is the eventual backstop
+    /// for a missed delete.
+    fn handle_delete_segments(&mut self, cmd: DeleteSegments) {
+        for key in cmd.segment_keys {
+            let Some(start_offset) = self.segments.remove_segment(&key) else {
+                continue;
+            };
+            self.recovered.remove(&key);
+            if let Err(e) = OrphanCandidate::new(key, start_offset).delete(&self.config.data_dir) {
+                tracing::warn!("retention: deleting segment file {key:?} failed: {e}");
+            }
+            self.out.store_delete_segment_index(key);
         }
     }
 
@@ -2867,6 +2887,64 @@ mod tests {
         assert!(
             matches!(reply_rx.try_recv(), Ok(OrphanGcSignal::KeepTicking)),
             "ticker told to keep going while an orphan is pending"
+        );
+    }
+
+    /// Retention (D7): a `DeleteSegment` for a sealed segment this node holds reclaims
+    /// the file, drops it from the store, and queues a sparse-index delete.
+    #[test]
+    fn retention_delete_reclaims_a_sealed_segment() {
+        use crate::data_plane::checkpoint::CheckpointTask;
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let path = key.file_path(dir.path(), 0);
+        write_seg_file(&path, &[(b"a", 1)]);
+        let mut dp = make_data_plane(&dir);
+        dp.segments.insert_sealed_from_catch_up(key, 0, 0);
+        assert!(dp.segments.sealed_bounds(&key).is_some());
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            DeleteSegments {
+                segment_keys: Box::new([key]),
+            }
+            .into(),
+        ));
+
+        assert!(!path.exists(), "segment file must be reclaimed");
+        assert!(
+            dp.segments.sealed_bounds(&key).is_none(),
+            "segment dropped from the store"
+        );
+        assert!(
+            dp.out
+                .checkpoint_tasks
+                .iter()
+                .any(|t| matches!(t, CheckpointTask::DeleteSegmentIndex(k) if *k == key)),
+            "sparse-index delete queued for the worker"
+        );
+    }
+
+    /// Idempotent: a `DeleteSegment` for a segment this node doesn't hold (already
+    /// gone, or never had it) is a no-op — no panic, no index-delete task.
+    #[test]
+    fn retention_delete_of_unheld_segment_is_a_noop() {
+        use crate::data_plane::checkpoint::CheckpointTask;
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+
+        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+            DeleteSegments {
+                segment_keys: Box::new([test_key()]),
+            }
+            .into(),
+        ));
+
+        assert!(
+            !dp.out
+                .checkpoint_tasks
+                .iter()
+                .any(|t| matches!(t, CheckpointTask::DeleteSegmentIndex(_))),
+            "no index delete for a segment not held here"
         );
     }
 
