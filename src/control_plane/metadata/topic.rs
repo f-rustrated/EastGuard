@@ -75,6 +75,16 @@ impl TopicMeta {
         Ok(vec_ranges.try_into().unwrap())
     }
 
+    pub(crate) fn get_range_mut(
+        &mut self,
+        range_id: &RangeId,
+    ) -> Result<&mut RangeMeta, MetadataError> {
+        Ok(self
+            .ranges
+            .get_mut(range_id)
+            .ok_or(MetadataError::RangeNotFound)?)
+    }
+
     pub(crate) fn validate_active(&self) -> Result<(), MetadataError> {
         (self.state == TopicState::Active)
             .then_some(())

@@ -71,9 +71,7 @@ impl MetadataStateMachine {
             RollSegment(cmd) => {
                 let range = self
                     .get_active_topic_mut(cmd.segment_key.topic_id)?
-                    .ranges
-                    .get_mut(&cmd.segment_key.range_id)
-                    .ok_or(RangeNotFound)?;
+                    .get_range_mut(&cmd.segment_key.range_id)?;
 
                 if !range.is_active_segment(cmd.segment_key.segment_id)? {
                     range.correct_end_offset(cmd.segment_key.segment_id, cmd.end_entry_id);
@@ -118,10 +116,7 @@ impl MetadataStateMachine {
     fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentRolled, MetadataError> {
         let topic = self.get_active_topic_mut(cmd.segment_key.topic_id)?;
         let can_split = topic.can_split();
-        let range = topic
-            .ranges
-            .get_mut(&cmd.segment_key.range_id)
-            .ok_or(RangeNotFound)?;
+        let range = topic.get_range_mut(&cmd.segment_key.range_id)?;
 
         let new_segment_id = range.roll_segment(cmd.clone())?;
 
@@ -170,19 +165,16 @@ impl MetadataStateMachine {
     }
 
     /// Retention: mark an oldest-first prefix of a range's sealed segments `Deleting`.
-    /// `Noop` when nothing transitions (all named ids already `Deleting`/absent),
-    /// else `SegmentsDeleted` carrying each deleted segment's key + `replica_set` so
-    /// the leader can dispatch the per-segment file deletion. Uses plain `get_mut`
-    /// (not `validate_active`) so a command applied after the topic is being deleted
-    /// is a harmless no-op (segments already `Deleting`).
+    /// `Noop` when nothing transitions (all named ids already `Deleting`/absent), else
+    /// `SegmentsDeleted` carrying the deleted segments grouped by `replica_set` for
+    /// batched dispatch. Uses plain `get_mut` (not `validate_active`) so a command
+    /// applied after the topic is being deleted is a harmless no-op (already `Deleting`).
     fn delete_segments(&mut self, cmd: DeleteSegments) -> Result<ApplyResult, MetadataError> {
         let range = self
             .topics
             .get_mut(&cmd.topic_id)
             .ok_or(TopicNotFound(cmd.topic_id))?
-            .ranges
-            .get_mut(&cmd.range_id)
-            .ok_or(RangeNotFound)?;
+            .get_range_mut(&cmd.range_id)?;
 
         let deleted_ids = range.delete_segments(&cmd.segment_ids);
         if deleted_ids.is_empty() {
