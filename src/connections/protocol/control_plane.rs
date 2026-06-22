@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
@@ -25,7 +25,7 @@ use crate::control_plane::metadata::{
     RangeMeta, RangeState, SegmentMeta, TopicMeta, TopicState as MetaTopicState,
 };
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub enum ControlPlaneRequest {
     CreateTopic {
         name: String,
@@ -40,7 +40,7 @@ pub enum ControlPlaneRequest {
     },
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum ControlPlaneResponse {
     // CreateTopic
     TopicCreated,
@@ -67,14 +67,14 @@ pub enum ControlPlaneResponse {
     InternalError(String),
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct TopicSummary {
     pub name: String,
     pub range_count: u32,
     pub state: TopicState,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum TopicState {
     Active,
     Deleting,
@@ -83,7 +83,7 @@ pub enum TopicState {
 /// Full metadata snapshot for a topic, returned by `DescribeTopic`. Includes every
 /// range — active, sealed, and deleting — so a consumer can walk lineage from any
 /// historical ancestor forward through splits and merges.
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub struct TopicDetail {
     /// Resolved id, so a consumer can fetch by id directly from a holding replica
     /// (no name re-resolution on the data node). See `FetchByIdRequest`.
@@ -96,7 +96,7 @@ pub struct TopicDetail {
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)
 /// let the consumer reconstruct the DAG; only the predecessor that owned a given
 /// key needs to be drained before its successor. See d4_consumer_range_tracking.md.
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RangeDetail {
     pub range_id: u64,
     pub keyspace_start: Vec<u8>,
@@ -115,7 +115,7 @@ pub struct RangeDetail {
 /// Per-segment metadata exposed to consumers. The replica set carries resolved
 /// client addresses so the consumer can pick a node to send fetches to without a
 /// separate address-resolution round trip.
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentDetail {
     pub segment_id: u64,
     pub start_offset: u64,
@@ -126,7 +126,7 @@ pub struct SegmentDetail {
 
 /// A node identifier paired with its currently-known client address.
 /// Addresses come from SWIM membership; consumers cache them.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct NodeAddressInfo {
     pub node_id: String,
     pub client_addr: SocketAddr,

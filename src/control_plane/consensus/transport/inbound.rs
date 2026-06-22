@@ -1,7 +1,7 @@
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
-use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::NodeId;
 use crate::net::OwnedReadHalf;
 use tokio::io::AsyncReadExt;
 
@@ -13,7 +13,7 @@ impl RaftRpcListener {
         anyhow::ensure!(len <= 1024, "NodeId frame too large: {len} bytes");
         let mut buf = vec![0u8; len];
         self.0.read_exact(&mut buf).await?;
-        let (id, _) = bincode::decode_from_slice::<NodeId, _>(&buf, BINCODE_CONFIG)?;
+        let id = borsh::from_slice::<NodeId>(&buf)?;
         Ok(id)
     }
 
@@ -25,7 +25,7 @@ impl RaftRpcListener {
         );
         let mut buf = vec![0u8; len];
         self.0.read_exact(&mut buf).await?;
-        let (msg, _) = bincode::decode_from_slice::<WireRaftMessage, _>(&buf, BINCODE_CONFIG)?;
+        let msg = borsh::from_slice::<WireRaftMessage>(&buf)?;
         Ok(msg)
     }
 

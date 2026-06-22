@@ -1,13 +1,13 @@
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::{NodeId, SwimNode};
 
 use super::dissemination_buffer::ShardLeaderInfo;
 
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct SwimHeader {
     pub seq: u64,
     pub source_node_id: NodeId,
@@ -17,7 +17,7 @@ pub struct SwimHeader {
 }
 
 /// The Wire Format (What goes over UDP)
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub enum SwimPacket {
     Ping(SwimHeader),
     Ack(SwimHeader),

@@ -14,7 +14,7 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId, Topology};
-use crate::control_plane::{BINCODE_CONFIG, NodeId, SwimNodeState};
+use crate::control_plane::{NodeId, SwimNodeState};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
@@ -137,7 +137,7 @@ async fn serve_leader(
     let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
     let (stream, _) = listener.accept().await?;
     let (_read, mut write) = stream.into_split();
-    let bytes = bincode::encode_to_vec(&leader, BINCODE_CONFIG).unwrap();
+    let bytes = borsh::to_vec(&leader).unwrap();
     let len = bytes.len() as u32;
     write.write_all(&len.to_be_bytes()).await?;
     write.write_all(&bytes).await?;
@@ -151,8 +151,7 @@ async fn read_leader(host: &str, port: u16) -> Option<NodeId> {
     let len = read.read_u32().await.unwrap() as usize;
     let mut buf = vec![0u8; len];
     read.read_exact(&mut buf).await.unwrap();
-    let (leader, _): (Option<NodeId>, _) =
-        bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
+    let leader: Option<NodeId> = borsh::from_slice(&buf).unwrap();
     leader
 }
 
@@ -166,7 +165,7 @@ async fn serve_peers(
     let listener = TcpListener::bind(format!("0.0.0.0:{}", query_port)).await?;
     let (stream, _) = listener.accept().await?;
     let (_read, mut write) = stream.into_split();
-    let bytes = bincode::encode_to_vec(&peers, BINCODE_CONFIG).unwrap();
+    let bytes = borsh::to_vec(&peers).unwrap();
     let len = bytes.len() as u32;
     write.write_all(&len.to_be_bytes()).await?;
     write.write_all(&bytes).await?;
@@ -180,7 +179,7 @@ async fn read_peers(host: &str, port: u16) -> Vec<NodeId> {
     let len = read.read_u32().await.unwrap() as usize;
     let mut buf = vec![0u8; len];
     read.read_exact(&mut buf).await.unwrap();
-    let (peers, _): (Vec<NodeId>, _) = bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
+    let peers: Vec<NodeId> = borsh::from_slice(&buf).unwrap();
     peers
 }
 

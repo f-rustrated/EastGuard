@@ -10,7 +10,7 @@ use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMess
 
 use crate::control_plane::consensus::transport::RaftRpcListener;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::NodeId;
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -217,8 +217,7 @@ impl RaftRpcDispatcher {
         })?;
         let mut buf = Vec::new();
         for msg in msgs {
-            let bytes = bincode::encode_to_vec(msg, BINCODE_CONFIG)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let bytes = borsh::to_vec(msg)?;
             let len = bytes.len() as u32;
             buf.extend_from_slice(&len.to_be_bytes());
             buf.extend_from_slice(&bytes);
@@ -257,7 +256,7 @@ async fn dial(
     .await??;
 
     let (read_half, mut write_half) = stream.into_split();
-    let bytes = bincode::encode_to_vec(&node_id, BINCODE_CONFIG)
+    let bytes = borsh::to_vec(&node_id)
         .map_err(|e| anyhow::anyhow!("[{}] Handshake encode failed: {e}", node_id))?;
     let len = bytes.len() as u32;
     write_half.write_all(&len.to_be_bytes()).await?;

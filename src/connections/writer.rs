@@ -1,7 +1,6 @@
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    config::SERDE_CONFIG,
     connections::{REQUEST_ID_SIZE, protocol::ClientResponse},
     net::OwnedWriteHalf,
 };
@@ -16,12 +15,12 @@ impl ClientRawWriter {
         Self { stream: write_half }
     }
 
-    pub async fn write<T: bincode::Encode>(
+    pub async fn write<T: borsh::BorshSerialize>(
         &mut self,
         request_id: u64,
         data: &T,
     ) -> anyhow::Result<()> {
-        let encoded = bincode::encode_to_vec(data, SERDE_CONFIG)?;
+        let encoded = borsh::to_vec(data)?;
         let len = (REQUEST_ID_SIZE + encoded.len()) as u32;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&request_id.to_be_bytes()).await?;

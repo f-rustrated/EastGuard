@@ -1,11 +1,11 @@
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::membership::ShardGroupId;
 use crate::impl_from_variant;
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RequestVote {
     pub term: u64,
     pub candidate_id: NodeId,
@@ -13,14 +13,14 @@ pub struct RequestVote {
     pub last_log_term: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RequestVoteResponse {
     pub term: u64,
     pub node_id: NodeId,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct AppendEntries {
     pub term: u64,
     pub leader_id: NodeId,
@@ -30,7 +30,7 @@ pub struct AppendEntries {
     pub leader_commit: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct AppendEntriesResponse {
     pub term: u64,
     pub node_id: NodeId,
@@ -38,7 +38,7 @@ pub struct AppendEntriesResponse {
     pub last_log_index: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum RaftRpc {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
@@ -75,7 +75,7 @@ impl OutboundRaftPacket {
     }
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct WireRaftMessage {
     pub shard_group_id: ShardGroupId,
     pub sender: NodeId,

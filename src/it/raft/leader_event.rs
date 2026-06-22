@@ -14,7 +14,7 @@ use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{
     QueryCommand, ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand,
 };
-use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId};
+use crate::control_plane::{NodeAddress, NodeId};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
@@ -164,15 +164,13 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 let (stream, _) = result_listener.accept().await?;
                 let (_read, mut write) = stream.into_split();
 
-                let count_bytes = bincode::encode_to_vec(events.len(), BINCODE_CONFIG).unwrap();
+                let count_bytes = borsh::to_vec(&events.len()).unwrap();
                 let count_len = count_bytes.len() as u32;
                 write.write_all(&count_len.to_be_bytes()).await?;
                 write.write_all(&count_bytes).await?;
 
                 if let Some(event) = events.first() {
-                    let leader_bytes =
-                        bincode::encode_to_vec(Some(event.leader_node_id.clone()), BINCODE_CONFIG)
-                            .unwrap();
+                    let leader_bytes = borsh::to_vec(&Some(event.leader_node_id.clone())).unwrap();
                     let leader_len = leader_bytes.len() as u32;
                     write.write_all(&leader_len.to_be_bytes()).await?;
                     write.write_all(&leader_bytes).await?;
@@ -200,7 +198,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
             let len = read.read_u32().await.unwrap() as usize;
             let mut buf = vec![0u8; len];
             read.read_exact(&mut buf).await.unwrap();
-            let (count, _): (usize, _) = bincode::decode_from_slice(&buf, BINCODE_CONFIG).unwrap();
+            let count: usize = borsh::from_slice(&buf).unwrap();
 
             total_events += count;
 
@@ -208,8 +206,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                 let leader_len = read.read_u32().await.unwrap() as usize;
                 let mut leader_buf = vec![0u8; leader_len];
                 read.read_exact(&mut leader_buf).await.unwrap();
-                let (node_id, _): (Option<NodeId>, _) =
-                    bincode::decode_from_slice(&leader_buf, BINCODE_CONFIG).unwrap();
+                let node_id: Option<NodeId> = borsh::from_slice(&leader_buf).unwrap();
                 leader_node = node_id;
             }
         }

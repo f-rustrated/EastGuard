@@ -1,4 +1,4 @@
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::ReassignSegment;
@@ -11,7 +11,7 @@ use crate::{impl_from_variant, impl_from_variant_via};
 /// mutated only when `AddPeer` / `RemovePeer` entries apply — never by direct mutation
 /// from gossip events. See `diagrams/metadata-management/metadata_management_roadmap.md`
 /// Phase 3d ("Membership Changes via the Log") for the rationale.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum RaftCommand {
     Noop,
     Metadata(MetadataCommand),

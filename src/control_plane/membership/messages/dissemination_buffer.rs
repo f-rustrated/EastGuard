@@ -1,7 +1,7 @@
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::membership::topology::ShardGroupId;
-use crate::control_plane::{BINCODE_CONFIG, NodeAddress, NodeId, SwimNode};
+use crate::control_plane::{NodeAddress, NodeId, SwimNode};
 
 // UDP does not handle splitting large messages up.
 // Preventing IP fragmentation is therefore necessary unless we have dedicated fragmentation handling logics.
@@ -113,7 +113,7 @@ impl<T: Disseminable> DisseminationBuffer<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ShardLeaderInfo {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: NodeId,
@@ -124,9 +124,7 @@ pub struct ShardLeaderInfo {
 impl ShardLeaderInfo {
     #[inline]
     pub(crate) fn encoded_size(&self) -> usize {
-        bincode::encode_to_vec(self, BINCODE_CONFIG)
-            .map(|v| v.len())
-            .unwrap_or(0)
+        borsh::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
 }
 
@@ -405,11 +403,14 @@ mod tests {
             buf.enqueue(leader_info(i, &format!("node-{}", i), 8000, 1), 10);
         }
 
-        buf.collect(MAX_GOSSIP_BYTES);
+        // Unbounded budget: this exercises eviction at capacity, not the per-round
+        // byte budget (see `byte_budget_respected`). A bounded round would only drain
+        // a prefix of the 64 entries, leaving the assertion at the mercy of entry size.
+        buf.collect(usize::MAX);
 
         buf.enqueue(leader_info(999, "node-new", 9000, 1), 10);
 
-        let result = buf.collect(MAX_GOSSIP_BYTES);
+        let result = buf.collect(usize::MAX);
         assert!(result.iter().any(|i| i.shard_group_id == ShardGroupId(999)));
     }
 }

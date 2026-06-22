@@ -202,7 +202,7 @@ async fn test_ping_response() {
     // 1. Simulate receiving a Ping from a remote node
     let ping = SwimPacket::Ping(SwimHeader {
         seq: 100,
-        source_node_id: "node-remote".into(),
+        source_node_id: NodeId::new("node-remote"),
         source_incarnation: 0,
         gossip: vec![],
         shard_leaders: vec![],
@@ -239,7 +239,7 @@ async fn test_refutation_mechanism() {
     // 1. Send a gossip message claiming WE (local_addr) are Suspect
     // The actor starts at Incarnation 0. We send Suspect with Incarnation 0.
     let lie = SwimNode {
-        node_id: "node-local-8000".into(),
+        node_id: NodeId::new("node-local-8000"),
         addr: NodeAddress::test(harness.local_addr, harness.local_addr),
         state: SwimNodeState::Suspect,
         incarnation: 0,
@@ -247,7 +247,7 @@ async fn test_refutation_mechanism() {
 
     let ping = SwimPacket::Ping(SwimHeader {
         seq: 200,
-        source_node_id: "node-remote".into(),
+        source_node_id: NodeId::new("node-remote"),
         source_incarnation: 0,
         gossip: vec![lie],
         shard_leaders: vec![],
@@ -289,7 +289,7 @@ async fn test_gossip_propagation() {
 
     // 1. Tell the actor that "Node 9999" is DEAD via gossip
     let gossip_msg = SwimNode {
-        node_id: "node-dead".into(),
+        node_id: NodeId::new("node-dead"),
         addr: NodeAddress::test(dead_node, dead_node),
         state: SwimNodeState::Dead,
         incarnation: 5,
@@ -301,7 +301,7 @@ async fn test_gossip_propagation() {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 300,
-                source_node_id: "node-sender".into(),
+                source_node_id: NodeId::new("node-sender"),
                 source_incarnation: 0,
                 gossip: vec![gossip_msg],
                 shard_leaders: vec![],
@@ -322,7 +322,7 @@ async fn test_gossip_propagation() {
                 src: probe_addr,
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 400 + i, // Increment seq to keep packets distinct
-                    source_node_id: "node-probe".into(),
+                    source_node_id: NodeId::new("node-probe"),
                     source_incarnation: 0,
                     gossip: vec![],
                     shard_leaders: vec![],
@@ -355,7 +355,7 @@ async fn test_gossip_propagation() {
 
 fn make_peer(name: &str, addr: SocketAddr) -> SwimNode {
     SwimNode {
-        node_id: name.into(),
+        node_id: NodeId::new(name),
         addr: NodeAddress::test(addr, addr),
         state: SwimNodeState::Alive,
         incarnation: 1,
@@ -396,7 +396,7 @@ async fn test_indirect_ping_trigger() {
             src: peer_1,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
-                source_node_id: "node-peer-1".into(),
+                source_node_id: NodeId::new("node-peer-1"),
                 source_incarnation: 1,
                 gossip: vec![
                     make_peer("node-peer-1", peer_1),
@@ -435,7 +435,7 @@ async fn test_self_registers_in_topology_on_startup() {
 
     assert!(
         harness
-            .query_topology_includes("node-local-8000".into())
+            .query_topology_includes(NodeId::new("node-local-8000"))
             .await,
         "SwimActor should register itself in the topology ring on startup"
     );
@@ -452,10 +452,10 @@ async fn test_alive_gossip_adds_node_to_topology() {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
-                source_node_id: "node-sender".into(),
+                source_node_id: NodeId::new("node-sender"),
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
-                    node_id: "node-new".into(),
+                    node_id: NodeId::new("node-new"),
                     addr: NodeAddress::test(new_node, new_node),
                     state: SwimNodeState::Alive,
                     incarnation: 1,
@@ -466,7 +466,9 @@ async fn test_alive_gossip_adds_node_to_topology() {
         .await;
 
     assert!(
-        harness.query_topology_includes("node-new".into()).await,
+        harness
+            .query_topology_includes(NodeId::new("node-new"))
+            .await,
         "Alive gossip should add the node to the topology ring"
     );
 }
@@ -485,10 +487,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
                 src: sender_addr,
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 1,
-                    source_node_id: "node-sender".into(),
+                    source_node_id: NodeId::new("node-sender"),
                     source_incarnation: 1,
                     gossip: vec![SwimNode {
-                        node_id: "node-target".into(),
+                        node_id: NodeId::new("node-target"),
                         addr: NodeAddress::test(node, node),
                         state: SwimNodeState::Alive,
                         incarnation: 1,
@@ -500,7 +502,9 @@ async fn test_dead_gossip_removes_node_from_topology() {
     }
 
     assert!(
-        harness.query_topology_includes("node-target".into()).await,
+        harness
+            .query_topology_includes(NodeId::new("node-target"))
+            .await,
         "Node should be present in topology after Alive gossip"
     );
 
@@ -511,10 +515,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 2,
-                source_node_id: "node-sender".into(),
+                source_node_id: NodeId::new("node-sender"),
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
-                    node_id: "node-target".into(),
+                    node_id: NodeId::new("node-target"),
                     addr: NodeAddress::test(node, node),
                     state: SwimNodeState::Dead,
                     incarnation: 2,
@@ -525,7 +529,9 @@ async fn test_dead_gossip_removes_node_from_topology() {
         .await;
 
     assert!(
-        !harness.query_topology_includes("node-target".into()).await,
+        !harness
+            .query_topology_includes(NodeId::new("node-target"))
+            .await,
         "Dead gossip should remove the node from the topology ring"
     );
 }

@@ -1,8 +1,8 @@
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 
-#[derive(Debug, PartialEq, Eq, Decode, Encode, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, thiserror::Error)]
 pub enum ProposalError {
     #[error("Non-leader cannot make proposal: {0:?}")]
     NotLeader(Option<NodeId>),

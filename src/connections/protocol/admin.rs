@@ -4,9 +4,9 @@
 
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,
@@ -15,7 +15,7 @@ pub enum AdminRequest {
     GetShardLeader { shard_group_id: u64 },
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum AdminResponse {
     // DescribeCluster
     ClusterInfo { nodes: Box<[NodeInfo]> },
@@ -32,7 +32,7 @@ pub enum AdminResponse {
     InternalError(String),
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub struct ShardDetail {
     pub shard_group_id: u64,
     pub leader_node_id: Option<String>,
@@ -40,21 +40,21 @@ pub struct ShardDetail {
     pub member_node_ids: Box<[String]>,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct NodeInfo {
     pub node_id: String,
     pub addr: SocketAddr,
     pub state: NodeState,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum NodeState {
     Alive,
     Suspect,
     Dead,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct TopicStats {
     pub name: String,
     pub range_count: u32,

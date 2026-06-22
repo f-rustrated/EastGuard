@@ -4,5 +4,3 @@ pub(crate) mod metadata;
 mod types;
 
 pub(crate) use types::node::*;
-
-pub(crate) const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();

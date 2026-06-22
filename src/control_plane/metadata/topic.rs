@@ -13,15 +13,15 @@ use crate::{
     data_plane::SegmentKey,
 };
 
-use bincode::{Decode, Encode};
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+use borsh::{BorshDeserialize, BorshSerialize};
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum TopicState {
     Active,
     Sealed,
     Deleted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct TopicMeta {
     pub id: TopicId,
     pub name: String,

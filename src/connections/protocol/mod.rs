@@ -25,20 +25,20 @@ pub use admin::*;
 pub use control_plane::*;
 pub use data_plane::*;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::impl_from_variant;
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(ClientDataPlaneRequest),
     Admin(AdminRequest),
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum ClientResponse {
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),

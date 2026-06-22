@@ -1321,7 +1321,10 @@ mod tests {
             match &out[0].packet() {
                 SwimPacket::Ping(header) => {
                     assert!(
-                        header.gossip.iter().any(|n| n.node_id == "node-d".into()),
+                        header
+                            .gossip
+                            .iter()
+                            .any(|n| n.node_id == NodeId::new("node-d")),
                         "proxy Ping gossip should contain node-d"
                     );
                 }
@@ -1431,7 +1434,7 @@ mod tests {
                         header
                             .gossip
                             .iter()
-                            .any(|n| n.node_id == "node-local".into() && n.incarnation == 6),
+                            .any(|n| n.node_id == NodeId::new("node-local") && n.incarnation == 6),
                         "self-refutation should be enqueued in gossip"
                     );
                 }

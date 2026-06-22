@@ -20,8 +20,6 @@ use crate::net::OwnedReadHalf;
 use bytes::{Buf, BytesMut};
 use tokio::io::AsyncReadExt;
 
-use crate::config::SERDE_CONFIG;
-
 pub struct ClientStreamReader {
     pub(crate) stream: OwnedReadHalf,
     buffer: BytesMut,
@@ -109,10 +107,10 @@ impl ClientStreamReader {
 
     pub async fn read_request<U>(&mut self) -> anyhow::Result<(u64, U)>
     where
-        U: bincode::Decode<()>,
+        U: borsh::BorshDeserialize,
     {
         let (request_id, body) = self.read_bytes().await?;
-        let (request, _) = bincode::decode_from_slice(&body, SERDE_CONFIG)?;
+        let request = borsh::from_slice(&body)?;
         Ok((request_id, request))
     }
 }

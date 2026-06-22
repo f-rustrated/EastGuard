@@ -3,12 +3,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::control_plane::BINCODE_CONFIG;
 use crate::control_plane::SwimNodeState::Alive;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct NodeAddress {
     pub cluster_addr: SocketAddr,
     client_addr: SocketAddr,
@@ -46,7 +45,7 @@ impl NodeAddress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SwimNode {
     pub node_id: NodeId,
     pub addr: NodeAddress,
@@ -54,7 +53,7 @@ pub struct SwimNode {
     pub incarnation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub enum SwimNodeState {
     Alive,
     Suspect,
@@ -70,9 +69,7 @@ impl SwimNodeState {
 impl SwimNode {
     #[inline]
     pub(crate) fn encoded_size(&self) -> usize {
-        bincode::encode_to_vec(self, BINCODE_CONFIG)
-            .map(|v| v.len())
-            .unwrap_or(0)
+        borsh::to_vec(self).map(|v| v.len()).unwrap_or(0)
     }
 
     pub(crate) fn resolve_state(&mut self, state: SwimNodeState, incarnation: u64) -> bool {
@@ -88,18 +85,12 @@ impl SwimNode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
 pub struct NodeId(Arc<str>);
 
 impl NodeId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into().into())
-    }
-}
-
-impl From<&str> for NodeId {
-    fn from(s: &str) -> Self {
-        Self(s.into())
     }
 }
 
