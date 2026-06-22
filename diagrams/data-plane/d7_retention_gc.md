@@ -133,9 +133,9 @@ segment command touches a single entity; retention is the only set-valued one.)
 | Aspect | Behavior |
 |---|---|
 | Scope | One range; `segment_ids` is a contiguous oldest-first prefix of that range's sealed segments. Multiple ranges → multiple commands. |
-| Precondition | Each named segment is `Sealed` and the set is a prefix (no surviving older sibling — see below). `Active` segments are rejected; already-`Deleting`/absent ids are skipped. |
-| Effect | State `Sealed → Deleting` for each. Nothing else changes — offsets, lineage, `replica_set`, timestamps stay frozen, exactly as `ReassignSegment` leaves them (metadata-state-machine.md #21). |
-| Idempotency | Re-applying is a no-op for any id already `Deleting`/gone, tolerating sweep re-runs and duplicate dispatch — same discipline as `RollSegment` (#19). |
+| Effect | Each named segment that is `Sealed` transitions `Sealed → Deleting`; nothing else changes — offsets, lineage, `replica_set`, timestamps stay frozen, exactly as `ReassignSegment` leaves them (metadata-state-machine.md #21). |
+| Skips, not rejects | An `Active` (write head) or already-`Deleting`/absent id is skipped, not an error — so apply can never delete the write head and is idempotent (sweep re-runs, duplicate dispatch). No-op'd entirely → `Noop`. |
+| No production prefix check | The oldest-first/no-hole property is guaranteed by the sweep's prefix construction and enforced as a *structural invariant* (`assert_retention_prefix`, #2), not re-validated on the apply path — a non-prefix would be a proposer bug, which the invariant catches in test/debug (cf. metadata-state-machine.md #11). |
 
 **Mark, don't remove.** The entity stays in metadata in the `Deleting` state rather
 than vanishing. Keeping it preserves the range's offset chain (a `Deleting` segment
@@ -156,10 +156,11 @@ the active head — never a hole in the middle.
 This is what keeps consumption safe. A consumer reading a range forward crosses the
 retained boundary exactly once: everything below it is gone, everything at and above it
 is present. There is no "deleted s1, present s2, deleted s3" state for a reader to fall
-into. Size- and time-based selection both produce a prefix naturally (seals advance in
-offset and time order), but the invariant is enforced at apply — `DeleteSegments`
-rejects a segment with a surviving older sibling — so a mis-ordered proposal can never
-punch a hole.
+into. The sweep produces a prefix naturally (it take-whiles expired sealed segments in
+segment_id order), and the property is pinned as the structural invariant
+`assert_retention_prefix` (#2) — so a proposer bug that named a non-prefix set is caught
+in test/debug rather than guarded on the hot path (cf. metadata-state-machine.md #11:
+precondition failures are a proposer bug, not a state-machine error).
 
 ---
 
@@ -167,19 +168,21 @@ punch a hole.
 
 A committed `DeleteSegments` reaches the data plane the same way every committed segment
 decision does — the leader dispatches on the post-commit drain (raft-actor.md #3). The
-metadata command is plural, but **dispatch fans out per segment**: segments in one
-range can have different `replica_set`s (seal-on-failure, reassign, and re-fill move
-them), so each segment's deletion goes to *its own* replicas. Each replica deletes the
-segment file, drops its in-memory cache, and range-deletes its sparse-index entries.
+dispatch **groups the deleted segments by `replica_set`** and sends one batched
+`DeleteSegments` per distinct set: segments in a range can sit on different sets
+(seal-on-failure, reassign, and re-fill move them), but the common case (a range's
+segments sharing replicas) collapses to a single message. Each replica, per key it
+holds, deletes the segment file, drops its in-memory cache, and range-deletes its
+sparse-index entries (skipping any key it no longer holds — idempotent).
 
 ```
-Coordinator (Raft leader)                     Each segment's own replica_set
+Coordinator (Raft leader)                     A replica_set's nodes
    |  retention sweep: oldest sealed segments past sealed_at + retention_ms
    |  propose DeleteSegments{ range, ids oldest-first } ──Raft──> committed on [A,B,C]
    |
-   |  (post-commit drain, leader only; fan out per segment)
-   |── delete segment ─────────────────────────> that segment's replicas
-   |                                              delete file + cache + index entries
+   |  (post-commit drain, leader only; group keys by replica_set)
+   |── DeleteSegments{ keys for this set } ─────> that set's nodes
+   |                                              per key: delete file + cache + index
 ```
 
 **Orphan GC is the backstop.** Dispatch is fire-and-forget, so a replica might miss a
@@ -253,14 +256,16 @@ about the command's behavior.
 
 1. **Optional retention config** — make `retention_ms` optional on the storage policy
    (default: off = keep forever).
-2. **`DeleteSegments` metadata command** — per-range oldest-first prefix (`{ topic_id,
-   range_id, segment_ids }`), `Sealed → Deleting`, prefix precondition, idempotent as a
-   set; add invariant checks #1 and #2 to `assert_invariants`.
+2. **`DeleteSegments` metadata command** — per-range prefix (`{ topic_id, range_id,
+   segment_ids }`); `Sealed → Deleting`, skipping active/absent/already-deleting
+   (idempotent, no production prefix/active rejection); add invariant checks #1 and #2
+   to `assert_invariants` — they pin the no-hole property.
 3. **Retention sweep on the coordinator** — leader-only, on the ring-check cadence:
    per owned range compute the deletable prefix by `sealed_at` age (with injected
    `now`), propose `DeleteSegments` carrying the ids oldest-first.
-4. **Data-plane deletion** — dispatch committed `DeleteSegments` to the segment's
-   replicas on the post-commit drain; each deletes file + cache + sparse-index
+4. **Data-plane deletion** — dispatch committed `DeleteSegments` grouped by
+   `replica_set` (one batched message per set) on the post-commit drain; each node, per
+   key it holds, deletes file + cache + sparse-index
    entries; idempotent (already-gone file is a no-op).
 5. **Orphan-GC backstop** — confirm a segment dropped from a node's assigned set is
    reclaimed by the existing sweep, so a missed dispatch self-heals.
