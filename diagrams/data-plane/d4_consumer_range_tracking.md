@@ -113,6 +113,8 @@ Before its first fetch, a consumer must learn two things from the metadata layer
 1. The set of ranges covering the keyspace it wants to read, with bounds, state, and lineage — what "Where to Start" presupposes.
 2. For each range it intends to read, the replica set of the range's current segment — the nodes a fetch can be sent to.
 
+For a *historical* read (`earliest`, or a consumer that has fallen behind into sealed segments), the current segment's replica set is not enough: an old `(range, offset)` lives on a sealed segment whose placement can differ (seal-on-failure, repair, and re-fill move segments independently). Surfacing each range's sealed segments — offset span + replica set — in the metadata response, **gated** so a tail reader doesn't pay for a long history, lets the consumer place any historical offset directly instead of guessing the active segment and leaning on "not local." The metadata group already tracks every segment's `replica_set`, so this is a small **proposed extension** to the query that the client phase (C-series) depends on — not part of D4 as built.
+
 A **topic-metadata query** answers both, and it must reach a node in the topic's metadata shard group — **there is no server-side proxying**. The query is sent to any cluster node the consumer knows (a bootstrap address from configuration, or any node it has previously talked to), with two possible outcomes:
 
 ```
@@ -191,7 +193,7 @@ Consumer                         Data node
 | Message | Direction | Carries | Status |
 |---|---|---|---|
 | Topic-metadata request | Consumer → any cluster node | topic | Introduced by D4 |
-| Topic-metadata response | Cluster node → consumer | either the **metadata payload** (range list with bounds/state/lineage + per-range active segment with replica set) or a **redirect** (address of a member of the owning metadata shard group) | Introduced by D4 |
+| Topic-metadata response | Cluster node → consumer | either the **metadata payload** (range list with bounds/state/lineage + per-range active segment with replica set; *proposed, gated:* sealed segments' offset spans + replica sets for historical reads) or a **redirect** (address of a member of the owning metadata shard group) | Introduced by D4 |
 | Fetch request | Consumer → data node | topic, range, start offset, max bytes, optional keyspace bound | Type extended in D4; handler is D4 |
 | Fetch response | Data node → consumer | records, next offset, **range status** | Type exists (send path is D4) |
 | Range status (in response) | — | `Active`, or `Sealed { end offset, transition }` | Exists |

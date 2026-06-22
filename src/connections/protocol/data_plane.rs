@@ -42,7 +42,8 @@ pub struct ProduceRequest {
     pub topic_name: String,
     /// Used by the server to locate the target range; never stored.
     pub routing_key: Vec<u8>,
-    /// Pre-serialized and optionally compressed blob produced by the client.
+    /// Pre-serialized blob produced by the client: a leading 1-byte cleartext
+    /// codec tag (none/lz4/zstd) followed by the optionally-compressed records.
     /// The broker stamps an entry_id and stores/replicates this opaque payload as-is.
     pub data: Vec<u8>,
     pub record_count: u32,
@@ -175,7 +176,8 @@ pub struct KeyspaceBound {
 
 /// A single entry as served to the consumer.
 /// The broker never parses `data` — it is stored and replicated opaque.
-/// Consumers decompress and parse records from `data` using `record_count`.
+/// Consumers read the leading 1-byte codec tag, decompress the remainder, and
+/// parse records from it using `record_count`.
 #[derive(Debug, Encode, Decode)]
 pub struct Entry {
     pub entry_id: u64,

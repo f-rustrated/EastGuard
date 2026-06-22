@@ -77,25 +77,26 @@ Same as WAL minus the routing header — segment file path already encodes routi
 **Opaque payload internal format** (producer/consumer contract, invisible to broker):
 
 ```
-decompress →
+[codec: 1B, cleartext]   ← read first, no decompress needed (none/lz4/zstd)
+[compressed records] ─decompress→
   [key_len: u32][key][value_len: u32][value]   ← record 0
   [key_len: u32][key][value_len: u32][value]   ← record 1
   ...
   (repeat record_count times)
 ```
 
-Each record is a `(key, value)` pair — matching Northguard's record definition ("composed of a key, a value, as well as user-defined headers, all of which are just a sequence of bytes"). Compression (LZ4/ZSTD) applies to the entire payload block — one compress/decompress per entry, amortized across all records.
+Each record is a `(key, value)` pair — matching Northguard's record definition ("composed of a key, a value, as well as user-defined headers, all of which are just a sequence of bytes"). Compression covers the records block; a one-byte codec tag in the clear prefixes it, so the consumer learns the codec *before* decompressing — it can't be re-derived from compressed bytes, and the WAL routing header that carries `record_count` is stripped at checkpoint, so the codec rides here where it survives to a cold read. One compress/decompress per entry, amortized across all records. The tag is part of the opaque blob: the broker stores and serves it but never reads it (invariant 17).
 
 **Data flow — broker never touches payload internals:**
 
 ```
-Producer client: encode records → compress → EntryPayload
+Producer client: encode records → compress → prefix codec tag → EntryPayload
         ↓
 Produce { segment_key, data: EntryPayload, record_count }
         ↓
 Broker: stamp entry_id → WAL (routing header + blob) → cache (blob as-is) → replicate (blob as-is)
         ↓
-Consumer: receive blob → decompress → parse records by record_index
+Consumer: receive blob → read codec tag → decompress → parse records by record_index
 ```
 
 **Batch boundaries:** A `BatchEnd` record is written at the end of each WAL flush. Flushes are closed by whichever trigger fires first: 10ms elapsed or 10MB buffered. In the WAL, `BatchEnd` marks the fsync boundary (one fsync per flush). In segment files, `BatchEnd` marks entry boundaries for readers. The sparse index writes one index entry per `entry_id` at the `BatchEnd` boundary.
