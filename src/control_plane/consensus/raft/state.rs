@@ -563,7 +563,7 @@ impl Raft {
 
     /// Re-fill known-end sealed segments left under-replicated by an earlier death
     fn refill_under_replicated_segments(&mut self, topology: &TopologyReader) -> bool {
-        let under_replicated_sealed_segments: Box<[(SegmentKey, Vec<NodeId>)]> = self
+        let targets: Box<[(SegmentKey, Vec<NodeId>)]> = self
             .state_machine
             .topics
             .values()
@@ -571,7 +571,7 @@ impl Raft {
             .collect();
 
         let mut changed = false;
-        for (segment_key, mut replica_set) in under_replicated_sealed_segments {
+        for (segment_key, mut replica_set) in targets {
             let excluded: HashSet<NodeId> = replica_set.iter().cloned().collect();
             let need = topology.replication_factor() - replica_set.len(); // > 0 by the query's `len < rf` filter
             let additions = topology.ring_replacements_for(self.shard_group_id, &excluded, need);
