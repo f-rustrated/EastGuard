@@ -1,6 +1,6 @@
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::borrow::Borrow;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -44,7 +44,7 @@ pub struct Produce {
     pub reply: oneshot::Sender<ProduceAck>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentAssignment {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
@@ -52,14 +52,14 @@ pub struct SegmentAssignment {
     pub start_entry_id: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentAssignmentAck {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub from: NodeId,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaAppend {
     pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
@@ -68,20 +68,20 @@ pub struct ReplicaAppend {
     pub entry_id: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaAck {
     pub segment_key: SegmentKey,
     pub entry_id: u64,
     pub from: NodeId,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CommitAdvance {
     pub segment_key: SegmentKey,
     pub committed_entry_id: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealRequest {
     pub from: NodeId,
     pub segment_key: SegmentKey,
@@ -89,14 +89,14 @@ pub struct SealRequest {
     pub end_entry_id: u64,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealResponse {
     pub old_segment_key: SegmentKey,
     pub new_segment_id: SegmentId,
     pub new_replica_set: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentSealed {
     pub segment_key: SegmentKey,
 }
@@ -115,7 +115,7 @@ pub struct SegmentSealed {
 // `CatchUpAssignment`/`CatchUpAck` are the coordinator↔replica pair; the rest is
 // the replacement↔source transfer. The ack lets the coordinator stop re-driving.
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpAssignment {
     pub segment_key: SegmentKey,
     /// Echoed into the `CatchUpAck` so the reply reaches this group's coordinator.
@@ -125,7 +125,7 @@ pub struct CatchUpAssignment {
     pub replica_set: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpRequest {
     pub segment_key: SegmentKey,
     /// The requesting node — the source streams its `CatchUpChunk`s back here.
@@ -135,13 +135,13 @@ pub struct CatchUpRequest {
     pub local_end: Option<u64>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpChunk {
     pub segment_key: SegmentKey,
     /// Contiguous entries in ascending `entry_id` order.
     pub entries: Box<[CatchUpEntry]>,
 }
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpEntry {
     pub entry_id: u64,
     pub data: EntryPayload,
@@ -158,7 +158,7 @@ impl CatchUpEntry {
     }
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpStreamEnd {
     pub segment_key: SegmentKey,
 }
@@ -166,7 +166,7 @@ pub struct CatchUpStreamEnd {
 /// Replacement → coordinator: "I hold this segment through `sealed_end`." Lets the
 /// coordinator stop re-driving. Sent after a transfer verifies, and on a
 /// zero-transfer full match so a re-drive re-confirms.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpAck {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
@@ -187,13 +187,13 @@ pub struct CatchUpAck {
 // `shard_group_id` rides the query so the survivor can address the report back
 // to the coordinator (a follower's tracker doesn't carry the real group id).
 // See `diagrams/data-plane/leader_crash_seal_boundary.md`.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealBoundaryQuery {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealBoundaryReport {
     pub segment_key: SegmentKey,
     pub from: NodeId,
@@ -206,12 +206,12 @@ pub struct SealBoundaryReport {
 /// all of that set's expired segments into one message. Idempotent per key: a node
 /// that no longer holds one (already gone / never had it) skips it; orphan GC is the
 /// backstop.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct DeleteSegments {
     pub segment_keys: Box<[SegmentKey]>,
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum DataPlaneInterNodeCommand {
     SegmentAssignment(SegmentAssignment),
     SegmentAssignmentAck(SegmentAssignmentAck),

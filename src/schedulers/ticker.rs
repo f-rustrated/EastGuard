@@ -80,9 +80,12 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::control_plane::membership::{
-        DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
-        SwimTimeOutCallback, SwimTimer, SwimTimerKind,
+    use crate::control_plane::{
+        NodeId,
+        membership::{
+            DIRECT_ACK_TIMEOUT_TICKS, INDIRECT_ACK_TIMEOUT_TICKS, SUSPECT_TIMEOUT_TICKS,
+            SwimTimeOutCallback, SwimTimer, SwimTimerKind,
+        },
     };
 
     use super::*;
@@ -119,7 +122,7 @@ mod tests {
         let mut ticker = Ticker::<SwimTimer>::new(Some(PROBE_INTERVAL_TICKS));
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: SwimTimer::direct_probe("node-b".into()),
+            timer: SwimTimer::direct_probe(NodeId::new("node-b")),
         });
 
         for _ in 0..DIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -150,7 +153,7 @@ mod tests {
         let mut ticker = Ticker::<SwimTimer>::new(Some(PROBE_INTERVAL_TICKS));
         ticker.apply(TimerCommand::SetSchedule {
             seq: 2,
-            timer: SwimTimer::indirect_probe("node-c".into()),
+            timer: SwimTimer::indirect_probe(NodeId::new("node-c")),
         });
 
         for _ in 0..INDIRECT_ACK_TIMEOUT_TICKS - 1 {
@@ -173,7 +176,7 @@ mod tests {
         let mut ticker = Ticker::<SwimTimer>::new(Some(PROBE_INTERVAL_TICKS));
         ticker.apply(TimerCommand::SetSchedule {
             seq: 1,
-            timer: SwimTimer::direct_probe("node-b".into()),
+            timer: SwimTimer::direct_probe(NodeId::new("node-b")),
         });
         ticker.apply(TimerCommand::CancelSchedule { seq: 1 });
 
@@ -195,7 +198,7 @@ mod tests {
         let node_id = "node-b";
         let seq = 1;
         ticker.apply(TimerCommand::SetSchedule {
-            timer: SwimTimer::suspect_timer(node_id.into()),
+            timer: SwimTimer::suspect_timer(NodeId::new(node_id)),
             seq,
         });
 

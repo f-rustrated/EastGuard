@@ -1,5 +1,5 @@
 use super::constants::*;
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, VecDeque};
 
 use crate::control_plane::metadata::{
@@ -8,14 +8,14 @@ use crate::control_plane::metadata::{
     error::MetadataError,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum RangeState {
     Active,
     Sealed,
     Deleting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct RangeMeta {
     pub range_id: RangeId,
     pub keyspace_start: Vec<u8>,
@@ -357,7 +357,7 @@ impl RangeMeta {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct RangeSealHistory {
     pub seal_timestamps: VecDeque<u64>,
     pub created_by_split_at: Option<u64>,

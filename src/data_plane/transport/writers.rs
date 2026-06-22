@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::{OwnedWriteHalf, TcpStream};
@@ -169,7 +169,7 @@ impl TransportState {
             .writers
             .get_mut(target)
             .context("no writer for target")?;
-        let bytes = bincode::encode_to_vec(&self.node_id, BINCODE_CONFIG)?;
+        let bytes = borsh::to_vec(&self.node_id)?;
         let len = bytes.len() as u32;
         writer.write_all(&len.to_be_bytes()).await?;
         writer.write_all(&bytes).await?;
@@ -185,7 +185,7 @@ impl TransportState {
             .writers
             .get_mut(target)
             .context("no writer for target")?;
-        let bytes = bincode::encode_to_vec(msg, BINCODE_CONFIG)?;
+        let bytes = borsh::to_vec(msg)?;
         let len = bytes.len() as u32;
         let mut buf = Vec::with_capacity(4 + bytes.len());
         buf.extend_from_slice(&len.to_be_bytes());

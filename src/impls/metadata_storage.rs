@@ -1,5 +1,5 @@
 use crate::control_plane::{
-    BINCODE_CONFIG, NodeId,
+    NodeId,
     consensus::messages::LogMutation,
     consensus::raft::{
         log::LogEntry,
@@ -71,15 +71,13 @@ impl DbOp {
     fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
         fn put_log_entry(group_id: u64, entry: &LogEntry) -> DbOp {
             let key = GroupKey::LogEntry(entry.index).encode_for(group_id);
-            let value =
-                bincode::encode_to_vec(entry, BINCODE_CONFIG).expect("encode LogEntry failed");
+            let value = borsh::to_vec(entry).expect("encode LogEntry failed");
             DbOp::Put { key, value }
         }
 
         fn put_hard_state(group_id: u64, term: u64, voted_for: Option<NodeId>) -> DbOp {
             let key = GroupKey::hard_state().encode_for(group_id);
-            let value = bincode::encode_to_vec(&(term, voted_for), BINCODE_CONFIG)
-                .expect("encode HardState failed");
+            let value = borsh::to_vec(&(term, voted_for)).expect("encode HardState failed");
             DbOp::Put { key, value }
         }
 
@@ -156,9 +154,8 @@ impl MetadataStorage {
             return RaftPersistentState::default();
         };
 
-        let ((term, voted_for), _) =
-            bincode::decode_from_slice::<(u64, Option<NodeId>), _>(&bytes, BINCODE_CONFIG)
-                .expect("corrupt HardState");
+        let (term, voted_for) =
+            borsh::from_slice::<(u64, Option<NodeId>)>(&bytes).expect("corrupt HardState");
 
         RaftPersistentState {
             term,
@@ -173,9 +170,7 @@ impl MetadataStorage {
         self.scan_range(&start, &end)
             .into_iter()
             .map(|bytes| {
-                let (entry, _) = bincode::decode_from_slice::<LogEntry, _>(&bytes, BINCODE_CONFIG)
-                    .expect("corrupt LogEntry in RocksDB");
-                entry
+                borsh::from_slice::<LogEntry>(&bytes).expect("corrupt LogEntry in RocksDB")
             })
             .collect()
     }

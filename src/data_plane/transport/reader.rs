@@ -1,7 +1,7 @@
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-use crate::control_plane::{BINCODE_CONFIG, NodeId};
+use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
 use crate::net::OwnedReadHalf;
@@ -12,12 +12,12 @@ const DATA_FRAME_MAX: usize = 64 * 1024 * 1024;
 pub(super) struct DataReader(pub OwnedReadHalf);
 
 impl DataReader {
-    async fn read_frame<T: bincode::Decode<()>>(&mut self, max: usize) -> anyhow::Result<T> {
+    async fn read_frame<T: borsh::BorshDeserialize>(&mut self, max: usize) -> anyhow::Result<T> {
         let len = self.0.read_u32().await? as usize;
         anyhow::ensure!(len <= max, "frame too large: {len} bytes (max {max})");
         let mut buf = vec![0u8; len];
         self.0.read_exact(&mut buf).await?;
-        let (val, _) = bincode::decode_from_slice::<T, _>(&buf, BINCODE_CONFIG)?;
+        let val = borsh::from_slice::<T>(&buf)?;
         Ok(val)
     }
 

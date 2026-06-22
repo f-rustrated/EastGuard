@@ -67,7 +67,6 @@ impl RaftTransportActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::BINCODE_CONFIG;
     use crate::control_plane::consensus::messages::{RaftRpc, RequestVote, WireRaftMessage};
     use crate::control_plane::membership::ShardGroupId;
     use crate::net::OwnedWriteHalf;
@@ -76,14 +75,13 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use turmoil::Builder;
 
-    /// Write a length-prefixed bincode-encoded value to a raw write half.
+    /// Write a length-prefixed borsh-encoded value to a raw write half.
     /// Used by tests to simulate the peer side of the wire protocol.
     async fn write_frame(
         writer: &mut OwnedWriteHalf,
-        value: &impl bincode::Encode,
+        value: &impl borsh::BorshSerialize,
     ) -> std::io::Result<()> {
-        let bytes = bincode::encode_to_vec(value, BINCODE_CONFIG)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let bytes = borsh::to_vec(value)?;
         let len = bytes.len() as u32;
         writer.write_all(&len.to_be_bytes()).await?;
         writer.write_all(&bytes).await?;

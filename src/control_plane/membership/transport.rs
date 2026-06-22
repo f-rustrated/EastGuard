@@ -1,4 +1,3 @@
-use crate::control_plane::BINCODE_CONFIG;
 use crate::control_plane::membership::{OutboundPacket, SwimCommand, actor::SwimSender};
 
 // ==========================================
@@ -26,8 +25,8 @@ impl SwimTransportActor {
             tokio::select! {
                 // INCOMING: Socket -> Decode -> Actor
                 Ok((len, src)) = socket.recv_from(&mut buf) => {
-                    match bincode::decode_from_slice(&buf[..len], BINCODE_CONFIG) {
-                        Ok((packet, _)) => {
+                    match borsh::from_slice(&buf[..len]) {
+                        Ok(packet) => {
                              let _ = to_actor.send(SwimCommand::InboundRaftRpc { src, packet }).await;
                         }
                         Err(e) => tracing::error!("Failed to decode packet from {}: {}", src, e),
@@ -37,7 +36,7 @@ impl SwimTransportActor {
                 // OUTGOING: Actor -> Encode -> Socket
                 Some(batch) = from_actor.recv() => {
                     for msg in batch {
-                        match bincode::encode_to_vec(msg.packet(), BINCODE_CONFIG) {
+                        match borsh::to_vec(msg.packet()) {
                             Ok(bytes) => {
                                 let _ = socket.send_to(&bytes, msg.target).await;
                             }

@@ -1,11 +1,11 @@
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::{
     NodeId,
     metadata::{SegmentId, error::MetadataError},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum SegmentMetaState {
     Active,
     Sealed,
@@ -13,7 +13,7 @@ pub enum SegmentMetaState {
 }
 
 pub(crate) type ReplicaSet = Vec<NodeId>;
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SegmentMeta {
     pub segment_id: SegmentId,
     pub state: SegmentMetaState,

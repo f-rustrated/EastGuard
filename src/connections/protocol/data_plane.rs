@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 
-use bincode::{Decode, Encode};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
     control_plane::metadata::{RangeId, RangeMeta, RangeState, TopicMeta},
@@ -21,7 +21,7 @@ use crate::{
 /// struct so the carried fields are named in one place (consistent with the
 /// project's tuple-variant + named-struct enum pattern) and the `Client`
 /// prefix makes the audience explicit at the use site.
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub enum ClientDataPlaneRequest {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
@@ -37,7 +37,7 @@ impl_from_variant!(
     ListOffsets(ListOffsetsRequest),
 );
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct ProduceRequest {
     pub topic_name: String,
     /// Used by the server to locate the target range; never stored.
@@ -49,7 +49,7 @@ pub struct ProduceRequest {
     pub record_count: u32,
 }
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchRequest {
     pub topic_name: String,
     pub range_id: u64,
@@ -67,7 +67,7 @@ pub struct FetchRequest {
 /// rather than by name. Lets any replica holding the segment serve it without
 /// resolving the topic name — i.e. without being a metadata peer. The client owns
 /// resolution; the server never proxies.
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
     pub topic_id: u64,
     pub range_id: u64,
@@ -75,13 +75,13 @@ pub struct FetchByIdRequest {
     pub max_bytes: u32,
 }
 
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 pub struct ListOffsetsRequest {
     pub topic_name: String,
     pub range_id: u64,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum DataPlaneResponse {
     // Produce
     Produced {
@@ -138,7 +138,7 @@ impl DataPlaneResponse {
                 progress_signal,
             } => {
                 // Single Bytes → Vec<u8> copy per entry at the wire boundary
-                // — bincode's owned-byte encoding requires Vec<u8>. The
+                // — borsh's owned-byte encoding requires Vec<u8>. The
                 // intermediate `FetchedEntry` step that used to live in the
                 // data plane is gone; the Arc rides straight through the
                 // channel from the cache.
@@ -168,7 +168,7 @@ impl DataPlaneResponse {
     }
 }
 
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct KeyspaceBound {
     pub start: Vec<u8>,
     pub end: Vec<u8>,
@@ -178,7 +178,7 @@ pub struct KeyspaceBound {
 /// The broker never parses `data` — it is stored and replicated opaque.
 /// Consumers read the leading 1-byte codec tag, decompress the remainder, and
 /// parse records from it using `record_count`.
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct Entry {
     pub entry_id: u64,
     pub data: Vec<u8>,
@@ -190,7 +190,7 @@ pub struct Entry {
 /// payload) — tells the consumer whether to keep fetching this range or drain
 /// to `end_offset` and follow the lineage transition to its successor(s).
 /// See (d4_consumer_range_tracking.md, "Range Transitions".)
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum RangeProgressSignal {
     Active,
     Sealed {
@@ -199,7 +199,7 @@ pub enum RangeProgressSignal {
     },
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum RangeTransition {
     Split {
         left_range_id: RangeId,
