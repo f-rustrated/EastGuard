@@ -18,10 +18,10 @@ impl Client {
         name: &str,
         storage_policy: StoragePolicy,
     ) -> Result<bool, ClientError> {
-        let request = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
+        let request = ControlPlaneRequest::CreateTopic {
             name: name.to_string(),
             storage_policy,
-        });
+        };
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
             ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated) => Ok(true),
@@ -32,9 +32,9 @@ impl Client {
 
     /// Delete a topic. A missing topic surfaces as `ClientError::TopicNotFound`.
     pub async fn delete_topic(&self, name: &str) -> Result<(), ClientError> {
-        let request = ClientRequest::ControlPlane(ControlPlaneRequest::DeleteTopic {
+        let request = ControlPlaneRequest::DeleteTopic {
             name: name.to_string(),
-        });
+        };
         let served = self.call(self.next_known_node(), request).await?;
         // The redirect loop already turned a `TopicNotFound` response into an error.
         self.cache.invalidate(name);
@@ -45,9 +45,9 @@ impl Client {
     }
 
     pub async fn resolve_topic(&self, name: &str) -> Result<TopicDetail, ClientError> {
-        let request = ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic {
+        let request = ControlPlaneRequest::DescribeTopic {
             name: name.to_string(),
-        });
+        };
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
             ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) => {
@@ -61,7 +61,7 @@ impl Client {
     /// Topics whose metadata is hosted by the node that answers (per-node, not a
     /// global listing — global list is a future scatter-gather).
     pub async fn list_hosted_topics(&self) -> Result<Box<[TopicSummary]>, ClientError> {
-        let request = ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics);
+        let request = ControlPlaneRequest::ListHostedTopics;
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
             ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),

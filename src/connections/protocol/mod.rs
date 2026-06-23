@@ -27,7 +27,7 @@ pub use data_plane::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::impl_from_variant;
+use crate::{impl_from_variant, impl_from_variant_via};
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
@@ -47,8 +47,24 @@ pub enum ClientResponse {
 }
 
 impl_from_variant!(
+    ClientRequest,
+    ControlPlane(ControlPlaneRequest),
+    DataPlane(ClientDataPlaneRequest),
+    Admin(AdminRequest),
+);
+
+impl_from_variant!(
     ClientResponse,
     ControlPlane(ControlPlaneResponse),
     DataPlane(DataPlaneResponse),
     Admin(AdminResponse),
+);
+
+impl_from_variant_via!(
+    ClientRequest,
+    ClientDataPlaneRequest,
+    ProduceRequest,
+    FetchRequest,
+    FetchByIdRequest,
+    ListOffsetsRequest
 );
