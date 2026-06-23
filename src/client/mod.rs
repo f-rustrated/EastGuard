@@ -63,7 +63,7 @@ impl Client {
 
     /// Round-robin the next seed to re-resolve against. Infallible — `seeds` is
     /// non-empty by construction.
-    pub(crate) fn next_seed(&self) -> SocketAddr {
+    pub(crate) fn next_known_node(&self) -> SocketAddr {
         self.known_nodes.pick()
     }
 }
