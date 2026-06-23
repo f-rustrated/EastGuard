@@ -40,7 +40,6 @@ impl Client {
 
         let served = self.call(start, request).await?;
         // A redirect -> the cached leader was stale; drop it so the next produce re-describes.
-        // TODO clarification! what leader, raft leader or data leader.
         if served.redirected {
             self.cache.invalidate(topic);
         }
