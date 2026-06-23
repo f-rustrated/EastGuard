@@ -17,6 +17,7 @@ mod pool;
 mod produce;
 mod redirect;
 mod routing;
+use crate::client::nodes::KnownNodes;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use error::ClientError;
@@ -32,8 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Client {
     pool: ConnectionPool,
     cache: RoutingCache,
-    seeds: Box<[SocketAddr]>,
-    seed_cursor: AtomicUsize,
+    known_nodes: KnownNodes,
     retry: RetryPolicy,
 }
 
@@ -49,15 +49,14 @@ impl Client {
         seeds: impl Into<Vec<SocketAddr>>,
         retry: RetryPolicy,
     ) -> Result<Self, ClientError> {
-        let seeds: Box<[SocketAddr]> = seeds.into().into_boxed_slice();
+        let seeds = seeds.into();
         if seeds.is_empty() {
             return Err(ClientError::NoSeeds);
         }
         Ok(Self {
             pool: ConnectionPool::new(),
             cache: RoutingCache::new(),
-            seeds,
-            seed_cursor: AtomicUsize::new(0),
+            known_nodes: KnownNodes::new(seeds),
             retry,
         })
     }
@@ -65,8 +64,7 @@ impl Client {
     /// Round-robin the next seed to re-resolve against. Infallible — `seeds` is
     /// non-empty by construction.
     pub(crate) fn next_seed(&self) -> SocketAddr {
-        let i = self.seed_cursor.fetch_add(1, Ordering::Relaxed) % self.seeds.len();
-        self.seeds[i]
+        self.known_nodes.pick()
     }
 }
 
