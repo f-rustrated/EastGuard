@@ -2,8 +2,17 @@ use std::time::Duration;
 
 use turmoil::Builder;
 
-use crate::StartUp;
-use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
+use super::{NodeSpec, host_cluster};
+use crate::it::helpers::{check_alive_count, check_dead_or_not_exist};
+
+/// (name, client_port, cluster_port) for the 3-node lifecycle cluster. Node-id
+/// suffix stays default (unpinned) — this test `bounce`s node-3, so a stable
+/// OS-random id per restart is what we want.
+static NODES: [NodeSpec; 3] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+];
 
 /// Full-stack E2E: SWIM cluster formation with MultiRaftActor wired in.
 ///
@@ -25,38 +34,7 @@ fn e2e_swim_raft_cluster_lifecycle() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    sim.host("node-1", || async {
-        let me = turmoil::lookup("node-1");
-        let n2 = turmoil::lookup("node-2");
-        let n3 = turmoil::lookup("node-3");
-        let mut env = default_env(1, "node-1".to_string(), 8081, 18001);
-        env.advertise_host = Some(me.to_string());
-        env.join_seed_nodes = vec![format!("{n2}:18002"), format!("{n3}:18003")];
-        StartUp::with_env(env, 0).run().await?;
-        Ok(())
-    });
-
-    sim.host("node-2", || async {
-        let me = turmoil::lookup("node-2");
-        let n1 = turmoil::lookup("node-1");
-        let n3 = turmoil::lookup("node-3");
-        let mut env = default_env(2, "node-2".to_string(), 8082, 18002);
-        env.advertise_host = Some(me.to_string());
-        env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n3}:18003")];
-        StartUp::with_env(env, 0).run().await?;
-        Ok(())
-    });
-
-    sim.host("node-3", || async {
-        let me = turmoil::lookup("node-3");
-        let n1 = turmoil::lookup("node-1");
-        let n2 = turmoil::lookup("node-2");
-        let mut env = default_env(3, "node-3".to_string(), 8083, 18003);
-        env.advertise_host = Some(me.to_string());
-        env.join_seed_nodes = vec![format!("{n1}:18001"), format!("{n2}:18002")];
-        StartUp::with_env(env, 0).run().await?;
-        Ok(())
-    });
+    host_cluster(&mut sim, &NODES, |_| {});
 
     sim.client("checker", async {
         tracing::info!("[E2E] Phase 1: waiting for cluster formation");

@@ -13,6 +13,21 @@ use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy}
 use crate::it::helpers::{default_env, send_request, try_send_request};
 use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
 
+use super::{NodeSpec, host_cluster};
+
+/// Standard 3- and 4-node clusters (name, client_port, cluster_port).
+static NODES_3: [NodeSpec; 3] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+];
+static NODES_4: [NodeSpec; 4] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+    ("node-4", 8084, 18004),
+];
+
 /// CreateTopic eventually succeeds when tried across all nodes (exactly one is the leader),
 /// and DescribeCluster returns a non-empty node list from every node.
 #[test]
@@ -28,25 +43,7 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |_| {});
 
     sim.client("test-client", async {
         // Wait for leader election then create a topic by trying all nodes.
@@ -112,25 +109,7 @@ fn delete_topic() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1, 8081, 18001),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |_| {});
 
     sim.client("test-client", async {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
@@ -250,25 +229,7 @@ fn list_topic_stats_after_create() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |_| {});
 
     sim.client("test-client", async {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
@@ -340,25 +301,7 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |_| {});
 
     sim.client("test-client", async {
         let create_req = ClientRequest::ControlPlane(ControlPlaneRequest::CreateTopic {
@@ -469,25 +412,7 @@ fn produce_then_fetch_hot() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |_| {});
 
     sim.client("test-client", async {
         const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
@@ -595,28 +520,11 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [("node-1", 18001u16), ("node-2", 18002), ("node-3", 18003)]
-                .iter()
-                .filter(|(n, _)| *n != name)
-                .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-                .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            // Force a fast age-based seal.
-            env.max_segment_age_secs = 5;
-            env.segment_age_check_interval_secs = 1;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_3, |env| {
+        // Force a fast age-based seal.
+        env.max_segment_age_secs = 5;
+        env.segment_age_check_interval_secs = 1;
+    });
 
     sim.client("test-client", async {
         const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
@@ -698,45 +606,22 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
         .try_init();
 
     // 4 nodes, RF=3 → the topic lands on 3, leaving one spare for the reassign.
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-        ("node-4", 4, 8084, 18004),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [
-                ("node-1", 18001u16),
-                ("node-2", 18002),
-                ("node-3", 18003),
-                ("node-4", 18004),
-            ]
-            .iter()
-            .filter(|(n, _)| *n != name)
-            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-            .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            // Pin the node-id suffix → deterministic hash-ring placement across runs
-            // (the default UUID is OS-random, which turmoil can't seed). This test
-            // never restarts a node, so a fixed id is safe. See CLAUDE.md "Testing".
-            env.node_id_suffix = Some("sim".to_string());
-            // Low vnodes → few Raft groups → fast sim. This is a *speed* choice: the
-            // #135 MAP-EMPTY gossip gap that once forced it is fixed by the data-plane
-            // topology fallback (the coordinator-crash test runs at 256 to guard that),
-            // so it's no longer a correctness workaround. See CLAUDE.md "Testing".
-            env.vnodes_per_node = 16;
-            // Seal by SIZE, not age: the size check is a pure byte-count on commit
-            // (deterministic), whereas age uses real wall-clock (`std::time::Instant`),
-            // which turmoil doesn't virtualize (CLAUDE.md "Testing"). 2 KiB rolls the
-            // ~1 KiB records once; a tiny limit would roll per-record into a storm.
-            env.segment_size_limit_bytes = 2048;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_4, |env| {
+        // Pin the node-id suffix → deterministic hash-ring placement across runs
+        // (the default UUID is OS-random, which turmoil can't seed). This test
+        // never restarts a node, so a fixed id is safe. See CLAUDE.md "Testing".
+        env.node_id_suffix = Some("sim".to_string());
+        // Low vnodes → few Raft groups → fast sim. This is a *speed* choice: the
+        // #135 MAP-EMPTY gossip gap that once forced it is fixed by the data-plane
+        // topology fallback (the coordinator-crash test runs at 256 to guard that),
+        // so it's no longer a correctness workaround. See CLAUDE.md "Testing".
+        env.vnodes_per_node = 16;
+        // Seal by SIZE, not age: the size check is a pure byte-count on commit
+        // (deterministic), whereas age uses real wall-clock (`std::time::Instant`),
+        // which turmoil doesn't virtualize (CLAUDE.md "Testing"). 2 KiB rolls the
+        // ~1 KiB records once; a tiny limit would roll per-record into a storm.
+        env.segment_size_limit_bytes = 2048;
+    });
 
     // The victim must be a *replica* of the sealed segment, but placement is
     // ring-determined — only the client knows it at runtime. It picks one and
@@ -895,39 +780,16 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
 
     // 4 nodes, RF=3 → the topic lands on 3; killing exactly one (the write-leader)
     // keeps metadata quorum (2 of 3) so the recovery RollSegment can commit.
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-        ("node-4", 4, 8084, 18004),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [
-                ("node-1", 18001u16),
-                ("node-2", 18002),
-                ("node-3", 18003),
-                ("node-4", 18004),
-            ]
-            .iter()
-            .filter(|(n, _)| *n != name)
-            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-            .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            env.node_id_suffix = Some("sim".to_string());
-            // Low vnodes for sim speed; #135 MAP-EMPTY is fixed (topology fallback) —
-            // the coordinator-crash test runs at 256 to guard the fix.
-            env.vnodes_per_node = 16;
-            // Huge size limit so one ~1 KiB record never rolls: the segment must stay
-            // *active* at kill time, so the only thing that can seal it is the
-            // leader-crash boundary recovery — not a size roll. (See CLAUDE.md "Testing".)
-            env.segment_size_limit_bytes = 1 << 20;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_4, |env| {
+        env.node_id_suffix = Some("sim".to_string());
+        // Low vnodes for sim speed; #135 MAP-EMPTY is fixed (topology fallback) —
+        // the coordinator-crash test runs at 256 to guard the fix.
+        env.vnodes_per_node = 16;
+        // Huge size limit so one ~1 KiB record never rolls: the segment must stay
+        // *active* at kill time, so the only thing that can seal it is the
+        // leader-crash boundary recovery — not a size roll. (See CLAUDE.md "Testing".)
+        env.segment_size_limit_bytes = 1 << 20;
+    });
 
     // The active segment's write-leader (`replica_set[0]`) is ring-determined; only
     // the client learns it at runtime. It produces, reads the leader, and hands it to
@@ -1099,40 +961,17 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-        ("node-4", 4, 8084, 18004),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [
-                ("node-1", 18001u16),
-                ("node-2", 18002),
-                ("node-3", 18003),
-                ("node-4", 18004),
-            ]
-            .iter()
-            .filter(|(n, _)| *n != name)
-            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-            .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            env.node_id_suffix = Some("sim".to_string());
-            // Realistic scale (256 vnodes ⇒ ~1000 groups): deliberately exercises the
-            // gossip pressure that exposed #135 — the one-shot shard-leader announce
-            // gets evicted before reaching every node → MAP-EMPTY → coordinator
-            // unresolvable. The data-plane topology fallback recovers resolution from
-            // MAP-EMPTY (broadcast to the ring's members), so the repair still completes
-            // at scale. This test guards that fix — and the learner model — end to end.
-            env.vnodes_per_node = 256;
-            env.segment_size_limit_bytes = 2048;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_4, |env| {
+        env.node_id_suffix = Some("sim".to_string());
+        // Realistic scale (256 vnodes ⇒ ~1000 groups): deliberately exercises the
+        // gossip pressure that exposed #135 — the one-shot shard-leader announce
+        // gets evicted before reaching every node → MAP-EMPTY → coordinator
+        // unresolvable. The data-plane topology fallback recovers resolution from
+        // MAP-EMPTY (broadcast to the ring's members), so the repair still completes
+        // at scale. This test guards that fix — and the learner model — end to end.
+        env.vnodes_per_node = 256;
+        env.segment_size_limit_bytes = 2048;
+    });
 
     // The metadata leader is ring-/election-determined; only the client learns it at
     // runtime. It seals a segment, resolves the leader, and hands it to the driver.
@@ -1317,34 +1156,11 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    for (name, idx, cp, rp) in [
-        ("node-1", 1u32, 8081u16, 18001u16),
-        ("node-2", 2, 8082, 18002),
-        ("node-3", 3, 8083, 18003),
-        ("node-4", 4, 8084, 18004),
-    ] {
-        sim.host(name, move || async move {
-            let me = turmoil::lookup(name);
-            let seeds: Vec<String> = [
-                ("node-1", 18001u16),
-                ("node-2", 18002),
-                ("node-3", 18003),
-                ("node-4", 18004),
-            ]
-            .iter()
-            .filter(|(n, _)| *n != name)
-            .map(|(n, p)| format!("{}:{}", turmoil::lookup(*n), p))
-            .collect();
-            let mut env = default_env(idx, name.to_string(), cp, rp);
-            env.advertise_host = Some(me.to_string());
-            env.join_seed_nodes = seeds;
-            env.node_id_suffix = Some("sim".to_string());
-            env.vnodes_per_node = 16;
-            env.segment_size_limit_bytes = 2048;
-            StartUp::with_env(env, 0).run().await?;
-            Ok(())
-        });
-    }
+    host_cluster(&mut sim, &NODES_4, |env| {
+        env.node_id_suffix = Some("sim".to_string());
+        env.vnodes_per_node = 16;
+        env.segment_size_limit_bytes = 2048;
+    });
 
     // The victim (a non-coordinator replica) is ring-determined; the client picks it at
     // runtime and hands it to the driver to crash.
