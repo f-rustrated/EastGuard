@@ -25,7 +25,7 @@ use crate::control_plane::metadata::{
     RangeMeta, RangeState, SegmentMeta, TopicMeta, TopicState as MetaTopicState,
 };
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum ControlPlaneRequest {
     CreateTopic {
         name: String,

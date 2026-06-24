@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,

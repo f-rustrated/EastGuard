@@ -31,7 +31,7 @@ use crate::{impl_from_variant, impl_from_variant_via};
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(ClientDataPlaneRequest),
