@@ -14,7 +14,7 @@ pub(crate) use topic::{TopicMeta, TopicState, TopicStats};
 #[allow(dead_code)]
 pub(crate) mod segment;
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::{BorshDeserialize as Deser, BorshSerialize as Ser};
 #[allow(unused_imports)]
 pub(crate) use command::*;
 #[allow(unused_imports)]
@@ -25,17 +25,17 @@ pub(crate) use segment::*;
 pub(crate) use state_machine::*;
 
 use crate::smart_pointer;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ser, Deser)]
 pub struct TopicId(pub(crate) u64);
 
 smart_pointer!(TopicId, u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ser, Deser, PartialOrd, Ord)]
 pub struct RangeId(pub(crate) u64);
 
 smart_pointer!(RangeId, u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct SegmentId(pub(crate) u64);
 
 smart_pointer!(SegmentId, u64);

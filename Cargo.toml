@@ -10,12 +10,13 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 bytes = "1.12.0"
 borsh = { version = "1.7.0", features = ["derive", "bytes","rc"] }
 rand = "0.10.1"
-uuid = { version = "1.23.0", features = ["v4"] }
+uuid = { version = "1.23.3", features = ["v4"] }
 murmur3 = "0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 thiserror = "2.0.18"
 rocksdb = "0.24.0"
+dashmap = "6.2.1"
 
 crc32fast = "1.4"
 arc-swap = "1"
@@ -30,6 +31,11 @@ serial_test = "3.5.0"
 turmoil = { version = "0.7.2", package = "turmoil" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# RocksDB compiles ~750MB of C++ debug symbols per build fingerprint; we never
+# debug into it, so drop them — shrinks each artifact copy to a fraction.
+[profile.dev.package.librocksdb-sys]
+debug = false
 
 [lints.clippy]
 shadow_unrelated = "deny"

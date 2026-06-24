@@ -14,7 +14,9 @@ use crate::test_traits::TAssertInvariant;
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
 /// virtual node on the consistent hash ring for a given key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize,
+)]
 pub struct ShardGroupId(pub u64);
 
 impl ShardGroupId {

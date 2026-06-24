@@ -63,13 +63,21 @@ metadata round-trips:
 
 The client caches this per topic and routes from it:
 
-- **Produce** → hash the routing key to the owning range, send to that range's write
-  leader (`replica_set[0]`).
+- **Produce** → match the routing key to the owning active range (the one with the
+  greatest `keyspace_start ≤ key` — the same rule the server applies; keys are compared
+  as raw bytes, not hashed), send to that range's write leader (`replica_set[0]`).
 - **Consume** → for each range of interest, map the offset to the segment that holds it
   (the active one, or — reading history — a sealed one) and fetch from any replica in
   that segment's set (nearest/preferred). Without sealed-segment placement a cold reader
   can only guess the active segment's replicas and lean on "not local" to correct it;
   with it, the first hop lands.
+
+What the cache actually *retains* is the routing projection of the snapshot: the topic
+id, and per active range its `keyspace_start` plus the active segment's replica
+addresses. The full keyspace bounds and split/merge lineage are the **consumer's**
+concern, not the router's — they ride the cursor library (bootstrapped once from the
+snapshot) and the in-band range-transition signal each fetch carries (see `c3` / `d4`),
+so they don't need to live in the routing cache.
 
 Only a member of the topic's metadata shard group can answer `DescribeTopic`
 authoritatively, so the *first* describe may itself be redirected (see below). Once
@@ -94,23 +102,33 @@ address is a hint to jump to, an absent address means "re-resolve and back off."
 | `NotWriteLeader { leader_addr }` | data (produce) | member, not the segment's write leader | jump to `leader_addr`; if `None`, re-resolve |
 | `TopicMetadataRedirect { owner }` | control | this node doesn't host the topic's metadata | retry the metadata op at `owner` |
 | `NotRaftLeader { leader_addr }` | control (write) | member, not the metadata Raft leader | jump to `leader_addr`; if `None`, retry a member |
-| `TopicNotFound` | both | topic absent (authoritative — from a member) | surface to the caller; don't retry |
+| `TopicNotFound` | both | topic absent on the member we hit | re-resolve (may be propagating); surface only if still absent at the deadline |
 
-The single rule: **follow the hint if present, else re-resolve, with bounded backoff;
-treat `TopicNotFound` as terminal.** A misrouted request converges in O(1) extra
-hops — the redirect target either serves it or redirects once more to the real owner.
-Because redirects are returned *before* any data-plane dispatch, a redirected produce
-never wrote, so following it can't double-write (full idempotency is C2's concern).
+The single rule: **follow the hint if present, else re-resolve with exponential
+backoff — until a wall-clock deadline.** A misrouted request converges in O(1) extra
+hops (the redirect target either serves it or points once more at the real owner).
+`TopicNotFound` is *not* immediately terminal: a just-created topic may not have
+propagated to the member we hit, so it's re-resolved like any transient and surfaces
+as not-found only if the whole deadline elapses still seeing it — the same call a
+Kafka producer makes on `UNKNOWN_TOPIC`. Because redirects are returned *before* any
+data-plane dispatch, a redirected produce never wrote, so following it can't
+double-write (full idempotency is C2's concern).
 
 ```
-send to best-known node
+send to best-known node                 (retry until the deadline)
    │
    ├─ ok / data        → done
-   ├─ redirect+addr    → jump there, retry (cap the hops)
-   ├─ redirect, no addr→ DescribeTopic refresh, back off, retry
-   ├─ TopicNotFound    → return "not found"
-   └─ transient/timeout→ back off, re-resolve, retry
+   ├─ redirect + addr  → jump there, retry (no wait — a hint is actionable)
+   ├─ redirect, no addr→ re-resolve to a seed, exponential backoff, retry
+   ├─ topic-not-found  → re-resolve (propagation lag); not-found only at the deadline
+   └─ unreachable      → drop the dead conn, re-resolve, backoff, retry
 ```
+
+**The deadline is the SDK's, not the caller's.** A retry policy (deadline + backoff,
+with a sane default) lives on the client, so one `produce` / `describe` / `create`
+call already rides out a leader election, metadata propagation lag, or a node crash —
+callers don't wrap calls in their own retry loops. The loop surfaces only what a
+caller must decide on: success, `TopicNotFound`, or a deadline `Timeout`.
 
 The integration tests already encode a minimal version of exactly this
 (`produce_until_acked` follows `NotWriteLeader`/`ShardNotLocal`; `describe_topic`
@@ -121,11 +139,13 @@ shared by producer, consumer, and admin.
 
 ## Admin (folded in)
 
-The control-plane ops — create / delete / describe / list, plus cluster/shard
-introspection — are the same redirect-follow loop over the control plane:
-`DescribeTopic` and reads follow `TopicMetadataRedirect` to a member; writes
-(`CreateTopic` / `DeleteTopic`) additionally follow `NotRaftLeader` to the Raft
-leader. No separate machinery; admin is C1's loop pointed at control-plane requests.
+The control-plane ops — create / delete / describe / list — are the same
+redirect-follow loop over the control plane: `DescribeTopic` and reads follow
+`TopicMetadataRedirect` to a member; writes (`CreateTopic` / `DeleteTopic`)
+additionally follow `NotRaftLeader` to the Raft leader. No separate machinery; admin
+is C1's loop pointed at control-plane requests. (Cluster/shard introspection —
+`DescribeCluster` and friends — is an existing operator/debug affordance on the wire,
+not part of the C1 client surface.)
 
 ---
 
@@ -134,12 +154,14 @@ leader. No separate machinery; admin is C1's loop pointed at control-plane reque
 1. **Connection pool** — lazy per-node connections over `client_port`, each with a
    request-id counter, an in-flight map, and a demultiplexing read loop; reconnect on
    drop.
-2. **Routing cache** — per-topic snapshot from `DescribeTopic` (topic id, ranges +
-   keyspaces + lineage, segment replica addresses); lookup by routing key (produce)
-   and by range (consume).
+2. **Routing cache** — the routing projection of the `DescribeTopic` snapshot (topic
+   id, per active range `keyspace_start` + active-segment replica addresses); lookup by
+   routing key (produce) and by range (consume). Full keyspace bounds and lineage stay
+   with the cursor library + in-band fetch signals, not the cache.
 3. **Redirect-follow loop** — the one retry path mapping each redirect to its action,
-   with bounded hops and backoff, cache-refresh on stale/absent hints, and
-   `TopicNotFound` as terminal.
+   bounded by a client-level retry policy (deadline + exponential backoff), with
+   cache-refresh on stale/absent hints and `TopicNotFound` retried within the deadline
+   (propagation lag), surfaced only if still absent when it expires.
 4. **Admin calls** — create/delete/describe/list over the same loop.
 5. **Tests** — against the simulated cluster: first-contact resolution via redirect,
    stale-cache correction in O(1) hops, reconnect after a node drop, concurrent

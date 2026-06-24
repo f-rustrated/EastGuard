@@ -21,7 +21,7 @@ use crate::{
 /// struct so the carried fields are named in one place (consistent with the
 /// project's tuple-variant + named-struct enum pattern) and the `Client`
 /// prefix makes the audience explicit at the use site.
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum ClientDataPlaneRequest {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
@@ -37,7 +37,7 @@ impl_from_variant!(
     ListOffsets(ListOffsetsRequest),
 );
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ProduceRequest {
     pub topic_name: String,
     /// Used by the server to locate the target range; never stored.
@@ -49,7 +49,7 @@ pub struct ProduceRequest {
     pub record_count: u32,
 }
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchRequest {
     pub topic_name: String,
     pub range_id: u64,
@@ -67,7 +67,7 @@ pub struct FetchRequest {
 /// rather than by name. Lets any replica holding the segment serve it without
 /// resolving the topic name — i.e. without being a metadata peer. The client owns
 /// resolution; the server never proxies.
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
     pub topic_id: u64,
     pub range_id: u64,
@@ -75,7 +75,7 @@ pub struct FetchByIdRequest {
     pub max_bytes: u32,
 }
 
-#[derive(Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ListOffsetsRequest {
     pub topic_name: String,
     pub range_id: u64,

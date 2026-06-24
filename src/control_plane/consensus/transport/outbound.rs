@@ -8,9 +8,9 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 
 use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMessage};
 
+use crate::control_plane::NodeId;
 use crate::control_plane::consensus::transport::RaftRpcListener;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::NodeId;
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
