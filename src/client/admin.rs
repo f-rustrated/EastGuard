@@ -51,6 +51,7 @@ impl Client {
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
             ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) => {
+                self.remember_nodes(&detail);
                 self.cache.insert(&detail);
                 Ok(detail)
             }

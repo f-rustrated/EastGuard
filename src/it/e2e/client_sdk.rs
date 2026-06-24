@@ -381,3 +381,41 @@ fn client_call_times_out_when_unreachable() -> turmoil::Result {
 
     sim.run()
 }
+
+/// Node discovery: a client bootstrapped from a single seed grows its contact pool as
+/// it learns the rest of the cluster from redirects and describe replica sets.
+#[test]
+#[serial_test::serial]
+fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        // Bootstrap from one node only.
+        let one = SocketAddr::new(turmoil::lookup(NODES[0].0), NODES[0].1);
+        let client = Client::connect(vec![one]).expect("client connects");
+        assert_eq!(client.known_node_count(), 1, "starts with just the seed");
+
+        client
+            .create_topic("discover", policy())
+            .await
+            .expect("create");
+        // Resolve until SWIM has filled in every replica address (a describe that runs
+        // before convergence may omit a not-yet-known node).
+        for _ in 0..10 {
+            client.resolve_topic("discover").await.expect("resolve");
+            if client.known_node_count() == NODES.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            client.known_node_count(),
+            NODES.len(),
+            "discovered the whole cluster from one seed"
+        );
+        Ok(())
+    });
+
+    sim.run()
+}

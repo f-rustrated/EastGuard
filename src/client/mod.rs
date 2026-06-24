@@ -25,7 +25,6 @@ use pool::ConnectionPool;
 pub use redirect::RetryPolicy;
 use routing::RoutingCache;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A connection to an EastGuard cluster. Cheap to construct (connections are lazy);
 /// share one across tasks behind an `Arc` — every method takes `&self` and the pool
@@ -61,10 +60,22 @@ impl Client {
         })
     }
 
-    /// Round-robin the next seed to re-resolve against. Infallible — `seeds` is
-    /// non-empty by construction.
+    /// Round-robin the next known node to (re-)resolve against. Infallible — the pool
+    /// is non-empty by construction and only ever grows.
     pub(crate) fn next_known_node(&self) -> SocketAddr {
         self.known_nodes.pick()
+    }
+
+    /// Record the cluster nodes a describe response revealed (active-segment replica
+    /// addresses), growing the contact pool beyond the bootstrap seeds.
+    pub(crate) fn remember_nodes(&self, detail: &TopicDetail) {
+        for range in &detail.ranges {
+            if let Some(seg) = &range.active_segment {
+                for replica in &seg.replica_set {
+                    self.known_nodes.remember(replica.client_addr);
+                }
+            }
+        }
     }
 }
 
@@ -79,5 +90,10 @@ impl Client {
     /// Test seam: read the currently-cached write leader for a routing key.
     pub(crate) fn cached_write_leader(&self, topic: &str, key: &[u8]) -> Option<SocketAddr> {
         self.cache.write_leader(topic, key)
+    }
+
+    /// Test seam: how many nodes the contact pool currently knows about.
+    pub(crate) fn known_node_count(&self) -> usize {
+        self.known_nodes.len()
     }
 }

@@ -3,8 +3,8 @@
 //! and never empty, so picking a node to (re-)resolve against is infallible.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
