@@ -234,7 +234,6 @@ fn client_reconnects_after_node_crash() -> turmoil::Result {
     sim.run()
 }
 
-
 /// Stale-cache correction (doc item 5): a wrong-but-live cached leader is fixed by one
 /// produce — `NotWriteLeader` is followed in one hop, the stale entry dropped, and the
 /// next produce routes straight to the real leader.
@@ -372,13 +371,13 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
     sim.run()
 }
 
-
-
 /// Producer uses Lz4 compression and the server stores the compressed batch byte-for-byte.
 #[test]
 #[serial_test::serial]
 fn producer_compression_lz4_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest, DataPlaneResponse};
+    use crate::connections::protocol::{
+        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
+    };
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -391,7 +390,10 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             .expect("create topic");
 
         // Warm the cache
-        client.resolve_topic("compressed-topic").await.expect("resolve");
+        client
+            .resolve_topic("compressed-topic")
+            .await
+            .expect("resolve");
 
         let producer = crate::client::Producer::new(
             client.clone(),
@@ -415,7 +417,10 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
         assert_eq!(entry_id, entry_id2);
 
         // Resolve topic to get topic_id and range_id
-        let detail = client.resolve_topic("compressed-topic").await.expect("resolve");
+        let detail = client
+            .resolve_topic("compressed-topic")
+            .await
+            .expect("resolve");
         let topic_id = detail.topic_id;
         let range = &detail.ranges[0];
         let range_id = range.range_id;
@@ -429,19 +434,30 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             max_bytes: 65536,
         };
 
-        let served = client.call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req)).await.expect("fetch");
-        if let crate::connections::protocol::ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) = served.response {
+        let served = client
+            .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
+            .await
+            .expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(
+            DataPlaneResponse::Fetched { entries, .. },
+        ) = served.response
+        {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
-            assert_eq!(entry.data[0], crate::client::CompressionCodec::Lz4 as u8, "Stored payload must lead with Lz4 tag");
+            assert_eq!(
+                entry.data[0],
+                crate::client::CompressionCodec::Lz4 as u8,
+                "Stored payload must lead with Lz4 tag"
+            );
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records = crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
-                .expect("Decompress and decode batch");
+            let decoded_records =
+                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                    .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
             assert_eq!(decoded_records[0].key, b"ckey");
@@ -462,7 +478,9 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
 #[test]
 #[serial_test::serial]
 fn producer_compression_zstd_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest, DataPlaneResponse};
+    use crate::connections::protocol::{
+        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
+    };
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -513,19 +531,30 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             max_bytes: 65536,
         };
 
-        let served = client.call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req)).await.expect("fetch");
-        if let crate::connections::protocol::ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) = served.response {
+        let served = client
+            .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
+            .await
+            .expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(
+            DataPlaneResponse::Fetched { entries, .. },
+        ) = served.response
+        {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
-            assert_eq!(entry.data[0], crate::client::CompressionCodec::Zstd as u8, "Stored payload must lead with Zstd tag");
+            assert_eq!(
+                entry.data[0],
+                crate::client::CompressionCodec::Zstd as u8,
+                "Stored payload must lead with Zstd tag"
+            );
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records = crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
-                .expect("Decompress and decode batch");
+            let decoded_records =
+                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                    .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
             assert_eq!(decoded_records[0].key, b"zkey");
@@ -575,7 +604,7 @@ fn producer_concurrency_stress() -> turmoil::Result {
 
         const TASKS: usize = 50;
         const RECORDS_PER_TASK: usize = 10;
-        
+
         let mut join_set = tokio::task::JoinSet::new();
 
         for t in 0..TASKS {
@@ -599,7 +628,11 @@ fn producer_concurrency_stress() -> turmoil::Result {
             all_ids.extend(ids);
         }
 
-        assert_eq!(all_ids.len(), TASKS * RECORDS_PER_TASK, "All records must be sent");
+        assert_eq!(
+            all_ids.len(),
+            TASKS * RECORDS_PER_TASK,
+            "All records must be sent"
+        );
 
         // Assert that batching actually happened: the number of unique entry IDs
         // must be significantly less than the total number of records (500).
@@ -616,5 +649,3 @@ fn producer_concurrency_stress() -> turmoil::Result {
 
     sim.run()
 }
-
-

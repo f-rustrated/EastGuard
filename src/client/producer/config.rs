@@ -1,5 +1,5 @@
-use std::time::Duration;
 use crate::client::CompressionCodec;
+use std::time::Duration;
 
 /// Configuration options for the Producer.
 #[derive(Clone, Debug)]
