@@ -19,9 +19,13 @@ pub struct RangeBuffer {
     pub current_bytes: usize,
     pub spawned_linger: bool,
     pub first_added_at: Option<Instant>,
+    pub current_batch_seq: u64,
 }
 impl RangeBuffer {
     fn push(&mut self, pending: PendingRecord) {
+        if self.records.is_empty() {
+            self.current_batch_seq = self.current_batch_seq.wrapping_add(1);
+        }
         // Estimate serialized size: key_len (4B) + value_len (4B) + content bytes
         let record_bytes = 8 + pending.record.key.len() + pending.record.value.len();
         self.current_bytes += record_bytes;
@@ -53,8 +57,8 @@ pub struct PendingRecord {
 
 /// The action to be taken after pushing a record to the buffer.
 pub enum PushResult {
-    /// The record was added, and the caller should spawn a linger task to flush after this duration.
-    SpawnLinger(Duration),
+    /// The record was added, and the caller should spawn a linger task to flush after this duration with the given batch sequence.
+    SpawnLinger(Duration, u64),
     /// The record was added, and it is buffered (linger is already active).
     Buffered,
     /// The buffer has reached size or record count limits and must be flushed immediately.
@@ -78,6 +82,7 @@ impl ProducerBuffers {
             current_bytes: 0,
             spawned_linger: false,
             first_added_at: None,
+            current_batch_seq: 0,
         });
 
         buf.push(pending);
@@ -86,15 +91,18 @@ impl ProducerBuffers {
             PushResult::Flush(buf.flush())
         } else if !buf.spawned_linger {
             buf.spawned_linger = true;
-            PushResult::SpawnLinger(self.config.linger)
+            PushResult::SpawnLinger(self.config.linger, buf.current_batch_seq)
         } else {
             PushResult::Buffered
         }
     }
 
-    /// Take and clear all records from the buffer for a specific partition, if any exist.
-    pub fn take(&self, range_id: RangeId) -> Option<Vec<PendingRecord>> {
+    /// Take and clear all records from the buffer for a specific partition, if the task sequence matches the current batch.
+    pub fn take(&self, range_id: RangeId, task_batch_seq: u64) -> Option<Vec<PendingRecord>> {
         let mut buf = self.inner.get_mut(&range_id)?;
+        if buf.current_batch_seq != task_batch_seq {
+            return None;
+        }
         if buf.records.is_empty() {
             return None;
         }

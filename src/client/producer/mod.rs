@@ -91,11 +91,11 @@ impl Producer {
             PushResult::Flush(records_to_flush) => {
                 self.flush_records(records_to_flush).await;
             }
-            PushResult::SpawnLinger(linger) => {
+            PushResult::SpawnLinger(linger, seq) => {
                 let producer = self.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(linger).await;
-                    producer.flush_range(range_id).await;
+                    producer.flush_range(range_id, seq).await;
                 });
             }
             PushResult::Buffered => {}
@@ -105,8 +105,8 @@ impl Producer {
     }
 
     /// Flush the buffered records for a specific range if they exist.
-    async fn flush_range(&self, range_id: RangeId) {
-        if let Some(records_to_flush) = self.inner.buffers.take(range_id) {
+    async fn flush_range(&self, range_id: RangeId, task_batch_seq: u64) {
+        if let Some(records_to_flush) = self.inner.buffers.take(range_id, task_batch_seq) {
             self.flush_records(records_to_flush).await;
         }
     }
