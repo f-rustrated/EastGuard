@@ -168,6 +168,91 @@ A slow replica is as bad as a dead replica. If one node's fsync takes 500ms inst
 
 ---
 
+## Client SDK
+
+EastGuard includes a highly optimized client SDK designed for low-latency, high-throughput communication with the cluster. The SDK is split into a shared connection layer, a producer, and a consumer.
+
+### Multiplexed Connection Core
+The client manages a lazy connection pool that opens a single multiplexed TCP connection per EastGuard Broker. A background read loop listens on each connection and demultiplexes responses back to awaiting caller tasks using request IDs. This eliminates thread-of-execution bottlenecks and minimizes socket overhead.
+
+### Producer: Thread-Safe Batching & Compression
+The `Producer` is a thread-safe, cloneable client component designed to publish records to a specific topic with maximum throughput:
+
+- **Partition-Level Concurrency**: Uses a sharded concurrent hash for range buffers. Threads writing to different range partitions acquire isolated entry locks, allowing parallel writes without contention.
+- **End-to-End Compression**: Batched payloads are optionally compressed using block-level LZ4 or Zstd, prefixed with a 1-byte codec tag, and stored opaque on the server.
+- **Idempotency Seam**: Stamps each buffered record with a globally unique `producer_id` and a monotonic sequence number to prepare for server-side deduplication.
+
+#### High-Level Batching & Demultiplexing Architecture
+The producer coordinates concurrent writes, partition-level buffering, batch triggers, and network multiplexing/demultiplexing through a highly parallel, asynchronous data flow:
+
+```mermaid
+graph LR
+    subgraph App["Application Layer"]
+        T1["Thread 1 (send)"]
+        T2["Thread 2 (send)"]
+        T3["Thread 3 (send)"]
+    end
+
+    subgraph Producer["Producer Client (SDK)"]
+        direction TB
+        subgraph Buffers["Partition Buffers"]
+            B1["Range Buffer A"]
+            B2["Range Buffer B"]
+        end
+        subgraph Trigger["Flush Triggers"]
+            Size["Size Limit"]
+            Count["Count Limit"]
+            Linger["Linger Timer"]
+        end
+        subgraph Pipeline["Pipeline"]
+            Codec["Opaque Encoder"]
+        end
+        
+        Buffers --> Trigger
+        Trigger --> Pipeline
+    end
+
+    subgraph ConnPool["Connection Pool"]
+        Mux["Multiplexed Connection"]
+        ReadLoop["Background Read Loop"]
+    end
+
+    subgraph Brokers["EastGuard Brokers"]
+        Broker["Segment Leader"]
+    end
+
+    %% Forward path (App -> SDK -> Broker)
+    T1 -->|1. Route| Buffers
+    T2 -->|1. Route| Buffers
+    T3 -->|1. Route| Buffers
+    
+    Pipeline -->|2. Serialized Batch| Mux
+    Mux -->|3. TCP Write| Broker
+
+    %% Return path (Broker -> SDK -> App)
+    Broker -.->|4. Response| ReadLoop
+    ReadLoop -.->|5. Demux by Request ID| Mux
+    Mux -.->|6. Complete batch| Pipeline
+    Pipeline -.->|7. Fan-out to records| Buffers
+    Buffers -.->|8. Return entry_id| T1
+    Buffers -.->|8. Return entry_id| T2
+```
+
+Here is how the end-to-end write path operates:
+
+1. **Routing & Thread-Safe Buffering**: Concurrent application threads produce data. The producer routes it to the target range's buffer. Buffers reduces lock contention by per-range shard operation.
+
+2. **Dynamic Flush Triggers**: As records accumulate, three triggers monitor the buffer:
+   - **Size Limit (`max_batch_bytes`)**: Triggers an immediate synchronous flush when the serialized byte limit is reached.
+   - **Record Count Limit (`max_batch_records`)**: Triggers an immediate synchronous flush when the count limit is reached.
+   - **Linger Timer (`linger`)**: When the first record of a batch is pushed, a lightweight one-shot timer is spawned to flush the buffer asynchronously after the configured duration.
+3. **Pipeline & Network Write**: The thread that triggers the flush extracts the batch, serializes it, applies the configured compression codec (LZ4 or Zstd), and writes it as an opaque payload to the multiplexed TCP connection.
+4. **Two-Stage Demultiplexing & Unblocking**: 
+   - **Connection Demultiplexing**: When the broker sends the write acknowledgment, the client's background TCP read loop receives it and demultiplexes the response using its unique request ID, completing the batch-level future.
+   - **Batch Demultiplexing (Fan-out)**: The completed batch future wakes up the producer's flushing thread, which demultiplexes (fans out) the single committed `entry_id` to the individual oneshot channels of all the threads (`T1`, `T2`, etc.) that contributed to that batch, unblocking them.
+
+---
+
 ## How To Start
 
 ```shell
