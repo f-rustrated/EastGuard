@@ -399,9 +399,11 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             client.clone(),
             "compressed-topic".to_string(),
             crate::client::ProducerConfig {
-                linger: Duration::from_millis(50),
-                max_batch_bytes: 1024 * 1024,
-                max_batch_records: 100,
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
                 codec: crate::client::CompressionCodec::Lz4,
             },
         );
@@ -499,9 +501,11 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             client.clone(),
             "zstd-topic".to_string(),
             crate::client::ProducerConfig {
-                linger: Duration::from_millis(50),
-                max_batch_bytes: 1024 * 1024,
-                max_batch_records: 100,
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
                 codec: crate::client::CompressionCodec::Zstd,
             },
         );
@@ -595,9 +599,11 @@ fn producer_concurrency_stress() -> turmoil::Result {
             client.clone(),
             "prod-stress".to_string(),
             crate::client::ProducerConfig {
-                linger: Duration::from_millis(30),
-                max_batch_bytes: 1024 * 1024,
-                max_batch_records: 100,
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(30),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
                 codec: crate::client::CompressionCodec::None,
             },
         ));

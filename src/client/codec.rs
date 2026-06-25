@@ -2,7 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use super::record::ClientRecord;
 
 /// Compression codec for opaque entry payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, clap::ValueEnum)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum CompressionCodec {

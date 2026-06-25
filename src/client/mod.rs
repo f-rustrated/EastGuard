@@ -26,7 +26,7 @@ pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePol
 pub use codec::CompressionCodec;
 pub use error::ClientError;
 use pool::ConnectionPool;
-pub use producer::{Producer, ProducerConfig};
+pub use producer::{Producer, ProducerConfig, BufferConfig};
 pub use record::ClientRecord;
 pub use redirect::RetryPolicy;
 use routing::RoutingCache;
