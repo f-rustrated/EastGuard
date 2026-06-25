@@ -655,3 +655,104 @@ fn producer_concurrency_stress() -> turmoil::Result {
 
     sim.run()
 }
+
+/// Exercises the exact overlapping linger task scenario:
+/// 1) Record 1 is sent -> Linger 1 spawned (100ms).
+/// 2) Wait 40ms. Send enough records to trigger a size/count threshold flush.
+///    This flushes the buffer immediately and resets spawned_linger to false.
+/// 3) Send Record 3 (does not hit threshold). Since spawned_linger is false,
+///    it sets spawned_linger = true and spawns Linger 2 (100ms).
+/// 4) Wait 80ms (virtual time 120ms, past Linger 1's 100ms expiration).
+///    Linger 1 wakes up, calls take(), finds Record 3, and flushes it early.
+///    This resets spawned_linger to false.
+/// 5) Wait another 80ms (virtual time 200ms, past Linger 2's 100ms expiration).
+///    Linger 2 wakes up, calls take(), finds the buffer empty, and safely no-ops.
+#[test]
+#[serial_test::serial]
+fn producer_overlapping_linger_scenario() -> turmoil::Result {
+    fn is_future_ready<F: std::future::Future>(f: F) -> bool {
+        use std::task::{Context, Waker, Poll};
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut f = std::pin::pin!(f);
+        matches!(f.as_mut().poll(&mut cx), Poll::Ready(_))
+    }
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("linger-overlap", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("linger-overlap").await.expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "linger-overlap".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(100),
+                    // Threshold is 2 records
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 2,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // 1) Send Record 1 -> spawns Linger 1 (100ms)
+        let f1 = producer.send(b"key-1", b"val-1".to_vec());
+
+        // 2) Wait 40ms
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Send Record 2 -> hits threshold (max_batch_records: 2) -> flushes immediately!
+        // Record 1 and Record 2 are flushed. spawned_linger becomes false.
+        let f2 = producer.send(b"key-1", b"val-2".to_vec());
+
+        // Wait for them to complete (they were flushed immediately)
+        let (id1, id2) = tokio::try_join!(f1, f2).expect("first batch flushed");
+        assert_eq!(id1, id2, "Should be in the same batch");
+
+        // 3) Send Record 3 -> does not hit threshold.
+        // Since spawned_linger is false, this spawns Linger 2 (100ms).
+        let mut f3 = std::pin::pin!(producer.send(b"key-1", b"val-3".to_vec()));
+
+        // 4) Wait 80ms (total elapsed time: 120ms since start).
+        // Linger 1 (spawned at 0ms, fires at 100ms) wakes up (with seq 1).
+        // It calls take(..., 1). Since the current batch seq is 2, it no-ops!
+        // Therefore, Record 3 must NOT be flushed early.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Verify that Record 3 is indeed NOT flushed yet.
+        assert!(
+            !is_future_ready(f3.as_mut()),
+            "Record 3 must not be flushed early by Linger 1"
+        );
+
+        // 5) Wait another 40ms (total elapsed time: 160ms since start).
+        // Linger 2 (spawned at 40ms, fires at 140ms) wakes up (with seq 2).
+        // It calls take(..., 2), finds Record 3, flushes it, and resets spawned_linger.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let id3 = f3.as_mut().await.expect("Record 3 should be flushed by Linger 2");
+
+        // 6) Wait another 40ms (total elapsed time: 200ms since start).
+        // Linger 2's timer has already fired. No other active linger timers remain.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Verify that we can still write new records and they behave normally.
+        let id4 = producer.send(b"key-1", b"val-4".to_vec()).await.expect("Record 4");
+        assert_ne!(id3, id4);
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
