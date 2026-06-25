@@ -117,7 +117,7 @@ impl RangeMeta {
     ) -> Option<ReplicaSet> {
         let seg = self.segments.get_mut(&segment_id)?;
 
-        if seg.end_entry_id.is_some() {
+        if seg.state != SegmentMetaState::Sealed || seg.end_entry_id.is_some() {
             return None;
         }
 
@@ -129,9 +129,8 @@ impl RangeMeta {
             && let Some(active_seg) = self.segments.get_mut(&active_seg_id)
         {
             active_seg.start_entry_id = end_entry_id + 1;
-            return Some(replica_set);
         }
-        None
+        Some(replica_set)
     }
 
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {

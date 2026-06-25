@@ -68,30 +68,7 @@ impl MetadataStateMachine {
         use MetadataCommand::*;
         let result = match command {
             CreateTopic(cmd) => self.create_topic(cmd)?.into(),
-            RollSegment(cmd) => {
-                let range = self
-                    .get_active_topic_mut(cmd.segment_key.topic_id)?
-                    .get_range_mut(&cmd.segment_key.range_id)?;
-
-                let is_active = range.active_segment == Some(cmd.segment_key.segment_id);
-
-                if !is_active {
-                    if let Some(end_entry_id) = cmd.end_entry_id
-                        && let Some(replica_set) =
-                            range.correct_end_offset(cmd.segment_key.segment_id, end_entry_id)
-                    {
-                        ApplyResult::SegmentSealCorrected(SegmentSealCorrected {
-                            segment_key: cmd.segment_key,
-                            replica_set,
-                            committed_entry_id: cmd.end_entry_id,
-                        })
-                    } else {
-                        ApplyResult::Noop
-                    }
-                } else {
-                    self.roll_segment(cmd)?.into()
-                }
-            }
+            RollSegment(cmd) => self.roll_segment(cmd)?,
             SplitRange(cmd) => self.split_range(cmd)?.into(),
             MergeRange(cmd) => self.merge_range(cmd)?.into(),
             DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted)?,
@@ -125,13 +102,33 @@ impl MetadataStateMachine {
         })
     }
 
-    fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentRolled, MetadataError> {
+    fn roll_segment(&mut self, cmd: RollSegment) -> Result<ApplyResult, MetadataError> {
         let topic = self.get_active_topic_mut(cmd.segment_key.topic_id)?;
         let can_split = topic.can_split();
         let range = topic.get_range_mut(&cmd.segment_key.range_id)?;
 
-        let new_segment_id = range.roll_segment(cmd.clone())?;
+        let is_active = range.active_segment == Some(cmd.segment_key.segment_id);
 
+        // If Inactive, correction path
+        if !is_active {
+            let Some(end_entry_id) = cmd.end_entry_id else {
+                return Ok(ApplyResult::Noop);
+            };
+            let Some(replica_set) =
+                range.correct_end_offset(cmd.segment_key.segment_id, end_entry_id)
+            else {
+                return Ok(ApplyResult::Noop);
+            };
+
+            return Ok(ApplyResult::SegmentSealCorrected(SegmentSealCorrected {
+                segment_key: cmd.segment_key,
+                replica_set,
+                committed_entry_id: cmd.end_entry_id,
+            }));
+        }
+
+        // If Active, Roll
+        let new_segment_id = range.roll_segment(cmd.clone())?;
         if range.should_split(cmd.sealed_at) && can_split {
             match range.build_split_proposal(&cmd) {
                 Ok(p) => self.pending_proposals.push(p),
@@ -148,7 +145,8 @@ impl MetadataStateMachine {
             new_segment_key: cmd.segment_key.with_segment_id(new_segment_id),
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
-        })
+        }
+        .into())
     }
 
     /// Re-points a sealed segment's replica set.
