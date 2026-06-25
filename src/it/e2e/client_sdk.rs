@@ -638,3 +638,79 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
     sim.run()
 }
 
+/// Stress: 50 concurrent tasks firing sends independently.
+/// Verifies thread-safety, lock-free sequencing, and robust batching under load.
+#[test]
+#[serial_test::serial]
+fn producer_concurrency_stress() -> turmoil::Result {
+    use std::collections::HashSet;
+
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("prod-stress", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("prod-stress").await.expect("resolve");
+
+        let producer = Arc::new(crate::client::Producer::new(
+            client.clone(),
+            "prod-stress".to_string(),
+            crate::client::ProducerConfig {
+                linger: Duration::from_millis(30),
+                max_batch_bytes: 1024 * 1024,
+                max_batch_records: 100,
+                codec: crate::client::CompressionCodec::None,
+            },
+        ));
+
+        const TASKS: usize = 50;
+        const RECORDS_PER_TASK: usize = 10;
+        
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for t in 0..TASKS {
+            let producer = producer.clone();
+            join_set.spawn(async move {
+                let mut ids = Vec::with_capacity(RECORDS_PER_TASK);
+                for r in 0..RECORDS_PER_TASK {
+                    // Alternate keys to write to different ranges or share them
+                    let key = format!("key-{}", (t * RECORDS_PER_TASK + r) % 5).into_bytes();
+                    let val = format!("val-{}-{}", t, r).into_bytes();
+                    let id = producer.send(&key, val).await?;
+                    ids.push(id);
+                }
+                Ok::<_, ClientError>(ids)
+            });
+        }
+
+        let mut all_ids = Vec::with_capacity(TASKS * RECORDS_PER_TASK);
+        while let Some(res) = join_set.join_next().await {
+            let ids = res.expect("Task did not panic").expect("Send successful");
+            all_ids.extend(ids);
+        }
+
+        assert_eq!(all_ids.len(), TASKS * RECORDS_PER_TASK, "All records must be sent");
+
+        // Assert that batching actually happened: the number of unique entry IDs
+        // must be significantly less than the total number of records (500).
+        let unique_ids: HashSet<u64> = all_ids.into_iter().collect();
+        assert!(
+            unique_ids.len() < (TASKS * RECORDS_PER_TASK) / 2,
+            "Records must be batched; unique entry IDs: {}, total: {}",
+            unique_ids.len(),
+            TASKS * RECORDS_PER_TASK
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+
