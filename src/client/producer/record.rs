@@ -1,11 +1,11 @@
 /// A single key-value record produced or consumed by the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClientRecord {
+pub struct ProducerRecord {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
 
-impl ClientRecord {
+impl ProducerRecord {
     pub fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         Self {
             key: key.into(),
@@ -14,7 +14,7 @@ impl ClientRecord {
     }
 
     /// Serialize a slice of records into a byte buffer.
-    pub fn serialize_batch(records: &[ClientRecord]) -> Vec<u8> {
+    pub fn serialize_batch(records: &[ProducerRecord]) -> Vec<u8> {
         let mut buf = Vec::new();
         for r in records {
             buf.extend_from_slice(&(r.key.len() as u32).to_be_bytes());
@@ -26,7 +26,10 @@ impl ClientRecord {
     }
 
     /// Deserialize a byte buffer into a vector of records.
-    pub fn deserialize_batch(mut buf: &[u8], count: u32) -> Result<Box<[ClientRecord]>, std::io::Error> {
+    pub fn deserialize_batch(
+        mut buf: &[u8],
+        count: u32,
+    ) -> Result<Box<[ProducerRecord]>, std::io::Error> {
         let mut records = Vec::with_capacity(count as usize);
         for _ in 0..count {
             if buf.len() < 4 {
@@ -65,7 +68,7 @@ impl ClientRecord {
             let value = buf[..val_len].to_vec();
             buf = &buf[val_len..];
 
-            records.push(ClientRecord { key, value });
+            records.push(ProducerRecord { key, value });
         }
         Ok(records.into_boxed_slice())
     }

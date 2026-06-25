@@ -110,6 +110,7 @@ pub enum DataPlaneResponse {
         hint_node: Option<SocketAddr>,
     },
     TopicNotFound,
+    SegmentNotLocal,
     InternalError(String),
 }
 
@@ -123,9 +124,7 @@ impl DataPlaneResponse {
                 start_entry_id,
                 committed_entry_id,
             },
-            ListOffsetsResult::SegmentNotLocal => {
-                DataPlaneResponse::InternalError("segment not hosted on this node".into())
-            }
+            ListOffsetsResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
             ListOffsetsResult::InternalError(s) => DataPlaneResponse::InternalError(s),
         }
     }
@@ -158,11 +157,7 @@ impl DataPlaneResponse {
                 }
             }
             FetchResult::EntryIdOutOfRange => DataPlaneResponse::EntryIdOutOfRange,
-            FetchResult::SegmentNotLocal => {
-                // The consumer treats this as "stale targeting" — re-resolve via
-                // DescribeTopic and retry against a node that hosts the segment.
-                DataPlaneResponse::InternalError("segment not hosted on this node".into())
-            }
+            FetchResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
             FetchResult::InternalError(s) => DataPlaneResponse::InternalError(s),
         }
     }
@@ -268,5 +263,3 @@ impl RangeProgressSignal {
         }
     }
 }
-
-

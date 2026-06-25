@@ -11,7 +11,9 @@
 //! their predecessor drains.
 
 use super::cursor::RangeCursor;
+use crate::client::{KeyInterest, StartPolicy, TopicDetail};
 use crate::connections::protocol::{RangeProgressSignal, RangeTransition};
+use crate::consumer::bootstrap::CursorBootstrap;
 use crate::consumer::{ParkedMerge, ParkedMerges};
 use crate::control_plane::metadata::RangeId;
 use crate::test_traits::TAssertInvariant;
@@ -49,6 +51,10 @@ impl RangeCursorSet {
         set
     }
 
+    pub fn bootstrap(detail: &TopicDetail, interest: KeyInterest, policy: StartPolicy) -> Self {
+        CursorBootstrap::build(detail, interest, policy)
+    }
+
     pub fn cursors(&self) -> &[RangeCursor] {
         &self.cursors
     }
@@ -83,7 +89,7 @@ impl RangeCursorSet {
             .iter()
             .position(|c| c.range_id == range_id)
             .expect("apply_fetch_result called for range not in cursor set");
-        self.cursors[idx].next_offset = next_entry_id;
+        self.cursors[idx].next_entry_id = next_entry_id;
 
         let cursor_action = match signal {
             RangeProgressSignal::Active => CursorAction::KeepGoing {
@@ -174,6 +180,17 @@ impl RangeCursorSet {
         let [pa, pb] = merged_from;
         let sibling = if pa == cursor.range_id { pb } else { pa };
         self.cursors.iter().any(|c| c.range_id == sibling)
+    }
+
+    /// Skip the cursor for `range_id` forward to `new_offset` if it is currently behind.
+    pub fn skip_forward(&mut self, range_id: RangeId, new_entry_id: u64) {
+        if let Some(c) = self.cursors.iter_mut().find(|c| c.range_id == range_id)
+            && c.next_entry_id < new_entry_id
+        {
+            c.next_entry_id = new_entry_id;
+        }
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
     }
 }
 
@@ -276,7 +293,7 @@ mod tests {
                 next_offset: 101,
             }
         );
-        assert_eq!(set.cursors()[0].next_offset, 101);
+        assert_eq!(set.cursors()[0].next_entry_id, 101);
     }
 
     /// Sealed range, but consumer hasn't drained past `end_offset` yet —

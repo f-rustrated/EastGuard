@@ -1,16 +1,16 @@
 mod buffers;
 mod config;
-
+pub(crate) mod record;
+use crate::client::error::ClientError;
+use crate::client::{Client, CompressionCodec};
+use crate::control_plane::metadata::RangeId;
+use buffers::{PendingRecord, ProducerBuffers, PushResult};
 pub use config::{BufferConfig, ProducerConfig};
+use record::ProducerRecord;
 
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-use crate::client::error::ClientError;
-use crate::client::{Client, ClientRecord, CompressionCodec};
-use crate::control_plane::metadata::RangeId;
-use buffers::{PendingRecord, ProducerBuffers, PushResult};
 
 /// A thread-safe, internally synchronized producer for a single topic.
 /// Cheap to clone and share across tasks.
@@ -79,7 +79,7 @@ impl Producer {
         let (tx, rx) = oneshot::channel();
 
         let pending = PendingRecord {
-            record: ClientRecord::new(key, value),
+            record: ProducerRecord::new(key, value),
             producer_id: self.inner.producer_id,
             sequence_number,
             tx,

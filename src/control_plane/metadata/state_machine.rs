@@ -73,9 +73,21 @@ impl MetadataStateMachine {
                     .get_active_topic_mut(cmd.segment_key.topic_id)?
                     .get_range_mut(&cmd.segment_key.range_id)?;
 
-                if !range.is_active_segment(cmd.segment_key.segment_id)? {
-                    range.correct_end_offset(cmd.segment_key.segment_id, cmd.end_entry_id);
-                    ApplyResult::Noop
+                let is_active = range.active_segment == Some(cmd.segment_key.segment_id);
+
+                if !is_active {
+                    if let Some(end_entry_id) = cmd.end_entry_id
+                        && let Some(replica_set) =
+                            range.correct_end_offset(cmd.segment_key.segment_id, end_entry_id)
+                    {
+                        ApplyResult::SegmentSealCorrected(SegmentSealCorrected {
+                            segment_key: cmd.segment_key,
+                            replica_set,
+                            committed_entry_id: cmd.end_entry_id,
+                        })
+                    } else {
+                        ApplyResult::Noop
+                    }
                 } else {
                     self.roll_segment(cmd)?.into()
                 }
@@ -210,6 +222,19 @@ impl MetadataStateMachine {
         if !topic.can_split() {
             return Err(SplitNotAllowed(cmd.topic_id));
         }
+
+        let parent_range = topic
+            .ranges
+            .get(&cmd.range_id)
+            .ok_or(MetadataError::RangeNotFound)?;
+        let parent_active_segment = parent_range.active_segment.and_then(|seg_id| {
+            let seg = parent_range.segments.get(&seg_id)?;
+            Some((
+                SegmentKey::new(cmd.topic_id, cmd.range_id, seg_id),
+                seg.replica_set.clone(),
+            ))
+        });
+
         let (left_id, right_id) = topic.execute_split(cmd.clone())?;
         Ok(RangeSplit {
             topic_id: cmd.topic_id,
@@ -217,6 +242,7 @@ impl MetadataStateMachine {
                 (left_id, SegmentId(0), cmd.left_replica_set),
                 (right_id, SegmentId(0), cmd.right_replica_set),
             ],
+            parent_active_segment,
         })
     }
 

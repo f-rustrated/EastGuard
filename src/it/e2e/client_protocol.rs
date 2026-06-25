@@ -562,9 +562,9 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset > 0
+                && seg.start_entry_id > 0
             {
-                rolled_start = Some(seg.start_offset);
+                rolled_start = Some(seg.start_entry_id);
                 break;
             }
         }
@@ -676,7 +676,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset > 0
+                && seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -834,7 +834,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                 && let Some(write_leader) = seg.replica_set.first()
             {
                 assert_eq!(
-                    seg.start_offset, 0,
+                    seg.start_entry_id, 0,
                     "segment must still be active at offset 0"
                 );
                 chosen = Some((detail.topic_id, write_leader.node_id.clone()));
@@ -872,7 +872,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset == 1
+                && seg.start_entry_id == 1
             {
                 if let Some(new_leader) = seg.replica_set.first() {
                     assert!(
@@ -1021,7 +1021,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset > 0
+                && seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -1208,7 +1208,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset > 0
+                && seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -1429,7 +1429,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_offset > 0
+                && seg.start_entry_id > 0
             {
                 topic_id = Some(detail.topic_id);
                 break;

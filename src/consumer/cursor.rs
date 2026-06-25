@@ -9,7 +9,7 @@ use crate::control_plane::metadata::RangeId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCursor {
     pub range_id: RangeId,
-    pub next_offset: u64,
+    pub next_entry_id: u64,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
 }
@@ -17,13 +17,13 @@ pub struct RangeCursor {
 impl RangeCursor {
     pub fn new(
         range_id: RangeId,
-        next_offset: u64,
+        next_entry_id: u64,
         keyspace_start: Vec<u8>,
         keyspace_end: Vec<u8>,
     ) -> Self {
         Self {
             range_id,
-            next_offset,
+            next_entry_id,
             keyspace_start,
             keyspace_end,
         }
@@ -56,7 +56,7 @@ impl RangeCursor {
     pub fn into_merged_cursor(self, merged_id: RangeId) -> Self {
         Self {
             range_id: merged_id,
-            next_offset: 0,
+            next_entry_id: 0,
             ..self
         }
     }

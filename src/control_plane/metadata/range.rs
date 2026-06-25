@@ -110,29 +110,28 @@ impl RangeMeta {
         self.seal_history.should_split(sealed_at)
     }
 
-    pub(crate) fn is_active_segment(&self, expected: SegmentId) -> Result<bool, MetadataError> {
-        let active_seg_id = self.validate_active()?;
-        Ok(active_seg_id == expected)
-    }
+    pub(crate) fn correct_end_offset(
+        &mut self,
+        segment_id: SegmentId,
+        end_entry_id: u64,
+    ) -> Option<ReplicaSet> {
+        let seg = self.segments.get_mut(&segment_id)?;
 
-    pub(crate) fn correct_end_offset(&mut self, segment_id: SegmentId, end_entry_id: Option<u64>) {
-        let Some(end_entry_id) = end_entry_id else {
-            return;
-        };
-        let Some(active_seg_id) = self.active_segment else {
-            return;
-        };
-        let Some(seg) = self.segments.get_mut(&segment_id) else {
-            return;
-        };
-        if seg.state != SegmentMetaState::Sealed || seg.end_entry_id.is_some() {
-            return;
+        if seg.end_entry_id.is_some() {
+            return None;
         }
+
         seg.end_entry_id = Some(end_entry_id);
+        let replica_set = seg.replica_set.clone();
+
         self.next_offset = end_entry_id + 1;
-        if let Some(active_seg) = self.segments.get_mut(&active_seg_id) {
+        if let Some(active_seg_id) = self.active_segment
+            && let Some(active_seg) = self.segments.get_mut(&active_seg_id)
+        {
             active_seg.start_entry_id = end_entry_id + 1;
+            return Some(replica_set);
         }
+        None
     }
 
     pub(crate) fn valid_split_point(&self, split_point: &Vec<u8>) -> bool {
@@ -261,7 +260,7 @@ impl RangeMeta {
         if let Some(seg_id) = self.active_segment
             && let Some(seg) = self.segments.get_mut(&seg_id)
         {
-            seg.seal(Some(self.next_offset.saturating_sub(1)), created_at)?;
+            seg.seal(None, created_at)?;
         }
         self.state = RangeState::Sealed;
         self.active_segment = None;

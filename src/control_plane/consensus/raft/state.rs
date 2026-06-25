@@ -723,6 +723,13 @@ impl Raft {
         Some(seg.replica_set.clone())
     }
 
+    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
+        let topic = self.state_machine.get_topic(&key.topic_id)?;
+        let range = topic.ranges.get(&key.range_id)?;
+        let seg = range.segments.get(&key.segment_id)?;
+        Some(seg.replica_set.clone())
+    }
+
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
         std::mem::take(&mut self.events)
     }

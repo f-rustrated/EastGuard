@@ -19,7 +19,7 @@ pub(crate) mod bootstrap;
 pub(crate) mod cursor;
 pub(crate) mod cursor_set;
 mod parked_merges;
-pub(crate) use bootstrap::{KeyInterest, StartPolicy};
+pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::{CursorAction, RangeCursorSet};
 use parked_merges::*;

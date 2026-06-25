@@ -1,8 +1,10 @@
+use super::producer::record::ProducerRecord;
 use borsh::{BorshDeserialize, BorshSerialize};
-use super::record::ClientRecord;
 
 /// Compression codec for opaque entry payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, clap::ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, clap::ValueEnum,
+)]
 #[borsh(use_discriminant = true)]
 #[repr(u8)]
 pub enum CompressionCodec {
@@ -42,8 +44,8 @@ impl CompressionCodec {
     }
 
     /// Helper to encode a batch of records into an opaque EntryPayload with a 1-byte codec tag.
-    pub fn encode_payload(&self, records: &[ClientRecord]) -> Result<Vec<u8>, std::io::Error> {
-        let serialized = ClientRecord::serialize_batch(records);
+    pub fn encode_payload(&self, records: &[ProducerRecord]) -> Result<Vec<u8>, std::io::Error> {
+        let serialized = ProducerRecord::serialize_batch(records);
         let compressed = self.compress(&serialized)?;
         let mut payload = Vec::with_capacity(1 + compressed.len());
         payload.push(*self as u8);
@@ -55,7 +57,7 @@ impl CompressionCodec {
     pub fn decode_payload(
         payload: &[u8],
         record_count: u32,
-    ) -> Result<Box<[ClientRecord]>, std::io::Error> {
+    ) -> Result<Box<[ProducerRecord]>, std::io::Error> {
         if payload.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -64,6 +66,6 @@ impl CompressionCodec {
         }
         let codec = Self::from_u8(payload[0])?;
         let decompressed = codec.decompress(&payload[1..])?;
-        ClientRecord::deserialize_batch(&decompressed, record_count)
+        ProducerRecord::deserialize_batch(&decompressed, record_count)
     }
 }

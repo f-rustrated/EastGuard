@@ -99,6 +99,7 @@ pub struct SealResponse {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentSealed {
     pub segment_key: SegmentKey,
+    pub committed_entry_id: Option<u64>,
 }
 
 // Catch-up: re-replicate a sealed segment to a newly assigned replica.

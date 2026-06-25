@@ -671,7 +671,7 @@ fn producer_concurrency_stress() -> turmoil::Result {
 #[serial_test::serial]
 fn producer_overlapping_linger_scenario() -> turmoil::Result {
     fn is_future_ready<F: std::future::Future>(f: F) -> bool {
-        use std::task::{Context, Waker, Poll};
+        use std::task::{Context, Poll, Waker};
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut f = std::pin::pin!(f);
@@ -689,7 +689,10 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
             .expect("create topic");
 
         // Warm the cache
-        client.resolve_topic("linger-overlap").await.expect("resolve");
+        client
+            .resolve_topic("linger-overlap")
+            .await
+            .expect("resolve");
 
         let producer = crate::client::Producer::new(
             client.clone(),
@@ -740,14 +743,20 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
         // It calls take(..., 2), finds Record 3, flushes it, and resets spawned_linger.
         tokio::time::sleep(Duration::from_millis(40)).await;
 
-        let id3 = f3.as_mut().await.expect("Record 3 should be flushed by Linger 2");
+        let id3 = f3
+            .as_mut()
+            .await
+            .expect("Record 3 should be flushed by Linger 2");
 
         // 6) Wait another 40ms (total elapsed time: 200ms since start).
         // Linger 2's timer has already fired. No other active linger timers remain.
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         // Verify that we can still write new records and they behave normally.
-        let id4 = producer.send(b"key-1", b"val-4".to_vec()).await.expect("Record 4");
+        let id4 = producer
+            .send(b"key-1", b"val-4".to_vec())
+            .await
+            .expect("Record 4");
         assert_ne!(id3, id4);
 
         Ok(())
@@ -756,3 +765,591 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
     sim.run()
 }
 
+/// E2E Consumer Test 1: Basic Consume.
+/// Produce 5 records, consume them with StartPolicy::Earliest and KeyInterest::AllKeys,
+/// and assert exact ordered delivery.
+/// Then roll the segment (making them sealed history) and verify that StartPolicy::Latest
+/// skips them and only reads new records produced afterward.
+#[test]
+#[serial_test::serial]
+fn consumer_basic_consume_earliest() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        // Force fast size-based rolls
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        let custom_policy = policy();
+        client
+            .create_topic("basic-consume", custom_policy)
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("basic-consume")
+            .await
+            .expect("resolve");
+
+        // Produce 5 records
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "basic-consume".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 5,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        for i in 0..5 {
+            let key = format!("key-{}", i);
+            let val = format!("val-{}", i).into_bytes();
+            producer
+                .send(key.as_bytes(), val)
+                .await
+                .expect("produce record");
+        }
+
+        // Consume them with Earliest
+        let consumer = crate::client::Consumer::new(
+            client.clone(),
+            "basic-consume".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Earliest,
+        )
+        .await
+        .expect("create consumer");
+
+        let mut received = Vec::new();
+        for _ in 0..5 {
+            let rec = consumer.next_record().await.expect("read record");
+            let rec = rec.expect("should have record");
+            received.push(rec);
+        }
+
+        // Verify keys and values
+        for (i, rec) in received.iter().enumerate().take(5) {
+            assert_eq!(rec.key, format!("key-{}", i).into_bytes());
+            assert_eq!(rec.value, format!("val-{}", i).into_bytes());
+        }
+
+        // Now, wait for the segment to roll and seal, making these 5 records "sealed history"
+        wait_for_segment_roll(&client, "basic-consume", 0, 1).await;
+
+        // Start a consumer with StartPolicy::Latest. It should skip the sealed segment 0
+        // and start at segment 1 (offset 5).
+        let consumer_latest = crate::client::Consumer::new(
+            client.clone(),
+            "basic-consume".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Latest,
+        )
+        .await
+        .expect("create latest consumer");
+
+        // Send 2 new records
+        producer
+            .send(b"key-5", b"val-5".to_vec())
+            .await
+            .expect("produce record");
+        producer
+            .send(b"key-6", b"val-6".to_vec())
+            .await
+            .expect("produce record");
+
+        // The latest consumer should only receive keys 5 and 6
+        let rec5 = consumer_latest
+            .next_record()
+            .await
+            .expect("read")
+            .expect("rec 5");
+        assert_eq!(rec5.key, b"key-5");
+        let rec6 = consumer_latest
+            .next_record()
+            .await
+            .expect("read")
+            .expect("rec 6");
+        assert_eq!(rec6.key, b"key-6");
+
+        // Verify no other record is returned
+        let timeout_res =
+            tokio::time::timeout(Duration::from_millis(500), consumer_latest.next_record()).await;
+        assert!(
+            timeout_res.is_err(),
+            "Latest consumer should not receive historical records"
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// E2E Consumer Test 2: Key Filtering.
+/// Configure a topic with two ranges (via automatic split), consume with KeyInterest::KeySpan
+/// matching only the right child range, and verify that only records from that range are received.
+#[test]
+#[serial_test::serial]
+fn consumer_key_filtering_multi_range() -> turmoil::Result {
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        // Force fast size-based rolls to trigger automatic split
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("key-filter-multi", policy())
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("key-filter-multi")
+            .await
+            .expect("resolve");
+
+        // Produce a record, then wait for roll, 3 times to trigger split
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "key-filter-multi".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 1,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        for i in 0..3 {
+            producer
+                .send(b"k", format!("p-{}", i).into_bytes())
+                .await
+                .expect("send parent");
+            wait_for_segment_roll(&client, "key-filter-multi", 0, (i + 1) as u64).await;
+        }
+
+        // Wait for split to propagate and commit
+        let detail = wait_for_split(&client, "key-filter-multi").await;
+        assert_eq!(
+            detail.ranges.len(),
+            3,
+            "Topic must have split into 3 ranges total"
+        );
+
+        // Create a consumer with KeyInterest for the right child only ([144, 149))
+        // Since midpoint is 127, the right child is [127, 255), which overlaps with [144, 149).
+        // The left child is [0, 127), which does not overlap with [144, 149).
+        let consumer = crate::client::Consumer::new(
+            client.clone(),
+            "key-filter-multi".to_string(),
+            crate::client::KeyInterest::KeySpan {
+                start: vec![0x90], // 144
+                end: vec![0x95],   // 149
+            },
+            crate::client::StartPolicy::Latest,
+        )
+        .await
+        .expect("create consumer");
+
+        // Produce a record to the left child range (key b"a" = 97)
+        producer
+            .send(b"a", b"left-child".to_vec())
+            .await
+            .expect("send to left child");
+
+        // Produce a record to the right child range (key b"\x90" = 144)
+        producer
+            .send(b"\x90", b"right-child".to_vec())
+            .await
+            .expect("send to right child");
+
+        // The consumer should receive the right child record
+        let rec = consumer
+            .next_record()
+            .await
+            .expect("read record")
+            .expect("should have record");
+        assert_eq!(rec.key, vec![0x90]);
+        assert_eq!(rec.value, b"right-child");
+
+        // Sleep a bit and check that no other record is received (since left child is filtered out)
+        let timeout_res =
+            tokio::time::timeout(Duration::from_millis(500), consumer.next_record()).await;
+        assert!(timeout_res.is_err(), "Should not receive any other record");
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// E2E Consumer Test 3: Range Split Consume.
+/// Configure a topic with AutoSplit and trigger segment rolls. Produce continuously,
+/// verify an automatic split occurs, and assert the consumer walks the lineage split
+/// and receives all records from both parent and child ranges exactly once.
+#[test]
+#[serial_test::serial]
+fn consumer_range_split_consume() -> turmoil::Result {
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        // Force fast size-based rolls
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("split-consume", policy())
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("split-consume")
+            .await
+            .expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "split-consume".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 1,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // 1. Produce 3 records to parent range, waiting for segment rolls in between
+        for i in 0..3 {
+            producer
+                .send(b"k", format!("parent-{}", i + 1).into_bytes())
+                .await
+                .expect("send");
+            wait_for_segment_roll(&client, "split-consume", 0, (i + 1) as u64).await;
+        }
+
+        // Wait for split to propagate and commit
+        let detail = wait_for_split(&client, "split-consume").await;
+        assert_eq!(detail.ranges.len(), 3, "Topic must have split");
+
+        // 2. Produce records to children ranges
+        // Left child (midpoint is 127): key b"a" = 97
+        producer
+            .send(b"a", b"child-left".to_vec())
+            .await
+            .expect("send left");
+        // Right child: key b"\x90" = 144
+        producer
+            .send(b"\x90", b"child-right".to_vec())
+            .await
+            .expect("send right");
+
+        // 3. Consume all records starting from Earliest
+        let consumer = crate::client::Consumer::new(
+            client.clone(),
+            "split-consume".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Earliest,
+        )
+        .await
+        .expect("create consumer");
+
+        let mut received = Vec::new();
+        for _ in 0..5 {
+            let rec = consumer
+                .next_record()
+                .await
+                .expect("read record")
+                .expect("should have record");
+            received.push(rec);
+        }
+
+        // Verify we got exactly 5 records: 3 parent, 2 children
+        let mut values: Vec<String> = received
+            .into_iter()
+            .map(|r| String::from_utf8(r.value).unwrap())
+            .collect();
+        values.sort();
+
+        let expected = vec![
+            "child-left".to_string(),
+            "child-right".to_string(),
+            "parent-1".to_string(),
+            "parent-2".to_string(),
+            "parent-3".to_string(),
+        ];
+        assert_eq!(values, expected);
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// E2E Consumer Test 4: Retention Recovery.
+/// Produce records, wait for them to age out and be automatically deleted by retention on the server.
+/// Assert that a consumer starting at Earliest (offset 0) receives EntryIdOutOfRange,
+/// automatically recovers by querying ListOffsets, skips forward to the surviving offset, and continues.
+#[test]
+#[serial_test::serial]
+fn consumer_retention_recovery() -> turmoil::Result {
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        // Force fast size-based rolls
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+
+        // Topic policy: 0 second retention! This means sealed segments are immediately expired.
+        let mut retention_policy = policy();
+        retention_policy.retention_ms = Some(0);
+
+        client
+            .create_topic("retention-recover", retention_policy)
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("retention-recover")
+            .await
+            .expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "retention-recover".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 1,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // 1. Produce record 1 (goes to segment 0, offset 0)
+        producer
+            .send(b"k", b"expired-rec".to_vec())
+            .await
+            .expect("send");
+
+        // 2. Wait for the segment to roll and seal
+        wait_for_segment_roll(&client, "retention-recover", 0, 1).await;
+
+        // 3. Wait for the sealed segment to exceed retention and be deleted
+        wait_for_retention_deletion(&client, "retention-recover", 0).await;
+
+        // 4. Produce record 2 (goes to segment 1, offset 1)
+        producer
+            .send(b"k", b"surviving-rec".to_vec())
+            .await
+            .expect("send");
+
+        // 5. Start consumer at Earliest (tries to read offset 0)
+        let consumer = crate::client::Consumer::new(
+            client.clone(),
+            "retention-recover".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Earliest,
+        )
+        .await
+        .expect("create consumer");
+
+        // 6. Read the record. The consumer should automatically skip offset 0 and return surviving-rec at offset 1
+        let rec = consumer
+            .next_record()
+            .await
+            .expect("read record")
+            .expect("should have record");
+        assert_eq!(rec.offset, 1);
+        assert_eq!(rec.value, b"surviving-rec");
+
+        // Ensure no other record is returned
+        let timeout_res =
+            tokio::time::timeout(Duration::from_millis(500), consumer.next_record()).await;
+        assert!(timeout_res.is_err(), "Should not receive expired-rec");
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// E2E Consumer Test 5: Prefetching.
+/// Produce records across multiple segments (forcing rolls), and consume them.
+/// Verify that historical reads cross segment boundaries smoothly, utilizing
+/// the client-side speculative one-ahead prefetching of the next sealed segment.
+#[test]
+#[serial_test::serial]
+fn consumer_prefetch_sealed_segments() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        // Force fast size-based rolls
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("prefetch-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("prefetch-topic")
+            .await
+            .expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "prefetch-topic".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 1,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // Produce 3 records across 3 different segments by rolling them
+        producer
+            .send(b"k", b"rec-seg-0".to_vec())
+            .await
+            .expect("send");
+        wait_for_segment_roll(&client, "prefetch-topic", 0, 1).await;
+
+        producer
+            .send(b"k", b"rec-seg-1".to_vec())
+            .await
+            .expect("send");
+        wait_for_segment_roll(&client, "prefetch-topic", 0, 2).await;
+
+        producer
+            .send(b"k", b"rec-seg-2".to_vec())
+            .await
+            .expect("send");
+
+        // Now we have sealed segment 0, sealed segment 1, and active segment 2.
+        // Start consumer at Earliest to read them.
+        let consumer = crate::client::Consumer::new(
+            client.clone(),
+            "prefetch-topic".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Earliest,
+        )
+        .await
+        .expect("create consumer");
+
+        // Consume all 3 records. The historical reads will cross segment boundaries.
+        // Speculative prefetching of segment 1 is triggered when reading segment 0,
+        // and prefetching of segment 2 is triggered when reading segment 1.
+        let rec0 = consumer
+            .next_record()
+            .await
+            .expect("read")
+            .expect("rec-seg-0");
+        assert_eq!(rec0.value, b"rec-seg-0");
+
+        let rec1 = consumer
+            .next_record()
+            .await
+            .expect("read")
+            .expect("rec-seg-1");
+        assert_eq!(rec1.value, b"rec-seg-1");
+
+        let rec2 = consumer
+            .next_record()
+            .await
+            .expect("read")
+            .expect("rec-seg-2");
+        assert_eq!(rec2.value, b"rec-seg-2");
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+// ── Polling helper functions for robust E2E testing ───────────────────────
+
+async fn wait_for_segment_roll(
+    client: &Client,
+    topic: &str,
+    range_id: u64,
+    expected_segment_id: u64,
+) {
+    for _ in 0..240 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Ok(detail) = client.resolve_topic(topic).await
+            && let Some(range) = detail.ranges.iter().find(|r| r.range_id == range_id)
+        {
+            if range.state == crate::control_plane::metadata::RangeState::Sealed {
+                return;
+            }
+            if let Some(seg) = &range.active_segment
+                && seg.segment_id >= expected_segment_id
+            {
+                return;
+            }
+        }
+    }
+    panic!(
+        "Timed out waiting for segment roll to {} on range {}",
+        expected_segment_id, range_id
+    );
+}
+
+async fn wait_for_split(client: &Client, topic: &str) -> crate::connections::protocol::TopicDetail {
+    for _ in 0..240 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Ok(detail) = client.resolve_topic(topic).await
+            && detail.ranges.len() == 3
+        {
+            return detail;
+        }
+    }
+    panic!("Timed out waiting for split on topic {}", topic);
+}
+
+async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64) {
+    for _ in 0..240 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Ok(detail) = client.resolve_topic(topic).await
+            && let Some(range) = detail.ranges.iter().find(|r| r.range_id == range_id)
+            && range.sealed_segments.is_empty()
+            && let Some(seg) = &range.active_segment
+            && seg.start_entry_id > 0
+        {
+            return;
+        }
+    }
+    panic!(
+        "Timed out waiting for retention deletion on range {}",
+        range_id
+    );
+}

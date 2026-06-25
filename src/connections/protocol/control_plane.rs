@@ -22,7 +22,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
 
 use crate::control_plane::metadata::{
-    RangeMeta, RangeState, SegmentMeta, TopicMeta, TopicState as MetaTopicState,
+    RangeMeta, RangeState, SegmentMeta, SegmentMetaState, TopicMeta, TopicState as MetaTopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -104,11 +104,11 @@ pub struct RangeDetail {
     pub state: RangeState,
     /// `None` once the range is sealed or deleting.
     pub active_segment: Option<SegmentDetail>,
+    /// All sealed segments in this range, sorted by start_offset.
+    pub sealed_segments: Box<[SegmentDetail]>,
     /// Set when this range was split: the two child range IDs.
     pub split_into: Option<(u64, u64)>,
-    /// Set when this range was merged into a successor.
     pub merged_into: Option<u64>,
-    /// Set when this range was created by merging two predecessors.
     pub merged_from: Option<(u64, u64)>,
 }
 
@@ -118,9 +118,9 @@ pub struct RangeDetail {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentDetail {
     pub segment_id: u64,
-    pub start_offset: u64,
+    pub start_entry_id: u64,
     /// `None` while the segment is still active (the write head).
-    pub end_offset: Option<u64>,
+    pub end_entry_id: Option<u64>,
     pub replica_set: Vec<NodeAddressInfo>,
 }
 
@@ -165,12 +165,20 @@ impl RangeDetail {
             .active_segment
             .and_then(|id| range.segments.get(&id))
             .map(|seg| SegmentDetail::from_meta(seg, addresses));
+        let mut sealed_segments: Vec<SegmentDetail> = range
+            .segments
+            .values()
+            .filter(|seg| seg.state == SegmentMetaState::Sealed)
+            .map(|seg| SegmentDetail::from_meta(seg, addresses))
+            .collect();
+        sealed_segments.sort_by_key(|s| s.start_entry_id);
         RangeDetail {
             range_id: range.range_id.0,
             keyspace_start: range.keyspace_start,
             keyspace_end: range.keyspace_end,
             state: range.state,
             active_segment,
+            sealed_segments: sealed_segments.into_boxed_slice(),
             split_into: range.split_into.map(|[l, r]| (l.0, r.0)),
             merged_into: range.merged_into.map(|m| m.0),
             merged_from: range.merged_from.map(|[a, b]| (a.0, b.0)),
@@ -192,9 +200,54 @@ impl SegmentDetail {
             .collect();
         SegmentDetail {
             segment_id: seg.segment_id.0,
-            start_offset: seg.start_entry_id,
-            end_offset: seg.end_entry_id,
+            start_entry_id: seg.start_entry_id,
+            end_entry_id: seg.end_entry_id,
             replica_set,
+        }
+    }
+
+    /// Pick a replica from the segment's replica set.
+    /// load-balances randomly across all replicas
+    pub fn pick_replica(&self) -> Option<SocketAddr> {
+        if self.replica_set.is_empty() {
+            return None;
+        }
+
+        use rand::RngExt;
+        let idx = rand::rng().random_range(0..self.replica_set.len());
+        Some(self.replica_set[idx].client_addr)
+    }
+}
+
+impl RangeDetail {
+    /// Find the segment in this range that covers the specified `entry_id`.
+    pub fn find_segment_for_offset(&self, entry_id: u64) -> Option<&SegmentDetail> {
+        // Check if it is in the active segment
+        if let Some(seg) = &self.active_segment
+            && entry_id >= seg.start_entry_id
+        {
+            return Some(seg);
+        }
+        // Check sealed segments
+        self.sealed_segments.iter().find(|seg| {
+            if entry_id >= seg.start_entry_id {
+                if let Some(end) = seg.end_entry_id {
+                    entry_id <= end
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Get the start offset of the very first segment in the range (either sealed or active).
+    pub fn first_segment_start_offset(&self) -> Option<u64> {
+        if let Some(seg) = self.sealed_segments.first() {
+            Some(seg.start_entry_id)
+        } else {
+            self.active_segment.as_ref().map(|seg| seg.start_entry_id)
         }
     }
 }

@@ -12,22 +12,25 @@
 
 mod admin;
 mod codec;
+mod consumer;
 mod error;
 mod nodes;
 mod pool;
 mod produce;
 mod producer;
-mod record;
+
 mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
+pub use crate::consumer::{KeyInterest, StartPolicy};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use codec::CompressionCodec;
+pub use consumer::{Consumer, ConsumerRecord};
 pub use error::ClientError;
 use pool::ConnectionPool;
-pub use producer::{Producer, ProducerConfig, BufferConfig};
-pub use record::ClientRecord;
+pub use producer::{BufferConfig, Producer, ProducerConfig};
+
 pub use redirect::RetryPolicy;
 use routing::RoutingCache;
 use std::net::SocketAddr;
