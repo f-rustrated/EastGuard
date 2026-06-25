@@ -533,10 +533,10 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
-            assert_eq!(entry.data[0], crate::connections::protocol::CompressionCodec::Lz4 as u8, "Stored payload must lead with Lz4 tag");
+            assert_eq!(entry.data[0], crate::client::CompressionCodec::Lz4 as u8, "Stored payload must lead with Lz4 tag");
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records = crate::connections::protocol::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+            let decoded_records = crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
                 .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
@@ -617,10 +617,10 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
-            assert_eq!(entry.data[0], crate::connections::protocol::CompressionCodec::Zstd as u8, "Stored payload must lead with Zstd tag");
+            assert_eq!(entry.data[0], crate::client::CompressionCodec::Zstd as u8, "Stored payload must lead with Zstd tag");
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records = crate::connections::protocol::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+            let decoded_records = crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
                 .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
