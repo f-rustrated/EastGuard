@@ -419,3 +419,222 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
 
     sim.run()
 }
+
+/// High-level producer batches multiple concurrent sends into a single produce request.
+#[test]
+#[serial_test::serial]
+fn producer_batches_concurrent_sends() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("batching-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("batching-topic").await.expect("resolve");
+
+        // Producer configured with linger to allow batching
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "batching-topic".to_string(),
+            crate::client::ProducerConfig {
+                linger: Duration::from_millis(50),
+                max_batch_bytes: 1024 * 1024,
+                max_batch_records: 100,
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // Send 3 records concurrently
+        let (res1, res2, res3) = tokio::join!(
+            producer.send(b"key1", b"value1".to_vec()),
+            producer.send(b"key1", b"value2".to_vec()),
+            producer.send(b"key1", b"value3".to_vec()),
+        );
+
+        let id1 = res1.expect("send 1");
+        let id2 = res2.expect("send 2");
+        let id3 = res3.expect("send 3");
+
+        // Since they were batched together, they must share the exact same entry ID
+        assert_eq!(id1, id2);
+        assert_eq!(id2, id3);
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Producer uses Lz4 compression and the server stores the compressed batch byte-for-byte.
+#[test]
+#[serial_test::serial]
+fn producer_compression_lz4_end_to_end() -> turmoil::Result {
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest, DataPlaneResponse};
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("compressed-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("compressed-topic").await.expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "compressed-topic".to_string(),
+            crate::client::ProducerConfig {
+                linger: Duration::from_millis(50),
+                max_batch_bytes: 1024 * 1024,
+                max_batch_records: 100,
+                codec: crate::client::CompressionCodec::Lz4,
+            },
+        );
+
+        // Send 2 records concurrently so they get batched and compressed
+        let (res1, res2) = tokio::join!(
+            producer.send(b"ckey", b"cval1".to_vec()),
+            producer.send(b"ckey", b"cval2".to_vec()),
+        );
+
+        let entry_id = res1.expect("send 1");
+        let entry_id2 = res2.expect("send 2");
+        assert_eq!(entry_id, entry_id2);
+
+        // Resolve topic to get topic_id and range_id
+        let detail = client.resolve_topic("compressed-topic").await.expect("resolve");
+        let topic_id = detail.topic_id;
+        let range = &detail.ranges[0];
+        let range_id = range.range_id;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+
+        // Perform a raw FetchById to retrieve the exact stored payload from the leader
+        let fetch_req = FetchByIdRequest {
+            topic_id,
+            range_id,
+            entry_id,
+            max_bytes: 65536,
+        };
+
+        let served = client.call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req)).await.expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) = served.response {
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.record_count, 2);
+
+            // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
+            assert_eq!(entry.data[0], crate::connections::protocol::CompressionCodec::Lz4 as u8, "Stored payload must lead with Lz4 tag");
+
+            // Decompress and decode records from the retrieved payload
+            let decoded_records = crate::connections::protocol::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                .expect("Decompress and decode batch");
+
+            assert_eq!(decoded_records.len(), 2);
+            assert_eq!(decoded_records[0].key, b"ckey");
+            assert_eq!(decoded_records[0].value, b"cval1");
+            assert_eq!(decoded_records[1].key, b"ckey");
+            assert_eq!(decoded_records[1].value, b"cval2");
+        } else {
+            panic!("Expected Fetched response, got {:?}", served.response);
+        }
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Producer uses Zstd compression and the server stores the compressed batch byte-for-byte.
+#[test]
+#[serial_test::serial]
+fn producer_compression_zstd_end_to_end() -> turmoil::Result {
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest, DataPlaneResponse};
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("zstd-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("zstd-topic").await.expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "zstd-topic".to_string(),
+            crate::client::ProducerConfig {
+                linger: Duration::from_millis(50),
+                max_batch_bytes: 1024 * 1024,
+                max_batch_records: 100,
+                codec: crate::client::CompressionCodec::Zstd,
+            },
+        );
+
+        // Send 2 records concurrently so they get batched and compressed
+        let (res1, res2) = tokio::join!(
+            producer.send(b"zkey", b"zval1".to_vec()),
+            producer.send(b"zkey", b"zval2".to_vec()),
+        );
+
+        let entry_id = res1.expect("send 1");
+        let entry_id2 = res2.expect("send 2");
+        assert_eq!(entry_id, entry_id2);
+
+        // Resolve topic to get topic_id and range_id
+        let detail = client.resolve_topic("zstd-topic").await.expect("resolve");
+        let topic_id = detail.topic_id;
+        let range = &detail.ranges[0];
+        let range_id = range.range_id;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+
+        // Perform a raw FetchById to retrieve the exact stored payload from the leader
+        let fetch_req = FetchByIdRequest {
+            topic_id,
+            range_id,
+            entry_id,
+            max_bytes: 65536,
+        };
+
+        let served = client.call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req)).await.expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) = served.response {
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.record_count, 2);
+
+            // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
+            assert_eq!(entry.data[0], crate::connections::protocol::CompressionCodec::Zstd as u8, "Stored payload must lead with Zstd tag");
+
+            // Decompress and decode records from the retrieved payload
+            let decoded_records = crate::connections::protocol::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                .expect("Decompress and decode batch");
+
+            assert_eq!(decoded_records.len(), 2);
+            assert_eq!(decoded_records[0].key, b"zkey");
+            assert_eq!(decoded_records[0].value, b"zval1");
+            assert_eq!(decoded_records[1].key, b"zkey");
+            assert_eq!(decoded_records[1].value, b"zval2");
+        } else {
+            panic!("Expected Fetched response, got {:?}", served.response);
+        }
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
