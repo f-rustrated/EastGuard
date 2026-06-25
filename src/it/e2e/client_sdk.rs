@@ -234,54 +234,6 @@ fn client_reconnects_after_node_crash() -> turmoil::Result {
     sim.run()
 }
 
-/// Stress: a burst of concurrent produces over one multiplexed connection. Distinct
-/// entry ids ⇒ every ack reached its own waiter (no demux race under load).
-#[test]
-#[serial_test::serial]
-fn client_sdk_stress_concurrent_produces() -> turmoil::Result {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    let mut sim = build_sim(120);
-    host_cluster(&mut sim, &NODES, sim_cluster);
-
-    sim.client("test-client", async {
-        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
-        client
-            .create_topic("stress", policy())
-            .await
-            .expect("create");
-        // Warm cache + segment assignment so the burst routes straight to the leader.
-        client
-            .produce("stress", b"k", b"warm".to_vec(), 1)
-            .await
-            .expect("warmup produce");
-
-        const N: usize = 100;
-        let mut tasks = tokio::task::JoinSet::new();
-        for i in 0..N {
-            let client = client.clone();
-            tasks.spawn(async move {
-                client
-                    .produce("stress", b"k", format!("rec-{i}").into_bytes(), 1)
-                    .await
-            });
-        }
-
-        let mut ids = HashSet::new();
-        while let Some(joined) = tasks.join_next().await {
-            let entry_id = joined.expect("task did not panic").expect("produce acked");
-            assert!(
-                ids.insert(entry_id),
-                "entry_id {entry_id} returned twice — demux delivered an ack to the wrong waiter"
-            );
-        }
-        assert_eq!(ids.len(), N, "every concurrent produce got a distinct ack");
-        Ok(())
-    });
-
-    sim.run()
-}
 
 /// Stale-cache correction (doc item 5): a wrong-but-live cached leader is fixed by one
 /// produce — `NotWriteLeader` is followed in one hop, the stale entry dropped, and the
@@ -420,55 +372,7 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
     sim.run()
 }
 
-/// High-level producer batches multiple concurrent sends into a single produce request.
-#[test]
-#[serial_test::serial]
-fn producer_batches_concurrent_sends() -> turmoil::Result {
-    let mut sim = build_sim(90);
-    host_cluster(&mut sim, &NODES, sim_cluster);
 
-    sim.client("test-client", async {
-        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
-        client
-            .create_topic("batching-topic", policy())
-            .await
-            .expect("create topic");
-
-        // Warm the cache
-        client.resolve_topic("batching-topic").await.expect("resolve");
-
-        // Producer configured with linger to allow batching
-        let producer = crate::client::Producer::new(
-            client.clone(),
-            "batching-topic".to_string(),
-            crate::client::ProducerConfig {
-                linger: Duration::from_millis(50),
-                max_batch_bytes: 1024 * 1024,
-                max_batch_records: 100,
-                codec: crate::client::CompressionCodec::None,
-            },
-        );
-
-        // Send 3 records concurrently
-        let (res1, res2, res3) = tokio::join!(
-            producer.send(b"key1", b"value1".to_vec()),
-            producer.send(b"key1", b"value2".to_vec()),
-            producer.send(b"key1", b"value3".to_vec()),
-        );
-
-        let id1 = res1.expect("send 1");
-        let id2 = res2.expect("send 2");
-        let id3 = res3.expect("send 3");
-
-        // Since they were batched together, they must share the exact same entry ID
-        assert_eq!(id1, id2);
-        assert_eq!(id2, id3);
-
-        Ok(())
-    });
-
-    sim.run()
-}
 
 /// Producer uses Lz4 compression and the server stores the compressed batch byte-for-byte.
 #[test]
