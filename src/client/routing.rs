@@ -53,9 +53,17 @@ impl TopicRouting {
     fn write_leader(&self, routing_key: &[u8]) -> Option<SocketAddr> {
         self.ranges
             .iter()
-            .filter(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
-            .max_by(|a, b| a.keyspace_start.cmp(&b.keyspace_start))
+            .rev()
+            .find(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
             .and_then(|r| r.write_leader)
+    }
+
+    pub(crate) fn range_id(&self, routing_key: &[u8]) -> Option<u64> {
+        self.ranges
+            .iter()
+            .rev()
+            .find(|r| r.keyspace_start.as_slice() <= routing_key)
+            .map(|r| r.range_id)
     }
 
     fn replicas(&self, range_id: u64) -> Option<&[SocketAddr]> {
@@ -83,10 +91,18 @@ impl RoutingCache {
         self.topics.load().get(topic).cloned()
     }
 
+    pub(crate) fn range_id(&self, topic: &str, routing_key: &[u8]) -> Option<u64> {
+        self.get(topic)?.range_id(routing_key)
+    }
+
     pub(crate) fn insert(&self, detail: &TopicDetail) {
+        let mut ranges: Vec<RangeRoute> = detail.ranges.iter().map(RangeRoute::from).collect();
+        // Sort ranges by keyspace_start so that reverse-scan and binary search work
+        ranges.sort_unstable_by(|a, b| a.keyspace_start.cmp(&b.keyspace_start));
+
         let topic_routing = TopicRouting {
             topic_id: detail.topic_id,
-            ranges: detail.ranges.iter().map(RangeRoute::from).collect(),
+            ranges: ranges.into_boxed_slice(),
         };
 
         let routing = Arc::new(topic_routing);

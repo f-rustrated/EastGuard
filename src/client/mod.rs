@@ -11,17 +11,23 @@
 #![allow(dead_code, unused_imports)]
 
 mod admin;
+mod codec;
 mod error;
 mod nodes;
 mod pool;
 mod produce;
+mod producer;
+mod record;
 mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+pub use codec::CompressionCodec;
 pub use error::ClientError;
 use pool::ConnectionPool;
+pub use producer::{Producer, ProducerConfig, BufferConfig};
+pub use record::ClientRecord;
 pub use redirect::RetryPolicy;
 use routing::RoutingCache;
 use std::net::SocketAddr;

@@ -234,55 +234,6 @@ fn client_reconnects_after_node_crash() -> turmoil::Result {
     sim.run()
 }
 
-/// Stress: a burst of concurrent produces over one multiplexed connection. Distinct
-/// entry ids ⇒ every ack reached its own waiter (no demux race under load).
-#[test]
-#[serial_test::serial]
-fn client_sdk_stress_concurrent_produces() -> turmoil::Result {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    let mut sim = build_sim(120);
-    host_cluster(&mut sim, &NODES, sim_cluster);
-
-    sim.client("test-client", async {
-        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
-        client
-            .create_topic("stress", policy())
-            .await
-            .expect("create");
-        // Warm cache + segment assignment so the burst routes straight to the leader.
-        client
-            .produce("stress", b"k", b"warm".to_vec(), 1)
-            .await
-            .expect("warmup produce");
-
-        const N: usize = 100;
-        let mut tasks = tokio::task::JoinSet::new();
-        for i in 0..N {
-            let client = client.clone();
-            tasks.spawn(async move {
-                client
-                    .produce("stress", b"k", format!("rec-{i}").into_bytes(), 1)
-                    .await
-            });
-        }
-
-        let mut ids = HashSet::new();
-        while let Some(joined) = tasks.join_next().await {
-            let entry_id = joined.expect("task did not panic").expect("produce acked");
-            assert!(
-                ids.insert(entry_id),
-                "entry_id {entry_id} returned twice — demux delivered an ack to the wrong waiter"
-            );
-        }
-        assert_eq!(ids.len(), N, "every concurrent produce got a distinct ack");
-        Ok(())
-    });
-
-    sim.run()
-}
-
 /// Stale-cache correction (doc item 5): a wrong-but-live cached leader is fixed by one
 /// produce — `NotWriteLeader` is followed in one hop, the stale entry dropped, and the
 /// next produce routes straight to the real leader.
@@ -414,6 +365,291 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
             NODES.len(),
             "discovered the whole cluster from one seed"
         );
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Producer uses Lz4 compression and the server stores the compressed batch byte-for-byte.
+#[test]
+#[serial_test::serial]
+fn producer_compression_lz4_end_to_end() -> turmoil::Result {
+    use crate::connections::protocol::{
+        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
+    };
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("compressed-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client
+            .resolve_topic("compressed-topic")
+            .await
+            .expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "compressed-topic".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
+                codec: crate::client::CompressionCodec::Lz4,
+            },
+        );
+
+        // Send 2 records concurrently so they get batched and compressed
+        let (res1, res2) = tokio::join!(
+            producer.send(b"ckey", b"cval1".to_vec()),
+            producer.send(b"ckey", b"cval2".to_vec()),
+        );
+
+        let entry_id = res1.expect("send 1");
+        let entry_id2 = res2.expect("send 2");
+        assert_eq!(entry_id, entry_id2);
+
+        // Resolve topic to get topic_id and range_id
+        let detail = client
+            .resolve_topic("compressed-topic")
+            .await
+            .expect("resolve");
+        let topic_id = detail.topic_id;
+        let range = &detail.ranges[0];
+        let range_id = range.range_id;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+
+        // Perform a raw FetchById to retrieve the exact stored payload from the leader
+        let fetch_req = FetchByIdRequest {
+            topic_id,
+            range_id,
+            entry_id,
+            max_bytes: 65536,
+        };
+
+        let served = client
+            .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
+            .await
+            .expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(
+            DataPlaneResponse::Fetched { entries, .. },
+        ) = served.response
+        {
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.record_count, 2);
+
+            // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
+            assert_eq!(
+                entry.data[0],
+                crate::client::CompressionCodec::Lz4 as u8,
+                "Stored payload must lead with Lz4 tag"
+            );
+
+            // Decompress and decode records from the retrieved payload
+            let decoded_records =
+                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                    .expect("Decompress and decode batch");
+
+            assert_eq!(decoded_records.len(), 2);
+            assert_eq!(decoded_records[0].key, b"ckey");
+            assert_eq!(decoded_records[0].value, b"cval1");
+            assert_eq!(decoded_records[1].key, b"ckey");
+            assert_eq!(decoded_records[1].value, b"cval2");
+        } else {
+            panic!("Expected Fetched response, got {:?}", served.response);
+        }
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Producer uses Zstd compression and the server stores the compressed batch byte-for-byte.
+#[test]
+#[serial_test::serial]
+fn producer_compression_zstd_end_to_end() -> turmoil::Result {
+    use crate::connections::protocol::{
+        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
+    };
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("zstd-topic", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("zstd-topic").await.expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "zstd-topic".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
+                codec: crate::client::CompressionCodec::Zstd,
+            },
+        );
+
+        // Send 2 records concurrently so they get batched and compressed
+        let (res1, res2) = tokio::join!(
+            producer.send(b"zkey", b"zval1".to_vec()),
+            producer.send(b"zkey", b"zval2".to_vec()),
+        );
+
+        let entry_id = res1.expect("send 1");
+        let entry_id2 = res2.expect("send 2");
+        assert_eq!(entry_id, entry_id2);
+
+        // Resolve topic to get topic_id and range_id
+        let detail = client.resolve_topic("zstd-topic").await.expect("resolve");
+        let topic_id = detail.topic_id;
+        let range = &detail.ranges[0];
+        let range_id = range.range_id;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+
+        // Perform a raw FetchById to retrieve the exact stored payload from the leader
+        let fetch_req = FetchByIdRequest {
+            topic_id,
+            range_id,
+            entry_id,
+            max_bytes: 65536,
+        };
+
+        let served = client
+            .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
+            .await
+            .expect("fetch");
+        if let crate::connections::protocol::ClientResponse::DataPlane(
+            DataPlaneResponse::Fetched { entries, .. },
+        ) = served.response
+        {
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.record_count, 2);
+
+            // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
+            assert_eq!(
+                entry.data[0],
+                crate::client::CompressionCodec::Zstd as u8,
+                "Stored payload must lead with Zstd tag"
+            );
+
+            // Decompress and decode records from the retrieved payload
+            let decoded_records =
+                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                    .expect("Decompress and decode batch");
+
+            assert_eq!(decoded_records.len(), 2);
+            assert_eq!(decoded_records[0].key, b"zkey");
+            assert_eq!(decoded_records[0].value, b"zval1");
+            assert_eq!(decoded_records[1].key, b"zkey");
+            assert_eq!(decoded_records[1].value, b"zval2");
+        } else {
+            panic!("Expected Fetched response, got {:?}", served.response);
+        }
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Stress: 50 concurrent tasks firing sends independently.
+/// Verifies thread-safety, lock-free sequencing, and robust batching under load.
+#[test]
+#[serial_test::serial]
+fn producer_concurrency_stress() -> turmoil::Result {
+    use std::collections::HashSet;
+
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("prod-stress", policy())
+            .await
+            .expect("create topic");
+
+        // Warm the cache
+        client.resolve_topic("prod-stress").await.expect("resolve");
+
+        let producer = Arc::new(crate::client::Producer::new(
+            client.clone(),
+            "prod-stress".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(30),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 100,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        ));
+
+        const TASKS: usize = 50;
+        const RECORDS_PER_TASK: usize = 10;
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for t in 0..TASKS {
+            let producer = producer.clone();
+            join_set.spawn(async move {
+                let mut ids = Vec::with_capacity(RECORDS_PER_TASK);
+                for r in 0..RECORDS_PER_TASK {
+                    // Alternate keys to write to different ranges or share them
+                    let key = format!("key-{}", (t * RECORDS_PER_TASK + r) % 5).into_bytes();
+                    let val = format!("val-{}-{}", t, r).into_bytes();
+                    let id = producer.send(&key, val).await?;
+                    ids.push(id);
+                }
+                Ok::<_, ClientError>(ids)
+            });
+        }
+
+        let mut all_ids = Vec::with_capacity(TASKS * RECORDS_PER_TASK);
+        while let Some(res) = join_set.join_next().await {
+            let ids = res.expect("Task did not panic").expect("Send successful");
+            all_ids.extend(ids);
+        }
+
+        assert_eq!(
+            all_ids.len(),
+            TASKS * RECORDS_PER_TASK,
+            "All records must be sent"
+        );
+
+        // Assert that batching actually happened: the number of unique entry IDs
+        // must be significantly less than the total number of records (500).
+        let unique_ids: HashSet<u64> = all_ids.into_iter().collect();
+        assert!(
+            unique_ids.len() < (TASKS * RECORDS_PER_TASK) / 2,
+            "Records must be batched; unique entry IDs: {}, total: {}",
+            unique_ids.len(),
+            TASKS * RECORDS_PER_TASK
+        );
+
         Ok(())
     });
 

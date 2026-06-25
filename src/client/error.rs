@@ -3,7 +3,7 @@ use std::time::Duration;
 
 /// Errors a caller decides on. Redirect-following, reconnect, and retry-within-deadline
 /// are handled internally.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ClientError {
     /// Could not reach `addr`. Internal to the pool — the retry loop catches it and
     /// re-resolves; a persistent failure surfaces as `Timeout`, not this.
