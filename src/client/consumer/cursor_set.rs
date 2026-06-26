@@ -9,11 +9,11 @@
 //! consumer should currently be fetching — successors only appear after
 //! their predecessor drains.
 
+use super::bootstrap::CursorBootstrap;
 use super::cursor::RangeCursor;
+use super::parked_merges::{ParkedMerge, ParkedMerges};
 use crate::client::{KeyInterest, StartPolicy, TopicDetail};
 use crate::connections::protocol::RangeTransition;
-use crate::consumer::bootstrap::CursorBootstrap;
-use crate::consumer::{ParkedMerge, ParkedMerges};
 use crate::control_plane::metadata::RangeId;
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
