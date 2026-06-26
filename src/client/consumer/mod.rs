@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use crate::client::consumer::fetch::{ConsumerContext, LookupResult, compute_progress_signal};
+use crate::client::consumer::fetch::ConsumerContext;
 use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
