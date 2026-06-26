@@ -198,7 +198,7 @@ pub struct Entry {
 pub enum RangeProgressSignal {
     Active,
     Sealed {
-        end_offset: u64,
+        end_entry_id: u64,
         transition: RangeTransition,
     },
 }
@@ -237,7 +237,7 @@ impl RangeProgressSignal {
             // walker re-resolves the precise split point when it discovers the
             // children.
             return RangeProgressSignal::Sealed {
-                end_offset,
+                end_entry_id: end_offset,
                 transition: RangeTransition::Split {
                     left_range_id: left,
                     right_range_id: right,
@@ -252,7 +252,7 @@ impl RangeProgressSignal {
                 .merged_from(merged)
                 .expect("Merged from not found when range.merge_into is invoked");
             return RangeProgressSignal::Sealed {
-                end_offset,
+                end_entry_id: end_offset,
                 transition: RangeTransition::Merged {
                     merged_range_id: merged,
                     merged_from,
@@ -264,7 +264,7 @@ impl RangeProgressSignal {
         // a "self-merged" sentinel so the consumer at least sees a Sealed
         // signal and can stop fetching past `end_offset`.
         RangeProgressSignal::Sealed {
-            end_offset,
+            end_entry_id: end_offset,
             transition: RangeTransition::Merged {
                 merged_range_id: range.range_id,
                 merged_from: [range.range_id, range.range_id],

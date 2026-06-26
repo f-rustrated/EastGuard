@@ -141,7 +141,7 @@ pub struct RangeDetail {
 }
 
 impl RangeDetail {
-    pub(crate) fn end_offset(&self) -> u64 {
+    pub(crate) fn end_entry_id(&self) -> u64 {
         self.sealed_segments
             .last()
             .and_then(|s| s.end_entry_id)
