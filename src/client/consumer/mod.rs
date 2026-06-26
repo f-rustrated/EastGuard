@@ -25,6 +25,8 @@ pub use record::ConsumerRecord;
 /// Cheap to clone and share across tasks.
 #[derive(Clone)]
 pub struct Consumer {
+    //  The  `ctx`  is completely private and not exposed to the user, but it serves a critical role:
+    // it is the ownership anchor(reference count) for the consumer's context.
     ctx: Arc<ConsumerContext>,
     record_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
 }
