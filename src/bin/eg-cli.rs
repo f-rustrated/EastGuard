@@ -37,6 +37,9 @@ enum Commands {
         start: String,
         #[arg(default_value = "10")]
         count: usize,
+        /// Optional timeout in seconds to wait for new messages. If absent, waits indefinitely.
+        #[arg(short, long)]
+        timeout_sec: Option<u64>,
     },
     /// Exit the CLI
     Exit,
@@ -166,6 +169,7 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
             topic,
             start,
             count,
+            timeout_sec,
         } => {
             let start_policy = match start.to_lowercase().as_str() {
                 "latest" => StartPolicy::Latest,
@@ -182,13 +186,16 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
 
             let mut fetched = 0;
             while fetched < count {
-                // Use a timeout so the REPL doesn't hang forever if the topic is empty
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    consumer.next_record(),
-                )
-                .await
-                {
+                let next_record_future = consumer.next_record();
+
+                let result = if let Some(sec) = timeout_sec {
+                    tokio::time::timeout(std::time::Duration::from_secs(sec), next_record_future)
+                        .await
+                } else {
+                    Ok(next_record_future.await)
+                };
+
+                match result {
                     Ok(Ok(Some(record))) => {
                         println!(
                             "[{}] key: '{}', value: '{}'",
@@ -304,11 +311,13 @@ impl rustyline::hint::Hinter for CliHelper {
             }
             "consume" => {
                 if parts_count == 1 && ends_with_space {
-                    return Some("<TOPIC> [START] [COUNT]".to_string());
+                    return Some("<TOPIC> [START] [COUNT] [-t TIMEOUT]".to_string());
                 } else if parts_count == 2 && ends_with_space {
-                    return Some("[START] [COUNT]".to_string());
+                    return Some("[START] [COUNT] [-t TIMEOUT]".to_string());
                 } else if parts_count == 3 && ends_with_space {
-                    return Some("[COUNT]".to_string());
+                    return Some("[COUNT] [-t TIMEOUT]".to_string());
+                } else if parts_count == 4 && ends_with_space {
+                    return Some("[-t TIMEOUT]".to_string());
                 }
             }
             _ => {}
