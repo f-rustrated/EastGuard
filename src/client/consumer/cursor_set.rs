@@ -42,6 +42,10 @@ impl RangeCursorSet {
         &self.cursors
     }
 
+    pub(crate) fn cursors_mut(&mut self) -> &mut [RangeCursor] {
+        &mut self.cursors
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.cursors.len()

@@ -165,9 +165,10 @@ impl FetchActor {
             }
             DataPlaneResponse::EntryIdOutOfRange => {
                 let prev_entry_id = self.next_entry_id;
-                self.ctx
-                    .sync_range_offset(self.range_id, &mut self.next_entry_id)
-                    .await?;
+                let (start_id, _) = self.ctx.fetch_range_offsets(self.range_id).await?;
+                if self.next_entry_id < start_id {
+                    self.next_entry_id = start_id;
+                }
                 if self.next_entry_id == prev_entry_id {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     self.ctx.refresh_metadata().await?;
@@ -233,11 +234,10 @@ impl ConsumerContext {
             .and_then(|seg| seg.pick_replica())
     }
 
-    async fn sync_range_offset(
+    pub(crate) async fn fetch_range_offsets(
         &self,
         range_id: RangeId,
-        next_offset: &mut u64,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(u64, u64), ClientError> {
         let addr = self
             .pick_replica_for_range(range_id)
             .unwrap_or_else(|| self.client.next_known_node());
@@ -249,16 +249,15 @@ impl ConsumerContext {
 
         let served = self.client.call(addr, req).await?;
 
-        let ClientResponse::DataPlane(DataPlaneResponse::RangeOffset { start_entry_id, .. }) =
-            served.response
+        let ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
+            start_entry_id,
+            committed_entry_id,
+        }) = served.response
         else {
             return Err(ClientError::UnexpectedResponse);
         };
 
-        if *next_offset < start_entry_id {
-            *next_offset = start_entry_id;
-        }
-        Ok(())
+        Ok((start_entry_id, committed_entry_id))
     }
 
     /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
