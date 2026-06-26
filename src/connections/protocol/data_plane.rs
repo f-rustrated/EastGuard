@@ -70,7 +70,7 @@ pub struct FetchRequest {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
     pub topic_id: u64,
-    pub range_id: u64,
+    pub range_id: RangeId,
     pub entry_id: u64,
     pub max_bytes: u32,
 }
@@ -78,7 +78,7 @@ pub struct FetchByIdRequest {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ListOffsetsRequest {
     pub topic_name: String,
-    pub range_id: u64,
+    pub range_id: RangeId,
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]

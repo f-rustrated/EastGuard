@@ -373,7 +373,7 @@ impl ClientController {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = DataPlaneQuery::Fetch(Fetch {
             topic_id: TopicId(req.topic_id),
-            range_id: RangeId(req.range_id),
+            range_id: req.range_id,
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             // The by-id consumer already has the range lineage from DescribeTopic,
@@ -400,7 +400,7 @@ impl ClientController {
 
         let query: DataPlaneQuery = ListOffsets {
             topic_id: meta.id,
-            range_id: RangeId(req.range_id),
+            range_id: req.range_id,
             reply: reply_tx,
         }
         .into();

@@ -22,7 +22,8 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
 
 use crate::control_plane::metadata::{
-    RangeMeta, RangeState, SegmentMeta, SegmentMetaState, TopicMeta, TopicState as MetaTopicState,
+    RangeId, RangeMeta, RangeState, SegmentMeta, SegmentMetaState, TopicMeta,
+    TopicState as MetaTopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -98,7 +99,7 @@ pub struct TopicDetail {
 /// key needs to be drained before its successor. See d4_consumer_range_tracking.md.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RangeDetail {
-    pub range_id: u64,
+    pub range_id: RangeId,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
     pub state: RangeState,
@@ -107,9 +108,9 @@ pub struct RangeDetail {
     /// All sealed segments in this range, sorted by start_offset.
     pub sealed_segments: Box<[SegmentDetail]>,
     /// Set when this range was split: the two child range IDs.
-    pub split_into: Option<(u64, u64)>,
-    pub merged_into: Option<u64>,
-    pub merged_from: Option<(u64, u64)>,
+    pub split_into: Option<(RangeId, RangeId)>,
+    pub merged_into: Option<RangeId>,
+    pub merged_from: Option<(RangeId, RangeId)>,
 }
 
 /// Per-segment metadata exposed to consumers. The replica set carries resolved
@@ -173,15 +174,15 @@ impl RangeDetail {
             .collect();
         sealed_segments.sort_by_key(|s| s.start_entry_id);
         RangeDetail {
-            range_id: range.range_id.0,
+            range_id: range.range_id,
             keyspace_start: range.keyspace_start,
             keyspace_end: range.keyspace_end,
             state: range.state,
             active_segment,
             sealed_segments: sealed_segments.into_boxed_slice(),
-            split_into: range.split_into.map(|[l, r]| (l.0, r.0)),
-            merged_into: range.merged_into.map(|m| m.0),
-            merged_from: range.merged_from.map(|[a, b]| (a.0, b.0)),
+            split_into: range.split_into.map(|[l, r]| (l, r)),
+            merged_into: range.merged_into,
+            merged_from: range.merged_from.map(|[a, b]| (a, b)),
         }
     }
 }

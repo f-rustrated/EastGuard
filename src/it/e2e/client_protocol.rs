@@ -9,6 +9,7 @@ use crate::connections::protocol::{
     ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, FetchRequest,
     NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
 };
+use crate::control_plane::metadata::RangeId;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use crate::it::helpers::{default_env, send_request, try_send_request};
 use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
@@ -716,7 +717,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
             let fetch =
                 ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                     topic_id,
-                    range_id: 0,
+                    range_id: RangeId(0),
                     entry_id: 0,
                     max_bytes: 1 << 20,
                 }));
@@ -898,7 +899,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                 let fetch =
                     ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                         topic_id,
-                        range_id: 0,
+                        range_id: RangeId(0),
                         entry_id: 0,
                         max_bytes: 1 << 20,
                     }));
@@ -1093,7 +1094,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
             let fetch =
                 ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                     topic_id,
-                    range_id: 0,
+                    range_id: RangeId(0),
                     entry_id: 0,
                     max_bytes: 1 << 20,
                 }));
@@ -1251,7 +1252,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
 
         let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
             topic_id,
-            range_id: 0,
+            range_id: RangeId(0),
             entry_id: 0,
             max_bytes: 1 << 20,
         }));
@@ -1448,7 +1449,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
         // Poll tolerantly — node-3 is unreachable during the crash/bounce window.
         let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
             topic_id,
-            range_id: 0,
+            range_id: RangeId(0),
             entry_id: 0,
             max_bytes: 1 << 20,
         }));

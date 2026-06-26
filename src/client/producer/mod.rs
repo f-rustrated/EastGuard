@@ -65,10 +65,7 @@ impl Producer {
         };
 
         // Locate the target range ID for the key
-        let range_id = routing
-            .range_id(key)
-            .map(RangeId)
-            .ok_or(ClientError::TopicNotFound)?;
+        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
 
         // Idempotency seam: allocate sequence number
         let sequence_number = self

@@ -74,7 +74,7 @@ impl RangeCursor {
 impl From<&RangeDetail> for RangeCursor {
     fn from(r: &RangeDetail) -> Self {
         RangeCursor::new(
-            RangeId(r.range_id),
+            r.range_id,
             0,
             r.keyspace_start.clone(),
             r.keyspace_end.clone(),

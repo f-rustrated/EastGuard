@@ -14,6 +14,7 @@ use turmoil::Builder;
 use super::{NodeSpec, host_cluster};
 use crate::client::{Client, ClientError, PartitionStrategy, RetryPolicy, StoragePolicy};
 use crate::config::Environment;
+use crate::control_plane::metadata::RangeId;
 
 /// (name, client_port, raft/cluster_port) for the standard 3-node cluster.
 static NODES: [NodeSpec; 3] = [
@@ -1305,7 +1306,10 @@ async fn wait_for_segment_roll(
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         if let Ok(detail) = client.resolve_topic(topic).await
-            && let Some(range) = detail.ranges.iter().find(|r| r.range_id == range_id)
+            && let Some(range) = detail
+                .ranges
+                .iter()
+                .find(|r| r.range_id == RangeId(range_id))
         {
             if range.state == crate::control_plane::metadata::RangeState::Sealed {
                 return;
@@ -1340,7 +1344,10 @@ async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64
         tokio::time::sleep(Duration::from_millis(250)).await;
         std::thread::sleep(std::time::Duration::from_millis(10));
         if let Ok(detail) = client.resolve_topic(topic).await
-            && let Some(range) = detail.ranges.iter().find(|r| r.range_id == range_id)
+            && let Some(range) = detail
+                .ranges
+                .iter()
+                .find(|r| r.range_id == RangeId(range_id))
             && range.sealed_segments.is_empty()
             && let Some(seg) = &range.active_segment
             && seg.start_entry_id > 0
