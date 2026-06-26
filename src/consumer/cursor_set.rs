@@ -1,8 +1,7 @@
 //! `CursorSet` — the consumer's set of per-range cursors.
-//! Mutated only via `apply_fetch_result`, which takes the range_id the
-//! consumer just fetched, the `next_entry_id` from the response, and the
-//! in-band `RangeProgressSignal`. Returns a `CursorAction` describing what
-//! changed so the caller can drive the next fetch without diffing the set.
+//! Mutated only via `apply_drained`, which takes the range_id the
+//! consumer just fully drained and the transition to apply. Returns the
+//! newly activated cursors so the caller can spawn fetch tasks for them.
 //!
 //! Lineage discipline (Ordering Guarantees): a successor range is
 //! not read until its sole owning predecessor has been drained to the sealed
@@ -12,28 +11,12 @@
 
 use super::cursor::RangeCursor;
 use crate::client::{KeyInterest, StartPolicy, TopicDetail};
-use crate::connections::protocol::{RangeProgressSignal, RangeTransition};
+use crate::connections::protocol::RangeTransition;
 use crate::consumer::bootstrap::CursorBootstrap;
 use crate::consumer::{ParkedMerge, ParkedMerges};
 use crate::control_plane::metadata::RangeId;
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
-
-/// What changed in the cursor set when a fetch response was applied. The
-/// caller uses this to schedule the next fetch — `KeepGoing` says "fetch
-/// `range_id` again at `next_offset`"; `Transitioned` says "stop fetching
-/// `dropped`, start fetching each `added` cursor."
-#[derive(Debug, PartialEq, Eq)]
-pub enum CursorAction {
-    /// Same cursor, advance to `next_offset`.
-    KeepGoing { range_id: RangeId, next_offset: u64 },
-    /// The fetched range was sealed and drained; cursors transitioned per
-    /// the lineage rule.
-    Transitioned {
-        dropped: Box<[RangeId]>,
-        added: Box<[RangeCursor]>,
-    },
-}
 
 pub struct RangeCursorSet {
     cursors: Vec<RangeCursor>,
@@ -69,62 +52,27 @@ impl RangeCursorSet {
         self.cursors.is_empty()
     }
 
-    /// Advance the cursor for `range_id` to `next_entry_id` and react to the
-    /// in-band progress signal.
-    ///
-    /// - `Active` → `KeepGoing` (consumer should refetch).
-    /// - `Sealed { end_offset, .. }` with `next_entry_id <= end_offset` →
-    ///   `KeepGoing` (still draining the sealed range).
-    /// - `Sealed { end_offset, transition }` with `next_entry_id > end_offset`
-    ///   → drop this cursor and apply the transition, returning
-    ///   `Transitioned`.
-    pub fn apply_fetch_result(
+    /// Apply a lineage transition after a range has been fully drained.
+    /// Returns any newly activated cursors that the consumer should now fetch.
+    pub fn apply_drained(
         &mut self,
         range_id: RangeId,
-        next_entry_id: u64,
-        signal: RangeProgressSignal,
-    ) -> CursorAction {
+        transition: RangeTransition,
+    ) -> Box<[RangeCursor]> {
         let idx = self
             .cursors
             .iter()
             .position(|c| c.range_id == range_id)
-            .expect("apply_fetch_result called for range not in cursor set");
-        self.cursors[idx].next_entry_id = next_entry_id;
+            .expect("apply_drained called for range not in cursor set");
 
-        let cursor_action = match signal {
-            RangeProgressSignal::Active => CursorAction::KeepGoing {
-                range_id,
-                next_offset: next_entry_id,
-            },
-            RangeProgressSignal::Sealed {
-                end_offset,
-                transition,
-            } => {
-                // `end_offset` is inclusive — the last entry in the sealed
-                // range. Draining means we've fetched past it. The fetch
-                // response's `next_entry_id` is the offset to fetch next; if
-                // that's strictly > end_offset, we're done with this range.
-                if next_entry_id <= end_offset {
-                    return CursorAction::KeepGoing {
-                        range_id,
-                        next_offset: next_entry_id,
-                    };
-                }
-                let drained = self.cursors.remove(idx);
-                let added = self.apply_transition(drained, transition);
-                self.cursors.extend(added.clone());
-
-                CursorAction::Transitioned {
-                    dropped: Box::new([range_id]),
-                    added,
-                }
-            }
-        };
+        let drained = self.cursors.remove(idx);
+        let added = self.apply_transition(drained, transition);
+        self.cursors.extend(added.clone());
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
 
-        cursor_action
+        added
     }
 
     fn apply_transition(
@@ -180,17 +128,6 @@ impl RangeCursorSet {
         let [pa, pb] = merged_from;
         let sibling = if pa == cursor.range_id { pb } else { pa };
         self.cursors.iter().any(|c| c.range_id == sibling)
-    }
-
-    /// Skip the cursor for `range_id` forward to `new_offset` if it is currently behind.
-    pub fn skip_forward(&mut self, range_id: RangeId, new_entry_id: u64) {
-        if let Some(c) = self.cursors.iter_mut().find(|c| c.range_id == range_id)
-            && c.next_entry_id < new_entry_id
-        {
-            c.next_entry_id = new_entry_id;
-        }
-        #[cfg(any(test, debug_assertions))]
-        self.assert_invariants();
     }
 }
 
@@ -252,71 +189,19 @@ mod tests {
         RangeCursor::new(range_id, next_offset, start.to_vec(), end.to_vec())
     }
 
-    fn sealed_split(
-        end_offset: u64,
-        l: RangeId,
-        r: RangeId,
-        split_point: &[u8],
-    ) -> RangeProgressSignal {
-        RangeProgressSignal::Sealed {
-            end_offset,
-            transition: RangeTransition::Split {
-                left_range_id: l,
-                right_range_id: r,
-                split_point: split_point.to_vec(),
-            },
+    fn split_transition(l: RangeId, r: RangeId, split_point: &[u8]) -> RangeTransition {
+        RangeTransition::Split {
+            left_range_id: l,
+            right_range_id: r,
+            split_point: split_point.to_vec(),
         }
     }
 
-    fn sealed_merged(
-        end_offset: u64,
-        merged: RangeId,
-        merged_from: [RangeId; 2],
-    ) -> RangeProgressSignal {
-        RangeProgressSignal::Sealed {
-            end_offset,
-            transition: RangeTransition::Merged {
-                merged_range_id: merged,
-                merged_from,
-            },
+    fn merge_transition(merged: RangeId, merged_from: [RangeId; 2]) -> RangeTransition {
+        RangeTransition::Merged {
+            merged_range_id: merged,
+            merged_from,
         }
-    }
-
-    #[test]
-    fn active_signal_returns_keep_going_with_advanced_offset() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 100, b"a", b"c")]);
-        let action = set.apply_fetch_result(RangeId(0), 101, RangeProgressSignal::Active);
-        assert_eq!(
-            action,
-            CursorAction::KeepGoing {
-                range_id: RangeId(0),
-                next_offset: 101,
-            }
-        );
-        assert_eq!(set.cursors()[0].next_entry_id, 101);
-    }
-
-    /// Sealed range, but consumer hasn't drained past `end_offset` yet —
-    /// must keep fetching until next_entry_id > end_offset (per the doc:
-    /// "drain to end offset, then follow the transition").
-    #[test]
-    fn sealed_before_drained_keeps_going() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 100, b"a", b"c")]);
-        let action = set.apply_fetch_result(
-            RangeId(0),
-            150,
-            sealed_split(200, RangeId(1), RangeId(2), b"b"),
-        );
-        assert_eq!(
-            action,
-            CursorAction::KeepGoing {
-                range_id: RangeId(0),
-                next_offset: 150,
-            }
-        );
-        // Cursor still in set; no transition.
-        assert_eq!(set.len(), 1);
-        assert_eq!(set.cursors()[0].range_id, RangeId(0));
     }
 
     /// Split: parent fully drained → replaced by two children with disjoint
@@ -324,20 +209,12 @@ mod tests {
     #[test]
     fn split_replaces_parent_with_two_children() {
         let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 1001, b"a", b"c")]);
-        let action = set.apply_fetch_result(
-            RangeId(0),
-            1001,
-            sealed_split(1000, RangeId(1), RangeId(2), b"b"),
-        );
-        match action {
-            CursorAction::Transitioned { dropped, added } => {
-                assert_eq!(dropped[0], RangeId(0));
-                assert_eq!(added.len(), 2);
-                assert_eq!(added[0], cursor(RangeId(1), 0, b"a", b"b"));
-                assert_eq!(added[1], cursor(RangeId(2), 0, b"b", b"c"));
-            }
-            other => panic!("expected Transitioned, got {other:?}"),
-        }
+        let added = set.apply_drained(RangeId(0), split_transition(RangeId(1), RangeId(2), b"b"));
+
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0], cursor(RangeId(1), 0, b"a", b"b"));
+        assert_eq!(added[1], cursor(RangeId(2), 0, b"b", b"c"));
+
         assert_eq!(set.len(), 2);
     }
 
@@ -351,18 +228,13 @@ mod tests {
             cursor(RangeId(1), 0, b"a", b"b"),
             cursor(RangeId(2), 0, b"b", b"c"),
         ]);
-        let action = set.apply_fetch_result(
+        let added = set.apply_drained(
             RangeId(1),
-            101,
-            sealed_merged(100, RangeId(3), [RangeId(1), RangeId(2)]),
+            merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
         );
-        assert_eq!(
-            action,
-            CursorAction::Transitioned {
-                dropped: Box::new([RangeId(1)]),
-                added: Box::new([]),
-            }
-        );
+
+        assert_eq!(added.len(), 0);
+
         // P1 dropped; P2 still tracked; M not yet a fetchable cursor.
         let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
         assert_eq!(ids, vec![RangeId(2)]);
@@ -379,23 +251,19 @@ mod tests {
             cursor(RangeId(1), 0, b"a", b"b"),
             cursor(RangeId(2), 0, b"b", b"c"),
         ]);
-        set.apply_fetch_result(
+        set.apply_drained(
             RangeId(1),
-            101,
-            sealed_merged(100, RangeId(3), [RangeId(1), RangeId(2)]),
+            merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
         );
-        let action = set.apply_fetch_result(
+
+        let added = set.apply_drained(
             RangeId(2),
-            101,
-            sealed_merged(100, RangeId(3), [RangeId(1), RangeId(2)]),
+            merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
         );
-        assert_eq!(
-            action,
-            CursorAction::Transitioned {
-                dropped: Box::new([RangeId(2)]),
-                added: Box::new([cursor(RangeId(3), 0, b"a", b"c")]),
-            }
-        );
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"c"));
+
         // Only M remains, spanning both pre-merge keyspaces.
         assert_eq!(set.len(), 1);
         assert_eq!(set.cursors()[0].range_id, RangeId(3));
@@ -408,16 +276,17 @@ mod tests {
     #[test]
     fn single_parent_consumer_follows_into_m_without_tracking_sibling() {
         let mut set = RangeCursorSet::new(vec![cursor(RangeId(1), 0, b"a", b"b")]);
-        set.apply_fetch_result(
+        let added = set.apply_drained(
             RangeId(1),
-            101,
-            sealed_merged(100, RangeId(3), [RangeId(1), RangeId(2)]),
+            merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
         );
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"b"));
+
         let cursors = set.cursors();
         assert_eq!(cursors.len(), 1);
         assert_eq!(cursors[0].range_id, RangeId(3));
-        assert_eq!(cursors[0].keyspace_start, b"a".to_vec());
-        assert_eq!(cursors[0].keyspace_end, b"b".to_vec());
     }
 
     #[test]

@@ -21,5 +21,5 @@ pub(crate) mod cursor_set;
 mod parked_merges;
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
-pub(crate) use cursor_set::{CursorAction, RangeCursorSet};
+pub(crate) use cursor_set::RangeCursorSet;
 use parked_merges::*;
