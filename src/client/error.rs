@@ -17,8 +17,11 @@ pub enum ClientError {
 
     /// Cluster stayed unavailable (no leader, unreachable) for the whole deadline.
     /// Retriable with a fresh call.
-    #[error("operation did not complete within {waited:?}")]
-    Timeout { waited: Duration },
+    #[error("operation did not complete within {waited:?} (last error: {last_error:?})")]
+    Timeout {
+        waited: Duration,
+        last_error: Option<String>,
+    },
 
     /// Constructed with no seed addresses.
     #[error("no seed addresses configured")]

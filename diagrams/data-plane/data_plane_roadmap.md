@@ -242,6 +242,7 @@ Port layout:
 | [D5: Crash Recovery](d5_crash_recovery.md) | WAL replay, local inventory, sealed segment repair | D1 (D2 for repair) | Data plane recovery |
 | [D6: Produce/Consume API](d6_produce_consume_api.md) | Server-side produce/consume routing via redirects | D4, D5 | Server routing (client SDK: see clients/) |
 | [D7: Retention GC](d7_retention_gc.md) | Optional per-topic **age** retention; expire sealed segments oldest-first, reclaim files | D3, D5 | Opt-in, logical (time); keep-forever is the default. Disk capacity is a separate node-level concern |
+| [D8: Consumer Offset Management](d8_consumer_offset_management.md) | Durable offset tracking and Consumer Group work distribution | D6 | Internal offset topic + Raft lease assignment |
 
 D1 defines the storage primitives (WAL, segment files, sparse index) and the threading model that drives them: DataPlaneActor on a dedicated OS thread (WAL + cache publish), lock-free per-segment `SegmentRingBuffer` (concurrent consumer reads without locking), and I/O thread pools (checkpoint writes + cold reads). D2–D5 extend the D1 foundation with replication, metadata integration, consumer tracking, and crash recovery. D6 adds the client-facing protocol layer (produce/consume wire format, connection management) — consumer tasks on tokio read directly from `SegmentRingBuffer`.
 
@@ -263,6 +264,9 @@ D4 (Range Tracking) |
  ├──────────────────┤
  v                  v
 D6 (Produce API)   D7 (Retention GC)   ← D7 also depends on D3
+ |
+ v
+D8 (Consumer Groups)
 ```
 
 D6 completes the **server-side** routing. The **client SDK** (producer, consumer,
@@ -284,19 +288,13 @@ admin) that consumes those redirects is its own track — see
 
 ---
 
-## Backlog (Out of Scope)
+## Backlog 
 
 ### Exactly-Once Semantics
 Producer idempotency keys, deduplication at segment leader. Requires producer session tracking.
 
-### Consumer Groups
-Multiple consumers sharing work across ranges. Offset commit tracking. Rebalancing on consumer join/leave. Consumer offset storage is a separate system concern — not part of the log storage layer.
 
-### Batching / Compression
-Batch multiple records into a single write. Compress batches (Zstd). Reduces I/O and network.
 
-### Zero-Copy Reads
-`sendfile()` / `splice()` from segment file directly to TCP socket. Eliminates kernel-to-userspace copy on consume path.
 
 ### Dynamic Segment Leader Rebalancing
 Actively rebalance `replica_set[0]` across nodes based on real-time load metrics rather than static assignment at segment creation.

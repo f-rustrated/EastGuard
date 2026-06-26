@@ -253,54 +253,66 @@ Here is how the end-to-end write path operates:
 
 ---
 
-## How To Start
+## Getting Started
+
+### 1. Run a Local Cluster
+
+EastGuard includes a convenient script to quickly boot a local 3-node cluster. The script automatically handles compiling the binaries and isolating the cluster data into a clean `.test_cluster` directory.
 
 ```shell
-cargo build
-cargo run --bin server
+# Starts a clean 3-node cluster
+bash run_cluster.sh
+
+# Stops the running cluster
+bash run_cluster.sh stop
+
+# Cleans up all local cluster data
+bash run_cluster.sh clean
 ```
 
-### Running a 3-Node Cluster
+### 2. Using the Interactive CLI
+
+Once the cluster is running, you can interact with it using the built-in interactive CLI. The CLI is a powerful REPL (like `redis-cli`) that talks directly to the cluster using the EastGuard client SDK.
 
 ```shell
-# Terminal 1 (node-1):
-cargo run --bin server -- \
-  --client-port 3001 \
-  --cluster-port 13001 \
-  --advertise-host 127.0.0.1 \
-  --data-dir /tmp/eg-node1 \
-  --meta-dir /tmp/eg-node1-meta \
-  --config-dir /tmp/eg-node1-config \
-  --join-seed-nodes 127.0.0.1:13002 \
-  --join-seed-nodes 127.0.0.1:13003 \
-  --join-initial-delay-ms 500 \
-  --join-interval-ms 500
+# Start the interactive CLI
+cargo run --bin eg-cli
+```
 
-# Terminal 2 (node-2):
-cargo run --bin server -- \
-  --client-port 3002 \
-  --cluster-port 13002 \
-  --advertise-host 127.0.0.1 \
-  --data-dir /tmp/eg-node2 \
-  --meta-dir /tmp/eg-node2-meta \
-  --config-dir /tmp/eg-node2-config \
-  --join-seed-nodes 127.0.0.1:13001 \
-  --join-seed-nodes 127.0.0.1:13003 \
-  --join-initial-delay-ms 500 \
-  --join-interval-ms 500
+Inside the CLI prompt, you can run commands directly:
 
-# Terminal 3 (node-3):
-cargo run --bin server -- \
-  --client-port 3003 \
-  --cluster-port 13003 \
-  --advertise-host 127.0.0.1 \
-  --data-dir /tmp/eg-node3 \
-  --meta-dir /tmp/eg-node3-meta \
-  --config-dir /tmp/eg-node3-config \
-  --join-seed-nodes 127.0.0.1:13001 \
-  --join-seed-nodes 127.0.0.1:13002 \
-  --join-initial-delay-ms 500 \
-  --join-interval-ms 500
+```text
+eastguard> help
+eastguard> create-topic my_topic 3
+eastguard> publish my_topic user123 "Hello EastGuard!"
+eastguard> consume my_topic earliest 10
+```
+
+### 3. Configuration
+
+EastGuard supports a clean configuration hierarchy. The priority is (from highest to lowest):
+1. **Command-Line Arguments** (e.g., `--client-port 3000`)
+2. **Environment Variables** (e.g., `CLIENT_PORT=3000`)
+3. **YAML Configuration File**
+4. **Hardcoded Defaults**
+
+To use a YAML configuration file, simply create an `eastguard.yaml` file in the directory where you run the server, or pass its path via `-c` or `--config`:
+
+```yaml
+# eastguard.yaml
+client_port: 2921
+cluster_port: 2922
+data_port: 2923
+host: "0.0.0.0"
+advertise_host: "127.0.0.1"
+
+vnodes_per_node: 256
+join_seed_nodes:
+  - "127.0.0.1:2922"
+```
+
+```shell
+cargo run --bin server -- --config ./eastguard.yaml
 ```
 
 ---
