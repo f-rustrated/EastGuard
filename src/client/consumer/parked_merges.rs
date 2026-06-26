@@ -1,4 +1,5 @@
-use crate::{consumer::RangeCursor, control_plane::metadata::RangeId};
+use super::RangeCursor;
+use crate::control_plane::metadata::RangeId;
 
 pub(super) struct ParkedMerge {
     /// The merged range's wire ID.
