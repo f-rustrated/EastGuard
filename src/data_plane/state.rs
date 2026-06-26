@@ -332,7 +332,7 @@ impl<W: WalStorage> DataPlane<W> {
             let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
             return;
         };
-        let _ = cmd.reply.send(ListOffsetsResult::Offsets {
+        let _ = cmd.reply.send(ListOffsetsResult::RangeOffsets {
             start_entry_id: tracker.start_entry_id(),
             committed_entry_id: tracker.committed_entry_id(),
         });

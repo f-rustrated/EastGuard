@@ -66,5 +66,5 @@ impl_from_variant_via!(
     ProduceRequest,
     FetchRequest,
     FetchByIdRequest,
-    ListOffsetsRequest
+    RangeOffsetRequest
 );

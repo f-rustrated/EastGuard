@@ -234,7 +234,7 @@ impl Client {
                 | DataPlaneResponse::Fetched { .. }
                 | DataPlaneResponse::EntryIdOutOfRange
                 | DataPlaneResponse::KeyspaceBoundNarrowed
-                | DataPlaneResponse::Offsets { .. } => Redirect::Done,
+                | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
             },
             ClientResponse::Admin(_) => Redirect::Done,
             // The server's writer-loop sentinel; a client never legitimately reads it.

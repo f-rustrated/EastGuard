@@ -392,7 +392,7 @@ impl ClientController {
 
     /// Offset-bounds query — used by consumers to bound their read window
     /// for the range's currently-active segment on this node.
-    async fn handle_list_offsets(&self, req: ListOffsetsRequest) -> anyhow::Result<ClientResponse> {
+    async fn handle_list_offsets(&self, req: RangeOffsetRequest) -> anyhow::Result<ClientResponse> {
         let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
             return Ok(DataPlaneResponse::TopicNotFound.into());
         };

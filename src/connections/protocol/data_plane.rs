@@ -26,7 +26,7 @@ pub enum ClientDataPlaneRequest {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
-    ListOffsets(ListOffsetsRequest),
+    ListOffsets(RangeOffsetRequest),
 }
 
 impl_from_variant!(
@@ -34,7 +34,7 @@ impl_from_variant!(
     Produce(ProduceRequest),
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
-    ListOffsets(ListOffsetsRequest),
+    ListOffsets(RangeOffsetRequest),
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -76,7 +76,7 @@ pub struct FetchByIdRequest {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ListOffsetsRequest {
+pub struct RangeOffsetRequest {
     pub topic_name: String,
     pub range_id: RangeId,
 }
@@ -96,8 +96,8 @@ pub enum DataPlaneResponse {
     EntryIdOutOfRange,
     // keyspace_bound was set but narrower than the target range's keyspace.
     KeyspaceBoundNarrowed,
-    // ListOffsets
-    Offsets {
+
+    RangeOffset {
         start_entry_id: u64,
         committed_entry_id: u64,
     },
@@ -126,10 +126,10 @@ impl DataPlaneResponse {
 
     pub(crate) fn from_list_offset_result(value: ListOffsetsResult) -> Self {
         match value {
-            ListOffsetsResult::Offsets {
+            ListOffsetsResult::RangeOffsets {
                 start_entry_id,
                 committed_entry_id,
-            } => DataPlaneResponse::Offsets {
+            } => DataPlaneResponse::RangeOffset {
                 start_entry_id,
                 committed_entry_id,
             },

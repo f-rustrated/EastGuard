@@ -6,7 +6,7 @@ use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
-    ListOffsetsRequest, SegmentDetail, TopicDetail,
+    RangeOffsetRequest, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::RangeId;
 pub(crate) mod bootstrap;
