@@ -212,6 +212,10 @@ impl SegmentTracker {
         (self.next_entry_id > self.start_entry_id).then(|| self.next_entry_id - 1)
     }
 
+    pub(crate) fn is_fully_committed(&self) -> bool {
+        self.last_committed_entry_id() == self.durable_end_entry_id()
+    }
+
     pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,

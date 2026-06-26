@@ -1,12 +1,12 @@
+use super::ProducerRecord;
+use crate::client::error::ClientError;
+use crate::client::producer::config::BufferConfig;
+use crate::control_plane::metadata::RangeId;
+
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-use crate::client::ClientRecord;
-use crate::client::error::ClientError;
-use crate::client::producer::config::BufferConfig;
-use crate::control_plane::metadata::RangeId;
 
 /// A thread-safe, encapsulated manager for partition-level range buffers.
 pub struct ProducerBuffers {
@@ -49,7 +49,7 @@ impl RangeBuffer {
 }
 
 pub struct PendingRecord {
-    pub record: ClientRecord,
+    pub record: ProducerRecord,
     pub producer_id: Uuid,
     pub sequence_number: u32,
     pub tx: oneshot::Sender<Result<u64, ClientError>>,

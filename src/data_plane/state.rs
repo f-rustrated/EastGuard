@@ -88,6 +88,7 @@ pub struct DataPlane<W: WalStorage> {
     /// Consulted on a catch-up assignment to decide full-match / delta /
     /// full-copy and to skip transfer when we already hold the segment.
     recovered: LocalInventory,
+    pending_seals: std::collections::HashSet<SegmentKey>,
 }
 
 impl<W: WalStorage> DataPlane<W> {
@@ -115,6 +116,7 @@ impl<W: WalStorage> DataPlane<W> {
             self_tx,
             out,
             recovered,
+            pending_seals: std::collections::HashSet::new(),
         }
     }
 
@@ -231,11 +233,15 @@ impl<W: WalStorage> DataPlane<W> {
 
         let cache = tracker.cache();
         let read_cursor = cache.load_read_cursor();
+        let start_entry_id = tracker.start_entry_id();
+
+        // Translate the absolute entry_id to a 0-based cache position.
+        let cache_position = cmd.entry_id.saturating_sub(start_entry_id);
 
         // The active tail can have `committed_entry_id = 0` and no entries
         // yet committed; distinguish "no data committed at all" by also
         // checking against the cache read cursor.
-        if cmd.entry_id >= read_cursor {
+        if cache_position >= read_cursor {
             // Past the tail — nothing to return.
             let _ = cmd.reply.send(FetchResult::Records {
                 entries: Vec::new(),
@@ -250,7 +256,9 @@ impl<W: WalStorage> DataPlane<W> {
         let mut bytes_read: usize = 0;
         let max_bytes = cmd.max_bytes as usize;
 
-        while let Some(entry_arc) = cache.read_committed(next_entry_id) {
+        while let Some(entry_arc) =
+            cache.read_committed(next_entry_id.saturating_sub(start_entry_id))
+        {
             let payload_len = entry_arc.data.len();
             // Always include at least one entry (even if max_bytes is small).
             if !entries.is_empty() && bytes_read + payload_len > max_bytes {
@@ -281,6 +289,11 @@ impl<W: WalStorage> DataPlane<W> {
         start_entry_id: u64,
         end_entry_id: u64,
     ) {
+        if cmd.entry_id > end_entry_id {
+            let _ = cmd.reply.send(FetchResult::EntryIdOutOfRange);
+            return;
+        }
+
         let req = ColdReadRequest {
             segment_key: key,
             segment_file_path: key.file_path(&self.config.data_dir, start_entry_id),
@@ -319,7 +332,7 @@ impl<W: WalStorage> DataPlane<W> {
             let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
             return;
         };
-        let _ = cmd.reply.send(ListOffsetsResult::Offsets {
+        let _ = cmd.reply.send(ListOffsetsResult::RangeOffsets {
             start_entry_id: tracker.start_entry_id(),
             committed_entry_id: tracker.committed_entry_id(),
         });
@@ -395,7 +408,7 @@ impl<W: WalStorage> DataPlane<W> {
             C::ReplicaAck(cmd) => self.handle_replica_ack(cmd),
             C::CommitAdvance(cmd) => self.handle_commit_advance(cmd),
             C::SealResponse(cmd) => self.handle_seal_response(cmd),
-            C::SegmentSealed(cmd) => self.retire_old_segment(cmd.segment_key),
+            C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd),
 
             // Pass-through to MultiRaftActor — SealRequest is a control plane
             // message that shares the data transport wire format. The
@@ -833,6 +846,8 @@ impl<W: WalStorage> DataPlane<W> {
                 .repl_schedules
                 .push((seq, ReplicationTimer::timeout(cmd.segment_key)));
         }
+
+        self.check_pending_seal(cmd.segment_key);
     }
 
     fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
@@ -933,12 +948,15 @@ impl<W: WalStorage> DataPlane<W> {
         let followers = old_tracker.followers().to_vec();
         let replayed_bytes: usize = uncommitted.iter().map(|(data, _)| data.len()).sum();
 
+        let committed_entry_id = old_tracker.last_committed_entry_id();
+
         if !followers.is_empty() {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     followers,
                     SegmentSealed {
                         segment_key: cmd.old_segment_key,
+                        committed_entry_id,
                     },
                 ));
         }
@@ -973,6 +991,87 @@ impl<W: WalStorage> DataPlane<W> {
         self.needs_flush = true;
     }
 
+    fn handle_segment_sealed(&mut self, cmd: SegmentSealed) {
+        match cmd.committed_entry_id {
+            // Determine the end offset and notify the coordinator
+            None => {
+                if let Some(tracker) = self.segments.get(&cmd.segment_key)
+                    && tracker.role() == SegmentRole::Leader
+                {
+                    if !tracker.is_fully_committed() {
+                        self.pending_seals.insert(cmd.segment_key);
+                        return; // Defer and exit early
+                    }
+
+                    let end_entry_id = tracker
+                        .last_committed_entry_id()
+                        .unwrap_or_else(|| tracker.start_entry_id().saturating_sub(1));
+
+                    self.out
+                        .store_transport_cmd(DataTransportSendToCoordinator {
+                            shard_group_id: tracker.shard_group_id(),
+                            message: SealRequest {
+                                from: self.node_id.clone(),
+                                segment_key: cmd.segment_key,
+                                failed_nodes: vec![],
+                                end_entry_id,
+                            }
+                            .into(),
+                        });
+                }
+            }
+
+            // Commit the specified entries
+            Some(end) => {
+                if let Some(tracker) = self.segments.get_mut(&cmd.segment_key) {
+                    let start = tracker
+                        .last_committed_entry_id()
+                        .map_or(tracker.start_entry_id(), |c| c + 1);
+
+                    for offset in start..=end {
+                        tracker.commit_entry(offset);
+                    }
+                }
+            }
+        }
+
+        // Cleanup applies to all paths that weren't deferred
+        self.retire_old_segment(cmd.segment_key);
+    }
+
+    fn check_pending_seal(&mut self, segment_key: SegmentKey) {
+        if !self.pending_seals.contains(&segment_key) {
+            return;
+        }
+
+        let Some(tracker) = self.segments.get(&segment_key) else {
+            return;
+        };
+
+        if !tracker.is_fully_committed() {
+            return;
+        }
+
+        let actual_end_offset = tracker
+            .last_committed_entry_id()
+            .unwrap_or_else(|| tracker.start_entry_id().saturating_sub(1));
+
+        self.out
+            .store_transport_cmd(DataTransportSendToCoordinator {
+                shard_group_id: tracker.shard_group_id(),
+                message: SealRequest {
+                    from: self.node_id.clone(),
+                    segment_key,
+                    failed_nodes: vec![],
+                    end_entry_id: actual_end_offset,
+                }
+                .into(),
+            });
+
+        self.retire_old_segment(segment_key);
+        self.pending_seals.remove(&segment_key);
+    }
+
     // Drop the sealed segment's live tracker and checkpoint its committed
     // records so cold reads can still serve them.
     fn retire_old_segment(&mut self, segment_key: SegmentKey) {
@@ -991,14 +1090,21 @@ impl<W: WalStorage> DataPlane<W> {
         let followers = tracker.followers().to_vec();
         if !followers.is_empty() {
             self.out
-                .transport_cmds
-                .push(DataTransportCommand::send_to_targets(
+                .store_transport_cmd(DataTransportCommand::send_to_targets(
                     followers,
                     CommitAdvance {
                         segment_key,
                         committed_entry_id: entry_id,
                     },
                 ));
+        }
+
+        if tracker.role() == SegmentRole::Leader
+            && tracker.size_limit_reached(self.config.segment_size_limit)
+            && tracker.is_fully_committed()
+        {
+            self.out.store_checkpoint(tracker.checkpoint(segment_key));
+            self.enqueue_seal_request(segment_key);
         }
     }
 
@@ -1144,10 +1250,15 @@ impl<W: WalStorage> DataPlane<W> {
                 }
             }
 
-            if tracker.size_limit_reached(self.config.segment_size_limit) {
+            if tracker.role() == SegmentRole::Leader
+                && tracker.size_limit_reached(self.config.segment_size_limit)
+                && tracker.is_fully_committed()
+            {
                 self.out.store_checkpoint(tracker.checkpoint(key));
                 self.enqueue_seal_request(key);
             }
+
+            self.check_pending_seal(key);
         }
 
         for pending_repl in segment_batches {
@@ -2341,6 +2452,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SegmentSealed {
                 segment_key: test_key(),
+                committed_entry_id: None,
             }
             .into(),
         ));

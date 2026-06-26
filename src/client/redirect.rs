@@ -13,7 +13,7 @@ use tokio::time::Instant;
 use crate::client::Client;
 use crate::client::error::ClientError;
 use crate::connections::protocol::{
-    ClientRequest, ClientResponse, ControlPlaneResponse, DataPlaneResponse,
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneResponse, DataPlaneResponse,
 };
 
 /// Consecutive hint-follows before forcing a backoff — breaks a redirect cycle
@@ -146,24 +146,46 @@ impl Client {
             };
 
             match res {
-                Ok(response) => match Self::redirect_target(&response) {
-                    Redirect::Done => {
-                        return Ok(Served {
-                            response,
-                            redirected: state.redirected,
-                        });
-                    }
-                    Redirect::Follow(next) => {
-                        // The hint is a node the server just pointed us at — remember it
-                        // so future re-resolves can reach it, not just the bootstrap set.
-                        self.known_nodes.remember(next);
-                        if state.try_follow(next) {
-                            continue;
+                Ok(response) => {
+                    let is_direct_to_node = matches!(
+                        request,
+                        ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(_))
+                            | ClientRequest::DataPlane(ClientDataPlaneRequest::ListOffsets(_))
+                    );
+
+                    let redirect = if is_direct_to_node {
+                        match &response {
+                            ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
+                                Redirect::Done
+                            }
+                            ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
+                                hint_node: None,
+                            }) => Redirect::Done,
+                            _ => Self::redirect_target(&response),
                         }
+                    } else {
+                        Self::redirect_target(&response)
+                    };
+
+                    match redirect {
+                        Redirect::Done => {
+                            return Ok(Served {
+                                response,
+                                redirected: state.redirected,
+                            });
+                        }
+                        Redirect::Follow(next) => {
+                            // The hint is a node the server just pointed us at — remember it
+                            // so future re-resolves can reach it, not just the bootstrap set.
+                            self.known_nodes.remember(next);
+                            if state.try_follow(next) {
+                                continue;
+                            }
+                        }
+                        Redirect::NotFound => state.mark_not_found(),
+                        Redirect::Reresolve => state.mark_redirected(),
                     }
-                    Redirect::NotFound => state.mark_not_found(),
-                    Redirect::Reresolve => state.mark_redirected(),
-                },
+                }
                 // Pool dropped the dead connection; re-resolve like any transient.
                 Err(ClientError::Connection { .. }) => state.mark_redirected(),
                 Err(e) => return Err(e),
@@ -207,11 +229,12 @@ impl Client {
                 },
                 DataPlaneResponse::TopicNotFound => Redirect::NotFound,
                 DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
-                DataPlaneResponse::Produced { .. }
+                DataPlaneResponse::SegmentNotLocal
+                | DataPlaneResponse::Produced { .. }
                 | DataPlaneResponse::Fetched { .. }
                 | DataPlaneResponse::EntryIdOutOfRange
                 | DataPlaneResponse::KeyspaceBoundNarrowed
-                | DataPlaneResponse::Offsets { .. } => Redirect::Done,
+                | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
             },
             ClientResponse::Admin(_) => Redirect::Done,
             // The server's writer-loop sentinel; a client never legitimately reads it.
@@ -301,6 +324,12 @@ mod tests {
         assert_eq!(
             classify(&ClientResponse::DataPlane(DataPlaneResponse::TopicNotFound)),
             "notfound"
+        );
+        assert_eq!(
+            classify(&ClientResponse::DataPlane(
+                DataPlaneResponse::SegmentNotLocal
+            )),
+            "done"
         );
         assert_eq!(
             classify(&ClientResponse::DataPlane(DataPlaneResponse::Produced {

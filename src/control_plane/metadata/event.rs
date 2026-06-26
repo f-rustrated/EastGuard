@@ -4,7 +4,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment,
+    CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment, SegmentSealed,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
@@ -104,11 +104,13 @@ impl SegmentReassigned {
 pub struct RangeSplit {
     pub topic_id: TopicId,
     pub children: [(RangeId, SegmentId, Vec<NodeId>); 2],
+    pub parent_active_segment: Option<(SegmentKey, Vec<NodeId>)>,
 }
 
 impl RangeSplit {
     pub fn into_command(self, shard_group_id: ShardGroupId) -> Vec<DataTransportCommand> {
-        self.children
+        let mut cmds: Vec<DataTransportCommand> = self
+            .children
             .into_iter()
             .map(|(range_id, segment_id, replica_set)| {
                 let target = replica_set[0].clone();
@@ -122,7 +124,22 @@ impl RangeSplit {
                     },
                 )
             })
-            .collect()
+            .collect();
+
+        // sealing parent segment
+        if let Some((parent_key, parent_replica_set)) = self.parent_active_segment
+            && !parent_replica_set.is_empty()
+        {
+            cmds.push(DataTransportCommand::send_to_targets(
+                parent_replica_set,
+                SegmentSealed {
+                    segment_key: parent_key,
+                    committed_entry_id: None,
+                },
+            ));
+        }
+
+        cmds
     }
 }
 
@@ -173,6 +190,29 @@ impl SegmentsDeleted {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentSealCorrected {
+    pub segment_key: SegmentKey,
+    pub replica_set: Vec<NodeId>,
+    pub committed_entry_id: Option<u64>,
+}
+
+impl SegmentSealCorrected {
+    pub fn into_commands(self) -> Vec<DataTransportCommand> {
+        if self.replica_set.is_empty() {
+            vec![]
+        } else {
+            vec![DataTransportCommand::send_to_targets(
+                self.replica_set,
+                SegmentSealed {
+                    segment_key: self.segment_key,
+                    committed_entry_id: self.committed_entry_id,
+                },
+            )]
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyResult {
     TopicCreated(TopicCreated),
     SegmentRolled(SegmentRolled),
@@ -180,6 +220,7 @@ pub enum ApplyResult {
     RangeMerged(RangeMerged),
     SegmentReassigned(SegmentReassigned),
     SegmentsDeleted(SegmentsDeleted),
+    SegmentSealCorrected(SegmentSealCorrected),
     TopicDeleted,
     Noop,
 }
@@ -191,5 +232,6 @@ impl_from_variant!(
     RangeSplit,
     RangeMerged,
     SegmentReassigned,
-    SegmentsDeleted
+    SegmentsDeleted,
+    SegmentSealCorrected
 );

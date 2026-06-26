@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::connections::protocol::{RangeDetail, TopicDetail};
-use crate::control_plane::metadata::RangeState;
+use crate::control_plane::metadata::{RangeId, RangeState};
 
 use super::cursor::RangeCursor;
 use super::cursor_set::RangeCursorSet;
@@ -45,13 +45,13 @@ pub enum StartPolicy {
 
 /// Module-local helper that bundles the `(detail, interest)` pair the
 /// bootstrap path walks.
-struct CursorBootstrap<'a> {
+pub(crate) struct CursorBootstrap<'a> {
     detail: &'a TopicDetail,
     interest: KeyInterest,
 }
 
 impl<'a> CursorBootstrap<'a> {
-    fn build(
+    pub(crate) fn build(
         detail: &'a TopicDetail,
         interest: KeyInterest,
         policy: StartPolicy,
@@ -71,7 +71,19 @@ impl<'a> CursorBootstrap<'a> {
             .iter()
             .filter(|r| r.state == RangeState::Active)
             .filter(|r| self.interest.matches(r))
-            .map(RangeCursor::from)
+            .map(|r| {
+                let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
+                println!(
+                    "[DEBUG LATEST] range_id={}, start_offset={}",
+                    *r.range_id, start_offset
+                );
+                RangeCursor::new(
+                    r.range_id,
+                    start_offset,
+                    r.keyspace_start.clone(),
+                    r.keyspace_end.clone(),
+                )
+            })
             .collect()
     }
 
@@ -81,7 +93,7 @@ impl<'a> CursorBootstrap<'a> {
     /// that has only split, the original full-keyspace range is the sole
     /// root.
     fn earliest_cursors(&self) -> Vec<RangeCursor> {
-        let split_children: HashSet<u64> = self
+        let split_children: HashSet<RangeId> = self
             .detail
             .ranges
             .iter()
@@ -110,21 +122,22 @@ mod tests {
         state: RangeState,
         start: &[u8],
         end: &[u8],
-        split_into: Option<(u64, u64)>,
-        merged_into: Option<u64>,
-        merged_from: Option<(u64, u64)>,
+        split_into: Option<(RangeId, RangeId)>,
+        merged_into: Option<RangeId>,
+        merged_from: Option<(RangeId, RangeId)>,
     ) -> RangeDetail {
         RangeDetail {
-            range_id,
+            range_id: RangeId(range_id),
             keyspace_start: start.to_vec(),
             keyspace_end: end.to_vec(),
             state,
             active_segment: state.eq(&RangeState::Active).then(|| SegmentDetail {
                 segment_id: 0,
-                start_offset: 0,
-                end_offset: None,
+                start_entry_id: 0,
+                end_entry_id: None,
                 replica_set: vec![],
             }),
+            sealed_segments: Box::default(),
             split_into,
             merged_into,
             merged_from,
@@ -148,7 +161,7 @@ mod tests {
                 RangeState::Sealed,
                 b"",
                 b"\xff",
-                Some((1, 2)),
+                Some((RangeId(1), RangeId(2))),
                 None,
                 None,
             ),
@@ -191,7 +204,7 @@ mod tests {
                 RangeState::Sealed,
                 b"",
                 b"\xff",
-                Some((1, 2)),
+                Some((RangeId(1), RangeId(2))),
                 None,
                 None,
             ),
@@ -209,8 +222,24 @@ mod tests {
     fn earliest_skips_merge_products() {
         // Two original ranges 1, 2 merged into 3.
         let t = topic(vec![
-            range(1, RangeState::Sealed, b"", b"m", None, Some(3), None),
-            range(2, RangeState::Sealed, b"m", b"\xff", None, Some(3), None),
+            range(
+                1,
+                RangeState::Sealed,
+                b"",
+                b"m",
+                None,
+                Some(RangeId(3)),
+                None,
+            ),
+            range(
+                2,
+                RangeState::Sealed,
+                b"m",
+                b"\xff",
+                None,
+                Some(RangeId(3)),
+                None,
+            ),
             range(
                 3,
                 RangeState::Active,
@@ -218,7 +247,7 @@ mod tests {
                 b"\xff",
                 None,
                 None,
-                Some((1, 2)),
+                Some((RangeId(1), RangeId(2))),
             ),
         ]);
         let set = CursorBootstrap::build(&t, KeyInterest::AllKeys, StartPolicy::Earliest);

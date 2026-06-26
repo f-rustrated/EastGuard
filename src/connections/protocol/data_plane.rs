@@ -26,7 +26,7 @@ pub enum ClientDataPlaneRequest {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
-    ListOffsets(ListOffsetsRequest),
+    ListOffsets(RangeOffsetRequest),
 }
 
 impl_from_variant!(
@@ -34,7 +34,7 @@ impl_from_variant!(
     Produce(ProduceRequest),
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
-    ListOffsets(ListOffsetsRequest),
+    ListOffsets(RangeOffsetRequest),
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -70,15 +70,15 @@ pub struct FetchRequest {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
     pub topic_id: u64,
-    pub range_id: u64,
+    pub range_id: RangeId,
     pub entry_id: u64,
     pub max_bytes: u32,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ListOffsetsRequest {
+pub struct RangeOffsetRequest {
     pub topic_name: String,
-    pub range_id: u64,
+    pub range_id: RangeId,
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -96,8 +96,8 @@ pub enum DataPlaneResponse {
     EntryIdOutOfRange,
     // keyspace_bound was set but narrower than the target range's keyspace.
     KeyspaceBoundNarrowed,
-    // ListOffsets
-    Offsets {
+
+    RangeOffset {
         start_entry_id: u64,
         committed_entry_id: u64,
     },
@@ -110,22 +110,30 @@ pub enum DataPlaneResponse {
         hint_node: Option<SocketAddr>,
     },
     TopicNotFound,
+    SegmentNotLocal,
     InternalError(String),
 }
 
 impl DataPlaneResponse {
+    pub fn is_routing_error(&self) -> bool {
+        matches!(
+            self,
+            DataPlaneResponse::SegmentNotLocal
+                | DataPlaneResponse::ShardNotLocal { .. }
+                | DataPlaneResponse::NotWriteLeader { .. }
+        )
+    }
+
     pub(crate) fn from_list_offset_result(value: ListOffsetsResult) -> Self {
         match value {
-            ListOffsetsResult::Offsets {
+            ListOffsetsResult::RangeOffsets {
                 start_entry_id,
                 committed_entry_id,
-            } => DataPlaneResponse::Offsets {
+            } => DataPlaneResponse::RangeOffset {
                 start_entry_id,
                 committed_entry_id,
             },
-            ListOffsetsResult::SegmentNotLocal => {
-                DataPlaneResponse::InternalError("segment not hosted on this node".into())
-            }
+            ListOffsetsResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
             ListOffsetsResult::InternalError(s) => DataPlaneResponse::InternalError(s),
         }
     }
@@ -158,11 +166,7 @@ impl DataPlaneResponse {
                 }
             }
             FetchResult::EntryIdOutOfRange => DataPlaneResponse::EntryIdOutOfRange,
-            FetchResult::SegmentNotLocal => {
-                // The consumer treats this as "stale targeting" — re-resolve via
-                // DescribeTopic and retry against a node that hosts the segment.
-                DataPlaneResponse::InternalError("segment not hosted on this node".into())
-            }
+            FetchResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
             FetchResult::InternalError(s) => DataPlaneResponse::InternalError(s),
         }
     }
@@ -194,7 +198,7 @@ pub struct Entry {
 pub enum RangeProgressSignal {
     Active,
     Sealed {
-        end_offset: u64,
+        end_entry_id: u64,
         transition: RangeTransition,
     },
 }
@@ -233,7 +237,7 @@ impl RangeProgressSignal {
             // walker re-resolves the precise split point when it discovers the
             // children.
             return RangeProgressSignal::Sealed {
-                end_offset,
+                end_entry_id: end_offset,
                 transition: RangeTransition::Split {
                     left_range_id: left,
                     right_range_id: right,
@@ -248,7 +252,7 @@ impl RangeProgressSignal {
                 .merged_from(merged)
                 .expect("Merged from not found when range.merge_into is invoked");
             return RangeProgressSignal::Sealed {
-                end_offset,
+                end_entry_id: end_offset,
                 transition: RangeTransition::Merged {
                     merged_range_id: merged,
                     merged_from,
@@ -260,7 +264,7 @@ impl RangeProgressSignal {
         // a "self-merged" sentinel so the consumer at least sees a Sealed
         // signal and can stop fetching past `end_offset`.
         RangeProgressSignal::Sealed {
-            end_offset,
+            end_entry_id: end_offset,
             transition: RangeTransition::Merged {
                 merged_range_id: range.range_id,
                 merged_from: [range.range_id, range.range_id],
@@ -268,5 +272,3 @@ impl RangeProgressSignal {
         }
     }
 }
-
-

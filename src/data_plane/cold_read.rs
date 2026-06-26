@@ -115,49 +115,66 @@ impl ColdReadPool {
     }
 
     fn handle_request(req: ColdReadRequest, sparse_index: &dyn SparseIndex) {
+        println!(
+            "[DEBUG COLD READ] handle_request received for {:?} offset {} path {:?}",
+            req.segment_key, req.start_entry_offset, req.segment_file_path
+        );
         let result = Self::process_request(&req, sparse_index);
         let ColdReadRequest {
             segment_key, reply, ..
         } = req;
 
         match result {
-            Ok(records) => match reply {
-                ColdReadReply::Consumer {
-                    reply,
-                    progress_signal,
-                } => {
-                    let _ = reply.send(FetchResult::Records {
-                        entries: records.entries,
-                        next_entry_id: records.next_offset,
+            Ok(records) => {
+                println!(
+                    "[DEBUG COLD READ] handle_request SUCCESS for {:?} records {}",
+                    segment_key,
+                    records.entries.len()
+                );
+                match reply {
+                    ColdReadReply::Consumer {
+                        reply,
                         progress_signal,
-                    });
-                }
-                ColdReadReply::CatchUp(cu) => {
-                    let done = CatchUpReadComplete {
-                        requester: cu.requester,
-                        segment_key,
-                        start_offset: cu.start_offset,
-                        sealed_end: cu.sealed_end,
-                        entries: records.entries,
-                        next_offset: records.next_offset,
-                    };
+                    } => {
+                        let _ = reply.send(FetchResult::Records {
+                            entries: records.entries,
+                            next_entry_id: records.next_offset,
+                            progress_signal,
+                        });
+                    }
+                    ColdReadReply::CatchUp(cu) => {
+                        let done = CatchUpReadComplete {
+                            requester: cu.requester,
+                            segment_key,
+                            start_offset: cu.start_offset,
+                            sealed_end: cu.sealed_end,
+                            entries: records.entries,
+                            next_offset: records.next_offset,
+                        };
 
-                    let _ = cu.mailbox.send(done);
+                        let _ = cu.mailbox.send(done);
+                    }
                 }
-            },
+            }
 
-            Err(e) => match reply {
-                ColdReadReply::Consumer { reply, .. } => {
-                    tracing::warn!("cold read failed for {segment_key:?}: {e}");
-                    let err_msg = format!("cold read failed: {e}");
-                    let _ = reply.send(FetchResult::InternalError(err_msg));
+            Err(e) => {
+                println!(
+                    "[DEBUG COLD READ] handle_request FAILED for {:?}: {:?}",
+                    segment_key, e
+                );
+                match reply {
+                    ColdReadReply::Consumer { reply, .. } => {
+                        tracing::warn!("cold read failed for {segment_key:?}: {e}");
+                        let err_msg = format!("cold read failed: {e}");
+                        let _ = reply.send(FetchResult::InternalError(err_msg));
+                    }
+                    ColdReadReply::CatchUp(_) => {
+                        // Source-side read failed; nothing durable changed. The
+                        // replacement times out and the coordinator re-drives, so just drop with a log.
+                        tracing::warn!("catch-up source read failed for {segment_key:?}: {e}");
+                    }
                 }
-                ColdReadReply::CatchUp(_) => {
-                    // Source-side read failed; nothing durable changed. The
-                    // replacement times out and the coordinator re-drives, so just drop with a log.
-                    tracing::warn!("catch-up source read failed for {segment_key:?}: {e}");
-                }
-            },
+            }
         }
     }
 

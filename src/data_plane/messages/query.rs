@@ -73,7 +73,7 @@ pub struct ListOffsets {
 #[derive(Debug)]
 
 pub enum ListOffsetsResult {
-    Offsets {
+    RangeOffsets {
         start_entry_id: u64,
         committed_entry_id: u64,
     },

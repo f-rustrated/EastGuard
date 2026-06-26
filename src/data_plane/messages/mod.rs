@@ -7,7 +7,11 @@ use command::DataPlaneCommand;
 use query::DataPlaneQuery;
 
 use crate::{
-    data_plane::timer::DataPlaneTimeoutCallback, impl_from_variant, impl_from_variant_via,
+    data_plane::{
+        messages::query::{Fetch, ListOffsets},
+        timer::DataPlaneTimeoutCallback,
+    },
+    impl_from_variant, impl_from_variant_via,
 };
 
 pub enum DataPlaneMessage {
@@ -30,3 +34,5 @@ impl_from_variant_via!(
     DataPlaneInterNodeCommand,
     CatchUpReadComplete
 );
+
+impl_from_variant_via!(DataPlaneMessage, DataPlaneQuery, Fetch, ListOffsets);

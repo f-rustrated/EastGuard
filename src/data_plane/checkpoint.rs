@@ -80,6 +80,10 @@ impl CheckpointWorker {
             return Ok(());
         }
 
+        println!(
+            "[DEBUG CHECKPOINT] process_job starting for {:?} at path {:?}",
+            job.segment_key, job.segment_file_path
+        );
         let mut appender = SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
         let mut index_entries = Vec::with_capacity(checkpoint.entries.len());
         for entry in &checkpoint.entries {
@@ -95,6 +99,10 @@ impl CheckpointWorker {
         sparse_index.put_batch(index_entries)?;
         job.cache.advance_eviction_frontier(checkpoint.new_frontier);
 
+        println!(
+            "[DEBUG CHECKPOINT] process_job completed successfully for {:?}",
+            job.segment_key
+        );
         let completion: DataPlaneCommand = CheckpointComplete {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),

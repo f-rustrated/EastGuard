@@ -19,6 +19,10 @@ impl Client {
         data: Vec<u8>,
         record_count: u32,
     ) -> Result<u64, ClientError> {
+        println!(
+            "[DEBUG CLIENT PRODUCE] starting produce for topic={}, key={:?}",
+            topic, routing_key
+        );
         // Describe once to seed the cache (gives the first hop).
         if self.cache.get(topic).is_none() {
             self.resolve_topic(topic).await?;
@@ -39,6 +43,10 @@ impl Client {
         };
 
         let served = self.call(start, request).await?;
+        println!(
+            "[DEBUG CLIENT PRODUCE] served: redirected={}, response={:?}",
+            served.redirected, served.response
+        );
         // A redirect -> the cached leader was stale; drop it so the next produce re-describes.
         if served.redirected {
             self.cache.invalidate(topic);

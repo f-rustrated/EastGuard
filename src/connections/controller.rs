@@ -347,14 +347,15 @@ impl ClientController {
         let progress_signal = RangeProgressSignal::compute_progress_signal(range, &meta);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let query = DataPlaneQuery::Fetch(Fetch {
+        let query = Fetch {
             topic_id: meta.id,
             range_id: RangeId(req.range_id),
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             progress_signal,
             reply: reply_tx,
-        });
+        };
+
         if self.data_plane_tx.send(query).is_err() {
             return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
         }
@@ -373,7 +374,7 @@ impl ClientController {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = DataPlaneQuery::Fetch(Fetch {
             topic_id: TopicId(req.topic_id),
-            range_id: RangeId(req.range_id),
+            range_id: req.range_id,
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             // The by-id consumer already has the range lineage from DescribeTopic,
@@ -392,7 +393,7 @@ impl ClientController {
 
     /// Offset-bounds query — used by consumers to bound their read window
     /// for the range's currently-active segment on this node.
-    async fn handle_list_offsets(&self, req: ListOffsetsRequest) -> anyhow::Result<ClientResponse> {
+    async fn handle_list_offsets(&self, req: RangeOffsetRequest) -> anyhow::Result<ClientResponse> {
         let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
             return Ok(DataPlaneResponse::TopicNotFound.into());
         };
@@ -400,7 +401,7 @@ impl ClientController {
 
         let query: DataPlaneQuery = ListOffsets {
             topic_id: meta.id,
-            range_id: RangeId(req.range_id),
+            range_id: req.range_id,
             reply: reply_tx,
         }
         .into();

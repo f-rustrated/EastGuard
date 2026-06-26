@@ -199,30 +199,33 @@ impl SegmentStore {
     ///
     /// See d4_consumer_range_tracking.md "Resolving a bare (range, offset)
     /// to the segment that holds it."
-    #[allow(dead_code)]
     pub(crate) fn resolve(
         &self,
         topic_id: TopicId,
         range_id: RangeId,
-        offset: u64,
+        entry_id: u64,
     ) -> Option<SegmentReadState> {
+        // ACTIVE PATH
         if let Some(active) = self.active_by_range.get(&(topic_id, range_id))
-            && let Some((&start, &segment_id)) = active.range(..=offset).next_back()
+            && let Some((&start, &segment_id)) = active.range(..=entry_id).next_back()
         {
             let key = SegmentKey::new(topic_id, range_id, segment_id);
             // BTreeMap key == tracker.start_entry_id (invariant 2), so any
             // offset >= start lies in this segment while it is still active
             // (no upper bound yet).
-            debug_assert!(offset >= start, "BTreeMap lookup violated invariant");
+            debug_assert!(entry_id >= start, "BTreeMap lookup violated invariant");
             if self.by_key.contains_key(&key) {
                 return Some(SegmentReadState::Active(key));
             }
         }
-        let sealed = self.sealed_by_range.get(&(topic_id, range_id))?;
-        let (&start_entry_id, slot) = sealed.range(..=offset).next_back()?;
 
-        // ? what would this mean
-        if offset > slot.end_entry_id {
+        // SEALED PATH
+        let sealed = self.sealed_by_range.get(&(topic_id, range_id))?;
+        let (&start_entry_id, slot) = sealed.range(..=entry_id).next_back()?;
+
+        // Asked entry_id is bigger than selected slot's end entry id
+        // meaning, it's not in the active nor in the sealed? How come?
+        if entry_id > slot.end_entry_id {
             return None;
         }
         Some(SegmentReadState::Sealed {

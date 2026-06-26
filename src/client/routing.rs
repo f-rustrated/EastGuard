@@ -3,6 +3,7 @@
 //! per-request check corrects a stale entry with a redirect (`redirect.rs`), so the
 //! cache only ever costs an extra hop, never a wrong target.
 use crate::connections::protocol::{RangeDetail, TopicDetail};
+use crate::control_plane::metadata::RangeId;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,7 +18,7 @@ pub(crate) struct TopicRouting {
 
 /// One active range's placement. Sealed/deleting ranges have no write leader.
 struct RangeRoute {
-    range_id: u64,
+    range_id: RangeId,
     keyspace_start: Vec<u8>,
     /// `replica_set[0]` of the active segment, the produce target. `None` when the
     /// range has no active segment (sealed/deleting) or its replica set is empty.
@@ -58,7 +59,7 @@ impl TopicRouting {
             .and_then(|r| r.write_leader)
     }
 
-    pub(crate) fn range_id(&self, routing_key: &[u8]) -> Option<u64> {
+    pub(crate) fn range_id(&self, routing_key: &[u8]) -> Option<RangeId> {
         self.ranges
             .iter()
             .rev()
@@ -66,7 +67,7 @@ impl TopicRouting {
             .map(|r| r.range_id)
     }
 
-    fn replicas(&self, range_id: u64) -> Option<&[SocketAddr]> {
+    fn replicas(&self, range_id: RangeId) -> Option<&[SocketAddr]> {
         self.ranges
             .iter()
             .find(|r| r.range_id == range_id)
@@ -91,7 +92,7 @@ impl RoutingCache {
         self.topics.load().get(topic).cloned()
     }
 
-    pub(crate) fn range_id(&self, topic: &str, routing_key: &[u8]) -> Option<u64> {
+    pub(crate) fn range_id(&self, topic: &str, routing_key: &[u8]) -> Option<RangeId> {
         self.get(topic)?.range_id(routing_key)
     }
 
@@ -133,7 +134,7 @@ impl RoutingCache {
 
     /// Cached *active-segment* replica addresses for a range (C3 tailing fetch).
     /// Historical reads need the sealed-segment extension — see `RangeRoute`.
-    pub(crate) fn replicas(&self, topic: &str, range_id: u64) -> Option<Box<[SocketAddr]>> {
+    pub(crate) fn replicas(&self, topic: &str, range_id: RangeId) -> Option<Box<[SocketAddr]>> {
         Some(self.get(topic)?.replicas(range_id)?.into())
     }
 }
