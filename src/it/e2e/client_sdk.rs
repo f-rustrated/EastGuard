@@ -893,6 +893,92 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
     sim.run()
 }
 
+/// E2E Consumer Test 1.5: Latest Skips History (Active Segment)
+/// StartPolicy::Latest should skip existing records in an active segment without needing a roll.
+#[test]
+#[serial_test::serial]
+fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        let custom_policy = policy();
+        client
+            .create_topic("basic-consume-latest", custom_policy)
+            .await
+            .expect("create topic");
+
+        // Warm cache
+        client
+            .resolve_topic("basic-consume-latest")
+            .await
+            .expect("resolve");
+
+        let producer = crate::client::Producer::new(
+            client.clone(),
+            "basic-consume-latest".to_string(),
+            crate::client::ProducerConfig {
+                buffer: crate::client::BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024,
+                    max_batch_records: 5,
+                },
+                codec: crate::client::CompressionCodec::None,
+            },
+        );
+
+        // Produce 5 records into the active segment (no roll)
+        for i in 0..5 {
+            let key = format!("key-{}", i);
+            let val = format!("val-{}", i).into_bytes();
+            producer
+                .send(key.as_bytes(), val)
+                .await
+                .expect("produce record");
+        }
+
+        // Wait a tiny bit to ensure they hit the server
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Start a Latest consumer. Because it's Latest, it should skip all 5 existing
+        // records in the active segment and wait at offset 5.
+        let consumer_latest = crate::client::Consumer::new(
+            client.clone(),
+            "basic-consume-latest".to_string(),
+            crate::client::KeyInterest::AllKeys,
+            crate::client::StartPolicy::Latest,
+        )
+        .await
+        .expect("create latest consumer");
+
+        // Produce 2 NEW records
+        producer.send(b"key-5", b"val-5".to_vec()).await.unwrap();
+        producer.send(b"key-6", b"val-6".to_vec()).await.unwrap();
+
+        // Consumer should read exactly key-5 and key-6
+        let rec5 = consumer_latest.next_record().await.unwrap().unwrap();
+        assert_eq!(rec5.key, b"key-5");
+
+        let rec6 = consumer_latest.next_record().await.unwrap().unwrap();
+        assert_eq!(rec6.key, b"key-6");
+
+        // Verify no historical records are returned
+        let timeout_res =
+            tokio::time::timeout(Duration::from_millis(500), consumer_latest.next_record()).await;
+        assert!(
+            timeout_res.is_err(),
+            "Latest consumer should not receive historical records from the active segment"
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
 /// E2E Consumer Test 2: Key Filtering.
 /// Configure a topic with two ranges (via automatic split), consume with KeyInterest::KeySpan
 /// matching only the right child range, and verify that only records from that range are received.
