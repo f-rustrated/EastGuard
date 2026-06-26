@@ -23,7 +23,7 @@ arc-swap = "1"
 flume = "0.12"
 lz4_flex = "0.13.1"
 zstd = "0.13"
-rustyline = "18.0.1"
+rustyline = { version = "18.0.1", features = ["derive"] }
 shlex = "2.0.1"
 serde_yaml = "0.9.34"
 serde = "1"

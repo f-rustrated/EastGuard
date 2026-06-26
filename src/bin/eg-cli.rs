@@ -3,8 +3,9 @@ use east_guard::client::{
     Client, Consumer, KeyInterest, PartitionStrategy, Producer, ProducerConfig, StartPolicy,
     StoragePolicy,
 };
-use rustyline::DefaultEditor;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::{Context, Editor};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -54,7 +55,6 @@ struct StartupCli {
 async fn main() -> anyhow::Result<()> {
     // Only log warnings and above so the REPL isn't cluttered
     let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
-
     let startup = StartupCli::parse();
 
     let seeds: Vec<SocketAddr> = startup
@@ -63,6 +63,15 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.parse().expect("Invalid socket address in seeds"))
         .collect();
 
+    let ascii_art = r#"
+  ______           _    _____                     _ 
+ |  ____|         | |  / ____|                   | |
+ | |__   __ _ ___ | |_| |  __ _   _  __ _ _ __ __| |
+ |  __| / _` / __|| __| | |_ | | | |/ _` | '__/ _` |
+ | |___| (_| \__ \| |_| |__| | |_| | (_| | | | (_| |
+ |______\__,_|___/ \__|\_____|\__,_|\__,_|_|  \__,_|
+"#;
+    println!("\x1b[1;36m{}\x1b[0m", ascii_art);
     println!("Connecting to EastGuard cluster at {:?}...", seeds);
     let client = match Client::connect(seeds) {
         Ok(c) => Arc::new(c),
@@ -73,10 +82,12 @@ async fn main() -> anyhow::Result<()> {
     };
     println!("Connected! Type 'help' for available commands.");
 
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(CliHelper));
 
     loop {
-        let readline = rl.readline("eastguard> ");
+        // \x1b[1;32m = bold green, \x1b[0m = reset
+        let readline = rl.readline("\x1b[1;32meastguard>\x1b[0m ");
         match readline {
             Ok(line) => {
                 if line.trim().is_empty() {
@@ -215,3 +226,40 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
     }
     Ok(())
 }
+
+struct CliHelper;
+
+impl Completer for CliHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let commands = vec!["create-topic", "publish", "consume", "help", "exit", "quit"];
+        let mut matches = Vec::new();
+
+        // Only autocomplete the first word (command)
+        if !line[..pos].contains(' ') {
+            let prefix = &line[..pos];
+            for cmd in commands {
+                if cmd.starts_with(prefix) {
+                    matches.push(Pair {
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
+                    });
+                }
+            }
+        }
+        Ok((0, matches))
+    }
+}
+
+impl rustyline::hint::Hinter for CliHelper {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for CliHelper {}
+impl rustyline::validate::Validator for CliHelper {}
+impl rustyline::Helper for CliHelper {}
