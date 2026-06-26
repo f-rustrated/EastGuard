@@ -40,7 +40,7 @@ impl Consumer {
         start_policy: StartPolicy,
     ) -> Result<Self, ClientError> {
         let detail = client.resolve_topic(&topic).await?;
-        let cursors = RangeCursorSet::bootstrap(&detail, interest, start_policy);
+        let mut cursors = RangeCursorSet::bootstrap(&detail, interest, start_policy);
 
         let (record_tx, record_rx) = flume::unbounded();
         let (cursor_tx, cursor_rx) = flume::bounded(100);
@@ -52,6 +52,19 @@ impl Consumer {
             metadata: ArcSwap::from_pointee(detail),
             cursor_tx,
         });
+
+        if matches!(start_policy, StartPolicy::Latest) {
+            for cursor in cursors.cursors_mut() {
+                match ctx.fetch_range_offsets(cursor.range_id).await {
+                    Ok((_, committed_id)) => {
+                        cursor.next_entry_id = committed_id;
+                    }
+                    Err(_) => {
+                        // Keep the bootstrap offset if we fail to fetch
+                    }
+                }
+            }
+        }
 
         // Spawn the asynchronous manager loop for RangeCursorSet
         tokio::spawn(run_cursor_manager(
