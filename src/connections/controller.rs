@@ -347,14 +347,15 @@ impl ClientController {
         let progress_signal = RangeProgressSignal::compute_progress_signal(range, &meta);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let query = DataPlaneQuery::Fetch(Fetch {
+        let query = Fetch {
             topic_id: meta.id,
             range_id: RangeId(req.range_id),
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             progress_signal,
             reply: reply_tx,
-        });
+        };
+
         if self.data_plane_tx.send(query).is_err() {
             return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
         }
