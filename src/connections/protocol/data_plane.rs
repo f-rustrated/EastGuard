@@ -115,6 +115,15 @@ pub enum DataPlaneResponse {
 }
 
 impl DataPlaneResponse {
+    pub fn is_routing_error(&self) -> bool {
+        matches!(
+            self,
+            DataPlaneResponse::SegmentNotLocal
+                | DataPlaneResponse::ShardNotLocal { .. }
+                | DataPlaneResponse::NotWriteLeader { .. }
+        )
+    }
+
     pub(crate) fn from_list_offset_result(value: ListOffsetsResult) -> Self {
         match value {
             ListOffsetsResult::Offsets {

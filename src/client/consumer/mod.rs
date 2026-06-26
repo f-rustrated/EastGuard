@@ -1,24 +1,21 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use crate::client::consumer::fetch::{Inner, LookupResult, compute_progress_signal};
-use crate::client::consumer::manager::{CursorEvent, run_cursor_manager};
+use crate::client::consumer::fetch::{ConsumerContext, LookupResult, compute_progress_signal};
+use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
     ListOffsetsRequest, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::RangeId;
-
 pub(crate) mod bootstrap;
 pub(crate) mod cursor;
 pub(crate) mod cursor_set;
-pub(crate) mod parked_merges;
-
 mod fetch;
 pub(crate) mod manager;
+pub(crate) mod parked_merges;
 mod record;
-
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
@@ -28,7 +25,7 @@ pub use record::ConsumerRecord;
 /// Cheap to clone and share across tasks.
 #[derive(Clone)]
 pub struct Consumer {
-    inner: Arc<Inner>,
+    ctx: Arc<ConsumerContext>,
     record_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
 }
 
@@ -44,26 +41,25 @@ impl Consumer {
         let cursors = RangeCursorSet::bootstrap(&detail, interest, start_policy);
 
         let (record_tx, record_rx) = flume::unbounded();
-        let (cursor_tx, cursor_rx) = flume::unbounded();
+        let (cursor_tx, cursor_rx) = flume::bounded(100);
 
-        let inner = Arc::new(Inner {
-            client,
-            topic,
+        let ctx = Arc::new(ConsumerContext {
+            client: client.clone(),
+            topic: topic.clone(),
             topic_id: detail.topic_id,
             metadata: ArcSwap::from_pointee(detail),
             cursor_tx,
         });
 
-        // Arc::downgrade to pass a Weak pointer so the rx channel cleanly disconnects
-        // and shuts down the manager when the Consumer is dropped.
+        // Spawn the asynchronous manager loop for RangeCursorSet
         tokio::spawn(run_cursor_manager(
             cursors,
             cursor_rx,
-            Arc::downgrade(&inner),
+            Arc::downgrade(&ctx),
             record_tx,
         ));
 
-        Ok(Self { inner, record_rx })
+        Ok(Self { ctx, record_rx })
     }
 
     /// Retrieve the next record from the topic.
