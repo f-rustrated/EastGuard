@@ -121,6 +121,7 @@ impl Client {
         request: impl Into<ClientRequest>,
     ) -> Result<Served, ClientError> {
         let mut state = RetryState::new(start, &self.retry);
+        let mut last_error: Option<String> = None;
 
         let request = request.into();
         loop {
@@ -131,6 +132,7 @@ impl Client {
                 }
                 return Err(ClientError::Timeout {
                     waited: self.retry.deadline,
+                    last_error,
                 });
             }
 
@@ -140,10 +142,14 @@ impl Client {
             let attempt =
                 tokio::time::timeout(state.budget(), self.pool.send(state.addr, request.clone()));
 
-            let Ok(res) = attempt.await else {
-                // this will fallback to timeout
+            let attempt_res = attempt.await;
+
+            if attempt_res.is_err() {
+                last_error = Some("request attempt timed out".to_string());
                 continue;
-            };
+            }
+
+            let res = attempt_res.unwrap();
 
             match res {
                 Ok(response) => {
@@ -187,7 +193,10 @@ impl Client {
                     }
                 }
                 // Pool dropped the dead connection; re-resolve like any transient.
-                Err(ClientError::Connection { .. }) => state.mark_redirected(),
+                Err(ClientError::Connection { addr, reason }) => {
+                    last_error = Some(format!("Connection to {} failed: {}", addr, reason));
+                    state.mark_redirected()
+                }
                 Err(e) => return Err(e),
             }
 

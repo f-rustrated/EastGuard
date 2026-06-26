@@ -1,0 +1,21 @@
+# EastGuard Configuration
+
+# Sockets and networking
+client_port: 2921
+cluster_port: 2922
+data_port: 2923
+host: "0.0.0.0"
+advertise_host: "127.0.0.1"
+
+# Directories
+data_dir: "./eastguard/data"
+meta_dir: "./eastguard/meta"
+
+# Cluster topology and bootstrapping
+vnodes_per_node: 256
+join_seed_nodes:
+  - "127.0.0.1:2922"
+
+# Data plane settings
+max_segment_age_secs: 3600
+segment_size_limit_bytes: 1073741824

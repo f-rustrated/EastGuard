@@ -21,6 +21,10 @@ pub struct Environment {
     #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
+    /// Path to a YAML configuration file. Defaults to "eastguard.yaml".
+    #[arg(short = 'c', long = "config")]
+    pub config_file: Option<String>,
+
     #[arg(long, env = "DATA_DIR", default_value = "./eastguard/data")]
     pub data_dir: String,
 
@@ -126,8 +130,65 @@ pub struct Environment {
 }
 
 impl Environment {
+    pub fn config_file() -> String {
+        let mut args = std::env::args().peekable();
+        while let Some(arg) = args.next() {
+            if arg == "-c" || arg == "--config" {
+                if let Some(path) = args.next() {
+                    return path;
+                }
+            } else if arg.starts_with("--config=") {
+                return arg.trim_start_matches("--config=").to_string();
+            }
+        }
+
+        // default config path
+        "./eastguard.yaml".to_string()
+    }
+    pub fn from_config_file() {
+        // Find config file path from args or fallback to "./eastguard.yaml"
+        let path = Self::config_file();
+
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str(&content)
+        {
+            for (k, v) in map {
+                if let Some(key_str) = k.as_str() {
+                    let env_key = key_str.to_uppercase().replace("-", "_");
+
+                    // Only set if not already provided via shell environment
+                    if std::env::var(&env_key).is_err() {
+                        unsafe {
+                            match v {
+                                serde_yaml::Value::String(s) => std::env::set_var(&env_key, s),
+                                serde_yaml::Value::Number(n) => {
+                                    std::env::set_var(&env_key, n.to_string())
+                                }
+                                serde_yaml::Value::Bool(b) => {
+                                    std::env::set_var(&env_key, b.to_string())
+                                }
+                                serde_yaml::Value::Sequence(seq) => {
+                                    let s = seq
+                                        .iter()
+                                        .filter_map(|i| match i {
+                                            serde_yaml::Value::String(s) => Some(s.clone()),
+                                            serde_yaml::Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(",");
+                                    std::env::set_var(&env_key, s);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn init() -> Self {
-        // 1. Parse arguments from CLI and/or ENV vars
         let env = Environment::parse();
 
         if env.client_port == env.cluster_port {
@@ -333,8 +394,9 @@ mod tests {
 
     fn make_env() -> Environment {
         Environment {
-            config_dir: "./eastguard/config".into(),
-            data_dir: "./eastguard/data".into(),
+            config_dir: "./eastguard/config".to_string(),
+            config_file: None,
+            data_dir: "./eastguard/data".to_string(),
             meta_dir: "./eastguard/meta".into(),
             node_id_prefix: None,
             node_id_suffix: None,
