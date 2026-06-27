@@ -128,7 +128,7 @@ impl FetchActor {
                     for (i, rec) in records.iter().enumerate() {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
-                            range_id: self.range_id.0,
+                            range_id: self.range_id,
                             offset: entry.entry_id + i as u64,
                             key: rec.key.clone(),
                             value: rec.value.clone(),
