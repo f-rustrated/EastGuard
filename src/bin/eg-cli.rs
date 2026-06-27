@@ -40,6 +40,9 @@ enum Commands {
         /// Optional timeout in seconds to wait for new messages. If absent, waits indefinitely.
         #[arg(short, long)]
         timeout_sec: Option<u64>,
+        /// Optional group ID for consumer group offset management
+        #[arg(short, long)]
+        group: Option<String>,
     },
     /// Exit the CLI
     Exit,
@@ -170,6 +173,7 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
             start,
             count,
             timeout_sec,
+            group,
         } => {
             let start_policy = match start.to_lowercase().as_str() {
                 "latest" => StartPolicy::Latest,
@@ -177,12 +181,26 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
                 _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
             };
 
-            println!(
-                "Consuming up to {} records from '{}' (start: {})...",
-                count, topic, start
-            );
-            let consumer =
-                Consumer::new(client.clone(), topic, KeyInterest::AllKeys, start_policy).await?;
+            if let Some(ref g) = group {
+                println!(
+                    "Consuming up to {} records from '{}' (start: {}, group: {})...",
+                    count, topic, start, g
+                );
+            } else {
+                println!(
+                    "Consuming up to {} records from '{}' (start: {})...",
+                    count, topic, start
+                );
+            }
+
+            let consumer = Consumer::new_with_group(
+                client.clone(),
+                topic,
+                KeyInterest::AllKeys,
+                start_policy,
+                group.clone(),
+            )
+            .await?;
 
             let mut fetched = 0;
             while fetched < count {
@@ -225,6 +243,15 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
                 println!("(Reached limit of {} records)", count);
             } else {
                 println!("(Fetched {} records)", fetched);
+            }
+
+            if group.is_some() && fetched > 0 {
+                println!("Committing offsets...");
+                if let Err(e) = consumer.commit().await {
+                    println!("Failed to commit offsets: {}", e);
+                } else {
+                    println!("Offsets committed successfully.");
+                }
             }
         }
         Commands::Exit | Commands::Quit => {

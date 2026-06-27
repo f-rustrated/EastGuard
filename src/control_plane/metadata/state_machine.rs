@@ -10,7 +10,6 @@ use crate::test_traits::TAssertInvariant;
 use MetadataError::*;
 use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct MetadataStateMachine {
     pub(crate) topics: HashMap<TopicId, TopicMeta>,
     topic_name_index: HashMap<String, TopicId>,
@@ -19,6 +18,15 @@ pub struct MetadataStateMachine {
 }
 
 impl MetadataStateMachine {
+    pub(crate) fn new(shard_group_id: crate::control_plane::membership::ShardGroupId) -> Self {
+        MetadataStateMachine {
+            topics: HashMap::new(),
+            topic_name_index: HashMap::new(),
+            next_topic_id: shard_group_id.0 << 32,
+            pending_proposals: Vec::new(),
+        }
+    }
+
     pub(crate) fn get_topic(&self, id: &TopicId) -> Option<&TopicMeta> {
         self.topics.get(id)
     }
@@ -325,8 +333,7 @@ mod tests {
     use super::super::constants::*;
     use super::super::range::*;
     use super::*;
-    use std::collections::VecDeque;
-
+    use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::{
         NodeId,
         metadata::{
@@ -334,6 +341,7 @@ mod tests {
             strategy::{PartitionStrategy, StoragePolicy},
         },
     };
+    use std::collections::VecDeque;
 
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
@@ -443,7 +451,7 @@ mod tests {
 
     #[test]
     fn delete_segments_marks_oldest_prefix_deleting() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
 
         let result = delete_segments(&mut sm, t, &[0, 1]).unwrap();
@@ -461,7 +469,7 @@ mod tests {
 
     #[test]
     fn delete_segments_skips_the_active_head() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
         // Naming the active head (seg 3) alongside the sealed prefix: only the sealed
         // ones transition; the write head is skipped, never deleted.
@@ -479,14 +487,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "not an oldest-first prefix")]
     fn delete_segments_non_prefix_trips_invariant() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
         let _ = delete_segments(&mut sm, t, &[1]);
     }
 
     #[test]
     fn delete_segments_is_idempotent() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
         assert!(matches!(
             delete_segments(&mut sm, t, &[0]).unwrap(),
@@ -501,7 +509,7 @@ mod tests {
 
     #[test]
     fn expired_prefix_selects_by_age_oldest_first() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm); // sealed_at 100/200/300, retention 3_600_000
         let topic = sm.get_topic(&t).unwrap();
 
@@ -516,7 +524,7 @@ mod tests {
 
     #[test]
     fn expired_prefix_empty_without_retention() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t = sm
             .apply(MetadataCommand::CreateTopic(CreateTopic {
                 name: "no-retention".into(),
@@ -598,7 +606,7 @@ mod tests {
 
     #[test]
     fn reassign_swaps_a_sealed_segments_replica_set() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let topic_id = create_topic(&mut sm, "blue");
         // Roll so SegmentId(0) becomes Sealed (SegmentId(1) is the new write head).
         roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
@@ -626,7 +634,7 @@ mod tests {
 
     #[test]
     fn reassign_same_set_is_a_noop() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let topic_id = create_topic(&mut sm, "blue");
         roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
         let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
@@ -650,7 +658,7 @@ mod tests {
 
     #[test]
     fn reassign_rejects_an_active_segment() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let topic_id = create_topic(&mut sm, "blue");
         // SegmentId(0) is the active write head — no roll yet.
         let active = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
@@ -664,7 +672,7 @@ mod tests {
 
     #[test]
     fn reassign_rejects_an_unknown_segment() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let topic_id = create_topic(&mut sm, "blue");
         let unknown = SegmentKey::new(topic_id, RangeId(0), SegmentId(99));
 
@@ -679,7 +687,7 @@ mod tests {
 
     #[test]
     fn create_topic_basic() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let id = create_topic(&mut sm, "blue");
 
         let topic = sm.get_topic(&id).unwrap();
@@ -696,7 +704,7 @@ mod tests {
 
     #[test]
     fn create_topic_duplicate_name_rejected() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
@@ -710,7 +718,7 @@ mod tests {
 
     #[test]
     fn create_topic_increments_id() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let id1 = create_topic(&mut sm, "alpha");
         let id2 = create_topic(&mut sm, "beta");
 
@@ -721,7 +729,7 @@ mod tests {
 
     #[test]
     fn create_topic_initial_offsets() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let id = create_topic(&mut sm, "blue");
 
         let topic = sm.get_topic(&id).unwrap();
@@ -735,7 +743,7 @@ mod tests {
 
     #[test]
     fn create_topic_name_index() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let id = create_topic(&mut sm, "blue");
 
         let found = sm.get_topic_by_name("blue").unwrap();
@@ -747,7 +755,7 @@ mod tests {
 
     #[test]
     fn roll_segment_creates_next() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
@@ -759,7 +767,7 @@ mod tests {
 
     #[test]
     fn roll_segment_increments_segment_id() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
@@ -773,7 +781,7 @@ mod tests {
 
     #[test]
     fn roll_segment_bad_topic() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             segment_key: SegmentKey::new(TopicId(99), RangeId(0), SegmentId(0)),
             sealed_at: 2000,
@@ -785,7 +793,7 @@ mod tests {
 
     #[test]
     fn roll_segment_bad_range() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
@@ -799,7 +807,7 @@ mod tests {
 
     #[test]
     fn roll_segment_stale_is_rejected() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
@@ -819,7 +827,7 @@ mod tests {
 
     #[test]
     fn split_range_basic() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
@@ -840,7 +848,7 @@ mod tests {
 
     #[test]
     fn split_range_updates_active_ranges() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
@@ -852,7 +860,7 @@ mod tests {
 
     #[test]
     fn split_range_lineage() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
@@ -863,7 +871,7 @@ mod tests {
 
     #[test]
     fn split_range_fixed_rejected() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
             name: "ordered".to_string(),
             storage_policy: fixed_policy(),
@@ -888,7 +896,7 @@ mod tests {
 
     #[test]
     fn split_range_invalid_split_point() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let upper_bound = sm.apply(MetadataCommand::SplitRange(SplitRange {
@@ -914,7 +922,7 @@ mod tests {
 
     #[test]
     fn split_range_keyspace_coverage() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
@@ -932,7 +940,7 @@ mod tests {
 
     #[test]
     fn merge_range_basic() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -947,7 +955,7 @@ mod tests {
 
     #[test]
     fn merge_range_active_ranges_updated() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -959,7 +967,7 @@ mod tests {
 
     #[test]
     fn merge_range_lineage() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -973,7 +981,7 @@ mod tests {
 
     #[test]
     fn merge_range_non_adjacent_rejected() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
         let (c1a, _c1b) = split_range(&mut sm, tid, c1, vec![0x40], 3000);
@@ -992,7 +1000,7 @@ mod tests {
 
     #[test]
     fn delete_topic_cascades() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
@@ -1014,7 +1022,7 @@ mod tests {
 
     #[test]
     fn delete_topic_removes_name_index() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let _tid = create_topic(&mut sm, "blue");
 
         sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
@@ -1027,7 +1035,7 @@ mod tests {
 
     #[test]
     fn delete_topic_nonexistent() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let result = sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
             name: "nope".into(),
         }));
@@ -1038,7 +1046,7 @@ mod tests {
 
     #[test]
     fn create_split_seal() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, _c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -1051,7 +1059,7 @@ mod tests {
 
     #[test]
     fn split_merge_roundtrip() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -1066,7 +1074,7 @@ mod tests {
 
     #[test]
     fn multiple_topics_independent() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let t1 = create_topic(&mut sm, "alpha");
         let t2 = create_topic(&mut sm, "beta");
 
@@ -1084,7 +1092,7 @@ mod tests {
 
     #[test]
     fn roll_already_rolled_segment_is_stale() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
@@ -1106,7 +1114,7 @@ mod tests {
 
     #[test]
     fn seal_history_records_timestamps() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
@@ -1119,7 +1127,7 @@ mod tests {
 
     #[test]
     fn seal_history_prunes_old_entries() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
@@ -1170,7 +1178,7 @@ mod tests {
 
     #[test]
     fn auto_proposal_on_hot_range() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         for i in 0..SPLIT_SEAL_THRESHOLD {
@@ -1190,7 +1198,7 @@ mod tests {
 
     #[test]
     fn no_auto_proposal_below_threshold() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         for i in 0..(SPLIT_SEAL_THRESHOLD - 1) {
@@ -1209,7 +1217,7 @@ mod tests {
 
     #[test]
     fn no_auto_proposal_for_fixed_strategy() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
             name: "ordered".to_string(),
             storage_policy: fixed_policy(),
@@ -1237,7 +1245,7 @@ mod tests {
 
     #[test]
     fn evaluate_merges_cold_adjacent() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -1249,7 +1257,7 @@ mod tests {
 
     #[test]
     fn evaluate_merges_one_hot() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, _c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
         sm.take_pending_proposals(); // discard any split proposals
@@ -1263,7 +1271,7 @@ mod tests {
 
     #[test]
     fn split_clears_seal_history() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
@@ -1276,7 +1284,7 @@ mod tests {
 
     #[test]
     fn split_sets_cooldown() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
 
@@ -1295,7 +1303,7 @@ mod tests {
 
     #[test]
     fn active_segments_for_node_returns_matching() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let segments = sm.active_segments_for_node(&NodeId::new("node-1"));
@@ -1309,7 +1317,7 @@ mod tests {
 
     #[test]
     fn active_segments_for_node_excludes_non_member() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         create_topic(&mut sm, "blue");
 
         let segments = sm.active_segments_for_node(&NodeId::new("node-99"));
@@ -1318,7 +1326,7 @@ mod tests {
 
     #[test]
     fn active_segments_for_node_excludes_sealed() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
@@ -1331,7 +1339,7 @@ mod tests {
 
     #[test]
     fn roll_segment_uses_end_entry_id() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
@@ -1361,7 +1369,7 @@ mod tests {
 
     #[test]
     fn end_offset_correction_updates_placeholder() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         // Death-triggered roll with end_entry_id=0 (placeholder)
@@ -1393,7 +1401,7 @@ mod tests {
 
     #[test]
     fn end_offset_correction_rejected_when_already_set() {
-        let mut sm = MetadataStateMachine::default();
+        let mut sm = MetadataStateMachine::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         // Normal roll with actual end_entry_id

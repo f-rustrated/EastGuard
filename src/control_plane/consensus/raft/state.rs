@@ -174,7 +174,7 @@ impl Raft {
             last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
-            state_machine: MetadataStateMachine::default(),
+            state_machine: MetadataStateMachine::new(shard_group_id),
             pending_proposals: Vec::new(),
             leaderless_segments: Vec::new(),
             peer_states: HashMap::new(),

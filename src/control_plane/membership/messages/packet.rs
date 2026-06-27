@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::control_plane::{NodeId, SwimNode};
+use crate::control_plane::{NodeAddress, NodeId, SwimNode};
 
 use super::dissemination_buffer::ShardLeaderInfo;
 
@@ -11,6 +11,7 @@ use super::dissemination_buffer::ShardLeaderInfo;
 pub struct SwimHeader {
     pub seq: u64,
     pub source_node_id: NodeId,
+    pub source_addr: NodeAddress,
     pub source_incarnation: u64,
     pub gossip: Vec<SwimNode>,
     pub shard_leaders: Vec<ShardLeaderInfo>,

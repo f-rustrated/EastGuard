@@ -203,6 +203,10 @@ async fn test_ping_response() {
     let ping = SwimPacket::Ping(SwimHeader {
         seq: 100,
         source_node_id: NodeId::new("node-remote"),
+        source_addr: NodeAddress::test(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ),
         source_incarnation: 0,
         gossip: vec![],
         shard_leaders: vec![],
@@ -248,6 +252,10 @@ async fn test_refutation_mechanism() {
     let ping = SwimPacket::Ping(SwimHeader {
         seq: 200,
         source_node_id: NodeId::new("node-remote"),
+        source_addr: NodeAddress::test(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ),
         source_incarnation: 0,
         gossip: vec![lie],
         shard_leaders: vec![],
@@ -302,6 +310,10 @@ async fn test_gossip_propagation() {
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 300,
                 source_node_id: NodeId::new("node-sender"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 0,
                 gossip: vec![gossip_msg],
                 shard_leaders: vec![],
@@ -323,6 +335,10 @@ async fn test_gossip_propagation() {
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 400 + i, // Increment seq to keep packets distinct
                     source_node_id: NodeId::new("node-probe"),
+                    source_addr: NodeAddress::test(
+                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    ),
                     source_incarnation: 0,
                     gossip: vec![],
                     shard_leaders: vec![],
@@ -397,6 +413,10 @@ async fn test_indirect_ping_trigger() {
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-peer-1"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![
                     make_peer("node-peer-1", peer_1),
@@ -453,6 +473,10 @@ async fn test_alive_gossip_adds_node_to_topology() {
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-sender"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
                     node_id: NodeId::new("node-new"),
@@ -488,6 +512,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
                 packet: SwimPacket::Ping(SwimHeader {
                     seq: 1,
                     source_node_id: NodeId::new("node-sender"),
+                    source_addr: NodeAddress::test(
+                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    ),
                     source_incarnation: 1,
                     gossip: vec![SwimNode {
                         node_id: NodeId::new("node-target"),
@@ -516,6 +544,10 @@ async fn test_dead_gossip_removes_node_from_topology() {
             packet: SwimPacket::Ping(SwimHeader {
                 seq: 2,
                 source_node_id: NodeId::new("node-sender"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![SwimNode {
                     node_id: NodeId::new("node-target"),
