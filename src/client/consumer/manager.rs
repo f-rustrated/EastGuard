@@ -1,9 +1,9 @@
 use super::RangeCursorSet;
-use crate::client::ClientError;
 use crate::client::consumer::bootstrap::{KeyInterest, StartPolicy};
 use crate::client::consumer::fetch::run_fetch_actor;
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord};
+use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::RangeTransition;
 use crate::control_plane::metadata::RangeId;
 
@@ -232,9 +232,9 @@ pub(crate) async fn run_cursor_manager(
     weak_ctx: std::sync::Weak<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     consumer_group: Option<Arc<ConsumerGroup>>,
-    start_policy: StartPolicy,
+    config: ConsumerConfig,
 ) {
-    let mut state = CursorManagerState::new(cursors, consumer_group, start_policy);
+    let mut state = CursorManagerState::new(cursors, consumer_group, config.start_policy);
     if state.should_exit() {
         return;
     }
@@ -244,6 +244,8 @@ pub(crate) async fn run_cursor_manager(
     }
 
     let mut rebalance_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut commit_interval =
+        tokio::time::interval(Duration::from_millis(config.auto_commit_interval_ms));
 
     // Waiting exactly 2 tickets(~2secs) before the first rebalance.
     let mut startup_grace_ticks = if state.consumer_group.is_some() { 2 } else { 0 };
@@ -261,6 +263,11 @@ pub(crate) async fn run_cursor_manager(
                 if state.should_exit() {
                     break;
                 }
+            }
+
+            _ = commit_interval.tick(), if state.consumer_group.is_some() => {
+                let group = state.consumer_group.as_ref().unwrap();
+                let _ = group.commit().await;
             }
 
             _ = rebalance_interval.tick(), if state.consumer_group.is_some() => {

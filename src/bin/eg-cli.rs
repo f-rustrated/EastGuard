@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use east_guard::client::{
-    Client, Consumer, ConsumerRecord, KeyInterest, PartitionStrategy, Producer, ProducerConfig,
-    StoragePolicy,
+    Client, Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, PartitionStrategy, Producer,
+    ProducerConfig, StoragePolicy,
 };
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -44,6 +44,9 @@ enum Commands {
         /// Optional group ID for consumer group offset management
         #[arg(short, long)]
         group: Option<String>,
+        /// Optional auto-commit interval in milliseconds (default: 1000)
+        #[arg(long, default_value = "1000")]
+        auto_commit_ms: u64,
     },
     /// Exit the CLI
     Exit,
@@ -158,7 +161,19 @@ async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<
             count,
             timeout_sec,
             group,
-        } => handle_consume(client, topic, start, count, timeout_sec, group).await,
+            auto_commit_ms,
+        } => {
+            handle_consume(
+                client,
+                topic,
+                start,
+                count,
+                timeout_sec,
+                group,
+                auto_commit_ms,
+            )
+            .await
+        }
         Commands::Exit | Commands::Quit => {
             // Handled in main loop
             Ok(())
@@ -208,6 +223,7 @@ async fn handle_consume(
     count: usize,
     timeout_sec: Option<u64>,
     group: Option<String>,
+    auto_commit_ms: u64,
 ) -> anyhow::Result<()> {
     let start_policy = start.parse()?;
     println!(
@@ -215,14 +231,14 @@ async fn handle_consume(
         count, topic, start, group
     );
 
-    let consumer = Consumer::new(
-        client.clone(),
-        topic,
-        KeyInterest::AllKeys,
+    let config = ConsumerConfig {
         start_policy,
-        group.clone(),
-    )
-    .await?;
+        group_id: group.clone(),
+        auto_commit_interval_ms: auto_commit_ms,
+    };
+
+    let consumer =
+        Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, config).await?;
 
     let mut fetched = 0;
     let limit = if count == 0 { usize::MAX } else { count };
@@ -247,11 +263,6 @@ async fn handle_consume(
             Ok(Some(record)) => {
                 print_record(&record);
                 fetched += 1;
-
-                // Auto-commit periodically in unlimited mode
-                if count == 0 && group.is_some() && fetched % 10 == 0 {
-                    let _ = consumer.commit().await;
-                }
             }
             Ok(None) => {
                 println!("Topic drained.");

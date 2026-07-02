@@ -1,6 +1,6 @@
 use crate::client::{
-    Client, ClientError, Consumer, ConsumerRecord, KeyInterest, PartitionStrategy, Producer,
-    ProducerConfig, StartPolicy, StoragePolicy,
+    Client, ClientError, Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, PartitionStrategy,
+    Producer, ProducerConfig, StartPolicy, StoragePolicy,
 };
 use crate::control_plane::metadata::RangeId;
 use arc_swap::ArcSwap;
@@ -199,10 +199,15 @@ impl ConsumerGroup {
     }
 
     pub fn rebalance(&self, active_ranges: &[RangeId]) -> (Vec<RangeId>, Vec<RangeId>) {
-        let latest_assignments = self.assigned_ranges(active_ranges);
-        let current_owned = self.owned_ranges.load();
-        let current_set = current_owned.as_ref().as_ref().cloned().unwrap_or_default();
-        let latest_set: HashSet<RangeId> = latest_assignments.into_iter().collect();
+        let current_set = self
+            .owned_ranges
+            .load()
+            .as_ref()
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        let latest_set: HashSet<RangeId> =
+            self.assigned_ranges(active_ranges).into_iter().collect();
         let to_drop: Vec<RangeId> = current_set
             .iter()
             .filter(|r| !latest_set.contains(r))
@@ -253,8 +258,7 @@ async fn heartbeat_receiver(
         client,
         SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
         KeyInterest::AllKeys,
-        StartPolicy::Latest,
-        None,
+        ConsumerConfig::new(StartPolicy::Latest),
     )
     .await;
 

@@ -1,5 +1,5 @@
 use super::{NodeSpec, host_cluster};
-use crate::client::{Client, Consumer, KeyInterest, Producer, ProducerConfig, StartPolicy};
+use crate::client::{Client, Consumer, ConsumerConfig, KeyInterest, Producer, ProducerConfig, StartPolicy};
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,8 +85,11 @@ fn consumer_group_assignment_and_offsets() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            StartPolicy::Earliest,
-            Some(group_id.clone()),
+            ConsumerConfig {
+                start_policy: StartPolicy::Earliest,
+                group_id: Some(group_id.clone()),
+                auto_commit_interval_ms: 1000,
+            },
         )
         .await
         .unwrap();
@@ -128,8 +131,11 @@ fn consumer_group_assignment_and_offsets() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            StartPolicy::Earliest,
-            Some(group_id.clone()),
+            ConsumerConfig {
+                start_policy: StartPolicy::Earliest,
+                group_id: Some(group_id.clone()),
+                auto_commit_interval_ms: 1000,
+            },
         )
         .await
         .unwrap();
@@ -182,7 +188,7 @@ fn consumer_group_scale_out_and_rebalance() {
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
         let group_id = "scale-group".to_string();
 
-        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
 
         for i in 0..10 {
             producer.send(format!("key_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
@@ -202,7 +208,7 @@ fn consumer_group_scale_out_and_rebalance() {
         c1.commit().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         for i in 10..30 {
@@ -265,8 +271,8 @@ fn consumer_group_failover() {
 
         let group_id = "failover-group".to_string();
 
-        let c1 = Consumer::new(client_c1.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
-        let c2 = Consumer::new(client_c2.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c1 = Consumer::new(client_c1.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c2 = Consumer::new(client_c2.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -346,8 +352,8 @@ fn consumer_group_independent_groups() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let c_alpha = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-alpha".to_string())).await.unwrap();
-        let c_beta = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-beta".to_string())).await.unwrap();
+        let c_alpha = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some("group-alpha".to_string()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c_beta = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some("group-beta".to_string()), auto_commit_interval_ms: 1000 }).await.unwrap();
 
         let mut alpha_count = 0;
         let mut beta_count = 0;

@@ -25,8 +25,7 @@ use crate::client::nodes::KnownNodes;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use codec::CompressionCodec;
-pub use consumer::{Consumer, ConsumerRecord};
-pub use consumer::{KeyInterest, StartPolicy};
+pub use consumer::{Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, StartPolicy};
 pub use error::ClientError;
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};
@@ -141,8 +140,7 @@ impl Client {
             self,
             SYSTEM_TOPIC_OFFSETS.to_string(),
             KeyInterest::AllKeys,
-            StartPolicy::Earliest,
-            None,
+            ConsumerConfig::new(StartPolicy::Earliest),
         )
         .await?;
 

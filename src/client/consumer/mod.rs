@@ -26,6 +26,23 @@ pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
 pub use record::ConsumerRecord;
 
+#[derive(Debug, Clone)]
+pub struct ConsumerConfig {
+    pub start_policy: StartPolicy,
+    pub group_id: Option<String>,
+    pub auto_commit_interval_ms: u64,
+}
+
+impl ConsumerConfig {
+    pub fn new(start_policy: StartPolicy) -> Self {
+        Self {
+            start_policy,
+            group_id: None,
+            auto_commit_interval_ms: 5000, // Default to 1 second for groups
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Consumer {
     ctx: Arc<ConsumerContext>,
@@ -38,17 +55,15 @@ impl Consumer {
         client: Arc<Client>,
         topic: String,
         interest: KeyInterest,
-        start_policy: StartPolicy,
-        group_id: impl Into<Option<String>>,
+        config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
-        let group_id = group_id.into();
         let detail = client.resolve_topic(&topic).await?;
-        let mut cursors = CursorBootstrap::build(&detail, interest, start_policy);
+        let mut cursors = CursorBootstrap::build(&detail, interest, config.start_policy);
 
         let mut consumer_group = None;
 
         // Consolidate all group-specific logic into a single block
-        if let Some(gid) = &group_id {
+        if let Some(gid) = config.group_id.clone() {
             let group = Arc::new(ConsumerGroup::new(
                 client.clone(),
                 gid.to_string(),
@@ -58,7 +73,7 @@ impl Consumer {
             consumer_group = Some(group);
         }
 
-        if matches!(start_policy, StartPolicy::Latest) {
+        if matches!(config.start_policy, StartPolicy::Latest) {
             for cursor in cursors.cursors_mut() {
                 let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
                 if !has_saved_offset
@@ -87,7 +102,7 @@ impl Consumer {
             &ctx,
             record_tx,
             consumer_group.clone(),
-            start_policy,
+            config,
         );
 
         Ok(Self {
@@ -103,7 +118,7 @@ impl Consumer {
         ctx: &Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
         consumer_group: Option<Arc<ConsumerGroup>>,
-        start_policy: StartPolicy,
+        config: ConsumerConfig,
     ) {
         tokio::spawn(run_cursor_manager(
             cursors,
@@ -111,7 +126,7 @@ impl Consumer {
             Arc::downgrade(ctx),
             record_tx,
             consumer_group,
-            start_policy,
+            config,
         ));
     }
 
