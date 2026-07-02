@@ -168,7 +168,7 @@ impl FetchActor {
                 let (start_id, _) = self
                     .ctx
                     .client
-                    .fetch_range_offsets(&self.ctx.topic, self.range_id)
+                    .fetch_range_entry_ids(&self.ctx.topic, self.range_id)
                     .await?;
 
                 if self.next_entry_id < start_id {

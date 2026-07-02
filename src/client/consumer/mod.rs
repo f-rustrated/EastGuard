@@ -62,10 +62,10 @@ impl Consumer {
             for cursor in cursors.cursors_mut() {
                 let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
                 if !has_saved_offset
-                    && let Ok((_, committed_id)) =
-                        client.fetch_range_offsets(&topic, cursor.range_id).await
+                    && let Ok((_, committed_entry_id)) =
+                        client.fetch_range_entry_ids(&topic, cursor.range_id).await
                 {
-                    cursor.next_entry_id = committed_id;
+                    cursor.next_entry_id = committed_entry_id;
                 }
             }
         }

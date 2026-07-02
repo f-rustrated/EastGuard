@@ -95,7 +95,7 @@ impl Client {
         }
     }
 
-    pub async fn fetch_range_offsets(
+    pub async fn fetch_range_entry_ids(
         &self,
         topic: &str,
         range_id: RangeId,
