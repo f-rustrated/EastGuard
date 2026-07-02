@@ -9,3 +9,9 @@ pub struct ConsumerRecord {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
+
+impl ConsumerRecord {
+    pub fn key_match<'a>(&'a self, key: impl Iterator<Item = &'a u8>) -> bool {
+        self.key.iter().eq(key)
+    }
+}
