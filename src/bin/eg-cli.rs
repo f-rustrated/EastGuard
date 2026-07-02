@@ -215,7 +215,7 @@ async fn handle_consume(
         count, topic, start, group
     );
 
-    let consumer = Consumer::new_with_group(
+    let consumer = Consumer::new(
         client.clone(),
         topic,
         KeyInterest::AllKeys,
