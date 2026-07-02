@@ -182,6 +182,29 @@ impl ConsumerGroup {
 
         ranges
     }
+
+    pub fn rebalance(&self, active_ranges: &[RangeId]) -> (Vec<RangeId>, Vec<RangeId>) {
+        let latest_assignments = self.assigned_ranges(active_ranges);
+        let current_owned = self.owned_ranges.load();
+        let current_set = current_owned.as_ref().as_ref().cloned().unwrap_or_default();
+        let latest_set: HashSet<RangeId> = latest_assignments.into_iter().collect();
+        let to_drop: Vec<RangeId> = current_set
+            .iter()
+            .filter(|r| !latest_set.contains(r))
+            .copied()
+            .collect();
+        let to_start: Vec<RangeId> = latest_set
+            .iter()
+            .filter(|r| !current_set.contains(r))
+            .copied()
+            .collect();
+
+        if !to_drop.is_empty() || !to_start.is_empty() {
+            self.owned_ranges.store(Arc::new(Some(latest_set)));
+        }
+
+        (to_drop, to_start)
+    }
 }
 
 async fn group_heartbeat_sender(consumer_id: Uuid, hb_client: Arc<Client>, routing_key: String) {

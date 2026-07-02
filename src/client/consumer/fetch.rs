@@ -164,8 +164,13 @@ impl FetchActor {
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
-                 let prev_entry_id = self.next_entry_id;
-                 let (start_id, _) = self.ctx.client.fetch_range_offsets(&self.ctx.topic, self.range_id).await?;
+                let prev_entry_id = self.next_entry_id;
+                let (start_id, _) = self
+                    .ctx
+                    .client
+                    .fetch_range_offsets(&self.ctx.topic, self.range_id)
+                    .await?;
+
                 if self.next_entry_id < start_id {
                     self.next_entry_id = start_id;
                 }
@@ -233,7 +238,6 @@ impl ConsumerContext {
             // If we found either, try to pick a replica from it
             .and_then(|seg| seg.pick_replica())
     }
-
 
     /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
     pub(crate) async fn refresh_metadata(&self) -> Result<(), ClientError> {
