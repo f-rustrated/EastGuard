@@ -65,20 +65,38 @@ impl Consumer {
             cursor_tx,
         });
 
-        tokio::spawn(run_cursor_manager(
+        Self::spawn_manager(
             cursors,
             cursor_rx,
-            Arc::downgrade(&ctx),
+            &ctx,
             record_tx,
             consumer_group.clone(),
             start_policy,
-        ));
+        );
 
         Ok(Self {
             ctx,
             record_rx,
             group: consumer_group,
         })
+    }
+
+    fn spawn_manager(
+        cursors: RangeCursorSet,
+        cursor_rx: flume::Receiver<CursorDrained>,
+        ctx: &Arc<ConsumerContext>,
+        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+        consumer_group: Option<Arc<ConsumerGroup>>,
+        start_policy: StartPolicy,
+    ) {
+        tokio::spawn(run_cursor_manager(
+            cursors,
+            cursor_rx,
+            Arc::downgrade(ctx),
+            record_tx,
+            consumer_group,
+            start_policy,
+        ));
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
