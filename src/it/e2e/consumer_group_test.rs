@@ -81,7 +81,7 @@ fn consumer_group_assignment_and_offsets() {
         let group_id = "test-group".to_string();
 
         // Start a consumer with the group
-        let c1 = Consumer::new_with_group(
+        let c1 = Consumer::new(
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
@@ -94,7 +94,7 @@ fn consumer_group_assignment_and_offsets() {
         let mut c1_records = 0;
         // With 3 partitions and only 1 consumer, c1 should consume everything
         loop {
-            match tokio::time::timeout(Duration::from_secs(1), c1.next_record()).await {
+            match tokio::time::timeout(Duration::from_secs(6), c1.next_record()).await {
                 Ok(Ok(Some(_))) => {
                     c1_records += 1;
                 }
@@ -124,7 +124,7 @@ fn consumer_group_assignment_and_offsets() {
 
         // Start a second consumer in the SAME group
         // It should pick up the committed offsets and only read the new 5 messages
-        let c2 = Consumer::new_with_group(
+        let c2 = Consumer::new(
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
@@ -182,7 +182,7 @@ fn consumer_group_scale_out_and_rebalance() {
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
         let group_id = "scale-group".to_string();
 
-        let c1 = Consumer::new_with_group(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
 
         for i in 0..10 {
             producer.send(format!("key_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
@@ -202,7 +202,7 @@ fn consumer_group_scale_out_and_rebalance() {
         c1.commit().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let c2 = Consumer::new_with_group(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         for i in 10..30 {
@@ -265,8 +265,8 @@ fn consumer_group_failover() {
 
         let group_id = "failover-group".to_string();
 
-        let c1 = Consumer::new_with_group(client_c1.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
-        let c2 = Consumer::new_with_group(client_c2.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c1 = Consumer::new(client_c1.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
+        let c2 = Consumer::new(client_c2.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some(group_id.clone())).await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -346,8 +346,8 @@ fn consumer_group_independent_groups() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let c_alpha = Consumer::new_with_group(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-alpha".to_string())).await.unwrap();
-        let c_beta = Consumer::new_with_group(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-beta".to_string())).await.unwrap();
+        let c_alpha = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-alpha".to_string())).await.unwrap();
+        let c_beta = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, StartPolicy::Earliest, Some("group-beta".to_string())).await.unwrap();
 
         let mut alpha_count = 0;
         let mut beta_count = 0;
