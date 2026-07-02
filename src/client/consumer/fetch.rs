@@ -164,8 +164,8 @@ impl FetchActor {
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
-                let prev_entry_id = self.next_entry_id;
-                let (start_id, _) = self.ctx.fetch_range_offsets(self.range_id).await?;
+                 let prev_entry_id = self.next_entry_id;
+                 let (start_id, _) = self.ctx.client.fetch_range_offsets(&self.ctx.topic, self.range_id).await?;
                 if self.next_entry_id < start_id {
                     self.next_entry_id = start_id;
                 }
@@ -234,31 +234,6 @@ impl ConsumerContext {
             .and_then(|seg| seg.pick_replica())
     }
 
-    pub(crate) async fn fetch_range_offsets(
-        &self,
-        range_id: RangeId,
-    ) -> Result<(u64, u64), ClientError> {
-        let addr = self
-            .pick_replica_for_range(range_id)
-            .unwrap_or_else(|| self.client.next_known_node());
-
-        let req = RangeOffsetRequest {
-            topic_name: self.topic.clone(),
-            range_id,
-        };
-
-        let served = self.client.call(addr, req).await?;
-
-        let ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
-            start_entry_id,
-            committed_entry_id,
-        }) = served.response
-        else {
-            return Err(ClientError::UnexpectedResponse);
-        };
-
-        Ok((start_entry_id, committed_entry_id))
-    }
 
     /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
     pub(crate) async fn refresh_metadata(&self) -> Result<(), ClientError> {
