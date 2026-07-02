@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use east_guard::client::{
-    Client, Consumer, KeyInterest, PartitionStrategy, Producer, ProducerConfig, StartPolicy,
+    Client, Consumer, ConsumerRecord, KeyInterest, PartitionStrategy, Producer, ProducerConfig,
     StoragePolicy,
 };
 use rustyline::completion::{Completer, Pair};
@@ -35,7 +35,8 @@ enum Commands {
         topic: String,
         #[arg(default_value = "earliest")]
         start: String,
-        #[arg(default_value = "10")]
+        /// 0 means no bound
+        #[arg(default_value = "0")]
         count: usize,
         /// Optional timeout in seconds to wait for new messages. If absent, waits indefinitely.
         #[arg(short, long)]
@@ -140,125 +141,174 @@ async fn main() -> anyhow::Result<()> {
     println!("Goodbye!");
     Ok(())
 }
-
 async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Result<()> {
     match cmd {
         Commands::CreateTopic {
             topic,
             replication_factor,
-        } => {
-            let policy = StoragePolicy {
-                retention_ms: None,
-                replication_factor,
-                partition_strategy: PartitionStrategy::AutoSplit,
-            };
-            println!("Creating topic '{}' (RF={})...", topic, replication_factor);
-            client.create_topic(&topic, policy).await?;
-            println!("Topic created successfully.");
-        }
+        } => handle_create_topic(client, topic, replication_factor).await,
         Commands::Publish {
             topic,
             key,
             message,
-        } => {
-            let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
-            let entry_id = producer.send(key.as_bytes(), message.into_bytes()).await?;
-            println!(
-                "Published to '{}' [key: '{}'] -> entry_id: {}",
-                topic, key, entry_id
-            );
-        }
+        } => handle_publish(client, topic, key, message).await,
         Commands::Consume {
             topic,
             start,
             count,
             timeout_sec,
             group,
-        } => {
-            let start_policy = match start.to_lowercase().as_str() {
-                "latest" => StartPolicy::Latest,
-                "earliest" => StartPolicy::Earliest,
-                _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
-            };
-
-            if let Some(ref g) = group {
-                println!(
-                    "Consuming up to {} records from '{}' (start: {}, group: {})...",
-                    count, topic, start, g
-                );
-            } else {
-                println!(
-                    "Consuming up to {} records from '{}' (start: {})...",
-                    count, topic, start
-                );
-            }
-
-            let consumer = Consumer::new_with_group(
-                client.clone(),
-                topic,
-                KeyInterest::AllKeys,
-                start_policy,
-                group.clone(),
-            )
-            .await?;
-
-            let mut fetched = 0;
-            while fetched < count {
-                let next_record_future = consumer.next_record();
-
-                let result = if let Some(sec) = timeout_sec {
-                    tokio::time::timeout(std::time::Duration::from_secs(sec), next_record_future)
-                        .await
-                } else {
-                    Ok(next_record_future.await)
-                };
-
-                match result {
-                    Ok(Ok(Some(record))) => {
-                        println!(
-                            "[{}] key: '{}', value: '{}'",
-                            record.offset,
-                            String::from_utf8_lossy(&record.key),
-                            String::from_utf8_lossy(&record.value)
-                        );
-                        fetched += 1;
-                    }
-                    Ok(Ok(None)) => {
-                        println!("Topic drained.");
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        println!("Consume error: {}", e);
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout reached, no more records immediately available
-                        break;
-                    }
-                }
-            }
-            if fetched == 0 {
-                println!("(No records found)");
-            } else if fetched == count {
-                println!("(Reached limit of {} records)", count);
-            } else {
-                println!("(Fetched {} records)", fetched);
-            }
-
-            if group.is_some() && fetched > 0 {
-                println!("Committing offsets...");
-                if let Err(e) = consumer.commit().await {
-                    println!("Failed to commit offsets: {}", e);
-                } else {
-                    println!("Offsets committed successfully.");
-                }
-            }
-        }
+        } => handle_consume(client, topic, start, count, timeout_sec, group).await,
         Commands::Exit | Commands::Quit => {
             // Handled in main loop
+            Ok(())
         }
     }
+}
+
+async fn handle_create_topic(
+    client: &Arc<Client>,
+    topic: String,
+    replication_factor: u64,
+) -> anyhow::Result<()> {
+    let policy = StoragePolicy {
+        retention_ms: None,
+        replication_factor,
+        partition_strategy: PartitionStrategy::AutoSplit,
+    };
+
+    println!("Creating topic '{}' (RF={})...", topic, replication_factor);
+    client.create_topic(&topic, policy).await?;
+    println!("Topic created successfully.");
+
     Ok(())
+}
+
+async fn handle_publish(
+    client: &Arc<Client>,
+    topic: String,
+    key: String,
+    message: String,
+) -> anyhow::Result<()> {
+    let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+    let entry_id = producer.send(key.as_bytes(), message.into_bytes()).await?;
+
+    println!(
+        "Published to '{}' [key: '{}'] -> entry_id: {}",
+        topic, key, entry_id
+    );
+
+    Ok(())
+}
+
+async fn handle_consume(
+    client: &Arc<Client>,
+    topic: String,
+    start: String,
+    count: usize,
+    timeout_sec: Option<u64>,
+    group: Option<String>,
+) -> anyhow::Result<()> {
+    let start_policy = start.parse()?;
+    println!(
+        "Consuming up to {} records from '{}' (start: {}, group: {:?})...",
+        count, topic, start, group
+    );
+
+    let consumer = Consumer::new_with_group(
+        client.clone(),
+        topic,
+        KeyInterest::AllKeys,
+        start_policy,
+        group.clone(),
+    )
+    .await?;
+
+    let mut fetched = 0;
+    let limit = if count == 0 { usize::MAX } else { count };
+
+    while fetched < limit {
+        let next_record_future = consumer.next_record();
+
+        let result = tokio::select! {
+            _ = shutdown_signal() => {
+                println!("\nGracefully stopping consumer...");
+                break;
+            }
+            r =  fetch_with_optional_timeout(next_record_future, timeout_sec) => r,
+        };
+
+        let Ok(result) = result else {
+            // Timeout reached
+            break;
+        };
+
+        match result {
+            Ok(Some(record)) => {
+                print_record(&record);
+                fetched += 1;
+
+                // Auto-commit periodically in unlimited mode
+                if count == 0 && group.is_some() && fetched % 10 == 0 {
+                    let _ = consumer.commit().await;
+                }
+            }
+            Ok(None) => {
+                println!("Topic drained.");
+                break;
+            }
+            Err(e) => {
+                println!("Consume error: {}", e);
+                break;
+            }
+        }
+    }
+
+    if fetched == 0 {
+        println!("(No records found)");
+    }
+
+    if group.is_some() && fetched > 0 {
+        if let Err(e) = consumer.commit().await {
+            println!("Failed to commit offsets: {}", e);
+        } else {
+            println!("Offsets committed successfully.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_with_optional_timeout<F, T>(
+    fut: F,
+    timeout_sec: Option<u64>,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    match timeout_sec {
+        Some(sec) => tokio::time::timeout(std::time::Duration::from_secs(sec), fut).await,
+        None => Ok(fut.await),
+    }
+}
+
+fn print_record(record: &ConsumerRecord) {
+    // Replace RecordType with your actual struct
+    let sys_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+
+    print!(
+        "Fetched At:{}.{:03} ",
+        sys_time.as_secs() % 86_400,
+        sys_time.subsec_millis(),
+    );
+    println!(
+        "[[{}] key: '{}', value: '{}'",
+        record.offset,
+        String::from_utf8_lossy(&record.key),
+        String::from_utf8_lossy(&record.value)
+    );
 }
 
 struct CliHelper;
@@ -338,13 +388,13 @@ impl rustyline::hint::Hinter for CliHelper {
             }
             "consume" => {
                 if parts_count == 1 && ends_with_space {
-                    return Some("<TOPIC> [START] [COUNT] [-t TIMEOUT]".to_string());
+                    return Some("<TOPIC> [START] [COUNT] [-t TIMEOUT] [-g GROUP]".to_string());
                 } else if parts_count == 2 && ends_with_space {
-                    return Some("[START] [COUNT] [-t TIMEOUT]".to_string());
+                    return Some("[START] [COUNT] [-t TIMEOUT] [-g GROUP]".to_string());
                 } else if parts_count == 3 && ends_with_space {
-                    return Some("[COUNT] [-t TIMEOUT]".to_string());
+                    return Some("[COUNT] [-t TIMEOUT] [-g GROUP]".to_string());
                 } else if parts_count == 4 && ends_with_space {
-                    return Some("[-t TIMEOUT]".to_string());
+                    return Some("[-t TIMEOUT] [-g GROUP]".to_string());
                 }
             }
             _ => {}
@@ -361,3 +411,27 @@ impl rustyline::highlight::Highlighter for CliHelper {
 }
 impl rustyline::validate::Validator for CliHelper {}
 impl rustyline::Helper for CliHelper {}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}

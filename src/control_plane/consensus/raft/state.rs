@@ -3872,7 +3872,11 @@ mod tests {
     fn seal_segment_zero_with(raft: &mut Raft, sealed_set: Vec<NodeId>) -> SegmentKey {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
         create_topic_in_raft(raft, "t", sealed_set.clone());
-        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let seg0 = SegmentKey::new(
+            TopicId((raft.shard_group_id.0) << 32),
+            RangeId(0),
+            SegmentId(0),
+        );
         raft.propose(
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
