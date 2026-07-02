@@ -378,3 +378,125 @@ fn consumer_group_independent_groups() {
     });
     sim.run().unwrap();
 }
+#[test]
+fn consumer_group_split_rebalance() {
+    use crate::control_plane::metadata::RangeId;
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(10))
+        .simulation_duration(Duration::from_secs(60))
+        .build();
+
+    host_cluster(&mut sim, NODES, |env| {
+        env.node_id_suffix = Some(String::new());
+        env.vnodes_per_node = 16;
+        env.segment_size_limit_bytes = 1024; // Force size-based rolls but high enough to spare system topics
+    });
+
+    sim.client("client", async move {
+        let client_addr: std::net::SocketAddr = format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let client = Arc::new(Client::connect([client_addr]).unwrap());
+
+        let topic = format!("test_split_rebalance_{}", Uuid::new_v4());
+        client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 1, partition_strategy: PartitionStrategy::AutoSplit }).await.unwrap();
+        let _ = client.create_topic("__eastguard_assignments", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
+        let _ = client.create_topic("__eastguard_offsets", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
+
+        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let group_id = "split-group".to_string();
+
+        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Produce enough to trigger a roll (and eventually split)
+        // 3 segments are needed to trigger a split.
+        for i in 0..3 {
+            producer.send(b"k", vec![0u8; 1200]).await.unwrap();
+            // Wait for segment roll
+            let mut rolled = false;
+            for _ in 0..120 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if let Ok(detail) = client.resolve_topic(&topic).await {
+                    let r_opt = detail.ranges.iter().find(|r| r.range_id == RangeId(0));
+                    match r_opt {
+                        Some(r) => {
+                            if r.state == crate::control_plane::metadata::RangeState::Sealed {
+                                rolled = true;
+                                break;
+                            }
+                            if let Some(s) = &r.active_segment
+                                && s.segment_id >= (i + 1) as u64
+                            {
+                                rolled = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            rolled = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !rolled {
+                panic!("Timeout waiting for segment roll to {}", i + 1);
+            }
+        }
+
+        // Wait for split (ranges == 3)
+        let mut split = false;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Ok(detail) = client.resolve_topic(&topic).await && detail.ranges.len() == 3 {
+                split = true;
+                break;
+            
+            }
+        }
+        if !split {
+            panic!("Timeout waiting for split to 3 ranges");
+        }
+        
+        let detail = client.resolve_topic(&topic).await.unwrap();
+        assert_eq!(detail.ranges.len(), 3, "Topic must split into 3 ranges");
+
+        // Wait for rebalance (consumers to pick up the new children)
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Send messages to children
+        // Left child
+        for i in 0..5 {
+            producer.send(b"a", format!("left-{}", i).into_bytes()).await.unwrap();
+        }
+        // Right child
+        for i in 0..5 {
+            producer.send(b"\x90", format!("right-{}", i).into_bytes()).await.unwrap();
+        }
+
+        let mut c1_records = 0;
+        let mut c2_records = 0;
+        
+        let mut total_records = 0;
+        while total_records < 13 { // 3 parent + 5 left + 5 right
+            tokio::select! {
+                res = c1.next_record() => {
+                    if let Ok(Some(_)) = res { c1_records += 1; total_records += 1; }
+                }
+                res = c2.next_record() => {
+                    if let Ok(Some(_)) = res { c2_records += 1; total_records += 1; }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    panic!("Timeout: c1={}, c2={}", c1_records, c2_records);
+                }
+            }
+        }
+
+        // Due to consistent hash ring assignment of only 3 ranges, there's a 25% chance
+        // one consumer gets all three ranges. As long as all 13 records are processed,
+        // the split/rebalance mechanics are working.
+        assert_eq!(c1_records + c2_records, 13, "All records must be processed");
+        println!("Test completed. C1: {}, C2: {}", c1_records, c2_records);
+        Ok(())
+    });
+    sim.run().unwrap();
+}

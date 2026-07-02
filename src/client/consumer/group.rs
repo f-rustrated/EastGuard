@@ -198,7 +198,11 @@ impl ConsumerGroup {
         ranges
     }
 
-    pub fn rebalance(&self, active_ranges: &[RangeId]) -> (Vec<RangeId>, Vec<RangeId>) {
+    pub fn rebalance(
+        &self,
+        ranges: &[RangeId],
+        active_ranges: HashSet<RangeId>,
+    ) -> (Vec<RangeId>, Vec<RangeId>) {
         let current_set = self
             .owned_ranges
             .load()
@@ -206,20 +210,24 @@ impl ConsumerGroup {
             .as_ref()
             .cloned()
             .unwrap_or_default();
-        let latest_set: HashSet<RangeId> =
-            self.assigned_ranges(active_ranges).into_iter().collect();
+        let latest_set: HashSet<RangeId> = self.assigned_ranges(ranges).into_iter().collect();
         let to_drop: Vec<RangeId> = current_set
             .iter()
             .filter(|r| !latest_set.contains(r))
             .copied()
             .collect();
+
+        // Start tasks for any range in the target assignments that does not currently have an active task.
+        // This covers both:
+        //   1. Newly assigned ranges (which won't be in active_ranges)
+        //   2. Previously owned ranges whose fetch tasks crashed or stopped running (reconciliation)
         let to_start: Vec<RangeId> = latest_set
             .iter()
-            .filter(|r| !current_set.contains(r))
+            .filter(|r| !active_ranges.contains(r))
             .copied()
             .collect();
 
-        if !to_drop.is_empty() || !to_start.is_empty() {
+        if current_set != latest_set {
             self.owned_ranges.store(Arc::new(Some(latest_set)));
         }
 

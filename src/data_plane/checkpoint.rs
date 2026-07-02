@@ -97,7 +97,9 @@ impl CheckpointWorker {
         appender.flush_sync_and_release()?;
 
         sparse_index.put_batch(index_entries)?;
-        job.cache.advance_eviction_frontier(checkpoint.new_frontier);
+        // We do NOT advance the eviction frontier here. We defer it to the DataPlane thread
+        // via CheckpointComplete to prevent an invariant race condition where the frontier 
+        // advances before checkpoint_lsn is updated.
 
         println!(
             "[DEBUG CHECKPOINT] process_job completed successfully for {:?}",
@@ -106,6 +108,7 @@ impl CheckpointWorker {
         let completion: DataPlaneCommand = CheckpointComplete {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),
+            new_frontier: checkpoint.new_frontier,
         }
         .into();
         let _ = data_plane_tx.send(DataPlaneMessage::Command(completion));

@@ -69,14 +69,13 @@ impl CursorManagerState {
         if self.consumer_group.is_some() {
             return;
         }
-        for cursor in self.cursors.cursors() {
-            let handle = tokio::spawn(run_fetch_actor(
+        for cursor in self.cursors.cursors().to_vec() {
+            self.spawn_fetch_actor(
                 cursor.range_id,
                 cursor.next_entry_id,
                 ctx.clone(),
                 record_tx.clone(),
-            ));
-            self.active_tasks.insert(cursor.range_id, handle);
+            );
         }
     }
 
@@ -90,13 +89,12 @@ impl CursorManagerState {
         let added = self.cursors.apply_drained(event.range_id, event.transition);
 
         for new_cursor in added.iter() {
-            let handle = tokio::spawn(run_fetch_actor(
+            self.spawn_fetch_actor(
                 new_cursor.range_id,
                 new_cursor.next_entry_id,
                 ctx.clone(),
                 record_tx.clone(),
-            ));
-            self.active_tasks.insert(new_cursor.range_id, handle);
+            );
         }
     }
 
@@ -110,7 +108,7 @@ impl CursorManagerState {
         };
         let mut dead_peers = Vec::new();
 
-        // 1. cleanup dead peers
+        // Cleanup dead peers
         let peers_copy: Vec<(Uuid, u64)> = group
             .active_peers
             .iter()
@@ -141,16 +139,17 @@ impl CursorManagerState {
             self.stale_ticks.remove(&dead_id);
         }
 
-        // 2. Perform rebalance inside ConsumerGroup
-        let active_ranges = ctx.metadata.load().active_ranges();
-        let (to_drop, to_start) = group.rebalance(&active_ranges);
+        // Perform rebalance inside ConsumerGroup
+        let (to_drop, to_start) = group.rebalance(
+            &ctx.all_ranges(),
+            self.active_tasks.keys().cloned().collect(),
+        );
 
-        // 3. Commit offsets for revoked tasks BEFORE dropping them
+        // Commit offsets for revoked tasks BEFORE dropping them
         if !to_drop.is_empty() {
             let _ = group.commit_ranges(&to_drop).await;
         }
 
-        // 4. Drop revoked tasks
         for range in to_drop {
             if let Some(handle) = self.active_tasks.remove(&range) {
                 handle.abort();
@@ -161,27 +160,41 @@ impl CursorManagerState {
             return;
         }
 
-        // 5. Start new tasks
-        let saved_offsets = group
-            .client
-            .clone()
-            .fetch_all_saved_offsets(&group.group_id, &ctx.topic)
-            .await
-            .unwrap_or_default();
+        // Fetch committed offsets with a 5-second timeout, falling back to empty offsets on timeout/error.
+        let saved_offsets = tokio::time::timeout(
+            Duration::from_secs(5),
+            group
+                .client
+                .clone()
+                .fetch_all_saved_offsets(&group.group_id, &ctx.topic),
+        )
+        .await
+        .map(|res| res.unwrap_or_default())
+        .unwrap_or_default();
 
         for range in to_start {
             let resolved_entry_id = self
                 .resolve_start_entry_id(range, ctx, saved_offsets.get(&range).copied())
                 .await;
 
-            let handle = tokio::spawn(run_fetch_actor(
-                range,
-                resolved_entry_id,
-                ctx.clone(),
-                record_tx.clone(),
-            ));
-            self.active_tasks.insert(range, handle);
+            self.spawn_fetch_actor(range, resolved_entry_id, ctx.clone(), record_tx.clone());
         }
+    }
+
+    fn spawn_fetch_actor(
+        &mut self,
+        range_id: RangeId,
+        entry_id: u64,
+        ctx: Arc<ConsumerContext>,
+        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    ) {
+        let handle = tokio::spawn(run_fetch_actor(
+            range_id,
+            entry_id,
+            ctx.clone(),
+            record_tx.clone(),
+        ));
+        self.active_tasks.insert(range_id, handle);
     }
 
     /// Resolves the starting entry ID for a range cursor when it is dynamically started.
@@ -266,14 +279,19 @@ pub(crate) async fn run_cursor_manager(
             }
 
             _ = commit_interval.tick(), if state.consumer_group.is_some() => {
-                let group = state.consumer_group.as_ref().unwrap();
-                let _ = group.commit().await;
+                let group = state.consumer_group.as_ref().unwrap().clone();
+                tokio::spawn(async move {
+                    let _ = group.commit().await;
+                });
             }
 
             _ = rebalance_interval.tick(), if state.consumer_group.is_some() => {
                 if startup_grace_ticks > 0 {
                     startup_grace_ticks -= 1;
                 } else {
+                    if state.active_tasks.is_empty() {
+                        let _ = ctx.refresh_metadata().await;
+                    }
                     state.handle_rebalance(&ctx, &record_tx).await;
                 }
             }

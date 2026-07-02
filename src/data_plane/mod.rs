@@ -22,7 +22,9 @@ pub(crate) mod timer;
 pub(crate) mod transport;
 pub(crate) mod wal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BorshSerialize, BorshDeserialize,
+)]
 pub struct SegmentKey {
     pub topic_id: TopicId,
     pub range_id: RangeId,

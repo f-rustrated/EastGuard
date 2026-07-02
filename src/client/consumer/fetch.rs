@@ -26,13 +26,13 @@ enum RangeLookupResult {
 /// The asynchronous fetch loop for a single active range cursor.
 pub(crate) async fn run_fetch_actor(
     range_id: RangeId,
-    next_offset: u64,
+    next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 ) {
     let mut actor = FetchActor {
         range_id,
-        next_entry_id: next_offset,
+        next_entry_id,
         ctx,
         record_tx,
     };
@@ -241,8 +241,14 @@ impl ConsumerContext {
 
     /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
     pub(crate) async fn refresh_metadata(&self) -> Result<(), ClientError> {
-        let detail = self.client.resolve_topic(&self.topic).await?;
-        self.metadata.store(Arc::new(detail));
+        if let Ok(Ok(detail)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.resolve_topic(&self.topic),
+        )
+        .await
+        {
+            self.metadata.store(Arc::new(detail));
+        }
         Ok(())
     }
 
@@ -280,6 +286,15 @@ impl ConsumerContext {
         }
 
         RangeLookupResult::NeedRefresh
+    }
+
+    pub(crate) fn all_ranges(&self) -> Vec<RangeId> {
+        self.metadata
+            .load()
+            .ranges
+            .iter()
+            .map(|r| r.range_id)
+            .collect::<Vec<_>>()
     }
 }
 
