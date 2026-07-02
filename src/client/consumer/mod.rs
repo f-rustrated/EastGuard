@@ -43,7 +43,7 @@ impl Consumer {
     ) -> Result<Self, ClientError> {
         let group_id = group_id.into();
         let detail = client.resolve_topic(&topic).await?;
-        let cursors = CursorBootstrap::build(&detail, interest, start_policy);
+        let mut cursors = CursorBootstrap::build(&detail, interest, start_policy);
 
         let mut consumer_group = None;
 
@@ -52,6 +52,18 @@ impl Consumer {
             let group = Arc::new(ConsumerGroup::new(client.clone(), gid.to_string())?);
             group.bootstrap().await?;
             consumer_group = Some(group);
+        }
+
+        if matches!(start_policy, StartPolicy::Latest) {
+            for cursor in cursors.cursors_mut() {
+                let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
+                if !has_saved_offset
+                    && let Ok((_, committed_id)) =
+                        client.fetch_range_offsets(&topic, cursor.range_id).await
+                {
+                    cursor.next_entry_id = committed_id;
+                }
+            }
         }
 
         let (record_tx, record_rx) = flume::unbounded();
