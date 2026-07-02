@@ -164,4 +164,11 @@ impl DataPlaneSender {
     ) -> Result<(), flume::SendError<DataPlaneMessage>> {
         self.0.send(msg.into())
     }
+
+    pub async fn send_async(
+        &self,
+        msg: impl Into<DataPlaneMessage>,
+    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
+        self.0.send_async(msg.into()).await
+    }
 }

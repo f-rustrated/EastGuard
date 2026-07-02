@@ -12,7 +12,10 @@ use std::time::Duration;
 use turmoil::Builder;
 
 use super::{NodeSpec, host_cluster};
-use crate::client::{Client, ClientError, PartitionStrategy, RetryPolicy, StoragePolicy};
+use crate::client::{
+    Client, ClientError, Consumer, ConsumerConfig, KeyInterest, PartitionStrategy, RetryPolicy,
+    StartPolicy, StoragePolicy,
+};
 use crate::config::Environment;
 use crate::control_plane::metadata::RangeId;
 
@@ -819,11 +822,11 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
         }
 
         // Consume them with Earliest
-        let consumer = crate::client::Consumer::new(
+        let consumer = Consumer::new(
             client.clone(),
             "basic-consume".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Earliest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Earliest),
         )
         .await
         .expect("create consumer");
@@ -846,11 +849,11 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
 
         // Start a consumer with StartPolicy::Latest. It should skip the sealed segment 0
         // and start at segment 1 (offset 5).
-        let consumer_latest = crate::client::Consumer::new(
+        let consumer_latest = Consumer::new(
             client.clone(),
             "basic-consume".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Latest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Latest),
         )
         .await
         .expect("create latest consumer");
@@ -945,11 +948,11 @@ fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
 
         // Start a Latest consumer. Because it's Latest, it should skip all 5 existing
         // records in the active segment and wait at offset 5.
-        let consumer_latest = crate::client::Consumer::new(
+        let consumer_latest = Consumer::new(
             client.clone(),
             "basic-consume-latest".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Latest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Latest),
         )
         .await
         .expect("create latest consumer");
@@ -1038,14 +1041,14 @@ fn consumer_key_filtering_multi_range() -> turmoil::Result {
         // Create a consumer with KeyInterest for the right child only ([144, 149))
         // Since midpoint is 127, the right child is [127, 255), which overlaps with [144, 149).
         // The left child is [0, 127), which does not overlap with [144, 149).
-        let consumer = crate::client::Consumer::new(
+        let consumer = Consumer::new(
             client.clone(),
             "key-filter-multi".to_string(),
-            crate::client::KeyInterest::KeySpan {
-                start: vec![0x90], // 144
-                end: vec![0x95],   // 149
+            KeyInterest::KeySpan {
+                start: vec![0x90],
+                end: vec![0x95],
             },
-            crate::client::StartPolicy::Latest,
+            ConsumerConfig::new(StartPolicy::Latest),
         )
         .await
         .expect("create consumer");
@@ -1148,11 +1151,11 @@ fn consumer_range_split_consume() -> turmoil::Result {
             .expect("send right");
 
         // 3. Consume all records starting from Earliest
-        let consumer = crate::client::Consumer::new(
+        let consumer = Consumer::new(
             client.clone(),
             "split-consume".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Earliest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Earliest),
         )
         .await
         .expect("create consumer");
@@ -1253,11 +1256,11 @@ fn consumer_retention_recovery() -> turmoil::Result {
             .expect("send");
 
         // 5. Start consumer at Earliest (tries to read offset 0)
-        let consumer = crate::client::Consumer::new(
+        let consumer = Consumer::new(
             client.clone(),
             "retention-recover".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Earliest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Earliest),
         )
         .await
         .expect("create consumer");
@@ -1342,11 +1345,11 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
 
         // Now we have sealed segment 0, sealed segment 1, and active segment 2.
         // Start consumer at Earliest to read them.
-        let consumer = crate::client::Consumer::new(
+        let consumer = Consumer::new(
             client.clone(),
             "prefetch-topic".to_string(),
-            crate::client::KeyInterest::AllKeys,
-            crate::client::StartPolicy::Earliest,
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Earliest),
         )
         .await
         .expect("create consumer");

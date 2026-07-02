@@ -26,13 +26,13 @@ enum RangeLookupResult {
 /// The asynchronous fetch loop for a single active range cursor.
 pub(crate) async fn run_fetch_actor(
     range_id: RangeId,
-    next_offset: u64,
+    next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 ) {
     let mut actor = FetchActor {
         range_id,
-        next_entry_id: next_offset,
+        next_entry_id,
         ctx,
         record_tx,
     };
@@ -128,7 +128,7 @@ impl FetchActor {
                     for (i, rec) in records.iter().enumerate() {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
-                            range_id: self.range_id.0,
+                            range_id: self.range_id,
                             offset: entry.entry_id + i as u64,
                             key: rec.key.clone(),
                             value: rec.value.clone(),
@@ -165,7 +165,12 @@ impl FetchActor {
             }
             DataPlaneResponse::EntryIdOutOfRange => {
                 let prev_entry_id = self.next_entry_id;
-                let (start_id, _) = self.ctx.fetch_range_offsets(self.range_id).await?;
+                let (start_id, _) = self
+                    .ctx
+                    .client
+                    .fetch_range_entry_ids(&self.ctx.topic, self.range_id)
+                    .await?;
+
                 if self.next_entry_id < start_id {
                     self.next_entry_id = start_id;
                 }
@@ -234,36 +239,16 @@ impl ConsumerContext {
             .and_then(|seg| seg.pick_replica())
     }
 
-    pub(crate) async fn fetch_range_offsets(
-        &self,
-        range_id: RangeId,
-    ) -> Result<(u64, u64), ClientError> {
-        let addr = self
-            .pick_replica_for_range(range_id)
-            .unwrap_or_else(|| self.client.next_known_node());
-
-        let req = RangeOffsetRequest {
-            topic_name: self.topic.clone(),
-            range_id,
-        };
-
-        let served = self.client.call(addr, req).await?;
-
-        let ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
-            start_entry_id,
-            committed_entry_id,
-        }) = served.response
-        else {
-            return Err(ClientError::UnexpectedResponse);
-        };
-
-        Ok((start_entry_id, committed_entry_id))
-    }
-
     /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
     pub(crate) async fn refresh_metadata(&self) -> Result<(), ClientError> {
-        let detail = self.client.resolve_topic(&self.topic).await?;
-        self.metadata.store(Arc::new(detail));
+        if let Ok(Ok(detail)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client.resolve_topic(&self.topic),
+        )
+        .await
+        {
+            self.metadata.store(Arc::new(detail));
+        }
         Ok(())
     }
 
@@ -301,6 +286,15 @@ impl ConsumerContext {
         }
 
         RangeLookupResult::NeedRefresh
+    }
+
+    pub(crate) fn all_ranges(&self) -> Vec<RangeId> {
+        self.metadata
+            .load()
+            .ranges
+            .iter()
+            .map(|r| r.range_id)
+            .collect::<Vec<_>>()
     }
 }
 

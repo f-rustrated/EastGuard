@@ -176,8 +176,9 @@ impl SegmentTracker {
         self.committed_entry_id = entry_id;
     }
 
-    pub(crate) fn advance_checkpoint(&mut self, checkpointed_lsn: u64) {
+    pub(crate) fn advance_checkpoint(&mut self, checkpointed_lsn: u64, new_frontier: u64) {
         self.checkpoint_lsn = self.checkpoint_lsn.max(checkpointed_lsn);
+        self.cache.advance_eviction_frontier(new_frontier);
     }
 
     pub(crate) fn checkpoint_lsn(&self) -> u64 {
@@ -435,9 +436,12 @@ pub mod tests {
     #[test]
     fn advance_checkpoint_is_monotonic() {
         let mut t = make_tracker(SegmentRole::Leader);
-        t.advance_checkpoint(10);
-        t.advance_checkpoint(5);
-        t.advance_checkpoint(20);
+        assert_eq!(t.checkpoint_lsn(), 0);
+        t.advance_checkpoint(10, 0);
+        assert_eq!(t.checkpoint_lsn(), 10);
+        t.advance_checkpoint(5, 0); // shouldn't go backward
+        assert_eq!(t.checkpoint_lsn(), 10);
+        t.advance_checkpoint(20, 0);
         assert_eq!(t.checkpoint_lsn(), 20);
     }
 

@@ -119,6 +119,14 @@ impl TopicDetail {
             ranges,
         }
     }
+
+    pub(crate) fn active_ranges(&self) -> Vec<RangeId> {
+        self.ranges
+            .iter()
+            .filter(|r| r.state == RangeState::Active)
+            .map(|r| r.range_id)
+            .collect()
+    }
 }
 
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)

@@ -43,6 +43,7 @@ impl Default for RetryPolicy {
 
 /// The response that served the call. `redirected` ⇒ the starting target was wrong
 /// (a follow/re-resolve happened), so the caller can refresh its cache.
+#[derive(Debug)]
 pub(crate) struct Served {
     pub response: ClientResponse,
     pub redirected: bool,

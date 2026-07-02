@@ -128,6 +128,7 @@ impl Swim {
         SwimHeader {
             seq,
             source_node_id: self.node_id.clone(),
+            source_addr: self.self_addr,
             source_incarnation: self.incarnation,
             gossip,
             shard_leaders,
@@ -423,7 +424,7 @@ impl Swim {
             src,
             header.seq
         );
-        self.handle_incarnation_check(header.source_node_id, src, header.source_incarnation);
+        self.handle_incarnation_check(&header, src);
         let ack = SwimPacket::Ack(self.generate_swim_header(header.seq));
         self.pending_events
             .push(SwimEvent::Packet(OutboundPacket::new(src, ack)));
@@ -437,11 +438,7 @@ impl Swim {
             src,
             header.seq
         );
-        self.handle_incarnation_check(
-            header.source_node_id.clone(),
-            src,
-            header.source_incarnation,
-        );
+        self.handle_incarnation_check(&header, src);
         self.pending_events
             .push(SwimEvent::Timer(TimerCommand::CancelSchedule {
                 seq: header.seq,
@@ -465,6 +462,7 @@ impl Swim {
         let forwarded_ack = SwimPacket::Ack(SwimHeader {
             seq: request_seq,
             source_node_id: header.source_node_id.clone(),
+            source_addr: header.source_addr,
             source_incarnation: header.source_incarnation,
             gossip,
             shard_leaders,
@@ -477,11 +475,7 @@ impl Swim {
     }
 
     fn handle_ping_req(&mut self, src: SocketAddr, header: SwimHeader, target: SocketAddr) {
-        self.handle_incarnation_check(
-            header.source_node_id.clone(),
-            src,
-            header.source_incarnation,
-        );
+        self.handle_incarnation_check(&header, src);
         let seq = self.next_seq();
         self.pending_indirect_pings.insert(
             seq,
@@ -545,25 +539,27 @@ impl Swim {
         member.node_id == self.node_id
     }
 
-    fn handle_incarnation_check(
-        &mut self,
-        source_node_id: NodeId,
-        addr: SocketAddr,
-        remote_inc: u64,
-    ) {
-        if let Some(member) = self.members.get(&source_node_id) {
-            if remote_inc > member.incarnation {
-                let mut node_addr = member.addr;
+    fn handle_incarnation_check(&mut self, header: &SwimHeader, addr: SocketAddr) {
+        if let Some(member) = self.members.get(&header.source_node_id) {
+            if header.source_incarnation > member.incarnation {
+                let mut node_addr = header.source_addr;
                 node_addr.cluster_addr = addr;
-                self.cancel_suspect_timer(&source_node_id);
-                self.update_member(source_node_id, node_addr, SwimNodeState::Alive, remote_inc);
+                self.cancel_suspect_timer(&header.source_node_id);
+                self.update_member(
+                    header.source_node_id.clone(),
+                    node_addr,
+                    SwimNodeState::Alive,
+                    header.source_incarnation,
+                );
             }
         } else {
+            let mut node_addr = header.source_addr;
+            node_addr.cluster_addr = addr;
             self.update_member(
-                source_node_id,
-                NodeAddress::new(addr, addr, addr),
+                header.source_node_id.clone(),
+                node_addr,
                 SwimNodeState::Alive,
-                remote_inc,
+                header.source_incarnation,
             );
         }
     }
@@ -847,6 +843,10 @@ mod tests {
         SwimPacket::Ping(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
+            source_addr: NodeAddress::test(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            ),
             source_incarnation: from_inc,
             gossip,
             shard_leaders: vec![],
@@ -869,6 +869,10 @@ mod tests {
         SwimPacket::Ack(SwimHeader {
             seq,
             source_node_id: NodeId::new(from_id),
+            source_addr: NodeAddress::test(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            ),
             source_incarnation: from_inc,
             gossip,
             shard_leaders: vec![],
@@ -887,6 +891,10 @@ mod tests {
             header: SwimHeader {
                 seq,
                 source_node_id: NodeId::new(from_id),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: from_inc,
                 gossip,
                 shard_leaders: vec![],
@@ -1651,6 +1659,10 @@ mod tests {
             let header = SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-b"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![],
                 shard_leaders: vec![ShardLeaderInfo {
@@ -1681,6 +1693,10 @@ mod tests {
             let header = SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-b"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![],
                 shard_leaders: vec![ShardLeaderInfo {
@@ -1718,6 +1734,10 @@ mod tests {
             let header1 = SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-b"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![],
                 shard_leaders: vec![ShardLeaderInfo {
@@ -1734,6 +1754,10 @@ mod tests {
             let header2 = SwimHeader {
                 seq: 2,
                 source_node_id: NodeId::new("node-b"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![],
                 shard_leaders: vec![ShardLeaderInfo {
@@ -1830,6 +1854,10 @@ mod tests {
             let header = SwimHeader {
                 seq: 1,
                 source_node_id: NodeId::new("node-b"),
+                source_addr: NodeAddress::test(
+                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
                 source_incarnation: 1,
                 gossip: vec![],
                 shard_leaders: vec![ShardLeaderInfo {

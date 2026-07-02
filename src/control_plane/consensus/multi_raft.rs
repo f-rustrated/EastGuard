@@ -1857,7 +1857,7 @@ mod tests {
         store.flush();
         create_topic_via_store(&mut store, "t", vec![node("x"), node("y"), node("z")]);
 
-        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
 
         // x (the leader) crashed: the death drives reconcile, which finds the
         // leaderless segment and starts a seal-end gather querying both
@@ -1914,7 +1914,7 @@ mod tests {
         store.flush();
         create_topic_via_store(&mut store, "t", vec![node("x"), node("y"), node("z")]);
 
-        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
         let before = proposals_after_become_leader(&store).len();
 
         // No reports ever arrive: each death-driven reconcile re-drives the
@@ -1947,7 +1947,7 @@ mod tests {
         store.flush();
         create_topic_via_store(&mut store, "t", vec![node("x"), node("y"), node("z")]);
 
-        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
         store.handle_node_death(node("x"));
         assert!(
             store.seal_recovery.contains(&seg0),

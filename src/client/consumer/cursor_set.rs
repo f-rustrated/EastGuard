@@ -34,10 +34,6 @@ impl RangeCursorSet {
         set
     }
 
-    pub fn bootstrap(detail: &TopicDetail, interest: KeyInterest, policy: StartPolicy) -> Self {
-        CursorBootstrap::build(detail, interest, policy)
-    }
-
     pub fn cursors(&self) -> &[RangeCursor] {
         &self.cursors
     }

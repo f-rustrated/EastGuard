@@ -25,7 +25,7 @@ pub(crate) use segment::*;
 pub(crate) use state_machine::*;
 
 use crate::smart_pointer;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ser, Deser)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct TopicId(pub(crate) u64);
 
 smart_pointer!(TopicId, u64);

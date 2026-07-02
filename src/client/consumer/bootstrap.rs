@@ -43,6 +43,17 @@ pub enum StartPolicy {
     Earliest,
 }
 
+impl std::str::FromStr for StartPolicy {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "latest" => Ok(StartPolicy::Latest),
+            "earliest" => Ok(StartPolicy::Earliest),
+            _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
+        }
+    }
+}
+
 /// Module-local helper that bundles the `(detail, interest)` pair the
 /// bootstrap path walks.
 pub(crate) struct CursorBootstrap<'a> {
@@ -73,10 +84,6 @@ impl<'a> CursorBootstrap<'a> {
             .filter(|r| self.interest.matches(r))
             .map(|r| {
                 let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
-                println!(
-                    "[DEBUG LATEST] range_id={}, start_offset={}",
-                    *r.range_id, start_offset
-                );
                 RangeCursor::new(
                     r.range_id,
                     start_offset,

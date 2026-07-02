@@ -54,7 +54,7 @@ impl DataPlaneOutputs {
 
     pub(crate) async fn flush(&mut self) {
         for cmd in self.coordinator_cmds.drain(..) {
-            let _ = self.coordinator_tx.try_send(cmd);
+            let _ = self.coordinator_tx.send(cmd).await;
         }
         for (entry_id, reply) in self.produce_replies.drain(..) {
             let _ = reply.send(ProduceAck::Ok { entry_id });
@@ -62,7 +62,10 @@ impl DataPlaneOutputs {
 
         let checkpoint_tasks = std::mem::take(&mut self.checkpoint_tasks);
         if !checkpoint_tasks.is_empty() {
-            let _ = self.checkpoint_tx.send(checkpoint_tasks.into_boxed_slice());
+            let _ = self
+                .checkpoint_tx
+                .send_async(checkpoint_tasks.into_boxed_slice())
+                .await;
         }
         self.batch_scheduler
             .send_timer_batch(self.batch_timer_cmds.drain(..).collect())

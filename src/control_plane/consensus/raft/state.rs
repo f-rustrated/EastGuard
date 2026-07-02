@@ -174,7 +174,7 @@ impl Raft {
             last_applied_index: 0,
             role: Role::Follower,
             current_leader: None,
-            state_machine: MetadataStateMachine::default(),
+            state_machine: MetadataStateMachine::new(shard_group_id),
             pending_proposals: Vec::new(),
             leaderless_segments: Vec::new(),
             peer_states: HashMap::new(),
@@ -3872,7 +3872,11 @@ mod tests {
     fn seal_segment_zero_with(raft: &mut Raft, sealed_set: Vec<NodeId>) -> SegmentKey {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
         create_topic_in_raft(raft, "t", sealed_set.clone());
-        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let seg0 = SegmentKey::new(
+            TopicId((raft.shard_group_id.0) << 32),
+            RangeId(0),
+            SegmentId(0),
+        );
         raft.propose(
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,

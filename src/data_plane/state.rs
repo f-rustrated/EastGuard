@@ -30,7 +30,7 @@ use crate::data_plane::transport::command::DataTransportSendToCoordinator;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Same rational as the Raft transport's 4MiB cap, Per-`CatchUpChunk` read cap.
 /// A large segment streams as several chunks via the read-complete re-arm loop.
@@ -67,7 +67,7 @@ pub struct DataPlane<W: WalStorage> {
     /// All locally-resident segments + the secondary indexes the consume
     /// read path needs. See `states::segment_store::SegmentStore`.
     segments: SegmentStore,
-    dirty_segments: Vec<SegmentKey>,
+    dirty_segments: BTreeSet<SegmentKey>,
     buffer_byte_count: usize,
     needs_flush: bool,
 
@@ -106,7 +106,7 @@ impl<W: WalStorage> DataPlane<W> {
             config,
             wal,
             segments: SegmentStore::new(),
-            dirty_segments: Vec::new(),
+            dirty_segments: BTreeSet::new(),
             buffer_byte_count: 0,
             needs_flush: false,
             replication: ReplicationState::default(),
@@ -187,7 +187,7 @@ impl<W: WalStorage> DataPlane<W> {
 
         self.buffer_byte_count += cmd.data.len();
         tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count);
-        self.dirty_segments.push(cmd.segment_key);
+        self.dirty_segments.insert(cmd.segment_key);
 
         self.out
             .store_batch_produce_timer(TimerCommand::SetSchedule {
@@ -340,7 +340,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     fn handle_checkpoint_complete(&mut self, complete: CheckpointComplete) {
         if let Some(tracker) = self.segments.get_mut(&complete.segment_key) {
-            tracker.advance_checkpoint(complete.checkpointed_lsn);
+            tracker.advance_checkpoint(complete.checkpointed_lsn, complete.new_frontier);
         }
 
         let watermark = self.compute_checkpoint_watermark();
@@ -907,7 +907,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         tracker.stage_entry_from_replica(cmd.segment_key, cmd.data, cmd.record_count, cmd.entry_id);
-        self.dirty_segments.push(cmd.segment_key);
+        self.dirty_segments.insert(cmd.segment_key);
 
         self.needs_flush = true;
     }
@@ -987,7 +987,7 @@ impl<W: WalStorage> DataPlane<W> {
             }
         }
         self.buffer_byte_count += replayed_bytes;
-        self.dirty_segments.push(new_segment_key);
+        self.dirty_segments.insert(new_segment_key);
         self.needs_flush = true;
     }
 
@@ -1775,12 +1775,14 @@ mod tests {
         dp.handle_command(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
             segment_key: key1,
             checkpointed_lsn: 10,
+            new_frontier: 0,
         }));
         assert_eq!(wal_file_count(), initial_count);
 
         dp.handle_command(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
             segment_key: key2,
             checkpointed_lsn: 5,
+            new_frontier: 0,
         }));
     }
 

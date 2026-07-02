@@ -311,7 +311,7 @@ impl ClientController {
             record_count: req.record_count,
             reply: reply_tx,
         };
-        let _ = self.data_plane_tx.send(cmd);
+        let _ = self.data_plane_tx.send_async(cmd).await;
 
         let ack = reply_rx
             .await
@@ -356,7 +356,7 @@ impl ClientController {
             reply: reply_tx,
         };
 
-        if self.data_plane_tx.send(query).is_err() {
+        if self.data_plane_tx.send_async(query).await.is_err() {
             return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
         }
         let result = reply_rx
@@ -382,7 +382,7 @@ impl ClientController {
             progress_signal: RangeProgressSignal::Active,
             reply: reply_tx,
         });
-        if self.data_plane_tx.send(query).is_err() {
+        if self.data_plane_tx.send_async(query).await.is_err() {
             return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
         }
         let result = reply_rx
@@ -406,7 +406,7 @@ impl ClientController {
         }
         .into();
 
-        let _ = self.data_plane_tx.send(query);
+        let _ = self.data_plane_tx.send_async(query).await;
 
         let list_offset_result = reply_rx.await.context("data plane dropped reply")?;
         let result = DataPlaneResponse::from_list_offset_result(list_offset_result);

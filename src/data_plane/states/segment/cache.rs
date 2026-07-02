@@ -90,13 +90,12 @@ impl SegmentRingBuffer {
         self.write_cursor.store(tail + 1, Ordering::Release);
     }
 
-    pub(super) fn advance_read_cursor(&self, new_offset: u64) {
+    pub(in crate::data_plane::states::segment) fn advance_read_cursor(&self, new_offset: u64) {
         self.read_cursor.store(new_offset, Ordering::Release);
         self.notify.notify_waiters();
     }
 
     // Read path (called by consumer tasks)
-
     pub(crate) fn load_read_cursor(&self) -> u64 {
         self.read_cursor.load(Ordering::Acquire)
     }
@@ -139,7 +138,6 @@ impl SegmentRingBuffer {
         self.eviction_frontier.load(Ordering::Acquire)
     }
 
-    // Checkpoint path (called by checkpoint worker)
     pub(crate) fn drain_for_checkpoint(&self) -> CheckpointBatch {
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
         let commit = self.read_cursor.load(Ordering::Acquire);
@@ -162,7 +160,10 @@ impl SegmentRingBuffer {
         }
     }
 
-    pub(crate) fn advance_eviction_frontier(&self, new_frontier: u64) {
+    pub(in crate::data_plane::states::segment) fn advance_eviction_frontier(
+        &self,
+        new_frontier: u64,
+    ) {
         self.eviction_frontier
             .store(new_frontier, Ordering::Release);
     }

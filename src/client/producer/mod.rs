@@ -35,6 +35,16 @@ impl Producer {
         // Generate a globally unique UUID for the producer session ID (idempotency seam)
         let producer_id = Uuid::new_v4();
 
+        Self::new_with_producer_id(client, topic, config, producer_id)
+    }
+    pub fn new_with_producer_id(
+        client: Arc<Client>,
+        topic: String,
+        config: ProducerConfig,
+        producer_id: Uuid,
+    ) -> Self {
+        // Generate a globally unique UUID for the producer session ID (idempotency seam)
+
         Self {
             inner: Arc::new(Inner {
                 client,

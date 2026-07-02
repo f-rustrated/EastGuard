@@ -267,6 +267,7 @@ pub enum ProduceAck {
 pub struct CheckpointComplete {
     pub segment_key: SegmentKey,
     pub checkpointed_lsn: u64,
+    pub new_frontier: u64,
 }
 
 /// The cold-read pool's reply for a catch-up *source* read.
