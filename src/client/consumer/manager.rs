@@ -145,7 +145,12 @@ impl CursorManagerState {
         let active_ranges = ctx.metadata.load().active_ranges();
         let (to_drop, to_start) = group.rebalance(&active_ranges);
 
-        // 3. Drop revoked tasks
+        // 3. Commit offsets for revoked tasks BEFORE dropping them
+        if !to_drop.is_empty() {
+            let _ = group.commit_ranges(&to_drop).await;
+        }
+
+        // 4. Drop revoked tasks
         for range in to_drop {
             if let Some(handle) = self.active_tasks.remove(&range) {
                 handle.abort();
@@ -156,7 +161,7 @@ impl CursorManagerState {
             return;
         }
 
-        // 4. Start new tasks
+        // 5. Start new tasks
         let saved_offsets = group
             .client
             .clone()
@@ -240,6 +245,9 @@ pub(crate) async fn run_cursor_manager(
 
     let mut rebalance_interval = tokio::time::interval(Duration::from_secs(1));
 
+    // Waiting exactly 2 tickets(~2secs) before the first rebalance.
+    let mut startup_grace_ticks = if state.consumer_group.is_some() { 2 } else { 0 };
+
     loop {
         let Some(ctx) = weak_ctx.upgrade() else {
             break;
@@ -256,7 +264,11 @@ pub(crate) async fn run_cursor_manager(
             }
 
             _ = rebalance_interval.tick(), if state.consumer_group.is_some() => {
-                state.handle_rebalance(&ctx, &record_tx).await;
+                if startup_grace_ticks > 0 {
+                    startup_grace_ticks -= 1;
+                } else {
+                    state.handle_rebalance(&ctx, &record_tx).await;
+                }
             }
         }
     }

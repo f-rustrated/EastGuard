@@ -33,7 +33,7 @@ pub struct ConsumerGroup {
     pub consumer_id: Uuid,
     pub client: Arc<Client>,
     pub offset_producer: Producer,
-    pub active_peers: DashMap<Uuid, u64>,
+    pub active_peers: Arc<DashMap<Uuid, u64>>,
     pub owned_ranges: ArcSwap<Option<HashSet<RangeId>>>,
     pub offsets: DashMap<RangeId, u64>,
 
@@ -45,7 +45,7 @@ pub struct ConsumerGroup {
 impl ConsumerGroup {
     pub fn new(client: Arc<Client>, group_id: String, topic: String) -> Result<Self, ClientError> {
         let consumer_id = Uuid::new_v4();
-        let active_peers = DashMap::new();
+        let active_peers = Arc::new(DashMap::new());
 
         let hb_sender_handle = tokio::spawn(group_heartbeat_sender(
             consumer_id,
@@ -66,9 +66,6 @@ impl ConsumerGroup {
         ))
         .abort_handle();
 
-        let owned_ranges = ArcSwap::from_pointee(None);
-        let offsets = DashMap::new();
-
         Ok(Self {
             group_id,
             topic,
@@ -76,8 +73,8 @@ impl ConsumerGroup {
             client,
             offset_producer,
             active_peers,
-            owned_ranges,
-            offsets,
+            owned_ranges: ArcSwap::from_pointee(None),
+            offsets: DashMap::new(),
             hb_sender_handle,
             hb_receiver_handle,
         })
@@ -134,6 +131,24 @@ impl ConsumerGroup {
                     .offset_producer
                     .send(self.routing_key().as_bytes(), data)
                     .await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn commit_ranges(&self, ranges: &[RangeId]) -> Result<(), ClientError> {
+        for range in ranges {
+            if let Some(entry) = self.offsets.get(range) {
+                let payload = OffsetCommitPayload {
+                    range_id: *entry.key(),
+                    offset: *entry.value(),
+                };
+                if let Ok(data) = borsh::to_vec(&payload) {
+                    let _ = self
+                        .offset_producer
+                        .send(self.routing_key().as_bytes(), data)
+                        .await;
+                }
             }
         }
         Ok(())
@@ -231,7 +246,7 @@ async fn group_heartbeat_sender(consumer_id: Uuid, hb_client: Arc<Client>, routi
 
 async fn heartbeat_receiver(
     client: Arc<Client>,
-    active_peers: DashMap<Uuid, u64>,
+    active_peers: Arc<DashMap<Uuid, u64>>,
     heartbeat_key: String,
 ) {
     let consumer_res = Consumer::new(
