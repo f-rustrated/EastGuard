@@ -1,11 +1,12 @@
 use crate::client::{
-    Client, ClientError, Consumer, ConsumerRecord, KeyInterest, Producer, ProducerConfig,
-    StartPolicy,
+    Client, ClientError, Consumer, ConsumerRecord, KeyInterest, PartitionStrategy, Producer,
+    ProducerConfig, StartPolicy, StoragePolicy,
 };
 use crate::control_plane::metadata::RangeId;
+use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use dashmap::DashMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -22,48 +23,123 @@ pub struct HeartbeatPayload {
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct OffsetCommitPayload {
-    pub range_id: u64,
+    pub range_id: RangeId,
     pub offset: u64,
 }
 
 pub struct ConsumerGroup {
     pub group_id: String,
+    pub topic: String,
     pub consumer_id: Uuid,
     pub client: Arc<Client>,
-    pub active_peers: Arc<DashMap<Uuid, u64>>,
-    // FIX: Hold the handles so we can kill them on drop!
-    hb_sender_task: tokio::task::JoinHandle<()>,
-    hb_receiver_task: tokio::task::JoinHandle<()>,
+    pub offset_producer: Producer,
+    pub active_peers: DashMap<Uuid, u64>,
+    pub owned_ranges: ArcSwap<Option<HashSet<RangeId>>>,
+    pub offsets: DashMap<RangeId, u64>,
+
+    // Hold the handles so we can kill them on drop
+    hb_sender_handle: tokio::task::AbortHandle,
+    hb_receiver_handle: tokio::task::AbortHandle,
 }
 
 impl ConsumerGroup {
-    pub fn new(client: Arc<Client>, group_id: String) -> Result<Self, ClientError> {
+    pub fn new(client: Arc<Client>, group_id: String, topic: String) -> Result<Self, ClientError> {
         let consumer_id = Uuid::new_v4();
-        let active_peers = Arc::new(DashMap::new());
+        let active_peers = DashMap::new();
 
-        let hb_sender_task = tokio::spawn(group_hb_sender(
+        let hb_sender_handle = tokio::spawn(group_heartbeat_sender(
             consumer_id,
             client.clone(),
-            group_id.clone(),
-        ));
+            format!("hb:{}", group_id.clone()),
+        ))
+        .abort_handle();
+        let offset_producer = Producer::new(
+            client.clone(),
+            SYSTEM_TOPIC_OFFSETS.to_string(),
+            ProducerConfig::default(),
+        );
 
-        let hb_receiver_task = tokio::spawn(hb_receiver(
+        let hb_receiver_handle = tokio::spawn(heartbeat_receiver(
             client.clone(),
             active_peers.clone(),
-            group_id.clone(),
-        ));
+            format!("hb:{}", group_id),
+        ))
+        .abort_handle();
+
+        let owned_ranges = ArcSwap::from_pointee(None);
+        let offsets = DashMap::new();
 
         Ok(Self {
             group_id,
+            topic,
             consumer_id,
             client,
+            offset_producer,
             active_peers,
-            hb_sender_task,
-            hb_receiver_task,
+            owned_ranges,
+            offsets,
+            hb_sender_handle,
+            hb_receiver_handle,
         })
     }
 
-    pub fn assigned_ranges(&self, available_ranges: &[RangeId]) -> Vec<RangeId> {
+    pub fn routing_key(&self) -> String {
+        format!("{}:{}", self.group_id, self.topic)
+    }
+
+    pub async fn bootstrap(&self) -> Result<(), ClientError> {
+        let policy = StoragePolicy {
+            retention_ms: None,
+            replication_factor: 1, // Single replica for system topics locally for now, or match cluster default
+            partition_strategy: PartitionStrategy::AutoSplit,
+        };
+
+        // Attempt to create system topics. Ignore errors if they already exist.
+        let _ = self
+            .client
+            .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
+            .await;
+        let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+
+        Ok(())
+    }
+
+    pub(crate) fn is_responsible_for(&self, range_id: RangeId) -> bool {
+        let guard = self.owned_ranges.load();
+        if let Some(owned) = &**guard {
+            owned.contains(&range_id)
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn record_offset(&self, range_id: RangeId, offset: u64) {
+        self.offsets.insert(range_id, offset);
+    }
+
+    pub async fn commit(&self) -> Result<(), ClientError> {
+        for entry in self.offsets.iter() {
+            if let Some(owned) = &**self.owned_ranges.load()
+                && !owned.contains(entry.key())
+            {
+                continue;
+            }
+
+            let payload = OffsetCommitPayload {
+                range_id: *entry.key(),
+                offset: *entry.value(),
+            };
+            if let Ok(data) = borsh::to_vec(&payload) {
+                let _ = self
+                    .offset_producer
+                    .send(self.routing_key().as_bytes(), data)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn assigned_ranges(&self, available_ranges: &[RangeId]) -> Vec<RangeId> {
         let mut peers: Vec<Uuid> = Vec::new();
         peers.push(self.consumer_id); // Always include self
 
@@ -86,7 +162,7 @@ impl ConsumerGroup {
             }
         }
 
-        let mut my_ranges = Vec::new();
+        let mut ranges = Vec::new();
 
         for &range in available_ranges {
             let range_bytes = range.0.to_le_bytes();
@@ -100,48 +176,15 @@ impl ConsumerGroup {
                 .1;
 
             if assigned_peer == &self.consumer_id {
-                my_ranges.push(range);
+                ranges.push(range);
             }
         }
 
-        my_ranges
-    }
-
-    pub fn fetch_saved_offset<'a>(
-        &'a self,
-        topic: &'a str,
-        range_id: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + 'a>> {
-        Box::pin(async move {
-            let offsets_consumer = Consumer::new(
-                self.client.clone(),
-                SYSTEM_TOPIC_OFFSETS.to_string(),
-                KeyInterest::AllKeys,
-                StartPolicy::Earliest,
-            )
-            .await
-            .ok()?;
-
-            let routing_key = format!("{}:{}", self.group_id, topic);
-            let mut latest_offset = None;
-
-            while let Ok(Ok(Some(record))) =
-                tokio::time::timeout(Duration::from_millis(2000), offsets_consumer.next_record())
-                    .await
-            {
-                if record.key == routing_key.as_bytes()
-                    && let Ok(payload) = OffsetCommitPayload::try_from_slice(&record.value)
-                    && payload.range_id == range_id
-                {
-                    latest_offset = Some(payload.offset);
-                }
-            }
-            latest_offset
-        })
+        ranges
     }
 }
 
-async fn group_hb_sender(consumer_id: Uuid, hb_client: Arc<Client>, hb_group: String) {
+async fn group_heartbeat_sender(consumer_id: Uuid, hb_client: Arc<Client>, routing_key: String) {
     let producer = Producer::new(
         hb_client,
         SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
@@ -157,35 +200,42 @@ async fn group_hb_sender(consumer_id: Uuid, hb_client: Arc<Client>, hb_group: St
         };
 
         if let Ok(data) = borsh::to_vec(&payload) {
-            let _ = producer.send(hb_group.as_bytes(), data).await;
+            let _ = producer.send(routing_key.as_bytes(), data).await;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn hb_receiver(rx_client: Arc<Client>, rx_peers: Arc<DashMap<Uuid, u64>>, rx_group: String) {
+async fn heartbeat_receiver(
+    client: Arc<Client>,
+    active_peers: DashMap<Uuid, u64>,
+    heartbeat_key: String,
+) {
     let consumer_res = Consumer::new(
-        rx_client,
+        client,
         SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
         KeyInterest::AllKeys,
         StartPolicy::Latest,
+        None,
     )
     .await;
 
-    if let Ok(consumer) = consumer_res {
-        while let Ok(Some(record)) = consumer.next_record().await {
-            if record.key == rx_group.as_bytes()
-                && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
-                && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
-            {
-                // Store the highest sequence number seen
-                if let Some(mut current) = rx_peers.get_mut(&cid) {
-                    if payload.sequence_number > *current {
-                        *current = payload.sequence_number;
-                    }
-                } else {
-                    rx_peers.insert(cid, payload.sequence_number);
+    let Ok(consumer) = consumer_res else {
+        return;
+    };
+
+    while let Ok(Some(record)) = consumer.next_record().await {
+        if record.key_match(heartbeat_key.as_bytes().iter())
+            && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
+            && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
+        {
+            // Store the highest sequence number seen
+            if let Some(mut current) = active_peers.get_mut(&cid) {
+                if payload.sequence_number > *current {
+                    *current = payload.sequence_number;
                 }
+            } else {
+                active_peers.insert(cid, payload.sequence_number);
             }
         }
     }
@@ -193,7 +243,7 @@ async fn hb_receiver(rx_client: Arc<Client>, rx_peers: Arc<DashMap<Uuid, u64>>, 
 
 impl Drop for ConsumerGroup {
     fn drop(&mut self) {
-        self.hb_sender_task.abort();
-        self.hb_receiver_task.abort();
+        self.hb_sender_handle.abort();
+        self.hb_receiver_handle.abort();
     }
 }

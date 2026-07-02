@@ -49,7 +49,11 @@ impl Consumer {
 
         // Consolidate all group-specific logic into a single block
         if let Some(gid) = &group_id {
-            let group = Arc::new(ConsumerGroup::new(client.clone(), gid.to_string())?);
+            let group = Arc::new(ConsumerGroup::new(
+                client.clone(),
+                gid.to_string(),
+                topic.clone(),
+            )?);
             group.bootstrap().await?;
             consumer_group = Some(group);
         }
@@ -113,7 +117,7 @@ impl Consumer {
 
     pub async fn commit(&self) -> Result<(), ClientError> {
         if let Some(group) = &self.group {
-            group.commit(&self.ctx.topic).await?;
+            group.commit().await?;
         }
         Ok(())
     }
