@@ -131,7 +131,7 @@ impl Consumer {
             let rec = res?;
 
             if let Some(group) = &self.group {
-                if !group.is_range_owned(rec.range_id) {
+                if !group.is_responsible_for(rec.range_id) {
                     continue;
                 }
                 group.record_offset(rec.range_id, rec.offset);
