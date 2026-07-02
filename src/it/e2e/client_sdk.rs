@@ -824,6 +824,7 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             "basic-consume".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Earliest,
+            None,
         )
         .await
         .expect("create consumer");
@@ -851,6 +852,7 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             "basic-consume".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Latest,
+            None,
         )
         .await
         .expect("create latest consumer");
@@ -950,6 +952,7 @@ fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
             "basic-consume-latest".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Latest,
+            None,
         )
         .await
         .expect("create latest consumer");
@@ -1046,6 +1049,7 @@ fn consumer_key_filtering_multi_range() -> turmoil::Result {
                 end: vec![0x95],   // 149
             },
             crate::client::StartPolicy::Latest,
+            None,
         )
         .await
         .expect("create consumer");
@@ -1153,6 +1157,7 @@ fn consumer_range_split_consume() -> turmoil::Result {
             "split-consume".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Earliest,
+            None,
         )
         .await
         .expect("create consumer");
@@ -1258,6 +1263,7 @@ fn consumer_retention_recovery() -> turmoil::Result {
             "retention-recover".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Earliest,
+            None,
         )
         .await
         .expect("create consumer");
@@ -1347,6 +1353,7 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
             "prefetch-topic".to_string(),
             crate::client::KeyInterest::AllKeys,
             crate::client::StartPolicy::Earliest,
+            None,
         )
         .await
         .expect("create consumer");
