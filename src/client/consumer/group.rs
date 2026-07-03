@@ -27,6 +27,28 @@ pub struct OffsetCommitPayload {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetTracker {
+    pub processed: u64,
+    pub committed: Option<u64>,
+}
+
+impl OffsetTracker {
+    pub fn new(processed: u64) -> Self {
+        Self {
+            processed,
+            committed: None,
+        }
+    }
+
+    pub fn needs_commit(&self) -> bool {
+        match self.committed {
+            Some(committed) => self.processed > committed,
+            None => true,
+        }
+    }
+}
+
 pub struct ConsumerGroup {
     pub group_id: String,
     pub topic: String,
@@ -34,8 +56,11 @@ pub struct ConsumerGroup {
     pub client: Arc<Client>,
     pub offset_producer: Producer,
     pub active_peers: Arc<DashMap<Uuid, u64>>,
-    pub owned_ranges: ArcSwap<Option<HashSet<RangeId>>>,
-    pub offsets: DashMap<RangeId, u64>,
+    /// Active ranges owned by this group member. Updated immediately during rebalance
+    /// to discard records fetched from revoked ranges while their final offsets are
+    /// being committed and before their fetch tasks are aborted.
+    pub owned_ranges: ArcSwap<HashSet<RangeId>>,
+    pub offsets: DashMap<RangeId, OffsetTracker>,
 
     // Hold the handles so we can kill them on drop
     hb_sender_handle: tokio::task::AbortHandle,
@@ -73,7 +98,7 @@ impl ConsumerGroup {
             client,
             offset_producer,
             active_peers,
-            owned_ranges: ArcSwap::from_pointee(None),
+            owned_ranges: ArcSwap::from_pointee(HashSet::new()),
             offsets: DashMap::new(),
             hb_sender_handle,
             hb_receiver_handle,
@@ -101,54 +126,63 @@ impl ConsumerGroup {
         Ok(())
     }
 
+    /// Returns true if this member owns the range. Filters out stale records in transit
+    /// during the revocation commit transition window of a rebalance.
     pub(crate) fn is_responsible_for(&self, range_id: RangeId) -> bool {
-        let guard = self.owned_ranges.load();
-        if let Some(owned) = &**guard {
-            owned.contains(&range_id)
-        } else {
-            true
-        }
+        self.owned_ranges.load().contains(&range_id)
     }
 
     pub(crate) fn record_offset(&self, range_id: RangeId, offset: u64) {
-        self.offsets.insert(range_id, offset);
+        self.offsets
+            .entry(range_id)
+            .and_modify(|tracker| tracker.processed = offset)
+            .or_insert_with(|| OffsetTracker::new(offset));
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
-        for entry in self.offsets.iter() {
-            if let Some(owned) = &**self.owned_ranges.load()
-                && !owned.contains(entry.key())
-            {
-                continue;
-            }
+        // Collect commits synchronously to release DashMap locks before awaiting network calls.
+        let commits: Vec<(RangeId, u64)> = self
+            .offsets
+            .iter()
+            .filter(|entry| entry.needs_commit())
+            .map(|entry| (*entry.key(), entry.value().processed))
+            .collect();
 
-            let payload = OffsetCommitPayload {
-                range_id: *entry.key(),
-                offset: *entry.value(),
-            };
-            if let Ok(data) = borsh::to_vec(&payload) {
-                let _ = self
-                    .offset_producer
-                    .send(self.routing_key().as_bytes(), data)
-                    .await;
+        self.write_offset_commits(commits).await
+    }
+
+    pub async fn revoke_ranges(&self, ranges: &[RangeId]) -> Result<(), ClientError> {
+        // Collect commits synchronously to release DashMap locks before awaiting network calls.
+        let mut commits = Vec::new();
+        for &range in ranges {
+            if let Some(entry) = self.offsets.get(&range)
+                && entry.needs_commit()
+            {
+                commits.push((range, entry.processed));
             }
+        }
+
+        self.write_offset_commits(commits).await?;
+
+        // Remove revoked ranges from local offsets map
+        for &range in ranges {
+            self.offsets.remove(&range);
         }
         Ok(())
     }
 
-    pub async fn commit_ranges(&self, ranges: &[RangeId]) -> Result<(), ClientError> {
-        for range in ranges {
-            if let Some(entry) = self.offsets.get(range) {
-                let payload = OffsetCommitPayload {
-                    range_id: *entry.key(),
-                    offset: *entry.value(),
-                };
-                if let Ok(data) = borsh::to_vec(&payload) {
-                    let _ = self
-                        .offset_producer
-                        .send(self.routing_key().as_bytes(), data)
-                        .await;
-                }
+    async fn write_offset_commits(&self, commits: Vec<(RangeId, u64)>) -> Result<(), ClientError> {
+        for (range_id, offset) in commits {
+            let payload = OffsetCommitPayload { range_id, offset };
+            if let Ok(data) = borsh::to_vec(&payload)
+                && self
+                    .offset_producer
+                    .send(self.routing_key().as_bytes(), data)
+                    .await
+                    .is_ok()
+                && let Some(mut entry) = self.offsets.get_mut(&range_id)
+            {
+                entry.committed = Some(offset);
             }
         }
         Ok(())
@@ -203,13 +237,7 @@ impl ConsumerGroup {
         ranges: &[RangeId],
         active_ranges: HashSet<RangeId>,
     ) -> (Vec<RangeId>, Vec<RangeId>) {
-        let current_set = self
-            .owned_ranges
-            .load()
-            .as_ref()
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
+        let current_set = self.owned_ranges.load();
         let latest_set: HashSet<RangeId> = self.assigned_ranges(ranges).into_iter().collect();
         let to_drop: Vec<RangeId> = current_set
             .iter()
@@ -227,8 +255,8 @@ impl ConsumerGroup {
             .copied()
             .collect();
 
-        if current_set != latest_set {
-            self.owned_ranges.store(Arc::new(Some(latest_set)));
+        if **current_set != latest_set {
+            self.owned_ranges.store(Arc::new(latest_set));
         }
 
         (to_drop, to_start)
@@ -262,10 +290,16 @@ async fn heartbeat_receiver(
     active_peers: Arc<DashMap<Uuid, u64>>,
     heartbeat_key: String,
 ) {
+    let mut end_key = heartbeat_key.as_bytes().to_vec();
+    end_key.push(0u8);
+
     let consumer_res = Consumer::new(
         client,
         SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
-        KeyInterest::AllKeys,
+        KeyInterest::KeySpan {
+            start: heartbeat_key.as_bytes().to_vec(),
+            end: end_key,
+        },
         ConsumerConfig::new(StartPolicy::Latest),
     )
     .await;

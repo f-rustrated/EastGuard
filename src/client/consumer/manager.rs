@@ -41,9 +41,6 @@ impl CursorManagerState {
         consumer_group: Option<Arc<ConsumerGroup>>,
         start_policy: StartPolicy,
     ) -> Self {
-        if let Some(ref group) = consumer_group {
-            group.owned_ranges.store(Arc::new(Some(HashSet::new())));
-        }
         Self {
             cursors,
             active_tasks: HashMap::new(),
@@ -147,7 +144,7 @@ impl CursorManagerState {
 
         // Commit offsets for revoked tasks BEFORE dropping them
         if !to_drop.is_empty() {
-            let _ = group.commit_ranges(&to_drop).await;
+            let _ = group.revoke_ranges(&to_drop).await;
         }
 
         for range in to_drop {
@@ -264,6 +261,14 @@ pub(crate) async fn run_cursor_manager(
     let mut startup_grace_ticks = if state.consumer_group.is_some() { 2 } else { 0 };
 
     loop {
+        if record_tx.is_disconnected() {
+            // Perform a final commit on graceful shutdown.
+            if let Some(group) = &state.consumer_group {
+                let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
+            }
+            break;
+        }
+
         let Some(ctx) = weak_ctx.upgrade() else {
             break;
         };
