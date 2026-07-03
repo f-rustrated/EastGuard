@@ -264,6 +264,14 @@ pub(crate) async fn run_cursor_manager(
     let mut startup_grace_ticks = if state.consumer_group.is_some() { 2 } else { 0 };
 
     loop {
+        if record_tx.is_disconnected() {
+            // Perform a final commit on graceful shutdown.
+            if let Some(group) = &state.consumer_group {
+                let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
+            }
+            break;
+        }
+
         let Some(ctx) = weak_ctx.upgrade() else {
             break;
         };
