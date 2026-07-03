@@ -245,6 +245,9 @@ fn consumer_group_scale_out_and_rebalance() {
 }
 #[test]
 fn consumer_group_failover() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(10))
         .simulation_duration(Duration::from_secs(40))

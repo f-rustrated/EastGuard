@@ -251,6 +251,26 @@ Here is how the end-to-end write path operates:
    - **Connection Demultiplexing**: When the broker sends the write acknowledgment, the client's background TCP read loop receives it and demultiplexes the response using its unique request ID, completing the batch-level future.
    - **Batch Demultiplexing (Fan-out)**: The completed batch future wakes up the producer's flushing thread, which demultiplexes (fans out) the single committed `entry_id` to the individual oneshot channels of all the threads (`T1`, `T2`, etc.) that contributed to that batch, unblocking them.
 
+### Consumer Groups: Zero-Controller Coordination
+
+EastGuard implements consumer groups using a fully decentralized, client-driven design that eliminates the need for central broker-side coordinators (like Kafka's Group Coordinator).
+
+
+#### Key Characteristics & Mechanisms
+
+* **System Topic Gossip**:
+  * `__eastguard_assignments`: Heartbeat channel. Consumers periodically publish `HeartbeatPayload`s with their consumer ID and monotonic sequence numbers under the group-specific routing key.
+  * `__eastguard_offsets`: Offset checkpoint storage. Consumers write committed partition offsets under the routing key `"{group_id}:{topic}"`.
+* **Targeted KeySpan Filtering**:
+  * Consumers subscribe via [KeyInterest::KeySpan].
+  * This limits message delivery strictly to relevant group heartbeats, mitigating cluster-wide heartbeat storms and allowing the system topics to scale horizontally via `AutoSplit` partitioning.
+* **Deterministic Rebalancing**:
+  * Consumers track sequence numbers of peers and evict dead nodes if their heartbeat sequences do not advance for 3 consecutive seconds.
+  * Every consumer builds a local consistent hash ring using active peer IDs mapped to 20 virtual nodes per peer.
+  * Active partition ranges are hashed and assigned clockwise. Because every group member shares the same peer list and runs the same deterministic hash ring mapping, they converge on the identical assignment locally without coordinator handshake protocols.
+* **Revocation Integrity**:
+  * During a rebalance, a consumer first commits current offsets and terminates fetchers for revoked ranges *before* fetching offsets and starting tasks for newly acquired ranges, keeping partition dual-ownership windows to a minimum.
+
 ---
 
 ## Getting Started
