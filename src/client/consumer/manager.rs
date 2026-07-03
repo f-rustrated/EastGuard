@@ -41,9 +41,6 @@ impl CursorManagerState {
         consumer_group: Option<Arc<ConsumerGroup>>,
         start_policy: StartPolicy,
     ) -> Self {
-        if let Some(ref group) = consumer_group {
-            group.owned_ranges.store(Arc::new(Some(HashSet::new())));
-        }
         Self {
             cursors,
             active_tasks: HashMap::new(),
@@ -147,7 +144,7 @@ impl CursorManagerState {
 
         // Commit offsets for revoked tasks BEFORE dropping them
         if !to_drop.is_empty() {
-            let _ = group.commit_ranges(&to_drop).await;
+            let _ = group.revoke_ranges(&to_drop).await;
         }
 
         for range in to_drop {
