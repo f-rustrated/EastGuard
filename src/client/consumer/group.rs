@@ -56,6 +56,9 @@ pub struct ConsumerGroup {
     pub client: Arc<Client>,
     pub offset_producer: Producer,
     pub active_peers: Arc<DashMap<Uuid, u64>>,
+    /// Active ranges owned by this group member. Updated immediately during rebalance
+    /// to discard records fetched from revoked ranges while their final offsets are
+    /// being committed and before their fetch tasks are aborted.
     pub owned_ranges: ArcSwap<HashSet<RangeId>>,
     pub offsets: DashMap<RangeId, OffsetTracker>,
 
@@ -123,6 +126,8 @@ impl ConsumerGroup {
         Ok(())
     }
 
+    /// Returns true if this member owns the range. Filters out stale records in transit
+    /// during the revocation commit transition window of a rebalance.
     pub(crate) fn is_responsible_for(&self, range_id: RangeId) -> bool {
         self.owned_ranges.load().contains(&range_id)
     }
