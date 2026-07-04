@@ -20,11 +20,25 @@ mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
 pub(crate) mod ownership;
-mod record;
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
-pub use record::ConsumerRecord;
+
+/// A record returned to the consumer application.
+#[derive(Debug, Clone)]
+pub struct ConsumerRecord {
+    pub topic: String,
+    pub range_id: RangeId,
+    pub offset: u64,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl ConsumerRecord {
+    pub fn key_match<'a>(&'a self, key: impl Iterator<Item = &'a u8>) -> bool {
+        self.key.iter().eq(key)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
