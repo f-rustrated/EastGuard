@@ -71,6 +71,12 @@ pub struct ConsumerGroup {
     pub owned_ranges: ArcSwap<HashSet<RangeId>>,
     pub offsets: DashMap<RangeId, OffsetTracker>,
 
+    /// The last observed heartbeat sequence number for each active group peer.
+    last_seen_sequences: DashMap<Uuid, u64>,
+    /// Consecutive rebalance ticks where a peer's heartbeat sequence number has not advanced.
+    /// Peers are declared dead and pruned when this count reaches 3.
+    stale_ticks: DashMap<Uuid, u8>,
+
     _hb_stop_tx: flume::Sender<()>,
 }
 
@@ -112,6 +118,8 @@ impl ConsumerGroup {
             owned_ranges: ArcSwap::from_pointee(HashSet::new()),
             offsets: DashMap::new(),
             _hb_stop_tx: hb_stop_tx,
+            last_seen_sequences: DashMap::new(),
+            stale_ticks: DashMap::new(),
         })
     }
 
@@ -172,6 +180,45 @@ impl ConsumerGroup {
             .collect();
 
         self.write_offset_commits(commits).await
+    }
+
+    fn remove_dead_peers(&self) {
+        let mut dead_peers = Vec::new();
+
+        // Identify stale peers directly from the iterator
+        for entry in self.active_peers.iter() {
+            let peer_id = *entry.key();
+            let current_seq = *entry.value();
+
+            let mut last_seq = self
+                .last_seen_sequences
+                .entry(peer_id)
+                .or_insert(current_seq);
+            let mut ticks = self.stale_ticks.entry(peer_id).or_insert(0);
+
+            if current_seq == *last_seq {
+                *ticks += 1;
+                if *ticks >= 3 {
+                    dead_peers.push(peer_id);
+                }
+            } else {
+                *last_seq = current_seq;
+                *ticks = 0;
+            }
+        }
+
+        // Remove newly dead peers from the active set
+        for dead_id in dead_peers {
+            self.active_peers.remove(&dead_id);
+        }
+
+        // Garbage collect tracking maps:
+        // This single pass cleans up the peers we just removed, as well as
+        // any peers that disconnected or were removed externally since the last tick.
+        self.last_seen_sequences
+            .retain(|k, _| self.active_peers.contains_key(k));
+        self.stale_ticks
+            .retain(|k, _| self.active_peers.contains_key(k));
     }
 
     pub async fn revoke_ranges(&self, ranges: &[RangeId]) -> Result<(), ClientError> {
@@ -265,6 +312,8 @@ impl ConsumerGroup {
         ranges: &[RangeId],
         active_ranges: HashSet<RangeId>,
     ) -> (Vec<RangeId>, Vec<RangeId>) {
+        self.remove_dead_peers();
+
         let current_set = self.owned_ranges.load();
         let latest_set: HashSet<RangeId> = self.assigned_ranges(ranges).into_iter().collect();
         let to_drop: Vec<RangeId> = current_set

@@ -21,11 +21,7 @@ pub(crate) struct CursorDrained {
 struct CursorManagerState {
     cursors: RangeCursorSet,
     senders: HashMap<RangeId, flume::Sender<FetchActorCommand>>,
-    /// The last observed heartbeat sequence number for each active group peer.
-    last_seen_sequences: HashMap<Uuid, u64>,
-    /// Consecutive rebalance ticks where a peer's heartbeat sequence number has not advanced.
-    /// Peers are declared dead and pruned when this count reaches 3.
-    stale_ticks: HashMap<Uuid, u8>,
+
     /// The optional shared consumer group context for dynamic partition rebalancing.
     consumer_group: Option<Arc<ConsumerGroup>>,
     /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
@@ -41,8 +37,6 @@ impl CursorManagerState {
         Self {
             cursors,
             senders: HashMap::new(),
-            last_seen_sequences: HashMap::new(),
-            stale_ticks: HashMap::new(),
             consumer_group,
             start_policy,
         }
@@ -96,44 +90,6 @@ impl CursorManagerState {
         let Some(group) = &self.consumer_group else {
             return;
         };
-        let mut dead_peers = Vec::new();
-
-        // Cleanup dead peers
-        let peers_copy: Vec<(Uuid, u64)> = group
-            .active_peers
-            .iter()
-            .map(|kv| (*kv.key(), *kv.value()))
-            .collect();
-
-        // Garbage collect tracking maps for any peers that left or were removed
-        self.last_seen_sequences
-            .retain(|k, _| group.active_peers.contains_key(k));
-        self.stale_ticks
-            .retain(|k, _| group.active_peers.contains_key(k));
-
-        for (peer_id, current_seq) in peers_copy {
-            let last_seq = self
-                .last_seen_sequences
-                .entry(peer_id)
-                .or_insert(current_seq);
-            let ticks = self.stale_ticks.entry(peer_id).or_insert(0);
-
-            if current_seq == *last_seq {
-                *ticks += 1;
-                if *ticks >= 3 {
-                    dead_peers.push(peer_id);
-                }
-            } else {
-                *last_seq = current_seq;
-                *ticks = 0;
-            }
-        }
-
-        for dead_id in dead_peers {
-            group.active_peers.remove(&dead_id);
-            self.last_seen_sequences.remove(&dead_id);
-            self.stale_ticks.remove(&dead_id);
-        }
 
         // Perform rebalance inside ConsumerGroup
         let (to_drop, to_start) =
