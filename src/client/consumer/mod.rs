@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::bootstrap::CursorBootstrap;
+use crate::client::consumer::bootstrap::build_cursors;
 use crate::client::consumer::fetch::ConsumerContext;
 use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
 use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
@@ -72,7 +72,7 @@ impl Consumer {
         config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
         let detail = client.resolve_topic(&topic).await?;
-        let mut cursors = CursorBootstrap::build(&detail, interest, config.start_policy);
+        let mut cursors = build_cursors(&detail, interest, config.start_policy);
 
         let mut consumer_group = None;
 

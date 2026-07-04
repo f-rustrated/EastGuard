@@ -54,68 +54,56 @@ impl std::str::FromStr for StartPolicy {
     }
 }
 
-/// Module-local helper that bundles the `(detail, interest)` pair the
-/// bootstrap path walks.
-pub(crate) struct CursorBootstrap<'a> {
-    detail: &'a TopicDetail,
+pub(crate) fn build_cursors(
+    detail: &TopicDetail,
     interest: KeyInterest,
+    policy: StartPolicy,
+) -> RangeCursorSet {
+    let cursors = match policy {
+        StartPolicy::Latest => latest_cursors(detail, &interest),
+        StartPolicy::Earliest => earliest_cursors(detail, &interest),
+    };
+    RangeCursorSet::new(cursors)
 }
 
-impl<'a> CursorBootstrap<'a> {
-    pub(crate) fn build(
-        detail: &'a TopicDetail,
-        interest: KeyInterest,
-        policy: StartPolicy,
-    ) -> RangeCursorSet {
-        let bstp = Self { detail, interest };
+fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<RangeCursor> {
+    detail
+        .ranges
+        .iter()
+        .filter(|r| r.state == RangeState::Active)
+        .filter(|r| interest.matches(r))
+        .map(|r| {
+            let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
+            RangeCursor::new(
+                r.range_id,
+                start_offset,
+                r.keyspace_start.clone(),
+                r.keyspace_end.clone(),
+            )
+        })
+        .collect()
+}
 
-        let cursors = match policy {
-            StartPolicy::Latest => bstp.latest_cursors(),
-            StartPolicy::Earliest => bstp.earliest_cursors(),
-        };
-        RangeCursorSet::new(cursors)
-    }
+/// A "root" range is one with no predecessor in lineage: not the product
+/// of a merge (`merged_from = None`) and not the child of any split (no
+/// other range's `split_into` mentions it). For a freshly-created topic
+/// that has only split, the original full-keyspace range is the sole
+/// root.
+fn earliest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<RangeCursor> {
+    let split_children: HashSet<RangeId> = detail
+        .ranges
+        .iter()
+        .filter_map(|r| r.split_into)
+        .flat_map(|(l, r)| [l, r])
+        .collect();
 
-    fn latest_cursors(&self) -> Vec<RangeCursor> {
-        self.detail
-            .ranges
-            .iter()
-            .filter(|r| r.state == RangeState::Active)
-            .filter(|r| self.interest.matches(r))
-            .map(|r| {
-                let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
-                RangeCursor::new(
-                    r.range_id,
-                    start_offset,
-                    r.keyspace_start.clone(),
-                    r.keyspace_end.clone(),
-                )
-            })
-            .collect()
-    }
-
-    /// A "root" range is one with no predecessor in lineage: not the product
-    /// of a merge (`merged_from = None`) and not the child of any split (no
-    /// other range's `split_into` mentions it). For a freshly-created topic
-    /// that has only split, the original full-keyspace range is the sole
-    /// root.
-    fn earliest_cursors(&self) -> Vec<RangeCursor> {
-        let split_children: HashSet<RangeId> = self
-            .detail
-            .ranges
-            .iter()
-            .filter_map(|r| r.split_into)
-            .flat_map(|(l, r)| [l, r])
-            .collect();
-
-        self.detail
-            .ranges
-            .iter()
-            .filter(|r| r.merged_from.is_none() && !split_children.contains(&r.range_id))
-            .filter(|r| self.interest.matches(r))
-            .map(RangeCursor::from)
-            .collect()
-    }
+    detail
+        .ranges
+        .iter()
+        .filter(|r| r.merged_from.is_none() && !split_children.contains(&r.range_id))
+        .filter(|r| interest.matches(r))
+        .map(RangeCursor::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -175,7 +163,7 @@ mod tests {
             range(1, RangeState::Active, b"", b"m", None, None, None),
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
-        let set = CursorBootstrap::build(&t, KeyInterest::AllKeys, StartPolicy::Latest);
+        let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Latest);
         let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
         assert!(ids.contains(&RangeId(1)));
         assert!(ids.contains(&RangeId(2)));
@@ -190,7 +178,7 @@ mod tests {
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
         // Interest [a, c) — only overlaps range 1 ([, m)).
-        let set = CursorBootstrap::build(
+        let set = build_cursors(
             &t,
             KeyInterest::KeySpan {
                 start: b"a".to_vec(),
@@ -218,7 +206,7 @@ mod tests {
             range(1, RangeState::Active, b"", b"m", None, None, None),
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
-        let set = CursorBootstrap::build(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
+        let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
         let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
         // Earliest = original root (range 0), not the split children.
@@ -257,7 +245,7 @@ mod tests {
                 Some((RangeId(1), RangeId(2))),
             ),
         ]);
-        let set = CursorBootstrap::build(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
+        let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
         let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
         // 1 and 2 are the roots (no merged_from, not split children); 3 has
