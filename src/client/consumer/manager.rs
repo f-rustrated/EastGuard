@@ -1,16 +1,16 @@
-use super::RangeCursorSet;
-use crate::client::consumer::bootstrap::{KeyInterest, StartPolicy};
+use super::RangeCursor;
+use crate::client::consumer::bootstrap::StartPolicy;
 use crate::client::consumer::fetch::{FetchActorCommand, run_fetch_actor};
 use crate::client::consumer::group::ConsumerGroup;
-use crate::client::consumer::{ConsumerContext, ConsumerRecord};
+use crate::client::consumer::ownership::RangeOwnership;
+use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
-use crate::connections::protocol::RangeTransition;
+use crate::connections::protocol::{RangeDetail, RangeTransition};
 use crate::control_plane::metadata::RangeId;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Interval;
 use uuid::Uuid;
 
 pub(crate) struct CursorDrained {
@@ -19,10 +19,8 @@ pub(crate) struct CursorDrained {
 }
 
 struct CursorManagerState {
-    /// Active partition range cursors and their next entry IDs to fetch.
-    cursors: RangeCursorSet,
-    /// Active background fetch actors (running tasks) keyed by their partition RangeId.
-    active_tasks: HashMap<RangeId, flume::Sender<FetchActorCommand>>,
+    /// Unified ownership of per-range cursors and their fetch actor senders.
+    ownership: RangeOwnership,
     /// The last observed heartbeat sequence number for each active group peer.
     last_seen_sequences: HashMap<Uuid, u64>,
     /// Consecutive rebalance ticks where a peer's heartbeat sequence number has not advanced.
@@ -41,8 +39,7 @@ impl CursorManagerState {
         start_policy: StartPolicy,
     ) -> Self {
         Self {
-            cursors,
-            active_tasks: HashMap::new(),
+            ownership: RangeOwnership::new(cursors),
             last_seen_sequences: HashMap::new(),
             stale_ticks: HashMap::new(),
             consumer_group,
@@ -51,7 +48,7 @@ impl CursorManagerState {
     }
 
     fn should_exit(&self) -> bool {
-        self.cursors.is_empty() && self.consumer_group.is_none()
+        self.ownership.is_empty() && self.consumer_group.is_none()
     }
 
     fn provision_initial_tasks(
@@ -59,14 +56,14 @@ impl CursorManagerState {
         ctx: &Arc<ConsumerContext>,
         record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
-        // If a consumer_group  is present, partition ownership is dynamic and determined entirely by the
+        // If a consumer_group is present, partition ownership is dynamic and determined entirely by the
         // group rebalancer. We return early to prevent the consumer from starting fetch tasks before
         // partitions are assigned to it.
         if self.consumer_group.is_some() {
             return;
         }
-        for cursor in self.cursors.cursors().to_vec() {
-            self.spawn_fetch_actor(
+        for cursor in self.ownership.cursors().to_vec() {
+            self.spawn_and_register(
                 cursor.range_id,
                 cursor.next_entry_id,
                 ctx.clone(),
@@ -81,11 +78,16 @@ impl CursorManagerState {
         ctx: &Arc<ConsumerContext>,
         record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
-        self.active_tasks.remove(&event.range_id);
-        let added = self.cursors.apply_drained(event.range_id, event.transition);
+        let Some(added) = self.ownership.drain(event.range_id, event.transition) else {
+            // This range was already revoked/stopped by a rebalance or shutdown.
+            return;
+        };
 
         for new_cursor in added.iter() {
-            self.spawn_fetch_actor(
+            if self.ownership.owns(&new_cursor.range_id) {
+                continue; // Skip if a fetch actor is already running
+            }
+            self.spawn_and_register(
                 new_cursor.range_id,
                 new_cursor.next_entry_id,
                 ctx.clone(),
@@ -144,7 +146,7 @@ impl CursorManagerState {
         // Perform rebalance inside ConsumerGroup
         let (to_drop, to_start) = group.rebalance(
             &ctx.all_ranges(),
-            self.active_tasks.keys().cloned().collect(),
+            self.ownership.owned_range_ids().cloned().collect(),
         );
 
         // Abort revoked tasks immediately and commit their offsets in the background
@@ -153,9 +155,7 @@ impl CursorManagerState {
             let group = group.clone();
             let ranges_to_commit = to_drop.clone();
             for range in to_drop {
-                if let Some(stop_tx) = self.active_tasks.remove(&range) {
-                    let _ = stop_tx.send(FetchActorCommand::Stop);
-                }
+                self.ownership.revoke(range);
             }
             tokio::spawn(async move {
                 let _ = group.revoke_ranges(&ranges_to_commit).await;
@@ -178,16 +178,38 @@ impl CursorManagerState {
         .map(|res| res.unwrap_or_default())
         .unwrap_or_default();
 
+        let metadata = ctx.metadata.load();
+
         for range in to_start {
             let resolved_entry_id = self
                 .resolve_start_entry_id(range, ctx, saved_offsets.get(&range).copied())
                 .await;
 
-            self.spawn_fetch_actor(range, resolved_entry_id, ctx.clone(), record_tx.clone());
+            if self.ownership.should_skip_start(
+                range,
+                &metadata.ranges,
+                &saved_offsets,
+                resolved_entry_id,
+            ) {
+                continue;
+            }
+
+            if let Some(r_meta) = metadata.ranges.iter().find(|r| r.range_id == range) {
+                self.spawn_and_acquire(
+                    range,
+                    resolved_entry_id,
+                    r_meta,
+                    ctx.clone(),
+                    record_tx.clone(),
+                );
+            }
         }
     }
 
-    fn spawn_fetch_actor(
+    /// Spawn a fetch actor and register its stop channel for a range whose
+    /// cursor already exists in the ownership set (independent consumer init
+    /// or post-drain transition).
+    fn spawn_and_register(
         &mut self,
         range_id: RangeId,
         entry_id: u64,
@@ -195,14 +217,29 @@ impl CursorManagerState {
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
         let (stop_tx, stop_rx) = flume::bounded(1);
-        tokio::spawn(run_fetch_actor(
+        self.ownership.register(range_id, stop_tx);
+        tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
+    }
+
+    /// Create a cursor from range metadata, acquire ownership, and spawn
+    /// the fetch actor. Used by `handle_rebalance` for newly assigned ranges.
+    fn spawn_and_acquire(
+        &mut self,
+        range_id: RangeId,
+        entry_id: u64,
+        r_meta: &RangeDetail,
+        ctx: Arc<ConsumerContext>,
+        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    ) {
+        let cursor = RangeCursor::new(
             range_id,
             entry_id,
-            ctx.clone(),
-            record_tx.clone(),
-            stop_rx,
-        ));
-        self.active_tasks.insert(range_id, stop_tx);
+            r_meta.keyspace_start.clone(),
+            r_meta.keyspace_end.clone(),
+        );
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        self.ownership.acquire(cursor, stop_tx);
+        tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
     }
 
     /// Resolves the starting entry ID for a range cursor when it is dynamically started.
@@ -232,7 +269,12 @@ impl CursorManagerState {
         }
 
         // 3. Fallback to the local cursor's next entry ID.
-        if let Some(cursor) = self.cursors.cursors().iter().find(|c| c.range_id == range) {
+        if let Some(cursor) = self
+            .ownership
+            .cursors()
+            .iter()
+            .find(|c| c.range_id == range)
+        {
             return cursor.next_entry_id;
         }
 
@@ -241,9 +283,7 @@ impl CursorManagerState {
     }
 
     async fn abort_all(&mut self) {
-        for (_, stop_tx) in self.active_tasks.drain() {
-            let _ = stop_tx.send(FetchActorCommand::Stop);
-        }
+        self.ownership.revoke_all();
         if let Some(group) = &self.consumer_group {
             let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
         }
@@ -304,7 +344,7 @@ pub(crate) async fn run_cursor_manager(
                 if startup_grace_ticks > 0 {
                     startup_grace_ticks -= 1;
                 } else {
-                    if state.active_tasks.is_empty() {
+                    if state.ownership.is_empty() {
                         let _ = ctx.refresh_metadata().await;
                     }
                     state.handle_rebalance(&ctx, &record_tx).await;

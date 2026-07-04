@@ -19,6 +19,7 @@ pub(crate) mod cursor_set;
 mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
+pub(crate) mod ownership;
 pub(crate) mod parked_merges;
 mod record;
 pub use bootstrap::{KeyInterest, StartPolicy};
@@ -71,6 +72,9 @@ impl Consumer {
             )?);
             group.bootstrap().await?;
             consumer_group = Some(group);
+            // If in a consumer group, initialize with empty cursors;
+            // assignments will be dynamically resolved and started by the rebalancer.
+            cursors = RangeCursorSet::new(Vec::new());
         }
 
         if matches!(config.start_policy, StartPolicy::Latest) {

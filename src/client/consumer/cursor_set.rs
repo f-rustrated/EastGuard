@@ -47,9 +47,29 @@ impl RangeCursorSet {
         self.cursors.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.cursors.is_empty()
+    }
+
+    pub fn add_or_update(&mut self, cursor: RangeCursor) {
+        if let Some(c) = self
+            .cursors
+            .iter_mut()
+            .find(|c| c.range_id == cursor.range_id)
+        {
+            c.next_entry_id = cursor.next_entry_id;
+        } else {
+            self.cursors.push(cursor);
+        }
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
+    }
+
+    pub fn remove(&mut self, range_id: RangeId) -> Option<RangeCursor> {
+        if let Some(idx) = self.cursors.iter().position(|c| c.range_id == range_id) {
+            return Some(self.cursors.remove(idx));
+        }
+        None
     }
 
     /// Apply a lineage transition after a range has been fully drained.
@@ -59,20 +79,17 @@ impl RangeCursorSet {
         range_id: RangeId,
         transition: RangeTransition,
     ) -> Box<[RangeCursor]> {
-        let idx = self
-            .cursors
-            .iter()
-            .position(|c| c.range_id == range_id)
-            .expect("apply_drained called for range not in cursor set");
+        let Some(drained) = self.remove(range_id) else {
+            return Box::new([]);
+        };
 
-        let drained = self.cursors.remove(idx);
-        let added = self.apply_transition(drained, transition);
-        self.cursors.extend(added.clone());
+        let new_cursors = self.apply_transition(drained, transition);
+        self.cursors.extend(new_cursors.clone());
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
 
-        added
+        new_cursors
     }
 
     fn apply_transition(
