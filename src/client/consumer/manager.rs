@@ -1,6 +1,6 @@
 use super::RangeCursorSet;
 use crate::client::consumer::bootstrap::{KeyInterest, StartPolicy};
-use crate::client::consumer::fetch::run_fetch_actor;
+use crate::client::consumer::fetch::{FetchActorCommand, run_fetch_actor};
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord};
 use crate::client::{ClientError, ConsumerConfig};
@@ -10,7 +10,6 @@ use crate::control_plane::metadata::RangeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::time::Interval;
 use uuid::Uuid;
 
@@ -23,7 +22,7 @@ struct CursorManagerState {
     /// Active partition range cursors and their next entry IDs to fetch.
     cursors: RangeCursorSet,
     /// Active background fetch actors (running tasks) keyed by their partition RangeId.
-    active_tasks: HashMap<RangeId, JoinHandle<()>>,
+    active_tasks: HashMap<RangeId, flume::Sender<FetchActorCommand>>,
     /// The last observed heartbeat sequence number for each active group peer.
     last_seen_sequences: HashMap<Uuid, u64>,
     /// Consecutive rebalance ticks where a peer's heartbeat sequence number has not advanced.
@@ -152,14 +151,14 @@ impl CursorManagerState {
         // to prevent blocking the main cursor manager loop.
         if !to_drop.is_empty() {
             let group = group.clone();
-
-            for range in &to_drop {
-                if let Some(handle) = self.active_tasks.remove(range) {
-                    handle.abort();
+            let ranges_to_commit = to_drop.clone();
+            for range in to_drop {
+                if let Some(stop_tx) = self.active_tasks.remove(&range) {
+                    let _ = stop_tx.send(FetchActorCommand::Stop);
                 }
             }
             tokio::spawn(async move {
-                let _ = group.revoke_ranges(&to_drop).await;
+                let _ = group.revoke_ranges(&ranges_to_commit).await;
             });
         }
 
@@ -195,13 +194,15 @@ impl CursorManagerState {
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
-        let handle = tokio::spawn(run_fetch_actor(
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        tokio::spawn(run_fetch_actor(
             range_id,
             entry_id,
             ctx.clone(),
             record_tx.clone(),
+            stop_rx,
         ));
-        self.active_tasks.insert(range_id, handle);
+        self.active_tasks.insert(range_id, stop_tx);
     }
 
     /// Resolves the starting entry ID for a range cursor when it is dynamically started.
@@ -240,8 +241,8 @@ impl CursorManagerState {
     }
 
     async fn abort_all(&mut self) {
-        for (_, handle) in self.active_tasks.drain() {
-            handle.abort();
+        for (_, stop_tx) in self.active_tasks.drain() {
+            let _ = stop_tx.send(FetchActorCommand::Stop);
         }
         if let Some(group) = &self.consumer_group {
             let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;

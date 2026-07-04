@@ -23,18 +23,25 @@ enum RangeLookupResult {
         progress_signal: RangeProgressSignal,
     },
 }
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FetchActorCommand {
+    Stop,
+}
+
 /// The asynchronous fetch loop for a single active range cursor.
 pub(crate) async fn run_fetch_actor(
     range_id: RangeId,
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    stop_rx: flume::Receiver<FetchActorCommand>,
 ) {
     let mut actor = FetchActor {
         range_id,
         next_entry_id,
         ctx,
         record_tx,
+        stop_rx,
     };
     actor.run().await;
 }
@@ -44,17 +51,34 @@ struct FetchActor {
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    stop_rx: flume::Receiver<FetchActorCommand>,
 }
 
 impl FetchActor {
     async fn run(&mut self) {
+        let stop_rx = self.stop_rx.clone();
         loop {
-            match self.step().await {
-                Ok(true) => continue, // Keep looping
-                Ok(false) => return,  // Graceful shutdown (e.g., drained)
-                Err(e) => {
-                    let _ = self.record_tx.send(Err(e));
-                    return; // Fatal error shutdown
+            if self.record_tx.is_disconnected() {
+                return;
+            }
+
+            tokio::select! {
+                cmd = stop_rx.recv_async() => {
+                    match cmd {
+                        Ok(FetchActorCommand::Stop) | Err(_) => {
+                            return; // Graceful shutdown
+                        }
+                    }
+                }
+                res = self.step() => {
+                    match res {
+                        Ok(true) => continue, // Keep looping
+                        Ok(false) => return,  // Graceful shutdown (e.g., drained)
+                        Err(e) => {
+                            let _ = self.record_tx.send(Err(e));
+                            return; // Fatal error shutdown
+                        }
+                    }
                 }
             }
         }
