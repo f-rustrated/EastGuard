@@ -74,6 +74,11 @@ impl ClientController {
                 Ok((request_id, request)) => {
                     let writer_tx = writer_tx.clone();
                     let controller = self.clone();
+                    // Spawn a task per request to process them concurrently. This prevents
+                    // Head-of-Line (HOL) blocking on the multiplexed connection: slow requests
+                    // (e.g. disk reads or consensus proposals) won't block fast hot-cache reads
+                    // from other concurrent client threads. Strict partition-level ordering for
+                    // sequential clients remains intact because they await responses sequentially.
                     tokio::spawn(async move {
                         let response = controller.dispatch(request).await;
                         if writer_tx.send((request_id, response)).await.is_err() {
