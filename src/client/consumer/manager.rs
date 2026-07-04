@@ -2,11 +2,10 @@ use super::RangeCursor;
 use crate::client::consumer::bootstrap::StartPolicy;
 use crate::client::consumer::fetch::{FetchActorCommand, run_fetch_actor};
 use crate::client::consumer::group::ConsumerGroup;
-use crate::client::consumer::ownership::RangeOwnership;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{RangeId, RangeState};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,8 +18,8 @@ pub(crate) struct CursorDrained {
 }
 
 struct CursorManagerState {
-    /// Unified ownership of per-range cursors and their fetch actor senders.
-    ownership: RangeOwnership,
+    cursors: RangeCursorSet,
+    senders: HashMap<RangeId, flume::Sender<FetchActorCommand>>,
     /// The last observed heartbeat sequence number for each active group peer.
     last_seen_sequences: HashMap<Uuid, u64>,
     /// Consecutive rebalance ticks where a peer's heartbeat sequence number has not advanced.
@@ -39,7 +38,8 @@ impl CursorManagerState {
         start_policy: StartPolicy,
     ) -> Self {
         Self {
-            ownership: RangeOwnership::new(cursors),
+            cursors,
+            senders: HashMap::new(),
             last_seen_sequences: HashMap::new(),
             stale_ticks: HashMap::new(),
             consumer_group,
@@ -48,7 +48,7 @@ impl CursorManagerState {
     }
 
     fn should_exit(&self) -> bool {
-        self.ownership.is_empty() && self.consumer_group.is_none()
+        self.cursors.is_empty() && self.consumer_group.is_none()
     }
 
     fn provision_initial_tasks(
@@ -62,7 +62,7 @@ impl CursorManagerState {
         if self.consumer_group.is_some() {
             return;
         }
-        for cursor in self.ownership.iter_cursors().cloned().collect::<Vec<_>>() {
+        for cursor in self.cursors.iter().cloned().collect::<Vec<_>>() {
             self.spawn_and_register(
                 cursor.range_id,
                 cursor.next_entry_id,
@@ -78,13 +78,14 @@ impl CursorManagerState {
         ctx: &Arc<ConsumerContext>,
         record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
-        let Some(added) = self.ownership.drain(event.range_id, event.transition) else {
-            // This range was already revoked/stopped by a rebalance or shutdown.
+        // If not owned, it was already revoked — late drain event, safe to ignore.
+        if self.senders.remove(&event.range_id).is_none() {
             return;
-        };
+        }
+        let added = self.cursors.apply_drained(event.range_id, event.transition);
 
         for new_cursor in added.iter() {
-            if self.ownership.owns(&new_cursor.range_id) {
+            if self.senders.contains_key(&new_cursor.range_id) {
                 continue; // Skip if a fetch actor is already running
             }
             self.spawn_and_register(
@@ -144,21 +145,23 @@ impl CursorManagerState {
         }
 
         // Perform rebalance inside ConsumerGroup
-        let (to_drop, to_start) = group.rebalance(
-            &ctx.all_ranges(),
-            self.ownership.owned_range_ids().cloned().collect(),
-        );
+        let (to_drop, to_start) =
+            group.rebalance(&ctx.all_ranges(), self.senders.keys().cloned().collect());
 
         // Abort revoked tasks immediately and commit their offsets in the background
         // to prevent blocking the main cursor manager loop.
         if !to_drop.is_empty() {
-            let group = group.clone();
-            let ranges_to_commit = to_drop.clone();
-            for range in to_drop {
-                self.ownership.revoke(range);
+            for range in &to_drop {
+                // Revoke ownership: send Stop, remove cursor and stop channel.
+                if let Some(stop_tx) = self.senders.remove(range) {
+                    let _ = stop_tx.send(FetchActorCommand::Stop);
+                }
+                self.cursors.remove(*range);
             }
+
+            let group = group.clone();
             tokio::spawn(async move {
-                let _ = group.revoke_ranges(&ranges_to_commit).await;
+                let _ = group.revoke_ranges(&to_drop).await;
             });
         }
 
@@ -185,12 +188,7 @@ impl CursorManagerState {
                 .resolve_start_entry_id(range, ctx, saved_offsets.get(&range).copied())
                 .await;
 
-            if self.ownership.should_skip_start(
-                range,
-                &metadata.ranges,
-                &saved_offsets,
-                resolved_entry_id,
-            ) {
+            if self.should_skip_start(range, &metadata.ranges, &saved_offsets, resolved_entry_id) {
                 continue;
             }
 
@@ -207,8 +205,8 @@ impl CursorManagerState {
     }
 
     /// Spawn a fetch actor and register its stop channel for a range whose
-    /// cursor already exists in the ownership set (independent consumer init
-    /// or post-drain transition).
+    /// cursor already exists in the set (independent consumer init or
+    /// post-drain transition).
     fn spawn_and_register(
         &mut self,
         range_id: RangeId,
@@ -216,8 +214,12 @@ impl CursorManagerState {
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
+        debug_assert!(
+            self.cursors.contains(range_id),
+            "register called for range {range_id:?} not in cursor set"
+        );
         let (stop_tx, stop_rx) = flume::bounded(1);
-        self.ownership.register(range_id, stop_tx);
+        self.senders.insert(range_id, stop_tx);
         tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
     }
 
@@ -238,7 +240,8 @@ impl CursorManagerState {
             r_meta.keyspace_end.clone(),
         );
         let (stop_tx, stop_rx) = flume::bounded(1);
-        self.ownership.acquire(cursor, stop_tx);
+        self.senders.insert(cursor.range_id, stop_tx);
+        self.cursors.add_or_update(cursor);
         tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
     }
 
@@ -269,7 +272,7 @@ impl CursorManagerState {
         }
 
         // 3. Fallback to the local cursor's next entry ID.
-        if let Some(cursor) = self.ownership.get_cursor(range) {
+        if let Some(cursor) = self.cursors.get(range) {
             return cursor.next_entry_id;
         }
 
@@ -278,10 +281,115 @@ impl CursorManagerState {
     }
 
     async fn abort_all(&mut self) {
-        self.ownership.revoke_all();
+        for (_, stop_tx) in self.senders.drain() {
+            let _ = stop_tx.send(FetchActorCommand::Stop);
+        }
         if let Some(group) = &self.consumer_group {
             let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
         }
+    }
+
+    /// Returns true if this range should NOT be started. Consolidates:
+    /// - Active descendant check (children already being fetched)
+    /// - Undrained parent check (parent not yet fully consumed)
+    /// - Sealed-and-consumed check (range already fully consumed)
+    fn should_skip_start(
+        &self,
+        range_id: RangeId,
+        ranges: &[RangeDetail],
+        saved_offsets: &HashMap<RangeId, u64>,
+        resolved_entry_id: u64,
+    ) -> bool {
+        self.has_active_descendant(range_id, ranges)
+            || self.has_undrained_parent(range_id, ranges, saved_offsets)
+            || ranges
+                .iter()
+                .find(|r| r.range_id == range_id)
+                .is_some_and(|r| {
+                    r.state == RangeState::Sealed && resolved_entry_id > r.end_entry_id()
+                })
+    }
+
+    /// Returns true if any descendant (split child or merge target) of the
+    /// given range is currently owned or has a live cursor.
+    fn has_active_descendant(&self, range_id: RangeId, ranges: &[RangeDetail]) -> bool {
+        let Some(r_meta) = ranges.iter().find(|r| r.range_id == range_id) else {
+            return false;
+        };
+
+        if let Some(children) = r_meta.split_into {
+            if self.senders.contains_key(&children.0) || self.senders.contains_key(&children.1) {
+                return true;
+            }
+            if self.cursors.contains(children.0) || self.cursors.contains(children.1) {
+                return true;
+            }
+            if self.has_active_descendant(children.0, ranges)
+                || self.has_active_descendant(children.1, ranges)
+            {
+                return true;
+            }
+        }
+
+        if let Some(child) = r_meta.merged_into {
+            if self.senders.contains_key(&child) {
+                return true;
+            }
+            if self.cursors.contains(child) {
+                return true;
+            }
+            if self.has_active_descendant(child, ranges) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Returns true if any ancestor (split parent or merge source) of the
+    /// given range still needs to be drained before this range can start.
+    fn has_undrained_parent(
+        &self,
+        range_id: RangeId,
+        ranges: &[RangeDetail],
+        saved_offsets: &HashMap<RangeId, u64>,
+    ) -> bool {
+        for p in ranges.iter() {
+            let is_parent = p
+                .split_into
+                .is_some_and(|children| children.0 == range_id || children.1 == range_id)
+                || p.merged_into.is_some_and(|child| child == range_id);
+
+            if !is_parent {
+                continue;
+            }
+
+            // Parent still has an active fetch actor — not yet drained.
+            if self.senders.contains_key(&p.range_id) {
+                return true;
+            }
+
+            // Parent is still active (not sealed) — can't have drained.
+            if p.state == RangeState::Active {
+                return true;
+            }
+
+            // Parent is sealed but consumer hasn't consumed past its end.
+            if p.state == RangeState::Sealed {
+                let parent_resolved = saved_offsets.get(&p.range_id).map(|o| o + 1).unwrap_or(0);
+
+                if parent_resolved <= p.end_entry_id() {
+                    return true;
+                }
+            }
+
+            // Walk further up the lineage tree.
+            if self.has_undrained_parent(p.range_id, ranges, saved_offsets) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -339,7 +447,7 @@ pub(crate) async fn run_cursor_manager(
                 if startup_grace_ticks > 0 {
                     startup_grace_ticks -= 1;
                 } else {
-                    if state.ownership.is_empty() {
+                    if state.cursors.is_empty() {
                         let _ = ctx.refresh_metadata().await;
                     }
                     state.handle_rebalance(&ctx, &record_tx).await;

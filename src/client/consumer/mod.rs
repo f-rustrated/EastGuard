@@ -19,7 +19,7 @@ pub(crate) mod cursor_set;
 mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
-pub(crate) mod ownership;
+
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
