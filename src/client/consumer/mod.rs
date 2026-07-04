@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::bootstrap::CursorBootstrap;
+use crate::client::consumer::bootstrap::build_cursors;
 use crate::client::consumer::fetch::ConsumerContext;
 use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
 use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
@@ -19,13 +19,26 @@ pub(crate) mod cursor_set;
 mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
-pub(crate) mod ownership;
-pub(crate) mod parked_merges;
-mod record;
+
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
-pub use record::ConsumerRecord;
+
+/// A record returned to the consumer application.
+#[derive(Debug, Clone)]
+pub struct ConsumerRecord {
+    pub topic: String,
+    pub range_id: RangeId,
+    pub offset: u64,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl ConsumerRecord {
+    pub fn key_match<'a>(&'a self, key: impl Iterator<Item = &'a u8>) -> bool {
+        self.key.iter().eq(key)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
@@ -59,7 +72,7 @@ impl Consumer {
         config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
         let detail = client.resolve_topic(&topic).await?;
-        let mut cursors = CursorBootstrap::build(&detail, interest, config.start_policy);
+        let mut cursors = build_cursors(&detail, interest, config.start_policy);
 
         let mut consumer_group = None;
 
@@ -78,7 +91,7 @@ impl Consumer {
         }
 
         if matches!(config.start_policy, StartPolicy::Latest) {
-            for cursor in cursors.cursors_mut() {
+            for cursor in cursors.iter_mut() {
                 let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
                 if !has_saved_offset
                     && let Ok((_, committed_entry_id)) =

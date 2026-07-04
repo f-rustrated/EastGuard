@@ -9,14 +9,41 @@
 //! consumer should currently be fetching — successors only appear after
 //! their predecessor drains.
 
-use super::bootstrap::CursorBootstrap;
 use super::cursor::RangeCursor;
-use super::parked_merges::{ParkedMerge, ParkedMerges};
-use crate::client::{KeyInterest, StartPolicy, TopicDetail};
 use crate::connections::protocol::RangeTransition;
 use crate::control_plane::metadata::RangeId;
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
+
+struct ParkedMerge {
+    /// The merged range's wire ID.
+    merged_id: RangeId,
+
+    /// `Vec` instead of `HashMap` — for `n` this small the linear scan is cache-friendly and
+    /// avoids HashMap's per-entry hashing + sparse-storage overhead.
+    drained: Vec<RangeCursor>,
+}
+
+#[derive(Default)]
+struct ParkedMerges(Vec<ParkedMerge>);
+
+impl ParkedMerges {
+    fn push(&mut self, pending: ParkedMerge) {
+        self.0.push(pending);
+    }
+
+    fn try_complete_merge(
+        &mut self,
+        merged_range_id: RangeId,
+        drained: &RangeCursor,
+    ) -> Option<RangeCursor> {
+        let pos = self.0.iter().position(|p| p.merged_id == merged_range_id)?;
+        let parked = self.0.swap_remove(pos).drained.pop()?;
+        let mut m = parked.into_merged_cursor(merged_range_id);
+        m.absorb(drained.clone());
+        Some(m)
+    }
+}
 
 pub struct RangeCursorSet {
     cursors: Vec<RangeCursor>,
@@ -34,12 +61,20 @@ impl RangeCursorSet {
         set
     }
 
-    pub fn cursors(&self) -> &[RangeCursor] {
-        &self.cursors
+    pub fn contains(&self, range_id: RangeId) -> bool {
+        self.cursors.iter().any(|c| c.range_id == range_id)
     }
 
-    pub(crate) fn cursors_mut(&mut self) -> &mut [RangeCursor] {
-        &mut self.cursors
+    pub fn get(&self, range_id: RangeId) -> Option<&RangeCursor> {
+        self.cursors.iter().find(|c| c.range_id == range_id)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RangeCursor> {
+        self.cursors.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RangeCursor> {
+        self.cursors.iter_mut()
     }
 
     #[allow(dead_code)]
@@ -253,7 +288,7 @@ mod tests {
         assert_eq!(added.len(), 0);
 
         // P1 dropped; P2 still tracked; M not yet a fetchable cursor.
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         assert_eq!(ids, vec![RangeId(2)]);
     }
 
@@ -283,7 +318,7 @@ mod tests {
 
         // Only M remains, spanning both pre-merge keyspaces.
         assert_eq!(set.len(), 1);
-        assert_eq!(set.cursors()[0].range_id, RangeId(3));
+        assert_eq!(set.get(RangeId(3)).unwrap().range_id, RangeId(3));
     }
 
     /// Single-parent consumer reading only `[a, b)`: P1 drains, M is added
@@ -301,9 +336,8 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"b"));
 
-        let cursors = set.cursors();
-        assert_eq!(cursors.len(), 1);
-        assert_eq!(cursors[0].range_id, RangeId(3));
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.get(RangeId(3)).unwrap().range_id, RangeId(3));
     }
 
     #[test]
