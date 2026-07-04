@@ -212,11 +212,11 @@ impl CursorManagerState {
             "register called for range {:?} not in cursor set",
             cursor.range_id
         );
-        let (stop_tx, stop_rx) = flume::bounded(1);
-        self.senders.insert(cursor.range_id, stop_tx);
 
+        let (stop_tx, stop_rx) = flume::bounded(1);
         let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
         tokio::spawn(actor.run(stop_rx));
+        self.senders.insert(cursor.range_id, stop_tx);
     }
 
     /// Create a cursor from range metadata, acquire ownership, and spawn
