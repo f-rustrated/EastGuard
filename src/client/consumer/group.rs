@@ -1,6 +1,7 @@
+use crate::client::consumer::cursor_set::{KeyInterest, StartPolicy};
 use crate::client::{
-    Client, ClientError, Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, PartitionStrategy,
-    Producer, ProducerConfig, StartPolicy, StoragePolicy,
+    Client, ClientError, Consumer, ConsumerConfig, ConsumerRecord, PartitionStrategy, Producer,
+    ProducerConfig, StoragePolicy,
 };
 use crate::control_plane::metadata::RangeId;
 use arc_swap::ArcSwap;

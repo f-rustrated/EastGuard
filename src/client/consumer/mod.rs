@@ -3,7 +3,6 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::bootstrap::build_cursors;
 use crate::client::consumer::fetch::ConsumerContext;
 use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
 use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
@@ -13,16 +12,15 @@ use crate::connections::protocol::{
     RangeOffsetRequest, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{RangeId, RangeState};
-pub(crate) mod bootstrap;
 pub(crate) mod cursor;
 pub(crate) mod cursor_set;
 mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
 
-pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor_set::RangeCursorSet;
+pub use cursor_set::{KeyInterest, StartPolicy};
 
 /// A record returned to the consumer application.
 #[derive(Debug, Clone)]
@@ -72,7 +70,7 @@ impl Consumer {
         config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
         let detail = client.resolve_topic(&topic).await?;
-        let mut cursors = build_cursors(&detail, interest, config.start_policy);
+        let mut cursors = RangeCursorSet::build_cursors(&detail, interest, config.start_policy);
 
         let mut consumer_group = None;
 

@@ -3,8 +3,12 @@
 //! transitions (so split/merge can carve / extend the cursor's keyspace
 //! without going back to metadata).
 
+use std::collections::HashSet;
+
+use crate::client::TopicDetail;
+use crate::client::consumer::cursor_set::KeyInterest;
 use crate::connections::protocol::RangeDetail;
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{RangeId, RangeState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCursor {
@@ -27,6 +31,52 @@ impl RangeCursor {
             keyspace_start,
             keyspace_end,
         }
+    }
+    pub(crate) fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
+        detail
+            .ranges
+            .iter()
+            .filter(|r| r.state == RangeState::Active)
+            .filter(|r| interest.matches(r))
+            .map(|r| {
+                let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
+                RangeCursor::new(
+                    r.range_id,
+                    start_offset,
+                    r.keyspace_start.clone(),
+                    r.keyspace_end.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// A "root" range is one with no predecessor in lineage: not the product
+    /// of a merge (`merged_from = None`) and not the child of any split (no
+    /// other range's `split_into` mentions it). For a freshly-created topic
+    /// that has only split, the original full-keyspace range is the sole
+    /// root.
+    pub(crate) fn earliest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
+        let split_children: HashSet<RangeId> = detail
+            .ranges
+            .iter()
+            .filter_map(|r| r.split_into)
+            .flat_map(|(l, r)| [l, r])
+            .collect();
+
+        detail
+            .ranges
+            .iter()
+            .filter(|r| r.merged_from.is_none() && !split_children.contains(&r.range_id))
+            .filter(|r| interest.matches(r))
+            .map(|r| {
+                RangeCursor::new(
+                    r.range_id,
+                    r.first_segment_start_offset().unwrap_or(0),
+                    r.keyspace_start.clone(),
+                    r.keyspace_end.clone(),
+                )
+            })
+            .collect()
     }
 
     pub fn split(
@@ -68,16 +118,5 @@ impl RangeCursor {
         if half.keyspace_end > self.keyspace_end {
             self.keyspace_end = half.keyspace_end.clone();
         }
-    }
-}
-
-impl From<&RangeDetail> for RangeCursor {
-    fn from(r: &RangeDetail) -> Self {
-        RangeCursor::new(
-            r.range_id,
-            r.first_segment_start_offset().unwrap_or(0),
-            r.keyspace_start.clone(),
-            r.keyspace_end.clone(),
-        )
     }
 }
