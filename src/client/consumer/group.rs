@@ -116,12 +116,25 @@ impl ConsumerGroup {
             partition_strategy: PartitionStrategy::AutoSplit,
         };
 
-        // Attempt to create system topics. Ignore errors if they already exist.
-        let _ = self
+        if self
             .client
-            .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
-            .await;
-        let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+            .resolve_topic(SYSTEM_TOPIC_ASSIGNMENTS)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .client
+                .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
+                .await;
+        }
+        if self
+            .client
+            .resolve_topic(SYSTEM_TOPIC_OFFSETS)
+            .await
+            .is_err()
+        {
+            let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+        }
 
         Ok(())
     }

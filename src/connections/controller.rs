@@ -72,10 +72,14 @@ impl ClientController {
             // TODO idempotency based on request id (or separate idempotence key)
             match reader.read_request::<ClientRequest>().await {
                 Ok((request_id, request)) => {
-                    let response = self.dispatch(request).await;
-                    if writer_tx.send((request_id, response)).await.is_err() {
-                        tracing::debug!("client writer closed");
-                    }
+                    let writer_tx = writer_tx.clone();
+                    let controller = self.clone();
+                    tokio::spawn(async move {
+                        let response = controller.dispatch(request).await;
+                        if writer_tx.send((request_id, response)).await.is_err() {
+                            tracing::debug!("client writer closed");
+                        }
+                    });
                 }
                 Err(e) => {
                     tracing::debug!("client connection closed: {e}");
