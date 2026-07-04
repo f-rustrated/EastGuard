@@ -91,7 +91,7 @@ impl Consumer {
         }
 
         if matches!(config.start_policy, StartPolicy::Latest) {
-            for cursor in cursors.cursors_mut() {
+            for cursor in cursors.iter_mut() {
                 let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
                 if !has_saved_offset
                     && let Ok((_, committed_entry_id)) =

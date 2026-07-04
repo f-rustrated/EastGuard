@@ -41,10 +41,7 @@ impl RangeOwnership {
     /// by `apply_drained`).
     pub fn register(&mut self, range_id: RangeId, stop_tx: flume::Sender<FetchActorCommand>) {
         debug_assert!(
-            self.cursors
-                .cursors()
-                .iter()
-                .any(|c| c.range_id == range_id),
+            self.cursors.contains(range_id),
             "register called for range {range_id:?} not in cursor set"
         );
         self.senders.insert(range_id, stop_tx);
@@ -87,12 +84,12 @@ impl RangeOwnership {
         self.senders.keys()
     }
 
-    pub fn cursors(&self) -> &[RangeCursor] {
-        self.cursors.cursors()
+    pub fn get_cursor(&self, range_id: RangeId) -> Option<&RangeCursor> {
+        self.cursors.get(range_id)
     }
 
-    pub fn cursors_mut(&mut self) -> &mut [RangeCursor] {
-        self.cursors.cursors_mut()
+    pub fn iter_cursors(&self) -> std::slice::Iter<'_, RangeCursor> {
+        self.cursors.iter()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -131,12 +128,7 @@ impl RangeOwnership {
             if self.owns(&children.0) || self.owns(&children.1) {
                 return true;
             }
-            if self
-                .cursors
-                .cursors()
-                .iter()
-                .any(|c| c.range_id == children.0 || c.range_id == children.1)
-            {
+            if self.cursors.contains(children.0) || self.cursors.contains(children.1) {
                 return true;
             }
             if self.has_active_descendant(children.0, ranges)
@@ -150,7 +142,7 @@ impl RangeOwnership {
             if self.owns(&child) {
                 return true;
             }
-            if self.cursors.cursors().iter().any(|c| c.range_id == child) {
+            if self.cursors.contains(child) {
                 return true;
             }
             if self.has_active_descendant(child, ranges) {

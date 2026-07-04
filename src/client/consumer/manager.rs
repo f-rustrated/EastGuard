@@ -62,7 +62,7 @@ impl CursorManagerState {
         if self.consumer_group.is_some() {
             return;
         }
-        for cursor in self.ownership.cursors().to_vec() {
+        for cursor in self.ownership.iter_cursors().cloned().collect::<Vec<_>>() {
             self.spawn_and_register(
                 cursor.range_id,
                 cursor.next_entry_id,
@@ -269,12 +269,7 @@ impl CursorManagerState {
         }
 
         // 3. Fallback to the local cursor's next entry ID.
-        if let Some(cursor) = self
-            .ownership
-            .cursors()
-            .iter()
-            .find(|c| c.range_id == range)
-        {
+        if let Some(cursor) = self.ownership.get_cursor(range) {
             return cursor.next_entry_id;
         }
 

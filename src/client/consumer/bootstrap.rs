@@ -164,7 +164,7 @@ mod tests {
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
         let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Latest);
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         assert!(ids.contains(&RangeId(1)));
         assert!(ids.contains(&RangeId(2)));
         assert!(!ids.contains(&RangeId(0)));
@@ -186,7 +186,7 @@ mod tests {
             },
             StartPolicy::Latest,
         );
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         assert_eq!(ids, vec![RangeId(1)]);
     }
 
@@ -208,7 +208,7 @@ mod tests {
         ]);
         let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         // Earliest = original root (range 0), not the split children.
         assert_eq!(ids, vec![RangeId(0)]);
     }
@@ -247,7 +247,7 @@ mod tests {
         ]);
         let set = build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         // 1 and 2 are the roots (no merged_from, not split children); 3 has
         // merged_from set so it's not a root.
         assert!(ids.contains(&RangeId(1)));

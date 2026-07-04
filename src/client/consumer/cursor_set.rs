@@ -61,12 +61,20 @@ impl RangeCursorSet {
         set
     }
 
-    pub fn cursors(&self) -> &[RangeCursor] {
-        &self.cursors
+    pub fn contains(&self, range_id: RangeId) -> bool {
+        self.cursors.iter().any(|c| c.range_id == range_id)
     }
 
-    pub(crate) fn cursors_mut(&mut self) -> &mut [RangeCursor] {
-        &mut self.cursors
+    pub fn get(&self, range_id: RangeId) -> Option<&RangeCursor> {
+        self.cursors.iter().find(|c| c.range_id == range_id)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RangeCursor> {
+        self.cursors.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RangeCursor> {
+        self.cursors.iter_mut()
     }
 
     #[allow(dead_code)]
@@ -280,7 +288,7 @@ mod tests {
         assert_eq!(added.len(), 0);
 
         // P1 dropped; P2 still tracked; M not yet a fetchable cursor.
-        let ids: Vec<RangeId> = set.cursors().iter().map(|c| c.range_id).collect();
+        let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         assert_eq!(ids, vec![RangeId(2)]);
     }
 
@@ -310,7 +318,7 @@ mod tests {
 
         // Only M remains, spanning both pre-merge keyspaces.
         assert_eq!(set.len(), 1);
-        assert_eq!(set.cursors()[0].range_id, RangeId(3));
+        assert_eq!(set.get(RangeId(3)).unwrap().range_id, RangeId(3));
     }
 
     /// Single-parent consumer reading only `[a, b)`: P1 drains, M is added
@@ -328,9 +336,8 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"b"));
 
-        let cursors = set.cursors();
-        assert_eq!(cursors.len(), 1);
-        assert_eq!(cursors[0].range_id, RangeId(3));
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.get(RangeId(3)).unwrap().range_id, RangeId(3));
     }
 
     #[test]
