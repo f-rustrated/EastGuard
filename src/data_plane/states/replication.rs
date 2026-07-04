@@ -60,13 +60,6 @@ impl ReplicationState {
             .push(reply);
     }
 
-    pub(crate) fn drain_pending_replies(
-        &mut self,
-        segment_key: &SegmentKey,
-    ) -> Vec<oneshot::Sender<ProduceAck>> {
-        self.pending_replies.remove(segment_key).unwrap_or_default()
-    }
-
     /// Pop the oldest waiting reply for a segment (FIFO). The no-follower commit
     /// path publishes one entry per produce in order, so popping one reply per
     /// published entry pairs each producer with its exact committed `entry_id`.
@@ -114,7 +107,10 @@ impl ReplicationState {
         &mut self,
         pending_repl: &PendingReplicationBatch,
     ) -> Option<u64> {
-        let replies = self.drain_pending_replies(&pending_repl.segment_key);
+        let mut replies = Vec::new();
+        if let Some(reply) = self.pop_pending_reply(&pending_repl.segment_key) {
+            replies.push(reply);
+        }
         let pending_acks = pending_repl.followers.iter().cloned().collect();
         let is_first = self.push_in_flight(
             pending_repl.segment_key,
@@ -278,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_replication_drains_pending_replies() {
+    fn begin_replication_pops_single_reply() {
         let mut state = ReplicationState::default();
         let sk = key(0);
         let (tx1, _) = tokio::sync::oneshot::channel();
@@ -290,7 +286,10 @@ mod tests {
         let repl = pending_repl(sk, vec![node("f1")], 0);
         state.begin_replication(&repl);
 
-        assert!(state.drain_pending_replies(&sk).is_empty());
+        assert_eq!(
+            state.pending_replies.get(&sk).map(|v| v.len()).unwrap_or(0),
+            1
+        );
     }
 
     #[test]
