@@ -118,6 +118,18 @@ impl Producer {
         }
     }
 
+    /// Flush all currently buffered records across all partitions and wait for their completion.
+    pub async fn flush(&self) {
+        let batches = self.inner.buffers.take_all();
+        if batches.is_empty() {
+            return;
+        }
+        let futures = batches
+            .into_iter()
+            .map(|(_, records)| self.flush_records(records));
+        futures::future::join_all(futures).await;
+    }
+
     /// Serialize, compress, and publish a batch of records.
     async fn flush_records(&self, pending_records: Vec<PendingRecord>) {
         if pending_records.is_empty() {

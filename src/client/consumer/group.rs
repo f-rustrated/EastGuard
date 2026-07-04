@@ -20,6 +20,14 @@ pub struct HeartbeatPayload {
     pub consumer_id: [u8; 16],
     pub sequence_number: u64, // Repurposed from timestamp to be a deterministic counter
 }
+impl HeartbeatPayload {
+    fn stop_signal(consumer_id: &[u8; 16]) -> Self {
+        HeartbeatPayload {
+            consumer_id: *consumer_id,
+            sequence_number: 0, // indicates leaving
+        }
+    }
+}
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct OffsetCommitPayload {
@@ -62,9 +70,7 @@ pub struct ConsumerGroup {
     pub owned_ranges: ArcSwap<HashSet<RangeId>>,
     pub offsets: DashMap<RangeId, OffsetTracker>,
 
-    // Hold the handles so we can kill them on drop
-    hb_sender_handle: tokio::task::AbortHandle,
-    hb_receiver_handle: tokio::task::AbortHandle,
+    _hb_stop_tx: flume::Sender<()>,
 }
 
 impl ConsumerGroup {
@@ -72,24 +78,28 @@ impl ConsumerGroup {
         let consumer_id = Uuid::new_v4();
         let active_peers = Arc::new(DashMap::new());
 
-        let hb_sender_handle = tokio::spawn(group_heartbeat_sender(
+        let (hb_stop_tx, hb_stop_rx) = flume::bounded(0);
+
+        let routing_key = format!("hb:{}", group_id.clone());
+        tokio::spawn(group_heartbeat_sender(
             consumer_id,
             client.clone(),
-            format!("hb:{}", group_id.clone()),
-        ))
-        .abort_handle();
+            routing_key.clone(),
+            hb_stop_rx.clone(),
+        ));
+
         let offset_producer = Producer::new(
             client.clone(),
             SYSTEM_TOPIC_OFFSETS.to_string(),
             ProducerConfig::default(),
         );
 
-        let hb_receiver_handle = tokio::spawn(heartbeat_receiver(
+        tokio::spawn(heartbeat_receiver(
             client.clone(),
             active_peers.clone(),
-            format!("hb:{}", group_id),
-        ))
-        .abort_handle();
+            routing_key,
+            hb_stop_rx,
+        ));
 
         Ok(Self {
             group_id,
@@ -100,8 +110,7 @@ impl ConsumerGroup {
             active_peers,
             owned_ranges: ArcSwap::from_pointee(HashSet::new()),
             offsets: DashMap::new(),
-            hb_sender_handle,
-            hb_receiver_handle,
+            _hb_stop_tx: hb_stop_tx,
         })
     }
 
@@ -116,12 +125,25 @@ impl ConsumerGroup {
             partition_strategy: PartitionStrategy::AutoSplit,
         };
 
-        // Attempt to create system topics. Ignore errors if they already exist.
-        let _ = self
+        if self
             .client
-            .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
-            .await;
-        let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+            .resolve_topic(SYSTEM_TOPIC_ASSIGNMENTS)
+            .await
+            .is_err()
+        {
+            let _ = self
+                .client
+                .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
+                .await;
+        }
+        if self
+            .client
+            .resolve_topic(SYSTEM_TOPIC_OFFSETS)
+            .await
+            .is_err()
+        {
+            let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+        }
 
         Ok(())
     }
@@ -172,9 +194,12 @@ impl ConsumerGroup {
     }
 
     async fn write_offset_commits(&self, commits: Vec<(RangeId, u64)>) -> Result<(), ClientError> {
-        for (range_id, offset) in commits {
-            let payload = OffsetCommitPayload { range_id, offset };
-            if let Ok(data) = borsh::to_vec(&payload)
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let futures = commits.into_iter().map(|(range_id, offset)| async move {
+            if let Ok(data) = borsh::to_vec(&OffsetCommitPayload { range_id, offset })
                 && self
                     .offset_producer
                     .send(self.routing_key().as_bytes(), data)
@@ -184,7 +209,9 @@ impl ConsumerGroup {
             {
                 entry.committed = Some(offset);
             }
-        }
+        });
+
+        futures::future::join_all(futures).await;
         Ok(())
     }
 
@@ -263,7 +290,12 @@ impl ConsumerGroup {
     }
 }
 
-async fn group_heartbeat_sender(consumer_id: Uuid, hb_client: Arc<Client>, routing_key: String) {
+async fn group_heartbeat_sender(
+    consumer_id: Uuid,
+    hb_client: Arc<Client>,
+    routing_key: String,
+    stop_rx: flume::Receiver<()>,
+) {
     let producer = Producer::new(
         hb_client,
         SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
@@ -281,7 +313,17 @@ async fn group_heartbeat_sender(consumer_id: Uuid, hb_client: Arc<Client>, routi
         if let Ok(data) = borsh::to_vec(&payload) {
             let _ = producer.send(routing_key.as_bytes(), data).await;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        tokio::select! {
+            _ = stop_rx.recv_async() => { // Matches any Result (Ok or Err!)
+                // Gracefully publish a leave tombstone signal before exiting
+                if let Ok(data) = borsh::to_vec(&HeartbeatPayload::stop_signal(consumer_id.as_bytes())) {
+                    let _ = producer.send(routing_key.as_bytes(), data).await;
+                }
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 
@@ -289,6 +331,7 @@ async fn heartbeat_receiver(
     client: Arc<Client>,
     active_peers: Arc<DashMap<Uuid, u64>>,
     heartbeat_key: String,
+    stop_rx: flume::Receiver<()>,
 ) {
     let mut end_key = heartbeat_key.as_bytes().to_vec();
     end_key.push(0u8);
@@ -308,26 +351,35 @@ async fn heartbeat_receiver(
         return;
     };
 
-    while let Ok(Some(record)) = consumer.next_record().await {
-        if record.key_match(heartbeat_key.as_bytes().iter())
-            && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
-            && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
-        {
-            // Store the highest sequence number seen
-            if let Some(mut current) = active_peers.get_mut(&cid) {
-                if payload.sequence_number > *current {
-                    *current = payload.sequence_number;
+    loop {
+        tokio::select! {
+            _ = stop_rx.recv_async() => {
+                break;
+            }
+            res = consumer.next_record() => {
+
+                let Ok(Some(record)) = res else {
+                    break;
+                };
+                if record.key_match(heartbeat_key.as_bytes().iter())
+                    && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
+                    && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
+                {
+                    if payload.sequence_number == 0 {
+                        // Peer is leaving gracefully; remove immediately
+                        active_peers.remove(&cid);
+                    } else {
+                        // Store the highest sequence number seen
+                        if let Some(mut current) = active_peers.get_mut(&cid) {
+                            if payload.sequence_number > *current {
+                                *current = payload.sequence_number;
+                            }
+                        } else {
+                            active_peers.insert(cid, payload.sequence_number);
+                        }
+                    }
                 }
-            } else {
-                active_peers.insert(cid, payload.sequence_number);
             }
         }
-    }
-}
-
-impl Drop for ConsumerGroup {
-    fn drop(&mut self) {
-        self.hb_sender_handle.abort();
-        self.hb_receiver_handle.abort();
     }
 }

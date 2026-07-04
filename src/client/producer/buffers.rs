@@ -23,9 +23,6 @@ pub struct RangeBuffer {
 }
 impl RangeBuffer {
     fn push(&mut self, pending: PendingRecord) {
-        if self.records.is_empty() {
-            self.current_batch_seq = self.current_batch_seq.wrapping_add(1);
-        }
         // Estimate serialized size: key_len (4B) + value_len (4B) + content bytes
         let record_bytes = 8 + pending.record.key.len() + pending.record.value.len();
         self.current_bytes += record_bytes;
@@ -39,7 +36,9 @@ impl RangeBuffer {
         self.current_bytes >= config.max_batch_bytes
             || self.records.len() >= config.max_batch_records
     }
+
     fn flush(&mut self) -> Vec<PendingRecord> {
+        self.current_batch_seq = self.current_batch_seq.wrapping_add(1);
         let records_to_flush = std::mem::take(&mut self.records);
         self.current_bytes = 0;
         self.spawned_linger = false;
@@ -106,10 +105,18 @@ impl ProducerBuffers {
         if buf.records.is_empty() {
             return None;
         }
-        let records = std::mem::take(&mut buf.records);
-        buf.current_bytes = 0;
-        buf.spawned_linger = false;
-        buf.first_added_at = None;
-        Some(records)
+        Some(buf.flush())
+    }
+
+    /// Take and clear all buffered records unconditionally across all partitions.
+    /// Increment the batch sequence to invalidate any pending linger tasks.
+    pub fn take_all(&self) -> Vec<(RangeId, Vec<PendingRecord>)> {
+        let mut all_records = Vec::with_capacity(self.inner.len());
+        for mut entry in self.inner.iter_mut() {
+            if !entry.records.is_empty() {
+                all_records.push((*entry.key(), entry.flush()));
+            }
+        }
+        all_records
     }
 }

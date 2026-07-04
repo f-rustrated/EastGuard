@@ -125,16 +125,15 @@ impl FetchActor {
                             ClientError::UnexpectedResponse
                         })?;
 
-                    for (i, rec) in records.iter().enumerate() {
+                    for (i, rec) in records.into_iter().enumerate() {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.range_id,
                             offset: entry.entry_id + i as u64,
-                            key: rec.key.clone(),
-                            value: rec.value.clone(),
+                            key: rec.key,
+                            value: rec.value,
                         };
 
-                        // TODO commit offset management?
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {
                             return Ok(false); // Disconnected
                         }

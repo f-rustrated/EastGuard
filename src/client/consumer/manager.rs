@@ -112,6 +112,12 @@ impl CursorManagerState {
             .map(|kv| (*kv.key(), *kv.value()))
             .collect();
 
+        // Garbage collect tracking maps for any peers that left or were removed
+        self.last_seen_sequences
+            .retain(|k, _| group.active_peers.contains_key(k));
+        self.stale_ticks
+            .retain(|k, _| group.active_peers.contains_key(k));
+
         for (peer_id, current_seq) in peers_copy {
             let last_seq = self
                 .last_seen_sequences
@@ -142,15 +148,19 @@ impl CursorManagerState {
             self.active_tasks.keys().cloned().collect(),
         );
 
-        // Commit offsets for revoked tasks BEFORE dropping them
+        // Abort revoked tasks immediately and commit their offsets in the background
+        // to prevent blocking the main cursor manager loop.
         if !to_drop.is_empty() {
-            let _ = group.revoke_ranges(&to_drop).await;
-        }
+            let group = group.clone();
 
-        for range in to_drop {
-            if let Some(handle) = self.active_tasks.remove(&range) {
-                handle.abort();
+            for range in &to_drop {
+                if let Some(handle) = self.active_tasks.remove(range) {
+                    handle.abort();
+                }
             }
+            tokio::spawn(async move {
+                let _ = group.revoke_ranges(&to_drop).await;
+            });
         }
 
         if to_start.is_empty() {
@@ -229,9 +239,12 @@ impl CursorManagerState {
         0
     }
 
-    fn abort_all(&mut self) {
+    async fn abort_all(&mut self) {
         for (_, handle) in self.active_tasks.drain() {
             handle.abort();
+        }
+        if let Some(group) = &self.consumer_group {
+            let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
         }
     }
 }
@@ -262,10 +275,6 @@ pub(crate) async fn run_cursor_manager(
 
     loop {
         if record_tx.is_disconnected() {
-            // Perform a final commit on graceful shutdown.
-            if let Some(group) = &state.consumer_group {
-                let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
-            }
             break;
         }
 
@@ -279,7 +288,7 @@ pub(crate) async fn run_cursor_manager(
                 state.handle_cursor_drained(event, &ctx, &record_tx);
 
                 if state.should_exit() {
-                    break;
+                     break;
                 }
             }
 
@@ -303,5 +312,5 @@ pub(crate) async fn run_cursor_manager(
         }
     }
 
-    state.abort_all();
+    state.abort_all().await;
 }
