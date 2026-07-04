@@ -172,9 +172,12 @@ impl ConsumerGroup {
     }
 
     async fn write_offset_commits(&self, commits: Vec<(RangeId, u64)>) -> Result<(), ClientError> {
-        for (range_id, offset) in commits {
-            let payload = OffsetCommitPayload { range_id, offset };
-            if let Ok(data) = borsh::to_vec(&payload)
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let futures = commits.into_iter().map(|(range_id, offset)| async move {
+            if let Ok(data) = borsh::to_vec(&OffsetCommitPayload { range_id, offset })
                 && self
                     .offset_producer
                     .send(self.routing_key().as_bytes(), data)
@@ -184,7 +187,9 @@ impl ConsumerGroup {
             {
                 entry.committed = Some(offset);
             }
-        }
+        });
+
+        futures::future::join_all(futures).await;
         Ok(())
     }
 
