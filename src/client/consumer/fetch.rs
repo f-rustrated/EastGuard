@@ -34,16 +34,15 @@ pub(crate) async fn run_fetch_actor(
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    stop_rx: flume::Receiver<FetchActorCommand>,
+    rx: flume::Receiver<FetchActorCommand>,
 ) {
     let mut actor = FetchActor {
         range_id,
         next_entry_id,
         ctx,
         record_tx,
-        stop_rx,
     };
-    actor.run().await;
+    actor.run(rx).await;
 }
 
 struct FetchActor {
@@ -51,19 +50,17 @@ struct FetchActor {
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    stop_rx: flume::Receiver<FetchActorCommand>,
 }
 
 impl FetchActor {
-    async fn run(&mut self) {
-        let stop_rx = self.stop_rx.clone();
+    async fn run(&mut self, rx: flume::Receiver<FetchActorCommand>) {
         loop {
             if self.record_tx.is_disconnected() {
                 return;
             }
 
             tokio::select! {
-                cmd = stop_rx.recv_async() => {
+                cmd = rx.recv_async() => {
                     match cmd {
                         Ok(FetchActorCommand::Stop) | Err(_) => {
                             return; // Graceful shutdown
