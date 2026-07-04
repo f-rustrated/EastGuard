@@ -148,15 +148,19 @@ impl CursorManagerState {
             self.active_tasks.keys().cloned().collect(),
         );
 
-        // Commit offsets for revoked tasks BEFORE dropping them
+        // Abort revoked tasks immediately and commit their offsets in the background
+        // to prevent blocking the main cursor manager loop.
         if !to_drop.is_empty() {
-            let _ = group.revoke_ranges(&to_drop).await;
-        }
+            let group = group.clone();
 
-        for range in to_drop {
-            if let Some(handle) = self.active_tasks.remove(&range) {
-                handle.abort();
+            for range in &to_drop {
+                if let Some(handle) = self.active_tasks.remove(range) {
+                    handle.abort();
+                }
             }
+            tokio::spawn(async move {
+                let _ = group.revoke_ranges(&to_drop).await;
+            });
         }
 
         if to_start.is_empty() {
