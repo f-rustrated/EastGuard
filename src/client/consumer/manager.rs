@@ -1,7 +1,7 @@
 use super::RangeCursor;
 
 use crate::client::consumer::cursor_set::StartPolicy;
-use crate::client::consumer::fetch::{FetchActorCommand, run_fetch_actor};
+use crate::client::consumer::fetch::{FetchActor, FetchActorCommand};
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
@@ -64,12 +64,7 @@ impl CursorManagerState {
             return;
         }
         for cursor in self.cursors.iter().cloned().collect::<Vec<_>>() {
-            self.spawn_and_register(
-                cursor.range_id,
-                cursor.next_entry_id,
-                ctx.clone(),
-                record_tx.clone(),
-            );
+            self.spawn_and_register(&cursor, ctx.clone(), record_tx.clone());
         }
     }
 
@@ -89,12 +84,7 @@ impl CursorManagerState {
             if self.senders.contains_key(&new_cursor.range_id) {
                 continue; // Skip if a fetch actor is already running
             }
-            self.spawn_and_register(
-                new_cursor.range_id,
-                new_cursor.next_entry_id,
-                ctx.clone(),
-                record_tx.clone(),
-            );
+            self.spawn_and_register(new_cursor, ctx.clone(), record_tx.clone());
         }
     }
 
@@ -195,9 +185,12 @@ impl CursorManagerState {
 
             if let Some(r_meta) = metadata.ranges.iter().find(|r| r.range_id == range) {
                 self.spawn_and_acquire(
-                    range,
-                    resolved_entry_id,
-                    r_meta,
+                    RangeCursor::new(
+                        range,
+                        resolved_entry_id,
+                        r_meta.keyspace_start.clone(),
+                        r_meta.keyspace_end.clone(),
+                    ),
                     ctx.clone(),
                     record_tx.clone(),
                 );
@@ -210,40 +203,35 @@ impl CursorManagerState {
     /// post-drain transition).
     fn spawn_and_register(
         &mut self,
-        range_id: RangeId,
-        entry_id: u64,
+        cursor: &RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
         debug_assert!(
-            self.cursors.contains(range_id),
-            "register called for range {range_id:?} not in cursor set"
+            self.cursors.contains(cursor.range_id),
+            "register called for range {:?} not in cursor set",
+            cursor.range_id
         );
         let (stop_tx, stop_rx) = flume::bounded(1);
-        self.senders.insert(range_id, stop_tx);
-        tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
+        self.senders.insert(cursor.range_id, stop_tx);
+
+        let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
+        tokio::spawn(actor.run(stop_rx));
     }
 
     /// Create a cursor from range metadata, acquire ownership, and spawn
     /// the fetch actor. Used by `handle_rebalance` for newly assigned ranges.
     fn spawn_and_acquire(
         &mut self,
-        range_id: RangeId,
-        entry_id: u64,
-        r_meta: &RangeDetail,
+        cursor: RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
-        let cursor = RangeCursor::new(
-            range_id,
-            entry_id,
-            r_meta.keyspace_start.clone(),
-            r_meta.keyspace_end.clone(),
-        );
         let (stop_tx, stop_rx) = flume::bounded(1);
+        let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
+        tokio::spawn(actor.run(stop_rx));
         self.senders.insert(cursor.range_id, stop_tx);
         self.cursors.add_or_update(cursor);
-        tokio::spawn(run_fetch_actor(range_id, entry_id, ctx, record_tx, stop_rx));
     }
 
     /// Resolves the starting entry ID for a range cursor when it is dynamically started.

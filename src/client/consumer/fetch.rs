@@ -28,24 +28,7 @@ pub(crate) enum FetchActorCommand {
     Stop,
 }
 
-/// The asynchronous fetch loop for a single active range cursor.
-pub(crate) async fn run_fetch_actor(
-    range_id: RangeId,
-    next_entry_id: u64,
-    ctx: Arc<ConsumerContext>,
-    record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    rx: flume::Receiver<FetchActorCommand>,
-) {
-    let mut actor = FetchActor {
-        range_id,
-        next_entry_id,
-        ctx,
-        record_tx,
-    };
-    actor.run(rx).await;
-}
-
-struct FetchActor {
+pub(crate) struct FetchActor {
     range_id: RangeId,
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
@@ -53,7 +36,20 @@ struct FetchActor {
 }
 
 impl FetchActor {
-    async fn run(&mut self, rx: flume::Receiver<FetchActorCommand>) {
+    pub(crate) fn new(
+        range_id: RangeId,
+        next_entry_id: u64,
+        ctx: Arc<ConsumerContext>,
+        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    ) -> Self {
+        Self {
+            range_id,
+            next_entry_id,
+            ctx,
+            record_tx,
+        }
+    }
+    pub(crate) async fn run(mut self, rx: flume::Receiver<FetchActorCommand>) {
         loop {
             if self.record_tx.is_disconnected() {
                 return;
