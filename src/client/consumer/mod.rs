@@ -20,7 +20,6 @@ mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
 pub(crate) mod ownership;
-pub(crate) mod parked_merges;
 mod record;
 pub use bootstrap::{KeyInterest, StartPolicy};
 pub(crate) use cursor::RangeCursor;

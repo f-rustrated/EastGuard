@@ -10,11 +10,40 @@
 //! their predecessor drains.
 
 use super::cursor::RangeCursor;
-use super::parked_merges::{ParkedMerge, ParkedMerges};
 use crate::connections::protocol::RangeTransition;
 use crate::control_plane::metadata::RangeId;
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
+
+struct ParkedMerge {
+    /// The merged range's wire ID.
+    merged_id: RangeId,
+
+    /// `Vec` instead of `HashMap` — for `n` this small the linear scan is cache-friendly and
+    /// avoids HashMap's per-entry hashing + sparse-storage overhead.
+    drained: Vec<RangeCursor>,
+}
+
+#[derive(Default)]
+struct ParkedMerges(Vec<ParkedMerge>);
+
+impl ParkedMerges {
+    fn push(&mut self, pending: ParkedMerge) {
+        self.0.push(pending);
+    }
+
+    fn try_complete_merge(
+        &mut self,
+        merged_range_id: RangeId,
+        drained: &RangeCursor,
+    ) -> Option<RangeCursor> {
+        let pos = self.0.iter().position(|p| p.merged_id == merged_range_id)?;
+        let parked = self.0.swap_remove(pos).drained.pop()?;
+        let mut m = parked.into_merged_cursor(merged_range_id);
+        m.absorb(drained.clone());
+        Some(m)
+    }
+}
 
 pub struct RangeCursorSet {
     cursors: Vec<RangeCursor>,
