@@ -1,6 +1,6 @@
 use super::RangeCursor;
 
-use crate::client::consumer::cursor_set::StartPolicy;
+use crate::client::consumer::cursor::StartPolicy;
 use crate::client::consumer::fetch::{FetchActor, FetchActorCommand};
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};

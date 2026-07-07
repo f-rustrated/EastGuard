@@ -1,4 +1,4 @@
-use crate::client::consumer::cursor_set::{KeyInterest, StartPolicy};
+use crate::client::consumer::cursor::{KeyInterest, StartPolicy};
 use crate::client::{
     Client, ClientError, Consumer, ConsumerConfig, ConsumerRecord, PartitionStrategy, Producer,
     ProducerConfig, StoragePolicy,

@@ -12,15 +12,15 @@ use crate::connections::protocol::{
     RangeOffsetRequest, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{RangeId, RangeState};
+
 pub(crate) mod cursor;
-pub(crate) mod cursor_set;
 mod fetch;
 pub(crate) mod group;
 pub(crate) mod manager;
 
 pub(crate) use cursor::RangeCursor;
-pub(crate) use cursor_set::RangeCursorSet;
-pub use cursor_set::{KeyInterest, StartPolicy};
+pub(crate) use cursor::RangeCursorSet;
+pub use cursor::{KeyInterest, StartPolicy};
 
 /// A record returned to the consumer application.
 #[derive(Debug, Clone)]
