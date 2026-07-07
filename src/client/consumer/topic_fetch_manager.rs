@@ -1,7 +1,7 @@
 use super::RangeCursor;
 
 use crate::client::consumer::cursor::StartPolicy;
-use crate::client::consumer::fetch::{FetchActor, FetchActorCommand};
+use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
@@ -20,9 +20,9 @@ pub(crate) struct CursorDrained {
     pub transition: RangeTransition,
 }
 
-struct CursorManagerState {
+struct TopicFetchManagerState {
     cursors: RangeCursorSet,
-    senders: HashMap<RangeId, flume::Sender<FetchActorCommand>>,
+    senders: HashMap<RangeId, flume::Sender<RangeFetchActorCommand>>,
 
     /// The optional shared consumer group context for dynamic partition rebalancing.
     consumer_group: Option<Arc<ConsumerGroup>>,
@@ -30,7 +30,7 @@ struct CursorManagerState {
     start_policy: StartPolicy,
 }
 
-impl CursorManagerState {
+impl TopicFetchManagerState {
     fn new(
         cursors: RangeCursorSet,
         consumer_group: Option<Arc<ConsumerGroup>>,
@@ -100,7 +100,7 @@ impl CursorManagerState {
             for range in &to_drop {
                 // Revoke ownership: send Stop, remove cursor and stop channel.
                 if let Some(stop_tx) = self.senders.remove(range) {
-                    let _ = stop_tx.send(FetchActorCommand::Stop);
+                    let _ = stop_tx.send(RangeFetchActorCommand::Stop);
                 }
                 self.cursors.remove(*range);
             }
@@ -165,7 +165,7 @@ impl CursorManagerState {
             return;
         }
         let (stop_tx, stop_rx) = flume::bounded(1);
-        let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
+        let actor = RangeFetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
         tokio::spawn(actor.run(stop_rx));
         self.senders.insert(cursor.range_id, stop_tx);
         self.cursors.add_or_update(cursor);
@@ -208,7 +208,7 @@ impl CursorManagerState {
 
     async fn abort_all(&mut self) {
         for (_, stop_tx) in self.senders.drain() {
-            let _ = stop_tx.send(FetchActorCommand::Stop);
+            let _ = stop_tx.send(RangeFetchActorCommand::Stop);
         }
         if let Some(group) = &self.consumer_group {
             let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
@@ -319,7 +319,7 @@ impl CursorManagerState {
     }
 }
 
-pub(crate) async fn run_cursor_manager(
+pub(crate) async fn run_topic_fetch_manager(
     cursors: RangeCursorSet,
     rx: flume::Receiver<CursorDrained>,
     weak_ctx: std::sync::Weak<ConsumerContext>,
@@ -327,7 +327,7 @@ pub(crate) async fn run_cursor_manager(
     consumer_group: Option<Arc<ConsumerGroup>>,
     config: ConsumerConfig,
 ) {
-    let mut state = CursorManagerState::new(cursors, consumer_group, config.start_policy);
+    let mut state = TopicFetchManagerState::new(cursors, consumer_group, config.start_policy);
     if state.should_exit() {
         return;
     }
@@ -355,6 +355,7 @@ pub(crate) async fn run_cursor_manager(
         tokio::select! {
             res = rx.recv_async() => {
                 let Ok(event) = res else { break };
+                // CursorDrained Event arrived! meaning that fetch actor figured that the range is sealed
                 state.handle_cursor_drained(event, &ctx, &record_tx);
 
                 if state.should_exit() {
@@ -389,8 +390,17 @@ pub(crate) async fn run_cursor_manager(
 }
 
 #[cfg(any(test, debug_assertions))]
-impl TAssertInvariant for CursorManagerState {
+impl TAssertInvariant for TopicFetchManagerState {
     fn assert_invariants(&self) {
+        // Invariant 1: Size constraint (active fetchers cannot exceed cursors)
+        assert!(
+            self.senders.len() <= self.cursors.len(),
+            "Invariant violated: More active fetch actors ({}) than cursors ({})",
+            self.senders.len(),
+            self.cursors.len()
+        );
+
+        // Invariant 2: Subset property (active fetcher must have an associated cursor)
         for range_id in self.senders.keys() {
             assert!(
                 self.cursors.contains(*range_id),

@@ -4,7 +4,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use super::ConsumerRecord;
-use crate::client::consumer::manager::CursorDrained;
+use crate::client::consumer::topic_fetch_manager::CursorDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, CompressionCodec};
 use crate::connections::protocol::{
@@ -24,18 +24,18 @@ enum RangeLookupResult {
     },
 }
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum FetchActorCommand {
+pub(crate) enum RangeFetchActorCommand {
     Stop,
 }
 
-pub(crate) struct FetchActor {
+pub(crate) struct RangeFetchActor {
     range_id: RangeId,
     next_entry_id: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
 
-impl FetchActor {
+impl RangeFetchActor {
     pub(crate) fn new(
         range_id: RangeId,
         next_entry_id: u64,
@@ -49,7 +49,7 @@ impl FetchActor {
             record_tx,
         }
     }
-    pub(crate) async fn run(mut self, rx: flume::Receiver<FetchActorCommand>) {
+    pub(crate) async fn run(mut self, rx: flume::Receiver<RangeFetchActorCommand>) {
         loop {
             if self.record_tx.is_disconnected() {
                 return;
@@ -58,7 +58,7 @@ impl FetchActor {
             tokio::select! {
                 cmd = rx.recv_async() => {
                     match cmd {
-                        Ok(FetchActorCommand::Stop) | Err(_) => {
+                        Ok(RangeFetchActorCommand::Stop) | Err(_) => {
                             return; // Graceful shutdown
                         }
                     }

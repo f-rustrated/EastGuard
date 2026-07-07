@@ -3,9 +3,9 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::fetch::ConsumerContext;
+use crate::client::consumer::range_fetcher::ConsumerContext;
 use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
-use crate::client::consumer::manager::{CursorDrained, run_cursor_manager};
+use crate::client::consumer::topic_fetch_manager::{CursorDrained, run_topic_fetch_manager};
 use crate::client::{Client, ClientError, Producer, ProducerConfig};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
@@ -14,9 +14,9 @@ use crate::connections::protocol::{
 use crate::control_plane::metadata::{RangeId, RangeState};
 
 pub(crate) mod cursor;
-mod fetch;
 pub(crate) mod group;
-pub(crate) mod manager;
+pub(crate) mod range_fetcher;
+pub(crate) mod topic_fetch_manager;
 
 pub(crate) use cursor::RangeCursor;
 pub(crate) use cursor::RangeCursorSet;
@@ -135,7 +135,7 @@ impl Consumer {
         consumer_group: Option<Arc<ConsumerGroup>>,
         config: ConsumerConfig,
     ) {
-        tokio::spawn(run_cursor_manager(
+        tokio::spawn(run_topic_fetch_manager(
             cursors,
             cursor_rx,
             Arc::downgrade(ctx),
