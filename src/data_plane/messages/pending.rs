@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 use crate::channels::BatchSender;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::checkpoint::{CheckpointJob, CheckpointTask};
 use crate::data_plane::messages::command::ProduceAck;
@@ -26,7 +27,7 @@ pub(crate) struct DataPlaneOutputs {
     pub(crate) coordinator_cmds: Vec<MultiRaftActorCommand>,
     /// `(entry_id, reply)` — the committed offset is paired with each waiting
     /// producer so the `ProduceAck::Ok` carries it back to the client.
-    pub(crate) produce_replies: Vec<(u64, oneshot::Sender<ProduceAck>)>,
+    pub(crate) produce_replies: Vec<(EntryId, oneshot::Sender<ProduceAck>)>,
 }
 
 impl DataPlaneOutputs {

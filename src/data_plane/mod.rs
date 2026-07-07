@@ -2,7 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
-use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::smart_pointer;
 
 pub(crate) mod actor;
@@ -65,15 +65,15 @@ impl SegmentKey {
     }
 
     /// Path to this segment's file. The filename encodes the segment's
-    /// `start_offset` (its first entry id) so the file is self-describing for
+    /// `start_entry` (its first entry id) so the file is self-describing for
     /// crash recovery — discovery derives the base entry id from the name
-    /// alone, no metadata lookup. `start_offset` is immutable, so the name is
+    /// alone, no metadata lookup. `start_entry` is immutable, so the name is
     /// stable for the segment's life (no rename on seal).
-    pub fn file_path(&self, data_dir: &Path, start_offset: u64) -> PathBuf {
+    pub fn file_path(&self, data_dir: &Path, start_entry: impl Into<EntryId>) -> PathBuf {
         data_dir
             .join(self.topic_id.to_string())
             .join(self.range_id.to_string())
-            .join(format!("{}-{}.seg", *self.segment_id, start_offset))
+            .join(format!("{}-{}.seg", *self.segment_id, *start_entry.into()))
     }
 
     pub fn with_segment_id(&self, segment_id: SegmentId) -> Self {

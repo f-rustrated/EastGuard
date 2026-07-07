@@ -1,5 +1,6 @@
 use super::{NodeSpec, host_cluster};
 use crate::client::{Client, Consumer, ConsumerConfig, KeyInterest, Producer, ProducerConfig, StartPolicy};
+use crate::control_plane::metadata::RangeState;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use std::sync::Arc;
 use std::time::Duration;
@@ -423,12 +424,12 @@ fn consumer_group_split_rebalance() {
                     let r_opt = detail.ranges.iter().find(|r| r.range_id == RangeId(0));
                     match r_opt {
                         Some(r) => {
-                            if r.state == crate::control_plane::metadata::RangeState::Sealed {
+                            if r.state == RangeState::Sealed {
                                 rolled = true;
                                 break;
                             }
                             if let Some(s) = &r.active_segment
-                                && s.segment_id >= (i + 1) as u64
+                                && *s.segment_id >= (i + 1) as u64
                             {
                                 rolled = true;
                                 break;

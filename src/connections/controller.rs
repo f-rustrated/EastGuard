@@ -11,7 +11,7 @@ use crate::control_plane::{
         actor::{ShardRouting, SwimSender},
     },
     metadata::{
-        RangeId, TopicId,
+        EntryId, RangeId, TopicId,
         command::{CreateTopic, DeleteTopic, MetadataCommand},
         strategy::StoragePolicy,
     },
@@ -359,7 +359,7 @@ impl ClientController {
         let query = Fetch {
             topic_id: meta.id,
             range_id: RangeId(req.range_id),
-            entry_id: req.entry_id,
+            entry_id: EntryId(req.entry_id),
             max_bytes: req.max_bytes,
             progress_signal,
             reply: reply_tx,
@@ -604,7 +604,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 if let DataPlaneMessage::Command(DataPlaneCommand::Produce(p)) = msg {
-                    let _ = p.reply.send(ProduceAck::Ok { entry_id: 7 });
+                    let _ = p.reply.send(ProduceAck::Ok { entry_id: 7.into() });
                 }
             }
         });
@@ -747,7 +747,7 @@ mod tests {
         let ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) = resp else {
             panic!("expected Produced, got {resp:?}");
         };
-        assert_eq!(entry_id, 7);
+        assert_eq!(entry_id, 7.into());
     }
 
     /// A control-plane write on a non-member node returns the structural redirect
@@ -808,11 +808,10 @@ mod tests {
             .dispatch(ClientRequest::ControlPlane(
                 ControlPlaneRequest::CreateTopic {
                     name: "t1".into(),
-                    storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
+                    storage_policy: StoragePolicy {
                         retention_ms: Some(3_600_000),
                         replication_factor: 1,
-                        partition_strategy:
-                            crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
+                        partition_strategy: PartitionStrategy::AutoSplit,
                     },
                 },
             ))
@@ -833,24 +832,19 @@ mod tests {
                 let _ = reply.send(None);
             }
         });
-        let resp = ClientController::new(
-            node_id("self"),
-            swim,
-            raft_sender_with(|_| {}),
-            dp_stub(),
-        )
-        .dispatch(ClientRequest::ControlPlane(
-            ControlPlaneRequest::CreateTopic {
-                name: "t1".into(),
-                storage_policy: crate::control_plane::metadata::strategy::StoragePolicy {
-                    retention_ms: Some(3_600_000),
-                    replication_factor: 1,
-                    partition_strategy:
-                        crate::control_plane::metadata::strategy::PartitionStrategy::AutoSplit,
-                },
-            },
-        ))
-        .await;
+        let resp =
+            ClientController::new(node_id("self"), swim, raft_sender_with(|_| {}), dp_stub())
+                .dispatch(ClientRequest::ControlPlane(
+                    ControlPlaneRequest::CreateTopic {
+                        name: "t1".into(),
+                        storage_policy: StoragePolicy {
+                            retention_ms: Some(3_600_000),
+                            replication_factor: 1,
+                            partition_strategy: PartitionStrategy::AutoSplit,
+                        },
+                    },
+                ))
+                .await;
         assert!(
             matches!(
                 resp,

@@ -226,7 +226,7 @@ impl TopicFetchManagerState {
                 .iter()
                 .find(|r| r.range_id == range_id)
                 .is_some_and(|r| {
-                    r.state == RangeState::Sealed && resolved_entry_id > r.end_entry_id()
+                    r.state == RangeState::Sealed && resolved_entry_id > *r.end_entry_id()
                 })
     }
 
@@ -298,7 +298,7 @@ impl TopicFetchManagerState {
             if p.state == RangeState::Sealed {
                 let parent_resolved = saved_offsets.get(&p.range_id).map(|o| o + 1).unwrap_or(0);
 
-                if parent_resolved <= p.end_entry_id() {
+                if parent_resolved <= *p.end_entry_id() {
                     return true;
                 }
             }

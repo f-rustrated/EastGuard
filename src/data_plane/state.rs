@@ -23,6 +23,7 @@ use crate::config::DataNodeConfig;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
 use crate::data_plane::states::segment_store::SegmentReadState;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
@@ -50,11 +51,11 @@ const ORPHAN_GC_BATCH: usize = 64;
 struct PendingCatchUp {
     appender: SegmentAppender,
     shard_group_id: ShardGroupId,
-    start_offset: u64,
-    sealed_end: u64,
+    start_offset: EntryId,
+    sealed_end: EntryId,
     /// Highest entry id written so far; `None` until the first append. A resume
     /// re-requests `(last_written, sealed_end]`.
-    last_written: Option<u64>,
+    last_written: Option<EntryId>,
     /// Re-drives since the last append — the stall detector. Reset on append.
     idle_rounds: u32,
     anchors: Vec<SparseEntry>,
@@ -236,12 +237,12 @@ impl<W: WalStorage> DataPlane<W> {
         let start_entry_id = tracker.start_entry_id();
 
         // Translate the absolute entry_id to a 0-based cache position.
-        let cache_position = cmd.entry_id.saturating_sub(start_entry_id);
+        let cache_position = cmd.entry_id.saturating_sub(*start_entry_id);
 
         // The active tail can have `committed_entry_id = 0` and no entries
         // yet committed; distinguish "no data committed at all" by also
         // checking against the cache read cursor.
-        if cache_position >= read_cursor {
+        if *cache_position >= read_cursor {
             // Past the tail — nothing to return.
             let _ = cmd.reply.send(FetchResult::Records {
                 entries: Vec::new(),
@@ -257,14 +258,14 @@ impl<W: WalStorage> DataPlane<W> {
         let max_bytes = cmd.max_bytes as usize;
 
         while let Some(entry_arc) =
-            cache.read_committed(next_entry_id.saturating_sub(start_entry_id))
+            cache.read_committed(*next_entry_id.saturating_sub(*start_entry_id))
         {
             let payload_len = entry_arc.data.len();
             // Always include at least one entry (even if max_bytes is small).
             if !entries.is_empty() && bytes_read + payload_len > max_bytes {
                 break;
             }
-            next_entry_id = entry_arc.entry_id + 1;
+            next_entry_id = entry_arc.entry_id + 1u64;
             entries.push(entry_arc);
             bytes_read += payload_len;
 
@@ -286,8 +287,8 @@ impl<W: WalStorage> DataPlane<W> {
         &self,
         cmd: Fetch,
         key: SegmentKey,
-        start_entry_id: u64,
-        end_entry_id: u64,
+        start_entry_id: EntryId,
+        end_entry_id: EntryId,
     ) {
         if cmd.entry_id > end_entry_id {
             let _ = cmd.reply.send(FetchResult::EntryIdOutOfRange);
@@ -322,7 +323,8 @@ impl<W: WalStorage> DataPlane<W> {
         // active index. Resolve via the highest indexable offset (u64::MAX)
         // to land on whatever's currently active.
         let Some(SegmentReadState::Active(key)) =
-            self.segments.resolve(cmd.topic_id, cmd.range_id, u64::MAX)
+            self.segments
+                .resolve(cmd.topic_id, cmd.range_id, EntryId(u64::MAX))
         else {
             let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
             return;
@@ -463,7 +465,7 @@ impl<W: WalStorage> DataPlane<W> {
                 continue;
             };
             self.recovered.remove(&key);
-            if let Err(e) = OrphanCandidate::new(key, start_offset).delete(&self.config.data_dir) {
+            if let Err(e) = OrphanCandidate::new(key, *start_offset).delete(&self.config.data_dir) {
                 tracing::warn!("retention: deleting segment file {key:?} failed: {e}");
             }
             self.out.store_delete_segment_index(key);
@@ -575,9 +577,10 @@ impl<W: WalStorage> DataPlane<W> {
     /// Highest verified entry id we already hold for this sealed segment — from the
     /// live sealed store (a survivor or a prior catch-up) or the recovered inventory
     /// (a restarted node's on-disk data). `None` if we hold nothing.
-    fn local_sealed_progress(&self, key: &SegmentKey) -> Option<u64> {
+    fn local_sealed_progress(&self, key: &SegmentKey) -> Option<EntryId> {
         let registered = self.segments.sealed_bounds(key).map(|(_, end)| end);
-        registered.max(self.recovered.get(key))
+        let recovered = self.recovered.get(key).map(EntryId);
+        registered.max(recovered)
     }
 
     /// Highest durable (fsync'd) entry id this node holds for `key`, across every
@@ -585,7 +588,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// still following), the sealed store, or the recovered inventory. `None` if
     /// we hold nothing. Reported in a `SealBoundaryReport` so the coordinator can seal
     /// a leader-crashed segment at the `min` of survivors' durable extents.
-    fn durable_end(&self, key: &SegmentKey) -> Option<u64> {
+    fn durable_end(&self, key: &SegmentKey) -> Option<EntryId> {
         let live = self
             .segments
             .get(key)
@@ -614,7 +617,7 @@ impl<W: WalStorage> DataPlane<W> {
     fn open_catch_up_appender(
         key: SegmentKey,
         path: &std::path::Path,
-        local: Option<u64>,
+        local: Option<EntryId>,
     ) -> std::io::Result<SegmentAppender> {
         match local {
             None => SegmentAppender::create(key, path),
@@ -641,7 +644,9 @@ impl<W: WalStorage> DataPlane<W> {
             // Append only the strictly-next id; skip duplicates / out-of-order. A
             // resume can overlap a stalled stream's tail, and a double append would
             // overstate the verified prefix.
-            let next = pending.last_written.map_or(pending.start_offset, |w| w + 1);
+            let next = pending
+                .last_written
+                .map_or(pending.start_offset, |w| w + 1u64);
             if entry.entry_id != next {
                 continue;
             }
@@ -698,7 +703,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
         if scan
             .last_entry_id
-            .is_none_or(|last| last < pending.sealed_end)
+            .is_none_or(|last| EntryId(last) < pending.sealed_end)
         {
             tracing::warn!(
                 "catch-up incomplete for {:?}: have {:?}, need {}; not registering",
@@ -745,7 +750,7 @@ impl<W: WalStorage> DataPlane<W> {
             );
             return;
         };
-        let start = cmd.local_end.map_or(start_offset, |held| held + 1);
+        let start = cmd.local_end.map_or(start_offset, |held| held + 1u64);
         if start > sealed_end {
             // The requester is already at or past OUR committed end — nothing to
             // stream. Confirm completion immediately and skip a pointless cold-read
@@ -762,9 +767,9 @@ impl<W: WalStorage> DataPlane<W> {
         &self,
         requester: NodeId,
         segment_key: SegmentKey,
-        start_offset: u64, // Segment base — names the file (`{segment_id}-{start_offset}.seg`)
-        sealed_end: u64,
-        read_from: u64,
+        start_offset: EntryId, // Segment base — names the file (`{segment_id}-{start_offset}.seg`)
+        sealed_end: EntryId,
+        read_from: EntryId,
     ) {
         let req = ColdReadRequest {
             segment_key,
@@ -1026,10 +1031,10 @@ impl<W: WalStorage> DataPlane<W> {
                 if let Some(tracker) = self.segments.get_mut(&cmd.segment_key) {
                     let start = tracker
                         .last_committed_entry_id()
-                        .map_or(tracker.start_entry_id(), |c| c + 1);
+                        .map_or(tracker.start_entry_id(), |c| c + 1u64);
 
-                    for offset in start..=end {
-                        tracker.commit_entry(offset);
+                    for offset in *start..=*end {
+                        tracker.commit_entry(EntryId(offset));
                     }
                 }
             }
@@ -1080,7 +1085,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    fn commit_segment(&mut self, segment_key: SegmentKey, entry_id: u64) {
+    fn commit_segment(&mut self, segment_key: SegmentKey, entry_id: EntryId) {
         let Some(tracker) = self.segments.get_mut(&segment_key) else {
             return;
         };
@@ -1476,7 +1481,7 @@ mod tests {
                 segment_key: key,
                 shard_group_id: ShardGroupId(1),
                 replica_set,
-                start_entry_id: 0,
+                start_entry_id: EntryId(0),
             }
             .into(),
         )
@@ -1571,7 +1576,7 @@ mod tests {
 
         let tracker = dp.segments.get(&test_key()).unwrap();
         assert_eq!(tracker.size_bytes(), 12);
-        assert_eq!(tracker.next_entry_id(), 0);
+        assert_eq!(tracker.next_entry_id(), EntryId(0));
     }
 
     #[test]
@@ -1818,7 +1823,7 @@ mod tests {
             let t = dp.segments.get(&test_key()).unwrap();
             assert_eq!(t.staged_entries().len(), 3);
             assert_eq!(t.cache_write_cursor(), 0);
-            assert_eq!(t.next_entry_id(), 0);
+            assert_eq!(t.next_entry_id(), EntryId(0));
         }
 
         dp.flush_batch();
@@ -1826,7 +1831,7 @@ mod tests {
         let t = dp.segments.get(&test_key()).unwrap();
         assert!(t.staged_entries().is_empty());
         assert_eq!(t.cache_write_cursor(), 3);
-        assert_eq!(t.next_entry_id(), 3);
+        assert_eq!(t.next_entry_id(), EntryId(3));
         assert_eq!(t.cache_read_cursor(), 3);
     }
 
@@ -1918,7 +1923,7 @@ mod tests {
         );
         dp.out.transport_cmds.clear();
 
-        dp.commit_segment(test_key(), 0);
+        dp.commit_segment(test_key(), EntryId(0));
 
         let cache = dp.segments.get(&test_key()).unwrap().cache();
         assert_eq!(cache.load_read_cursor(), 1);
@@ -1938,7 +1943,7 @@ mod tests {
                 replica_set: vec![leader, test_node_id()],
                 data: b"setup".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -1963,7 +1968,7 @@ mod tests {
                 replica_set: vec![leader.clone(), test_node_id()],
                 data: b"data".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -1986,7 +1991,7 @@ mod tests {
                 replica_set: vec![NodeId::new("other-leader"), NodeId::new("other-follower")],
                 data: b"data".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -2006,7 +2011,7 @@ mod tests {
                 replica_set: vec![leader.clone(), test_node_id()],
                 data: b"data".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -2015,13 +2020,13 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             CommitAdvance {
                 segment_key: test_key(),
-                committed_entry_id: 0,
+                committed_entry_id: EntryId(0),
             }
             .into(),
         ));
 
         let tracker = dp.segments.get(&test_key()).unwrap();
-        assert_eq!(tracker.committed_entry_id(), 0);
+        assert_eq!(tracker.committed_entry_id(), EntryId(0));
         assert_eq!(tracker.cache().load_read_cursor(), 1);
     }
 
@@ -2125,7 +2130,7 @@ mod tests {
                 replica_set: vec![leader, test_node_id()],
                 data: b"data".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -2147,7 +2152,7 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
-        dp.segments.get_mut(&test_key()).unwrap().commit_entry(0);
+        dp.segments.get_mut(&test_key()).unwrap().commit_entry(EntryId(0));
 
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SealResponse {
@@ -2222,7 +2227,7 @@ mod tests {
                 replica_set: vec![leader, test_node_id()],
                 data: b"data".to_vec().into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
             }
             .into(),
         ));
@@ -2260,7 +2265,7 @@ mod tests {
 
         let resolved = dp
             .segments
-            .resolve(TopicId(1), RangeId(0), 0)
+            .resolve(TopicId(1), RangeId(0), EntryId(0))
             .expect("active segment should resolve");
         assert!(matches!(resolved, SegmentReadState::Active(k) if k == test_key()));
     }
@@ -2299,18 +2304,18 @@ mod tests {
         let s0 = test_key();
         let s1 = s0.with_segment_id(SegmentId(1));
 
-        let lookup = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        let lookup = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
         match lookup {
             SegmentReadState::Sealed {
                 key, end_entry_id, ..
             } => {
                 assert_eq!(key, s0);
-                assert_eq!(end_entry_id, 0);
+                assert_eq!(end_entry_id, EntryId(0));
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
 
-        let active = dp.segments.resolve(TopicId(1), RangeId(0), 1).unwrap();
+        let active = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(1)).unwrap();
         assert!(matches!(active, SegmentReadState::Active(k) if k == s1));
     }
 
@@ -2358,12 +2363,12 @@ mod tests {
 
         // Offset 0 resolves to the active successor (which reuses start 0), not
         // an empty sealed segment — the old segment owned no committed offsets.
-        let resolved = dp.segments.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        let resolved = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
         assert!(
             matches!(resolved, SegmentReadState::Active(k) if k == s1),
             "offset 0 must resolve to the active successor, got {resolved:?}",
         );
-        assert_eq!(dp.segments.get(&s1).unwrap().start_entry_id(), 0);
+        assert_eq!(dp.segments.get(&s1).unwrap().start_entry_id(), EntryId(0));
 
         // The replayed record commits on flush (single replica) and is readable
         // at offset 0 — proving no record was stranded by the seal.
@@ -2428,7 +2433,7 @@ mod tests {
         // Write the segment file + sparse index exactly as the checkpoint worker
         // would (Data + BatchEnd per entry), then seal so the resolver routes
         // offset 0 to the sealed table → cold path.
-        let seg_path = test_key().file_path(dir.path(), 0);
+        let seg_path = test_key().file_path(dir.path(), EntryId(0));
         if let Some(parent) = seg_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -2464,7 +2469,7 @@ mod tests {
         dp.process(DataPlaneMessage::Query(DataPlaneQuery::Fetch(Fetch {
             topic_id: TopicId(1),
             range_id: RangeId(0),
-            entry_id: 0,
+            entry_id: EntryId(0),
             max_bytes: 1 << 20,
             progress_signal: RangeProgressSignal::Active,
             reply,
@@ -2483,7 +2488,7 @@ mod tests {
         };
         let got: Vec<(u64, u32, Vec<u8>)> = entries
             .iter()
-            .map(|e| (e.entry_id, e.record_count, e.data.to_vec()))
+            .map(|e| (*e.entry_id, e.record_count, e.data.to_vec()))
             .collect();
         assert_eq!(
             got,
@@ -2494,7 +2499,7 @@ mod tests {
             ],
             "cold read must restore payloads AND record_counts from disk"
         );
-        assert_eq!(next_entry_id, 3);
+        assert_eq!(next_entry_id, EntryId(3));
     }
 
     // ── Catch-up source side (commit 20) ──────────────────────────────────
@@ -2523,9 +2528,9 @@ mod tests {
             SegmentRole::Leader,
             vec![],
             ShardGroupId(1),
-            0,
+            EntryId(0),
         );
-        tracker.commit_entry(10);
+        tracker.commit_entry(EntryId(10));
         dp.segments.insert_active(test_key(), tracker);
         dp.segments.take_active_and_seal(test_key());
         (dp, cold_read_rx)
@@ -2544,17 +2549,17 @@ mod tests {
             CatchUpRequest {
                 segment_key: test_key(),
                 from: requester.clone(),
-                local_end: Some(4),
+                local_end: Some(EntryId(4)),
             }
             .into(),
         ));
 
         let req = cold_read_rx.try_recv().expect("dispatched cold read");
-        assert_eq!(req.start_entry_offset, 5); // requester's local_end + 1
-        assert_eq!(req.end_entry_id, 10); // the source's own sealed end
+        assert_eq!(req.start_entry_offset, EntryId(5)); // requester's local_end + 1
+        assert_eq!(req.end_entry_id, EntryId(10)); // the source's own sealed end
         assert!(matches!(
             req.reply,
-            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == 10
+            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == EntryId(10)
         ));
     }
 
@@ -2571,7 +2576,7 @@ mod tests {
             CatchUpRequest {
                 segment_key: test_key(),
                 from: requester.clone(),
-                local_end: Some(10), // == the source's sealed end
+                local_end: Some(EntryId(10)), // == the source's sealed end
             }
             .into(),
         ));
@@ -2605,29 +2610,29 @@ mod tests {
             Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"a").into(),
                 record_count: 1,
-                entry_id: 0,
+                entry_id: EntryId(0),
                 lsn: 0,
             }),
             Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"bb").into(),
                 record_count: 2,
-                entry_id: 1,
+                entry_id: EntryId(1),
                 lsn: 0,
             }),
             Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"ccc").into(),
                 record_count: 3,
-                entry_id: 2,
+                entry_id: EntryId(2),
                 lsn: 0,
             }),
         ];
         dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
             requester: requester.clone(),
             segment_key: test_key(),
-            start_offset: 0,
-            sealed_end: 2,
+            start_offset: EntryId(0),
+            sealed_end: EntryId(2),
             entries,
-            next_offset: 3,
+            next_offset: EntryId(3),
         }));
 
         assert_eq!(dp.out.transport_cmds.len(), 2);
@@ -2643,7 +2648,7 @@ mod tests {
         let got: Vec<(u64, u32, Vec<u8>)> = c
             .entries
             .iter()
-            .map(|e| (e.entry_id, e.record_count, e.data.to_vec()))
+            .map(|e| (*e.entry_id, e.record_count, e.data.to_vec()))
             .collect();
         assert_eq!(
             got,
@@ -2689,15 +2694,15 @@ mod tests {
         dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
             requester: requester.clone(),
             segment_key: test_key(),
-            start_offset: 0,
-            sealed_end: 9,
+            start_offset: EntryId(0),
+            sealed_end: EntryId(9),
             entries: vec![Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"x").into(),
                 record_count: 1,
-                entry_id: 4,
+                entry_id: EntryId(4),
                 lsn: 0,
             })],
-            next_offset: 5,
+            next_offset: EntryId(5),
         }));
 
         // One chunk, no Done yet.
@@ -2712,11 +2717,11 @@ mod tests {
 
         // The next read was re-armed against the pool, resuming at next_offset.
         let req = cold_read_rx.try_recv().expect("re-armed cold read");
-        assert_eq!(req.start_entry_offset, 5);
-        assert_eq!(req.end_entry_id, 9);
+        assert_eq!(req.start_entry_offset, EntryId(5));
+        assert_eq!(req.end_entry_id, EntryId(9));
         assert!(matches!(
             req.reply,
-            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == 9
+            ColdReadReply::CatchUp(cu) if cu.requester == requester && cu.sealed_end == EntryId(9)
         ));
     }
 
@@ -2738,8 +2743,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 2,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(2),
                 replica_set: vec![test_node_id(), source.clone()],
             }
             .into(),
@@ -2763,17 +2768,17 @@ mod tests {
                 segment_key: test_key(),
                 entries: vec![
                     CatchUpEntry {
-                        entry_id: 0,
+                        entry_id: EntryId(0),
                         data: b"a".to_vec().into(),
                         record_count: 1,
                     },
                     CatchUpEntry {
-                        entry_id: 1,
+                        entry_id: EntryId(1),
                         data: b"bb".to_vec().into(),
                         record_count: 2,
                     },
                     CatchUpEntry {
-                        entry_id: 2,
+                        entry_id: EntryId(2),
                         data: b"ccc".to_vec().into(),
                         record_count: 3,
                     },
@@ -2790,9 +2795,9 @@ mod tests {
         ));
 
         // Registered cold-readable at its sealed bounds...
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(2))));
         // ...the file verifies through the sealed end...
-        let scan = scan_segment_file(&test_key().file_path(dir.path(), 0)).unwrap();
+        let scan = scan_segment_file(&test_key().file_path(dir.path(), EntryId(0))).unwrap();
         assert_eq!(scan.last_entry_id, Some(2));
         // ...and the suffix anchors were handed to the checkpoint worker (entry 0
         // at byte 0 is always an anchor).
@@ -2822,8 +2827,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 5, // need through 5...
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(5), // need through 5...
                 replica_set: vec![test_node_id(), NodeId::new("source")],
             }
             .into(),
@@ -2834,17 +2839,17 @@ mod tests {
                 segment_key: test_key(),
                 entries: vec![
                     CatchUpEntry {
-                        entry_id: 0,
+                        entry_id: EntryId(0),
                         data: b"a".to_vec().into(),
                         record_count: 1,
                     },
                     CatchUpEntry {
-                        entry_id: 1,
+                        entry_id: EntryId(1),
                         data: b"b".to_vec().into(),
                         record_count: 1,
                     },
                     CatchUpEntry {
-                        entry_id: 2,
+                        entry_id: EntryId(2),
                         data: b"c".to_vec().into(),
                         record_count: 1,
                     },
@@ -2889,8 +2894,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 2,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(2),
                 replica_set: vec![test_node_id(), NodeId::new("peer")],
             }
             .into(),
@@ -2907,7 +2912,7 @@ mod tests {
             DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key()
         ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 2)));
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(2))));
     }
 
     #[test]
@@ -2924,14 +2929,14 @@ mod tests {
         recovered.advance(reused, 0);
         let mut dp = make_data_plane_with(&dir, LocalInventory::from_recovered(&recovered));
 
-        let stray_path = stray.file_path(dir.path(), 0);
-        let reused_path = reused.file_path(dir.path(), 0);
+        let stray_path = stray.file_path(dir.path(), EntryId(0));
+        let reused_path = reused.file_path(dir.path(), EntryId(0));
         write_seg_file(&stray_path, &[(b"x", 1)]);
         write_seg_file(&reused_path, &[(b"y", 1)]);
 
         // The owning group reassigned `reused` here and its catch-up registered it (the
         // lottery won) — now a live sealed segment. `stray` was never assigned here.
-        dp.segments.insert_sealed_from_catch_up(reused, 0, 0);
+        dp.segments.insert_sealed_from_catch_up(reused, EntryId(0), EntryId(0));
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         dp.handle_orphan_gc_check(OrphanGcCheck { reply: reply_tx });
@@ -2967,7 +2972,7 @@ mod tests {
     fn orphan_gc_skips_a_segment_with_an_in_flight_catch_up() {
         let dir = tempfile::tempdir().unwrap();
         // A partial local copy + matching cursor → a real in-flight (delta) catch-up.
-        let path = test_key().file_path(dir.path(), 0);
+        let path = test_key().file_path(dir.path(), EntryId(0));
         write_seg_file(&path, &[(b"a", 1), (b"b", 1)]);
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
 
@@ -2975,8 +2980,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 4,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(4),
                 replica_set: vec![test_node_id(), NodeId::new("source")],
             }
             .into(),
@@ -3011,10 +3016,10 @@ mod tests {
         use crate::data_plane::checkpoint::CheckpointTask;
         let dir = tempfile::tempdir().unwrap();
         let key = test_key();
-        let path = key.file_path(dir.path(), 0);
+        let path = key.file_path(dir.path(), EntryId(0));
         write_seg_file(&path, &[(b"a", 1)]);
         let mut dp = make_data_plane(&dir);
-        dp.segments.insert_sealed_from_catch_up(key, 0, 0);
+        dp.segments.insert_sealed_from_catch_up(key, EntryId(0), EntryId(0));
         assert!(dp.segments.sealed_bounds(&key).is_some());
 
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
@@ -3069,7 +3074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A partial local copy on disk plus the matching inventory cursor.
         write_seg_file(
-            &test_key().file_path(dir.path(), 0),
+            &test_key().file_path(dir.path(), EntryId(0)),
             &[(b"a", 1), (b"b", 1)],
         );
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
@@ -3078,8 +3083,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 4,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(4),
                 replica_set: vec![test_node_id(), NodeId::new("source")],
             }
             .into(),
@@ -3091,7 +3096,7 @@ mod tests {
         };
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpRequest(r) if r.local_end == Some(1)
+            DataPlaneInterNodeCommand::CatchUpRequest(r) if r.local_end == Some(EntryId(1))
         ));
     }
 
@@ -3108,8 +3113,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: 2,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(2),
                 // self (test-node) is a follower here; `leader` is replica_set[0].
                 replica_set: vec![leader.clone(), test_node_id(), follower.clone()],
             }
@@ -3132,8 +3137,8 @@ mod tests {
             CatchUpAssignment {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
-                start_entry_id: 0,
-                sealed_end_entry_id: sealed_end,
+                start_entry_id: EntryId(0),
+                sealed_end_entry_id: EntryId(sealed_end),
                 replica_set: vec![test_node_id(), source.clone()],
             }
             .into(),
@@ -3147,7 +3152,7 @@ mod tests {
                 entries: ids
                     .iter()
                     .map(|&entry_id| CatchUpEntry {
-                        entry_id,
+                        entry_id: EntryId(entry_id),
                         data: b"x".to_vec().into(),
                         record_count: 1,
                     })
@@ -3237,8 +3242,8 @@ mod tests {
         ));
 
         // Verified exactly through the sealed end — no duplicate inflation.
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((0, 4)));
-        let scan = scan_segment_file(&test_key().file_path(dir.path(), 0)).unwrap();
+        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(4))));
+        let scan = scan_segment_file(&test_key().file_path(dir.path(), EntryId(0))).unwrap();
         assert_eq!(scan.last_entry_id, Some(4));
     }
 
@@ -3260,7 +3265,7 @@ mod tests {
                     replica_set: vec![leader.clone(), test_node_id()],
                     data: b"x".to_vec().into(),
                     record_count: 1,
-                    entry_id,
+                    entry_id: EntryId(entry_id),
                 }
                 .into(),
             ));
@@ -3269,12 +3274,12 @@ mod tests {
 
         assert_eq!(
             dp.segments.get(&test_key()).unwrap().committed_entry_id(),
-            0,
+            EntryId(0),
             "follower hasn't been told of any commit"
         );
         assert_eq!(
             dp.durable_end(&test_key()),
-            Some(2),
+            Some(EntryId(2)),
             "durable extent is the highest fsync'd entry, ahead of the commit cursor"
         );
     }
@@ -3286,12 +3291,12 @@ mod tests {
         // Sealed store: a sealed segment with bounds (0, 10).
         let sealed_dir = tempfile::tempdir().unwrap();
         let (sealed_dp, _rx) = source_with_sealed_segment(&sealed_dir);
-        assert_eq!(sealed_dp.durable_end(&test_key()), Some(10));
+        assert_eq!(sealed_dp.durable_end(&test_key()), Some(EntryId(10)));
 
         // Recovered inventory only (restarted node, not yet in the live store).
         let recovered_dir = tempfile::tempdir().unwrap();
         let recovered_dp = make_data_plane_with(&recovered_dir, inventory_with(test_key(), 7));
-        assert_eq!(recovered_dp.durable_end(&test_key()), Some(7));
+        assert_eq!(recovered_dp.durable_end(&test_key()), Some(EntryId(7)));
 
         // Hold nothing → None.
         let empty_dir = tempfile::tempdir().unwrap();
@@ -3324,6 +3329,6 @@ mod tests {
         };
         assert_eq!(report.segment_key, test_key());
         assert_eq!(report.from, test_node_id());
-        assert_eq!(report.durable_end, Some(4));
+        assert_eq!(report.durable_end, Some(EntryId(4)));
     }
 }

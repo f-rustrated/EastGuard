@@ -2,7 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::{
     NodeId,
-    metadata::{SegmentId, error::MetadataError},
+    metadata::{EntryId, SegmentId, error::MetadataError},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -19,8 +19,8 @@ pub struct SegmentMeta {
     pub state: SegmentMetaState,
     pub replica_set: ReplicaSet,
     pub size_bytes: u64,
-    pub start_entry_id: u64,
-    pub end_entry_id: Option<u64>,
+    pub start_entry_id: EntryId,
+    pub end_entry_id: Option<EntryId>,
     pub created_at: u64,
     pub sealed_at: Option<u64>,
 }
@@ -29,7 +29,7 @@ impl SegmentMeta {
     pub(crate) fn new(
         segment_id: SegmentId,
         replica_set: ReplicaSet,
-        start_entry_id: u64,
+        start_entry_id: EntryId,
         created_at: u64,
     ) -> Self {
         SegmentMeta {
@@ -45,7 +45,7 @@ impl SegmentMeta {
     }
     pub(crate) fn seal(
         &mut self,
-        end_entry_id: Option<u64>,
+        end_entry_id: Option<EntryId>,
         sealed_at: u64,
     ) -> Result<(), MetadataError> {
         if self.state != SegmentMetaState::Active {

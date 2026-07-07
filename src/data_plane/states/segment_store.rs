@@ -24,7 +24,7 @@
 use super::segment::tracker::SegmentTracker;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 
 /// Where a segment's data currently lives once its tracker has been dropped.
@@ -36,7 +36,7 @@ pub(crate) struct SealedSegmentLocation {
     /// Last entry id in the segment (inclusive). Set at seal time from the
     /// tracker's `committed_entry_id`.
     #[allow(dead_code)]
-    pub(crate) end_entry_id: u64,
+    pub(crate) end_entry_id: EntryId,
 }
 
 /// Outcome of `SegmentStore::resolve`. Splits "active" (tail cache + WAL via
@@ -49,15 +49,15 @@ pub(crate) enum SegmentReadState {
     Active(SegmentKey),
     Sealed {
         key: SegmentKey,
-        start_entry_id: u64,
-        end_entry_id: u64,
+        start_entry_id: EntryId,
+        end_entry_id: EntryId,
     },
 }
 
 pub(crate) struct SegmentStore {
     by_key: HashMap<SegmentKey, SegmentTracker>,
-    active_by_range: HashMap<(TopicId, RangeId), BTreeMap<u64, SegmentId>>,
-    sealed_by_range: HashMap<(TopicId, RangeId), BTreeMap<u64, SealedSegmentLocation>>,
+    active_by_range: HashMap<(TopicId, RangeId), BTreeMap<EntryId, SegmentId>>,
+    sealed_by_range: HashMap<(TopicId, RangeId), BTreeMap<EntryId, SealedSegmentLocation>>,
 }
 
 impl SegmentStore {
@@ -122,7 +122,7 @@ impl SegmentStore {
             .insert(start, key.segment_id);
     }
 
-    pub(crate) fn unindex_active(&mut self, key: SegmentKey, start_entry_id: u64) {
+    pub(crate) fn unindex_active(&mut self, key: SegmentKey, start_entry_id: EntryId) {
         let Some(active) = self.active_by_range.get_mut(&(key.topic_id, key.range_id)) else {
             return;
         };
@@ -171,8 +171,8 @@ impl SegmentStore {
     pub(crate) fn insert_sealed_from_catch_up(
         &mut self,
         key: SegmentKey,
-        start_entry_id: u64,
-        end_entry_id: u64,
+        start_entry_id: EntryId,
+        end_entry_id: EntryId,
     ) {
         debug_assert!(
             !self.by_key.contains_key(&key),
@@ -203,7 +203,7 @@ impl SegmentStore {
         &self,
         topic_id: TopicId,
         range_id: RangeId,
-        entry_id: u64,
+        entry_id: EntryId,
     ) -> Option<SegmentReadState> {
         // ACTIVE PATH
         if let Some(active) = self.active_by_range.get(&(topic_id, range_id))
@@ -240,7 +240,7 @@ impl SegmentStore {
     /// its sparse-index entries. Removes the live tracker (active) or the sealed-index
     /// slot, whichever holds it. `None` if this node doesn't track it — already gone
     /// or never had it; the caller no-ops and orphan GC is the backstop.
-    pub(crate) fn remove_segment(&mut self, key: &SegmentKey) -> Option<u64> {
+    pub(crate) fn remove_segment(&mut self, key: &SegmentKey) -> Option<EntryId> {
         if let Some(tracker) = self.by_key.remove(key) {
             let start = tracker.start_entry_id();
             self.unindex_active(*key, start);
@@ -267,7 +267,7 @@ impl SegmentStore {
     /// `None` if this node holds no sealed segment with that id (GC'd, never had it, or a race), in
     /// which case the source declines and the requester re-drives. O(n) in the
     /// range's sealed segments; catch-up is death-driven and rare.
-    pub(crate) fn sealed_bounds(&self, key: &SegmentKey) -> Option<(u64, u64)> {
+    pub(crate) fn sealed_bounds(&self, key: &SegmentKey) -> Option<(EntryId, EntryId)> {
         let sealed = self.sealed_by_range.get(&(key.topic_id, key.range_id))?;
         sealed.iter().find_map(|(&start, loc)| {
             (loc.segment_id == key.segment_id).then_some((start, loc.end_entry_id))
@@ -335,7 +335,7 @@ mod tests {
             SegmentRole::Leader,
             vec![],
             ShardGroupId(1),
-            start,
+            EntryId(start),
         )
     }
 
@@ -344,7 +344,7 @@ mod tests {
         let mut store = SegmentStore::new();
         let k = key(1, 0, 0);
         store.insert_active(k, tracker(0));
-        let r = store.resolve(TopicId(1), RangeId(0), 5).unwrap();
+        let r = store.resolve(TopicId(1), RangeId(0), EntryId(5)).unwrap();
         assert!(matches!(r, SegmentReadState::Active(g) if g == k));
     }
 
@@ -355,9 +355,9 @@ mod tests {
         let s1 = key(1, 0, 1);
         store.insert_active(s0, tracker(0));
         store.insert_active(s1, tracker(100));
-        let mid = store.resolve(TopicId(1), RangeId(0), 50).unwrap();
-        let edge = store.resolve(TopicId(1), RangeId(0), 99).unwrap();
-        let next = store.resolve(TopicId(1), RangeId(0), 100).unwrap();
+        let mid = store.resolve(TopicId(1), RangeId(0), EntryId(50)).unwrap();
+        let edge = store.resolve(TopicId(1), RangeId(0), EntryId(99)).unwrap();
+        let next = store.resolve(TopicId(1), RangeId(0), EntryId(100)).unwrap();
         assert!(matches!(mid, SegmentReadState::Active(g) if g == s0));
         assert!(matches!(edge, SegmentReadState::Active(g) if g == s0));
         assert!(matches!(next, SegmentReadState::Active(g) if g == s1));
@@ -368,13 +368,13 @@ mod tests {
         let mut store = SegmentStore::new();
         let k = key(1, 0, 0);
         let mut t = tracker(0);
-        t.commit_entry(42);
+        t.commit_entry(EntryId(42));
         store.insert_active(k, t);
 
         let taken = store.take_active_and_seal(k);
         assert!(taken.is_some());
 
-        let r = store.resolve(TopicId(1), RangeId(0), 10).unwrap();
+        let r = store.resolve(TopicId(1), RangeId(0), EntryId(10)).unwrap();
         match r {
             SegmentReadState::Sealed {
                 key: g,
@@ -382,14 +382,14 @@ mod tests {
                 end_entry_id,
             } => {
                 assert_eq!(g, k);
-                assert_eq!(start_entry_id, 0);
-                assert_eq!(end_entry_id, 42);
+                assert_eq!(start_entry_id, EntryId(0));
+                assert_eq!(end_entry_id, EntryId(42));
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
 
         // Offset past sealed end_entry_id → no segment found.
-        assert!(store.resolve(TopicId(1), RangeId(0), 43).is_none());
+        assert!(store.resolve(TopicId(1), RangeId(0), EntryId(43)).is_none());
     }
 
     /// A segment sealed before its first commit owns no offsets, so it must end
@@ -405,14 +405,14 @@ mod tests {
         assert!(taken.is_some());
 
         assert!(
-            store.resolve(TopicId(1), RangeId(0), 0).is_none(),
+            store.resolve(TopicId(1), RangeId(0), EntryId(0)).is_none(),
             "a segment sealed with nothing committed must not claim offset 0",
         );
 
         // The successor reuses start 0 and now serves offset 0.
         let s1 = key(1, 0, 1);
         store.insert_active(s1, tracker(0));
-        let r = store.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        let r = store.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
         assert!(matches!(r, SegmentReadState::Active(g) if g == s1));
     }
 
@@ -424,9 +424,9 @@ mod tests {
         let successor = key(1, 0, 1);
         store.insert_active(successor, tracker(0)); // successor already at start 0
 
-        store.unindex_active(key(1, 0, 0), 0); // try to unindex the OLD segment id
+        store.unindex_active(key(1, 0, 0), EntryId(0)); // try to unindex the OLD segment id
 
-        let r = store.resolve(TopicId(1), RangeId(0), 0).unwrap();
+        let r = store.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
         assert!(
             matches!(r, SegmentReadState::Active(g) if g == successor),
             "unindexing a different segment id must not evict the successor",
@@ -438,11 +438,11 @@ mod tests {
         let mut store = SegmentStore::new();
         let k = key(1, 0, 7);
         let mut t = tracker(20);
-        t.commit_entry(99);
+        t.commit_entry(EntryId(99));
         store.insert_active(k, t);
         store.take_active_and_seal(k);
 
-        assert_eq!(store.sealed_bounds(&k), Some((20, 99)));
+        assert_eq!(store.sealed_bounds(&k), Some((EntryId(20), EntryId(99))));
         // Same range, a segment id this node never sealed → None.
         assert_eq!(store.sealed_bounds(&key(1, 0, 8)), None);
         // A range with no sealed segments at all → None.
@@ -454,19 +454,19 @@ mod tests {
         let mut store = SegmentStore::new();
         let k = key(1, 0, 5);
         // Received whole via catch-up — never active here.
-        store.insert_sealed_from_catch_up(k, 100, 142);
+        store.insert_sealed_from_catch_up(k, EntryId(100), EntryId(142));
 
-        assert_eq!(store.sealed_bounds(&k), Some((100, 142)));
+        assert_eq!(store.sealed_bounds(&k), Some((EntryId(100), EntryId(142))));
         // And the resolver routes an in-range offset to it (cold path).
-        match store.resolve(TopicId(1), RangeId(0), 120).unwrap() {
+        match store.resolve(TopicId(1), RangeId(0), EntryId(120)).unwrap() {
             SegmentReadState::Sealed {
                 key: g,
                 start_entry_id,
                 end_entry_id,
             } => {
                 assert_eq!(g, k);
-                assert_eq!(start_entry_id, 100);
-                assert_eq!(end_entry_id, 142);
+                assert_eq!(start_entry_id, EntryId(100));
+                assert_eq!(end_entry_id, EntryId(142));
             }
             other => panic!("expected Sealed, got {other:?}"),
         }

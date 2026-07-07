@@ -11,7 +11,7 @@ use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
-use crate::control_plane::metadata::{RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 
 enum RangeLookupResult {
     Found(SegmentDetail),
@@ -146,7 +146,7 @@ impl RangeFetchActor {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.range_id,
-                            offset: entry.entry_id + i as u64,
+                            offset: *entry.entry_id + i as u64,
                             key: rec.key,
                             value: rec.value,
                         };
@@ -176,7 +176,7 @@ impl RangeFetchActor {
                     return Ok(false);
                 }
 
-                self.next_entry_id = next_entry_id;
+                self.next_entry_id = *next_entry_id;
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
@@ -229,7 +229,7 @@ impl ConsumerContext {
         let req = FetchByIdRequest {
             topic_id: self.topic_id,
             range_id,
-            entry_id: offset,
+            entry_id: EntryId(offset),
             max_bytes: 1024 * 1024,
         };
         self.client
@@ -276,7 +276,7 @@ impl ConsumerContext {
         };
 
         // Try to find the segment directly
-        if let Some(segment) = r.find_segment_for_offset(next_entry_id) {
+        if let Some(segment) = r.find_segment_for_offset(EntryId(next_entry_id)) {
             return RangeLookupResult::Found(segment.clone());
         }
 
@@ -284,7 +284,7 @@ impl ConsumerContext {
         if r.state != RangeState::Active {
             let range_end_offset = r.end_entry_id();
 
-            if next_entry_id > range_end_offset {
+            if next_entry_id > *range_end_offset {
                 if let Some(progress_signal) = compute_progress_signal(&meta, r) {
                     return RangeLookupResult::RangeSealedAndDrained { progress_signal };
                 } else {
@@ -296,9 +296,9 @@ impl ConsumerContext {
         // (Common Fallback) Check if we fell behind the oldest available data,
         // otherwise signal that a metadata refresh is needed to discover the new segment
         if let Some(first_start) = r.first_segment_start_offset()
-            && next_entry_id < first_start
+            && next_entry_id < *first_start
         {
-            return RangeLookupResult::FellBehind { first_start };
+            return RangeLookupResult::FellBehind { first_start: *first_start };
         }
 
         RangeLookupResult::NeedRefresh

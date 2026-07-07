@@ -269,7 +269,7 @@ impl RangeCursor {
             .filter(|r| r.state == RangeState::Active)
             .filter(|r| interest.matches(r))
             .map(|r| {
-                let start_offset = r.active_segment.as_ref().map_or(0, |s| s.start_entry_id);
+                let start_offset = r.active_segment.as_ref().map_or(0, |s| *s.start_entry_id);
                 RangeCursor::new(
                     r.range_id,
                     start_offset,
@@ -301,7 +301,7 @@ impl RangeCursor {
             .map(|r| {
                 RangeCursor::new(
                     r.range_id,
-                    r.first_segment_start_offset().unwrap_or(0),
+                    r.first_segment_start_offset().map_or(0, |id| *id),
                     r.keyspace_start.clone(),
                     r.keyspace_end.clone(),
                 )
@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use super::*;
     use crate::connections::protocol::{RangeDetail, SegmentDetail, TopicState};
-    use crate::control_plane::metadata::{RangeId, RangeState};
+    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId};
 
     fn cursor(range_id: RangeId, next_offset: u64, start: &[u8], end: &[u8]) -> RangeCursor {
         RangeCursor::new(range_id, next_offset, start.to_vec(), end.to_vec())
@@ -442,8 +442,8 @@ mod tests {
             keyspace_end: end.to_vec(),
             state,
             active_segment: state.eq(&RangeState::Active).then(|| SegmentDetail {
-                segment_id: 0,
-                start_entry_id: 0,
+                segment_id: SegmentId(0),
+                start_entry_id: 0.into(),
                 end_entry_id: None,
                 replica_set: vec![],
             }),

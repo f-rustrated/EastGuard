@@ -127,7 +127,7 @@ impl Client {
             return Err(ClientError::UnexpectedResponse);
         };
 
-        Ok((start_entry_id, committed_entry_id))
+        Ok((*start_entry_id, *committed_entry_id))
     }
 
     pub async fn fetch_all_saved_offsets(

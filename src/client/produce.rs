@@ -44,7 +44,7 @@ impl Client {
             self.cache.invalidate(topic);
         }
         match served.response {
-            ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
+            ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(*entry_id),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

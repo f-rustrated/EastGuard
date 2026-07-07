@@ -6,13 +6,14 @@ use std::sync::{
 use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::EntryPayload;
 
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub data: EntryPayload,
     pub record_count: u32,
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub lsn: u64,
 }
 #[cfg(any(test, debug_assertions))]
@@ -217,7 +218,7 @@ mod tests {
         Arc::new(CachedEntry {
             data: EntryPayload::from(Bytes::from("test")),
             record_count: 1,
-            entry_id,
+            entry_id: EntryId(entry_id),
             lsn,
         })
     }
@@ -231,7 +232,7 @@ mod tests {
         cache.advance_read_cursor(1);
 
         let read = cache.read_committed(0).unwrap();
-        assert_eq!(read.entry_id, 0);
+        assert_eq!(read.entry_id, EntryId(0));
     }
 
     #[test]
@@ -264,7 +265,7 @@ mod tests {
 
         for i in 0..3u64 {
             let entry = cache.read_committed(i).unwrap();
-            assert_eq!(entry.entry_id, i);
+            assert_eq!(entry.entry_id, EntryId(i));
         }
     }
 
@@ -309,7 +310,7 @@ mod tests {
         cache.advance_read_cursor(6);
 
         let entry = cache.read_committed(5).unwrap();
-        assert_eq!(entry.entry_id, 5);
+        assert_eq!(entry.entry_id, EntryId(5));
     }
 
     #[test]

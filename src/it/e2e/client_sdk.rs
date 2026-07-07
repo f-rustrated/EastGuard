@@ -13,11 +13,13 @@ use turmoil::Builder;
 
 use super::{NodeSpec, host_cluster};
 use crate::client::{
-    Client, ClientError, Consumer, ConsumerConfig, KeyInterest, PartitionStrategy, RetryPolicy,
-    StartPolicy, StoragePolicy,
+    BufferConfig, Client, ClientError, CompressionCodec, Consumer, ConsumerConfig, KeyInterest,
+    PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy, StoragePolicy,
+    TopicDetail,
 };
 use crate::config::Environment;
-use crate::control_plane::metadata::RangeId;
+use crate::connections::protocol::ClientResponse;
+use crate::control_plane::metadata::{EntryId, RangeId};
 
 /// (name, client_port, raft/cluster_port) for the standard 3-node cluster.
 static NODES: [NodeSpec; 3] = [
@@ -399,16 +401,16 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "compressed-topic".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(50),
                     max_batch_bytes: 1024 * 1024,
                     max_batch_records: 100,
                 },
-                codec: crate::client::CompressionCodec::Lz4,
+                codec: CompressionCodec::Lz4,
             },
         );
 
@@ -436,7 +438,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
         let fetch_req = FetchByIdRequest {
             topic_id,
             range_id,
-            entry_id,
+            entry_id: EntryId(entry_id),
             max_bytes: 65536,
         };
 
@@ -444,26 +446,24 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let crate::connections::protocol::ClientResponse::DataPlane(
-            DataPlaneResponse::Fetched { entries, .. },
-        ) = served.response
+        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            served.response
         {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
-            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.entry_id, EntryId(entry_id));
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
             assert_eq!(
                 entry.data[0],
-                crate::client::CompressionCodec::Lz4 as u8,
+                CompressionCodec::Lz4 as u8,
                 "Stored payload must lead with Lz4 tag"
             );
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records =
-                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
-                    .expect("Decompress and decode batch");
+            let decoded_records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
             assert_eq!(decoded_records[0].key, b"ckey");
@@ -501,16 +501,16 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
         // Warm the cache
         client.resolve_topic("zstd-topic").await.expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "zstd-topic".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(50),
                     max_batch_bytes: 1024 * 1024,
                     max_batch_records: 100,
                 },
-                codec: crate::client::CompressionCodec::Zstd,
+                codec: CompressionCodec::Zstd,
             },
         );
 
@@ -535,7 +535,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
         let fetch_req = FetchByIdRequest {
             topic_id,
             range_id,
-            entry_id,
+            entry_id: EntryId(entry_id),
             max_bytes: 65536,
         };
 
@@ -543,26 +543,24 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let crate::connections::protocol::ClientResponse::DataPlane(
-            DataPlaneResponse::Fetched { entries, .. },
-        ) = served.response
+        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            served.response
         {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
-            assert_eq!(entry.entry_id, entry_id);
+            assert_eq!(entry.entry_id, EntryId(entry_id));
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
             assert_eq!(
                 entry.data[0],
-                crate::client::CompressionCodec::Zstd as u8,
+                CompressionCodec::Zstd as u8,
                 "Stored payload must lead with Zstd tag"
             );
 
             // Decompress and decode records from the retrieved payload
-            let decoded_records =
-                crate::client::CompressionCodec::decode_payload(&entry.data, entry.record_count)
-                    .expect("Decompress and decode batch");
+            let decoded_records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
             assert_eq!(decoded_records[0].key, b"zkey");
@@ -599,16 +597,16 @@ fn producer_concurrency_stress() -> turmoil::Result {
         // Warm the cache
         client.resolve_topic("prod-stress").await.expect("resolve");
 
-        let producer = Arc::new(crate::client::Producer::new(
+        let producer = Arc::new(Producer::new(
             client.clone(),
             "prod-stress".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(30),
                     max_batch_bytes: 1024 * 1024,
                     max_batch_records: 100,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         ));
 
@@ -698,17 +696,17 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "linger-overlap".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(100),
                     // Threshold is 2 records
                     max_batch_bytes: 1024 * 1024,
                     max_batch_records: 2,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -799,16 +797,16 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             .expect("resolve");
 
         // Produce 5 records
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "basic-consume".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 5,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -920,16 +918,16 @@ fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "basic-consume-latest".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 5,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -1009,16 +1007,16 @@ fn consumer_key_filtering_multi_range() -> turmoil::Result {
             .expect("resolve");
 
         // Produce a record, then wait for roll, 3 times to trigger split
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "key-filter-multi".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 1,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -1112,16 +1110,16 @@ fn consumer_range_split_consume() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "split-consume".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 1,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -1224,16 +1222,16 @@ fn consumer_retention_recovery() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "retention-recover".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 1,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -1312,16 +1310,16 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
             .await
             .expect("resolve");
 
-        let producer = crate::client::Producer::new(
+        let producer = Producer::new(
             client.clone(),
             "prefetch-topic".to_string(),
-            crate::client::ProducerConfig {
-                buffer: crate::client::BufferConfig {
+            ProducerConfig {
+                buffer: BufferConfig {
                     linger: Duration::from_millis(10),
                     max_batch_bytes: 1024,
                     max_batch_records: 1,
                 },
-                codec: crate::client::CompressionCodec::None,
+                codec: CompressionCodec::None,
             },
         );
 
@@ -1404,7 +1402,7 @@ async fn wait_for_segment_roll(
                 return;
             }
             if let Some(seg) = &range.active_segment
-                && seg.segment_id >= expected_segment_id
+                && *seg.segment_id >= expected_segment_id
             {
                 return;
             }
@@ -1416,7 +1414,7 @@ async fn wait_for_segment_roll(
     );
 }
 
-async fn wait_for_split(client: &Client, topic: &str) -> crate::connections::protocol::TopicDetail {
+async fn wait_for_split(client: &Client, topic: &str) -> TopicDetail {
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         if let Ok(detail) = client.resolve_topic(topic).await
@@ -1439,7 +1437,7 @@ async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64
                 .find(|r| r.range_id == RangeId(range_id))
             && range.sealed_segments.is_empty()
             && let Some(seg) = &range.active_segment
-            && seg.start_entry_id > 0
+            && seg.start_entry_id > 0.into()
         {
             return;
         }

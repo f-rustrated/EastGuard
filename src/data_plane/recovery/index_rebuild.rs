@@ -78,7 +78,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::sparse_index::{INDEX_INTERVAL_ENTRIES, SparseIndex};
 
     fn key() -> SegmentKey {
@@ -117,7 +117,7 @@ mod tests {
             .collect();
         // Byte offset where the id-n batch starts (batches vary in size).
         let pos_n: u64 = batches[..n as usize].iter().map(|b| b.len() as u64).sum();
-        let path = key().file_path(dir.path(), 0);
+        let path = key().file_path(dir.path(), EntryId(0));
         write_segment(&path, &batches.concat());
 
         let entries = rebuild_sparse_entries(&path, key()).unwrap();

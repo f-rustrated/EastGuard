@@ -3,7 +3,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, VecDeque};
 
 use crate::control_plane::metadata::{
-    RangeId, ReplicaSet, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
+    EntryId, RangeId, ReplicaSet, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
     command::{MetadataCommand, RollSegment},
     error::MetadataError,
 };
@@ -24,7 +24,7 @@ pub struct RangeMeta {
     pub active_segment: Option<SegmentId>,
     pub segments: HashMap<SegmentId, SegmentMeta>,
     pub next_segment_id: u64,
-    pub next_offset: u64,
+    pub next_offset: EntryId,
     pub split_into: Option<[RangeId; 2]>,
     pub merged_into: Option<RangeId>,
     pub merged_from: Option<[RangeId; 2]>,
@@ -40,7 +40,7 @@ impl RangeMeta {
         created_at: u64,
     ) -> Self {
         let segment_id = SegmentId(0);
-        let segment = SegmentMeta::new(segment_id, replica_set, 0, created_at);
+        let segment = SegmentMeta::new(segment_id, replica_set, EntryId::MIN, created_at);
 
         RangeMeta {
             range_id,
@@ -50,7 +50,7 @@ impl RangeMeta {
             active_segment: Some(segment_id),
             segments: HashMap::from([(segment_id, segment)]),
             next_segment_id: 1,
-            next_offset: 0,
+            next_offset: EntryId::MIN,
             split_into: None,
             merged_into: None,
             merged_from: None,
@@ -113,7 +113,7 @@ impl RangeMeta {
     pub(crate) fn correct_end_offset(
         &mut self,
         segment_id: SegmentId,
-        end_entry_id: u64,
+        end_entry_id: EntryId,
     ) -> Option<ReplicaSet> {
         let seg = self.segments.get_mut(&segment_id)?;
 
@@ -162,7 +162,7 @@ impl RangeMeta {
             .ok_or(MetadataError::SegmentNotFound)?;
         segment.seal(cmd.end_entry_id, cmd.sealed_at)?;
 
-        let start_offset = cmd.end_entry_id.map_or(0, |id| id + 1);
+        let start_offset = cmd.end_entry_id.map_or(EntryId::MIN, |id| id + 1);
         let new_segment_id = SegmentId(self.next_segment_id);
         let new_segment = SegmentMeta::new(
             new_segment_id,

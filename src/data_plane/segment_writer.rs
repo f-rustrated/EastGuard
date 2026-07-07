@@ -7,6 +7,7 @@
 //! file) — the one place segment files are written, so the framing and the
 //! anchor predicate live in exactly one spot.
 
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::sparse_index::{SparseEntry, is_index_anchor};
 use crate::data_plane::wal::WalRecord;
@@ -112,7 +113,7 @@ impl SegmentAppender {
     /// cheapest payload form (an Arc-backed clone) rather than forcing a copy.
     pub(crate) fn append_entry(
         &mut self,
-        entry_id: u64,
+        entry_id: EntryId,
         record: WalRecord,
     ) -> io::Result<Option<SparseEntry>> {
         let data_start = self.next_pos;
@@ -120,7 +121,7 @@ impl SegmentAppender {
         let end = WalRecord::batch_end();
         end.encode_to(&mut self.writer)?;
         self.next_pos += record.encoded_size() as u64 + end.encoded_size() as u64;
-        Ok(is_index_anchor(data_start, entry_id)
-            .then(|| SparseEntry::new(self.segment_key, entry_id, data_start.to_be_bytes())))
+        Ok(is_index_anchor(data_start, *entry_id)
+            .then(|| SparseEntry::new(self.segment_key, *entry_id, data_start.to_be_bytes())))
     }
 }

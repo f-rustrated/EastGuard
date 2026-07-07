@@ -96,7 +96,7 @@ impl RecoveredSegments {
             .get(&header.segment_key())
             .and_then(|scan| scan.last_entry_id)
         {
-            Some(cursor) if header.entry_id <= cursor => Decision::Skip,
+            Some(cursor) if *header.entry_id <= cursor => Decision::Skip,
             _ => Decision::Append,
         }
     }
@@ -281,7 +281,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::control_plane::metadata::SegmentId;
+    use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 
     /// Encodes entries the way `CheckpointWorker::process_job` (`checkpoint.rs`)
     /// does: each entry is a bare-payload `Data` record followed by a `BatchEnd`
@@ -422,12 +422,12 @@ mod tests {
         let k2 = SegmentKey::new(TopicId(1), RangeId(2), SegmentId(5));
         let k3 = SegmentKey::new(TopicId(7), RangeId(0), SegmentId(3));
         write_segment_file(
-            &k1.file_path(data_dir, 0),
+            &k1.file_path(data_dir, EntryId(0)),
             &encode_segment(&[("a", 1), ("b", 1)]),
         );
-        write_segment_file(&k2.file_path(data_dir, 100), &encode_segment(&[("c", 1)]));
+        write_segment_file(&k2.file_path(data_dir, EntryId(100)), &encode_segment(&[("c", 1)]));
         write_segment_file(
-            &k3.file_path(data_dir, 50),
+            &k3.file_path(data_dir, EntryId(50)),
             &encode_segment(&[("d", 1), ("e", 1), ("f", 1)]),
         );
 
@@ -444,7 +444,7 @@ mod tests {
         let data_dir = dir.path();
 
         let real = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
-        write_segment_file(&real.file_path(data_dir, 0), &encode_segment(&[("a", 1)]));
+        write_segment_file(&real.file_path(data_dir, EntryId(0)), &encode_segment(&[("a", 1)]));
 
         // A WAL sibling dir, a non-id topic dir, and a foreign file in a real
         // range dir — none should abort the walk or land in the map.
@@ -470,7 +470,7 @@ mod tests {
     }
 
     fn routing(entry_id: u64) -> RoutingHeader {
-        RoutingHeader::new(seg_key(), entry_id, 1)
+        RoutingHeader::new(seg_key(), EntryId(entry_id), 1)
     }
 
     fn scanned(start_entry_id: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {

@@ -2,7 +2,7 @@ use std::io;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::{EntryPayload, SegmentKey};
 
 const ROUTING_HEADER_SIZE: usize = 36;
@@ -12,12 +12,12 @@ pub(crate) struct RoutingHeader {
     topic_id: TopicId,
     range_id: RangeId,
     segment_id: SegmentId,
-    pub(crate) entry_id: u64,
+    pub(crate) entry_id: EntryId,
     pub(crate) record_count: u32,
 }
 
 impl RoutingHeader {
-    pub(crate) fn new(key: SegmentKey, entry_id: u64, record_count: u32) -> Self {
+    pub(crate) fn new(key: SegmentKey, entry_id: EntryId, record_count: u32) -> Self {
         Self {
             topic_id: key.topic_id,
             range_id: key.range_id,
@@ -35,7 +35,7 @@ impl RoutingHeader {
         buf.put_u64(self.topic_id.0);
         buf.put_u64(*self.range_id);
         buf.put_u64(self.segment_id.0);
-        buf.put_u64(self.entry_id);
+        buf.put_u64(*self.entry_id);
         buf.put_u32(self.record_count);
     }
 
@@ -58,7 +58,7 @@ impl RoutingHeader {
             topic_id: TopicId(u64::from_be_bytes(data[0..8].try_into().unwrap())),
             range_id: RangeId(u64::from_be_bytes(data[8..16].try_into().unwrap())),
             segment_id: SegmentId(u64::from_be_bytes(data[16..24].try_into().unwrap())),
-            entry_id: u64::from_be_bytes(data[24..32].try_into().unwrap()),
+            entry_id: EntryId(u64::from_be_bytes(data[24..32].try_into().unwrap())),
             record_count: u32::from_be_bytes(data[32..36].try_into().unwrap()),
         })
     }
@@ -103,7 +103,7 @@ mod tests {
             topic_id: TopicId(42),
             range_id: RangeId(7),
             segment_id: SegmentId(3),
-            entry_id: 999,
+            entry_id: EntryId(999),
             record_count: 50,
         };
         let mut buf = BytesMut::new();
@@ -119,7 +119,7 @@ mod tests {
             topic_id: TopicId(1),
             range_id: RangeId(2),
             segment_id: SegmentId(3),
-            entry_id: 100,
+            entry_id: EntryId(100),
             record_count: 5,
         };
         let entry_data = b"opaque entry payload";

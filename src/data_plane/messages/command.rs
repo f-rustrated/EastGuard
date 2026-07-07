@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
-    control_plane::metadata::SegmentId,
+    control_plane::metadata::{EntryId, SegmentId},
     data_plane::states::segment::cache::CachedEntry,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
@@ -49,7 +49,7 @@ pub struct SegmentAssignment {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub replica_set: Vec<NodeId>,
-    pub start_entry_id: u64,
+    pub start_entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -65,20 +65,20 @@ pub struct ReplicaAppend {
     pub replica_set: Vec<NodeId>,
     pub data: EntryPayload,
     pub record_count: u32,
-    pub entry_id: u64,
+    pub entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaAck {
     pub segment_key: SegmentKey,
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub from: NodeId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CommitAdvance {
     pub segment_key: SegmentKey,
-    pub committed_entry_id: u64,
+    pub committed_entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -86,7 +86,7 @@ pub struct SealRequest {
     pub from: NodeId,
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
-    pub end_entry_id: u64,
+    pub end_entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -99,7 +99,7 @@ pub struct SealResponse {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentSealed {
     pub segment_key: SegmentKey,
-    pub committed_entry_id: Option<u64>,
+    pub committed_entry_id: Option<EntryId>,
 }
 
 // Catch-up: re-replicate a sealed segment to a newly assigned replica.
@@ -121,8 +121,8 @@ pub struct CatchUpAssignment {
     pub segment_key: SegmentKey,
     /// Echoed into the `CatchUpAck` so the reply reaches this group's coordinator.
     pub shard_group_id: ShardGroupId,
-    pub start_entry_id: u64,
-    pub sealed_end_entry_id: u64,
+    pub start_entry_id: EntryId,
+    pub sealed_end_entry_id: EntryId,
     pub replica_set: Vec<NodeId>,
 }
 
@@ -133,7 +133,7 @@ pub struct CatchUpRequest {
     pub from: NodeId,
     /// Highest entry id the requester already holds locally; the source streams
     /// `(local_end, sealed_end]`. `None` means nothing is held.
-    pub local_end: Option<u64>,
+    pub local_end: Option<EntryId>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -144,7 +144,7 @@ pub struct CatchUpChunk {
 }
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpEntry {
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub data: EntryPayload,
     pub record_count: u32,
 }
@@ -198,7 +198,7 @@ pub struct SealBoundaryQuery {
 pub struct SealBoundaryReport {
     pub segment_key: SegmentKey,
     pub from: NodeId,
-    pub durable_end: Option<u64>,
+    pub durable_end: Option<EntryId>,
 }
 
 /// Retention (D7): the coordinator tells replicas to reclaim sealed segments —
@@ -259,7 +259,7 @@ pub enum ProduceAck {
     /// with one request in flight at a time (the common case); under pipelining
     /// it is the segment's committed highwater at ack time (an upper bound).
     Ok {
-        entry_id: u64,
+        entry_id: EntryId,
     },
     Err(String),
 }
@@ -274,10 +274,10 @@ pub struct CheckpointComplete {
 pub struct CatchUpReadComplete {
     pub requester: NodeId,
     pub segment_key: SegmentKey,
-    pub start_offset: u64,
-    pub sealed_end: u64,
+    pub start_offset: EntryId,
+    pub sealed_end: EntryId,
     pub entries: Vec<Arc<CachedEntry>>,
-    pub next_offset: u64,
+    pub next_offset: EntryId,
 }
 
 impl_from_variant!(

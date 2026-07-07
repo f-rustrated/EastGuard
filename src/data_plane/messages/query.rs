@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::connections::protocol::RangeProgressSignal;
-use crate::control_plane::metadata::{RangeId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
 use crate::data_plane::states::segment::cache::CachedEntry;
 use crate::impl_from_variant;
 
@@ -28,7 +28,7 @@ impl_from_variant!(DataPlaneQuery, Fetch, ListOffsets);
 pub struct Fetch {
     pub topic_id: TopicId,
     pub range_id: RangeId,
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub max_bytes: u32,
     /// Pre-computed by the broker from the topic's metadata snapshot. The data
     /// plane echoes it back on the response so the consumer sees the seal
@@ -50,7 +50,7 @@ pub enum FetchResult {
     /// `lsn` field rides along through the channel but isn't on the wire.
     Records {
         entries: Vec<Arc<CachedEntry>>,
-        next_entry_id: u64,
+        next_entry_id: EntryId,
         progress_signal: RangeProgressSignal,
     },
     /// `entry_id` was past the last committed offset on this node (e.g. caller
@@ -74,8 +74,8 @@ pub struct ListOffsets {
 
 pub enum ListOffsetsResult {
     RangeOffsets {
-        start_entry_id: u64,
-        committed_entry_id: u64,
+        start_entry_id: EntryId,
+        committed_entry_id: EntryId,
     },
     SegmentNotLocal,
     #[allow(dead_code)] // reserved for future failure modes

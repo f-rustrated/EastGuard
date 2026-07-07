@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::state::LeaderlessSegments;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 
 /// How many drive passes a gather waits for every survivor to report before
@@ -33,7 +34,7 @@ pub(crate) enum SealEndStep {
     Seal {
         shard_group_id: ShardGroupId,
         segment_key: SegmentKey,
-        end: Option<u64>,
+        end: Option<EntryId>,
         leader: Option<NodeId>,
     },
 }
@@ -45,7 +46,7 @@ struct SealEndGather {
     /// Survivors we await, in replica-set order.
     nodes: Vec<NodeId>,
     /// Durable extents reported so far (`None` = the survivor holds nothing).
-    reports: HashMap<NodeId, Option<u64>>,
+    reports: HashMap<NodeId, Option<EntryId>>,
     /// Re-drive budget; the roll falls back to an unknown end when it hits 0.
     attempts_left: u32,
     /// True once the roll is proposed — the gather then waits (ignoring late
@@ -68,7 +69,7 @@ impl SealEndGather {
         self.nodes.contains(node)
     }
 
-    fn record(&mut self, from: NodeId, durable_end: Option<u64>) {
+    fn record(&mut self, from: NodeId, durable_end: Option<EntryId>) {
         self.reports.insert(from, durable_end);
     }
 
@@ -89,14 +90,14 @@ impl SealEndGather {
     /// highest offset present on *every* survivor, hence committed (commit
     /// requires all-replica ack). `None` if any survivor holds nothing (nothing
     /// was committed) or none reported.
-    fn recovered_end(&self) -> Option<u64> {
+    fn recovered_end(&self) -> Option<EntryId> {
         if self.reports.is_empty() {
             return None;
         }
         let mut min = None;
         for extent in self.reports.values() {
             let extent = (*extent)?; // a survivor holding nothing ⇒ nothing committed
-            min = Some(min.map_or(extent, |m: u64| m.min(extent)));
+            min = Some(min.map_or(extent, |m: EntryId| m.min(extent)));
         }
         min
     }
@@ -105,7 +106,7 @@ impl SealEndGather {
     /// `NodeId` for determinism — to lead the rolled segment. `None` when no
     /// survivor reported any data.
     fn recency_leader(&self) -> Option<NodeId> {
-        let mut ranked: Vec<(u64, &NodeId)> = self
+        let mut ranked: Vec<(EntryId, &NodeId)> = self
             .reports
             .iter()
             .filter_map(|(node, extent)| extent.map(|e| (e, node)))
@@ -193,7 +194,7 @@ impl SealEndRecovery {
         &mut self,
         segment_key: SegmentKey,
         from: NodeId,
-        durable_end: Option<u64>,
+        durable_end: Option<EntryId>,
     ) -> Option<SealEndStep> {
         let g = self.gathers.get_mut(&segment_key)?;
         if g.proposed || !g.awaits(&from) {
@@ -255,7 +256,7 @@ impl SealEndRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
@@ -265,7 +266,7 @@ mod tests {
         let nodes = reports.iter().map(|(n, _)| node(n)).collect();
         let mut g = SealEndGather::new(ShardGroupId(0), nodes);
         for (n, end) in reports {
-            g.record(node(n), *end);
+            g.record(node(n), end.map(EntryId));
         }
         g
     }
@@ -274,7 +275,7 @@ mod tests {
     fn recovered_end_is_min_of_survivor_extents() {
         assert_eq!(
             gather_with(&[("y", Some(50)), ("z", Some(40))]).recovered_end(),
-            Some(40)
+            Some(EntryId(40))
         );
     }
 
@@ -336,16 +337,16 @@ mod tests {
         let mut recovery = SealEndRecovery::default();
         recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])]);
 
-        assert!(recovery.record(seg, node("y"), Some(50)).is_none()); // partial
+        assert!(recovery.record(seg, node("y"), Some(EntryId(50))).is_none()); // partial
         let step = recovery
-            .record(seg, node("z"), Some(40))
+            .record(seg, node("z"), Some(EntryId(40)))
             .expect("completes");
         assert!(matches!(
             step,
-            SealEndStep::Seal { end: Some(40), leader: Some(l), .. } if l == node("y")
+            SealEndStep::Seal { end: Some(EntryId(40)), leader: Some(l), .. } if l == node("y")
         ));
         // A late/duplicate report after the roll is proposed is ignored.
-        assert!(recovery.record(seg, node("y"), Some(99)).is_none());
+        assert!(recovery.record(seg, node("y"), Some(EntryId(99))).is_none());
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 
 use super::segment_scan::{Decision, RecoveredSegments};
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::segment_writer::SegmentAppender;
 use crate::data_plane::states::segment::record::RoutingHeader;
@@ -58,11 +59,11 @@ impl ReplayWriter {
             return Ok(Decision::Skip);
         }
         let key = header.segment_key();
-        self.writer_for(key, header.entry_id)?.append_entry(
+        self.writer_for(key, *header.entry_id)?.append_entry(
             header.entry_id,
             WalRecord::data(Bytes::copy_from_slice(entry_data), header.record_count),
         )?;
-        self.recovered.advance(key, header.entry_id);
+        self.recovered.advance(key, *header.entry_id);
         Ok(Decision::Append)
     }
 
@@ -90,7 +91,7 @@ impl ReplayWriter {
                 .start_entry_id(&key)
                 .unwrap_or(first_entry_id);
             let valid_len = self.recovered.valid_len(&key);
-            let path = key.file_path(&self.data_dir, start_offset);
+            let path = key.file_path(&self.data_dir, EntryId(start_offset));
             self.writers.insert(
                 key,
                 SegmentAppender::open_truncating(key, &path, valid_len)?,
@@ -110,7 +111,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::recovery::segment_scan::scan_segment_file;
     use crate::data_plane::wal::WalRecord;
 
@@ -141,18 +142,18 @@ mod tests {
 
         let mut w = ReplayWriter::new(data_dir.clone(), RecoveredSegments::default());
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), 0, 1), b"alpha")
+            w.replay(&RoutingHeader::new(key(), EntryId(0), 1), b"alpha")
                 .unwrap(),
             Decision::Append
         );
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), 1, 1), b"beta").unwrap(),
+            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta").unwrap(),
             Decision::Append
         );
         w.finish().unwrap();
 
         // Named from the first record's id (the segment's base).
-        let scan = scan_segment_file(&key().file_path(&data_dir, 0)).unwrap();
+        let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
         assert_eq!(scan.last_entry_id, Some(1)); // 0, 1
     }
 
@@ -161,25 +162,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_path_buf();
         write_segment(
-            &key().file_path(&data_dir, 0),
+            &key().file_path(&data_dir, EntryId(0)),
             &[encode_batch("alpha", 1), encode_batch("beta", 1)].concat(),
         );
 
         let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.clone(), recovered);
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), 1, 1), b"beta-again")
+            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta-again")
                 .unwrap(),
             Decision::Skip
         );
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), 2, 1), b"gamma")
+            w.replay(&RoutingHeader::new(key(), EntryId(2), 1), b"gamma")
                 .unwrap(),
             Decision::Append
         );
         w.finish().unwrap();
 
-        let scan = scan_segment_file(&key().file_path(&data_dir, 0)).unwrap();
+        let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
         assert_eq!(scan.last_entry_id, Some(2)); // 0, 1, 2
     }
 
@@ -189,18 +190,18 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         let mut bytes = encode_batch("alpha", 1); // verified prefix: entry 0
         bytes.extend_from_slice(b"torn-uncommitted-tail");
-        write_segment(&key().file_path(&data_dir, 0), &bytes);
+        write_segment(&key().file_path(&data_dir, EntryId(0)), &bytes);
 
         let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.clone(), recovered);
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), 1, 1), b"beta").unwrap(),
+            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta").unwrap(),
             Decision::Append
         );
         w.finish().unwrap();
 
         // The torn tail was truncated to valid_len, so the file re-scans clean.
-        let scan = scan_segment_file(&key().file_path(&data_dir, 0)).unwrap();
+        let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
         assert_eq!(scan.last_entry_id, Some(1)); // 0, 1 — tail gone, beta clean
     }
 
@@ -211,7 +212,7 @@ mod tests {
         let recovered = RecoveredSegments::scan_data_dir(data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.to_path_buf(), recovered);
         for &(seg, entry_id, payload) in stream {
-            w.replay(&RoutingHeader::new(seg, entry_id, 1), payload.as_bytes())
+            w.replay(&RoutingHeader::new(seg, EntryId(entry_id), 1), payload.as_bytes())
                 .unwrap();
         }
         w.finish().unwrap();
@@ -224,8 +225,8 @@ mod tests {
         let a = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
         let b = SegmentKey::new(TopicId(1), RangeId(1), SegmentId(0));
         // Each segment already has its entry 0 checkpointed on disk.
-        write_segment(&a.file_path(&data_dir, 0), &encode_batch("a0", 1));
-        write_segment(&b.file_path(&data_dir, 0), &encode_batch("b0", 1));
+        write_segment(&a.file_path(&data_dir, EntryId(0)), &encode_batch("a0", 1));
+        write_segment(&b.file_path(&data_dir, EntryId(0)), &encode_batch("b0", 1));
 
         // Interleaved across two notional WAL files: the checkpointed entries
         // reappear (overlap), plus new suffix entries.
@@ -239,19 +240,19 @@ mod tests {
 
         replay_stream(&data_dir, &stream);
         // Each segment's prefix is reconstructed contiguously.
-        let scan_a = scan_segment_file(&a.file_path(&data_dir, 0)).unwrap();
-        let scan_b = scan_segment_file(&b.file_path(&data_dir, 0)).unwrap();
+        let scan_a = scan_segment_file(&a.file_path(&data_dir, EntryId(0))).unwrap();
+        let scan_b = scan_segment_file(&b.file_path(&data_dir, EntryId(0))).unwrap();
         assert_eq!(scan_a.last_entry_id, Some(2)); // a0, a1, a2
         assert_eq!(scan_b.last_entry_id, Some(1)); // b0, b1
 
-        let a_bytes = fs::read(a.file_path(&data_dir, 0)).unwrap();
-        let b_bytes = fs::read(b.file_path(&data_dir, 0)).unwrap();
+        let a_bytes = fs::read(a.file_path(&data_dir, EntryId(0))).unwrap();
+        let b_bytes = fs::read(b.file_path(&data_dir, EntryId(0))).unwrap();
 
         // Re-running scan + replay over the same disk changes nothing — every
         // record now dedups against the higher cursors.
         replay_stream(&data_dir, &stream);
-        assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), a_bytes);
-        assert_eq!(fs::read(b.file_path(&data_dir, 0)).unwrap(), b_bytes);
+        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), a_bytes);
+        assert_eq!(fs::read(b.file_path(&data_dir, EntryId(0))).unwrap(), b_bytes);
     }
 
     #[test]
@@ -260,7 +261,7 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         let s = key();
         write_segment(
-            &s.file_path(&data_dir, 0),
+            &s.file_path(&data_dir, EntryId(0)),
             &[
                 encode_batch("e0", 1),
                 encode_batch("e1", 1),
@@ -268,20 +269,20 @@ mod tests {
             ]
             .concat(),
         );
-        let before = fs::read(s.file_path(&data_dir, 0)).unwrap();
+        let before = fs::read(s.file_path(&data_dir, EntryId(0))).unwrap();
 
         let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.clone(), recovered);
         // The WAL re-presents entries already checkpointed → all skipped.
         for entry_id in 0u64..=2 {
             assert_eq!(
-                w.replay(&RoutingHeader::new(s, entry_id, 1), b"dup")
+                w.replay(&RoutingHeader::new(s, EntryId(entry_id), 1), b"dup")
                     .unwrap(),
                 Decision::Skip
             );
         }
         w.finish().unwrap();
 
-        assert_eq!(fs::read(s.file_path(&data_dir, 0)).unwrap(), before);
+        assert_eq!(fs::read(s.file_path(&data_dir, EntryId(0))).unwrap(), before);
     }
 }

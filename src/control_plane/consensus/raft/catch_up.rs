@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::event::SegmentReassigned;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::CatchUpAssignment;
@@ -18,8 +19,8 @@ use crate::data_plane::transport::command::DataTransportCommand;
 /// `replica_set` is the full set (the assignment carries it so the receiver
 /// picks its own source).
 struct CatchUpRepair {
-    start_entry_id: u64,
-    sealed_end: u64,
+    start_entry_id: EntryId,
+    sealed_end: EntryId,
     replica_set: Vec<NodeId>,
     pending: HashSet<NodeId>,
 }
@@ -51,8 +52,8 @@ impl CatchUpRepairs {
     pub(crate) fn track_sealed(
         &mut self,
         segment_key: SegmentKey,
-        start_entry_id: u64,
-        sealed_end: u64,
+        start_entry_id: EntryId,
+        sealed_end: EntryId,
         replica_set: Vec<NodeId>,
     ) {
         let pending = replica_set.iter().cloned().collect();
@@ -124,8 +125,8 @@ mod tests {
     fn reassigned(members: &[&str], sealed_end: Option<u64>) -> SegmentReassigned {
         SegmentReassigned {
             segment_key: seg(),
-            start_entry_id: 0,
-            sealed_end,
+            start_entry_id: 0.into(),
+            sealed_end: sealed_end.map(EntryId),
             new_replica_set: members.iter().map(|n| node(n)).collect(),
         }
     }
@@ -167,7 +168,7 @@ mod tests {
             panic!("expected CatchUpAssignment");
         };
         assert_eq!(a.shard_group_id, ShardGroupId(7));
-        assert_eq!(a.sealed_end_entry_id, 100);
+        assert_eq!(a.sealed_end_entry_id, EntryId(100));
         assert_eq!(a.replica_set.len(), 3);
     }
 

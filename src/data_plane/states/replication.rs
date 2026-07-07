@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{ProduceAck, ReplicaAppend};
 use crate::data_plane::states::segment::cache::CachedEntry;
@@ -19,11 +20,11 @@ pub(crate) struct ReplicationState {
 pub(crate) struct PendingBatch {
     pub(crate) replies: Vec<oneshot::Sender<ProduceAck>>,
     pub(crate) pending_acks: HashSet<NodeId>,
-    pub(crate) entry_id: u64,
+    pub(crate) entry_id: EntryId,
 }
 
 pub(crate) struct AckCommitted {
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub replies: Vec<oneshot::Sender<ProduceAck>>,
     pub reset_timer_seq: Option<u64>,
 }
@@ -223,7 +224,7 @@ mod tests {
         NodeId::new(id)
     }
 
-    fn cached_entry(entry_id: u64) -> Arc<CachedEntry> {
+    fn cached_entry(entry_id: EntryId) -> Arc<CachedEntry> {
         Arc::new(CachedEntry {
             data: EntryPayload::from(Bytes::from("data")),
             record_count: 1,
@@ -235,7 +236,7 @@ mod tests {
     fn pending_repl(
         segment_key: SegmentKey,
         followers: Vec<NodeId>,
-        entry_id: u64,
+        entry_id: EntryId,
     ) -> PendingReplicationBatch {
         PendingReplicationBatch {
             segment_key,
@@ -252,7 +253,7 @@ mod tests {
         let sk = key(0);
 
         state.enqueue_reply(sk, reply_tx);
-        let repl = pending_repl(sk, vec![node("f1"), node("f2")], 0);
+        let repl = pending_repl(sk, vec![node("f1"), node("f2")], EntryId(0));
 
         let seq = state.begin_replication(&repl);
         assert!(seq.is_some());
@@ -264,11 +265,11 @@ mod tests {
         let mut state = ReplicationState::default();
         let sk = key(0);
 
-        let repl1 = pending_repl(sk, vec![node("f1")], 0);
+        let repl1 = pending_repl(sk, vec![node("f1")], EntryId(0));
         let seq = state.begin_replication(&repl1);
         assert!(seq.is_some());
 
-        let repl2 = pending_repl(sk, vec![node("f1")], 1);
+        let repl2 = pending_repl(sk, vec![node("f1")], EntryId(1));
         let seq2 = state.begin_replication(&repl2);
         assert!(seq2.is_none());
     }
@@ -283,7 +284,7 @@ mod tests {
         state.enqueue_reply(sk, tx1);
         state.enqueue_reply(sk, tx2);
 
-        let repl = pending_repl(sk, vec![node("f1")], 0);
+        let repl = pending_repl(sk, vec![node("f1")], EntryId(0));
         state.begin_replication(&repl);
 
         assert_eq!(
@@ -299,7 +300,7 @@ mod tests {
         let f1 = node("f1");
         let f2 = node("f2");
 
-        let repl = pending_repl(sk, vec![f1.clone(), f2.clone()], 0);
+        let repl = pending_repl(sk, vec![f1.clone(), f2.clone()], EntryId(0));
         state.begin_replication(&repl);
 
         let result = state.process_ack(&sk, &f1);
@@ -315,13 +316,13 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         state.enqueue_reply(sk, tx);
-        let repl = pending_repl(sk, vec![f1.clone(), f2.clone()], 42);
+        let repl = pending_repl(sk, vec![f1.clone(), f2.clone()], EntryId(42));
         state.begin_replication(&repl);
 
         assert!(state.process_ack(&sk, &f1).is_none());
 
         let committed = state.process_ack(&sk, &f2).unwrap();
-        assert_eq!(committed.entry_id, 42);
+        assert_eq!(committed.entry_id, EntryId(42));
         assert_eq!(committed.replies.len(), 1);
         assert!(committed.reset_timer_seq.is_none());
 
@@ -332,10 +333,10 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .send(ProduceAck::Ok { entry_id: 42 });
+            .send(ProduceAck::Ok { entry_id: EntryId(42) });
         assert!(matches!(
             rx.blocking_recv().unwrap(),
-            ProduceAck::Ok { entry_id: 42 }
+            ProduceAck::Ok { entry_id: EntryId(42) }
         ));
     }
 
@@ -345,14 +346,14 @@ mod tests {
         let sk = key(0);
         let f1 = node("f1");
 
-        let repl1 = pending_repl(sk, vec![f1.clone()], 0);
+        let repl1 = pending_repl(sk, vec![f1.clone()], EntryId(0));
         let first_seq = state.begin_replication(&repl1).unwrap();
 
-        let repl2 = pending_repl(sk, vec![f1.clone()], 1);
+        let repl2 = pending_repl(sk, vec![f1.clone()], EntryId(1));
         assert!(state.begin_replication(&repl2).is_none());
 
         let committed = state.process_ack(&sk, &f1).unwrap();
-        assert_eq!(committed.entry_id, 0);
+        assert_eq!(committed.entry_id, EntryId(0));
         let new_seq = committed.reset_timer_seq.unwrap();
         assert_ne!(first_seq, new_seq);
         assert!(state.is_active_timer(&sk, new_seq));
@@ -372,10 +373,10 @@ mod tests {
         let sk = key(0);
         let f1 = node("f1");
 
-        let repl1 = pending_repl(sk, vec![f1.clone()], 0);
+        let repl1 = pending_repl(sk, vec![f1.clone()], EntryId(0));
         let first_seq = state.begin_replication(&repl1).unwrap();
 
-        let repl2 = pending_repl(sk, vec![f1.clone()], 1);
+        let repl2 = pending_repl(sk, vec![f1.clone()], EntryId(1));
         state.begin_replication(&repl2);
 
         state.process_ack(&sk, &f1).unwrap();
