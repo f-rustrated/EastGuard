@@ -8,6 +8,8 @@ use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
 use crate::control_plane::metadata::{RangeId, RangeState};
 
+#[cfg(any(test, debug_assertions))]
+use crate::test_traits::TAssertInvariant;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +60,7 @@ impl CursorManagerState {
             return;
         }
         for cursor in self.cursors.iter().cloned().collect::<Vec<_>>() {
-            self.spawn_and_register(&cursor, ctx.clone(), record_tx.clone());
+            self.spawn_and_register(cursor, ctx.clone(), record_tx.clone());
         }
     }
 
@@ -74,10 +76,7 @@ impl CursorManagerState {
         }
         let added = self.cursors.apply_drained(event.range_id, event.transition);
 
-        for new_cursor in added.iter() {
-            if self.senders.contains_key(&new_cursor.range_id) {
-                continue; // Skip if a fetch actor is already running
-            }
+        for new_cursor in added {
             self.spawn_and_register(new_cursor, ctx.clone(), record_tx.clone());
         }
     }
@@ -140,7 +139,7 @@ impl CursorManagerState {
             }
 
             if let Some(r_meta) = metadata.ranges.iter().find(|r| r.range_id == range) {
-                self.spawn_and_acquire(
+                self.spawn_and_register(
                     RangeCursor::new(
                         range,
                         resolved_entry_id,
@@ -154,35 +153,17 @@ impl CursorManagerState {
         }
     }
 
-    /// Spawn a fetch actor and register its stop channel for a range whose
-    /// cursor already exists in the set (independent consumer init or
-    /// post-drain transition).
+    /// Spawn a fetch actor, register its stop channel, and update/add the cursor
+    /// in the cursor set.
     fn spawn_and_register(
-        &mut self,
-        cursor: &RangeCursor,
-        ctx: Arc<ConsumerContext>,
-        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    ) {
-        debug_assert!(
-            self.cursors.contains(cursor.range_id),
-            "register called for range {:?} not in cursor set",
-            cursor.range_id
-        );
-
-        let (stop_tx, stop_rx) = flume::bounded(1);
-        let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
-        tokio::spawn(actor.run(stop_rx));
-        self.senders.insert(cursor.range_id, stop_tx);
-    }
-
-    /// Create a cursor from range metadata, acquire ownership, and spawn
-    /// the fetch actor. Used by `handle_rebalance` for newly assigned ranges.
-    fn spawn_and_acquire(
         &mut self,
         cursor: RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) {
+        if self.senders.contains_key(&cursor.range_id) {
+            return;
+        }
         let (stop_tx, stop_rx) = flume::bounded(1);
         let actor = FetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
         tokio::spawn(actor.run(stop_rx));
@@ -399,7 +380,23 @@ pub(crate) async fn run_cursor_manager(
                 }
             }
         }
+
+        #[cfg(any(test, debug_assertions))]
+        state.assert_invariants();
     }
 
     state.abort_all().await;
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TAssertInvariant for CursorManagerState {
+    fn assert_invariants(&self) {
+        for range_id in self.senders.keys() {
+            assert!(
+                self.cursors.contains(*range_id),
+                "Invariant violated: Range {:?} has an active fetch actor in senders but is missing from self.cursors",
+                range_id
+            );
+        }
+    }
 }
