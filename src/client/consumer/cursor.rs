@@ -12,6 +12,7 @@
 use crate::client::TopicDetail;
 use crate::connections::protocol::RangeDetail;
 use crate::connections::protocol::RangeTransition;
+use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::{RangeId, RangeState};
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
@@ -243,7 +244,7 @@ impl RangeCursorSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeCursor {
     pub range_id: RangeId,
-    pub next_entry_id: u64,
+    pub next_entry_id: EntryId,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
 }
@@ -251,7 +252,7 @@ pub struct RangeCursor {
 impl RangeCursor {
     pub fn new(
         range_id: RangeId,
-        next_entry_id: u64,
+        next_entry_id: EntryId,
         keyspace_start: Vec<u8>,
         keyspace_end: Vec<u8>,
     ) -> Self {
@@ -269,10 +270,10 @@ impl RangeCursor {
             .filter(|r| r.state == RangeState::Active)
             .filter(|r| interest.matches(r))
             .map(|r| {
-                let start_offset = r.active_segment.as_ref().map_or(0, |s| *s.start_entry_id);
+                let start_entry = r.active_segment.as_ref().map_or(0, |s| *s.start_entry_id);
                 RangeCursor::new(
                     r.range_id,
-                    start_offset,
+                    EntryId(start_entry),
                     r.keyspace_start.clone(),
                     r.keyspace_end.clone(),
                 )
@@ -301,7 +302,7 @@ impl RangeCursor {
             .map(|r| {
                 RangeCursor::new(
                     r.range_id,
-                    r.first_segment_start_offset().map_or(0, |id| *id),
+                    r.first_segment_start_offset().map_or(EntryId(0), |id| id),
                     r.keyspace_start.clone(),
                     r.keyspace_end.clone(),
                 )
@@ -317,13 +318,13 @@ impl RangeCursor {
     ) -> [RangeCursor; 2] {
         let left = RangeCursor::new(
             RangeId(*left_range_id),
-            0,
+            EntryId::default(),
             self.keyspace_start.clone(),
             split_point.clone(),
         );
         let right = RangeCursor::new(
             RangeId(*right_range_id),
-            0,
+            EntryId::default(),
             split_point.clone(),
             self.keyspace_end.clone(),
         );
@@ -336,7 +337,7 @@ impl RangeCursor {
     fn into_merged_cursor(self, merged_id: RangeId) -> Self {
         Self {
             range_id: merged_id,
-            next_entry_id: 0,
+            next_entry_id: EntryId::default(),
             ..self
         }
     }
@@ -408,8 +409,8 @@ mod tests {
     use crate::connections::protocol::{RangeDetail, SegmentDetail, TopicState};
     use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId};
 
-    fn cursor(range_id: RangeId, next_offset: u64, start: &[u8], end: &[u8]) -> RangeCursor {
-        RangeCursor::new(range_id, next_offset, start.to_vec(), end.to_vec())
+    fn cursor(range_id: RangeId, next_entry_id: EntryId, start: &[u8], end: &[u8]) -> RangeCursor {
+        RangeCursor::new(range_id, next_entry_id, start.to_vec(), end.to_vec())
     }
 
     fn split_transition(l: RangeId, r: RangeId, split_point: &[u8]) -> RangeTransition {
@@ -574,12 +575,12 @@ mod tests {
     /// keyspaces around the split point, both at offset 0.
     #[test]
     fn split_replaces_parent_with_two_children() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 1001, b"a", b"c")]);
+        let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 1001.into(), b"a", b"c")]);
         let added = set.apply_drained(RangeId(0), split_transition(RangeId(1), RangeId(2), b"b"));
 
         assert_eq!(added.len(), 2);
-        assert_eq!(added[0], cursor(RangeId(1), 0, b"a", b"b"));
-        assert_eq!(added[1], cursor(RangeId(2), 0, b"b", b"c"));
+        assert_eq!(added[0], cursor(RangeId(1), EntryId::default(), b"a", b"b"));
+        assert_eq!(added[1], cursor(RangeId(2), EntryId::default(), b"b", b"c"));
 
         assert_eq!(set.len(), 2);
     }
@@ -591,8 +592,8 @@ mod tests {
     #[test]
     fn merge_first_parent_defers_m_when_sibling_tracked() {
         let mut set = RangeCursorSet::new(vec![
-            cursor(RangeId(1), 0, b"a", b"b"),
-            cursor(RangeId(2), 0, b"b", b"c"),
+            cursor(RangeId(1), EntryId::default(), b"a", b"b"),
+            cursor(RangeId(2), EntryId::default(), b"b", b"c"),
         ]);
         let added = set.apply_drained(
             RangeId(1),
@@ -614,8 +615,8 @@ mod tests {
     #[test]
     fn merge_second_parent_activates_m_with_union_keyspace() {
         let mut set = RangeCursorSet::new(vec![
-            cursor(RangeId(1), 0, b"a", b"b"),
-            cursor(RangeId(2), 0, b"b", b"c"),
+            cursor(RangeId(1), EntryId::default(), b"a", b"b"),
+            cursor(RangeId(2), EntryId::default(), b"b", b"c"),
         ]);
         set.apply_drained(
             RangeId(1),
@@ -628,7 +629,7 @@ mod tests {
         );
 
         assert_eq!(added.len(), 1);
-        assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"c"));
+        assert_eq!(added[0], cursor(RangeId(3), EntryId::default(), b"a", b"c"));
 
         // Only M remains, spanning both pre-merge keyspaces.
         assert_eq!(set.len(), 1);
@@ -641,14 +642,14 @@ mod tests {
     /// waits on, P2" case.
     #[test]
     fn single_parent_consumer_follows_into_m_without_tracking_sibling() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(1), 0, b"a", b"b")]);
+        let mut set = RangeCursorSet::new(vec![cursor(RangeId(1), EntryId::default(), b"a", b"b")]);
         let added = set.apply_drained(
             RangeId(1),
             merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
         );
 
         assert_eq!(added.len(), 1);
-        assert_eq!(added[0], cursor(RangeId(3), 0, b"a", b"b"));
+        assert_eq!(added[0], cursor(RangeId(3), EntryId::default(), b"a", b"b"));
 
         assert_eq!(set.len(), 1);
         assert_eq!(set.get(RangeId(3)).unwrap().range_id, RangeId(3));
@@ -658,8 +659,8 @@ mod tests {
     #[should_panic(expected = "duplicate range_id")]
     fn duplicate_range_id_panics_invariants() {
         RangeCursorSet::new(vec![
-            cursor(RangeId(1), 0, b"a", b"b"),
-            cursor(RangeId(1), 0, b"c", b"d"),
+            cursor(RangeId(1), EntryId::default(), b"a", b"b"),
+            cursor(RangeId(1), EntryId::default(), b"c", b"d"),
         ]);
     }
 
@@ -667,8 +668,8 @@ mod tests {
     #[should_panic(expected = "overlapping keyspaces")]
     fn overlapping_keyspaces_panic_invariants() {
         RangeCursorSet::new(vec![
-            cursor(RangeId(1), 0, b"a", b"c"),
-            cursor(RangeId(2), 0, b"b", b"d"),
+            cursor(RangeId(1), EntryId::default(), b"a", b"c"),
+            cursor(RangeId(2), EntryId::default(), b"b", b"d"),
         ]);
     }
 }

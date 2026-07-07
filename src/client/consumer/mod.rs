@@ -13,7 +13,7 @@ use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
     RangeOffsetRequest, SegmentDetail, TopicDetail,
 };
-use crate::control_plane::metadata::{RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 
 pub(crate) mod cursor;
 pub(crate) mod group;
@@ -93,7 +93,8 @@ impl Consumer {
 
         if matches!(config.start_policy, StartPolicy::Latest) {
             for cursor in cursors.iter_mut() {
-                let has_saved_offset = consumer_group.is_some() && cursor.next_entry_id > 0;
+                let has_saved_offset =
+                    consumer_group.is_some() && cursor.next_entry_id > EntryId::default();
                 if !has_saved_offset
                     && let Ok((_, committed_entry_id)) =
                         client.fetch_range_entry_ids(&topic, cursor.range_id).await

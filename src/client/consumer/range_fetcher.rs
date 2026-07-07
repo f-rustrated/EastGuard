@@ -16,7 +16,7 @@ use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 enum RangeLookupResult {
     Found(SegmentDetail),
     FellBehind {
-        first_start: u64,
+        first_start: EntryId,
     },
     NeedRefresh,
     RangeSealedAndDrained {
@@ -30,7 +30,7 @@ pub(crate) enum RangeFetchActorCommand {
 
 pub(crate) struct RangeFetchActor {
     range_id: RangeId,
-    next_entry_id: u64,
+    next_entry_id: EntryId,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
@@ -38,7 +38,7 @@ pub(crate) struct RangeFetchActor {
 impl RangeFetchActor {
     pub(crate) fn new(
         range_id: RangeId,
-        next_entry_id: u64,
+        next_entry_id: EntryId,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
@@ -176,7 +176,7 @@ impl RangeFetchActor {
                     return Ok(false);
                 }
 
-                self.next_entry_id = *next_entry_id;
+                self.next_entry_id = next_entry_id;
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
@@ -221,7 +221,7 @@ impl ConsumerContext {
         &self,
         segment: &SegmentDetail,
         range_id: RangeId,
-        offset: u64,
+        entry_id: EntryId,
     ) -> Result<Served, ClientError> {
         let addr = segment
             .pick_replica()
@@ -229,7 +229,7 @@ impl ConsumerContext {
         let req = FetchByIdRequest {
             topic_id: self.topic_id,
             range_id,
-            entry_id: EntryId(offset),
+            entry_id,
             max_bytes: 1024 * 1024,
         };
         self.client
@@ -269,22 +269,22 @@ impl ConsumerContext {
     }
 
     /// Pure synchronous metadata lookup to isolate the non-Send arc_swap::Guard.
-    fn lookup_range(&self, range_id: RangeId, next_entry_id: u64) -> RangeLookupResult {
+    fn lookup_range(&self, range_id: RangeId, next_entry_id: EntryId) -> RangeLookupResult {
         let meta = self.metadata.load();
         let Some(r) = meta.ranges.iter().find(|r| r.range_id == range_id) else {
             return RangeLookupResult::NeedRefresh;
         };
 
         // Try to find the segment directly
-        if let Some(segment) = r.find_segment_for_offset(EntryId(next_entry_id)) {
+        if let Some(segment) = r.find_segment_for_offset(next_entry_id) {
             return RangeLookupResult::Found(segment.clone());
         }
 
         // If sealed, check if we've drained it completely
         if r.state != RangeState::Active {
-            let range_end_offset = r.end_entry_id();
+            let range_end_entry = r.end_entry_id();
 
-            if next_entry_id > *range_end_offset {
+            if next_entry_id > range_end_entry {
                 if let Some(progress_signal) = compute_progress_signal(&meta, r) {
                     return RangeLookupResult::RangeSealedAndDrained { progress_signal };
                 } else {
@@ -295,11 +295,11 @@ impl ConsumerContext {
 
         // (Common Fallback) Check if we fell behind the oldest available data,
         // otherwise signal that a metadata refresh is needed to discover the new segment
-        if let Some(first_start) = r.first_segment_start_offset()
-            && next_entry_id < *first_start
+        if let Some(start_entry) = r.first_segment_start_offset()
+            && next_entry_id < start_entry
         {
             return RangeLookupResult::FellBehind {
-                first_start: *first_start,
+                first_start: start_entry,
             };
         }
 

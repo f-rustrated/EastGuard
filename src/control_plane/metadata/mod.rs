@@ -36,7 +36,7 @@ pub struct SegmentId(pub(crate) u64);
 
 smart_pointer!(SegmentId, u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct EntryId(pub u64);
 
 smart_pointer!(EntryId, u64);

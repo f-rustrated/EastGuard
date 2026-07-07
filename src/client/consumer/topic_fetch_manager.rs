@@ -6,7 +6,7 @@ use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCom
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
-use crate::control_plane::metadata::{RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -175,11 +175,15 @@ impl TopicFetchManagerState {
         range: RangeId,
         ctx: &Arc<ConsumerContext>,
         committed_offset: Option<u64>,
-    ) -> u64 {
-        // 1. Prefer explicitly saved offsets. If a consumer committed offset `N`,
-        // the next record to fetch starts at entry ID `N + 1`.
+    ) -> EntryId {
+        // 1. Prefer explicitly saved offsets. The committed offset is a
+        // record-level checkpoint. Because one entry can contain multiple
+        // records, `offset + 1` may still fall inside the same entry the
+        // consumer already consumed — not the start of the next entry.
+        // The fetch path re-delivers the containing entry; the consumer
+        // skips already-processed records.
         if let Some(offset) = committed_offset {
-            return offset + 1;
+            return EntryId(offset + 1);
         }
 
         // 2. Fetch the latest boundary from the replica if the start policy is Latest.
@@ -197,7 +201,7 @@ impl TopicFetchManagerState {
         }
 
         // 4. Default start entry ID is 0
-        0
+        EntryId::default()
     }
 
     async fn abort_all(&mut self) {
@@ -218,7 +222,7 @@ impl TopicFetchManagerState {
         range_id: RangeId,
         ranges: &[RangeDetail],
         saved_offsets: &HashMap<RangeId, u64>,
-        resolved_entry_id: u64,
+        resolved_entry_id: EntryId,
     ) -> bool {
         self.has_active_descendant(range_id, ranges)
             || self.has_undrained_parent(range_id, ranges, saved_offsets)
@@ -226,7 +230,7 @@ impl TopicFetchManagerState {
                 .iter()
                 .find(|r| r.range_id == range_id)
                 .is_some_and(|r| {
-                    r.state == RangeState::Sealed && resolved_entry_id > *r.end_entry_id()
+                    r.state == RangeState::Sealed && resolved_entry_id > r.end_entry_id()
                 })
     }
 

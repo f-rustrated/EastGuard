@@ -33,7 +33,7 @@ pub use producer::{BufferConfig, Producer, ProducerConfig};
 use crate::client::consumer::group::OffsetCommitPayload;
 use crate::client::consumer::group::SYSTEM_TOPIC_OFFSETS;
 use crate::connections::protocol::{ClientResponse, DataPlaneResponse, RangeOffsetRequest};
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{EntryId, RangeId};
 use borsh::BorshDeserialize;
 
 pub use redirect::RetryPolicy;
@@ -98,7 +98,7 @@ impl Client {
         &self,
         topic: &str,
         range_id: RangeId,
-    ) -> Result<(u64, u64), ClientError> {
+    ) -> Result<(EntryId, EntryId), ClientError> {
         let detail = self.resolve_topic(topic).await?;
         let addr = detail
             .ranges
@@ -127,7 +127,7 @@ impl Client {
             return Err(ClientError::UnexpectedResponse);
         };
 
-        Ok((*start_entry_id, *committed_entry_id))
+        Ok((start_entry_id, committed_entry_id))
     }
 
     pub async fn fetch_all_saved_offsets(
