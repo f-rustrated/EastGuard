@@ -262,7 +262,7 @@ impl RangeCursor {
             keyspace_end,
         }
     }
-    pub(crate) fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
+    fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
         detail
             .ranges
             .iter()
@@ -285,7 +285,7 @@ impl RangeCursor {
     /// other range's `split_into` mentions it). For a freshly-created topic
     /// that has only split, the original full-keyspace range is the sole
     /// root.
-    pub(crate) fn earliest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
+    fn earliest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
         let split_children: HashSet<RangeId> = detail
             .ranges
             .iter()
@@ -309,7 +309,7 @@ impl RangeCursor {
             .collect()
     }
 
-    pub fn split(
+    fn split(
         self,
         left_range_id: RangeId,
         right_range_id: RangeId,
@@ -333,7 +333,7 @@ impl RangeCursor {
     /// Consume this drained parent cursor and become the merged cursor it
     /// transitions to. Used when M doesn't yet exist in the cursor set (this is
     /// the first of the merge's parents to drain in the consumer's view).
-    pub fn into_merged_cursor(self, merged_id: RangeId) -> Self {
+    fn into_merged_cursor(self, merged_id: RangeId) -> Self {
         Self {
             range_id: merged_id,
             next_entry_id: 0,
@@ -341,7 +341,7 @@ impl RangeCursor {
         }
     }
 
-    pub fn absorb(&mut self, half: RangeCursor) {
+    fn absorb(&mut self, half: RangeCursor) {
         if half.keyspace_start < self.keyspace_start {
             self.keyspace_start = half.keyspace_start.clone();
         }
