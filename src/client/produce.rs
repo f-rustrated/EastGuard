@@ -7,6 +7,7 @@ use crate::client::error::ClientError;
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, DataPlaneResponse, ProduceRequest,
 };
+use crate::control_plane::metadata::EntryId;
 
 impl Client {
     /// Produce one entry under `routing_key`, returning the committed `entry_id`.
@@ -18,7 +19,7 @@ impl Client {
         routing_key: &[u8],
         data: Vec<u8>,
         record_count: u32,
-    ) -> Result<u64, ClientError> {
+    ) -> Result<EntryId, ClientError> {
         // Describe once to seed the cache (gives the first hop).
         if self.cache.get(topic).is_none() {
             self.resolve_topic(topic).await?;

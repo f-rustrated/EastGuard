@@ -13,8 +13,8 @@ use crate::control_plane::metadata::command::DeleteSegments;
 use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    MetadataCommand, RangeId, ReassignSegment, ReplicaSet, RollSegment, SegmentId, TopicId,
-    TopicMeta, TopicStats,
+    EntryId, MetadataCommand, RangeId, ReassignSegment, ReplicaSet, RollSegment, SegmentId,
+    TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
@@ -216,7 +216,7 @@ impl Raft {
     /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
     /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
     /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, EntryId)]> {
         self.state_machine.active_segment_assignments()
     }
 
@@ -713,7 +713,7 @@ impl Raft {
         leader_dead && (dead == 1)
     }
 
-    pub(crate) fn has_topic(&self, topic_id: &crate::control_plane::metadata::TopicId) -> bool {
+    pub(crate) fn has_topic(&self, topic_id: &TopicId) -> bool {
         self.state_machine.get_topic(topic_id).is_some()
     }
 
@@ -3808,7 +3808,7 @@ mod tests {
                 segment_key: seg0,
                 sealed_at: 2000,
                 new_replica_set: vec![node("node-1")],
-                end_entry_id: Some(100),
+                end_entry_id: Some(100.into()),
             })
             .into(),
         )
@@ -3882,7 +3882,7 @@ mod tests {
                 segment_key: seg0,
                 sealed_at: 2000,
                 new_replica_set: sealed_set,
-                end_entry_id: Some(100),
+                end_entry_id: Some(100.into()),
             })
             .into(),
         )
@@ -4011,7 +4011,7 @@ mod tests {
                 segment_key: seg0,
                 sealed_at: 2000,
                 new_replica_set: vec![node("node-1")],
-                end_entry_id: Some(100),
+                end_entry_id: Some(100.into()),
             })
             .into(),
         )
@@ -4067,8 +4067,8 @@ mod tests {
         for (_, a) in &redrives {
             assert_eq!(a.segment_key, seg0);
             assert_eq!(a.shard_group_id, TEST_SHARD);
-            assert_eq!(a.start_entry_id, 0);
-            assert_eq!(a.sealed_end_entry_id, 100);
+            assert_eq!(a.start_entry_id, 0.into());
+            assert_eq!(a.sealed_end_entry_id, 100.into());
             assert_eq!(a.replica_set, members);
         }
     }
@@ -4097,7 +4097,7 @@ mod tests {
         let redrives = drain_catch_up_redrives(&mut raft);
         for (_, a) in &redrives {
             assert_eq!(a.segment_key, seg0);
-            assert_eq!(a.sealed_end_entry_id, 100);
+            assert_eq!(a.sealed_end_entry_id, 100.into());
         }
         let mut targets: Vec<NodeId> = redrives.iter().map(|(t, _)| t.clone()).collect();
         targets.sort();

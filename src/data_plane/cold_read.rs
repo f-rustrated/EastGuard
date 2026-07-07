@@ -12,6 +12,7 @@ use super::states::segment::cache::CachedEntry;
 use super::wal::{WalRecord, WalRecordType};
 use crate::connections::protocol::RangeProgressSignal;
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::messages::command::CatchUpReadComplete;
 use crate::data_plane::messages::query::FetchResult;
 
@@ -31,10 +32,10 @@ pub(crate) struct ColdReadRequest {
     pub(crate) segment_key: SegmentKey,
     pub(crate) segment_file_path: PathBuf,
     /// First entry id wanted (inclusive).
-    pub(crate) start_entry_offset: u64,
+    pub(crate) start_entry_offset: EntryId,
     /// Last entry id stored in this sealed segment (inclusive). Reads never
     /// cross past this even if the file has a trailing partial write.
-    pub(crate) end_entry_id: u64,
+    pub(crate) end_entry_id: EntryId,
     pub(crate) max_bytes: u64,
     pub(crate) reply: ColdReadReply,
 }
@@ -54,8 +55,8 @@ pub(crate) struct CatchUpReadReply {
     pub(crate) requester: NodeId,
     /// Echoed into `CatchUpReadComplete` so the worker can re-arm the next read
     /// and decide when the sealed end is reached.
-    pub(crate) start_offset: u64,
-    pub(crate) sealed_end: u64,
+    pub(crate) start_offset: EntryId,
+    pub(crate) sealed_end: EntryId,
     pub(crate) mailbox: DataPlaneSender,
 }
 
@@ -63,7 +64,7 @@ pub(crate) struct CatchUpReadReply {
 /// and per-entry `record_count` (restored from the on-disk `WalRecord`).
 pub(crate) struct ColdReadRecords {
     entries: Vec<Arc<CachedEntry>>,
-    next_offset: u64,
+    next_offset: EntryId,
 }
 
 pub(crate) struct ColdReadPool;
@@ -183,7 +184,7 @@ impl ColdReadPool {
         sparse_index: &dyn SparseIndex,
     ) -> Result<ColdReadRecords, ColdReadError> {
         let (anchor_id, byte_position) =
-            sparse_index.seek_index(req.segment_key, req.start_entry_offset);
+            sparse_index.seek_index(req.segment_key, *req.start_entry_offset);
 
         let file = File::open(&req.segment_file_path).map_err(ColdReadError::FileOpen)?;
         let file_len = file.metadata()?.len();
@@ -192,7 +193,7 @@ impl ColdReadPool {
         reader.seek(SeekFrom::Start(byte_position))?;
 
         let mut entries: Vec<Arc<CachedEntry>> = Vec::new();
-        let mut current_offset = anchor_id;
+        let mut current_offset = EntryId(anchor_id);
         let mut next_offset = req.start_entry_offset;
         let mut bytes_read = 0u64;
 
@@ -220,7 +221,7 @@ impl ColdReadPool {
                 WalRecordType::BatchEnd => continue,
                 WalRecordType::Data => {
                     let entry_id = current_offset;
-                    current_offset += 1;
+                    current_offset += 1u64;
 
                     if entry_id < req.start_entry_offset {
                         continue;
@@ -237,7 +238,7 @@ impl ColdReadPool {
                     }
 
                     bytes_read += payload_len;
-                    next_offset = entry_id + 1;
+                    next_offset = entry_id + 1u64;
                     entries.push(Arc::new(CachedEntry {
                         data: record.payload.into(),
                         record_count: record.record_count,
@@ -345,8 +346,8 @@ mod tests {
         ColdReadRequest {
             segment_key: key(),
             segment_file_path: path,
-            start_entry_offset: start_offset,
-            end_entry_id,
+            start_entry_offset: EntryId(start_offset),
+            end_entry_id: EntryId(end_entry_id),
             max_bytes,
             reply: ColdReadReply::Consumer {
                 reply,
@@ -375,9 +376,9 @@ mod tests {
         let out = ColdReadPool::process_request(&req, &idx).unwrap();
 
         assert_eq!(out.entries.len(), 1);
-        assert_eq!(out.entries[0].entry_id, 4);
+        assert_eq!(out.entries[0].entry_id, EntryId(4));
         assert_eq!(out.entries[0].data.to_vec(), b"e4".to_vec());
-        assert_eq!(out.next_offset, 5);
+        assert_eq!(out.next_offset, EntryId(5));
     }
 
     #[test]
@@ -391,11 +392,11 @@ mod tests {
         let out = ColdReadPool::process_request(&req, &idx).unwrap();
 
         assert_eq!(out.entries.len(), 3, "BatchEnd must not end the stream");
-        assert_eq!(out.next_offset, 3);
+        assert_eq!(out.next_offset, EntryId(3));
         let got: Vec<(u64, u32, Vec<u8>)> = out
             .entries
             .iter()
-            .map(|e| (e.entry_id, e.record_count, e.data.to_vec()))
+            .map(|e| (*e.entry_id, e.record_count, e.data.to_vec()))
             .collect();
         assert_eq!(
             got,
@@ -418,8 +419,8 @@ mod tests {
         let out = ColdReadPool::process_request(&req, &idx).unwrap();
 
         assert_eq!(out.entries.len(), 1, "always include at least one entry");
-        assert_eq!(out.entries[0].entry_id, 0);
-        assert_eq!(out.next_offset, 1);
+        assert_eq!(out.entries[0].entry_id, EntryId(0));
+        assert_eq!(out.next_offset, EntryId(1));
     }
 
     #[test]
@@ -433,8 +434,8 @@ mod tests {
         let out = ColdReadPool::process_request(&req, &idx).unwrap();
 
         assert_eq!(out.entries.len(), 2);
-        assert_eq!(out.entries.last().unwrap().entry_id, 1);
-        assert_eq!(out.next_offset, 2);
+        assert_eq!(out.entries.last().unwrap().entry_id, EntryId(1));
+        assert_eq!(out.next_offset, EntryId(2));
     }
 
     #[test]
@@ -450,9 +451,9 @@ mod tests {
         let got: Vec<(u64, u32)> = out
             .entries
             .iter()
-            .map(|e| (e.entry_id, e.record_count))
+            .map(|e| (*e.entry_id, e.record_count))
             .collect();
         assert_eq!(got, vec![(1, 2), (2, 3)]);
-        assert_eq!(out.next_offset, 3);
+        assert_eq!(out.next_offset, EntryId(3));
     }
 }

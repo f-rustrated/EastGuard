@@ -326,7 +326,7 @@ impl SegmentRingBuffer {
 struct CachedEntry {
     data: EntryPayload,        // opaque blob from producer — broker never parses
     record_count: u32,         // number of records in this entry
-    entry_id: u64,             // broker-assigned, per-segment monotonic
+    entry_id: EntryId,         // broker-assigned, per-segment monotonic
     lsn: u64,                  // WAL LSN for checkpoint tracking
 }
 ```
@@ -357,8 +357,8 @@ struct SegmentTracker {
     segment_file_path: PathBuf,
     role: SegmentRole,                   // Leader | Follower (D2)
     replica_set: Vec<NodeId>,            // [leader, follower, ...] (D2)
-    committed_entry_id: u64,             // last committed entry_id (D2)
-    next_entry_id: u64,                  // next entry_id to assign on publish
+    committed_entry_id: EntryId,         // last committed entry_id (D2)
+    next_entry_id: EntryId,              // next entry_id to assign on publish
     staged_entries: Vec<StagedEntry>,    // accumulated entries awaiting flush
 }
 
@@ -550,14 +550,14 @@ Fixed-size thread pool (e.g., 4 threads). Cold reads are initiated by many indep
 ```rust
 struct ColdReadRequest {
     segment_key: SegmentKey,
-    start_entry_id: u64,
+    start_entry_id: EntryId,
     max_bytes: u64,
     respond_tx: oneshot::Sender<ColdReadResult>,
 }
 
 struct ColdReadResult {
     entries: Vec<EntryPayload>,
-    next_entry_id: u64,
+    next_entry_id: EntryId,
 }
 ```
 

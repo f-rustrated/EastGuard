@@ -3,7 +3,7 @@ mod config;
 pub(crate) mod record;
 use crate::client::error::ClientError;
 use crate::client::{Client, CompressionCodec};
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{EntryId, RangeId};
 use buffers::{PendingRecord, ProducerBuffers, PushResult};
 pub use config::{BufferConfig, ProducerConfig};
 use record::ProducerRecord;
@@ -58,7 +58,7 @@ impl Producer {
     }
 
     /// Produce a single record. Returns the committed entry ID once the batch flushes.
-    pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<u64, ClientError> {
+    pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
         let topic = &self.inner.topic;
         let client = &self.inner.client;
 

@@ -67,6 +67,7 @@ impl RaftTransportActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::{RaftRpc, RequestVote, WireRaftMessage};
     use crate::control_plane::membership::ShardGroupId;
     use crate::net::OwnedWriteHalf;
@@ -174,8 +175,7 @@ mod tests {
             .build();
 
         sim.host("acceptor", || async {
-            let (raft_tx, _raft_rx) =
-                crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
+            let (raft_tx, _raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
             let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"), dial_tx);
@@ -212,8 +212,7 @@ mod tests {
             .build();
 
         sim.host("node-b", || async {
-            let (raft_tx, _raft_rx) =
-                crate::control_plane::consensus::actor::MultiRaftActor::channel(16);
+            let (raft_tx, _raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
             let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);

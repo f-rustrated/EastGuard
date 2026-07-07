@@ -3,7 +3,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use crate::{
     control_plane::{
         NodeId,
-        metadata::{RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+        metadata::{EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
     },
     data_plane::SegmentKey,
     impl_from_variant,
@@ -25,7 +25,7 @@ pub struct RollSegment {
     /// None for SWIM-death-triggered seals — the coordinator doesn't know
     /// the actual committed offset. Corrected later via `correct_end_offset`
     /// or D5 sealed segment repair.
-    pub end_entry_id: Option<u64>,
+    pub end_entry_id: Option<EntryId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

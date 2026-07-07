@@ -9,7 +9,7 @@ use turmoil::Builder;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MultiRaftActor;
-use crate::control_plane::consensus::messages::{MultiRaftActorCommand, RaftTimer};
+use crate::control_plane::consensus::messages::{EnsureGroup, MultiRaftActorCommand, RaftTimer};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
@@ -134,7 +134,7 @@ async fn run_raft_node(
     );
 
     raft_tx
-        .send(crate::control_plane::consensus::messages::EnsureGroup {
+        .send(EnsureGroup {
             group: group.clone(),
         })
         .await

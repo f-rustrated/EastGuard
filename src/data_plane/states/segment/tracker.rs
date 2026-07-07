@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
@@ -24,12 +25,12 @@ pub(crate) struct SegmentTracker {
     role: SegmentRole,
     replica_set: Vec<NodeId>,
     shard_group_id: ShardGroupId,
-    committed_entry_id: u64,
-    next_entry_id: u64,
+    committed_entry_id: EntryId,
+    next_entry_id: EntryId,
     /// The entry id this segment was created with. Stable for the segment's
     /// lifetime; used by the data-plane (range, offset) → segment resolver to
     /// pin BTreeMap keys to a per-segment identity that survives writes.
-    start_entry_id: u64,
+    start_entry_id: EntryId,
     staged_entries: Vec<StagedEntry>,
     created_at: std::time::Instant,
 }
@@ -49,9 +50,9 @@ impl SegmentTracker {
             role,
             replica_set,
             shard_group_id,
-            committed_entry_id: 0,
-            next_entry_id: 0,
-            start_entry_id: 0,
+            committed_entry_id: EntryId::MIN,
+            next_entry_id: EntryId::MIN,
+            start_entry_id: EntryId::MIN,
             staged_entries: Vec::new(),
             created_at: std::time::Instant::now(),
         }
@@ -62,7 +63,7 @@ impl SegmentTracker {
         role: SegmentRole,
         replica_set: Vec<NodeId>,
         shard_group_id: ShardGroupId,
-        start_entry_id: u64,
+        start_entry_id: EntryId,
     ) -> Self {
         let mut tracker = Self::new(path, role, replica_set, shard_group_id);
         tracker.next_entry_id = start_entry_id;
@@ -70,7 +71,7 @@ impl SegmentTracker {
         tracker
     }
 
-    pub(crate) fn start_entry_id(&self) -> u64 {
+    pub(crate) fn start_entry_id(&self) -> EntryId {
         self.start_entry_id
     }
 
@@ -119,7 +120,7 @@ impl SegmentTracker {
             .drain(..)
             .map(|s| {
                 let entry_id = self.next_entry_id;
-                self.next_entry_id += 1;
+                self.next_entry_id += 1u64;
                 let entry = Arc::new(CachedEntry {
                     data: s.data,
                     record_count: s.record_count,
@@ -161,7 +162,7 @@ impl SegmentTracker {
         }
     }
 
-    pub(crate) fn commit_entry(&mut self, entry_id: u64) {
+    pub(crate) fn commit_entry(&mut self, entry_id: EntryId) {
         let commit = self.cache.load_read_cursor();
 
         #[cfg(debug_assertions)]
@@ -185,7 +186,7 @@ impl SegmentTracker {
         self.checkpoint_lsn
     }
 
-    pub(crate) fn committed_entry_id(&self) -> u64 {
+    pub(crate) fn committed_entry_id(&self) -> EntryId {
         self.committed_entry_id
     }
 
@@ -195,13 +196,13 @@ impl SegmentTracker {
 
     /// Successor starts one past the last committed entry — or at `old_start`
     /// when nothing committed, so replayed records keep their entry ids.
-    pub(crate) fn successor_start_entry_id(&self) -> u64 {
+    pub(crate) fn successor_start_entry_id(&self) -> EntryId {
         self.start_entry_id() + self.committed_count()
     }
 
     /// Last committed entry id, or `None` if nothing committed yet — the seal
     /// boundary, so a segment sealed before its first commit owns no offsets.
-    pub(crate) fn last_committed_entry_id(&self) -> Option<u64> {
+    pub(crate) fn last_committed_entry_id(&self) -> Option<EntryId> {
         (self.committed_count() > 0).then_some(self.committed_entry_id)
     }
 
@@ -209,7 +210,7 @@ impl SegmentTracker {
     /// `next_entry_id` only advances in `publish_staged` (after `wal.flush_batch()`),
     /// so `next_entry_id - 1` is durable — and can run ahead of the notified
     /// `committed_entry_id`.
-    pub(crate) fn durable_end_entry_id(&self) -> Option<u64> {
+    pub(crate) fn durable_end_entry_id(&self) -> Option<EntryId> {
         (self.next_entry_id > self.start_entry_id).then(|| self.next_entry_id - 1)
     }
 
@@ -233,7 +234,7 @@ impl SegmentTracker {
         segment_key: SegmentKey,
         data: EntryPayload,
         record_count: u32,
-        entry_id: u64,
+        entry_id: EntryId,
     ) {
         let expected = self.next_entry_id + self.staged_entries.len() as u64;
         if entry_id < expected {
@@ -312,7 +313,7 @@ pub mod tests {
         pub fn cache(&self) -> Arc<SegmentRingBuffer> {
             self.cache.clone()
         }
-        pub fn next_entry_id(&self) -> u64 {
+        pub fn next_entry_id(&self) -> EntryId {
             self.next_entry_id
         }
 
@@ -360,9 +361,9 @@ pub mod tests {
             SegmentRole::Follower,
             vec![NodeId::new("leader"), NodeId::new("follower")],
             ShardGroupId(1),
-            5,
+            EntryId(5),
         );
-        t.stage_entry_from_replica(test_key(), Bytes::from("data").into(), 1, 5);
+        t.stage_entry_from_replica(test_key(), Bytes::from("data").into(), 1, EntryId(5));
         assert!(t.has_staged());
 
         // Publish to advance next_entry_id
@@ -371,9 +372,9 @@ pub mod tests {
         t.publish_staged(1);
 
         // Duplicate entry_id (5) should be skipped since next is now 6
-        t.stage_entry_from_replica(test_key(), Bytes::from("dup").into(), 1, 5);
+        t.stage_entry_from_replica(test_key(), Bytes::from("dup").into(), 1, EntryId(5));
         assert!(!t.has_staged());
-        assert_eq!(t.next_entry_id, 6);
+        assert_eq!(t.next_entry_id, EntryId(6));
         t.assert_invariants();
     }
 
@@ -392,9 +393,9 @@ pub mod tests {
         assert_eq!(t.cache_read_cursor(), 0);
 
         for i in 0..3u64 {
-            t.commit_entry(i);
+            t.commit_entry(EntryId(i));
             assert_eq!(t.cache_read_cursor(), i + 1);
-            assert_eq!(t.committed_entry_id(), i);
+            assert_eq!(t.committed_entry_id(), EntryId(i));
         }
         t.assert_invariants();
     }
@@ -408,14 +409,14 @@ pub mod tests {
 
         assert!(!wal_buf.is_empty());
         assert!(t.has_staged());
-        assert_eq!(t.next_entry_id, 0);
+        assert_eq!(t.next_entry_id, EntryId(0));
 
         let entries = t.publish_staged(1);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].entry_id, 0);
+        assert_eq!(entries[0].entry_id, EntryId(0));
         assert_eq!(entries[0].record_count, 3);
         assert!(!t.has_staged());
-        assert_eq!(t.next_entry_id, 1);
+        assert_eq!(t.next_entry_id, EntryId(1));
         t.assert_invariants();
     }
 

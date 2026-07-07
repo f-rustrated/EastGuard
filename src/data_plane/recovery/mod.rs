@@ -129,7 +129,10 @@ impl Durable {
             let Some(start_offset) = self.recovered.start_entry_id(&key) else {
                 continue;
             };
-            let path = key.file_path(&self.data_dir, start_offset);
+            let path = key.file_path(
+                &self.data_dir,
+                crate::control_plane::metadata::EntryId(start_offset),
+            );
             index.put_batch(rebuild_sparse_entries(&path, key)?)?;
         }
 
@@ -151,7 +154,7 @@ mod tests {
 
     use super::segment_scan::scan_segment_file;
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::SegmentKey;
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
 
@@ -170,7 +173,7 @@ mod tests {
     /// exactly as the live produce path (`tracker.rs`) stages it.
     fn wal_data(key: SegmentKey, entry_id: u64, record_count: u32, payload: &str) -> WalRecord {
         let wal_payload =
-            RoutingHeader::new(key, entry_id, record_count).build_wal_payload(payload.as_bytes());
+            RoutingHeader::new(key, EntryId(entry_id), record_count).build_wal_payload(payload.as_bytes());
         WalRecord::data(wal_payload, record_count)
     }
 
@@ -185,7 +188,7 @@ mod tests {
     }
 
     fn write_segment(data_dir: &Path, key: SegmentKey, start_offset: u64, bytes: &[u8]) {
-        let path = key.file_path(data_dir, start_offset);
+        let path = key.file_path(data_dir, EntryId(start_offset));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
     }
@@ -203,7 +206,7 @@ mod tests {
     }
 
     fn last_id(data_dir: &Path, key: SegmentKey, start_offset: u64) -> Option<u64> {
-        scan_segment_file(&key.file_path(data_dir, start_offset))
+        scan_segment_file(&key.file_path(data_dir, EntryId(start_offset)))
             .unwrap()
             .last_entry_id
     }
@@ -264,13 +267,13 @@ mod tests {
 
         let (_db_dir, db) = open_db();
         run(data_dir.clone(), &db).unwrap();
-        let after_first = fs::read(a.file_path(&data_dir, 0)).unwrap();
+        let after_first = fs::read(a.file_path(&data_dir, EntryId(0))).unwrap();
 
         // Commit 13 deletes the WAL after the first run, so the second run finds
         // an empty WAL dir and rebuilds the inventory from the segment files
         // alone — still byte-identical, still cursor 2.
         let output = run(data_dir.clone(), &db).unwrap();
-        assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), after_first);
+        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), after_first);
         assert_eq!(output.inventory.get(&a), Some(2));
     }
 
@@ -332,14 +335,14 @@ mod tests {
         );
         // The survivor re-presents entry 1 — already on disk, so it dedups.
         write_wal(&data_dir, 2, &wal_batch(&[wal_data(a, 1, 1, "a1")]));
-        let before = fs::read(a.file_path(&data_dir, 0)).unwrap();
+        let before = fs::read(a.file_path(&data_dir, EntryId(0))).unwrap();
 
         let (_db_dir, db) = open_db();
         let output = run(data_dir.clone(), &db).unwrap();
 
         // Zero appends (the survivor dedups), the segment is byte-identical, and
         // the already-deleted half's data was safe in the segment all along.
-        assert_eq!(fs::read(a.file_path(&data_dir, 0)).unwrap(), before);
+        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), before);
         assert_eq!(output.inventory.get(&a), Some(1));
         assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
     }
@@ -370,7 +373,7 @@ mod tests {
         // every id — in particular the interior anchor resolves, instead of
         // collapsing to the byte-0 fallback that would mislabel a cold read.
         let (_full_dir, full) = open_db();
-        full.put_batch(rebuild_sparse_entries(&a.file_path(&data_dir, 0), a).unwrap())
+        full.put_batch(rebuild_sparse_entries(&a.file_path(&data_dir, EntryId(0)), a).unwrap())
             .unwrap();
         for id in 0..=n + 2 {
             assert_eq!(db.seek_index(a, id), full.seek_index(a, id));
@@ -391,7 +394,7 @@ mod tests {
         let mut wal = WalWriter::new(data_dir.to_path_buf()).unwrap();
         for batch in batches {
             for &(key, entry_id, payload) in *batch {
-                let wp = RoutingHeader::new(key, entry_id, 1).build_wal_payload(payload.as_bytes());
+                let wp = RoutingHeader::new(key, EntryId(entry_id), 1).build_wal_payload(payload.as_bytes());
                 WalRecord::data(wp, 1).encode_to(wal.buf()).unwrap();
             }
             WalRecord::batch_end().encode_to(wal.buf()).unwrap();

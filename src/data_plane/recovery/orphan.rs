@@ -37,7 +37,7 @@ impl OrphanCandidate {
     /// is cluster-confirmed and last. Returns the key so the caller can drop its inventory
     /// entry. Idempotent: an already-absent file is success.
     pub(crate) fn delete(&self, data_dir: &Path) -> io::Result<SegmentKey> {
-        let path = self.segment_key.file_path(data_dir, self.start_offset);
+        let path = self.segment_key.file_path(data_dir, crate::control_plane::metadata::EntryId(self.start_offset));
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(self.segment_key),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(self.segment_key),

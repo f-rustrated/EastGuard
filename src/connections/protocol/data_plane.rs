@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{RangeId, RangeMeta, RangeState, TopicMeta},
+    control_plane::metadata::{EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta},
     data_plane::messages::query::{FetchResult, ListOffsetsResult},
     impl_from_variant,
 };
@@ -52,8 +52,8 @@ pub struct ProduceRequest {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchRequest {
     pub topic_name: String,
-    pub range_id: u64,
-    pub entry_id: u64,
+    pub range_id: RangeId,
+    pub entry_id: EntryId,
     /// Position within the entry to start from; 0 means the first record.
     pub record_index: u32,
     pub max_bytes: u32,
@@ -69,9 +69,9 @@ pub struct FetchRequest {
 /// resolution; the server never proxies.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
-    pub topic_id: u64,
+    pub topic_id: TopicId,
     pub range_id: RangeId,
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub max_bytes: u32,
 }
 
@@ -85,12 +85,12 @@ pub struct RangeOffsetRequest {
 pub enum DataPlaneResponse {
     // Produce
     Produced {
-        entry_id: u64,
+        entry_id: EntryId,
     },
     // Fetch
     Fetched {
         entries: Box<[Entry]>,
-        next_entry_id: u64,
+        next_entry_id: EntryId,
         progress_signal: RangeProgressSignal,
     },
     EntryIdOutOfRange,
@@ -98,8 +98,8 @@ pub enum DataPlaneResponse {
     KeyspaceBoundNarrowed,
 
     RangeOffset {
-        start_entry_id: u64,
-        committed_entry_id: u64,
+        start_entry_id: EntryId,
+        committed_entry_id: EntryId,
     },
     // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
     // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
@@ -184,7 +184,7 @@ pub struct KeyspaceBound {
 /// parse records from it using `record_count`.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct Entry {
-    pub entry_id: u64,
+    pub entry_id: EntryId,
     pub data: Vec<u8>,
     pub record_count: u32,
 }
@@ -198,7 +198,7 @@ pub struct Entry {
 pub enum RangeProgressSignal {
     Active,
     Sealed {
-        end_entry_id: u64,
+        end_entry_id: EntryId,
         transition: RangeTransition,
     },
 }

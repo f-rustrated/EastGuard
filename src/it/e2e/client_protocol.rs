@@ -9,8 +9,9 @@ use crate::connections::protocol::{
     ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, FetchRequest,
     NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
 };
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::it::helpers::{default_env, send_request, try_send_request};
 use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
 
@@ -451,12 +452,12 @@ fn produce_then_fetch_hot() -> turmoil::Result {
         // empty response just means "keep polling"; never reaching all three is
         // a failure.
         let mut entries = Vec::new();
-        let mut next_entry_id = 0u64;
+        let mut next_entry_id = EntryId(0u64);
         let mut progress_signal = RangeProgressSignal::Active;
         for _ in 0..80 {
             let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::Fetch(FetchRequest {
                 topic_name: TOPIC.into(),
-                range_id: 0,
+                range_id: RangeId(0),
                 entry_id: next_entry_id,
                 record_index: 0,
                 max_bytes: 1 << 20,
@@ -486,11 +487,11 @@ fn produce_then_fetch_hot() -> turmoil::Result {
             "all three produced records should fetch, got {}",
             entries.len()
         );
-        assert_eq!(entries[0].entry_id, 0);
+        assert_eq!(entries[0].entry_id, EntryId(0));
         assert_eq!(entries[0].data, b"rec-0");
         assert_eq!(entries[1].data, b"rec-1");
         assert_eq!(entries[2].data, b"rec-2");
-        assert_eq!(next_entry_id, 3);
+        assert_eq!(*next_entry_id, 3);
         assert!(
             matches!(progress_signal, RangeProgressSignal::Active),
             "fresh single-range topic stays Active, got {progress_signal:?}"
@@ -563,7 +564,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id > 0
+                && *seg.start_entry_id > 0
             {
                 rolled_start = Some(seg.start_entry_id);
                 break;
@@ -677,7 +678,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id > 0
+                && *seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -718,7 +719,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
                 ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                     topic_id,
                     range_id: RangeId(0),
-                    entry_id: 0,
+                    entry_id: EntryId(0),
                     max_bytes: 1 << 20,
                 }));
             if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
@@ -835,7 +836,8 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                 && let Some(write_leader) = seg.replica_set.first()
             {
                 assert_eq!(
-                    seg.start_entry_id, 0,
+                    seg.start_entry_id,
+                    EntryId(0),
                     "segment must still be active at offset 0"
                 );
                 chosen = Some((detail.topic_id, write_leader.node_id.clone()));
@@ -849,7 +851,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
             .find(|n| leader_id.starts_with(n))
             .expect("write-leader must be one of the nodes");
         tracing::info!(
-            "[LEADERCRASH] topic_id={topic_id} write-leader={leader_id} victim={victim_node}"
+            "[LEADERCRASH] topic_id={topic_id:?} write-leader={leader_id} victim={victim_node}"
         );
         *victim_w.lock().unwrap() = Some(victim_node.to_string());
 
@@ -873,7 +875,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id == 1
+                && *seg.start_entry_id == 1
             {
                 if let Some(new_leader) = seg.replica_set.first() {
                     assert!(
@@ -900,7 +902,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                     ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                         topic_id,
                         range_id: RangeId(0),
-                        entry_id: 0,
+                        entry_id: EntryId(0),
                         max_bytes: 1 << 20,
                     }));
                 if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
@@ -1022,7 +1024,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id > 0
+                && *seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -1056,7 +1058,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
             .find(|(n, _)| !replicas.iter().any(|r| r.starts_with(n)))
             .expect("a spare node");
         tracing::info!(
-            "[COORDCRASH] shard={shard_group_id} leader/victim={leader_id} spare={spare:?}"
+            "[COORDCRASH] shard={shard_group_id:?} leader/victim={leader_id} spare={spare:?}"
         );
         *victim_w.lock().unwrap() = Some(victim_node.to_string());
 
@@ -1095,7 +1097,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                 ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                     topic_id,
                     range_id: RangeId(0),
-                    entry_id: 0,
+                    entry_id: EntryId(0),
                     max_bytes: 1 << 20,
                 }));
             if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
@@ -1209,7 +1211,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id > 0
+                && *seg.start_entry_id > 0
             {
                 let replicas = seg
                     .replica_set
@@ -1253,7 +1255,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
         let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
             topic_id,
             range_id: RangeId(0),
-            entry_id: 0,
+            entry_id: EntryId(0),
             max_bytes: 1 << 20,
         }));
 
@@ -1430,7 +1432,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
                     .ranges
                     .first()
                     .and_then(|r| r.active_segment.as_ref())
-                && seg.start_entry_id > 0
+                && *seg.start_entry_id > 0
             {
                 topic_id = Some(detail.topic_id);
                 break;
@@ -1450,7 +1452,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
         let fetch = ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
             topic_id,
             range_id: RangeId(0),
-            entry_id: 0,
+            entry_id: EntryId(0),
             max_bytes: 1 << 20,
         }));
         let mut served = false;
@@ -1506,7 +1508,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
 /// Resolve the topic shard group's metadata leader: `(shard_group_id, leader node id)`.
 /// Reads the group + members from any node (a ring lookup), then polls members for an
 /// authoritative Raft leader (a non-member's `GetShardLeader` is `None`).
-async fn metadata_leader(topic: &str, nodes: &[(&str, u16)]) -> Option<(u64, String)> {
+async fn metadata_leader(topic: &str, nodes: &[(&str, u16)]) -> Option<(ShardGroupId, String)> {
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut info = None;

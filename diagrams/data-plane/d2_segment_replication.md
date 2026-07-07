@@ -191,7 +191,7 @@ struct ReplicationState {
 struct PendingBatch {
     replies: Vec<oneshot::Sender<ProduceAck>>,
     pending_acks: HashSet<NodeId>,
-    entry_id: u64,
+    entry_id: EntryId,
 }
 ```
 

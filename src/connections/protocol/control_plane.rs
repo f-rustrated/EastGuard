@@ -22,8 +22,8 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
 
 use crate::control_plane::metadata::{
-    RangeId, RangeMeta, RangeState, SegmentMeta, SegmentMetaState, TopicMeta,
-    TopicState as MetaTopicState,
+    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState, TopicId,
+    TopicMeta, TopicState as MetaTopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -88,7 +88,7 @@ pub enum TopicState {
 pub struct TopicDetail {
     /// Resolved id, so a consumer can fetch by id directly from a holding replica
     /// (no name re-resolution on the data node). See `FetchByIdRequest`.
-    pub topic_id: u64,
+    pub topic_id: TopicId,
     pub name: String,
     pub state: TopicState,
     pub ranges: Box<[RangeDetail]>,
@@ -108,7 +108,7 @@ impl TopicDetail {
             .map(|range| RangeDetail::from_meta(range, addresses))
             .collect();
         TopicDetail {
-            topic_id: meta.id.0,
+            topic_id: meta.id,
             name: meta.name,
             state: match meta.state {
                 MetaTopicState::Active => TopicState::Active,
@@ -149,13 +149,13 @@ pub struct RangeDetail {
 }
 
 impl RangeDetail {
-    pub(crate) fn end_entry_id(&self) -> u64 {
+    pub(crate) fn end_entry_id(&self) -> EntryId {
         self.sealed_segments
             .last()
             .and_then(|s| s.end_entry_id)
-            .unwrap_or(0)
+            .unwrap_or(EntryId::MIN)
     }
-    pub(crate) fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
         let active_segment = range
             .active_segment
             .and_then(|id| range.segments.get(&id))
@@ -181,7 +181,7 @@ impl RangeDetail {
     }
 
     /// Find the segment in this range that covers the specified `entry_id`.
-    pub fn find_segment_for_offset(&self, entry_id: u64) -> Option<&SegmentDetail> {
+    pub fn find_segment_for_offset(&self, entry_id: EntryId) -> Option<&SegmentDetail> {
         // Check if it is in the active segment
         if let Some(seg) = &self.active_segment
             && entry_id >= seg.start_entry_id
@@ -203,7 +203,7 @@ impl RangeDetail {
     }
 
     /// Get the start offset of the very first segment in the range (either sealed or active).
-    pub fn first_segment_start_offset(&self) -> Option<u64> {
+    pub fn first_segment_start_offset(&self) -> Option<EntryId> {
         if let Some(seg) = self.sealed_segments.first() {
             Some(seg.start_entry_id)
         } else {
@@ -217,15 +217,15 @@ impl RangeDetail {
 /// separate address-resolution round trip.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SegmentDetail {
-    pub segment_id: u64,
-    pub start_entry_id: u64,
+    pub segment_id: SegmentId,
+    pub start_entry_id: EntryId,
     /// `None` while the segment is still active (the write head).
-    pub end_entry_id: Option<u64>,
+    pub end_entry_id: Option<EntryId>,
     pub replica_set: Vec<NodeAddressInfo>,
 }
 
 impl SegmentDetail {
-    pub(crate) fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
         let replica_set = seg
             .replica_set
             .iter()
@@ -237,7 +237,7 @@ impl SegmentDetail {
             })
             .collect();
         SegmentDetail {
-            segment_id: seg.segment_id.0,
+            segment_id: seg.segment_id,
             start_entry_id: seg.start_entry_id,
             end_entry_id: seg.end_entry_id,
             replica_set,

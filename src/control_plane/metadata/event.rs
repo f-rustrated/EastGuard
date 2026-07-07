@@ -1,7 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
     CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment, SegmentSealed,
@@ -22,7 +22,7 @@ impl TopicCreated {
                 segment_key: self.segment_key,
                 shard_group_id,
                 replica_set: self.replica_set,
-                start_entry_id: 0,
+                start_entry_id: EntryId::MIN,
             },
         )
     }
@@ -32,7 +32,7 @@ impl TopicCreated {
 pub struct SegmentRolled {
     pub new_segment_key: SegmentKey,
     pub new_replica_set: Vec<NodeId>,
-    pub end_entry_id: Option<u64>,
+    pub end_entry_id: Option<EntryId>,
 }
 
 impl SegmentRolled {
@@ -41,7 +41,7 @@ impl SegmentRolled {
         ctx: Option<SealContext>,
         shard_group_id: ShardGroupId,
     ) -> Vec<DataTransportCommand> {
-        let start = self.end_entry_id.map_or(0, |id| id + 1);
+        let start = self.end_entry_id.map_or(EntryId::MIN, |id| id + 1);
         let mut v = vec![DataTransportCommand::send_to_targets(
             vec![self.new_replica_set[0].clone()],
             SegmentAssignment {
@@ -69,11 +69,11 @@ impl SegmentRolled {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentReassigned {
     pub segment_key: SegmentKey,
-    pub start_entry_id: u64,
+    pub start_entry_id: EntryId,
     /// Committed end = the catch-up target. `None` only for a segment whose end
     /// was never established; those aren't selected for reassignment, so the
     /// dispatch just emits nothing.
-    pub sealed_end: Option<u64>,
+    pub sealed_end: Option<EntryId>,
     pub new_replica_set: Vec<NodeId>,
 }
 
@@ -120,7 +120,7 @@ impl RangeSplit {
                         segment_key: SegmentKey::new(self.topic_id, range_id, segment_id),
                         shard_group_id,
                         replica_set,
-                        start_entry_id: 0,
+                        start_entry_id: EntryId::MIN,
                     },
                 )
             })
@@ -158,7 +158,7 @@ impl RangeMerged {
                 segment_key: self.segment_key,
                 shard_group_id,
                 replica_set: self.replica_set,
-                start_entry_id: 0,
+                start_entry_id: EntryId::MIN,
             },
         )
     }
@@ -193,7 +193,7 @@ impl SegmentsDeleted {
 pub struct SegmentSealCorrected {
     pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
-    pub committed_entry_id: Option<u64>,
+    pub committed_entry_id: Option<EntryId>,
 }
 
 impl SegmentSealCorrected {

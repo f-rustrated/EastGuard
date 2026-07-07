@@ -343,7 +343,7 @@ mod tests {
         );
         assert_eq!(
             classify(&ClientResponse::DataPlane(DataPlaneResponse::Produced {
-                entry_id: 7
+                entry_id: 7.into()
             })),
             "done"
         );

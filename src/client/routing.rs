@@ -3,7 +3,7 @@
 //! per-request check corrects a stale entry with a redirect (`redirect.rs`), so the
 //! cache only ever costs an extra hop, never a wrong target.
 use crate::connections::protocol::{RangeDetail, TopicDetail};
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{RangeId, TopicId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Per-topic routing snapshot. Built once from a `DescribeTopic` response and
 /// replaced wholesale on refresh.
 pub(crate) struct TopicRouting {
-    pub topic_id: u64,
+    pub topic_id: TopicId,
     ranges: Box<[RangeRoute]>,
 }
 

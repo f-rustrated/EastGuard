@@ -6,13 +6,15 @@ use std::net::SocketAddr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
+use crate::control_plane::membership::ShardGroupId;
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum AdminRequest {
     DescribeCluster,
     ListHostedTopicsWithStats,
     // Internal/debug queries — also used by integration test helpers.
     GetShardInfo { key: Vec<u8> },
-    GetShardLeader { shard_group_id: u64 },
+    GetShardLeader { shard_group_id: ShardGroupId },
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -34,7 +36,7 @@ pub enum AdminResponse {
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub struct ShardDetail {
-    pub shard_group_id: u64,
+    pub shard_group_id: ShardGroupId,
     pub leader_node_id: Option<String>,
     pub leader_addr: Option<SocketAddr>,
     pub member_node_ids: Box<[String]>,

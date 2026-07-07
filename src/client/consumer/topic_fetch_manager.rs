@@ -1,12 +1,12 @@
 use super::RangeCursor;
 
 use crate::client::consumer::cursor::StartPolicy;
-use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
 use crate::client::consumer::group::ConsumerGroup;
+use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
-use crate::control_plane::metadata::{RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -15,44 +15,48 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-pub(crate) struct CursorDrained {
+pub(crate) struct RangeDrained {
     pub range_id: RangeId,
     pub transition: RangeTransition,
 }
 
-struct TopicFetchManagerState {
+pub(crate) struct TopicFetchManagerState {
     cursors: RangeCursorSet,
     senders: HashMap<RangeId, flume::Sender<RangeFetchActorCommand>>,
 
     /// The optional shared consumer group context for dynamic partition rebalancing.
     consumer_group: Option<Arc<ConsumerGroup>>,
-    /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
-    start_policy: StartPolicy,
+    config: ConsumerConfig,
+    record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
 
 impl TopicFetchManagerState {
-    fn new(
+    pub(crate) fn new(
         cursors: RangeCursorSet,
         consumer_group: Option<Arc<ConsumerGroup>>,
-        start_policy: StartPolicy,
+        config: ConsumerConfig,
+        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
             cursors,
             senders: HashMap::new(),
             consumer_group,
-            start_policy,
+            config,
+            record_tx,
         }
     }
+    fn auto_commit_interval_ms(&self) -> u64 {
+        self.config.auto_commit_interval_ms
+    }
+    fn start_policy(&self) -> &StartPolicy {
+        &self.config.start_policy
+    }
 
-    fn should_exit(&self) -> bool {
+    pub(crate) fn should_exit(&self) -> bool {
         self.cursors.is_empty() && self.consumer_group.is_none()
     }
 
-    fn provision_initial_tasks(
-        &mut self,
-        ctx: &Arc<ConsumerContext>,
-        record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
-    ) {
+    fn provision_initial_tasks(&mut self, ctx: &Arc<ConsumerContext>) {
         // If a consumer_group is present, partition ownership is dynamic and determined entirely by the
         // group rebalancer. We return early to prevent the consumer from starting fetch tasks before
         // partitions are assigned to it.
@@ -60,16 +64,11 @@ impl TopicFetchManagerState {
             return;
         }
         for cursor in self.cursors.iter().cloned().collect::<Vec<_>>() {
-            self.spawn_and_register(cursor, ctx.clone(), record_tx.clone());
+            self.spawn_and_register(cursor, ctx.clone());
         }
     }
 
-    fn handle_cursor_drained(
-        &mut self,
-        event: CursorDrained,
-        ctx: &Arc<ConsumerContext>,
-        record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
-    ) {
+    fn handle_cursor_drained(&mut self, event: RangeDrained, ctx: &Arc<ConsumerContext>) {
         // If not owned, it was already revoked — late drain event, safe to ignore.
         if self.senders.remove(&event.range_id).is_none() {
             return;
@@ -77,15 +76,11 @@ impl TopicFetchManagerState {
         let added = self.cursors.apply_drained(event.range_id, event.transition);
 
         for new_cursor in added {
-            self.spawn_and_register(new_cursor, ctx.clone(), record_tx.clone());
+            self.spawn_and_register(new_cursor, ctx.clone());
         }
     }
 
-    async fn handle_rebalance(
-        &mut self,
-        ctx: &Arc<ConsumerContext>,
-        record_tx: &flume::Sender<Result<ConsumerRecord, ClientError>>,
-    ) {
+    async fn handle_rebalance(&mut self, ctx: &Arc<ConsumerContext>) {
         let Some(group) = &self.consumer_group else {
             return;
         };
@@ -147,7 +142,6 @@ impl TopicFetchManagerState {
                         r_meta.keyspace_end.clone(),
                     ),
                     ctx.clone(),
-                    record_tx.clone(),
                 );
             }
         }
@@ -155,17 +149,17 @@ impl TopicFetchManagerState {
 
     /// Spawn a fetch actor, register its stop channel, and update/add the cursor
     /// in the cursor set.
-    fn spawn_and_register(
-        &mut self,
-        cursor: RangeCursor,
-        ctx: Arc<ConsumerContext>,
-        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    ) {
+    fn spawn_and_register(&mut self, cursor: RangeCursor, ctx: Arc<ConsumerContext>) {
         if self.senders.contains_key(&cursor.range_id) {
             return;
         }
         let (stop_tx, stop_rx) = flume::bounded(1);
-        let actor = RangeFetchActor::new(cursor.range_id, cursor.next_entry_id, ctx, record_tx);
+        let actor = RangeFetchActor::new(
+            cursor.range_id,
+            cursor.next_entry_id,
+            ctx,
+            self.record_tx.clone(),
+        );
         tokio::spawn(actor.run(stop_rx));
         self.senders.insert(cursor.range_id, stop_tx);
         self.cursors.add_or_update(cursor);
@@ -181,16 +175,20 @@ impl TopicFetchManagerState {
         range: RangeId,
         ctx: &Arc<ConsumerContext>,
         committed_offset: Option<u64>,
-    ) -> u64 {
-        // 1. Prefer explicitly saved offsets. If a consumer committed offset `N`,
-        // the next record to fetch starts at entry ID `N + 1`.
+    ) -> EntryId {
+        // 1. Prefer explicitly saved offsets. The committed offset is a
+        // record-level checkpoint. Because one entry can contain multiple
+        // records, `offset + 1` may still fall inside the same entry the
+        // consumer already consumed — not the start of the next entry.
+        // The fetch path re-delivers the containing entry; the consumer
+        // skips already-processed records.
         if let Some(offset) = committed_offset {
-            return offset + 1;
+            return EntryId(offset + 1);
         }
 
         // 2. Fetch the latest boundary from the replica if the start policy is Latest.
         // Note: fetch_range_entry_ids returns (start_entry_id, committed_entry_id).
-        if matches!(self.start_policy, StartPolicy::Latest)
+        if matches!(self.start_policy(), StartPolicy::Latest)
             && let Ok((_, committed_entry_id)) =
                 ctx.client.fetch_range_entry_ids(&ctx.topic, range).await
         {
@@ -203,7 +201,7 @@ impl TopicFetchManagerState {
         }
 
         // 4. Default start entry ID is 0
-        0
+        EntryId::default()
     }
 
     async fn abort_all(&mut self) {
@@ -224,7 +222,7 @@ impl TopicFetchManagerState {
         range_id: RangeId,
         ranges: &[RangeDetail],
         saved_offsets: &HashMap<RangeId, u64>,
-        resolved_entry_id: u64,
+        resolved_entry_id: EntryId,
     ) -> bool {
         self.has_active_descendant(range_id, ranges)
             || self.has_undrained_parent(range_id, ranges, saved_offsets)
@@ -304,7 +302,7 @@ impl TopicFetchManagerState {
             if p.state == RangeState::Sealed {
                 let parent_resolved = saved_offsets.get(&p.range_id).map(|o| o + 1).unwrap_or(0);
 
-                if parent_resolved <= p.end_entry_id() {
+                if parent_resolved <= *p.end_entry_id() {
                     return true;
                 }
             }
@@ -320,31 +318,23 @@ impl TopicFetchManagerState {
 }
 
 pub(crate) async fn run_topic_fetch_manager(
-    cursors: RangeCursorSet,
-    rx: flume::Receiver<CursorDrained>,
+    mut state: TopicFetchManagerState,
+    drain_event_rx: flume::Receiver<RangeDrained>,
     weak_ctx: std::sync::Weak<ConsumerContext>,
-    record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-    consumer_group: Option<Arc<ConsumerGroup>>,
-    config: ConsumerConfig,
 ) {
-    let mut state = TopicFetchManagerState::new(cursors, consumer_group, config.start_policy);
-    if state.should_exit() {
-        return;
-    }
-
     if let Some(ctx) = weak_ctx.upgrade() {
-        state.provision_initial_tasks(&ctx, &record_tx);
+        state.provision_initial_tasks(&ctx);
     }
 
     let mut rebalance_interval = tokio::time::interval(Duration::from_secs(1));
     let mut commit_interval =
-        tokio::time::interval(Duration::from_millis(config.auto_commit_interval_ms));
+        tokio::time::interval(Duration::from_millis(state.auto_commit_interval_ms()));
 
     // Waiting exactly 2 tickets(~2secs) before the first rebalance.
     let mut startup_grace_ticks = if state.consumer_group.is_some() { 2 } else { 0 };
 
     loop {
-        if record_tx.is_disconnected() {
+        if state.record_tx.is_disconnected() {
             break;
         }
 
@@ -353,10 +343,10 @@ pub(crate) async fn run_topic_fetch_manager(
         };
 
         tokio::select! {
-            res = rx.recv_async() => {
+            // CursorDrained Event arrived! meaning that fetch actor figured that the range is sealed
+            res = drain_event_rx.recv_async() => {
                 let Ok(event) = res else { break };
-                // CursorDrained Event arrived! meaning that fetch actor figured that the range is sealed
-                state.handle_cursor_drained(event, &ctx, &record_tx);
+                state.handle_cursor_drained(event, &ctx);
 
                 if state.should_exit() {
                      break;
@@ -377,7 +367,7 @@ pub(crate) async fn run_topic_fetch_manager(
                     if state.cursors.is_empty() {
                         let _ = ctx.refresh_metadata().await;
                     }
-                    state.handle_rebalance(&ctx, &record_tx).await;
+                    state.handle_rebalance(&ctx).await;
                 }
             }
         }

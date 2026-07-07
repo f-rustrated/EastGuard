@@ -10,7 +10,7 @@ use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now
 use crate::control_plane::consensus::seal_recovery::{SealEndRecovery, SealEndStep};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
-use crate::control_plane::metadata::{TopicId, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{EntryId, TopicId, TopicMeta, TopicStats};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
     CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
@@ -583,7 +583,7 @@ impl MultiRaft {
         &mut self,
         group_id: ShardGroupId,
         segment_key: SegmentKey,
-        end: Option<u64>,
+        end: Option<EntryId>,
         recency_leader: Option<NodeId>,
     ) {
         let Some(raft) = self.groups.get_mut(&group_id) else {
@@ -898,6 +898,7 @@ mod tests {
     use super::*;
 
     use crate::control_plane::consensus::raft::storage::RaftPersistentState;
+    use crate::control_plane::consensus::seal_recovery;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
     use std::collections::BTreeSet;
@@ -1877,12 +1878,12 @@ mod tests {
         store.handle_seal_boundary_report(SealBoundaryReport {
             segment_key: seg0,
             from: node("y"),
-            durable_end: Some(50),
+            durable_end: Some(EntryId(50)),
         });
         store.handle_seal_boundary_report(SealBoundaryReport {
             segment_key: seg0,
             from: node("z"),
-            durable_end: Some(40),
+            durable_end: Some(EntryId(40)),
         });
         store.flush();
 
@@ -1891,7 +1892,7 @@ mod tests {
         assert_eq!(rolls[0].segment_key, seg0);
         assert_eq!(
             rolls[0].end_entry_id,
-            Some(40),
+            Some(EntryId(40)),
             "seal at the min of survivor durable extents"
         );
         assert_eq!(
@@ -1919,7 +1920,7 @@ mod tests {
 
         // No reports ever arrive: each death-driven reconcile re-drives the
         // gather; after the attempt budget it falls back to an unknown-end roll.
-        for _ in 0..(crate::control_plane::consensus::seal_recovery::GATHER_ATTEMPTS + 2) {
+        for _ in 0..(seal_recovery::GATHER_ATTEMPTS + 2) {
             store.handle_node_death(node("x"));
         }
         store.flush();

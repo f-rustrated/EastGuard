@@ -7,7 +7,7 @@ use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::peer_discovery::JoinConfig;
 use crate::control_plane::membership::swim::Swim;
 use crate::control_plane::membership::{
-    DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, QueryCommand, SwimActorCommand, SwimCommand,
+    self, DIRECT_ACK_TIMEOUT_TICKS, OutboundPacket, QueryCommand, SwimActorCommand, SwimCommand,
     SwimHeader, SwimPacket, SwimTimer, Topology, TopologyConfig,
 };
 use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
@@ -165,8 +165,7 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     // Topology publish/read channel — this harness has no reader-side
     // consumer, but SwimActor still needs the writer half to publish into.
-    let (topology_pub, _topology_reader) =
-        crate::control_plane::membership::topology_channel(swim.topology.clone());
+    let (topology_pub, _topology_reader) = membership::topology_channel(swim.topology.clone());
 
     let ticker_tx = spawn_scheduling_actor(
         tx_in.clone(),

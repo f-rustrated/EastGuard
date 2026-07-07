@@ -4,19 +4,19 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use super::ConsumerRecord;
-use crate::client::consumer::topic_fetch_manager::CursorDrained;
+use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, CompressionCodec};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
-use crate::control_plane::metadata::{RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 
 enum RangeLookupResult {
     Found(SegmentDetail),
     FellBehind {
-        first_start: u64,
+        first_start: EntryId,
     },
     NeedRefresh,
     RangeSealedAndDrained {
@@ -30,7 +30,7 @@ pub(crate) enum RangeFetchActorCommand {
 
 pub(crate) struct RangeFetchActor {
     range_id: RangeId,
-    next_entry_id: u64,
+    next_entry_id: EntryId,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
@@ -38,7 +38,7 @@ pub(crate) struct RangeFetchActor {
 impl RangeFetchActor {
     pub(crate) fn new(
         range_id: RangeId,
-        next_entry_id: u64,
+        next_entry_id: EntryId,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
@@ -98,7 +98,7 @@ impl RangeFetchActor {
             }
             RangeLookupResult::RangeSealedAndDrained { progress_signal } => {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
-                    let _ = self.ctx.cursor_tx.send(CursorDrained {
+                    let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
                         transition,
                     });
@@ -146,7 +146,7 @@ impl RangeFetchActor {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.range_id,
-                            offset: entry.entry_id + i as u64,
+                            offset: *entry.entry_id + i as u64,
                             key: rec.key,
                             value: rec.value,
                         };
@@ -169,7 +169,7 @@ impl RangeFetchActor {
                 } = progress_signal
                     && next_entry_id > end_entry_id
                 {
-                    let _ = self.ctx.cursor_tx.send(CursorDrained {
+                    let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
                         transition,
                     });
@@ -210,9 +210,9 @@ impl RangeFetchActor {
 pub(crate) struct ConsumerContext {
     pub(crate) client: Arc<Client>,
     pub(crate) topic: String,
-    pub(crate) topic_id: u64,
+    pub(crate) topic_id: TopicId,
     pub(crate) metadata: ArcSwap<TopicDetail>,
-    pub(crate) cursor_tx: flume::Sender<CursorDrained>,
+    pub(crate) cursor_tx: flume::Sender<RangeDrained>,
 }
 
 impl ConsumerContext {
@@ -221,7 +221,7 @@ impl ConsumerContext {
         &self,
         segment: &SegmentDetail,
         range_id: RangeId,
-        offset: u64,
+        entry_id: EntryId,
     ) -> Result<Served, ClientError> {
         let addr = segment
             .pick_replica()
@@ -229,7 +229,7 @@ impl ConsumerContext {
         let req = FetchByIdRequest {
             topic_id: self.topic_id,
             range_id,
-            entry_id: offset,
+            entry_id,
             max_bytes: 1024 * 1024,
         };
         self.client
@@ -269,7 +269,7 @@ impl ConsumerContext {
     }
 
     /// Pure synchronous metadata lookup to isolate the non-Send arc_swap::Guard.
-    fn lookup_range(&self, range_id: RangeId, next_entry_id: u64) -> RangeLookupResult {
+    fn lookup_range(&self, range_id: RangeId, next_entry_id: EntryId) -> RangeLookupResult {
         let meta = self.metadata.load();
         let Some(r) = meta.ranges.iter().find(|r| r.range_id == range_id) else {
             return RangeLookupResult::NeedRefresh;
@@ -282,9 +282,9 @@ impl ConsumerContext {
 
         // If sealed, check if we've drained it completely
         if r.state != RangeState::Active {
-            let range_end_offset = r.end_entry_id();
+            let range_end_entry = r.end_entry_id();
 
-            if next_entry_id > range_end_offset {
+            if next_entry_id > range_end_entry {
                 if let Some(progress_signal) = compute_progress_signal(&meta, r) {
                     return RangeLookupResult::RangeSealedAndDrained { progress_signal };
                 } else {
@@ -295,10 +295,12 @@ impl ConsumerContext {
 
         // (Common Fallback) Check if we fell behind the oldest available data,
         // otherwise signal that a metadata refresh is needed to discover the new segment
-        if let Some(first_start) = r.first_segment_start_offset()
-            && next_entry_id < first_start
+        if let Some(start_entry) = r.first_segment_start_offset()
+            && next_entry_id < start_entry
         {
-            return RangeLookupResult::FellBehind { first_start };
+            return RangeLookupResult::FellBehind {
+                first_start: start_entry,
+            };
         }
 
         RangeLookupResult::NeedRefresh

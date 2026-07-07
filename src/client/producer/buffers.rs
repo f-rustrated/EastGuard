@@ -1,7 +1,7 @@
 use super::ProducerRecord;
-use crate::client::error::ClientError;
 use crate::client::producer::config::BufferConfig;
 use crate::control_plane::metadata::RangeId;
+use crate::{client::error::ClientError, control_plane::metadata::EntryId};
 
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ pub struct PendingRecord {
     pub record: ProducerRecord,
     pub producer_id: Uuid,
     pub sequence_number: u32,
-    pub tx: oneshot::Sender<Result<u64, ClientError>>,
+    pub tx: oneshot::Sender<Result<EntryId, ClientError>>,
 }
 
 /// The action to be taken after pushing a record to the buffer.

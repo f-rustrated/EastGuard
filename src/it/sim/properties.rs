@@ -5,6 +5,8 @@ use std::time::Duration;
 use turmoil::Builder;
 
 use crate::StartUp;
+use crate::connections::protocol::ControlPlaneResponse;
+use crate::control_plane::membership::ShardGroupId;
 use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
 use crate::it::sim::invariants::{
     assert_leader_converges, assert_membership_converged, assert_single_leader,
@@ -103,7 +105,7 @@ fn metadata_visible() -> turmoil::Result {
         for _ in 0..30u32 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             for i in 1..=3u8 {
-                if let Some(crate::connections::protocol::ControlPlaneResponse::TopicCreated) =
+                if let Some(ControlPlaneResponse::TopicCreated) =
                     try_propose(&node_name(i), client_port(i), &req).await
                 {
                     acked = true;
@@ -183,7 +185,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
         // ── Phase 1: topology + an initial leader agreed by ≥2 nodes ──
         let req = make_create_topic_req("leader-kill-test");
         let phase1_deadline = t0 + Duration::from_secs(30);
-        let mut shard_group_id: Option<u64> = None;
+        let mut shard_group_id: Option<ShardGroupId> = None;
         let mut topic_acked = false;
         let mut agreed_leader: Option<String> = None;
         let mut last_round: Vec<Option<String>> = vec![None, None, None];
@@ -198,7 +200,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
             }
             if !topic_acked {
                 for i in 1..=3u8 {
-                    if let Some(crate::connections::protocol::ControlPlaneResponse::TopicCreated) =
+                    if let Some(ControlPlaneResponse::TopicCreated) =
                         try_propose(&node_name(i), client_port(i), &req).await
                     {
                         topic_acked = true;
@@ -233,7 +235,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
         let initial_leader = agreed_leader.unwrap_or_else(|| {
             panic!(
                 "phase1: no quorum-agreed leader within 30s \
-                 (shard {shard_group_id}, topic_acked: {topic_acked}, \
+                 (shard {shard_group_id:?}, topic_acked: {topic_acked}, \
                  last views from node-1..3: {last_round:?})"
             )
         });
@@ -241,21 +243,14 @@ fn leader_elects_after_kill() -> turmoil::Result {
         assert!(
             topic_acked,
             "phase1: CreateTopic never acked within 30s \
-             (shard {shard_group_id}, leader {initial_leader}, \
+             (shard {shard_group_id:?}, leader {initial_leader}, \
              last views from node-1..3: {last_round:?})"
         );
 
         let victim_idx = (1..=3u8)
             .find(|i| initial_leader.starts_with(node_name(*i).as_str()))
             .unwrap_or_else(|| panic!("leader id {initial_leader:?} maps to no known host"));
-        tracing::info!(
-            elapsed = ?t0.elapsed(),
-            shard_group_id,
-            %initial_leader,
-            victim_idx,
-            topic_acked,
-            "phase1 done"
-        );
+
         victim_tx.store(victim_idx, Ordering::SeqCst);
 
         // Wait for the driver to perform the crash (it gates on the store above).

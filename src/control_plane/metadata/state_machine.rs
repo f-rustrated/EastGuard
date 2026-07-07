@@ -3,7 +3,8 @@ use super::event::*;
 use super::segment::*;
 use super::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::NodeId;
-use crate::control_plane::metadata::{RangeId, SegmentId, TopicId, error::MetadataError};
+use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
 use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -18,7 +19,7 @@ pub struct MetadataStateMachine {
 }
 
 impl MetadataStateMachine {
-    pub(crate) fn new(shard_group_id: crate::control_plane::membership::ShardGroupId) -> Self {
+    pub(crate) fn new(shard_group_id: ShardGroupId) -> Self {
         MetadataStateMachine {
             topics: HashMap::new(),
             topic_name_index: HashMap::new(),
@@ -41,7 +42,8 @@ impl MetadataStateMachine {
         self.topic_name_index.keys().cloned().collect()
     }
 
-    pub(crate) fn topic_count(&self) -> usize {
+    #[cfg(test)]
+    pub fn topic_count(&self) -> usize {
         self.topics.len()
     }
 
@@ -65,7 +67,7 @@ impl MetadataStateMachine {
 
     /// Every active segment across all topics with its replica set and start
     /// offset, for the leader's periodic assignment re-drive.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, u64)]> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, EntryId)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segment_assignments())
@@ -412,7 +414,7 @@ mod tests {
             segment_key: SegmentKey::new(topic_id, RangeId(0), segment_id),
             sealed_at,
             new_replica_set: replica_set(),
-            end_entry_id: Some(end_entry_id),
+            end_entry_id: Some(EntryId(end_entry_id)),
         }));
         assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
     }
@@ -734,10 +736,10 @@ mod tests {
 
         let topic = sm.get_topic(&id).unwrap();
         let range = &topic.ranges[&RangeId(0)];
-        assert_eq!(range.next_offset, 0);
+        assert_eq!(range.next_offset, EntryId(0));
 
         let seg = &range.segments[&SegmentId(0)];
-        assert_eq!(seg.start_entry_id, 0);
+        assert_eq!(seg.start_entry_id, EntryId(0));
         assert_eq!(seg.end_entry_id, None);
     }
 
@@ -1346,23 +1348,23 @@ mod tests {
             segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: Some(42000),
+            end_entry_id: Some(EntryId(42000)),
         }));
 
         let result = result.unwrap();
         assert!(matches!(
             result,
             ApplyResult::SegmentRolled(SegmentRolled {
-                end_entry_id: Some(42000),
+                end_entry_id: Some(EntryId(42000)),
                 ..
             })
         ));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         let sealed = &range.segments[&SegmentId(0)];
-        assert_eq!(sealed.end_entry_id, Some(42000));
+        assert_eq!(sealed.end_entry_id, Some(EntryId(42000)));
         let new_seg = &range.segments[&SegmentId(1)];
-        assert_eq!(new_seg.start_entry_id, 42001);
+        assert_eq!(new_seg.start_entry_id, EntryId(42001));
     }
 
     // --- D3: end-offset correction ---
@@ -1390,13 +1392,16 @@ mod tests {
             segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2500,
             new_replica_set: replica_set(),
-            end_entry_id: Some(42000),
+            end_entry_id: Some(EntryId(42000)),
         }));
         assert!(result.is_ok());
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.segments[&SegmentId(0)].end_entry_id, Some(42000));
-        assert_eq!(range.segments[&SegmentId(1)].start_entry_id, 42001);
+        assert_eq!(
+            range.segments[&SegmentId(0)].end_entry_id,
+            Some(EntryId(42000))
+        );
+        assert_eq!(range.segments[&SegmentId(1)].start_entry_id, EntryId(42001));
     }
 
     #[test]
@@ -1409,7 +1414,7 @@ mod tests {
             segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2000,
             new_replica_set: replica_set(),
-            end_entry_id: Some(1000),
+            end_entry_id: Some(EntryId(1000)),
         }));
 
         // Duplicate roll is rejected (end_offset already set)
@@ -1417,7 +1422,7 @@ mod tests {
             segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
             sealed_at: 2500,
             new_replica_set: replica_set(),
-            end_entry_id: Some(42000),
+            end_entry_id: Some(EntryId(42000)),
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
     }
