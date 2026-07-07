@@ -4,7 +4,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use super::ConsumerRecord;
-use crate::client::consumer::topic_fetch_manager::CursorDrained;
+use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, CompressionCodec};
 use crate::connections::protocol::{
@@ -98,7 +98,7 @@ impl RangeFetchActor {
             }
             RangeLookupResult::RangeSealedAndDrained { progress_signal } => {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
-                    let _ = self.ctx.cursor_tx.send(CursorDrained {
+                    let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
                         transition,
                     });
@@ -169,7 +169,7 @@ impl RangeFetchActor {
                 } = progress_signal
                     && next_entry_id > end_entry_id
                 {
-                    let _ = self.ctx.cursor_tx.send(CursorDrained {
+                    let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
                         transition,
                     });
@@ -212,7 +212,7 @@ pub(crate) struct ConsumerContext {
     pub(crate) topic: String,
     pub(crate) topic_id: u64,
     pub(crate) metadata: ArcSwap<TopicDetail>,
-    pub(crate) cursor_tx: flume::Sender<CursorDrained>,
+    pub(crate) cursor_tx: flume::Sender<RangeDrained>,
 }
 
 impl ConsumerContext {

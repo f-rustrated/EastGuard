@@ -3,9 +3,11 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::range_fetcher::ConsumerContext;
 use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
-use crate::client::consumer::topic_fetch_manager::{CursorDrained, run_topic_fetch_manager};
+use crate::client::consumer::range_fetcher::ConsumerContext;
+use crate::client::consumer::topic_fetch_manager::{
+    RangeDrained, TopicFetchManagerState, run_topic_fetch_manager,
+};
 use crate::client::{Client, ClientError, Producer, ProducerConfig};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
@@ -40,6 +42,7 @@ impl ConsumerRecord {
 
 #[derive(Debug, Clone)]
 pub struct ConsumerConfig {
+    /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
     pub start_policy: StartPolicy,
     pub group_id: Option<String>,
     pub auto_commit_interval_ms: u64,
@@ -58,7 +61,7 @@ impl ConsumerConfig {
 #[derive(Clone)]
 pub struct Consumer {
     ctx: Arc<ConsumerContext>,
-    record_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
+    consumer_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
     group: Option<Arc<ConsumerGroup>>,
 }
 
@@ -100,7 +103,7 @@ impl Consumer {
             }
         }
 
-        let (record_tx, record_rx) = flume::unbounded();
+        let (record_tx, consumer_rx) = flume::unbounded();
         let (cursor_tx, cursor_rx) = flume::bounded(100);
 
         let ctx = Arc::new(ConsumerContext {
@@ -111,37 +114,28 @@ impl Consumer {
             cursor_tx,
         });
 
-        Self::spawn_manager(
-            cursors,
-            cursor_rx,
-            &ctx,
-            record_tx,
-            consumer_group.clone(),
-            config,
-        );
+        let topic_fetch_manager =
+            TopicFetchManagerState::new(cursors, consumer_group.clone(), config, record_tx);
+        if !topic_fetch_manager.should_exit() {
+            Self::spawn_manager(topic_fetch_manager, cursor_rx, &ctx);
+        }
 
         Ok(Self {
             ctx,
-            record_rx,
+            consumer_rx,
             group: consumer_group,
         })
     }
 
     fn spawn_manager(
-        cursors: RangeCursorSet,
-        cursor_rx: flume::Receiver<CursorDrained>,
+        topic_fetch_manager: TopicFetchManagerState,
+        drain_event_rx: flume::Receiver<RangeDrained>,
         ctx: &Arc<ConsumerContext>,
-        record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
-        consumer_group: Option<Arc<ConsumerGroup>>,
-        config: ConsumerConfig,
     ) {
         tokio::spawn(run_topic_fetch_manager(
-            cursors,
-            cursor_rx,
+            topic_fetch_manager,
+            drain_event_rx,
             Arc::downgrade(ctx),
-            record_tx,
-            consumer_group,
-            config,
         ));
     }
 
@@ -158,7 +152,7 @@ impl Consumer {
     /// cursors remain).
     pub async fn next_record(&self) -> Result<Option<ConsumerRecord>, ClientError> {
         loop {
-            let Ok(res) = self.record_rx.recv_async().await else {
+            let Ok(res) = self.consumer_rx.recv_async().await else {
                 return Ok(None);
             };
 
