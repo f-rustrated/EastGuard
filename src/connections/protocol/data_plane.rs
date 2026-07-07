@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{EntryId, RangeId, RangeMeta, RangeState, TopicMeta},
+    control_plane::metadata::{EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta},
     data_plane::messages::query::{FetchResult, ListOffsetsResult},
     impl_from_variant,
 };
@@ -52,8 +52,8 @@ pub struct ProduceRequest {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchRequest {
     pub topic_name: String,
-    pub range_id: u64,
-    pub entry_id: u64,
+    pub range_id: RangeId,
+    pub entry_id: EntryId,
     /// Position within the entry to start from; 0 means the first record.
     pub record_index: u32,
     pub max_bytes: u32,
@@ -69,7 +69,7 @@ pub struct FetchRequest {
 /// resolution; the server never proxies.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchByIdRequest {
-    pub topic_id: u64,
+    pub topic_id: TopicId,
     pub range_id: RangeId,
     pub entry_id: EntryId,
     pub max_bytes: u32,

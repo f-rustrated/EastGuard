@@ -22,8 +22,8 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
 
 use crate::control_plane::metadata::{
-    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState, TopicMeta,
-    TopicState as MetaTopicState,
+    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState, TopicId,
+    TopicMeta, TopicState as MetaTopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -88,7 +88,7 @@ pub enum TopicState {
 pub struct TopicDetail {
     /// Resolved id, so a consumer can fetch by id directly from a holding replica
     /// (no name re-resolution on the data node). See `FetchByIdRequest`.
-    pub topic_id: u64,
+    pub topic_id: TopicId,
     pub name: String,
     pub state: TopicState,
     pub ranges: Box<[RangeDetail]>,
@@ -108,7 +108,7 @@ impl TopicDetail {
             .map(|range| RangeDetail::from_meta(range, addresses))
             .collect();
         TopicDetail {
-            topic_id: meta.id.0,
+            topic_id: meta.id,
             name: meta.name,
             state: match meta.state {
                 MetaTopicState::Active => TopicState::Active,

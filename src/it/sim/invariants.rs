@@ -5,6 +5,7 @@ use crate::connections::protocol::{
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::SwimNodeState;
+use crate::control_plane::membership::ShardGroupId;
 use crate::it::helpers::get_members;
 use crate::net::TcpStream;
 use std::time::Duration;
@@ -76,7 +77,7 @@ pub async fn assert_membership_converged(
 /// all non-None answers name the same leader.
 pub async fn assert_single_leader(
     nodes: &[(&str, u16)],
-    shard_group_id: u64,
+    shard_group_id: ShardGroupId,
     timeout: Duration,
 ) -> turmoil::Result {
     tokio::time::sleep(timeout).await;
@@ -99,7 +100,7 @@ pub async fn assert_single_leader(
                 *l,
                 first,
                 "split-brain detected for shard {}: node[{}] reports leader {:?}, node[0] reports {:?}",
-                shard_group_id,
+                *shard_group_id,
                 i + 1,
                 l,
                 first
@@ -121,7 +122,7 @@ pub async fn assert_single_leader(
 /// observable signal, and that is what this asserts (#133).
 pub async fn assert_leader_converges(
     nodes: &[(&str, u16)],
-    shard_group_id: u64,
+    shard_group_id: ShardGroupId,
     crashed: &str,
     budget: Duration,
 ) -> turmoil::Result {
@@ -147,7 +148,7 @@ pub async fn assert_leader_converges(
         assert!(
             tokio::time::Instant::now() < deadline,
             "shard {}: nodes did not converge on a single replacement leader within {:?} (views: {:?}, crashed: {:?})",
-            shard_group_id,
+            *shard_group_id,
             budget,
             views,
             crashed
@@ -195,7 +196,7 @@ pub async fn assert_topic_visible_on_quorum(
 pub(in crate::it) async fn query_shard_leader(
     host: &str,
     port: u16,
-    shard_group_id: u64,
+    shard_group_id: ShardGroupId,
 ) -> turmoil::Result<Option<String>> {
     let stream =
         tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await??;

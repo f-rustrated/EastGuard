@@ -11,7 +11,6 @@ use crate::control_plane::{
         actor::{ShardRouting, SwimSender},
     },
     metadata::{
-        EntryId, RangeId, TopicId,
         command::{CreateTopic, DeleteTopic, MetadataCommand},
         strategy::StoragePolicy,
     },
@@ -347,7 +346,7 @@ impl ClientController {
         let Some(meta) = self.raft_sender.get_topic_metadata(req.topic_name).await else {
             return Ok(DataPlaneResponse::TopicNotFound.into());
         };
-        let Some(range) = meta.ranges.get(&RangeId(req.range_id)) else {
+        let Some(range) = meta.ranges.get(&req.range_id) else {
             return Ok(DataPlaneResponse::TopicNotFound.into());
         };
         if !keyspace_bound_matches_range(&req.keyspace_bound, range) {
@@ -358,8 +357,8 @@ impl ClientController {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = Fetch {
             topic_id: meta.id,
-            range_id: RangeId(req.range_id),
-            entry_id: EntryId(req.entry_id),
+            range_id: req.range_id,
+            entry_id: req.entry_id,
             max_bytes: req.max_bytes,
             progress_signal,
             reply: reply_tx,
@@ -381,8 +380,8 @@ impl ClientController {
     /// retries another replica.
     async fn handle_fetch_by_id(&self, req: FetchByIdRequest) -> anyhow::Result<ClientResponse> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let query = DataPlaneQuery::Fetch(Fetch {
-            topic_id: TopicId(req.topic_id),
+        let query = Fetch {
+            topic_id: req.topic_id,
             range_id: req.range_id,
             entry_id: req.entry_id,
             max_bytes: req.max_bytes,
@@ -390,7 +389,7 @@ impl ClientController {
             // so the response's progress signal isn't authoritative here.
             progress_signal: RangeProgressSignal::Active,
             reply: reply_tx,
-        });
+        };
         if self.data_plane_tx.send_async(query).await.is_err() {
             return Ok(DataPlaneResponse::InternalError("data plane closed".into()).into());
         }
@@ -478,7 +477,7 @@ impl ClientController {
             .get_shard_info(key)
             .await?
             .map(|(group, leader)| ShardDetail {
-                shard_group_id: group.id.0,
+                shard_group_id: group.id,
                 leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
                 leader_addr: leader.map(|e| e.leader_addr.client_addr()),
                 member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
@@ -486,10 +485,13 @@ impl ClientController {
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
     }
 
-    async fn handle_get_shard_leader(&self, shard_group_id: u64) -> anyhow::Result<ClientResponse> {
+    async fn handle_get_shard_leader(
+        &self,
+        shard_group_id: ShardGroupId,
+    ) -> anyhow::Result<ClientResponse> {
         let leader = self
             .raft_sender
-            .get_leader(ShardGroupId(shard_group_id))
+            .get_leader(shard_group_id)
             .await
             .map(|n| n.to_string());
         Ok(ClientResponse::Admin(AdminResponse::ShardLeader { leader }))
@@ -1044,7 +1046,7 @@ mod tests {
         let ClientResponse::Admin(AdminResponse::ShardInfo { detail: Some(d) }) = resp else {
             panic!("expected ShardInfo with detail, got {resp:?}");
         };
-        assert_eq!(d.shard_group_id, 42);
+        assert_eq!(*d.shard_group_id, 42);
         assert_eq!(d.leader_node_id.as_deref(), Some("n1"));
         assert_eq!(d.leader_addr, Some(addr(8081)));
         assert_eq!(d.member_node_ids[0], "node-1");
@@ -1083,7 +1085,7 @@ mod tests {
         let resp =
             ClientController::new(node_id("self"), swim_sender_with(|_| {}), raft, dp_stub())
                 .dispatch(ClientRequest::Admin(AdminRequest::GetShardLeader {
-                    shard_group_id: 42,
+                    shard_group_id: ShardGroupId(42),
                 }))
                 .await;
         let ClientResponse::Admin(AdminResponse::ShardLeader { leader }) = resp else {

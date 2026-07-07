@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use super::*;
     use crate::connections::protocol::{RangeDetail, SegmentDetail, TopicState};
-    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId};
+    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId};
 
     fn cursor(range_id: RangeId, next_offset: u64, start: &[u8], end: &[u8]) -> RangeCursor {
         RangeCursor::new(range_id, next_offset, start.to_vec(), end.to_vec())
@@ -456,7 +456,7 @@ mod tests {
 
     fn topic(ranges: Vec<RangeDetail>) -> TopicDetail {
         TopicDetail {
-            topic_id: 0,
+            topic_id: TopicId(0),
             name: "t".into(),
             state: TopicState::Active,
             ranges: ranges.into_boxed_slice(),

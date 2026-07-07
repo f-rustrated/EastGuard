@@ -11,7 +11,7 @@ use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
-use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 
 enum RangeLookupResult {
     Found(SegmentDetail),
@@ -210,7 +210,7 @@ impl RangeFetchActor {
 pub(crate) struct ConsumerContext {
     pub(crate) client: Arc<Client>,
     pub(crate) topic: String,
-    pub(crate) topic_id: u64,
+    pub(crate) topic_id: TopicId,
     pub(crate) metadata: ArcSwap<TopicDetail>,
     pub(crate) cursor_tx: flume::Sender<RangeDrained>,
 }
@@ -298,7 +298,9 @@ impl ConsumerContext {
         if let Some(first_start) = r.first_segment_start_offset()
             && next_entry_id < *first_start
         {
-            return RangeLookupResult::FellBehind { first_start: *first_start };
+            return RangeLookupResult::FellBehind {
+                first_start: *first_start,
+            };
         }
 
         RangeLookupResult::NeedRefresh

@@ -438,7 +438,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
         let fetch_req = FetchByIdRequest {
             topic_id,
             range_id,
-            entry_id: EntryId(entry_id),
+            entry_id,
             max_bytes: 65536,
         };
 
@@ -451,7 +451,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
         {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
-            assert_eq!(entry.entry_id, EntryId(entry_id));
+            assert_eq!(entry.entry_id, entry_id);
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Lz4 codec tag (1)
@@ -535,7 +535,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
         let fetch_req = FetchByIdRequest {
             topic_id,
             range_id,
-            entry_id: EntryId(entry_id),
+            entry_id,
             max_bytes: 65536,
         };
 
@@ -548,7 +548,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
         {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
-            assert_eq!(entry.entry_id, EntryId(entry_id));
+            assert_eq!(entry.entry_id, entry_id);
             assert_eq!(entry.record_count, 2);
 
             // Verify that the first byte of the stored payload is indeed the Zstd codec tag (2)
@@ -644,7 +644,7 @@ fn producer_concurrency_stress() -> turmoil::Result {
 
         // Assert that batching actually happened: the number of unique entry IDs
         // must be significantly less than the total number of records (500).
-        let unique_ids: HashSet<u64> = all_ids.into_iter().collect();
+        let unique_ids: HashSet<EntryId> = all_ids.into_iter().collect();
         assert!(
             unique_ids.len() < (TASKS * RECORDS_PER_TASK) / 2,
             "Records must be batched; unique entry IDs: {}, total: {}",
