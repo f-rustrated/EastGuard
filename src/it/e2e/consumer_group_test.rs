@@ -446,6 +446,23 @@ fn consumer_group_split_rebalance() {
             }
         }
 
+        let mut c1_records = 0;
+        let mut c2_records = 0;
+
+        // Consume the 3 parent records and commit offsets so the rebalancer/lineage checking knows they are drained.
+        for _ in 0..3 {
+            tokio::select! {
+                res = c1.next_record() => {
+                    if let Ok(Some(_)) = res { c1_records += 1; }
+                }
+                res = c2.next_record() => {
+                    if let Ok(Some(_)) = res { c2_records += 1; }
+                }
+            }
+        }
+        c1.commit().await.unwrap();
+        c2.commit().await.unwrap();
+
         // Wait for split (ranges == 3)
         let mut split = false;
         for _ in 0..120 {
@@ -476,10 +493,7 @@ fn consumer_group_split_rebalance() {
             producer.send(b"\x90", format!("right-{}", i).into_bytes()).await.unwrap();
         }
 
-        let mut c1_records = 0;
-        let mut c2_records = 0;
-        
-        let mut total_records = 0;
+        let mut total_records = c1_records + c2_records;
         while total_records < 13 { // 3 parent + 5 left + 5 right
             tokio::select! {
                 res = c1.next_record() => {
