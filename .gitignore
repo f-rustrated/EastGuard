@@ -3,3 +3,4 @@
 .idea
 .serena
 .claude/worktrees/
+.cargo/config.toml
