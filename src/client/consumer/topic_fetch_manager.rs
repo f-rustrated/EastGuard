@@ -77,6 +77,13 @@ impl TopicFetchManagerState {
         let added = self.cursors.apply_drained(event.range_id, event.transition);
 
         for new_cursor in added {
+            if self
+                .consumer_group
+                .as_ref()
+                .is_some_and(|group| !group.is_responsible_for(new_cursor.range_id))
+            {
+                continue;
+            }
             self.spawn_and_register(new_cursor, ctx.clone());
         }
     }
@@ -315,7 +322,7 @@ impl TopicFetchManagerState {
                     .map(|pos| pos.entry_id)
                     .unwrap_or_default();
 
-                if parent_resolved <= p.end_entry_id() {
+                if parent_resolved < p.end_entry_id() {
                     return true;
                 }
             }
@@ -412,5 +419,113 @@ impl TAssertInvariant for TopicFetchManagerState {
                 range_id
             );
         }
+
+        // Invariant 3: a grouped consumer only fetches ranges it currently owns.
+        if let Some(group) = &self.consumer_group {
+            let owned_ranges = group.owned_ranges.load();
+            for range_id in self.senders.keys() {
+                assert!(
+                    owned_ranges.contains(range_id),
+                    "Invariant violated: grouped consumer has an active fetch actor for unowned range {:?}",
+                    range_id
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::consumer::cursor::RangeCursorSet;
+    use crate::connections::protocol::SegmentDetail;
+    use crate::control_plane::metadata::SegmentId;
+    use std::collections::HashMap;
+
+    fn manager_state() -> TopicFetchManagerState {
+        let (record_tx, _record_rx) = flume::unbounded();
+        TopicFetchManagerState::new(
+            RangeCursorSet::new(Vec::new()),
+            None,
+            ConsumerConfig::new(StartPolicy::Earliest),
+            record_tx,
+        )
+    }
+
+    fn split_ranges() -> Box<[RangeDetail]> {
+        Box::new([
+            RangeDetail {
+                range_id: RangeId(0),
+                keyspace_start: Vec::new(),
+                keyspace_end: vec![255],
+                state: RangeState::Sealed,
+                active_segment: None,
+                sealed_segments: Box::new([SegmentDetail {
+                    segment_id: SegmentId(0),
+                    start_entry_id: EntryId(0),
+                    end_entry_id: Some(EntryId(2)),
+                    replica_set: Vec::new(),
+                }]),
+                split_into: Some((RangeId(1), RangeId(2))),
+                merged_into: None,
+                merged_from: None,
+            },
+            RangeDetail {
+                range_id: RangeId(1),
+                keyspace_start: Vec::new(),
+                keyspace_end: vec![128],
+                state: RangeState::Active,
+                active_segment: None,
+                sealed_segments: Box::new([]),
+                split_into: None,
+                merged_into: None,
+                merged_from: None,
+            },
+            RangeDetail {
+                range_id: RangeId(2),
+                keyspace_start: vec![128],
+                keyspace_end: vec![255],
+                state: RangeState::Active,
+                active_segment: None,
+                sealed_segments: Box::new([]),
+                split_into: None,
+                merged_into: None,
+                merged_from: None,
+            },
+        ])
+    }
+
+    #[test]
+    fn saved_offset_at_parent_end_unblocks_split_child() {
+        let state = manager_state();
+        let ranges = split_ranges();
+        let mut offsets = HashMap::new();
+        offsets.insert(
+            RangeId(0),
+            ConsumerPosition {
+                entry_id: EntryId(2),
+                batch_offset: 0,
+                absolute_offset: 2,
+            },
+        );
+
+        assert!(!state.has_undrained_parent(RangeId(1), &ranges, &offsets));
+    }
+
+    #[test]
+    fn saved_offset_before_parent_end_blocks_split_child() {
+        let state = manager_state();
+        let ranges = split_ranges();
+        let mut offsets = HashMap::new();
+        offsets.insert(
+            RangeId(0),
+            ConsumerPosition {
+                entry_id: EntryId(1),
+                batch_offset: 0,
+                absolute_offset: 1,
+            },
+        );
+
+        assert!(state.has_undrained_parent(RangeId(1), &ranges, &offsets));
     }
 }
