@@ -32,6 +32,7 @@ pub(crate) enum RangeFetchActorCommand {
 pub(crate) struct RangeFetchActor {
     range_id: RangeId,
     next_entry_id: EntryId,
+    skip_batch_offsets_below: Option<u64>,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
@@ -40,12 +41,14 @@ impl RangeFetchActor {
     pub(crate) fn new(
         range_id: RangeId,
         next_entry_id: EntryId,
+        skip_batch_offsets_below: Option<u64>,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
             range_id,
             next_entry_id,
+            skip_batch_offsets_below,
             ctx,
             record_tx,
         }
@@ -90,6 +93,7 @@ impl RangeFetchActor {
         let segment = match self.ctx.lookup_range(self.range_id, self.next_entry_id) {
             RangeLookupResult::FellBehind { first_start } => {
                 self.next_entry_id = first_start;
+                self.skip_batch_offsets_below = None;
                 return Ok(true);
             }
             RangeLookupResult::NeedRefresh => {
@@ -144,14 +148,19 @@ impl RangeFetchActor {
                             ClientError::UnexpectedResponse
                         })?;
 
+                    let skip_batch_offsets_below = if entry.entry_id == self.next_entry_id {
+                        self.skip_batch_offsets_below
+                    } else {
+                        None
+                    };
+                    if skip_batch_offsets_below.is_some() {
+                        self.skip_batch_offsets_below = None;
+                    }
+
                     for (i, rec) in records.into_iter().enumerate() {
-                        // let current_record_offset = *entry.entry_id + i as u64;
-                        // if let Some(skip_threshold) = self.skip_below_offset {
-                        //     if current_record_offset <= skip_threshold {
-                        //         continue;
-                        //     }
-                        //     self.skip_below_offset = None;
-                        // }
+                        if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
+                            continue;
+                        }
 
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),

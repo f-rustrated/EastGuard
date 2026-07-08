@@ -245,6 +245,7 @@ impl RangeCursorSet {
 pub struct RangeCursor {
     pub range_id: RangeId,
     pub next_entry_id: EntryId,
+    pub skip_batch_offsets_below: Option<u64>,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
 }
@@ -259,9 +260,15 @@ impl RangeCursor {
         Self {
             range_id,
             next_entry_id,
+            skip_batch_offsets_below: None,
             keyspace_start,
             keyspace_end,
         }
+    }
+
+    pub fn with_skip_batch_offsets_below(mut self, skip_batch_offsets_below: Option<u64>) -> Self {
+        self.skip_batch_offsets_below = skip_batch_offsets_below;
+        self
     }
     fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
         detail

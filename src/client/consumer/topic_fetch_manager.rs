@@ -126,7 +126,7 @@ impl TopicFetchManagerState {
         let metadata = ctx.metadata.load();
 
         for range in to_start {
-            let (resolved_entry_id, _skip_below_offset) =
+            let (resolved_entry_id, skip_below_offset) =
                 if let Some(pos) = saved_offsets.get(&range) {
                     // Prefer explicitly saved offsets. The committed offset is a
                     // record-level checkpoint. Because one entry can contain multiple
@@ -148,7 +148,8 @@ impl TopicFetchManagerState {
                         resolved_entry_id,
                         r_meta.keyspace_start.clone(),
                         r_meta.keyspace_end.clone(),
-                    ),
+                    )
+                    .with_skip_batch_offsets_below(skip_below_offset),
                     ctx.clone(),
                 );
             }
@@ -165,6 +166,7 @@ impl TopicFetchManagerState {
         let actor = RangeFetchActor::new(
             cursor.range_id,
             cursor.next_entry_id,
+            cursor.skip_batch_offsets_below,
             ctx,
             self.record_tx.clone(),
         );
