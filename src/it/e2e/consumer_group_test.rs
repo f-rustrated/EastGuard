@@ -382,6 +382,8 @@ fn consumer_group_independent_groups() {
     });
     sim.run().unwrap();
 }
+
+// TODO flaky!
 #[test]
 fn consumer_group_split_rebalance() {
     use crate::control_plane::metadata::RangeId;
