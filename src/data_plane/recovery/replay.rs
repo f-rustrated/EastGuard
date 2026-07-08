@@ -59,11 +59,11 @@ impl ReplayWriter {
             return Ok(Decision::Skip);
         }
         let key = header.segment_key();
-        self.writer_for(key, *header.entry_id)?.append_entry(
+        self.writer_for(key, header.entry_id)?.append_entry(
             header.entry_id,
             WalRecord::data(Bytes::copy_from_slice(entry_data), header.record_count),
         )?;
-        self.recovered.advance(key, *header.entry_id);
+        self.recovered.advance(key, header.entry_id);
         Ok(Decision::Append)
     }
 
@@ -83,15 +83,15 @@ impl ReplayWriter {
     fn writer_for(
         &mut self,
         key: SegmentKey,
-        first_entry_id: u64,
+        first_entry_id: EntryId,
     ) -> io::Result<&mut SegmentAppender> {
         if !self.writers.contains_key(&key) {
-            let start_offset = self
+            let start_entry = self
                 .recovered
                 .start_entry_id(&key)
                 .unwrap_or(first_entry_id);
             let valid_len = self.recovered.valid_len(&key);
-            let path = key.file_path(&self.data_dir, EntryId(start_offset));
+            let path = key.file_path(&self.data_dir, start_entry);
             self.writers.insert(
                 key,
                 SegmentAppender::open_truncating(key, &path, valid_len)?,
@@ -147,14 +147,15 @@ mod tests {
             Decision::Append
         );
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta").unwrap(),
+            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta")
+                .unwrap(),
             Decision::Append
         );
         w.finish().unwrap();
 
         // Named from the first record's id (the segment's base).
         let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
-        assert_eq!(scan.last_entry_id, Some(1)); // 0, 1
+        assert_eq!(scan.last_entry_id, Some(EntryId(1))); // 0, 1
     }
 
     #[test]
@@ -181,7 +182,7 @@ mod tests {
         w.finish().unwrap();
 
         let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
-        assert_eq!(scan.last_entry_id, Some(2)); // 0, 1, 2
+        assert_eq!(scan.last_entry_id, Some(EntryId(2))); // 0, 1, 2
     }
 
     #[test]
@@ -195,14 +196,15 @@ mod tests {
         let recovered = RecoveredSegments::scan_data_dir(&data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.clone(), recovered);
         assert_eq!(
-            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta").unwrap(),
+            w.replay(&RoutingHeader::new(key(), EntryId(1), 1), b"beta")
+                .unwrap(),
             Decision::Append
         );
         w.finish().unwrap();
 
         // The torn tail was truncated to valid_len, so the file re-scans clean.
         let scan = scan_segment_file(&key().file_path(&data_dir, EntryId(0))).unwrap();
-        assert_eq!(scan.last_entry_id, Some(1)); // 0, 1 — tail gone, beta clean
+        assert_eq!(scan.last_entry_id, Some(EntryId(1))); // 0, 1 — tail gone, beta clean
     }
 
     /// Scans `data_dir` then replays an interleaved record stream over it,
@@ -212,8 +214,11 @@ mod tests {
         let recovered = RecoveredSegments::scan_data_dir(data_dir).unwrap();
         let mut w = ReplayWriter::new(data_dir.to_path_buf(), recovered);
         for &(seg, entry_id, payload) in stream {
-            w.replay(&RoutingHeader::new(seg, EntryId(entry_id), 1), payload.as_bytes())
-                .unwrap();
+            w.replay(
+                &RoutingHeader::new(seg, EntryId(entry_id), 1),
+                payload.as_bytes(),
+            )
+            .unwrap();
         }
         w.finish().unwrap();
     }
@@ -242,8 +247,8 @@ mod tests {
         // Each segment's prefix is reconstructed contiguously.
         let scan_a = scan_segment_file(&a.file_path(&data_dir, EntryId(0))).unwrap();
         let scan_b = scan_segment_file(&b.file_path(&data_dir, EntryId(0))).unwrap();
-        assert_eq!(scan_a.last_entry_id, Some(2)); // a0, a1, a2
-        assert_eq!(scan_b.last_entry_id, Some(1)); // b0, b1
+        assert_eq!(scan_a.last_entry_id, Some(EntryId(2))); // a0, a1, a2
+        assert_eq!(scan_b.last_entry_id, Some(EntryId(1))); // b0, b1
 
         let a_bytes = fs::read(a.file_path(&data_dir, EntryId(0))).unwrap();
         let b_bytes = fs::read(b.file_path(&data_dir, EntryId(0))).unwrap();
@@ -251,8 +256,14 @@ mod tests {
         // Re-running scan + replay over the same disk changes nothing — every
         // record now dedups against the higher cursors.
         replay_stream(&data_dir, &stream);
-        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), a_bytes);
-        assert_eq!(fs::read(b.file_path(&data_dir, EntryId(0))).unwrap(), b_bytes);
+        assert_eq!(
+            fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(),
+            a_bytes
+        );
+        assert_eq!(
+            fs::read(b.file_path(&data_dir, EntryId(0))).unwrap(),
+            b_bytes
+        );
     }
 
     #[test]
@@ -283,6 +294,9 @@ mod tests {
         }
         w.finish().unwrap();
 
-        assert_eq!(fs::read(s.file_path(&data_dir, EntryId(0))).unwrap(), before);
+        assert_eq!(
+            fs::read(s.file_path(&data_dir, EntryId(0))).unwrap(),
+            before
+        );
     }
 }

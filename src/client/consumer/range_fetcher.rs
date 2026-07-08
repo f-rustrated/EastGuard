@@ -4,6 +4,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use super::ConsumerRecord;
+use crate::client::consumer::group::ConsumerPosition;
 use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, CompressionCodec};
@@ -100,6 +101,7 @@ impl RangeFetchActor {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
+                        next_entry_id: self.next_entry_id,
                         transition,
                     });
                 }
@@ -143,10 +145,21 @@ impl RangeFetchActor {
                         })?;
 
                     for (i, rec) in records.into_iter().enumerate() {
+                        // let current_record_offset = *entry.entry_id + i as u64;
+                        // if let Some(skip_threshold) = self.skip_below_offset {
+                        //     if current_record_offset <= skip_threshold {
+                        //         continue;
+                        //     }
+                        //     self.skip_below_offset = None;
+                        // }
+
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.range_id,
-                            offset: *entry.entry_id + i as u64,
+                            position: ConsumerPosition {
+                                batch_offset: i as u64,
+                                entry_id: entry.entry_id,
+                            },
                             key: rec.key,
                             value: rec.value,
                         };
@@ -171,6 +184,7 @@ impl RangeFetchActor {
                 {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
+                        next_entry_id,
                         transition,
                     });
                     return Ok(false);

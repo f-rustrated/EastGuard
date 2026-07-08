@@ -80,10 +80,6 @@ impl CheckpointWorker {
             return Ok(());
         }
 
-        println!(
-            "[DEBUG CHECKPOINT] process_job starting for {:?} at path {:?}",
-            job.segment_key, job.segment_file_path
-        );
         let mut appender = SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
         let mut index_entries = Vec::with_capacity(checkpoint.entries.len());
         for entry in &checkpoint.entries {
@@ -98,13 +94,9 @@ impl CheckpointWorker {
 
         sparse_index.put_batch(index_entries)?;
         // We do NOT advance the eviction frontier here. We defer it to the DataPlane thread
-        // via CheckpointComplete to prevent an invariant race condition where the frontier 
+        // via CheckpointComplete to prevent an invariant race condition where the frontier
         // advances before checkpoint_lsn is updated.
 
-        println!(
-            "[DEBUG CHECKPOINT] process_job completed successfully for {:?}",
-            job.segment_key
-        );
         let completion: DataPlaneCommand = CheckpointComplete {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),

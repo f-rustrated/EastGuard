@@ -121,7 +121,7 @@ impl SegmentAppender {
         let end = WalRecord::batch_end();
         end.encode_to(&mut self.writer)?;
         self.next_pos += record.encoded_size() as u64 + end.encoded_size() as u64;
-        Ok(is_index_anchor(data_start, *entry_id)
-            .then(|| SparseEntry::new(self.segment_key, *entry_id, data_start.to_be_bytes())))
+        Ok(is_index_anchor(data_start, entry_id)
+            .then(|| SparseEntry::new(self.segment_key, entry_id, data_start.to_be_bytes())))
     }
 }

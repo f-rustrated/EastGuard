@@ -316,7 +316,7 @@ fn print_record(record: &ConsumerRecord) {
     );
     println!(
         "[[{}] key: '{}', value: '{}'",
-        record.offset,
+        record.position.batch_offset,
         String::from_utf8_lossy(&record.key),
         String::from_utf8_lossy(&record.value)
     );

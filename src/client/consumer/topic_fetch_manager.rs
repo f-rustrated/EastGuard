@@ -1,7 +1,7 @@
 use super::RangeCursor;
 
 use crate::client::consumer::cursor::StartPolicy;
-use crate::client::consumer::group::ConsumerGroup;
+use crate::client::consumer::group::{ConsumerGroup, ConsumerPosition};
 use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
 use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
 use crate::client::{ClientError, ConsumerConfig};
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub(crate) struct RangeDrained {
     pub range_id: RangeId,
+    pub next_entry_id: EntryId,
     pub transition: RangeTransition,
 }
 
@@ -125,9 +126,16 @@ impl TopicFetchManagerState {
         let metadata = ctx.metadata.load();
 
         for range in to_start {
-            let resolved_entry_id = self
-                .resolve_start_entry_id(range, ctx, saved_offsets.get(&range).copied())
-                .await;
+            let (resolved_entry_id, _skip_below_offset) =
+                if let Some(pos) = saved_offsets.get(&range) {
+                    // Prefer explicitly saved offsets. The committed offset is a
+                    // record-level checkpoint. Because one entry can contain multiple
+                    // records, the next entry we fetch begins at the physical batch containing
+                    // the committed offset, and we skip any records that have already been processed.
+                    (pos.entry_id, Some(pos.batch_offset))
+                } else {
+                    (self.resolve_start_entry_id(range, ctx).await, None)
+                };
 
             if self.should_skip_start(range, &metadata.ranges, &saved_offsets, resolved_entry_id) {
                 continue;
@@ -170,23 +178,8 @@ impl TopicFetchManagerState {
     /// In EastGuard:
     /// - **Entry ID** refers to the physical index of a record in the range's log.
     /// - **Offset** refers to the logical consumer-committed checkpoint (which is the last processed entry ID).
-    async fn resolve_start_entry_id(
-        &self,
-        range: RangeId,
-        ctx: &Arc<ConsumerContext>,
-        committed_offset: Option<u64>,
-    ) -> EntryId {
-        // 1. Prefer explicitly saved offsets. The committed offset is a
-        // record-level checkpoint. Because one entry can contain multiple
-        // records, `offset + 1` may still fall inside the same entry the
-        // consumer already consumed — not the start of the next entry.
-        // The fetch path re-delivers the containing entry; the consumer
-        // skips already-processed records.
-        if let Some(offset) = committed_offset {
-            return EntryId(offset + 1);
-        }
-
-        // 2. Fetch the latest boundary from the replica if the start policy is Latest.
+    async fn resolve_start_entry_id(&self, range: RangeId, ctx: &Arc<ConsumerContext>) -> EntryId {
+        // 1. Fetch the latest boundary from the replica if the start policy is Latest.
         // Note: fetch_range_entry_ids returns (start_entry_id, committed_entry_id).
         if matches!(self.start_policy(), StartPolicy::Latest)
             && let Ok((_, committed_entry_id)) =
@@ -195,12 +188,12 @@ impl TopicFetchManagerState {
             return committed_entry_id;
         }
 
-        // 3. Fallback to the local cursor's next entry ID.
+        // 2. Fallback to the local cursor's next entry ID.
         if let Some(cursor) = self.cursors.get(range) {
             return cursor.next_entry_id;
         }
 
-        // 4. Default start entry ID is 0
+        // 3. Default start entry ID is 0
         EntryId::default()
     }
 
@@ -221,7 +214,7 @@ impl TopicFetchManagerState {
         &self,
         range_id: RangeId,
         ranges: &[RangeDetail],
-        saved_offsets: &HashMap<RangeId, u64>,
+        saved_offsets: &HashMap<RangeId, ConsumerPosition>,
         resolved_entry_id: EntryId,
     ) -> bool {
         self.has_active_descendant(range_id, ranges)
@@ -276,7 +269,7 @@ impl TopicFetchManagerState {
         &self,
         range_id: RangeId,
         ranges: &[RangeDetail],
-        saved_offsets: &HashMap<RangeId, u64>,
+        saved_offsets: &HashMap<RangeId, ConsumerPosition>,
     ) -> bool {
         for p in ranges.iter() {
             let is_parent = p
@@ -300,9 +293,12 @@ impl TopicFetchManagerState {
 
             // Parent is sealed but consumer hasn't consumed past its end.
             if p.state == RangeState::Sealed {
-                let parent_resolved = saved_offsets.get(&p.range_id).map(|o| o + 1).unwrap_or(0);
+                let parent_resolved = saved_offsets
+                    .get(&p.range_id)
+                    .map(|pos| pos.entry_id)
+                    .unwrap_or_default();
 
-                if parent_resolved <= *p.end_entry_id() {
+                if parent_resolved <= p.end_entry_id() {
                     return true;
                 }
             }
@@ -335,6 +331,7 @@ pub(crate) async fn run_topic_fetch_manager(
 
     loop {
         if state.record_tx.is_disconnected() {
+            tracing::info!("Consumer Rx Dropped!");
             break;
         }
 

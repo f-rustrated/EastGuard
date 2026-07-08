@@ -270,6 +270,8 @@ impl RangeCursor {
             .filter(|r| r.state == RangeState::Active)
             .filter(|r| interest.matches(r))
             .map(|r| {
+                // ! Why start_entry_id when it is latest cursors? now it barely means 'starting from active segment', not the last entry of active segment.
+                // TODO e2e test that covers this case
                 let start_entry = r.active_segment.as_ref().map_or(0, |s| *s.start_entry_id);
                 RangeCursor::new(
                     r.range_id,

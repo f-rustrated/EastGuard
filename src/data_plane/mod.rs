@@ -88,7 +88,7 @@ impl SegmentKey {
 /// Parses a segment filename (`{segment_id}-{start_offset}.seg`) into its
 /// parts. Returns `Err` for names that don't match — recovery discovery skips
 /// foreign files. Inverse of the filename produced by [`SegmentKey::file_path`].
-pub(crate) fn parse_segment_file(path: &Path) -> std::io::Result<(SegmentId, u64)> {
+pub(crate) fn parse_segment_file(path: &Path) -> std::io::Result<(SegmentId, EntryId)> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -111,8 +111,9 @@ pub(crate) fn parse_segment_file(path: &Path) -> std::io::Result<(SegmentId, u64
 
     let (segment_id, start_offset) = stem.split_once('-').ok_or_else(invalid_format_err)?;
 
+    let offset_u64: u64 = start_offset.parse().map_err(|_| invalid_format_err())?;
     Ok((
         SegmentId(segment_id.parse().map_err(|_| invalid_format_err())?),
-        start_offset.parse().map_err(|_| invalid_format_err())?,
+        EntryId(offset_u64),
     ))
 }

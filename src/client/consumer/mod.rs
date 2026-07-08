@@ -1,9 +1,12 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::client::consumer::group::{ConsumerGroup, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS};
+use crate::client::consumer::group::{
+    ConsumerGroup, ConsumerPosition, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS,
+};
 use crate::client::consumer::range_fetcher::ConsumerContext;
 use crate::client::consumer::topic_fetch_manager::{
     RangeDrained, TopicFetchManagerState, run_topic_fetch_manager,
@@ -29,7 +32,7 @@ pub use cursor::{KeyInterest, StartPolicy};
 pub struct ConsumerRecord {
     pub topic: String,
     pub range_id: RangeId,
-    pub offset: u64,
+    pub position: ConsumerPosition,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
@@ -99,6 +102,8 @@ impl Consumer {
                     && let Ok((_, committed_entry_id)) =
                         client.fetch_range_entry_ids(&topic, cursor.range_id).await
                 {
+                    // ! next_entry_id = committed_entry_id? How come commited_entry becomes the next one.
+                    // TODO shouldn't it be committed_entry_id + 1? Or wrong naming
                     cursor.next_entry_id = committed_entry_id;
                 }
             }
@@ -117,6 +122,7 @@ impl Consumer {
 
         let topic_fetch_manager =
             TopicFetchManagerState::new(cursors, consumer_group.clone(), config, record_tx);
+
         if !topic_fetch_manager.should_exit() {
             Self::spawn_manager(topic_fetch_manager, cursor_rx, &ctx);
         }
@@ -153,7 +159,9 @@ impl Consumer {
     /// cursors remain).
     pub async fn next_record(&self) -> Result<Option<ConsumerRecord>, ClientError> {
         loop {
+            // ! culprit! blocks here
             let Ok(res) = self.consumer_rx.recv_async().await else {
+                tracing::info!("Topic fully consumed");
                 return Ok(None);
             };
 
@@ -163,7 +171,7 @@ impl Consumer {
                 if !group.is_responsible_for(rec.range_id) {
                     continue;
                 }
-                group.record_offset(rec.range_id, rec.offset);
+                group.record_offset(rec.range_id, rec.position);
             }
             return Ok(Some(rec));
         }

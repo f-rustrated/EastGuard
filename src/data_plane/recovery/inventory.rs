@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::segment_scan::RecoveredSegments;
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 
 /// What recovery verified for one on-disk segment: its `start_offset` (the filename base,
@@ -9,8 +10,9 @@ use crate::data_plane::SegmentKey;
 /// put on disk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InventoryEntry {
-    pub(crate) start_offset: u64,
-    pub(crate) verified_end: u64,
+    pub(crate) start_entry: EntryId,
+    pub(crate) verified_end: EntryId,
+    pub(crate) next_entry_id: EntryId,
 }
 
 /// Built only by [`LocalInventory::from_recovered`]; maps each locally-held segment to what
@@ -23,12 +25,13 @@ impl LocalInventory {
         Self(
             recovered
                 .inventory()
-                .map(|(key, start_offset, verified_end)| {
+                .map(|(key, start_offset, verified_end, next_entry_id)| {
                     (
                         key,
                         InventoryEntry {
-                            start_offset,
+                            start_entry: start_offset,
                             verified_end,
+                            next_entry_id,
                         },
                     )
                 })
@@ -38,14 +41,14 @@ impl LocalInventory {
 
     /// Highest verified entry id held for `key`, or `None` if the segment holds
     /// no verified data locally.
-    pub(crate) fn get(&self, key: &SegmentKey) -> Option<u64> {
+    pub(crate) fn get(&self, key: &SegmentKey) -> Option<EntryId> {
         self.0.get(key).map(|e| e.verified_end)
     }
 
     /// `(segment, start_offset)` for every recovered segment — the orphan-GC sweep's
     /// candidate set. Each is a stray until the cluster (re)assigns it here.
-    pub(crate) fn orphan_candidates(&self) -> impl Iterator<Item = (SegmentKey, u64)> + '_ {
-        self.0.iter().map(|(key, e)| (*key, e.start_offset))
+    pub(crate) fn orphan_candidates(&self) -> impl Iterator<Item = (SegmentKey, EntryId)> + '_ {
+        self.0.iter().map(|(key, e)| (*key, e.start_entry))
     }
 
     /// No recovered segments remain — orphan GC is done and need not re-arm.
@@ -82,18 +85,18 @@ mod tests {
         let a = seg(1, 0);
         let b = seg(2, 0);
         let mut recovered = RecoveredSegments::default();
-        recovered.advance(a, 5); // from-nothing segment, base 5 / cursor 5
-        recovered.advance(b, 0);
-        recovered.advance(b, 1); // base 0 / cursor 1
+        recovered.advance(a, 5.into()); // from-nothing segment, base 5 / cursor 5
+        recovered.advance(b, 0.into());
+        recovered.advance(b, 1.into()); // base 0 / cursor 1
 
         let inv = LocalInventory::from_recovered(&recovered);
         // `get` exposes the verified end (unchanged semantics).
-        assert_eq!(inv.get(&a), Some(5));
-        assert_eq!(inv.get(&b), Some(1));
+        assert_eq!(inv.get(&a), Some(5.into()));
+        assert_eq!(inv.get(&b), Some(1.into()));
         // orphan candidates expose the start_offset (the filename base).
-        let candidates: HashMap<SegmentKey, u64> = inv.orphan_candidates().collect();
-        assert_eq!(candidates.get(&a), Some(&5));
-        assert_eq!(candidates.get(&b), Some(&0));
+        let candidates: HashMap<SegmentKey, EntryId> = inv.orphan_candidates().collect();
+        assert_eq!(candidates.get(&a), Some(&5.into()));
+        assert_eq!(candidates.get(&b), Some(&0.into()));
     }
 
     #[test]
@@ -107,9 +110,9 @@ mod tests {
     fn remove_drops_the_candidate() {
         let a = seg(1, 0);
         let mut recovered = RecoveredSegments::default();
-        recovered.advance(a, 0);
+        recovered.advance(a, 0.into());
         let mut inv = LocalInventory::from_recovered(&recovered);
-        assert_eq!(inv.get(&a), Some(0));
+        assert_eq!(inv.get(&a), Some(0.into()));
         inv.remove(&a);
         assert_eq!(inv.get(&a), None);
         assert_eq!(inv.orphan_candidates().count(), 0);
