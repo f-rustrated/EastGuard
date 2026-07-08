@@ -96,16 +96,10 @@ impl Consumer {
 
         if matches!(config.start_policy, StartPolicy::Latest) {
             for cursor in cursors.iter_mut() {
-                let has_saved_offset =
-                    consumer_group.is_some() && cursor.next_entry_id > EntryId::default();
-                if !has_saved_offset
-                    && let Ok((_, committed_entry_id)) =
-                        client.fetch_range_entry_ids(&topic, cursor.range_id).await
-                {
-                    // ! next_entry_id = committed_entry_id? How come commited_entry becomes the next one.
-                    // TODO shouldn't it be committed_entry_id + 1? Or wrong naming
-                    cursor.next_entry_id = committed_entry_id;
-                }
+                let (_, tail_entry_id) = client
+                    .fetch_range_entry_ids(&topic, cursor.range_id)
+                    .await?;
+                cursor.next_entry_id = tail_entry_id;
             }
         }
 

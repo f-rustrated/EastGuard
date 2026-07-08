@@ -126,20 +126,28 @@ impl TopicFetchManagerState {
         let metadata = ctx.metadata.load();
 
         for range in to_start {
-            let (resolved_entry_id, skip_below_offset, next_absolute_offset) =
-                if let Some(pos) = saved_offsets.get(&range) {
-                    // Prefer explicitly saved offsets. The committed offset is a
-                    // record-level checkpoint. Because one entry can contain multiple
-                    // records, the next entry we fetch begins at the physical batch containing
-                    // the committed offset, and we skip any records that have already been processed.
-                    (
-                        pos.entry_id,
-                        Some(pos.batch_offset),
-                        pos.absolute_offset.saturating_add(1),
-                    )
-                } else {
-                    (self.resolve_start_entry_id(range, ctx).await, None, 0)
+            let (resolved_entry_id, skip_below_offset, next_absolute_offset) = if let Some(pos) =
+                saved_offsets.get(&range)
+            {
+                // Prefer explicitly saved offsets. The committed offset is a
+                // record-level checkpoint. Because one entry can contain multiple
+                // records, the next entry we fetch begins at the physical batch containing
+                // the committed offset, and we skip any records that have already been processed.
+                (
+                    pos.entry_id,
+                    Some(pos.batch_offset),
+                    pos.absolute_offset.saturating_add(1),
+                )
+            } else {
+                let resolved = match self.resolve_start_entry_id(range, ctx).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        tracing::warn!(?range, ?error, "failed to resolve consumer start entry id");
+                        continue;
+                    }
                 };
+                (resolved, None, 0)
+            };
 
             if self.should_skip_start(range, &metadata.ranges, &saved_offsets, resolved_entry_id) {
                 continue;
@@ -186,23 +194,24 @@ impl TopicFetchManagerState {
     /// In EastGuard:
     /// - **Entry ID** refers to the physical index of a record in the range's log.
     /// - **Offset** refers to the logical consumer-committed checkpoint (which is the last processed entry ID).
-    async fn resolve_start_entry_id(&self, range: RangeId, ctx: &Arc<ConsumerContext>) -> EntryId {
+    async fn resolve_start_entry_id(
+        &self,
+        range: RangeId,
+        ctx: &Arc<ConsumerContext>,
+    ) -> Result<EntryId, ClientError> {
         // 1. Fetch the latest boundary from the replica if the start policy is Latest.
-        // Note: fetch_range_entry_ids returns (start_entry_id, committed_entry_id).
-        if matches!(self.start_policy(), StartPolicy::Latest)
-            && let Ok((_, committed_entry_id)) =
-                ctx.client.fetch_range_entry_ids(&ctx.topic, range).await
-        {
-            return committed_entry_id;
+        if matches!(self.start_policy(), StartPolicy::Latest) {
+            let (_, tail_entry_id) = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
+            return Ok(tail_entry_id);
         }
 
         // 2. Fallback to the local cursor's next entry ID.
         if let Some(cursor) = self.cursors.get(range) {
-            return cursor.next_entry_id;
+            return Ok(cursor.next_entry_id);
         }
 
         // 3. Default start entry ID is 0
-        EntryId::default()
+        Ok(EntryId::default())
     }
 
     async fn abort_all(&mut self) {

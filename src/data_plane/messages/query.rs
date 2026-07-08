@@ -75,7 +75,7 @@ pub struct ListOffsets {
 pub enum ListOffsetsResult {
     RangeOffsets {
         start_entry_id: EntryId,
-        committed_entry_id: EntryId,
+        next_entry_id: EntryId,
     },
     SegmentNotLocal,
     #[allow(dead_code)] // reserved for future failure modes

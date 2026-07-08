@@ -41,6 +41,7 @@ use routing::RoutingCache;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::time::Instant;
 
 /// A connection to an EastGuard cluster. Cheap to construct (connections are lazy);
 /// share one across tasks behind an `Arc` — every method takes `&self` and the pool
@@ -94,40 +95,60 @@ impl Client {
         }
     }
 
+    /// Returns the range's surviving start and the next entry id to request at
+    /// the observed tail. The second value is not the last committed entry id.
     pub async fn fetch_range_entry_ids(
         &self,
         topic: &str,
         range_id: RangeId,
     ) -> Result<(EntryId, EntryId), ClientError> {
-        let detail = self.resolve_topic(topic).await?;
-        let addr = detail
-            .ranges
-            .iter()
-            .find(|r| r.range_id == range_id)
-            .and_then(|r| {
-                r.active_segment
-                    .as_ref()
-                    .or_else(|| r.sealed_segments.last())
-            })
-            .and_then(|seg| seg.pick_replica())
-            .unwrap_or_else(|| self.next_known_node());
+        let deadline = Instant::now() + self.retry.deadline;
+        let mut backoff = self.retry.initial_backoff;
+        let mut last_error = None;
 
-        let req = RangeOffsetRequest {
-            topic_name: topic.to_string(),
-            range_id,
-        };
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ClientError::Timeout {
+                    waited: self.retry.deadline,
+                    last_error,
+                });
+            }
 
-        let served = self.call(addr, req).await?;
+            let detail = self.resolve_topic(topic).await?;
+            let addr = detail
+                .ranges
+                .iter()
+                .find(|r| r.range_id == range_id)
+                .and_then(|r| {
+                    r.active_segment
+                        .as_ref()
+                        .or_else(|| r.sealed_segments.last())
+                })
+                .and_then(|seg| seg.pick_replica())
+                .unwrap_or_else(|| self.next_known_node());
 
-        let ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
-            start_entry_id,
-            committed_entry_id,
-        }) = served.response
-        else {
-            return Err(ClientError::UnexpectedResponse);
-        };
+            let req = RangeOffsetRequest {
+                topic_name: topic.to_string(),
+                range_id,
+            };
 
-        Ok((start_entry_id, committed_entry_id))
+            let served = self.call(addr, req).await?;
+
+            match served.response {
+                ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
+                    start_entry_id,
+                    next_entry_id,
+                }) => return Ok((start_entry_id, next_entry_id)),
+                ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
+                    last_error = Some("range offsets segment not local".to_string());
+                }
+                _ => return Err(ClientError::UnexpectedResponse),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = (backoff * 2).min(self.retry.max_backoff);
+        }
     }
 
     pub async fn fetch_all_saved_offsets(

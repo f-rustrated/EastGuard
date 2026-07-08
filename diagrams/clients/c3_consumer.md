@@ -100,6 +100,45 @@ identically whether it came from a hot replica or a cold segment file.
 
 ---
 
+## Record positions inside batched entries
+
+An entry is the broker's unit of durability, replication, and fetch. The producer may
+place several application records into one entry during its linger window, then compress
+and publish that batch as one opaque payload. The broker stamps one entry id on the whole
+payload; it does not know or index the individual records inside.
+
+That leaves three values in the consumer-facing position:
+
+| Coordinate | Meaning | Advances when |
+|---|---|---|
+| Entry id | Physical position of a stored entry in a range | A produce batch commits |
+| Batch offset | Record position inside that entry | The consumer decodes records from the payload |
+| Absolute offset | Logical record progress for the consumer stream | Each application record is delivered |
+
+The entry id and batch offset are the structural coordinate: together they identify the
+last delivered record closely enough for a restarted consumer to resume without either
+replaying or skipping records. The absolute offset is still important for progress,
+diagnostics, and lag, but it is not a storage seek key. Batch sizes vary with linger timing,
+byte limits, record limits, compression, and caller concurrency; a logical record counter
+therefore cannot be converted into an entry id.
+
+```
+entry 0: [record 0, record 1, record 2]
+entry 1: [record 0, record 1]
+entry 2: [record 0]
+
+committed position: entry 1, batch offset 1, absolute offset 4
+resume fetches:      entry 1
+resume skips:        record 0 and record 1 inside entry 1
+first delivered:     entry 2, record 0, absolute offset 5
+```
+
+This split keeps the broker opaque. The data plane stores and serves bytes; the consumer,
+which already has to decode the entry before delivery, is the layer that can see the
+intra-entry record boundary and attach the correct record-level position.
+
+---
+
 ## Lineage, made concrete
 
 The whole reason consume is more than "read a partition" is that ranges reshape live.
@@ -123,9 +162,28 @@ reconstruct the DAG from any historical ancestor when starting *earliest*.
 
 `ListOffsets` returns a range's surviving start and committed end — used to (a) bound a
 read window, and (b) recover from retention: a consumer that fell behind and fetched a
-now-deleted segment (see d7) skips forward to the surviving start. Durable offset
-*commit* (remembering where a consumer left off across restarts) is a consumer-group
-concern, out of scope here — C3 is a single consumer driving its own cursors.
+now-deleted segment (see d7) skips forward to the surviving start.
+
+Durable offset *storage* is a consumer-group concern (see d8), but C3 defines the position
+that gets stored because it is the layer that turns entries into application records. A
+committed position is a **last delivered** coordinate, not a next-record coordinate:
+
+| Stored field | Why it is stored |
+|---|---|
+| Range | Identifies which range the position belongs to |
+| Entry id | Tells the resumed consumer which physical entry to fetch first |
+| Batch offset | Tells the resumed consumer how much of that entry was already processed |
+| Absolute offset | Restores the logical record counter after restart and supports lag reporting |
+
+On resume, a saved position overrides the configured start policy for that range. The
+consumer fetches the saved entry, drops records with batch offsets less than or equal to
+the saved batch offset, then delivers the first unread record with the saved absolute
+offset plus one. The skip applies only to the saved entry; once that entry has been
+evaluated, later entries stream normally.
+
+If the saved entry has already fallen behind retention, the normal retention path wins:
+the cursor moves to the surviving start and the intra-entry skip is discarded because the
+physical entry it referred to no longer exists.
 
 ---
 
@@ -174,17 +232,21 @@ across; at a **merge**, hold the successor's first fetch until both parents drai
    `ListOffsets`.
 6. **Record decode** — read each entry's codec tag and decompress before surfacing
    records to the application (the producer/consumer contract from `c2_producer.md`).
-7. **Prefetch the next sealed segment** — while draining a sealed segment, pre-open the
+7. **Record-level positions** — surface entry id, batch offset, and absolute offset with
+   each delivered record; use the structural coordinate for resume and the absolute offset
+   for logical progress.
+8. **Prefetch the next sealed segment** — while draining a sealed segment, pre-open the
    next segment's replica connection and speculatively fetch past the current segment's
    end, so a hand-off to a segment on another node doesn't stall on connect + cold-read
    latency. Driven entirely from cached per-segment placement — no server cooperation;
    off on the active tail.
-8. **Tests** — against the simulated cluster: ordered drain of a range, a split mid-
+9. **Tests** — against the simulated cluster: ordered drain of a range, a split mid-
    consume (fan-out to children, each key once), a merge mid-consume (both parents
    drained before successor), read from a non-leader replica, by-id fetch after
    resolving the topic id, skip-forward past a retention-deleted segment, a compressed
-   entry decoded by its codec tag, and a historical read crossing a sealed-segment
-   boundary onto a different replica, served from a prewarmed next segment (no stall).
+   entry decoded by its codec tag, record-level resume from the middle of a batched
+   entry, and a historical read crossing a sealed-segment boundary onto a different
+   replica, served from a prewarmed next segment (no stall).
 
 ## See also
 
@@ -192,6 +254,8 @@ across; at a **merge**, hold the successor's first fetch until both parents drai
 - `d4_consumer_range_tracking.md` — the server side of the in-band progress signal and
   range transitions.
 - `d7_retention_gc.md` — retention deletion and the skip-forward recovery.
+- `d8_consumer_offset_management.md` — consumer-group offset storage and cooperative
+  assignment.
 - `d1_storage_engine.md` — the cold-read pool and the within-node hot/cold seam this
   prefetch mirrors, and the opaque payload the consumer decompresses.
 - `client_roadmap.md` — consumer-group / durable-offset backlog context.
