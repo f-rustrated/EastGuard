@@ -153,7 +153,6 @@ impl Consumer {
     /// cursors remain).
     pub async fn next_record(&self) -> Result<Option<ConsumerRecord>, ClientError> {
         loop {
-            // ! culprit! blocks here
             let Ok(res) = self.consumer_rx.recv_async().await else {
                 tracing::info!("Topic fully consumed");
                 return Ok(None);
