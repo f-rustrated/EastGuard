@@ -1,13 +1,13 @@
 use std::io;
 
-use crate::data_plane::SegmentKey;
+use crate::{control_plane::metadata::EntryId, data_plane::SegmentKey};
 
 pub struct SparseEntry {
     key: Vec<u8>,
     byte_position: [u8; 8],
 }
 impl SparseEntry {
-    pub(crate) fn new(segment_key: SegmentKey, entry_id: u64, byte_position: [u8; 8]) -> Self {
+    pub(crate) fn new(segment_key: SegmentKey, entry_id: EntryId, byte_position: [u8; 8]) -> Self {
         let mut key = Vec::with_capacity(32);
         key.extend_from_slice(&segment_key.topic_id.to_be_bytes());
         key.extend_from_slice(&segment_key.range_id.to_be_bytes());
@@ -31,7 +31,7 @@ pub(crate) const INDEX_INTERVAL_ENTRIES: u64 = 64;
 /// (`recovery/index_rebuild.rs`) both gate their anchor writes on this single
 /// predicate — stateless in absolute position, so the rebuilt index is
 /// byte-identical to the live one.
-pub(crate) fn is_index_anchor(byte_start: u64, entry_id: u64) -> bool {
+pub(crate) fn is_index_anchor(byte_start: u64, entry_id: EntryId) -> bool {
     byte_start == 0 || entry_id.is_multiple_of(INDEX_INTERVAL_ENTRIES)
 }
 

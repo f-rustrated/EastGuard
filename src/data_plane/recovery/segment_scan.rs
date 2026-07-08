@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::control_plane::metadata::{RangeId, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::parse_segment_file;
 use crate::data_plane::states::segment::record::RoutingHeader;
@@ -20,14 +20,19 @@ pub(crate) struct SegmentScan {
     /// The segment's first entry id — the `start_offset` encoded in its filename.
     /// The replay appender uses it to build the file path and as the contiguity
     /// base.
-    pub(crate) start_entry_id: u64,
+    pub(crate) start_entry_id: EntryId,
     /// Highest entry id covered by a complete batch, or `None` when no
     /// complete batch survived (empty, missing, or torn-from-the-start file).
-    pub(crate) last_entry_id: Option<u64>,
+    pub(crate) last_entry_id: Option<EntryId>,
     /// Byte offset where credit stops — the end of the last complete batch.
     /// Replay truncates the file to this length before appending, so a torn
     /// tail is overwritten rather than appended after.
     pub(crate) valid_len: u64,
+}
+impl SegmentScan {
+    pub(crate) fn next_entry_id(&self) -> EntryId {
+        self.last_entry_id.map_or(self.start_entry_id, |l| l + 1u64)
+    }
 }
 
 /// Whether a replayed WAL record should be appended to its segment file or
@@ -96,7 +101,7 @@ impl RecoveredSegments {
             .get(&header.segment_key())
             .and_then(|scan| scan.last_entry_id)
         {
-            Some(cursor) if *header.entry_id <= cursor => Decision::Skip,
+            Some(cursor) if header.entry_id <= cursor => Decision::Skip,
             _ => Decision::Append,
         }
     }
@@ -105,7 +110,7 @@ impl RecoveredSegments {
         self.0.get(key).map_or(0, |scan| scan.valid_len)
     }
 
-    pub(crate) fn start_entry_id(&self, key: &SegmentKey) -> Option<u64> {
+    pub(crate) fn start_entry_id(&self, key: &SegmentKey) -> Option<EntryId> {
         self.0.get(key).map(|scan| scan.start_entry_id)
     }
 
@@ -113,7 +118,7 @@ impl RecoveredSegments {
     /// verified prefix. Segments with no complete batch (`last_entry_id` is
     /// `None`) are omitted — they hold no durable data. This post-replay cursor
     /// map is what the local inventory (`inventory.rs`) is built from.
-    pub(crate) fn cursors(&self) -> impl Iterator<Item = (SegmentKey, u64)> + '_ {
+    pub(crate) fn cursors(&self) -> impl Iterator<Item = (SegmentKey, EntryId)> + '_ {
         self.0
             .iter()
             .filter_map(|(key, scan)| scan.last_entry_id.map(|id| (*key, id)))
@@ -122,10 +127,12 @@ impl RecoveredSegments {
     /// `(segment, start_offset, highest verified entry id)` for every segment with a
     /// verified prefix — the local inventory carries `start_offset` (the filename base)
     /// alongside the cursor so orphan GC can locate the file to delete.
-    pub(crate) fn inventory(&self) -> impl Iterator<Item = (SegmentKey, u64, u64)> + '_ {
+    pub(crate) fn inventory(
+        &self,
+    ) -> impl Iterator<Item = (SegmentKey, EntryId, EntryId, EntryId)> + '_ {
         self.0.iter().filter_map(|(key, scan)| {
             scan.last_entry_id
-                .map(|end| (*key, scan.start_entry_id, end))
+                .map(|end| (*key, scan.start_entry_id, end, scan.next_entry_id()))
         })
     }
 
@@ -136,8 +143,7 @@ impl RecoveredSegments {
     /// or the segment's `start_entry_id` for the first append.
     ///
     /// A segment absent from the map is inserted, taking `entry_id` as its base.
-    #[allow(dead_code)]
-    pub(crate) fn advance(&mut self, key: SegmentKey, entry_id: u64) {
+    pub(crate) fn advance(&mut self, key: SegmentKey, entry_id: EntryId) {
         let scan = self.0.entry(key).or_insert(SegmentScan {
             start_entry_id: entry_id,
             last_entry_id: None,
@@ -318,8 +324,8 @@ mod tests {
         let (_dir, path) = write_named(3, 100, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
-        assert_eq!(scan.start_entry_id, 100);
-        assert_eq!(scan.last_entry_id, Some(102)); // 100, 101, 102
+        assert_eq!(scan.start_entry_id, 100.into());
+        assert_eq!(scan.last_entry_id, Some(102.into()));
         assert_eq!(scan.valid_len, len);
     }
 
@@ -330,8 +336,14 @@ mod tests {
         let (_d0, p0) = write_named(0, 0, &bytes);
         let (_d5, p5) = write_named(0, 500, &bytes);
 
-        assert_eq!(scan_segment_file(&p0).unwrap().last_entry_id, Some(1));
-        assert_eq!(scan_segment_file(&p5).unwrap().last_entry_id, Some(501));
+        assert_eq!(
+            scan_segment_file(&p0).unwrap().last_entry_id,
+            Some(1.into())
+        );
+        assert_eq!(
+            scan_segment_file(&p5).unwrap().last_entry_id,
+            Some(501.into())
+        );
     }
 
     #[test]
@@ -369,7 +381,7 @@ mod tests {
         let (_dir, path) = write_named(2, 0, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
-        assert_eq!(scan.last_entry_id, Some(1)); // gamma uncredited
+        assert_eq!(scan.last_entry_id, Some(1.into())); // gamma uncredited
         assert_eq!(scan.valid_len, valid);
     }
 
@@ -386,7 +398,7 @@ mod tests {
         let (_dir, path) = write_named(1, 10, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
-        assert_eq!(scan.last_entry_id, Some(10)); // base 10 + 1 verified - 1
+        assert_eq!(scan.last_entry_id, Some(10.into())); // base 10 + 1 verified - 1
         assert_eq!(scan.valid_len, valid);
     }
 
@@ -402,7 +414,7 @@ mod tests {
         let (_dir, path) = write_named(5, 0, &bytes);
 
         let scan = scan_segment_file(&path).unwrap();
-        assert_eq!(scan.last_entry_id, Some(0)); // only the first batch
+        assert_eq!(scan.last_entry_id, Some(0.into())); // only the first batch
         assert_eq!(scan.valid_len, valid);
     }
 
@@ -425,7 +437,10 @@ mod tests {
             &k1.file_path(data_dir, EntryId(0)),
             &encode_segment(&[("a", 1), ("b", 1)]),
         );
-        write_segment_file(&k2.file_path(data_dir, EntryId(100)), &encode_segment(&[("c", 1)]));
+        write_segment_file(
+            &k2.file_path(data_dir, EntryId(100)),
+            &encode_segment(&[("c", 1)]),
+        );
         write_segment_file(
             &k3.file_path(data_dir, EntryId(50)),
             &encode_segment(&[("d", 1), ("e", 1), ("f", 1)]),
@@ -433,9 +448,9 @@ mod tests {
 
         let recovered = RecoveredSegments::scan_data_dir(data_dir).unwrap();
         assert_eq!(recovered.0.len(), 3);
-        assert_eq!(recovered.0[&k1].last_entry_id, Some(1)); // 0, 1
-        assert_eq!(recovered.0[&k2].last_entry_id, Some(100)); // 100
-        assert_eq!(recovered.0[&k3].last_entry_id, Some(52)); // 50, 51, 52
+        assert_eq!(recovered.0[&k1].last_entry_id, Some(1.into())); // 0, 1
+        assert_eq!(recovered.0[&k2].last_entry_id, Some(100.into())); // 100
+        assert_eq!(recovered.0[&k3].last_entry_id, Some(52.into())); // 50, 51, 52
     }
 
     #[test]
@@ -444,7 +459,10 @@ mod tests {
         let data_dir = dir.path();
 
         let real = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
-        write_segment_file(&real.file_path(data_dir, EntryId(0)), &encode_segment(&[("a", 1)]));
+        write_segment_file(
+            &real.file_path(data_dir, EntryId(0)),
+            &encode_segment(&[("a", 1)]),
+        );
 
         // A WAL sibling dir, a non-id topic dir, and a foreign file in a real
         // range dir — none should abort the walk or land in the map.
@@ -474,9 +492,11 @@ mod tests {
     }
 
     fn scanned(start_entry_id: u64, last_entry_id: Option<u64>, valid_len: u64) -> SegmentScan {
+        let start = EntryId(start_entry_id);
+        let last = last_entry_id.map(EntryId);
         SegmentScan {
-            start_entry_id,
-            last_entry_id,
+            start_entry_id: start,
+            last_entry_id: last,
             valid_len,
         }
     }
@@ -523,27 +543,27 @@ mod tests {
     #[test]
     fn advance_walks_contiguously() {
         let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
-        r.advance(seg_key(), 5);
-        r.advance(seg_key(), 6);
-        assert_eq!(r.0[&seg_key()].last_entry_id, Some(6));
+        r.advance(seg_key(), 5.into());
+        r.advance(seg_key(), 6.into());
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(EntryId(6)));
     }
 
     #[test]
     fn advance_inserts_an_absent_segment_at_its_base() {
         let mut r = RecoveredSegments::default();
-        r.advance(seg_key(), 7); // first record of a never-checkpointed segment
+        r.advance(seg_key(), EntryId(7)); // first record of a never-checkpointed segment
         let scan = r.0[&seg_key()];
-        assert_eq!(scan.start_entry_id, 7);
-        assert_eq!(scan.last_entry_id, Some(7));
-        r.advance(seg_key(), 8);
-        assert_eq!(r.0[&seg_key()].last_entry_id, Some(8));
+        assert_eq!(scan.start_entry_id, EntryId(7));
+        assert_eq!(scan.last_entry_id, Some(EntryId(7)));
+        r.advance(seg_key(), EntryId(8));
+        assert_eq!(r.0[&seg_key()].last_entry_id, Some(EntryId(8)));
     }
 
     #[test]
     #[should_panic(expected = "non-contiguous")]
     fn advance_rejects_a_gap() {
         let mut r = recovered_with(&[(seg_key(), scanned(0, Some(4), 0))]);
-        r.advance(seg_key(), 6); // skips 5
+        r.advance(seg_key(), EntryId(6)); // skips 5
     }
 
     #[test]
@@ -555,7 +575,8 @@ mod tests {
             (unverified, scanned(0, None, 0)),
         ]);
 
-        let cursors: std::collections::HashMap<SegmentKey, u64> = r.cursors().collect();
+        let cursors: std::collections::HashMap<SegmentKey, u64> =
+            r.cursors().map(|(k, id)| (k, *id)).collect();
         assert_eq!(cursors.len(), 1); // the unverified segment is omitted
         assert_eq!(cursors.get(&verified), Some(&14));
     }

@@ -30,8 +30,8 @@ pub use error::ClientError;
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};
 
-use crate::client::consumer::group::OffsetCommitPayload;
 use crate::client::consumer::group::SYSTEM_TOPIC_OFFSETS;
+use crate::client::consumer::group::{ConsumerPosition, OffsetCommitPayload};
 use crate::connections::protocol::{ClientResponse, DataPlaneResponse, RangeOffsetRequest};
 use crate::control_plane::metadata::{EntryId, RangeId};
 use borsh::BorshDeserialize;
@@ -134,7 +134,7 @@ impl Client {
         self: Arc<Self>,
         group_id: &str,
         topic: &str,
-    ) -> Result<HashMap<RangeId, u64>, ClientError> {
+    ) -> Result<HashMap<RangeId, ConsumerPosition>, ClientError> {
         let mut map = HashMap::new();
         let offsets_consumer = Consumer::new(
             self,
@@ -156,12 +156,10 @@ impl Client {
         .await
         {
             timeout_ms = 100;
-
             let is_key_match = record.key_match(routing_key.clone());
-
             if is_key_match && let Ok(payload) = OffsetCommitPayload::try_from_slice(&record.value)
             {
-                map.insert(payload.range_id, payload.offset);
+                map.insert(payload.range_id, payload.position);
             }
         }
         Ok(map)

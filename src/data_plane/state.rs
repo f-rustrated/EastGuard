@@ -378,13 +378,13 @@ impl<W: WalStorage> DataPlane<W> {
         //
         // Deletes are bounded per sweep; a large backlog drains over several.
         let mut deletes = 0usize;
-        for (key, start_offset) in self.recovered.orphan_candidates().collect::<Vec<_>>() {
+        for (key, start_entry) in self.recovered.orphan_candidates().collect::<Vec<_>>() {
             if self.segments.sealed_bounds(&key).is_some() {
                 self.recovered.remove(&key); // reused (lottery won) → live, no longer an orphan
             } else if self.pending_catch_ups.contains_key(&key) {
                 continue; // catch-up in flight → it will register; don't delete under it
             } else if deletes < ORPHAN_GC_BATCH
-                && OrphanCandidate::new(key, start_offset)
+                && OrphanCandidate::new(key, start_entry)
                     .delete(&self.config.data_dir)
                     .inspect_err(|e| tracing::warn!("orphan GC: deleting {key:?} failed: {e}"))
                     .is_ok()
@@ -465,7 +465,7 @@ impl<W: WalStorage> DataPlane<W> {
                 continue;
             };
             self.recovered.remove(&key);
-            if let Err(e) = OrphanCandidate::new(key, *start_offset).delete(&self.config.data_dir) {
+            if let Err(e) = OrphanCandidate::new(key, start_offset).delete(&self.config.data_dir) {
                 tracing::warn!("retention: deleting segment file {key:?} failed: {e}");
             }
             self.out.store_delete_segment_index(key);
@@ -579,7 +579,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// (a restarted node's on-disk data). `None` if we hold nothing.
     fn local_sealed_progress(&self, key: &SegmentKey) -> Option<EntryId> {
         let registered = self.segments.sealed_bounds(key).map(|(_, end)| end);
-        let recovered = self.recovered.get(key).map(EntryId);
+        let recovered = self.recovered.get(key);
         registered.max(recovered)
     }
 
@@ -703,7 +703,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
         if scan
             .last_entry_id
-            .is_none_or(|last| EntryId(last) < pending.sealed_end)
+            .is_none_or(|last| last < pending.sealed_end)
         {
             tracing::warn!(
                 "catch-up incomplete for {:?}: have {:?}, need {}; not registering",
@@ -1448,7 +1448,7 @@ mod tests {
     fn inventory_with(key: SegmentKey, local_end: u64) -> LocalInventory {
         let mut recovered = RecoveredSegments::default();
         for id in 0..=local_end {
-            recovered.advance(key, id);
+            recovered.advance(key, EntryId(id));
         }
         LocalInventory::from_recovered(&recovered)
     }
@@ -2152,7 +2152,10 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
-        dp.segments.get_mut(&test_key()).unwrap().commit_entry(EntryId(0));
+        dp.segments
+            .get_mut(&test_key())
+            .unwrap()
+            .commit_entry(EntryId(0));
 
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SealResponse {
@@ -2304,7 +2307,10 @@ mod tests {
         let s0 = test_key();
         let s1 = s0.with_segment_id(SegmentId(1));
 
-        let lookup = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
+        let lookup = dp
+            .segments
+            .resolve(TopicId(1), RangeId(0), EntryId(0))
+            .unwrap();
         match lookup {
             SegmentReadState::Sealed {
                 key, end_entry_id, ..
@@ -2315,7 +2321,10 @@ mod tests {
             other => panic!("expected Sealed, got {other:?}"),
         }
 
-        let active = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(1)).unwrap();
+        let active = dp
+            .segments
+            .resolve(TopicId(1), RangeId(0), EntryId(1))
+            .unwrap();
         assert!(matches!(active, SegmentReadState::Active(k) if k == s1));
     }
 
@@ -2363,7 +2372,10 @@ mod tests {
 
         // Offset 0 resolves to the active successor (which reuses start 0), not
         // an empty sealed segment — the old segment owned no committed offsets.
-        let resolved = dp.segments.resolve(TopicId(1), RangeId(0), EntryId(0)).unwrap();
+        let resolved = dp
+            .segments
+            .resolve(TopicId(1), RangeId(0), EntryId(0))
+            .unwrap();
         assert!(
             matches!(resolved, SegmentReadState::Active(k) if k == s1),
             "offset 0 must resolve to the active successor, got {resolved:?}",
@@ -2442,7 +2454,7 @@ mod tests {
         for (i, (payload, record_count)) in records.iter().enumerate() {
             index_entries.push(SparseEntry::new(
                 test_key(),
-                i as u64,
+                (i as u64).into(),
                 (buf.len() as u64).to_be_bytes(),
             ));
             WalRecord::data(Bytes::copy_from_slice(payload), *record_count)
@@ -2795,10 +2807,13 @@ mod tests {
         ));
 
         // Registered cold-readable at its sealed bounds...
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(2))));
+        assert_eq!(
+            dp.segments.sealed_bounds(&test_key()),
+            Some((EntryId(0), EntryId(2)))
+        );
         // ...the file verifies through the sealed end...
         let scan = scan_segment_file(&test_key().file_path(dir.path(), EntryId(0))).unwrap();
-        assert_eq!(scan.last_entry_id, Some(2));
+        assert_eq!(scan.last_entry_id, Some(2.into()));
         // ...and the suffix anchors were handed to the checkpoint worker (entry 0
         // at byte 0 is always an anchor).
         assert!(
@@ -2912,7 +2927,10 @@ mod tests {
             DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key()
         ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(2))));
+        assert_eq!(
+            dp.segments.sealed_bounds(&test_key()),
+            Some((EntryId(0), EntryId(2)))
+        );
     }
 
     #[test]
@@ -2925,8 +2943,8 @@ mod tests {
 
         // Recovery found both on disk (start_offset 0, verified through 0).
         let mut recovered = RecoveredSegments::default();
-        recovered.advance(stray, 0);
-        recovered.advance(reused, 0);
+        recovered.advance(stray, EntryId(0));
+        recovered.advance(reused, EntryId(0));
         let mut dp = make_data_plane_with(&dir, LocalInventory::from_recovered(&recovered));
 
         let stray_path = stray.file_path(dir.path(), EntryId(0));
@@ -2936,7 +2954,8 @@ mod tests {
 
         // The owning group reassigned `reused` here and its catch-up registered it (the
         // lottery won) — now a live sealed segment. `stray` was never assigned here.
-        dp.segments.insert_sealed_from_catch_up(reused, EntryId(0), EntryId(0));
+        dp.segments
+            .insert_sealed_from_catch_up(reused, EntryId(0), EntryId(0));
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
         dp.handle_orphan_gc_check(OrphanGcCheck { reply: reply_tx });
@@ -3000,7 +3019,11 @@ mod tests {
             path.exists(),
             "file must survive while its catch-up is in flight"
         );
-        assert_eq!(dp.recovered.get(&test_key()), Some(1), "kept in inventory");
+        assert_eq!(
+            dp.recovered.get(&test_key()),
+            Some(EntryId(1)),
+            "kept in inventory"
+        );
 
         // an orphan still pending → the handler tells the ticker to keep going.
         assert!(
@@ -3019,7 +3042,8 @@ mod tests {
         let path = key.file_path(dir.path(), EntryId(0));
         write_seg_file(&path, &[(b"a", 1)]);
         let mut dp = make_data_plane(&dir);
-        dp.segments.insert_sealed_from_catch_up(key, EntryId(0), EntryId(0));
+        dp.segments
+            .insert_sealed_from_catch_up(key, EntryId(0), EntryId(0));
         assert!(dp.segments.sealed_bounds(&key).is_some());
 
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
@@ -3094,6 +3118,7 @@ mod tests {
         let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("expected SendToTargets");
         };
+
         assert!(matches!(
             &s.message,
             DataPlaneInterNodeCommand::CatchUpRequest(r) if r.local_end == Some(EntryId(1))
@@ -3242,9 +3267,12 @@ mod tests {
         ));
 
         // Verified exactly through the sealed end — no duplicate inflation.
-        assert_eq!(dp.segments.sealed_bounds(&test_key()), Some((EntryId(0), EntryId(4))));
+        assert_eq!(
+            dp.segments.sealed_bounds(&test_key()),
+            Some((EntryId(0), EntryId(4)))
+        );
         let scan = scan_segment_file(&test_key().file_path(dir.path(), EntryId(0))).unwrap();
-        assert_eq!(scan.last_entry_id, Some(4));
+        assert_eq!(scan.last_entry_id, Some(EntryId(4)));
     }
 
     // --- Leader-crash boundary recovery: durable extent + query handler -----

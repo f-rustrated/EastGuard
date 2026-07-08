@@ -114,7 +114,7 @@ Also: `crate::net` is `turmoil::net` under `#[cfg(test)]`, so an in-binary `#[to
 
 # Subsystem Rule Routing
 
-This project enforces strict subsystem-level architectural rules and invariants. Because these rules are kept in individual files to keep the prompt size manageable, you **MUST** read the relevant rule file(s) from [.agents/rules/](file:///Users/migolee/rust_codes/EastGuard/.agents/rules/) using the `view_file` tool before making any changes if your task touches any of the following subsystems or components:
+This project enforces strict subsystem-level architectural rules and invariants. Because these rules are kept in individual files to keep the prompt size manageable, you **MUST** read the relevant rule file(s) from [.agents/rules/](file:///Users/migolee/rust_codes/EastGuard/.agents/rules/) with your available file-reading tool before making any changes if your task touches any of the following subsystems or components. For Codex, use shell file readers such as `sed`, `rg`, or `cat`; for Claude, use `view_file`.
 
 | Subsystem / Topic | Rule File to Read | Trigger Components / Keywords |
 | :--- | :--- | :--- |

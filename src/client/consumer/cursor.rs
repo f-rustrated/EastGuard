@@ -245,6 +245,8 @@ impl RangeCursorSet {
 pub struct RangeCursor {
     pub range_id: RangeId,
     pub next_entry_id: EntryId,
+    pub skip_batch_offsets_below: Option<u64>,
+    pub next_absolute_offset: u64,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
 }
@@ -259,9 +261,21 @@ impl RangeCursor {
         Self {
             range_id,
             next_entry_id,
+            skip_batch_offsets_below: None,
+            next_absolute_offset: 0,
             keyspace_start,
             keyspace_end,
         }
+    }
+
+    pub fn with_skip_batch_offsets_below(mut self, skip_batch_offsets_below: Option<u64>) -> Self {
+        self.skip_batch_offsets_below = skip_batch_offsets_below;
+        self
+    }
+
+    pub fn with_next_absolute_offset(mut self, next_absolute_offset: u64) -> Self {
+        self.next_absolute_offset = next_absolute_offset;
+        self
     }
     fn latest_cursors(detail: &TopicDetail, interest: &KeyInterest) -> Vec<Self> {
         detail
@@ -270,6 +284,8 @@ impl RangeCursor {
             .filter(|r| r.state == RangeState::Active)
             .filter(|r| interest.matches(r))
             .map(|r| {
+                // ! Why start_entry_id when it is latest cursors? now it barely means 'starting from active segment', not the last entry of active segment.
+                // TODO e2e test that covers this case
                 let start_entry = r.active_segment.as_ref().map_or(0, |s| *s.start_entry_id);
                 RangeCursor::new(
                     r.range_id,

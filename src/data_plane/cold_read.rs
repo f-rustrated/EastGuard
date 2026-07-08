@@ -193,7 +193,7 @@ impl ColdReadPool {
         reader.seek(SeekFrom::Start(byte_position))?;
 
         let mut entries: Vec<Arc<CachedEntry>> = Vec::new();
-        let mut current_offset = EntryId(anchor_id);
+        let mut current_entry_id = EntryId(anchor_id);
         let mut next_offset = req.start_entry_offset;
         let mut bytes_read = 0u64;
 
@@ -220,8 +220,8 @@ impl ColdReadPool {
                 // end of the stream — keep going.
                 WalRecordType::BatchEnd => continue,
                 WalRecordType::Data => {
-                    let entry_id = current_offset;
-                    current_offset += 1u64;
+                    let entry_id = current_entry_id;
+                    current_entry_id += 1u64;
 
                     if entry_id < req.start_entry_offset {
                         continue;

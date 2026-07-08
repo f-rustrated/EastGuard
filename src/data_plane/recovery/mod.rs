@@ -129,10 +129,7 @@ impl Durable {
             let Some(start_offset) = self.recovered.start_entry_id(&key) else {
                 continue;
             };
-            let path = key.file_path(
-                &self.data_dir,
-                crate::control_plane::metadata::EntryId(start_offset),
-            );
+            let path = key.file_path(&self.data_dir, start_offset);
             index.put_batch(rebuild_sparse_entries(&path, key)?)?;
         }
 
@@ -172,8 +169,8 @@ mod tests {
     /// One WAL data record: a routing header followed by the bare payload,
     /// exactly as the live produce path (`tracker.rs`) stages it.
     fn wal_data(key: SegmentKey, entry_id: u64, record_count: u32, payload: &str) -> WalRecord {
-        let wal_payload =
-            RoutingHeader::new(key, EntryId(entry_id), record_count).build_wal_payload(payload.as_bytes());
+        let wal_payload = RoutingHeader::new(key, EntryId(entry_id), record_count)
+            .build_wal_payload(payload.as_bytes());
         WalRecord::data(wal_payload, record_count)
     }
 
@@ -209,6 +206,7 @@ mod tests {
         scan_segment_file(&key.file_path(data_dir, EntryId(start_offset)))
             .unwrap()
             .last_entry_id
+            .map(|id| *id)
     }
 
     #[test]
@@ -240,8 +238,8 @@ mod tests {
         let output = run(data_dir.clone(), &db).unwrap();
 
         // Inventory reflects the post-replay cursors.
-        assert_eq!(output.inventory.get(&a), Some(2)); // a0, a1, a2
-        assert_eq!(output.inventory.get(&b), Some(1)); // b0, b1
+        assert_eq!(output.inventory.get(&a), Some(EntryId(2))); // a0, a1, a2
+        assert_eq!(output.inventory.get(&b), Some(EntryId(1))); // b0, b1
         assert_eq!(output.data_dir, data_dir);
 
         // The segment files actually gained the replayed suffix.
@@ -273,8 +271,11 @@ mod tests {
         // an empty WAL dir and rebuilds the inventory from the segment files
         // alone — still byte-identical, still cursor 2.
         let output = run(data_dir.clone(), &db).unwrap();
-        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), after_first);
-        assert_eq!(output.inventory.get(&a), Some(2));
+        assert_eq!(
+            fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(),
+            after_first
+        );
+        assert_eq!(output.inventory.get(&a), Some(EntryId(2)));
     }
 
     #[test]
@@ -294,7 +295,7 @@ mod tests {
         let (_db_dir, db) = open_db();
         // Recovery returns Ok, having recovered only the pre-corruption entry.
         let output = run(data_dir.clone(), &db).unwrap();
-        assert_eq!(output.inventory.get(&a), Some(0));
+        assert_eq!(output.inventory.get(&a), Some(EntryId(0)));
         assert_eq!(last_id(&data_dir, a, 0), Some(0));
     }
 
@@ -342,8 +343,11 @@ mod tests {
 
         // Zero appends (the survivor dedups), the segment is byte-identical, and
         // the already-deleted half's data was safe in the segment all along.
-        assert_eq!(fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(), before);
-        assert_eq!(output.inventory.get(&a), Some(1));
+        assert_eq!(
+            fs::read(a.file_path(&data_dir, EntryId(0))).unwrap(),
+            before
+        );
+        assert_eq!(output.inventory.get(&a), Some(EntryId(1)));
         assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
     }
 
@@ -367,7 +371,7 @@ mod tests {
 
         let (_db_dir, db) = open_db();
         let output = run(data_dir.clone(), &db).unwrap();
-        assert_eq!(output.inventory.get(&a), Some(n + 2));
+        assert_eq!(output.inventory.get(&a), Some(EntryId(n + 2)));
 
         // The rebuilt index resolves byte-identically to a from-scratch rebuild for
         // every id — in particular the interior anchor resolves, instead of
@@ -394,7 +398,8 @@ mod tests {
         let mut wal = WalWriter::new(data_dir.to_path_buf()).unwrap();
         for batch in batches {
             for &(key, entry_id, payload) in *batch {
-                let wp = RoutingHeader::new(key, EntryId(entry_id), 1).build_wal_payload(payload.as_bytes());
+                let wp = RoutingHeader::new(key, EntryId(entry_id), 1)
+                    .build_wal_payload(payload.as_bytes());
                 WalRecord::data(wp, 1).encode_to(wal.buf()).unwrap();
             }
             WalRecord::batch_end().encode_to(wal.buf()).unwrap();
@@ -430,7 +435,7 @@ mod tests {
         let output = run(data_dir.clone(), &db).unwrap();
 
         // Exactly the ACKed prefix survives; the never-fsynced entry 2 is gone.
-        assert_eq!(output.inventory.get(&a), Some(1));
+        assert_eq!(output.inventory.get(&a), Some(EntryId(1)));
         assert_eq!(last_id(&data_dir, a, 0), Some(1));
     }
 
@@ -449,7 +454,7 @@ mod tests {
         let output = run(data_dir.clone(), &db).unwrap();
 
         // Entry 0 dedups against the checkpoint; 1 and 2 are replayed from the WAL.
-        assert_eq!(output.inventory.get(&a), Some(2));
+        assert_eq!(output.inventory.get(&a), Some(EntryId(2)));
         assert_eq!(last_id(&data_dir, a, 0), Some(2));
         assert!(fs::read_dir(data_dir.join("wal")).unwrap().next().is_none());
     }
@@ -473,7 +478,7 @@ mod tests {
 
         // The torn segment tail is truncated to the verified prefix, then entry 1
         // is re-replayed from the WAL — converging to the full ACKed sequence.
-        assert_eq!(output.inventory.get(&a), Some(1));
+        assert_eq!(output.inventory.get(&a), Some(EntryId(1)));
         assert_eq!(last_id(&data_dir, a, 0), Some(1));
     }
 }

@@ -4,6 +4,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use super::ConsumerRecord;
+use crate::client::consumer::group::ConsumerPosition;
 use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, CompressionCodec};
@@ -31,6 +32,8 @@ pub(crate) enum RangeFetchActorCommand {
 pub(crate) struct RangeFetchActor {
     range_id: RangeId,
     next_entry_id: EntryId,
+    skip_batch_offsets_below: Option<u64>,
+    next_absolute_offset: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
@@ -39,12 +42,16 @@ impl RangeFetchActor {
     pub(crate) fn new(
         range_id: RangeId,
         next_entry_id: EntryId,
+        skip_batch_offsets_below: Option<u64>,
+        next_absolute_offset: u64,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
             range_id,
             next_entry_id,
+            skip_batch_offsets_below,
+            next_absolute_offset,
             ctx,
             record_tx,
         }
@@ -89,6 +96,7 @@ impl RangeFetchActor {
         let segment = match self.ctx.lookup_range(self.range_id, self.next_entry_id) {
             RangeLookupResult::FellBehind { first_start } => {
                 self.next_entry_id = first_start;
+                self.skip_batch_offsets_below = None;
                 return Ok(true);
             }
             RangeLookupResult::NeedRefresh => {
@@ -100,6 +108,7 @@ impl RangeFetchActor {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
+                        next_entry_id: self.next_entry_id,
                         transition,
                     });
                 }
@@ -142,14 +151,32 @@ impl RangeFetchActor {
                             ClientError::UnexpectedResponse
                         })?;
 
+                    let skip_batch_offsets_below = if entry.entry_id == self.next_entry_id {
+                        self.skip_batch_offsets_below
+                    } else {
+                        None
+                    };
+                    if skip_batch_offsets_below.is_some() {
+                        self.skip_batch_offsets_below = None;
+                    }
+
                     for (i, rec) in records.into_iter().enumerate() {
+                        if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
+                            continue;
+                        }
+
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.range_id,
-                            offset: *entry.entry_id + i as u64,
+                            position: ConsumerPosition {
+                                batch_offset: i as u64,
+                                entry_id: entry.entry_id,
+                                absolute_offset: self.next_absolute_offset,
+                            },
                             key: rec.key,
                             value: rec.value,
                         };
+                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
 
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {
                             return Ok(false); // Disconnected
@@ -171,6 +198,7 @@ impl RangeFetchActor {
                 {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
                         range_id: self.range_id,
+                        next_entry_id,
                         transition,
                     });
                     return Ok(false);

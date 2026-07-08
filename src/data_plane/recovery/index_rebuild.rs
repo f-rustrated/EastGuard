@@ -17,6 +17,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::parse_segment_file;
 use crate::data_plane::sparse_index::{SparseEntry, is_index_anchor};
@@ -35,23 +36,25 @@ pub(crate) fn rebuild_sparse_entries(path: &Path, key: SegmentKey) -> io::Result
     let mut position: u64 = 0;
     let mut completed: u64 = 0;
 
-    // The open batch's (Data-record byte start, positional entry id), pending
+    // The open batch's (Data-record byte start, positional entry id, record count), pending
     // until its `BatchEnd` confirms the batch is durable.
-    let mut pending: Option<(u64, u64)> = None;
+    let mut pending: Option<(u64, EntryId, u32)> = None;
 
     loop {
         match WalRecord::decode_from(&mut reader) {
             Ok(record) => {
                 match record.record_type {
-                    WalRecordType::Data => pending = Some((position, start_offset + completed)),
+                    WalRecordType::Data => {
+                        pending = Some((position, start_offset + completed, record.record_count))
+                    }
                     WalRecordType::BatchEnd => {
-                        if let Some((byte_start, entry_id)) = pending.take() {
+                        if let Some((byte_start, entry_id, _)) = pending.take() {
                             if is_index_anchor(byte_start, entry_id) {
                                 let entry =
                                     SparseEntry::new(key, entry_id, byte_start.to_be_bytes());
                                 entries.push(entry);
                             }
-                            completed += 1;
+                            completed += 1_u64;
                         }
                     }
                 }

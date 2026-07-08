@@ -3,10 +3,11 @@ use crate::client::{
     Client, ClientError, Consumer, ConsumerConfig, ConsumerRecord, PartitionStrategy, Producer,
     ProducerConfig, StoragePolicy,
 };
-use crate::control_plane::metadata::RangeId;
+use crate::control_plane::metadata::{EntryId, RangeId};
 use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use dashmap::DashMap;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,31 +31,60 @@ impl HeartbeatPayload {
     }
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerPosition {
+    pub entry_id: EntryId,
+    pub batch_offset: u64,
+    pub absolute_offset: u64,
+}
+
+impl Default for ConsumerPosition {
+    fn default() -> Self {
+        Self {
+            batch_offset: 0,
+            entry_id: EntryId(0),
+            absolute_offset: 0,
+        }
+    }
+}
+
+impl Ord for ConsumerPosition {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Idiomatic Rust: Pack fields into a tuple in the exact
+        // priority order you want them evaluated.
+        (self.entry_id, self.batch_offset).cmp(&(other.entry_id, other.batch_offset))
+    }
+}
+
+impl PartialOrd for ConsumerPosition {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct OffsetCommitPayload {
     pub range_id: RangeId,
-    pub offset: u64,
+    pub position: ConsumerPosition,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct OffsetTracker {
-    pub processed: u64,
-    pub committed: Option<u64>,
+    pub uncommitted: ConsumerPosition,
+    pub committed: Option<ConsumerPosition>,
 }
 
 impl OffsetTracker {
-    pub fn new(processed: u64) -> Self {
+    pub fn new(position: ConsumerPosition) -> Self {
         Self {
-            processed,
+            uncommitted: position,
             committed: None,
         }
     }
 
     pub fn needs_commit(&self) -> bool {
-        match self.committed {
-            Some(committed) => self.processed > committed,
-            None => true,
-        }
+        self.committed
+            .is_none_or(|committed| self.uncommitted > committed)
     }
 }
 
@@ -163,23 +193,32 @@ impl ConsumerGroup {
         self.owned_ranges.load().contains(&range_id)
     }
 
-    pub(crate) fn record_offset(&self, range_id: RangeId, offset: u64) {
+    pub(crate) fn record_offset(&self, range_id: RangeId, processed: ConsumerPosition) {
         self.offsets
             .entry(range_id)
-            .and_modify(|tracker| tracker.processed = offset)
-            .or_insert_with(|| OffsetTracker::new(offset));
+            .and_modify(|tracker| {
+                if processed > tracker.uncommitted {
+                    tracker.uncommitted = processed;
+                }
+            })
+            .or_insert_with(|| OffsetTracker::new(processed));
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
         // Collect commits synchronously to release DashMap locks before awaiting network calls.
-        let commits: Vec<(RangeId, u64)> = self
+        let uncommitted: Vec<(RangeId, ConsumerPosition)> = self
             .offsets
             .iter()
             .filter(|entry| entry.needs_commit())
-            .map(|entry| (*entry.key(), entry.value().processed))
+            .map(|entry| (*entry.key(), entry.value().uncommitted))
             .collect();
 
-        self.write_offset_commits(commits).await
+        tracing::info!(?uncommitted);
+        if uncommitted.is_empty() {
+            return Ok(());
+        }
+
+        self.write_offset_commits(uncommitted).await
     }
 
     fn remove_dead_peers(&self) {
@@ -228,11 +267,13 @@ impl ConsumerGroup {
             if let Some(entry) = self.offsets.get(&range)
                 && entry.needs_commit()
             {
-                commits.push((range, entry.processed));
+                commits.push((range, entry.uncommitted));
             }
         }
 
-        self.write_offset_commits(commits).await?;
+        if !commits.is_empty() {
+            self.write_offset_commits(commits).await?;
+        }
 
         // Remove revoked ranges from local offsets map
         for &range in ranges {
@@ -241,21 +282,36 @@ impl ConsumerGroup {
         Ok(())
     }
 
-    async fn write_offset_commits(&self, commits: Vec<(RangeId, u64)>) -> Result<(), ClientError> {
-        if commits.is_empty() {
-            return Ok(());
-        }
+    async fn write_offset_commits(
+        &self,
+        commits: Vec<(RangeId, ConsumerPosition)>,
+    ) -> Result<(), ClientError> {
+        let futures = commits.into_iter().map(|(range_id, position)| async move {
+            let data = match borsh::to_vec(&OffsetCommitPayload { range_id, position }) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(?range_id, error = ?e, "Failed to serialize offset payload");
+                    return; // Skip this range, retry on next tick
+                }
+            };
 
-        let futures = commits.into_iter().map(|(range_id, offset)| async move {
-            if let Ok(data) = borsh::to_vec(&OffsetCommitPayload { range_id, offset })
-                && self
-                    .offset_producer
-                    .send(self.routing_key().as_bytes(), data)
-                    .await
-                    .is_ok()
-                && let Some(mut entry) = self.offsets.get_mut(&range_id)
+            //  Send over network
+            if let Err(e) = self
+                .offset_producer
+                .send(self.routing_key().as_bytes(), data)
+                .await
             {
-                entry.committed = Some(offset);
+                tracing::warn!(?range_id, error = ?e, "Failed to send offset commit to broker");
+                return; // Skip this range, retry on next tick
+            }
+
+            // Update DashMap safely
+            if let Some(mut entry) = self.offsets.get_mut(&range_id) {
+                // Guard against out-of-order network responses dragging the pointer backward
+                let is_newer = entry.committed.is_none_or(|committed| position > committed);
+                if is_newer {
+                    entry.committed = Some(position);
+                }
             }
         });
 

@@ -315,8 +315,10 @@ fn print_record(record: &ConsumerRecord) {
         sys_time.subsec_millis(),
     );
     println!(
-        "[[{}] key: '{}', value: '{}'",
-        record.offset,
+        "[[{}:{} abs={}] key: '{}', value: '{}'",
+        record.position.entry_id.0,
+        record.position.batch_offset,
+        record.position.absolute_offset,
         String::from_utf8_lossy(&record.key),
         String::from_utf8_lossy(&record.value)
     );

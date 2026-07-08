@@ -1235,7 +1235,7 @@ fn consumer_retention_recovery() -> turmoil::Result {
             },
         );
 
-        // 1. Produce record 1 (goes to segment 0, offset 0)
+        // 1. Produce record 1 (goes to segment 0, entry 0)
         producer
             .send(b"k", b"expired-rec".to_vec())
             .await
@@ -1247,7 +1247,7 @@ fn consumer_retention_recovery() -> turmoil::Result {
         // 3. Wait for the sealed segment to exceed retention and be deleted
         wait_for_retention_deletion(&client, "retention-recover", 0).await;
 
-        // 4. Produce record 2 (goes to segment 1, offset 1)
+        // 4. Produce record 2 (goes to segment 1, entry 1)
         producer
             .send(b"k", b"surviving-rec".to_vec())
             .await
@@ -1269,7 +1269,8 @@ fn consumer_retention_recovery() -> turmoil::Result {
             .await
             .expect("read record")
             .expect("should have record");
-        assert_eq!(rec.offset, 1);
+        assert_eq!(rec.position.batch_offset, 0);
+        assert_eq!(rec.position.entry_id, 1.into());
         assert_eq!(rec.value, b"surviving-rec");
 
         // Ensure no other record is returned
@@ -1375,6 +1376,165 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
             .expect("read")
             .expect("rec-seg-2");
         assert_eq!(rec2.value, b"rec-seg-2");
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Verify that producer batching with linger_ms > 0 advances the physical entry IDs
+/// by the record_count of each batch, and that consumer reads/resumes work correctly.
+// ! Current it fails: "Error: "Ran for duration: 90s steps: 902 without completing"
+#[test]
+#[serial_test::serial]
+fn consumer_linger_batching_end_to_end() -> turmoil::Result {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("[new consumer]=info")
+        .with_test_writer()
+        .try_init();
+
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        let custom_policy = policy();
+        client
+            .create_topic("linger-batching", custom_policy)
+            .await
+            .expect("create topic");
+
+        client
+            .resolve_topic("linger-batching")
+            .await
+            .expect("resolve");
+
+        let producer = Producer::new(
+            client.clone(),
+            "linger-batching".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 10,
+                },
+                codec: CompressionCodec::Lz4,
+            },
+        );
+
+        // Send 3 records concurrently so they get batched together as Entry 0
+        let (res1, res2, res3) = tokio::join!(
+            producer.send(b"key1", b"val1".to_vec()),
+            producer.send(b"key1", b"val2".to_vec()),
+            producer.send(b"key1", b"val3".to_vec()),
+        );
+        let e0_1 = res1.expect("send 1");
+        let e0_2 = res2.expect("send 2");
+        let e0_3 = res3.expect("send 3");
+        assert_eq!(e0_1, EntryId(0));
+        assert_eq!(e0_2, EntryId(0));
+        assert_eq!(e0_3, EntryId(0));
+
+        // Sleep to let the next batch start
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Send 2 records concurrently so they get batched together as Entry 1
+        let (res4, res5) = tokio::join!(
+            producer.send(b"key1", b"val4".to_vec()),
+            producer.send(b"key1", b"val5".to_vec()),
+        );
+        let e1_1 = res4.expect("send 4");
+        let e1_2 = res5.expect("send 5");
+        // Since Entry 0 had 3 records, next_entry_id should have advanced to EntryId(3)
+        assert_eq!(e1_1, EntryId(1));
+        assert_eq!(e1_2, EntryId(1));
+
+        // Consume the records
+        let mut config = ConsumerConfig::new(StartPolicy::Earliest);
+        config.group_id = Some("linger-batching-group".into()); // Set group id 
+
+        let consumer = Consumer::new(
+            client.clone(),
+            "linger-batching".to_string(),
+            KeyInterest::AllKeys,
+            config.clone(),
+        )
+        .await
+        .expect("create consumer");
+
+        // Read first 3 records (from Entry 0)
+        let r1 = consumer.next_record().await.expect("read 1").expect("r1");
+        assert_eq!(r1.position.batch_offset, 0);
+        assert_eq!(r1.position.entry_id, EntryId(0));
+        assert_eq!(r1.position.absolute_offset, 0);
+        assert_eq!(r1.value, b"val1");
+
+        let r2 = consumer.next_record().await.expect("read 2").expect("r2");
+        assert_eq!(r2.position.batch_offset, 1);
+        assert_eq!(r2.position.entry_id, EntryId(0));
+        assert_eq!(r2.position.absolute_offset, 1);
+        assert_eq!(r2.value, b"val2");
+
+        let r3 = consumer.next_record().await.expect("read 3").expect("r3");
+        assert_eq!(r3.position.batch_offset, 2);
+        assert_eq!(r3.position.entry_id, EntryId(0));
+        assert_eq!(r3.position.absolute_offset, 2);
+        assert_eq!(r3.value, b"val3");
+
+        // Read next 2 records (from Entry 3)
+        let r4 = consumer.next_record().await.expect("read 4").expect("r4");
+        assert_eq!(r4.position.batch_offset, 0);
+        assert_eq!(r4.position.entry_id, EntryId(1));
+        assert_eq!(r4.position.absolute_offset, 3);
+        assert_eq!(r4.value, b"val4");
+
+        let r5 = consumer.next_record().await.expect("read 5").expect("r5");
+        assert_eq!(r5.position.batch_offset, 1);
+        assert_eq!(r5.position.entry_id, EntryId(1));
+        assert_eq!(r5.position.absolute_offset, 4);
+        assert_eq!(r5.value, b"val5");
+
+        // Commit progress at offset 4
+        consumer.commit().await.expect("commit");
+
+        // Close consumer and create a new one to verify resuming / skipping works
+        drop(consumer);
+
+        let span = tracing::info_span!("new consumer");
+
+        let _guard = span.enter();
+        let consumer_resume = Consumer::new(
+            client,
+            "linger-batching".to_string(),
+            KeyInterest::AllKeys,
+            config,
+        )
+        .await
+        .expect("create consumer resume");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Produce a 6th record (should start at offset 0 / EntryId 2)
+        let res6 = producer.send(b"key1", b"val6".to_vec()).await;
+
+        let e2 = res6.expect("send 6");
+        assert_eq!(e2, EntryId(2));
+
+        // Read the 6th record and verify offsets/entry_ids
+        let r6 = consumer_resume
+            .next_record()
+            .await
+            .expect("read 6")
+            .expect("r6");
+
+        drop(_guard);
+        assert_eq!(r6.position.batch_offset, 0);
+        assert_eq!(r6.value, b"val6");
+        assert_eq!(r6.position.entry_id, EntryId(2));
+        assert_eq!(r6.position.absolute_offset, 5);
 
         Ok(())
     });

@@ -417,7 +417,7 @@ impl Swim {
     }
 
     fn handle_ping(&mut self, src: SocketAddr, header: SwimHeader) {
-        tracing::info!(
+        tracing::debug!(
             "[{}] ← Received Ping from {} ({}) seq={}",
             self.node_id,
             header.source_node_id,
@@ -431,7 +431,7 @@ impl Swim {
     }
 
     fn handle_ack(&mut self, src: SocketAddr, header: SwimHeader) {
-        tracing::info!(
+        tracing::debug!(
             "[{}] ← Received Ack  from {} ({}) seq={}",
             self.node_id,
             header.source_node_id,

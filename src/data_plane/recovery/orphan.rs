@@ -14,6 +14,7 @@
 use std::io;
 use std::path::Path;
 
+use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 
 /// A recovered sealed segment no replica set currently names this node for. `start_offset`
@@ -21,14 +22,14 @@ use crate::data_plane::SegmentKey;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrphanCandidate {
     pub(crate) segment_key: SegmentKey,
-    pub(crate) start_offset: u64,
+    pub(crate) start_entry: EntryId,
 }
 
 impl OrphanCandidate {
-    pub(crate) fn new(segment_key: SegmentKey, start_offset: u64) -> Self {
+    pub(crate) fn new(segment_key: SegmentKey, start_entry: EntryId) -> Self {
         Self {
             segment_key,
-            start_offset,
+            start_entry,
         }
     }
 
@@ -37,7 +38,7 @@ impl OrphanCandidate {
     /// is cluster-confirmed and last. Returns the key so the caller can drop its inventory
     /// entry. Idempotent: an already-absent file is success.
     pub(crate) fn delete(&self, data_dir: &Path) -> io::Result<SegmentKey> {
-        let path = self.segment_key.file_path(data_dir, crate::control_plane::metadata::EntryId(self.start_offset));
+        let path = self.segment_key.file_path(data_dir, self.start_entry);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(self.segment_key),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(self.segment_key),
@@ -61,7 +62,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let candidate = OrphanCandidate {
             segment_key: seg(),
-            start_offset: 0,
+            start_entry: EntryId(0),
         };
         let path = candidate.segment_key.file_path(dir.path(), 0);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -79,7 +80,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let candidate = OrphanCandidate {
             segment_key: seg(),
-            start_offset: 0,
+            start_entry: EntryId(0),
         };
         // No file on disk: deleting is a no-op success (idempotent re-runs).
         assert_eq!(candidate.delete(dir.path()).unwrap(), seg());
