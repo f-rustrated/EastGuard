@@ -99,7 +99,7 @@ pub enum DataPlaneResponse {
 
     RangeOffset {
         start_entry_id: EntryId,
-        committed_entry_id: EntryId,
+        next_entry_id: EntryId,
     },
     // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
     // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
@@ -128,10 +128,10 @@ impl DataPlaneResponse {
         match value {
             ListOffsetsResult::RangeOffsets {
                 start_entry_id,
-                committed_entry_id,
+                next_entry_id,
             } => DataPlaneResponse::RangeOffset {
                 start_entry_id,
-                committed_entry_id,
+                next_entry_id,
             },
             ListOffsetsResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
             ListOffsetsResult::InternalError(s) => DataPlaneResponse::InternalError(s),
