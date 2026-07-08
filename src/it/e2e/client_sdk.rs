@@ -1469,27 +1469,32 @@ fn consumer_linger_batching_end_to_end() -> turmoil::Result {
         let r1 = consumer.next_record().await.expect("read 1").expect("r1");
         assert_eq!(r1.position.batch_offset, 0);
         assert_eq!(r1.position.entry_id, EntryId(0));
+        assert_eq!(r1.position.absolute_offset, 0);
         assert_eq!(r1.value, b"val1");
 
         let r2 = consumer.next_record().await.expect("read 2").expect("r2");
         assert_eq!(r2.position.batch_offset, 1);
         assert_eq!(r2.position.entry_id, EntryId(0));
+        assert_eq!(r2.position.absolute_offset, 1);
         assert_eq!(r2.value, b"val2");
 
         let r3 = consumer.next_record().await.expect("read 3").expect("r3");
         assert_eq!(r3.position.batch_offset, 2);
         assert_eq!(r3.position.entry_id, EntryId(0));
+        assert_eq!(r3.position.absolute_offset, 2);
         assert_eq!(r3.value, b"val3");
 
         // Read next 2 records (from Entry 3)
         let r4 = consumer.next_record().await.expect("read 4").expect("r4");
         assert_eq!(r4.position.batch_offset, 0);
         assert_eq!(r4.position.entry_id, EntryId(1));
+        assert_eq!(r4.position.absolute_offset, 3);
         assert_eq!(r4.value, b"val4");
 
         let r5 = consumer.next_record().await.expect("read 5").expect("r5");
         assert_eq!(r5.position.batch_offset, 1);
         assert_eq!(r5.position.entry_id, EntryId(1));
+        assert_eq!(r5.position.absolute_offset, 4);
         assert_eq!(r5.value, b"val5");
 
         // Commit progress at offset 4
@@ -1529,6 +1534,7 @@ fn consumer_linger_batching_end_to_end() -> turmoil::Result {
         assert_eq!(r6.position.batch_offset, 0);
         assert_eq!(r6.value, b"val6");
         assert_eq!(r6.position.entry_id, EntryId(2));
+        assert_eq!(r6.position.absolute_offset, 5);
 
         Ok(())
     });

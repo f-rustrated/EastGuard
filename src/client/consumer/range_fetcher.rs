@@ -33,6 +33,7 @@ pub(crate) struct RangeFetchActor {
     range_id: RangeId,
     next_entry_id: EntryId,
     skip_batch_offsets_below: Option<u64>,
+    next_absolute_offset: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
@@ -42,6 +43,7 @@ impl RangeFetchActor {
         range_id: RangeId,
         next_entry_id: EntryId,
         skip_batch_offsets_below: Option<u64>,
+        next_absolute_offset: u64,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
@@ -49,6 +51,7 @@ impl RangeFetchActor {
             range_id,
             next_entry_id,
             skip_batch_offsets_below,
+            next_absolute_offset,
             ctx,
             record_tx,
         }
@@ -168,10 +171,12 @@ impl RangeFetchActor {
                             position: ConsumerPosition {
                                 batch_offset: i as u64,
                                 entry_id: entry.entry_id,
+                                absolute_offset: self.next_absolute_offset,
                             },
                             key: rec.key,
                             value: rec.value,
                         };
+                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
 
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {
                             return Ok(false); // Disconnected

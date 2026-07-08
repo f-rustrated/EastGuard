@@ -126,15 +126,19 @@ impl TopicFetchManagerState {
         let metadata = ctx.metadata.load();
 
         for range in to_start {
-            let (resolved_entry_id, skip_below_offset) =
+            let (resolved_entry_id, skip_below_offset, next_absolute_offset) =
                 if let Some(pos) = saved_offsets.get(&range) {
                     // Prefer explicitly saved offsets. The committed offset is a
                     // record-level checkpoint. Because one entry can contain multiple
                     // records, the next entry we fetch begins at the physical batch containing
                     // the committed offset, and we skip any records that have already been processed.
-                    (pos.entry_id, Some(pos.batch_offset))
+                    (
+                        pos.entry_id,
+                        Some(pos.batch_offset),
+                        pos.absolute_offset.saturating_add(1),
+                    )
                 } else {
-                    (self.resolve_start_entry_id(range, ctx).await, None)
+                    (self.resolve_start_entry_id(range, ctx).await, None, 0)
                 };
 
             if self.should_skip_start(range, &metadata.ranges, &saved_offsets, resolved_entry_id) {
@@ -149,7 +153,8 @@ impl TopicFetchManagerState {
                         r_meta.keyspace_start.clone(),
                         r_meta.keyspace_end.clone(),
                     )
-                    .with_skip_batch_offsets_below(skip_below_offset),
+                    .with_skip_batch_offsets_below(skip_below_offset)
+                    .with_next_absolute_offset(next_absolute_offset),
                     ctx.clone(),
                 );
             }
@@ -167,6 +172,7 @@ impl TopicFetchManagerState {
             cursor.range_id,
             cursor.next_entry_id,
             cursor.skip_batch_offsets_below,
+            cursor.next_absolute_offset,
             ctx,
             self.record_tx.clone(),
         );

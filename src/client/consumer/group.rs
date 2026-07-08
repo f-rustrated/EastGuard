@@ -33,9 +33,9 @@ impl HeartbeatPayload {
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumerPosition {
-    // TODO absolute_offset: u64
     pub entry_id: EntryId,
     pub batch_offset: u64,
+    pub absolute_offset: u64,
 }
 
 impl Default for ConsumerPosition {
@@ -43,6 +43,7 @@ impl Default for ConsumerPosition {
         Self {
             batch_offset: 0,
             entry_id: EntryId(0),
+            absolute_offset: 0,
         }
     }
 }
