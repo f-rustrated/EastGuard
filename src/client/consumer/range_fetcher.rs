@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
-use super::ConsumerRecord;
+use super::{ConsumerRecord, RangeCursor};
 use crate::client::consumer::group::ConsumerPosition;
 use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
@@ -38,35 +38,20 @@ pub(crate) enum RangeFetchActorCommand {
     },
 }
 
-// TODO relationship between RangeFetchActor vs RangeCursor when there is a significant duplicate in data
-// and possibly stale data issue. (range_id, next_entry_id, skip_batch_offsets_below, skip_absolute_offsets_below)
-// These values are ephemeral, subject to changes.
 pub(crate) struct RangeFetchActor {
-    range_id: RangeId,
-    next_entry_id: EntryId,
-    skip_batch_offsets_below: Option<u64>,
-    skip_absolute_offsets_below: Option<u64>,
-    next_absolute_offset: u64,
+    cursor: RangeCursor,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
 
 impl RangeFetchActor {
     pub(crate) fn new(
-        range_id: RangeId,
-        next_entry_id: EntryId,
-        skip_batch_offsets_below: Option<u64>,
-        skip_absolute_offsets_below: Option<u64>,
-        next_absolute_offset: u64,
+        cursor: RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
-            range_id,
-            next_entry_id,
-            skip_batch_offsets_below,
-            skip_absolute_offsets_below,
-            next_absolute_offset,
+            cursor,
             ctx,
             record_tx,
         }
@@ -96,7 +81,7 @@ impl RangeFetchActor {
                             absolute_offset,
                             reply,
                         }) => {
-                            self.seek_absolute_offset(absolute_offset);
+                            self.cursor.seek_to_absolute_offset(absolute_offset);
                             self.ctx.refresh_metadata().await.ok();
                             let _ = reply.send(());
                         }
@@ -125,10 +110,13 @@ impl RangeFetchActor {
         }
 
         // Read metadata snapshot.
-        let segment = match self.ctx.lookup_range(self.range_id, self.next_entry_id) {
+        let segment = match self
+            .ctx
+            .lookup_range(self.cursor.range_id, self.cursor.next_entry_id)
+        {
             RangeLookupResult::FellBehind { first_start } => {
-                self.next_entry_id = first_start;
-                self.skip_batch_offsets_below = None;
+                self.cursor.next_entry_id = first_start;
+                self.cursor.skip_batch_offsets_below = None;
                 return Ok(true);
             }
             RangeLookupResult::NeedRefresh => {
@@ -139,8 +127,7 @@ impl RangeFetchActor {
             RangeLookupResult::RangeSealedAndDrained { progress_signal } => {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
-                        range_id: self.range_id,
-                        next_entry_id: self.next_entry_id,
+                        cursor: self.cursor.clone(),
                         transition,
                     });
                 }
@@ -151,7 +138,7 @@ impl RangeFetchActor {
 
         let served = self
             .ctx
-            .fetch(&segment, self.range_id, self.next_entry_id)
+            .fetch(&segment, self.cursor.range_id, self.cursor.next_entry_id)
             .await?;
 
         let ClientResponse::DataPlane(dp_response) = served.response else {
@@ -187,8 +174,8 @@ impl RangeFetchActor {
                             ClientError::UnexpectedResponse
                         })?;
 
-                    let skip_batch_offsets_below = if entry.entry_id == self.next_entry_id {
-                        self.skip_batch_offsets_below.take()
+                    let skip_batch_offsets_below = if entry.entry_id == self.cursor.next_entry_id {
+                        self.cursor.skip_batch_offsets_below.take()
                     } else {
                         None
                     };
@@ -198,20 +185,22 @@ impl RangeFetchActor {
                             continue;
                         }
 
-                        let absolute_offset = self.next_absolute_offset;
-                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
+                        let absolute_offset = self.cursor.next_absolute_offset;
+                        self.cursor.next_absolute_offset =
+                            self.cursor.next_absolute_offset.saturating_add(1);
 
                         if self
+                            .cursor
                             .skip_absolute_offsets_below
                             .is_some_and(|target| absolute_offset < target)
                         {
                             continue;
                         }
-                        self.skip_absolute_offsets_below = None;
+                        self.cursor.skip_absolute_offsets_below = None;
 
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
-                            range_id: self.range_id,
+                            range_id: self.cursor.range_id,
                             position: ConsumerPosition {
                                 batch_offset: i as u64,
                                 entry_id: entry.entry_id,
@@ -239,29 +228,29 @@ impl RangeFetchActor {
                 } = progress_signal
                     && next_entry_id > end_entry_id
                 {
+                    self.cursor.next_entry_id = next_entry_id;
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
-                        range_id: self.range_id,
-                        next_entry_id,
+                        cursor: self.cursor.clone(),
                         transition,
                     });
                     return Ok(false);
                 }
 
-                self.next_entry_id = next_entry_id;
+                self.cursor.next_entry_id = next_entry_id;
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
-                let prev_entry_id = self.next_entry_id;
+                let prev_entry_id = self.cursor.next_entry_id;
                 let (start_id, _) = self
                     .ctx
                     .client
-                    .fetch_range_entry_ids(&self.ctx.topic, self.range_id)
+                    .fetch_range_entry_ids(&self.ctx.topic, self.cursor.range_id)
                     .await?;
 
-                if self.next_entry_id < start_id {
-                    self.next_entry_id = start_id;
+                if self.cursor.next_entry_id < start_id {
+                    self.cursor.next_entry_id = start_id;
                 }
-                if self.next_entry_id == prev_entry_id {
+                if self.cursor.next_entry_id == prev_entry_id {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     self.ctx.refresh_metadata().await?;
                 }
@@ -277,24 +266,18 @@ impl RangeFetchActor {
         }
     }
 
-    fn seek_absolute_offset(&mut self, absolute_offset: u64) {
-        self.next_entry_id = EntryId::MIN;
-        self.skip_batch_offsets_below = None;
-        self.skip_absolute_offsets_below = Some(absolute_offset);
-        self.next_absolute_offset = 0;
-    }
-
     fn should_skip_entry_by_absolute_offset(&mut self, record_count: u32) -> bool {
-        let Some(target) = self.skip_absolute_offsets_below else {
+        let Some(target) = self.cursor.skip_absolute_offsets_below else {
             return false;
         };
 
         let next_entry_absolute_offset = self
+            .cursor
             .next_absolute_offset
             .saturating_add(u64::from(record_count));
 
         if next_entry_absolute_offset <= target {
-            self.next_absolute_offset = next_entry_absolute_offset;
+            self.cursor.next_absolute_offset = next_entry_absolute_offset;
             return true;
         }
         false

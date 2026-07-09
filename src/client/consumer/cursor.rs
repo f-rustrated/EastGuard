@@ -181,6 +181,20 @@ impl RangeCursorSet {
         new_cursors
     }
 
+    pub fn apply_drained_cursor(
+        &mut self,
+        drained: RangeCursor,
+        transition: RangeTransition,
+    ) -> Box<[RangeCursor]> {
+        let new_cursors = self.apply_transition(drained, transition);
+        self.cursors.extend(new_cursors.clone());
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
+
+        new_cursors
+    }
+
     fn apply_transition(
         &mut self,
         drained: RangeCursor,
