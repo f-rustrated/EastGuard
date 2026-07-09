@@ -25,17 +25,13 @@ pub struct MetadataProposal {
     pub command: MetadataCommand,
 }
 
-pub struct HandleNodeJoin {
-    pub new_node_id: NodeId,
-}
-
 pub enum RaftProtocolMessage {
     InboundRaftRpc(InboundRaftRpc),
     Timeout(RaftTimeoutCallback),
     EnsureGroup(EnsureGroup),
     RemoveGroup(RemoveGroup),
     HandleNodeDeath(NodeId),
-    HandleNodeJoin(HandleNodeJoin),
+    HandleNodeJoin(NodeId),
 }
 
 impl_from_variant!(
@@ -44,8 +40,6 @@ impl_from_variant!(
     Timeout(RaftTimeoutCallback),
     EnsureGroup,
     RemoveGroup,
-    HandleNodeDeath(NodeId),
-    HandleNodeJoin
 );
 
 /// Commands sent from MultiRaftActor to RaftTransportActor.

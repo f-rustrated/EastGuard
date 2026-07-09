@@ -294,7 +294,7 @@ impl MultiRaft {
             RaftProtocolMessage::EnsureGroup(cmd) => self.add_group(&cmd.group),
             RaftProtocolMessage::RemoveGroup(cmd) => self.remove_group(cmd.group_id),
             RaftProtocolMessage::HandleNodeDeath(node_id) => self.handle_node_death(node_id),
-            RaftProtocolMessage::HandleNodeJoin(cmd) => self.add_node(cmd.new_node_id),
+            RaftProtocolMessage::HandleNodeJoin(node_id) => self.add_node(node_id),
         }
     }
 

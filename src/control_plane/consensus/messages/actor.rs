@@ -7,8 +7,8 @@ use crate::control_plane::metadata::{TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
 
 use super::command::{
-    CoordinatorSealRequest, EnsureGroup, HandleNodeJoin, InboundRaftRpc, MetadataProposal,
-    RaftProtocolMessage, RemoveGroup,
+    CoordinatorSealRequest, EnsureGroup, InboundRaftRpc, MetadataProposal, RaftProtocolMessage,
+    RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
 use crate::impl_from_variant_via;
@@ -80,7 +80,6 @@ impl_from_variant_via!(
     InboundRaftRpc,
     EnsureGroup,
     RemoveGroup,
-    HandleNodeJoin,
 );
 
 pub(crate) enum DeferredReply {

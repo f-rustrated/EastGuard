@@ -1,7 +1,5 @@
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::messages::{
-    HandleNodeJoin, MultiRaftActorCommand, RaftProtocolMessage,
-};
+use crate::control_plane::consensus::messages::{MultiRaftActorCommand, RaftProtocolMessage};
 
 #[derive(Debug)]
 pub enum MembershipEvent {
@@ -34,12 +32,9 @@ impl MembershipEvent {
             MembershipEvent::NodeDead(node_id) => {
                 Some(RaftProtocolMessage::HandleNodeDeath(node_id).into())
             }
-            MembershipEvent::NodeAlive(node_id) => Some(
-                HandleNodeJoin {
-                    new_node_id: node_id,
-                }
-                .into(),
-            ),
+            MembershipEvent::NodeAlive(node_id) => {
+                Some(RaftProtocolMessage::HandleNodeJoin(node_id).into())
+            }
         }
     }
 }
