@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use east_guard::client::{
-    Client, Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, PartitionStrategy, Producer,
-    ProducerConfig, RangeId, StoragePolicy,
+    Client, CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
+    PartitionStrategy, Producer, ProducerConfig, RangeId, StoragePolicy,
 };
-use std::sync::Arc;
 use std::future::Future;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "", disable_help_flag = true, disable_version_flag = true)]
@@ -44,6 +44,9 @@ pub enum Commands {
         /// Optional auto-commit interval in milliseconds (default: 1000)
         #[arg(long, default_value = "1000")]
         auto_commit_ms: u64,
+        /// Delivery semantic: at-least-once or at-most-once (default: at-most-once for CLI)
+        #[arg(long, default_value = "at-most-once")]
+        delivery: String,
         /// Pause this range before consuming; mainly useful for manual testing.
         #[arg(long)]
         pause_range: Option<u64>,
@@ -80,6 +83,7 @@ pub async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Res
             timeout_sec,
             group,
             auto_commit_ms,
+            delivery,
             pause_range,
             resume_after_ms,
             seek_range,
@@ -94,6 +98,7 @@ pub async fn execute_command(cmd: Commands, client: &Arc<Client>) -> anyhow::Res
                 timeout_sec,
                 group,
                 auto_commit_ms,
+                delivery,
                 control,
             };
             handle_consume(client, request).await
@@ -147,6 +152,7 @@ struct ConsumeRequest {
     timeout_sec: Option<u64>,
     group: Option<String>,
     auto_commit_ms: u64,
+    delivery: String,
     control: ConsumeControl,
 }
 
@@ -196,10 +202,12 @@ async fn handle_consume(client: &Arc<Client>, request: ConsumeRequest) -> anyhow
         timeout_sec,
         group,
         auto_commit_ms,
+        delivery,
         control,
     } = request;
 
     let start_policy = start.parse()?;
+    let delivery_semantic = parse_delivery_semantic(&delivery)?;
     println!(
         "Consuming up to {} records from '{}' (start: {}, group: {:?})...",
         count, topic, start, group
@@ -209,6 +217,8 @@ async fn handle_consume(client: &Arc<Client>, request: ConsumeRequest) -> anyhow
         start_policy,
         group_id: group.clone(),
         auto_commit_interval_ms: auto_commit_ms,
+        delivery_semantic,
+        commit_mode: CommitMode::Auto,
     };
 
     let consumer =
@@ -271,6 +281,7 @@ async fn handle_consume(client: &Arc<Client>, request: ConsumeRequest) -> anyhow
         match result {
             Ok(Some(record)) => {
                 print_record(&record);
+                consumer.ack(&record)?;
                 fetched += 1;
             }
             Ok(None) => {
@@ -297,6 +308,17 @@ async fn handle_consume(client: &Arc<Client>, request: ConsumeRequest) -> anyhow
     }
 
     Ok(())
+}
+
+fn parse_delivery_semantic(value: &str) -> anyhow::Result<DeliverySemantic> {
+    match value {
+        "at-least-once" => Ok(DeliverySemantic::AtLeastOnce),
+        "at-most-once" => Ok(DeliverySemantic::AtMostOnce),
+        _ => anyhow::bail!(
+            "invalid --delivery '{}'; expected at-least-once or at-most-once",
+            value
+        ),
+    }
 }
 
 async fn fetch_with_optional_timeout<F, T>(

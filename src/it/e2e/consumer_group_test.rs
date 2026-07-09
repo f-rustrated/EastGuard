@@ -1,5 +1,8 @@
 use super::{NodeSpec, host_cluster};
-use crate::client::{Client, Consumer, ConsumerConfig, KeyInterest, Producer, ProducerConfig, StartPolicy};
+use crate::client::{
+    Client, Consumer, ConsumerConfig, DeliverySemantic, KeyInterest, Producer, ProducerConfig,
+    StartPolicy,
+};
 use crate::control_plane::metadata::RangeState;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use std::sync::Arc;
@@ -8,6 +11,171 @@ use turmoil::Builder;
 use uuid::Uuid;
 
 static NODES: &[NodeSpec] = &[("n1", 9091, 9191), ("n2", 9092, 9192), ("n3", 9093, 9193)];
+
+fn group_config(group_id: String) -> ConsumerConfig {
+    let mut config = ConsumerConfig::new(StartPolicy::Earliest);
+    config.group_id = Some(group_id);
+    config.auto_commit_interval_ms = 1000;
+    config
+}
+
+fn group_config_with_semantic(
+    group_id: String,
+    delivery_semantic: DeliverySemantic,
+) -> ConsumerConfig {
+    let mut config = group_config(group_id);
+    config.delivery_semantic = delivery_semantic;
+    config
+}
+
+async fn create_group_test_topics(client: &Arc<Client>, topic: &str) {
+    client
+        .create_topic(
+            topic,
+            StoragePolicy {
+                retention_ms: None,
+                replication_factor: 3,
+                partition_strategy: PartitionStrategy::Fixed,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[test]
+fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(10))
+        .simulation_duration(Duration::from_secs(40))
+        .build();
+
+    host_cluster(&mut sim, NODES, |env| {
+        env.node_id_suffix = Some(String::new());
+        env.vnodes_per_node = 16;
+    });
+
+    sim.client("client", async move {
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let client = Arc::new(Client::connect([client_addr]).unwrap());
+
+        let topic = format!("at_least_once_{}", Uuid::new_v4());
+        create_group_test_topics(&client, &topic).await;
+
+        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        producer.send(b"k", b"first".to_vec()).await.unwrap();
+
+        let group_id = format!("group-{}", Uuid::new_v4());
+        let c1 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(8), c1.next_record())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value, b"first");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(c1);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        let c2 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id),
+        )
+        .await
+        .unwrap();
+
+        let replayed = tokio::time::timeout(Duration::from_secs(8), c2.next_record())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.value, b"first");
+        c2.ack(&replayed).unwrap();
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn at_most_once_auto_commit_commits_delivery() {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(10))
+        .simulation_duration(Duration::from_secs(40))
+        .build();
+
+    host_cluster(&mut sim, NODES, |env| {
+        env.node_id_suffix = Some(String::new());
+        env.vnodes_per_node = 16;
+    });
+
+    sim.client("client", async move {
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let client = Arc::new(Client::connect([client_addr]).unwrap());
+
+        let topic = format!("at_most_once_{}", Uuid::new_v4());
+        create_group_test_topics(&client, &topic).await;
+
+        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        producer.send(b"k", b"first".to_vec()).await.unwrap();
+
+        let group_id = format!("group-{}", Uuid::new_v4());
+        let c1 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config_with_semantic(group_id.clone(), DeliverySemantic::AtMostOnce),
+        )
+        .await
+        .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(8), c1.next_record())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.value, b"first");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        drop(c1);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        producer.send(b"k", b"second".to_vec()).await.unwrap();
+
+        let c2 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config_with_semantic(group_id, DeliverySemantic::AtMostOnce),
+        )
+        .await
+        .unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(8), c2.next_record())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.value, b"second");
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
 
 #[test]
 fn consumer_group_assignment_and_offsets() {
@@ -40,30 +208,6 @@ fn consumer_group_assignment_and_offsets() {
             .await
             .unwrap();
 
-        // System topics will be auto-created upon first use, or we can just produce to them directly.
-        // Actually they are created on demand, but let's just create them to be safe if they aren't.
-        let _ = client
-            .create_topic(
-                "__eastguard_assignments",
-                StoragePolicy {
-                    retention_ms: None,
-                    replication_factor: 3,
-                    partition_strategy: PartitionStrategy::AutoSplit,
-                },
-            )
-            .await;
-
-        let _ = client
-            .create_topic(
-                "__eastguard_offsets",
-                StoragePolicy {
-                    retention_ms: None,
-                    replication_factor: 3,
-                    partition_strategy: PartitionStrategy::AutoSplit,
-                },
-            )
-            .await;
-
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
 
         // Publish some messages to different ranges
@@ -86,11 +230,7 @@ fn consumer_group_assignment_and_offsets() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            ConsumerConfig {
-                start_policy: StartPolicy::Earliest,
-                group_id: Some(group_id.clone()),
-                auto_commit_interval_ms: 1000,
-            },
+            group_config(group_id.clone()),
         )
         .await
         .unwrap();
@@ -99,7 +239,8 @@ fn consumer_group_assignment_and_offsets() {
         // With 3 partitions and only 1 consumer, c1 should consume everything
         loop {
             match tokio::time::timeout(Duration::from_secs(6), c1.next_record()).await {
-                Ok(Ok(Some(_))) => {
+                Ok(Ok(Some(record))) => {
+                    c1.ack(&record).unwrap();
                     c1_records += 1;
                 }
                 Ok(Err(e)) => {
@@ -132,11 +273,7 @@ fn consumer_group_assignment_and_offsets() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            ConsumerConfig {
-                start_policy: StartPolicy::Earliest,
-                group_id: Some(group_id.clone()),
-                auto_commit_interval_ms: 1000,
-            },
+            group_config(group_id.clone()),
         )
         .await
         .unwrap();
@@ -183,13 +320,18 @@ fn consumer_group_scale_out_and_rebalance() {
 
         let topic = format!("test_scale_out_{}", Uuid::new_v4());
         client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::Fixed }).await.unwrap();
-        let _ = client.create_topic("__eastguard_assignments", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
-        let _ = client.create_topic("__eastguard_offsets", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
 
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
         let group_id = "scale-group".to_string();
 
-        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c1 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
 
         for i in 0..10 {
             producer.send(format!("key_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
@@ -198,18 +340,28 @@ fn consumer_group_scale_out_and_rebalance() {
         let mut c1_records = 0;
         while c1_records < 10 {
             match tokio::time::timeout(Duration::from_secs(5), c1.next_record()).await {
-                Ok(Ok(Some(_))) => c1_records += 1,
+                Ok(Ok(Some(record))) => {
+                    c1.ack(&record).unwrap();
+                    c1_records += 1;
+                }
                 Ok(Ok(None)) => panic!("C1 channel closed prematurely!"),
                 Ok(Err(e)) => panic!("C1 error: {:?}", e),
                 Err(_) => panic!("Timeout waiting for C1 to consume record {}/10", c1_records),
             }
         }
         assert_eq!(c1_records, 10, "C1 should process everything while alone");
-        
+
         c1.commit().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c2 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         for i in 10..30 {
@@ -221,14 +373,20 @@ fn consumer_group_scale_out_and_rebalance() {
             tokio::select! {
                 res = c1.next_record() => {
                     match res {
-                        Ok(Some(_)) => total_new_records += 1,
+                        Ok(Some(record)) => {
+                            c1.ack(&record).unwrap();
+                            total_new_records += 1;
+                        }
                         Ok(None) => panic!("C1 closed prematurely"),
                         Err(e) => panic!("C1 error: {:?}", e),
                     }
                 }
                 res = c2.next_record() => {
                     match res {
-                        Ok(Some(_)) => total_new_records += 1,
+                        Ok(Some(record)) => {
+                            c2.ack(&record).unwrap();
+                            total_new_records += 1;
+                        }
                         Ok(None) => panic!("C2 closed prematurely"),
                         Err(e) => panic!("C2 error: {:?}", e),
                     }
@@ -260,8 +418,9 @@ fn consumer_group_failover() {
     });
 
     sim.client("client", async move {
-        let client_addr: std::net::SocketAddr = format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
-        
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+
         // FIX: Independent clients prevent the dropped Consumer from deadlocking the shared network router!
         let client_admin = Arc::new(Client::connect([client_addr]).unwrap());
         let client_prod = Arc::new(Client::connect([client_addr]).unwrap());
@@ -269,27 +428,66 @@ fn consumer_group_failover() {
         let client_c2 = Arc::new(Client::connect([client_addr]).unwrap());
 
         let topic = format!("test_failover_{}", Uuid::new_v4());
-        client_admin.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::Fixed }).await.unwrap();
-        let _ = client_admin.create_topic("__eastguard_assignments", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
-        let _ = client_admin.create_topic("__eastguard_offsets", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
+        client_admin
+            .create_topic(
+                &topic,
+                StoragePolicy {
+                    retention_ms: None,
+                    replication_factor: 3,
+                    partition_strategy: PartitionStrategy::Fixed,
+                },
+            )
+            .await
+            .unwrap();
 
         let group_id = "failover-group".to_string();
 
-        let c1 = Consumer::new(client_c1.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
-        let c2 = Consumer::new(client_c2.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c1 = Consumer::new(
+            client_c1.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
+        let c2 = Consumer::new(
+            client_c2.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let producer = Producer::new(client_prod.clone(), topic.clone(), ProducerConfig::default());
+        let producer = Producer::new(
+            client_prod.clone(),
+            topic.clone(),
+            ProducerConfig::default(),
+        );
         for i in 0..6 {
-            producer.send(format!("primer_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
+            producer
+                .send(format!("primer_{}", i).as_bytes(), b"data".to_vec())
+                .await
+                .unwrap();
         }
-        
+
         let mut primer_records = 0;
         while primer_records < 6 {
             tokio::select! {
-                res = c1.next_record() => { if let Ok(Some(_)) = res { primer_records += 1; } }
-                res = c2.next_record() => { if let Ok(Some(_)) = res { primer_records += 1; } }
+                res = c1.next_record() => {
+                    if let Ok(Some(record)) = res {
+                        c1.ack(&record).unwrap();
+                        primer_records += 1;
+                    }
+                }
+                res = c2.next_record() => {
+                    if let Ok(Some(record)) = res {
+                        c2.ack(&record).unwrap();
+                        primer_records += 1;
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     panic!("Timeout loading primer records");
                 }
@@ -301,33 +499,44 @@ fn consumer_group_failover() {
 
         // Simulate C2 crashing AND its network connection severing!
         drop(c2);
-        drop(client_c2); 
+        drop(client_c2);
 
         // Wait for C2 to expire and C1 to mature the ranges
-        tokio::time::sleep(Duration::from_secs(10)).await; 
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Produce 15 more messages
         for i in 0..15 {
             // Because client_prod is separate, it is completely unblocked by C2's death!
-            producer.send(format!("key_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
+            producer
+                .send(format!("key_{}", i).as_bytes(), b"data".to_vec())
+                .await
+                .unwrap();
         }
 
         let mut c1_records = 0;
         while c1_records < 15 {
             match tokio::time::timeout(Duration::from_secs(5), c1.next_record()).await {
-                Ok(Ok(Some(_))) => c1_records += 1,
+                Ok(Ok(Some(record))) => {
+                    c1.ack(&record).unwrap();
+                    c1_records += 1;
+                }
                 Ok(Ok(None)) => panic!("C1 channel closed prematurely!"),
                 Ok(Err(e)) => panic!("C1 error: {:?}", e),
-                Err(_) => panic!("Timeout waiting for C1. Processed {}/15 before hanging", c1_records),
+                Err(_) => panic!(
+                    "Timeout waiting for C1. Processed {}/15 before hanging",
+                    c1_records
+                ),
             }
         }
 
-        assert_eq!(c1_records, 15, "C1 should have taken over C2's ranges and processed all new messages alone");
+        assert_eq!(
+            c1_records, 15,
+            "C1 should have taken over C2's ranges and processed all new messages alone"
+        );
         Ok(())
     });
     sim.run().unwrap();
 }
-
 
 #[test]
 fn consumer_group_independent_groups() {
@@ -347,8 +556,6 @@ fn consumer_group_independent_groups() {
 
         let topic = format!("test_independent_{}", Uuid::new_v4());
         client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::Fixed }).await.unwrap();
-        let _ = client.create_topic("__eastguard_assignments", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
-        let _ = client.create_topic("__eastguard_offsets", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
 
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
         for i in 0..10 {
@@ -356,8 +563,22 @@ fn consumer_group_independent_groups() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let c_alpha = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some("group-alpha".to_string()), auto_commit_interval_ms: 1000 }).await.unwrap();
-        let c_beta = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some("group-beta".to_string()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c_alpha = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config("group-alpha".to_string()),
+        )
+        .await
+        .unwrap();
+        let c_beta = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config("group-beta".to_string()),
+        )
+        .await
+        .unwrap();
 
         let mut alpha_count = 0;
         let mut beta_count = 0;
@@ -365,10 +586,16 @@ fn consumer_group_independent_groups() {
         while alpha_count < 10 || beta_count < 10 {
             tokio::select! {
                 res = c_alpha.next_record(), if alpha_count < 10 => {
-                    if let Ok(Some(_)) = res { alpha_count += 1; }
+                    if let Ok(Some(record)) = res {
+                        c_alpha.ack(&record).unwrap();
+                        alpha_count += 1;
+                    }
                 }
                 res = c_beta.next_record(), if beta_count < 10 => {
-                    if let Ok(Some(_)) = res { beta_count += 1; }
+                    if let Ok(Some(record)) = res {
+                        c_beta.ack(&record).unwrap();
+                        beta_count += 1;
+                    }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     panic!("Timeout: Alpha processed {}, Beta processed {}", alpha_count, beta_count);
@@ -398,19 +625,42 @@ fn consumer_group_split_rebalance() {
     });
 
     sim.client("client", async move {
-        let client_addr: std::net::SocketAddr = format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
         let client = Arc::new(Client::connect([client_addr]).unwrap());
 
         let topic = format!("test_split_rebalance_{}", Uuid::new_v4());
-        client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 1, partition_strategy: PartitionStrategy::AutoSplit }).await.unwrap();
-        let _ = client.create_topic("__eastguard_assignments", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
-        let _ = client.create_topic("__eastguard_offsets", StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::AutoSplit }).await;
+        client
+            .create_topic(
+                &topic,
+                StoragePolicy {
+                    retention_ms: None,
+                    replication_factor: 1,
+                    partition_strategy: PartitionStrategy::AutoSplit,
+                },
+            )
+            .await
+            .unwrap();
 
         let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
         let group_id = "split-group".to_string();
 
-        let c1 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
-        let c2 = Consumer::new(client.clone(), topic.clone(), KeyInterest::AllKeys, ConsumerConfig { start_policy: StartPolicy::Earliest, group_id: Some(group_id.clone()), auto_commit_interval_ms: 1000 }).await.unwrap();
+        let c1 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
+        let c2 = Consumer::new(
+            client.clone(),
+            topic.clone(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Produce enough to trigger a roll (and eventually split)
@@ -455,10 +705,16 @@ fn consumer_group_split_rebalance() {
         for _ in 0..3 {
             tokio::select! {
                 res = c1.next_record() => {
-                    if let Ok(Some(_)) = res { c1_records += 1; }
+                    if let Ok(Some(record)) = res {
+                        c1.ack(&record).unwrap();
+                        c1_records += 1;
+                    }
                 }
                 res = c2.next_record() => {
-                    if let Ok(Some(_)) = res { c2_records += 1; }
+                    if let Ok(Some(record)) = res {
+                        c2.ack(&record).unwrap();
+                        c2_records += 1;
+                    }
                 }
             }
         }
@@ -469,16 +725,17 @@ fn consumer_group_split_rebalance() {
         let mut split = false;
         for _ in 0..120 {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            if let Ok(detail) = client.resolve_topic(&topic).await && detail.ranges.len() == 3 {
+            if let Ok(detail) = client.resolve_topic(&topic).await
+                && detail.ranges.len() == 3
+            {
                 split = true;
                 break;
-            
             }
         }
         if !split {
             panic!("Timeout waiting for split to 3 ranges");
         }
-        
+
         let detail = client.resolve_topic(&topic).await.unwrap();
         assert_eq!(detail.ranges.len(), 3, "Topic must split into 3 ranges");
 
@@ -488,21 +745,36 @@ fn consumer_group_split_rebalance() {
         // Send messages to children
         // Left child
         for i in 0..5 {
-            producer.send(b"a", format!("left-{}", i).into_bytes()).await.unwrap();
+            producer
+                .send(b"a", format!("left-{}", i).into_bytes())
+                .await
+                .unwrap();
         }
         // Right child
         for i in 0..5 {
-            producer.send(b"\x90", format!("right-{}", i).into_bytes()).await.unwrap();
+            producer
+                .send(b"\x90", format!("right-{}", i).into_bytes())
+                .await
+                .unwrap();
         }
 
         let mut total_records = c1_records + c2_records;
-        while total_records < 13 { // 3 parent + 5 left + 5 right
+        while total_records < 13 {
+            // 3 parent + 5 left + 5 right
             tokio::select! {
                 res = c1.next_record() => {
-                    if let Ok(Some(_)) = res { c1_records += 1; total_records += 1; }
+                    if let Ok(Some(record)) = res {
+                        c1.ack(&record).unwrap();
+                        c1_records += 1;
+                        total_records += 1;
+                    }
                 }
                 res = c2.next_record() => {
-                    if let Ok(Some(_)) = res { c2_records += 1; total_records += 1; }
+                    if let Ok(Some(record)) = res {
+                        c2.ack(&record).unwrap();
+                        c2_records += 1;
+                        total_records += 1;
+                    }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     panic!("Timeout: c1={}, c2={}", c1_records, c2_records);

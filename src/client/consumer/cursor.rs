@@ -54,7 +54,7 @@ impl KeyInterest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartPolicy {
     Latest,
     Earliest,

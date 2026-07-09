@@ -26,7 +26,10 @@ pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
 pub use codec::CompressionCodec;
-pub use consumer::{Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, StartPolicy};
+pub use consumer::{
+    CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
+    StartPolicy,
+};
 pub use error::ClientError;
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};

@@ -46,6 +46,7 @@ impl RangeFetchActor {
     pub(crate) async fn run(mut self, rx: flume::Receiver<RangeFetchActorCommand>) {
         let mut paused = false;
         loop {
+            // Check if the consumer is dropped (receiver disconnected) to avoid leaking tasks.
             if self.record_tx.is_disconnected() {
                 return;
             }
@@ -91,11 +92,6 @@ impl RangeFetchActor {
     /// Performs a single loop iteration. Returns `Ok(true)` to continue,
     /// `Ok(false)` for graceful shutdown, or `Err(ClientError)` to abort.
     async fn step(&mut self) -> Result<bool, ClientError> {
-        // Check if the consumer is dropped (receiver disconnected) to avoid leaking tasks.
-        if self.record_tx.is_disconnected() {
-            return Ok(false);
-        }
-
         // Read metadata snapshot.
         let segment = match self
             .ctx
