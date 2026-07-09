@@ -24,15 +24,28 @@ enum RangeLookupResult {
         progress_signal: RangeProgressSignal,
     },
 }
-#[derive(Debug, Clone, Copy)]
 pub(crate) enum RangeFetchActorCommand {
     Stop,
+    Pause {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Resume {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Seek {
+        absolute_offset: u64,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
+// TODO relationship between RangeFetchActor vs RangeCursor when there is a significant duplicate in data
+// and possibly stale data issue. (range_id, next_entry_id, skip_batch_offsets_below, skip_absolute_offsets_below)
+// These values are ephemeral, subject to changes.
 pub(crate) struct RangeFetchActor {
     range_id: RangeId,
     next_entry_id: EntryId,
     skip_batch_offsets_below: Option<u64>,
+    skip_absolute_offsets_below: Option<u64>,
     next_absolute_offset: u64,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
@@ -43,6 +56,7 @@ impl RangeFetchActor {
         range_id: RangeId,
         next_entry_id: EntryId,
         skip_batch_offsets_below: Option<u64>,
+        skip_absolute_offsets_below: Option<u64>,
         next_absolute_offset: u64,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
@@ -51,12 +65,14 @@ impl RangeFetchActor {
             range_id,
             next_entry_id,
             skip_batch_offsets_below,
+            skip_absolute_offsets_below,
             next_absolute_offset,
             ctx,
             record_tx,
         }
     }
     pub(crate) async fn run(mut self, rx: flume::Receiver<RangeFetchActorCommand>) {
+        let mut paused = false;
         loop {
             if self.record_tx.is_disconnected() {
                 return;
@@ -68,9 +84,25 @@ impl RangeFetchActor {
                         Ok(RangeFetchActorCommand::Stop) | Err(_) => {
                             return; // Graceful shutdown
                         }
+                        Ok(RangeFetchActorCommand::Pause { reply }) => {
+                            paused = true;
+                            let _ = reply.send(());
+                        }
+                        Ok(RangeFetchActorCommand::Resume { reply }) => {
+                            paused = false;
+                            let _ = reply.send(());
+                        }
+                        Ok(RangeFetchActorCommand::Seek {
+                            absolute_offset,
+                            reply,
+                        }) => {
+                            self.seek_absolute_offset(absolute_offset);
+                            self.ctx.refresh_metadata().await.ok();
+                            let _ = reply.send(());
+                        }
                     }
                 }
-                res = self.step() => {
+                res = self.step(), if !paused => {
                     match res {
                         Ok(true) => continue, // Keep looping
                         Ok(false) => return,  // Graceful shutdown (e.g., drained)
@@ -145,25 +177,37 @@ impl RangeFetchActor {
                 }
 
                 for entry in entries.into_iter() {
+                    if self.should_skip_entry_by_absolute_offset(entry.record_count) {
+                        continue;
+                    }
+
                     let records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
                         .map_err(|e| {
-                            eprintln!("Failed to decompress entry payload: {}", e);
+                            tracing::error!("Failed to decompress entry payload: {}", e);
                             ClientError::UnexpectedResponse
                         })?;
 
                     let skip_batch_offsets_below = if entry.entry_id == self.next_entry_id {
-                        self.skip_batch_offsets_below
+                        self.skip_batch_offsets_below.take()
                     } else {
                         None
                     };
-                    if skip_batch_offsets_below.is_some() {
-                        self.skip_batch_offsets_below = None;
-                    }
 
                     for (i, rec) in records.into_iter().enumerate() {
                         if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
                             continue;
                         }
+
+                        let absolute_offset = self.next_absolute_offset;
+                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
+
+                        if self
+                            .skip_absolute_offsets_below
+                            .is_some_and(|target| absolute_offset < target)
+                        {
+                            continue;
+                        }
+                        self.skip_absolute_offsets_below = None;
 
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
@@ -171,12 +215,11 @@ impl RangeFetchActor {
                             position: ConsumerPosition {
                                 batch_offset: i as u64,
                                 entry_id: entry.entry_id,
-                                absolute_offset: self.next_absolute_offset,
+                                absolute_offset,
                             },
                             key: rec.key,
                             value: rec.value,
                         };
-                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
 
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {
                             return Ok(false); // Disconnected
@@ -232,6 +275,29 @@ impl RangeFetchActor {
             }
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    fn seek_absolute_offset(&mut self, absolute_offset: u64) {
+        self.next_entry_id = EntryId::MIN;
+        self.skip_batch_offsets_below = None;
+        self.skip_absolute_offsets_below = Some(absolute_offset);
+        self.next_absolute_offset = 0;
+    }
+
+    fn should_skip_entry_by_absolute_offset(&mut self, record_count: u32) -> bool {
+        let Some(target) = self.skip_absolute_offsets_below else {
+            return false;
+        };
+
+        let next_entry_absolute_offset = self
+            .next_absolute_offset
+            .saturating_add(u64::from(record_count));
+
+        if next_entry_absolute_offset <= target {
+            self.next_absolute_offset = next_entry_absolute_offset;
+            return true;
+        }
+        false
     }
 }
 

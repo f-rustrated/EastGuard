@@ -9,7 +9,7 @@ use crate::client::consumer::group::{
 };
 use crate::client::consumer::range_fetcher::ConsumerContext;
 use crate::client::consumer::topic_fetch_manager::{
-    RangeDrained, TopicFetchManagerState, run_topic_fetch_manager,
+    RangeDrained, TopicFetchManagerCommand, TopicFetchManagerState, run_topic_fetch_manager,
 };
 use crate::client::{Client, ClientError, Producer, ProducerConfig};
 use crate::connections::protocol::{
@@ -65,6 +65,7 @@ impl ConsumerConfig {
 pub struct Consumer {
     ctx: Arc<ConsumerContext>,
     consumer_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
+    command_tx: flume::Sender<TopicFetchManagerCommand>,
     group: Option<Arc<ConsumerGroup>>,
 }
 
@@ -105,6 +106,7 @@ impl Consumer {
 
         let (record_tx, consumer_rx) = flume::unbounded();
         let (cursor_tx, cursor_rx) = flume::bounded(100);
+        let (command_tx, command_rx) = flume::bounded(100);
 
         let ctx = Arc::new(ConsumerContext {
             client,
@@ -118,12 +120,13 @@ impl Consumer {
             TopicFetchManagerState::new(cursors, consumer_group.clone(), config, record_tx);
 
         if !topic_fetch_manager.should_exit() {
-            Self::spawn_manager(topic_fetch_manager, cursor_rx, &ctx);
+            Self::spawn_manager(topic_fetch_manager, cursor_rx, command_rx, &ctx);
         }
 
         Ok(Self {
             ctx,
             consumer_rx,
+            command_tx,
             group: consumer_group,
         })
     }
@@ -131,11 +134,13 @@ impl Consumer {
     fn spawn_manager(
         topic_fetch_manager: TopicFetchManagerState,
         drain_event_rx: flume::Receiver<RangeDrained>,
+        command_rx: flume::Receiver<TopicFetchManagerCommand>,
         ctx: &Arc<ConsumerContext>,
     ) {
         tokio::spawn(run_topic_fetch_manager(
             topic_fetch_manager,
             drain_event_rx,
+            command_rx,
             Arc::downgrade(ctx),
         ));
     }
@@ -145,6 +150,62 @@ impl Consumer {
             group.commit().await?;
         }
         Ok(())
+    }
+
+    pub async fn pause_range(&self, range_id: RangeId) -> Result<(), ClientError> {
+        const OPERATION: &str = "pause";
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send_async(TopicFetchManagerCommand::Pause { range_id, reply })
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
+        response
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager dropped the reply"))?
+    }
+
+    pub async fn resume_range(&self, range_id: RangeId) -> Result<(), ClientError> {
+        const OPERATION: &str = "resume";
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send_async(TopicFetchManagerCommand::Resume { range_id, reply })
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
+        response
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager dropped the reply"))?
+    }
+
+    pub async fn seek_range(
+        &self,
+        range_id: RangeId,
+        absolute_offset: u64,
+    ) -> Result<(), ClientError> {
+        const OPERATION: &str = "seek";
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send_async(TopicFetchManagerCommand::Seek {
+                range_id,
+                absolute_offset,
+                reply,
+            })
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
+        response
+            .await
+            .map_err(|_| Self::control_error(OPERATION, range_id, "manager dropped the reply"))?
+    }
+
+    fn control_error(
+        operation: &'static str,
+        range_id: RangeId,
+        reason: impl Into<String>,
+    ) -> ClientError {
+        ClientError::ConsumerControl {
+            operation,
+            range_id: *range_id,
+            reason: reason.into(),
+        }
     }
 
     /// Retrieve the next record from the topic.

@@ -146,7 +146,7 @@ impl RangeCursorSet {
             .iter_mut()
             .find(|c| c.range_id == cursor.range_id)
         {
-            c.next_entry_id = cursor.next_entry_id;
+            *c = cursor;
         } else {
             self.cursors.push(cursor);
         }
@@ -246,6 +246,7 @@ pub struct RangeCursor {
     pub range_id: RangeId,
     pub next_entry_id: EntryId,
     pub skip_batch_offsets_below: Option<u64>,
+    pub skip_absolute_offsets_below: Option<u64>,
     pub next_absolute_offset: u64,
     pub keyspace_start: Vec<u8>,
     pub keyspace_end: Vec<u8>,
@@ -262,6 +263,7 @@ impl RangeCursor {
             range_id,
             next_entry_id,
             skip_batch_offsets_below: None,
+            skip_absolute_offsets_below: None,
             next_absolute_offset: 0,
             keyspace_start,
             keyspace_end,
@@ -271,6 +273,21 @@ impl RangeCursor {
     pub fn with_skip_batch_offsets_below(mut self, skip_batch_offsets_below: Option<u64>) -> Self {
         self.skip_batch_offsets_below = skip_batch_offsets_below;
         self
+    }
+
+    pub fn with_skip_absolute_offsets_below(
+        mut self,
+        skip_absolute_offsets_below: Option<u64>,
+    ) -> Self {
+        self.skip_absolute_offsets_below = skip_absolute_offsets_below;
+        self
+    }
+
+    pub(crate) fn seek_to_absolute_offset(&mut self, absolute_offset: u64) {
+        self.next_entry_id = EntryId::MIN;
+        self.skip_batch_offsets_below = None;
+        self.skip_absolute_offsets_below = Some(absolute_offset);
+        self.next_absolute_offset = 0;
     }
 
     pub fn with_next_absolute_offset(mut self, next_absolute_offset: u64) -> Self {

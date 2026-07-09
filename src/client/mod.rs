@@ -24,6 +24,7 @@ mod routing;
 use crate::client::nodes::KnownNodes;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+pub use crate::control_plane::metadata::{EntryId, RangeId};
 pub use codec::CompressionCodec;
 pub use consumer::{Consumer, ConsumerConfig, ConsumerRecord, KeyInterest, StartPolicy};
 pub use error::ClientError;
@@ -33,7 +34,6 @@ pub use producer::{BufferConfig, Producer, ProducerConfig};
 use crate::client::consumer::group::SYSTEM_TOPIC_OFFSETS;
 use crate::client::consumer::group::{ConsumerPosition, OffsetCommitPayload};
 use crate::connections::protocol::{ClientResponse, DataPlaneResponse, RangeOffsetRequest};
-use crate::control_plane::metadata::{EntryId, RangeId};
 use borsh::BorshDeserialize;
 
 pub use redirect::RetryPolicy;

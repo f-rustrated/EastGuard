@@ -13,7 +13,24 @@ use crate::test_traits::TAssertInvariant;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use uuid::Uuid;
+
+pub(crate) enum TopicFetchManagerCommand {
+    Pause {
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Resume {
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Seek {
+        range_id: RangeId,
+        absolute_offset: u64,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+}
 
 pub(crate) struct RangeDrained {
     pub range_id: RangeId,
@@ -85,6 +102,86 @@ impl TopicFetchManagerState {
                 continue;
             }
             self.spawn_and_register(new_cursor, ctx.clone());
+        }
+    }
+
+    fn handle_command(&mut self, command: TopicFetchManagerCommand) {
+        match command {
+            TopicFetchManagerCommand::Pause { range_id, reply } => {
+                self.forward_actor_command("pause", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Pause { reply }
+                });
+            }
+            TopicFetchManagerCommand::Resume { range_id, reply } => {
+                self.forward_actor_command("resume", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Resume { reply }
+                });
+            }
+            TopicFetchManagerCommand::Seek {
+                range_id,
+                absolute_offset,
+                reply,
+            } => {
+                if let Some(cursor) = self.cursors.iter_mut().find(|c| c.range_id == range_id) {
+                    cursor.seek_to_absolute_offset(absolute_offset);
+                } else {
+                    tracing::warn!(
+                        range_id = *range_id,
+                        absolute_offset,
+                        "consumer seek requested for a range without a cursor"
+                    );
+                }
+                self.forward_actor_command("seek", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Seek {
+                        absolute_offset,
+                        reply,
+                    }
+                });
+            }
+        }
+    }
+
+    fn forward_actor_command(
+        &self,
+        operation: &'static str,
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+        callback_build: impl FnOnce(oneshot::Sender<()>) -> RangeFetchActorCommand,
+    ) {
+        let Some(tx) = self.senders.get(&range_id) else {
+            let reason = "no active fetch actor for range";
+            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            return;
+        };
+
+        let (actor_ack_tx, actor_ack_rx) = oneshot::channel();
+
+        if tx.try_send(callback_build(actor_ack_tx)).is_err() {
+            let reason = "fetch actor command queue is full or closed";
+            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = actor_ack_rx.await.map_err(|_| {
+                let reason = "fetch actor stopped before acknowledging command";
+                Self::control_error(operation, range_id, reason)
+            });
+            let _ = reply.send(result);
+        });
+    }
+
+    fn control_error(
+        operation: &'static str,
+        range_id: RangeId,
+        reason: impl Into<String>,
+    ) -> ClientError {
+        let reason = reason.into();
+        tracing::warn!(operation, range_id = *range_id, reason);
+        ClientError::ConsumerControl {
+            operation,
+            range_id: *range_id,
+            reason,
         }
     }
 
@@ -169,6 +266,7 @@ impl TopicFetchManagerState {
                         r_meta.keyspace_end.clone(),
                     )
                     .with_skip_batch_offsets_below(skip_below_offset)
+                    .with_skip_absolute_offsets_below(None)
                     .with_next_absolute_offset(next_absolute_offset),
                     ctx.clone(),
                 );
@@ -182,11 +280,12 @@ impl TopicFetchManagerState {
         if self.senders.contains_key(&cursor.range_id) {
             return;
         }
-        let (stop_tx, stop_rx) = flume::bounded(1);
+        let (stop_tx, stop_rx) = flume::bounded(8);
         let actor = RangeFetchActor::new(
             cursor.range_id,
             cursor.next_entry_id,
             cursor.skip_batch_offsets_below,
+            cursor.skip_absolute_offsets_below,
             cursor.next_absolute_offset,
             ctx,
             self.record_tx.clone(),
@@ -340,6 +439,7 @@ impl TopicFetchManagerState {
 pub(crate) async fn run_topic_fetch_manager(
     mut state: TopicFetchManagerState,
     drain_event_rx: flume::Receiver<RangeDrained>,
+    command_rx: flume::Receiver<TopicFetchManagerCommand>,
     weak_ctx: std::sync::Weak<ConsumerContext>,
 ) {
     if let Some(ctx) = weak_ctx.upgrade() {
@@ -372,6 +472,11 @@ pub(crate) async fn run_topic_fetch_manager(
                 if state.should_exit() {
                      break;
                 }
+            }
+
+            res = command_rx.recv_async() => {
+                let Ok(command) = res else { break };
+                state.handle_command(command);
             }
 
             _ = commit_interval.tick(), if state.consumer_group.is_some() => {
