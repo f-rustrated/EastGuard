@@ -373,23 +373,6 @@ impl TopicMeta {
         self.active_ranges.insert(pos, range_id);
     }
 
-    // Range-seal metadata op. Currently has no caller (the refactor that split
-    // `types.rs` dropped it) — kept as the seal API the lifecycle path will use.
-    #[allow(dead_code)]
-    pub(crate) fn seal_range(
-        &mut self,
-        range_id: RangeId,
-        sealed_at: u64,
-    ) -> Result<(), MetadataError> {
-        let range = self
-            .ranges
-            .get_mut(&range_id)
-            .ok_or(MetadataError::RangeNotFound)?;
-
-        range.seal(sealed_at)?;
-        Ok(())
-    }
-
     pub(crate) fn delete(&mut self) {
         self.state = TopicState::Deleted;
         self.active_ranges.clear();
