@@ -10,43 +10,60 @@ use crate::control_plane::metadata::EntryId;
 use crate::data_plane::EntryPayload;
 
 #[derive(Debug, Clone)]
-pub struct CachedEntry {
-    pub data: EntryPayload,
-    pub record_count: u32,
-    pub entry_id: EntryId,
-    pub lsn: u64,
+pub(crate) struct CachedEntry {
+    pub(crate) data: EntryPayload,
+    pub(crate) record_count: u32,
+    pub(crate) entry_id: EntryId,
+    pub(crate) lsn: u64,
 }
+
+impl CachedEntry {
+    pub(crate) fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
 const DEFAULT_CAPACITY: usize = 1024;
+const EMPTY_SLOT_POSITION: u64 = u64::MAX;
 
-// Slots use `ArcSwapOption` instead of raw `AtomicPtr` to make load + refcount
-// increment atomic. With `AtomicPtr`, a consumer at the hot/cold boundary
-// (position == eviction_frontier) could load a raw pointer, then get preempted
-// before calling `Arc::increment_strong_count`. If the publisher wraps the
-// entire ring (~1024 publishes) during that window, the slot is overwritten
-// and the old Arc freed — the consumer wakes up holding a dangling pointer.
-// `ArcSwapOption::load_full()` returns `Option<Arc<…>>` with the refcount
-// already incremented, closing this gap with ~2-5ns overhead per read —
-// negligible since batch processing cost dominates.
-//
-// Refcount lifecycle:
-//   - `store(Some(batch))`: slot takes ownership. If overwriting, old Arc is
-//     dropped (refcount -1). Old batch freed only if no readers hold it.
-//   - `load_full()`: returns a new Arc clone (refcount +1). Slot keeps its
-//     own ref independently. Caller dropping the Arc decrements refcount.
-//   - Eviction: `advance_eviction_frontier` moves the cursor but does NOT
-//     clear the slot. The old Arc stays alive until `publish` overwrites it
-//     on the next ring wrap. This is delayed cleanup, not a leak — the slot
-//     is logically evicted (readers rejected by frontier check) but the
-//     memory is reclaimed when the publisher physically reaches that slot.
+/// Slots use `ArcSwapOption` instead of raw `AtomicPtr` to make load + refcount
+/// increment atomic. With `AtomicPtr`, a consumer at the hot/cold boundary
+/// (position == eviction_frontier) could load a raw pointer, then get preempted
+/// before calling `Arc::increment_strong_count`. If the publisher wraps the
+/// entire ring (~1024 publishes) during that window, the slot is overwritten
+/// and the old Arc freed — the consumer wakes up holding a dangling pointer.
+/// `ArcSwapOption::load_full()` returns `Option<Arc<…>>` with the refcount
+/// already incremented, closing this gap with ~2-5ns overhead per read —
+/// negligible since batch processing cost dominates.
+///
+/// Refcount lifecycle:
+///   - `store(Some(batch))`: slot takes ownership. If overwriting, old Arc is
+///     dropped (refcount -1). Old batch freed only if no readers hold it.
+///   - `load_full()`: returns a new Arc clone (refcount +1). Slot keeps its
+///     own ref independently. Caller dropping the Arc decrements refcount.
+///   - Eviction: checkpoint completion advances the frontier and clears evicted
+///     slots that still hold the same cache position. If a slot wrapped and now
+///     holds a newer entry, it is left intact.
+///
+/// Ordering model:
+/// - [`slot_positions`](Self::slot_positions) and cursors(write_cursor, read_cursor, and eviction_frontier) are the publication fences.
+///   Writers store them with "Release"; readers load them with Acquire before trusting a slot or cursor boundary.
+///
+/// - [`slot_byte_lengths`](Self::slot_byte_lengths) and [`byte counter`](Self::hot_cache_bytes) are accounting only.
+///   They do not  make entry contents visible, so "Relaxed" is enough.
 pub(crate) struct SegmentRingBuffer {
     entries: Box<[ArcSwapOption<CachedEntry>]>,
+    slot_positions: Box<[AtomicU64]>,
+    slot_byte_lengths: Box<[AtomicU64]>,
     capacity: usize,
     write_cursor: AtomicU64,
     read_cursor: AtomicU64,
     eviction_frontier: AtomicU64,
+    hot_cache_bytes: AtomicU64,
+    checkpointable_bytes: AtomicU64,
     notify: Notify,
 }
 
@@ -64,13 +81,25 @@ impl SegmentRingBuffer {
             .take(capacity)
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let slot_positions = std::iter::repeat_with(|| AtomicU64::new(EMPTY_SLOT_POSITION))
+            .take(capacity)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let slot_byte_lengths = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(capacity)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         SegmentRingBuffer {
             entries,
+            slot_positions,
+            slot_byte_lengths,
             capacity,
             write_cursor: AtomicU64::new(0),
             read_cursor: AtomicU64::new(0),
             eviction_frontier: AtomicU64::new(0),
+            hot_cache_bytes: AtomicU64::new(0),
+            checkpointable_bytes: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
@@ -79,19 +108,25 @@ impl SegmentRingBuffer {
         (position as usize) & (self.capacity - 1)
     }
 
-    // Write path (called by DataPlane)
-
     pub(super) fn publish(&self, entry: Arc<CachedEntry>) {
-        let tail = self.write_cursor.load(Ordering::Acquire);
+        let tail = self.write_cursor.load(Ordering::Relaxed);
         let idx = self.slot_index(tail);
-        self.entries[idx].store(Some(entry));
+        self.hot_cache_bytes
+            .fetch_add(entry.byte_len() as u64, Ordering::Relaxed);
 
-        // ! SAFETY: why not self.write_cursor.fetch_add(1)?
-        // ! because there is only one writer thread
+        self.slot_byte_lengths[idx].store(entry.byte_len() as u64, Ordering::Relaxed);
+        self.entries[idx].store(Some(entry));
+        self.slot_positions[idx].store(tail, Ordering::Release);
         self.write_cursor.store(tail + 1, Ordering::Release);
     }
 
-    pub(in crate::data_plane::states::segment) fn advance_read_cursor(&self, new_offset: u64) {
+    pub(crate) fn advance_read_cursor(&self, new_offset: u64) {
+        let old_offset = self.read_cursor.load(Ordering::Relaxed);
+        let committed_bytes: u64 = (old_offset..new_offset)
+            .map(|pos| self.byte_len_at(pos))
+            .sum();
+        self.checkpointable_bytes
+            .fetch_add(committed_bytes, Ordering::Relaxed);
         self.read_cursor.store(new_offset, Ordering::Release);
         self.notify.notify_waiters();
     }
@@ -114,7 +149,7 @@ impl SegmentRingBuffer {
         }
 
         let idx = self.slot_index(position);
-        self.entries[idx].load_full()
+        self.load_slot_at(idx, position)
     }
 
     /// Internal read: returns any published entry (committed or uncommitted).
@@ -127,7 +162,23 @@ impl SegmentRingBuffer {
         }
 
         let idx = self.slot_index(position);
+        self.load_slot_at(idx, position)
+    }
+
+    fn load_slot_at(&self, idx: usize, position: u64) -> Option<Arc<CachedEntry>> {
+        // The requested logical position maps to this physical slot, but does this slot still contain that logical position?”
+        if self.slot_positions[idx].load(Ordering::Acquire) != position {
+            return None;
+        }
         self.entries[idx].load_full()
+    }
+
+    fn byte_len_at(&self, position: u64) -> u64 {
+        let idx = self.slot_index(position);
+        if self.slot_positions[idx].load(Ordering::Acquire) != position {
+            return 0;
+        }
+        self.slot_byte_lengths[idx].load(Ordering::Relaxed)
     }
 
     pub(super) fn load_eviction_frontier(&self) -> u64 {
@@ -145,7 +196,7 @@ impl SegmentRingBuffer {
         let mut entries = Vec::new();
         for pos in frontier..commit {
             let idx: usize = self.slot_index(pos);
-            if let Some(entry) = self.entries[idx].load_full() {
+            if let Some(entry) = self.load_slot_at(idx, pos) {
                 entries.push(entry);
             }
         }
@@ -156,12 +207,50 @@ impl SegmentRingBuffer {
         }
     }
 
-    pub(in crate::data_plane::states::segment) fn advance_eviction_frontier(
-        &self,
-        new_frontier: u64,
-    ) {
+    pub(crate) fn complete_checkpoint(&self, new_frontier: u64, checkpointed_bytes: u64) {
+        let old_frontier = self.eviction_frontier.load(Ordering::Acquire);
+        if new_frontier <= old_frontier {
+            return;
+        }
+        self.clear_evicted_slots(old_frontier, new_frontier);
+
+        Self::fetch_sub_saturating(&self.hot_cache_bytes, checkpointed_bytes);
+        Self::fetch_sub_saturating(&self.checkpointable_bytes, checkpointed_bytes);
+
         self.eviction_frontier
             .store(new_frontier, Ordering::Release);
+    }
+
+    fn fetch_sub_saturating(counter: &AtomicU64, amount: u64) {
+        // why not fetch_sub? because such a raw atomic subtraction may underflow for u64.
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        });
+    }
+
+    fn clear_evicted_slots(&self, old_frontier: u64, new_frontier: u64) {
+        for pos in old_frontier..new_frontier {
+            let idx = self.slot_index(pos);
+            if self.slot_positions[idx].load(Ordering::Acquire) == pos {
+                self.entries[idx].store(None);
+                self.slot_byte_lengths[idx].store(0, Ordering::Relaxed);
+                self.slot_positions[idx].store(EMPTY_SLOT_POSITION, Ordering::Release);
+            }
+        }
+    }
+
+    // Uses eviction_frontier..read_cursor, because checkpoint can only drain
+    // committed entries. The checkpoint worker itself uses the same boundary in
+    // drain_for_checkpoint().
+    pub(super) fn checkpointable_bytes(&self) -> u64 {
+        self.checkpointable_bytes.load(Ordering::Relaxed)
+    }
+
+    // hot_cache_bytes: budget pressure signal
+    // Uses (eviction_frontier..write_cursor), because this is total resident hot cache,
+    // including uncommitted published entries.
+    pub(crate) fn hot_cache_bytes(&self) -> u64 {
+        self.hot_cache_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -178,6 +267,13 @@ impl CheckpointBatch {
     pub(crate) fn last_lsn(&self) -> u64 {
         self.entries.last().map(|e| e.lsn).unwrap_or(0)
     }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.byte_len() as u64)
+            .sum()
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -193,10 +289,30 @@ impl TAssertInvariant for SegmentRingBuffer {
         );
         assert!(commit <= tail, "read_cursor ({commit}) > tail ({tail})");
 
+        let actual_hot: u64 = (frontier..tail)
+            .filter_map(|pos| self.load_published(pos))
+            .map(|entry| entry.byte_len() as u64)
+            .sum();
+        assert_eq!(
+            self.hot_cache_bytes.load(Ordering::Relaxed),
+            actual_hot,
+            "hot cache byte counter mismatch"
+        );
+
+        let actual_checkpointable: u64 = (frontier..commit)
+            .filter_map(|pos| self.load_published(pos))
+            .map(|entry| entry.byte_len() as u64)
+            .sum();
+        assert_eq!(
+            self.checkpointable_bytes.load(Ordering::Relaxed),
+            actual_checkpointable,
+            "checkpointable byte counter mismatch"
+        );
+
         for pos in frontier..tail {
             let idx = self.slot_index(pos);
             assert!(
-                self.entries[idx].load().is_some(),
+                self.load_slot_at(idx, pos).is_some(),
                 "empty slot at position {pos} (between frontier and tail)"
             );
         }
@@ -244,7 +360,7 @@ mod tests {
 
         cache.publish(make_entry(0, 1));
         cache.advance_read_cursor(1);
-        cache.advance_eviction_frontier(1);
+        cache.complete_checkpoint(1, 4);
 
         assert!(cache.read_committed(0).is_none());
     }
@@ -272,10 +388,44 @@ mod tests {
         cache.publish(make_entry(1, 2));
         cache.advance_read_cursor(2);
 
-        cache.advance_eviction_frontier(1);
+        cache.complete_checkpoint(1, 4);
 
         assert!(cache.read_committed(0).is_none());
         assert!(cache.read_committed(1).is_some());
+    }
+
+    #[test]
+    fn checkpoint_completion_clears_only_evicted_positions() {
+        let cache = SegmentRingBuffer::with_capacity(4);
+
+        for i in 0..4u64 {
+            cache.publish(make_entry(i, i + 1));
+        }
+        cache.advance_read_cursor(4);
+
+        cache.complete_checkpoint(2, 8);
+
+        assert!(cache.entries[0].load().is_none());
+        assert!(cache.entries[1].load().is_none());
+        assert!(cache.entries[2].load().is_some());
+        assert!(cache.entries[3].load().is_some());
+        assert_eq!(cache.hot_cache_bytes(), 8);
+        assert_eq!(cache.checkpointable_bytes(), 8);
+    }
+
+    #[test]
+    fn checkpoint_completion_does_not_clear_wrapped_newer_slot() {
+        let cache = SegmentRingBuffer::with_capacity(4);
+
+        for i in 0..5u64 {
+            cache.publish(make_entry(i, i + 1));
+            cache.advance_read_cursor(i + 1);
+        }
+
+        cache.complete_checkpoint(1, 4);
+
+        let entry = cache.load_published(4).expect("wrapped entry kept");
+        assert_eq!(entry.entry_id, EntryId(4));
     }
 
     #[test]
@@ -298,11 +448,11 @@ mod tests {
 
         for i in 0..6u64 {
             cache.publish(make_entry(i, i + 1));
+            cache.advance_read_cursor(i + 1);
             if i >= 1 {
-                cache.advance_eviction_frontier(i - 1);
+                cache.complete_checkpoint(i - 1, 4);
             }
         }
-        cache.advance_read_cursor(6);
 
         let entry = cache.read_committed(5).unwrap();
         assert_eq!(entry.entry_id, EntryId(5));
@@ -316,7 +466,7 @@ mod tests {
             cache.publish(make_entry(i, i + 1));
         }
         cache.advance_read_cursor(5);
-        cache.advance_eviction_frontier(2);
+        cache.complete_checkpoint(2, 8);
 
         let frontier = cache.load_eviction_frontier();
         let commit = cache.load_read_cursor();

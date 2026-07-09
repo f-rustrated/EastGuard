@@ -113,6 +113,22 @@ pub struct Environment {
     )]
     pub batch_max_bytes: usize,
 
+    /// Node-wide hot cache budget for published segment entries. When resident
+    /// hot cache bytes cross `HOT_CACHE_PRESSURE_WATERMARK`, the
+    /// data plane submits a checkpoint for the largest checkpointable segment.
+    /// Set to 0 to disable pressure-triggered checkpoints.
+    #[arg(
+        long,
+        env = "HOT_CACHE_BUDGET_BYTES",
+        default_value_t = 4 * 1024 * 1024 * 1024
+    )]
+    pub hot_cache_budget_bytes: u64,
+
+    /// Fraction of `HOT_CACHE_BUDGET_BYTES` that triggers cache-pressure
+    /// checkpointing. Mirrors Pulsar's broker cache eviction watermark shape.
+    #[arg(long, env = "HOT_CACHE_PRESSURE_WATERMARK", default_value_t = 0.9)]
+    pub hot_cache_pressure_watermark: f64,
+
     #[arg(long, env = "SEAL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
     pub seal_request_timeout_secs: u64,
 
@@ -361,6 +377,8 @@ impl Environment {
             ),
             segment_size_limit: self.segment_size_limit_bytes,
             batch_max_bytes: self.batch_max_bytes,
+            hot_cache_budget_bytes: self.hot_cache_budget_bytes,
+            hot_cache_pressure_watermark: self.hot_cache_pressure_watermark,
             seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
             orphan_gc_interval: std::time::Duration::from_secs(self.orphan_gc_interval_secs),
             data_dir: self.data_dir_path(),
@@ -374,6 +392,8 @@ pub struct DataNodeConfig {
     pub age_check_interval: std::time::Duration,
     pub segment_size_limit: u64,
     pub batch_max_bytes: usize,
+    pub hot_cache_budget_bytes: u64,
+    pub hot_cache_pressure_watermark: f64,
     pub seal_request_timeout: std::time::Duration,
     pub orphan_gc_interval: std::time::Duration,
     pub data_dir: PathBuf,
@@ -382,6 +402,14 @@ pub struct DataNodeConfig {
 impl DataNodeConfig {
     pub(crate) fn age_check_ticks(&self) -> u64 {
         self.age_check_interval.as_millis() as u64 / TICK_PERIOD_100_MS
+    }
+
+    pub(crate) fn cache_pressure_threshold_bytes(&self) -> Option<u64> {
+        if self.hot_cache_budget_bytes == 0 {
+            return None;
+        }
+        let watermark = self.hot_cache_pressure_watermark.clamp(0.0, 1.0);
+        Some((self.hot_cache_budget_bytes as f64 * watermark) as u64)
     }
 }
 
@@ -414,6 +442,8 @@ mod tests {
             segment_age_check_interval_secs: 60,
             segment_size_limit_bytes: 1024 * 1024 * 1024,
             batch_max_bytes: 10 * 1024 * 1024,
+            hot_cache_budget_bytes: 4 * 1024 * 1024 * 1024,
+            hot_cache_pressure_watermark: 0.9,
             seal_request_timeout_secs: 5,
             orphan_gc_interval_secs: 300,
         }

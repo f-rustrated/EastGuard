@@ -90,6 +90,7 @@ pub struct DataPlane<W: WalStorage> {
     /// full-copy and to skip transfer when we already hold the segment.
     recovered: LocalInventory,
     pending_seals: std::collections::HashSet<SegmentKey>,
+    pressure_checkpoints_in_flight: BTreeSet<SegmentKey>,
 }
 
 impl<W: WalStorage> DataPlane<W> {
@@ -118,6 +119,7 @@ impl<W: WalStorage> DataPlane<W> {
             out,
             recovered,
             pending_seals: std::collections::HashSet::new(),
+            pressure_checkpoints_in_flight: BTreeSet::new(),
         }
     }
 
@@ -341,8 +343,14 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_checkpoint_complete(&mut self, complete: CheckpointComplete) {
+        self.pressure_checkpoints_in_flight
+            .remove(&complete.segment_key);
         if let Some(tracker) = self.segments.get_mut(&complete.segment_key) {
-            tracker.advance_checkpoint(complete.checkpointed_lsn, complete.new_frontier);
+            tracker.advance_checkpoint(
+                complete.checkpointed_lsn,
+                complete.new_frontier,
+                complete.checkpointed_bytes,
+            );
         }
 
         let watermark = self.compute_checkpoint_watermark();
@@ -1279,6 +1287,7 @@ impl<W: WalStorage> DataPlane<W> {
 
         self.buffer_byte_count = 0;
         self.needs_flush = false;
+        self.submit_checkpoint_if_cache_pressure();
     }
 
     fn compute_checkpoint_watermark(&self) -> u64 {
@@ -1289,21 +1298,35 @@ impl<W: WalStorage> DataPlane<W> {
             .unwrap_or(0)
     }
 
-    // Kept for the node-level cache budget pressure path described in D1.
-    #[allow(dead_code)]
+    fn hot_cache_bytes(&self) -> u64 {
+        self.segments.values().map(|t| t.hot_cache_bytes()).sum()
+    }
+
+    fn submit_checkpoint_if_cache_pressure(&mut self) {
+        let Some(threshold) = self.config.cache_pressure_threshold_bytes() else {
+            return;
+        };
+        if threshold == 0 || self.hot_cache_bytes() >= threshold {
+            self.submit_checkpoint_for_pressure();
+        }
+    }
+
     fn submit_checkpoint_for_pressure(&mut self) {
         let mut candidates: Vec<(SegmentKey, u64)> = self
             .segments
             .iter()
-            .map(|(key, tracker)| (*key, tracker.uncheckpointed()))
+            .filter(|(key, _)| !self.pressure_checkpoints_in_flight.contains(key))
+            .map(|(key, tracker)| (*key, tracker.checkpointable_bytes()))
             .collect();
 
         candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-        if let Some((key, _)) = candidates.first()
+        if let Some((key, bytes)) = candidates.first()
+            && *bytes > 0
             && let Some(tracker) = self.segments.get(key)
         {
             self.out.store_checkpoint(tracker.checkpoint(*key));
+            self.pressure_checkpoints_in_flight.insert(*key);
         }
     }
 
@@ -1405,6 +1428,8 @@ mod tests {
             age_check_interval: std::time::Duration::from_secs(60),
             segment_size_limit: 1024 * 1024 * 1024,
             batch_max_bytes: TEST_BATCH_MAX_BYTES,
+            hot_cache_budget_bytes: 0,
+            hot_cache_pressure_watermark: 0.9,
             seal_request_timeout: std::time::Duration::from_secs(5),
             orphan_gc_interval: std::time::Duration::from_secs(300),
             data_dir: dir,
@@ -1705,6 +1730,116 @@ mod tests {
         assert!(!dp.has_buffered_data());
     }
 
+    #[test]
+    fn cache_pressure_checkpoint_disabled_when_budget_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from(vec![0u8; 16]).into(),
+            record_count: 1,
+            reply: oneshot::channel().0,
+        });
+        dp.flush_batch();
+
+        assert_eq!(dp.hot_cache_bytes(), 16);
+        assert!(dp.out.checkpoint_tasks.is_empty());
+    }
+
+    #[test]
+    fn cache_pressure_submits_largest_checkpointable_segment() {
+        use crate::data_plane::checkpoint::CheckpointTask;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.config.hot_cache_budget_bytes = 100;
+        dp.config.hot_cache_pressure_watermark = 0.5;
+
+        let small = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
+        let large = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
+        dp.handle_command(assign_segment(small, vec![]));
+        dp.handle_command(assign_segment(large, vec![]));
+
+        dp.handle_command(Produce {
+            segment_key: small,
+            data: Bytes::from(vec![0u8; 10]).into(),
+            record_count: 1,
+            reply: oneshot::channel().0,
+        });
+        dp.handle_command(Produce {
+            segment_key: large,
+            data: Bytes::from(vec![0u8; 45]).into(),
+            record_count: 1,
+            reply: oneshot::channel().0,
+        });
+        dp.flush_batch();
+
+        assert_eq!(dp.hot_cache_bytes(), 55);
+        assert_eq!(dp.out.checkpoint_tasks.len(), 1);
+        let CheckpointTask::Checkpoint(job) = &dp.out.checkpoint_tasks[0] else {
+            panic!("expected checkpoint task");
+        };
+        assert_eq!(job.segment_key, large);
+    }
+
+    #[test]
+    fn cache_pressure_counts_uncommitted_hot_bytes_but_checkpoints_only_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.config.hot_cache_budget_bytes = 10;
+        dp.config.hot_cache_pressure_watermark = 0.5;
+        dp.handle_command(assign_segment(
+            test_key(),
+            vec![test_node_id(), NodeId::new("follower")],
+        ));
+
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from(vec![0u8; 8]).into(),
+            record_count: 1,
+            reply: oneshot::channel().0,
+        });
+        dp.flush_batch();
+
+        assert_eq!(dp.hot_cache_bytes(), 8);
+        assert_eq!(
+            dp.segments.get(&test_key()).unwrap().checkpointable_bytes(),
+            0
+        );
+        assert!(dp.out.checkpoint_tasks.is_empty());
+    }
+
+    #[test]
+    fn cache_pressure_does_not_duplicate_in_flight_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.config.hot_cache_budget_bytes = 10;
+        dp.config.hot_cache_pressure_watermark = 0.5;
+        dp.handle_command(assign_segment(test_key(), vec![]));
+
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from(vec![0u8; 8]).into(),
+            record_count: 1,
+            reply: oneshot::channel().0,
+        });
+        dp.flush_batch();
+        assert_eq!(dp.out.checkpoint_tasks.len(), 1);
+
+        dp.submit_checkpoint_if_cache_pressure();
+        assert_eq!(dp.out.checkpoint_tasks.len(), 1);
+
+        dp.handle_command(DataPlaneCommand::CheckpointComplete(CheckpointComplete {
+            segment_key: test_key(),
+            checkpointed_lsn: 1,
+            new_frontier: 1,
+            checkpointed_bytes: 8,
+        }));
+        assert!(dp.pressure_checkpoints_in_flight.is_empty());
+    }
+
     /// A seal that arrives while the active segment still holds a staged-but-
     /// unflushed produce must carry that produce into the successor. The old
     /// tracker is retired (removed from the leader-staged sum), so dropping its
@@ -1782,6 +1917,7 @@ mod tests {
             segment_key: key1,
             checkpointed_lsn: 10,
             new_frontier: 0,
+            checkpointed_bytes: 0,
         }));
         assert_eq!(wal_file_count(), initial_count);
 
@@ -1789,6 +1925,7 @@ mod tests {
             segment_key: key2,
             checkpointed_lsn: 5,
             new_frontier: 0,
+            checkpointed_bytes: 0,
         }));
     }
 

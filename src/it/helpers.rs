@@ -40,6 +40,8 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
         segment_age_check_interval_secs: 60,
         segment_size_limit_bytes: 1024 * 1024 * 1024,
         batch_max_bytes: 10 * 1024 * 1024,
+        hot_cache_budget_bytes: 4 * 1024 * 1024 * 1024,
+        hot_cache_pressure_watermark: 0.9,
         seal_request_timeout_secs: 5,
         // Short in tests so the orphan-GC sweep actually fires within a sim run; still
         // comfortably longer than re-fill + catch-up, so the lottery completes first.
