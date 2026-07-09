@@ -1728,6 +1728,11 @@ fn consumer_linger_batching_end_to_end() -> turmoil::Result {
         assert_eq!(r5.value, b"val5");
 
         // Commit progress at offset 4
+        consumer.ack(&r1).expect("ack 1");
+        consumer.ack(&r2).expect("ack 2");
+        consumer.ack(&r3).expect("ack 3");
+        consumer.ack(&r4).expect("ack 4");
+        consumer.ack(&r5).expect("ack 5");
         consumer.commit().await.expect("commit");
 
         // Close consumer and create a new one to verify resuming / skipping works

@@ -1,7 +1,7 @@
 use clap::Parser;
 use east_guard::client::Client;
-use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use rustyline::error::ReadlineError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

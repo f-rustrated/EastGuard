@@ -215,7 +215,9 @@ impl TopicMeta {
     /// Every known-end sealed segment, with the data a `CatchUpAssignment` needs.
     /// The takeover reseed (raft-actor.md #9) tracks these so a repair in flight
     /// when leadership changed isn't stranded.
-    pub(crate) fn known_end_sealed_segments(&self) -> Vec<(SegmentKey, EntryId, EntryId, ReplicaSet)> {
+    pub(crate) fn known_end_sealed_segments(
+        &self,
+    ) -> Vec<(SegmentKey, EntryId, EntryId, ReplicaSet)> {
         let mut out = Vec::new();
         for range in self.ranges.values() {
             for seg in range.segments.values() {

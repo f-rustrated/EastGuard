@@ -6,7 +6,7 @@ use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCom
 use crate::client::consumer::{
     ConsumerContext, ConsumerRecord, MergeSiblingState, PendingCursorStore,
 };
-use crate::client::{ClientError, ConsumerConfig};
+use crate::client::{ClientError, CommitMode, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 
@@ -67,12 +67,13 @@ impl TopicFetchManagerState {
     fn auto_commit_interval_ms(&self) -> u64 {
         self.config.auto_commit_interval_ms
     }
-    fn start_policy(&self) -> &StartPolicy {
-        &self.config.start_policy
-    }
 
     pub(crate) fn should_exit(&self) -> bool {
         self.senders.is_empty() && self.pending_cursors.is_empty() && self.consumer_group.is_none()
+    }
+
+    pub(crate) fn should_auto_commit(&self) -> bool {
+        self.consumer_group.is_some() && self.config.commit_mode == CommitMode::Auto
     }
 
     fn provision_initial_tasks(&mut self, ctx: &Arc<ConsumerContext>) {
@@ -164,7 +165,7 @@ impl TopicFetchManagerState {
     ) {
         let Some(tx) = self.senders.get(&range_id) else {
             let reason = "no active fetch actor for range";
-            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            let _ = reply.send(Err(ClientError::on_control(operation, range_id, reason)));
             return;
         };
 
@@ -172,31 +173,17 @@ impl TopicFetchManagerState {
 
         if tx.try_send(callback_build(actor_ack_tx)).is_err() {
             let reason = "fetch actor command queue is full or closed";
-            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            let _ = reply.send(Err(ClientError::on_control(operation, range_id, reason)));
             return;
         }
 
         tokio::spawn(async move {
             let result = actor_ack_rx.await.map_err(|_| {
                 let reason = "fetch actor stopped before acknowledging command";
-                Self::control_error(operation, range_id, reason)
+                ClientError::on_control(operation, range_id, reason)
             });
             let _ = reply.send(result);
         });
-    }
-
-    fn control_error(
-        operation: &'static str,
-        range_id: RangeId,
-        reason: impl Into<String>,
-    ) -> ClientError {
-        let reason = reason.into();
-        tracing::warn!(operation, range_id = *range_id, reason);
-        ClientError::ConsumerControl {
-            operation,
-            range_id: *range_id,
-            reason,
-        }
     }
 
     async fn handle_rebalance(&mut self, ctx: &Arc<ConsumerContext>) {
@@ -312,11 +299,8 @@ impl TopicFetchManagerState {
         ctx: &Arc<ConsumerContext>,
     ) -> Result<EntryId, ClientError> {
         // 1. Fetch the latest boundary from the replica if the start policy is Latest.
-        if matches!(self.start_policy(), StartPolicy::Latest) {
-            let (_, tail_entry_id) = ctx
-                .client
-                .fetch_range_entry_ids(&ctx.topic, range)
-                .await?;
+        if self.config.start_policy == StartPolicy::Latest {
+            let (_, tail_entry_id) = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
             return Ok(tail_entry_id);
         }
 
@@ -490,7 +474,7 @@ pub(crate) async fn run_topic_fetch_manager(
                 state.handle_command(command);
             }
 
-            _ = commit_interval.tick(), if state.consumer_group.is_some() => {
+            _ = commit_interval.tick(), if state.should_auto_commit() => {
                 let group = state.consumer_group.as_ref().unwrap().clone();
                 tokio::spawn(async move {
                     let _ = group.commit().await;

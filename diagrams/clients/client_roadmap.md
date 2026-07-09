@@ -66,6 +66,9 @@ minimal mechanics; the SDK turns it into a real, reusable library.
 - **Consumer** — bootstraps cursors from a topic's metadata, fetches each range from
   the nearest replica, feeds every response's progress signal to the cursor library,
   and follows the lineage transitions it returns.
+- **Consumer offset commits** — records which delivered positions are safe to resume
+  after, separating acknowledgement from durable commit so auto-commit does not skip
+  unprocessed work.
 - **Admin** — create/delete/describe/list, following the control-plane redirects.
 
 ---
@@ -77,6 +80,7 @@ minimal mechanics; the SDK turns it into a real, reusable library.
 | [C1: Routing & Connections](c1_routing_and_connections.md) | Connection pool, request-id multiplexing, metadata/routing cache, redirect-following, refresh | server D6 | The foundation both producer and consumer build on |
 | [C2: Producer](c2_producer.md) | Routing-key → write leader, redirect handling, batching hook, idempotency hook | C1 | Produce client |
 | [C3: Consumer](c3_consumer.md) | Wrap the cursor library, fetch routing, lineage walk, start policies, by-id fetch | C1 | Consume client |
+| [C4: Consumer Offset Commits](c4_consumer_offset_commits.md) | Delivery semantics, acknowledgement, auto/manual commit, resume checkpoints | C3, D8 | Durable consumer progress |
 
 Admin is small enough to fold into C1 (it's the same redirect-follow over the control
 plane) rather than its own phase.
@@ -88,6 +92,9 @@ C1 (Routing & Connections)
  ├──────────────┐
  v              v
 C2 (Producer)  C3 (Consumer)
+                |
+                v
+          C4 (Offset Commits)
 ```
 
 ---
@@ -114,9 +121,6 @@ C2 (Producer)  C3 (Consumer)
 ---
 
 ## Backlog (beyond a working client)
-
-- **Consumer groups** — sharing ranges across consumers, rebalancing, durable offset
-  commit. Offset storage is its own concern, not the log layer.
 - **Idempotent / exactly-once produce** — producer session + sequence numbers, dedup
   at the segment leader (the server-side half is its own backlog item).
 - **Client-side batching & compression** — amortize round-trips and bytes.

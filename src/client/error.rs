@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::client::RangeId;
+
 /// Errors a caller decides on. Redirect-following, reconnect, and retry-within-deadline
 /// are handled internally.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -38,4 +40,24 @@ pub enum ClientError {
         range_id: u64,
         reason: String,
     },
+}
+
+impl ClientError {
+    pub(crate) fn on_ack(range_id: RangeId, reason: &'static str) -> Self {
+        Self::on_control("ack", range_id, reason)
+    }
+
+    pub(crate) fn on_control(
+        operation: &'static str,
+        range_id: RangeId,
+        reason: impl Into<String>,
+    ) -> Self {
+        let reason = reason.into();
+        tracing::warn!(operation, range_id = *range_id, reason);
+        ClientError::ConsumerControl {
+            operation,
+            range_id: *range_id,
+            reason,
+        }
+    }
 }

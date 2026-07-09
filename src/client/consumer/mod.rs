@@ -45,11 +45,25 @@ impl ConsumerRecord {
 }
 
 #[derive(Debug, Clone)]
+pub enum DeliverySemantic {
+    AtLeastOnce,
+    AtMostOnce,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitMode {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConsumerConfig {
     /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
     pub start_policy: StartPolicy,
     pub group_id: Option<String>,
     pub auto_commit_interval_ms: u64,
+    pub delivery_semantic: DeliverySemantic,
+    pub commit_mode: CommitMode,
 }
 
 impl ConsumerConfig {
@@ -58,6 +72,8 @@ impl ConsumerConfig {
             start_policy,
             group_id: None,
             auto_commit_interval_ms: 5000, // Default to 1 second for groups
+            delivery_semantic: DeliverySemantic::AtLeastOnce,
+            commit_mode: CommitMode::Auto,
         }
     }
 }
@@ -68,6 +84,7 @@ pub struct Consumer {
     consumer_rx: flume::Receiver<Result<ConsumerRecord, ClientError>>,
     command_tx: flume::Sender<TopicFetchManagerCommand>,
     group: Option<Arc<ConsumerGroup>>,
+    delivery_semantic: DeliverySemantic,
 }
 
 impl Consumer {
@@ -84,12 +101,8 @@ impl Consumer {
 
         // Consolidate all group-specific logic into a single block
         if let Some(gid) = config.group_id.clone() {
-            let group = Arc::new(ConsumerGroup::new(
-                client.clone(),
-                gid.to_string(),
-                topic.clone(),
-            )?);
-            group.bootstrap().await?;
+            let group =
+                Arc::new(ConsumerGroup::new(client.clone(), gid.to_string(), topic.clone()).await?);
             consumer_group = Some(group);
             // If in a consumer group, initialize with empty cursors;
             // assignments will be dynamically resolved and started by the rebalancer.
@@ -117,6 +130,7 @@ impl Consumer {
             cursor_tx,
         });
 
+        let delivery_semantic = config.delivery_semantic.clone();
         let topic_fetch_manager =
             TopicFetchManagerState::new(cursors, consumer_group.clone(), config, record_tx);
 
@@ -129,6 +143,7 @@ impl Consumer {
             consumer_rx,
             command_tx,
             group: consumer_group,
+            delivery_semantic,
         })
     }
 
@@ -151,6 +166,17 @@ impl Consumer {
             group.commit().await?;
         }
         Ok(())
+    }
+
+    pub fn ack(&self, record: &ConsumerRecord) -> Result<(), ClientError> {
+        let Some(group) = &self.group else {
+            return Ok(());
+        };
+
+        match self.delivery_semantic {
+            DeliverySemantic::AtLeastOnce => group.ack_offset(record.range_id, record.position),
+            DeliverySemantic::AtMostOnce => Ok(()),
+        }
     }
 
     pub async fn pause_range(&self, range_id: RangeId) -> Result<(), ClientError> {
@@ -226,7 +252,15 @@ impl Consumer {
                 if !group.is_responsible_for(rec.range_id) {
                     continue;
                 }
-                group.record_offset(rec.range_id, rec.position);
+                match self.delivery_semantic {
+                    DeliverySemantic::AtLeastOnce => {
+                        group.record_delivery(rec.range_id, rec.position)?;
+                    }
+                    DeliverySemantic::AtMostOnce => {
+                        group.record_delivery(rec.range_id, rec.position)?;
+                        group.ack_offset(rec.range_id, rec.position)?;
+                    }
+                }
             }
             return Ok(Some(rec));
         }

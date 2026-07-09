@@ -70,21 +70,34 @@ pub struct OffsetCommitPayload {
 
 #[derive(Debug, Clone, Copy)]
 pub struct OffsetTracker {
-    pub uncommitted: ConsumerPosition,
+    pub delivered: ConsumerPosition,
+    pub committable: Option<ConsumerPosition>,
     pub committed: Option<ConsumerPosition>,
 }
 
 impl OffsetTracker {
-    pub fn new(position: ConsumerPosition) -> Self {
+    pub fn new_delivered(position: ConsumerPosition) -> Self {
         Self {
-            uncommitted: position,
+            delivered: position,
+            committable: None,
             committed: None,
         }
     }
 
-    pub fn needs_commit(&self) -> bool {
-        self.committed
-            .is_none_or(|committed| self.uncommitted > committed)
+    fn needs_commit(&self) -> bool {
+        self.committable.is_some_and(|committable| {
+            self.committed
+                .is_none_or(|committed| committable > committed)
+        })
+    }
+
+    /// Returns the committable position if a commit is actually needed, otherwise None.
+    fn commit_position(&self) -> Option<ConsumerPosition> {
+        if self.needs_commit() {
+            self.committable
+        } else {
+            None
+        }
     }
 }
 
@@ -111,19 +124,15 @@ pub struct ConsumerGroup {
 }
 
 impl ConsumerGroup {
-    pub fn new(client: Arc<Client>, group_id: String, topic: String) -> Result<Self, ClientError> {
+    pub async fn new(
+        client: Arc<Client>,
+        group_id: String,
+        topic: String,
+    ) -> Result<Self, ClientError> {
         let consumer_id = Uuid::new_v4();
         let active_peers = Arc::new(DashMap::new());
 
         let (hb_stop_tx, hb_stop_rx) = flume::bounded(0);
-
-        let routing_key = format!("hb:{}", group_id.clone());
-        tokio::spawn(group_heartbeat_sender(
-            consumer_id,
-            client.clone(),
-            routing_key.clone(),
-            hb_stop_rx.clone(),
-        ));
 
         let offset_producer = Producer::new(
             client.clone(),
@@ -131,14 +140,7 @@ impl ConsumerGroup {
             ProducerConfig::default(),
         );
 
-        tokio::spawn(heartbeat_receiver(
-            client.clone(),
-            active_peers.clone(),
-            routing_key,
-            hb_stop_rx,
-        ));
-
-        Ok(Self {
+        let group = Self {
             group_id,
             topic,
             consumer_id,
@@ -150,41 +152,58 @@ impl ConsumerGroup {
             _hb_stop_tx: hb_stop_tx,
             last_seen_sequences: DashMap::new(),
             stale_ticks: DashMap::new(),
-        })
+        };
+
+        group.ensure_system_topic(SYSTEM_TOPIC_ASSIGNMENTS).await?;
+        group.ensure_system_topic(SYSTEM_TOPIC_OFFSETS).await?;
+
+        group.start_heartbeat_tasks(hb_stop_rx);
+
+        Ok(group)
     }
 
-    pub fn routing_key(&self) -> String {
+    fn routing_key(&self) -> String {
         format!("{}:{}", self.group_id, self.topic)
     }
 
-    pub async fn bootstrap(&self) -> Result<(), ClientError> {
-        let policy = StoragePolicy {
-            retention_ms: None,
-            replication_factor: 1, // Single replica for system topics locally for now, or match cluster default
-            partition_strategy: PartitionStrategy::AutoSplit,
-        };
+    async fn ensure_system_topic(&self, name: &str) -> Result<(), ClientError> {
+        let already_exists =
+            tokio::time::timeout(Duration::from_secs(1), self.client.resolve_topic(name))
+                .await
+                .is_ok_and(|result| result.is_ok());
 
-        if self
-            .client
-            .resolve_topic(SYSTEM_TOPIC_ASSIGNMENTS)
-            .await
-            .is_err()
-        {
-            let _ = self
-                .client
-                .create_topic(SYSTEM_TOPIC_ASSIGNMENTS, policy.clone())
-                .await;
-        }
-        if self
-            .client
-            .resolve_topic(SYSTEM_TOPIC_OFFSETS)
-            .await
-            .is_err()
-        {
-            let _ = self.client.create_topic(SYSTEM_TOPIC_OFFSETS, policy).await;
+        if already_exists {
+            return Ok(());
         }
 
+        self.client
+            .create_topic(
+                name,
+                StoragePolicy {
+                    retention_ms: None,
+                    replication_factor: 1, // TODO Single replica for system topics locally for now, or match cluster default
+                    partition_strategy: PartitionStrategy::AutoSplit,
+                },
+            )
+            .await?;
         Ok(())
+    }
+
+    fn start_heartbeat_tasks(&self, hb_stop_rx: flume::Receiver<()>) {
+        let hb_routing_key = format!("hb:{}", self.group_id);
+        tokio::spawn(group_heartbeat_sender(
+            self.consumer_id,
+            self.client.clone(),
+            hb_routing_key.clone(),
+            hb_stop_rx.clone(),
+        ));
+
+        tokio::spawn(heartbeat_receiver(
+            self.client.clone(),
+            self.active_peers.clone(),
+            hb_routing_key,
+            hb_stop_rx,
+        ));
     }
 
     /// Returns true if this member owns the range. Filters out stale records in transit
@@ -193,32 +212,79 @@ impl ConsumerGroup {
         self.owned_ranges.load().contains(&range_id)
     }
 
-    pub(crate) fn record_offset(&self, range_id: RangeId, processed: ConsumerPosition) {
+    pub(crate) fn record_delivery(
+        &self,
+        range_id: RangeId,
+        delivered: ConsumerPosition,
+    ) -> Result<(), ClientError> {
+        if !self.is_responsible_for(range_id) {
+            return Err(ClientError::on_ack(
+                range_id,
+                "range is not currently owned by this consumer",
+            ));
+        }
+
         self.offsets
             .entry(range_id)
             .and_modify(|tracker| {
-                if processed > tracker.uncommitted {
-                    tracker.uncommitted = processed;
+                if delivered > tracker.delivered {
+                    tracker.delivered = delivered;
                 }
             })
-            .or_insert_with(|| OffsetTracker::new(processed));
+            .or_insert_with(|| OffsetTracker::new_delivered(delivered));
+        Ok(())
+    }
+
+    pub(crate) fn ack_offset(
+        &self,
+        range_id: RangeId,
+        processed: ConsumerPosition,
+    ) -> Result<(), ClientError> {
+        if !self.is_responsible_for(range_id) {
+            return Err(ClientError::on_ack(
+                range_id,
+                "range is not currently owned by this consumer",
+            ));
+        }
+
+        let Some(mut tracker) = self.offsets.get_mut(&range_id) else {
+            return Err(ClientError::on_ack(
+                range_id,
+                "record was not delivered by this consumer",
+            ));
+        };
+
+        if processed > tracker.delivered {
+            return Err(ClientError::on_ack(
+                range_id,
+                "position is ahead of the highest delivered record",
+            ));
+        }
+
+        if tracker
+            .committable
+            .is_none_or(|committable| processed > committable)
+        {
+            tracker.committable = Some(processed);
+        }
+        Ok(())
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
         // Collect commits synchronously to release DashMap locks before awaiting network calls.
-        let uncommitted: Vec<(RangeId, ConsumerPosition)> = self
+        let committable: Vec<(RangeId, ConsumerPosition)> = self
             .offsets
             .iter()
-            .filter(|entry| entry.needs_commit())
-            .map(|entry| (*entry.key(), entry.value().uncommitted))
+            .filter_map(|entry| entry.commit_position().map(|pos| (*entry.key(), pos)))
             .collect();
 
-        tracing::info!(?uncommitted);
-        if uncommitted.is_empty() {
+        if committable.is_empty() {
             return Ok(());
         }
 
-        self.write_offset_commits(uncommitted).await
+        tracing::debug!(?committable);
+
+        self.write_offset_commits(committable).await
     }
 
     fn remove_dead_peers(&self) {
@@ -265,9 +331,9 @@ impl ConsumerGroup {
         let mut commits = Vec::new();
         for &range in ranges {
             if let Some(entry) = self.offsets.get(&range)
-                && entry.needs_commit()
+                && let Some(committable) = entry.commit_position()
             {
-                commits.push((range, entry.uncommitted));
+                commits.push((range, committable));
             }
         }
 
@@ -442,19 +508,33 @@ async fn heartbeat_receiver(
     let mut end_key = heartbeat_key.as_bytes().to_vec();
     end_key.push(0u8);
 
-    let consumer_res = Consumer::new(
-        client,
-        SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
-        KeyInterest::KeySpan {
-            start: heartbeat_key.as_bytes().to_vec(),
-            end: end_key,
-        },
-        ConsumerConfig::new(StartPolicy::Latest),
-    )
-    .await;
+    let mut backoff = Duration::from_millis(100);
+    let max_backoff = Duration::from_secs(5);
 
-    let Ok(consumer) = consumer_res else {
-        return;
+    let consumer = loop {
+        let consumer_res = Consumer::new(
+            client.clone(),
+            SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
+            KeyInterest::KeySpan {
+                start: heartbeat_key.as_bytes().to_vec(),
+                end: end_key.clone(),
+            },
+            ConsumerConfig::new(StartPolicy::Latest),
+        )
+        .await;
+
+        match consumer_res {
+            Ok(c) => break c,
+            Err(e) => {
+                tracing::debug!("Failed to create heartbeat consumer, retrying: {:?}", e);
+                tokio::select! {
+                    _ = stop_rx.recv_async() => return,
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                }
+            }
+        }
     };
 
     loop {
