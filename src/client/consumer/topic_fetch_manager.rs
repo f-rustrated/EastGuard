@@ -313,7 +313,10 @@ impl TopicFetchManagerState {
     ) -> Result<EntryId, ClientError> {
         // 1. Fetch the latest boundary from the replica if the start policy is Latest.
         if matches!(self.start_policy(), StartPolicy::Latest) {
-            let (_, tail_entry_id) = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
+            let (_, tail_entry_id) = ctx
+                .client
+                .fetch_range_entry_ids(&ctx.topic, range)
+                .await?;
             return Ok(tail_entry_id);
         }
 

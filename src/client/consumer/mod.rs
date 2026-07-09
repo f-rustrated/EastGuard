@@ -4,20 +4,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::client::consumer::context::ConsumerContext;
 use crate::client::consumer::group::{
     ConsumerGroup, ConsumerPosition, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS,
 };
-use crate::client::consumer::range_fetcher::ConsumerContext;
 use crate::client::consumer::topic_fetch_manager::{
     RangeDrained, TopicFetchManagerCommand, TopicFetchManagerState, run_topic_fetch_manager,
 };
+use crate::client::redirect::Served;
 use crate::client::{Client, ClientError, Producer, ProducerConfig};
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest,
-    RangeOffsetRequest, SegmentDetail, TopicDetail,
+    ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
+    RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
-use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 
+pub(crate) mod context;
 pub(crate) mod cursor;
 pub(crate) mod group;
 pub(crate) mod range_fetcher;
