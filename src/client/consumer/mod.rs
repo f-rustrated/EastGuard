@@ -23,9 +23,8 @@ pub(crate) mod group;
 pub(crate) mod range_fetcher;
 pub(crate) mod topic_fetch_manager;
 
-pub(crate) use cursor::RangeCursor;
-pub(crate) use cursor::RangeCursorSet;
 pub use cursor::{KeyInterest, StartPolicy};
+pub(crate) use cursor::{MergeSiblingState, PendingCursorStore, RangeCursor};
 
 /// A record returned to the consumer application.
 #[derive(Debug, Clone)]
@@ -77,7 +76,7 @@ impl Consumer {
         config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
         let detail = client.resolve_topic(&topic).await?;
-        let mut cursors = RangeCursorSet::build_cursors(&detail, interest, config.start_policy);
+        let mut cursors = PendingCursorStore::build_cursors(&detail, interest, config.start_policy);
 
         let mut consumer_group = None;
 
@@ -92,7 +91,7 @@ impl Consumer {
             consumer_group = Some(group);
             // If in a consumer group, initialize with empty cursors;
             // assignments will be dynamically resolved and started by the rebalancer.
-            cursors = RangeCursorSet::new(Vec::new());
+            cursors = PendingCursorStore::new(Vec::new());
         }
 
         if matches!(config.start_policy, StartPolicy::Latest) {

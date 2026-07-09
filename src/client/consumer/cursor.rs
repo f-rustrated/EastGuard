@@ -1,13 +1,12 @@
-//! `CursorSet` — the consumer's set of per-range cursors.
-//! Mutated only via `apply_drained`, which takes the range_id the
-//! consumer just fully drained and the transition to apply. Returns the
-//! newly activated cursors so the caller can spawn fetch tasks for them.
+//! `PendingCursorStore` — the consumer's inactive cursor store.
+//! Live fetch position is owned by `RangeFetchActor`; this store only holds
+//! cursors that are ready to spawn plus drained merge parents waiting for
+//! their sibling to drain.
 //!
 //! Lineage discipline (Ordering Guarantees): a successor range is
 //! not read until its sole owning predecessor has been drained to the sealed
-//! `end_offset`. The set enforces this by holding only the cursors the
-//! consumer should currently be fetching — successors only appear after
-//! their predecessor drains.
+//! `end_offset`. The store enforces this by making successors fetchable only
+//! after their predecessor requirements are satisfied.
 
 use crate::client::TopicDetail;
 use crate::connections::protocol::RangeDetail;
@@ -17,34 +16,19 @@ use crate::control_plane::metadata::{RangeId, RangeState};
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
 
-struct ParkedMerge {
+struct PendingMerge {
     /// The merged range's wire ID.
     merged_id: RangeId,
 
-    /// `Vec` instead of `HashMap` — for `n` this small the linear scan is cache-friendly and
-    /// avoids HashMap's per-entry hashing + sparse-storage overhead.
-    drained: Vec<RangeCursor>,
+    /// Final cursor returned by the first drained parent. This is completed
+    /// lineage input, not stale live fetch state.
+    first_parent: RangeCursor,
 }
 
-#[derive(Default)]
-struct ParkedMerges(Vec<ParkedMerge>);
-
-impl ParkedMerges {
-    fn push(&mut self, pending: ParkedMerge) {
-        self.0.push(pending);
-    }
-
-    fn try_complete_merge(
-        &mut self,
-        merged_range_id: RangeId,
-        drained: &RangeCursor,
-    ) -> Option<RangeCursor> {
-        let pos = self.0.iter().position(|p| p.merged_id == merged_range_id)?;
-        let parked = self.0.swap_remove(pos).drained.pop()?;
-        let mut m = parked.into_merged_cursor(merged_range_id);
-        m.absorb(drained.clone());
-        Some(m)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeSiblingState {
+    Tracked,
+    Untracked,
 }
 
 /// What keys the consumer wants to read. Drives which ranges get cursors.
@@ -87,16 +71,16 @@ impl std::str::FromStr for StartPolicy {
     }
 }
 
-pub struct RangeCursorSet {
-    cursors: Vec<RangeCursor>,
-    parked_merges: ParkedMerges,
+pub struct PendingCursorStore {
+    fetchable: Vec<RangeCursor>,
+    merge_waits: Vec<PendingMerge>,
 }
 
-impl RangeCursorSet {
-    pub fn new(cursors: Vec<RangeCursor>) -> Self {
+impl PendingCursorStore {
+    pub fn new(fetchable: Vec<RangeCursor>) -> Self {
         let set = Self {
-            cursors,
-            parked_merges: ParkedMerges::default(),
+            fetchable,
+            merge_waits: Vec::new(),
         };
         #[cfg(any(test, debug_assertions))]
         set.assert_invariants();
@@ -107,87 +91,56 @@ impl RangeCursorSet {
         detail: &TopicDetail,
         interest: KeyInterest,
         policy: StartPolicy,
-    ) -> RangeCursorSet {
-        let cursors = match policy {
+    ) -> PendingCursorStore {
+        let fetchable = match policy {
             StartPolicy::Latest => RangeCursor::latest_cursors(detail, &interest),
             StartPolicy::Earliest => RangeCursor::earliest_cursors(detail, &interest),
         };
-        RangeCursorSet::new(cursors)
+        PendingCursorStore::new(fetchable)
     }
 
     pub fn contains(&self, range_id: RangeId) -> bool {
-        self.cursors.iter().any(|c| c.range_id == range_id)
+        self.fetchable.iter().any(|c| c.range_id == range_id)
     }
 
     pub fn get(&self, range_id: RangeId) -> Option<&RangeCursor> {
-        self.cursors.iter().find(|c| c.range_id == range_id)
+        self.fetchable.iter().find(|c| c.range_id == range_id)
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, RangeCursor> {
-        self.cursors.iter()
+        self.fetchable.iter()
     }
 
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RangeCursor> {
-        self.cursors.iter_mut()
+        self.fetchable.iter_mut()
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.cursors.len()
+        self.fetchable.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cursors.is_empty()
-    }
-
-    pub fn add_or_update(&mut self, cursor: RangeCursor) {
-        if let Some(c) = self
-            .cursors
-            .iter_mut()
-            .find(|c| c.range_id == cursor.range_id)
-        {
-            *c = cursor;
-        } else {
-            self.cursors.push(cursor);
-        }
-        #[cfg(any(test, debug_assertions))]
-        self.assert_invariants();
+        self.fetchable.is_empty()
     }
 
     pub fn remove(&mut self, range_id: RangeId) -> Option<RangeCursor> {
-        if let Some(idx) = self.cursors.iter().position(|c| c.range_id == range_id) {
-            return Some(self.cursors.remove(idx));
+        if let Some(idx) = self.fetchable.iter().position(|c| c.range_id == range_id) {
+            return Some(self.fetchable.remove(idx));
         }
         None
     }
 
-    /// Apply a lineage transition after a range has been fully drained.
-    /// Returns any newly activated cursors that the consumer should now fetch.
-    pub fn apply_drained(
-        &mut self,
-        range_id: RangeId,
-        transition: RangeTransition,
-    ) -> Box<[RangeCursor]> {
-        let Some(drained) = self.remove(range_id) else {
-            return Box::new([]);
-        };
-
-        let new_cursors = self.apply_transition(drained, transition);
-        self.cursors.extend(new_cursors.clone());
-
-        #[cfg(any(test, debug_assertions))]
-        self.assert_invariants();
-
-        new_cursors
-    }
-
+    /// Applies a transition from the final cursor returned by a drained actor.
+    /// Returns newly fetchable successor cursors.
     pub fn apply_drained_cursor(
         &mut self,
         drained: RangeCursor,
         transition: RangeTransition,
+        sibling_state: MergeSiblingState,
     ) -> Box<[RangeCursor]> {
-        let new_cursors = self.apply_transition(drained, transition);
-        self.cursors.extend(new_cursors.clone());
+        let new_cursors = self.apply_transition(drained, transition, sibling_state);
+        self.fetchable.extend(new_cursors.clone());
 
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -199,6 +152,7 @@ impl RangeCursorSet {
         &mut self,
         drained: RangeCursor,
         transition: RangeTransition,
+        sibling_state: MergeSiblingState,
     ) -> Box<[RangeCursor]> {
         match transition {
             RangeTransition::Split {
@@ -209,16 +163,12 @@ impl RangeCursorSet {
                 .split(left_range_id, right_range_id, split_point)
                 .into(),
             RangeTransition::Merged {
-                merged_range_id,
-                merged_from,
+                merged_range_id, ..
             } => {
-                //(a) Both parents tracked, the other already drained. M was parked
+                //(a) Both parents tracked, the other already drained. M was waiting
                 //    pending its second drain; now both have come in.
                 //    Build M with the union keyspace; ship it.
-                if let Some(merged) = self
-                    .parked_merges
-                    .try_complete_merge(merged_range_id, &drained)
-                {
+                if let Some(merged) = self.try_complete_merge(merged_range_id, &drained) {
                     return Box::new([merged]);
                 }
 
@@ -226,10 +176,10 @@ impl RangeCursorSet {
                 //       the sibling's drain. M is not yet fetchable — reading it now
                 //       would advance past records the consumer owes to keys whose
                 //       predecessor (the sibling) hasn't drained.
-                if self.has_active_sibling(merged_from, &drained) {
-                    self.parked_merges.push(ParkedMerge {
+                if sibling_state == MergeSiblingState::Tracked {
+                    self.merge_waits.push(PendingMerge {
                         merged_id: merged_range_id,
-                        drained: vec![drained],
+                        first_parent: drained,
                     });
                     return Box::new([]);
                 }
@@ -238,16 +188,25 @@ impl RangeCursorSet {
                 //   Setup:
                 //      P1 [a, b)
                 //      P2 [b, c) -> M [a, c).
-                //  Consumer is reading only [a, b). Their CursorSet has only P1 (P2 was never relevant).
+                //  Consumer is reading only [a, b). Their pending store saw only P1 (P2 was never relevant).
                 Box::new([drained.into_merged_cursor(merged_range_id)])
             }
         }
     }
 
-    fn has_active_sibling(&self, merged_from: [RangeId; 2], cursor: &RangeCursor) -> bool {
-        let [pa, pb] = merged_from;
-        let sibling = if pa == cursor.range_id { pb } else { pa };
-        self.cursors.iter().any(|c| c.range_id == sibling)
+    fn try_complete_merge(
+        &mut self,
+        merged_range_id: RangeId,
+        drained: &RangeCursor,
+    ) -> Option<RangeCursor> {
+        let pos = self
+            .merge_waits
+            .iter()
+            .position(|p| p.merged_id == merged_range_id)?;
+        let first_parent = self.merge_waits.swap_remove(pos).first_parent;
+        let mut merged = first_parent.into_merged_cursor(merged_range_id);
+        merged.absorb(drained.clone());
+        Some(merged)
     }
 }
 
@@ -379,6 +338,15 @@ impl RangeCursor {
         [left, right]
     }
 
+    pub(crate) fn merge_sibling(&self, merged_from: [RangeId; 2]) -> RangeId {
+        let [left_parent, right_parent] = merged_from;
+        if left_parent == self.range_id {
+            right_parent
+        } else {
+            left_parent
+        }
+    }
+
     /// Consume this drained parent cursor and become the merged cursor it
     /// transitions to. Used when M doesn't yet exist in the cursor set (this is
     /// the first of the merge's parents to drain in the consumer's view).
@@ -401,17 +369,17 @@ impl RangeCursor {
 }
 
 #[cfg(any(test, debug_assertions))]
-impl TAssertInvariant for RangeCursorSet {
+impl TAssertInvariant for PendingCursorStore {
     fn assert_invariants(&self) {
         // (1) Unique range_id. Two cursors on the same range would either
         //     race each other's offsets or deliver duplicates; the lineage
         //     walker assumes one cursor per active range covering the
         //     consumer's interest.
         let mut seen: HashSet<RangeId> = HashSet::new();
-        for cursor in &self.cursors {
+        for cursor in &self.fetchable {
             assert!(
                 seen.insert(cursor.range_id),
-                "duplicate range_id in CursorSet: {:?}",
+                "duplicate range_id in PendingCursorStore: {:?}",
                 cursor.range_id,
             );
         }
@@ -420,30 +388,27 @@ impl TAssertInvariant for RangeCursorSet {
         //     receive the same key from two different cursors → duplicate
         //     delivery for that key's per-key chain. Half-open intervals
         //     `[start, end)`; touching at a boundary is fine.
-        for (i, a) in self.cursors.iter().enumerate() {
-            for b in self.cursors.iter().skip(i + 1) {
+        for (i, a) in self.fetchable.iter().enumerate() {
+            for b in self.fetchable.iter().skip(i + 1) {
                 let overlap =
                     a.keyspace_start < b.keyspace_end && b.keyspace_start < a.keyspace_end;
                 assert!(
                     !overlap,
-                    "overlapping keyspaces in CursorSet: {a:?} and {b:?}",
+                    "overlapping keyspaces in PendingCursorStore: {a:?} and {b:?}",
                 );
             }
         }
 
         // (3) Pending consistency. A pending merge represents "M is waiting
-        //     for a sibling to drain"; if M were already live (in `cursors`)
-        //     or if there were no drained parents recorded, the entry would
-        //     be a bug.
-        for pending in &self.parked_merges.0 {
+        //     for a sibling to drain"; if M were already fetchable, the entry
+        //     would be a bug.
+        for pending in &self.merge_waits {
             assert!(
-                !self.cursors.iter().any(|c| c.range_id == pending.merged_id),
-                "pending merge {:?} also present as live cursor",
-                pending.merged_id,
-            );
-            assert!(
-                !pending.drained.is_empty(),
-                "pending merge {:?} has no drained parents",
+                !self
+                    .fetchable
+                    .iter()
+                    .any(|c| c.range_id == pending.merged_id),
+                "pending merge {:?} also present as fetchable cursor",
                 pending.merged_id,
             );
         }
@@ -527,7 +492,7 @@ mod tests {
             range(1, RangeState::Active, b"", b"m", None, None, None),
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
-        let set = RangeCursorSet::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Latest);
+        let set = PendingCursorStore::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Latest);
         let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         assert!(ids.contains(&RangeId(1)));
         assert!(ids.contains(&RangeId(2)));
@@ -542,7 +507,7 @@ mod tests {
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
         // Interest [a, c) — only overlaps range 1 ([, m)).
-        let set = RangeCursorSet::build_cursors(
+        let set = PendingCursorStore::build_cursors(
             &t,
             KeyInterest::KeySpan {
                 start: b"a".to_vec(),
@@ -570,7 +535,8 @@ mod tests {
             range(1, RangeState::Active, b"", b"m", None, None, None),
             range(2, RangeState::Active, b"m", b"\xff", None, None, None),
         ]);
-        let set = RangeCursorSet::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
+        let set =
+            PendingCursorStore::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
         let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         // Earliest = original root (range 0), not the split children.
@@ -609,7 +575,8 @@ mod tests {
                 Some((RangeId(1), RangeId(2))),
             ),
         ]);
-        let set = RangeCursorSet::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
+        let set =
+            PendingCursorStore::build_cursors(&t, KeyInterest::AllKeys, StartPolicy::Earliest);
 
         let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
         // 1 and 2 are the roots (no merged_from, not split children); 3 has
@@ -623,8 +590,12 @@ mod tests {
     /// keyspaces around the split point, both at offset 0.
     #[test]
     fn split_replaces_parent_with_two_children() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(0), 1001.into(), b"a", b"c")]);
-        let added = set.apply_drained(RangeId(0), split_transition(RangeId(1), RangeId(2), b"b"));
+        let mut set = PendingCursorStore::new(vec![]);
+        let added = set.apply_drained_cursor(
+            cursor(RangeId(0), 1001.into(), b"a", b"c"),
+            split_transition(RangeId(1), RangeId(2), b"b"),
+            MergeSiblingState::Untracked,
+        );
 
         assert_eq!(added.len(), 2);
         assert_eq!(added[0], cursor(RangeId(1), EntryId::default(), b"a", b"b"));
@@ -639,20 +610,18 @@ mod tests {
     /// owes to keys whose predecessor (P2) hasn't been drained yet.
     #[test]
     fn merge_first_parent_defers_m_when_sibling_tracked() {
-        let mut set = RangeCursorSet::new(vec![
+        let mut set = PendingCursorStore::new(vec![]);
+        let added = set.apply_drained_cursor(
             cursor(RangeId(1), EntryId::default(), b"a", b"b"),
-            cursor(RangeId(2), EntryId::default(), b"b", b"c"),
-        ]);
-        let added = set.apply_drained(
-            RangeId(1),
             merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
+            MergeSiblingState::Tracked,
         );
 
         assert_eq!(added.len(), 0);
 
-        // P1 dropped; P2 still tracked; M not yet a fetchable cursor.
+        // P1 waits; P2 is tracked by the manager/actor layer; M not fetchable yet.
         let ids: Vec<RangeId> = set.iter().map(|c| c.range_id).collect();
-        assert_eq!(ids, vec![RangeId(2)]);
+        assert_eq!(ids, Vec::<RangeId>::new());
     }
 
     /// Two-parent merge, second parent draining: M is activated now with
@@ -662,18 +631,17 @@ mod tests {
     /// record.
     #[test]
     fn merge_second_parent_activates_m_with_union_keyspace() {
-        let mut set = RangeCursorSet::new(vec![
+        let mut set = PendingCursorStore::new(vec![]);
+        set.apply_drained_cursor(
             cursor(RangeId(1), EntryId::default(), b"a", b"b"),
-            cursor(RangeId(2), EntryId::default(), b"b", b"c"),
-        ]);
-        set.apply_drained(
-            RangeId(1),
             merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
+            MergeSiblingState::Tracked,
         );
 
-        let added = set.apply_drained(
-            RangeId(2),
+        let added = set.apply_drained_cursor(
+            cursor(RangeId(2), EntryId::default(), b"b", b"c"),
             merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
+            MergeSiblingState::Untracked,
         );
 
         assert_eq!(added.len(), 1);
@@ -690,10 +658,11 @@ mod tests {
     /// waits on, P2" case.
     #[test]
     fn single_parent_consumer_follows_into_m_without_tracking_sibling() {
-        let mut set = RangeCursorSet::new(vec![cursor(RangeId(1), EntryId::default(), b"a", b"b")]);
-        let added = set.apply_drained(
-            RangeId(1),
+        let mut set = PendingCursorStore::new(vec![]);
+        let added = set.apply_drained_cursor(
+            cursor(RangeId(1), EntryId::default(), b"a", b"b"),
             merge_transition(RangeId(3), [RangeId(1), RangeId(2)]),
+            MergeSiblingState::Untracked,
         );
 
         assert_eq!(added.len(), 1);
@@ -706,7 +675,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate range_id")]
     fn duplicate_range_id_panics_invariants() {
-        RangeCursorSet::new(vec![
+        PendingCursorStore::new(vec![
             cursor(RangeId(1), EntryId::default(), b"a", b"b"),
             cursor(RangeId(1), EntryId::default(), b"c", b"d"),
         ]);
@@ -715,7 +684,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "overlapping keyspaces")]
     fn overlapping_keyspaces_panic_invariants() {
-        RangeCursorSet::new(vec![
+        PendingCursorStore::new(vec![
             cursor(RangeId(1), EntryId::default(), b"a", b"c"),
             cursor(RangeId(2), EntryId::default(), b"b", b"d"),
         ]);

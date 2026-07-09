@@ -3,7 +3,9 @@ use super::RangeCursor;
 use crate::client::consumer::cursor::StartPolicy;
 use crate::client::consumer::group::{ConsumerGroup, ConsumerPosition};
 use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
-use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
+use crate::client::consumer::{
+    ConsumerContext, ConsumerRecord, MergeSiblingState, PendingCursorStore,
+};
 use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
@@ -38,7 +40,7 @@ pub(crate) struct RangeDrained {
 }
 
 pub(crate) struct TopicFetchManagerState {
-    pending_cursors: RangeCursorSet,
+    pending_cursors: PendingCursorStore,
     senders: HashMap<RangeId, flume::Sender<RangeFetchActorCommand>>,
 
     /// The optional shared consumer group context for dynamic partition rebalancing.
@@ -49,7 +51,7 @@ pub(crate) struct TopicFetchManagerState {
 
 impl TopicFetchManagerState {
     pub(crate) fn new(
-        pending_cursors: RangeCursorSet,
+        pending_cursors: PendingCursorStore,
         consumer_group: Option<Arc<ConsumerGroup>>,
         config: ConsumerConfig,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
@@ -91,9 +93,12 @@ impl TopicFetchManagerState {
         if self.senders.remove(&range_id).is_none() {
             return;
         }
-        let added = self
-            .pending_cursors
-            .apply_drained_cursor(event.cursor, event.transition);
+        let sibling_state = self.merge_sibling_state(&event.cursor, &event.transition);
+        let added = self.pending_cursors.apply_drained_cursor(
+            event.cursor,
+            event.transition,
+            sibling_state,
+        );
 
         for new_cursor in added {
             if self
@@ -104,6 +109,22 @@ impl TopicFetchManagerState {
                 continue;
             }
             self.spawn_and_register(new_cursor, ctx.clone());
+        }
+    }
+
+    fn merge_sibling_state(
+        &self,
+        drained: &RangeCursor,
+        transition: &RangeTransition,
+    ) -> MergeSiblingState {
+        let RangeTransition::Merged { merged_from, .. } = transition else {
+            return MergeSiblingState::Untracked;
+        };
+        let sibling = drained.merge_sibling(*merged_from);
+        if self.senders.contains_key(&sibling) || self.pending_cursors.contains(sibling) {
+            MergeSiblingState::Tracked
+        } else {
+            MergeSiblingState::Untracked
         }
     }
 
@@ -522,7 +543,7 @@ impl TAssertInvariant for TopicFetchManagerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::consumer::cursor::RangeCursorSet;
+    use crate::client::consumer::cursor::PendingCursorStore;
     use crate::connections::protocol::SegmentDetail;
     use crate::control_plane::metadata::SegmentId;
     use std::collections::HashMap;
@@ -530,7 +551,7 @@ mod tests {
     fn manager_state() -> TopicFetchManagerState {
         let (record_tx, _record_rx) = flume::unbounded();
         TopicFetchManagerState::new(
-            RangeCursorSet::new(Vec::new()),
+            PendingCursorStore::new(Vec::new()),
             None,
             ConsumerConfig::new(StartPolicy::Earliest),
             record_tx,
