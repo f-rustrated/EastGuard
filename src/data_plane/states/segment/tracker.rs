@@ -95,9 +95,12 @@ impl SegmentTracker {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn uncheckpointed(&self) -> u64 {
-        self.cache.load_write_cursor() - self.cache.load_eviction_frontier()
+    pub(crate) fn checkpointable_bytes(&self) -> u64 {
+        self.cache.checkpointable_bytes()
+    }
+
+    pub(crate) fn hot_cache_bytes(&self) -> u64 {
+        self.cache.hot_cache_bytes()
     }
 
     pub(crate) fn stage_to_wal(&mut self, wal_buf: &mut Vec<u8>) {
@@ -175,9 +178,15 @@ impl SegmentTracker {
         self.committed_entry_id = entry_id;
     }
 
-    pub(crate) fn advance_checkpoint(&mut self, checkpointed_lsn: u64, new_frontier: u64) {
+    pub(crate) fn advance_checkpoint(
+        &mut self,
+        checkpointed_lsn: u64,
+        new_frontier: u64,
+        checkpointed_bytes: u64,
+    ) {
         self.checkpoint_lsn = self.checkpoint_lsn.max(checkpointed_lsn);
-        self.cache.advance_eviction_frontier(new_frontier);
+        self.cache
+            .complete_checkpoint(new_frontier, checkpointed_bytes);
     }
 
     pub(crate) fn checkpoint_lsn(&self) -> u64 {
@@ -436,11 +445,11 @@ pub mod tests {
     fn advance_checkpoint_is_monotonic() {
         let mut t = make_tracker(SegmentRole::Leader);
         assert_eq!(t.checkpoint_lsn(), 0);
-        t.advance_checkpoint(10, 0);
+        t.advance_checkpoint(10, 0, 0);
         assert_eq!(t.checkpoint_lsn(), 10);
-        t.advance_checkpoint(5, 0); // shouldn't go backward
+        t.advance_checkpoint(5, 0, 0); // shouldn't go backward
         assert_eq!(t.checkpoint_lsn(), 10);
-        t.advance_checkpoint(20, 0);
+        t.advance_checkpoint(20, 0, 0);
         assert_eq!(t.checkpoint_lsn(), 20);
     }
 

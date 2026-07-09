@@ -101,6 +101,7 @@ impl CheckpointWorker {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),
             new_frontier: checkpoint.new_frontier,
+            checkpointed_bytes: checkpoint.byte_len(),
         }
         .into();
         let _ = data_plane_tx.send(DataPlaneMessage::Command(completion));
