@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::LeaderChange;
+use crate::control_plane::membership::MembershipEvent;
 use crate::control_plane::membership::peer_discovery::JoinAttempt;
-use crate::control_plane::membership::{MembershipEvent, NodeAlive, NodeDead};
+use crate::impl_from_variant;
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::{impl_from_variant, impl_from_variant_via};
 
 use super::packet::{OutboundPacket, SwimPacket};
 use super::timer::SwimTimer;
@@ -59,5 +59,3 @@ impl_from_variant!(
     Timer(TimerCommand<SwimTimer>),
     MembershipEvent(MembershipEvent)
 );
-
-impl_from_variant_via!(SwimEvent, MembershipEvent, NodeAlive, NodeDead);

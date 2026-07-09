@@ -7,7 +7,7 @@ mod timer;
 
 pub use actor::QueryCommand;
 pub use command::SwimEvent;
-pub use event::{MembershipEvent, NodeAlive, NodeDead};
+pub use event::MembershipEvent;
 
 pub(crate) use actor::SwimActorCommand;
 pub(crate) use command::{SwimCommand, SwimTimeOutCallback, SwimTimerKind};

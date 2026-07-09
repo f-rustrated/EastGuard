@@ -13,7 +13,7 @@ use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
-use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId, Topology};
+use crate::control_plane::membership::{ShardGroup, ShardGroupId, Topology};
 use crate::control_plane::{NodeId, SwimNodeState};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
@@ -217,9 +217,7 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
                     start_raft_node(name, CLUSTER_PORT + port, g.clone(), &peers).await?;
 
                 let _ = raft_tx
-                    .send(NodeDead {
-                        dead_node_id: NodeId::new("node-3"),
-                    })
+                    .send(RaftProtocolMessage::HandleNodeDeath(NodeId::new("node-3")))
                     .await;
 
                 if name == "node-3" {
@@ -323,9 +321,7 @@ fn node_death_removes_dead_voter_unreachable_spare_stays_non_voting() -> turmoil
                 topology_pub.store(Arc::new(topology));
 
                 let _ = raft_tx
-                    .send(NodeDead {
-                        dead_node_id: NodeId::new("node-3"),
-                    })
+                    .send(RaftProtocolMessage::HandleNodeDeath(NodeId::new("node-3")))
                     .await;
 
                 // Drive ticks for the chained proposals to commit and apply

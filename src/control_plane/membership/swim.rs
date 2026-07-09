@@ -651,19 +651,15 @@ impl Swim {
         match member.state {
             SwimNodeState::Alive => {
                 self.cancel_suspect_timer(node_id);
-                self.pending_events.push(
-                    NodeAlive {
-                        node_id: node_id.clone(),
-                    }
-                    .into(),
-                );
+                self.pending_events
+                    .push(MembershipEvent::NodeAlive(node_id.clone()).into());
             }
             SwimNodeState::Dead => {
                 // Node can receive a Dead gossip while still locally Suspect; cancel the
                 // pending suspect timer so it doesn't fire and re-emit a stale Dead event.
                 self.cancel_suspect_timer(node_id);
                 self.pending_events
-                    .push(NodeDead::new(node_id.clone()).into());
+                    .push(MembershipEvent::NodeDead(node_id.clone()).into());
             }
             SwimNodeState::Suspect => {
                 let seq = self.next_seq();
@@ -1515,7 +1511,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            MembershipEvent::NodeAlive(NodeAlive { node_id, .. }) if *node_id == NodeId::new("node-remote")
+            MembershipEvent::NodeAlive(node_id) if *node_id == NodeId::new("node-remote")
         ));
     }
 
@@ -1553,10 +1549,10 @@ mod tests {
         // 2 events: NodeAlive for sender "node-other" + NodeDead for "node-remote"
         assert!(events
             .iter()
-            .any(|e| matches!(e, MembershipEvent::NodeDead(NodeDead{dead_node_id,..}) if *dead_node_id == NodeId::new("node-remote"))));
+            .any(|e| matches!(e, MembershipEvent::NodeDead(dead_node_id) if *dead_node_id == NodeId::new("node-remote"))));
         assert!(events
             .iter()
-            .any(|e| matches!(e, MembershipEvent::NodeAlive(NodeAlive { node_id, .. } )if *node_id == NodeId::new("node-other"))));
+            .any(|e| matches!(e, MembershipEvent::NodeAlive(node_id)if *node_id == NodeId::new("node-other"))));
     }
 
     #[test]

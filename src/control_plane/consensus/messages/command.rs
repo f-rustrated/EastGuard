@@ -1,7 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::rpc::{OutboundRaftPacket, RaftRpc};
 use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
-use crate::control_plane::membership::{NodeDead, ShardGroup, ShardGroupId};
+use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::command::MetadataCommand;
 use crate::data_plane::messages::command::SealRequest;
 use crate::impl_from_variant;
@@ -34,7 +34,7 @@ pub enum RaftProtocolMessage {
     Timeout(RaftTimeoutCallback),
     EnsureGroup(EnsureGroup),
     RemoveGroup(RemoveGroup),
-    HandleNodeDeath(NodeDead),
+    HandleNodeDeath(NodeId),
     HandleNodeJoin(HandleNodeJoin),
 }
 
@@ -44,7 +44,7 @@ impl_from_variant!(
     Timeout(RaftTimeoutCallback),
     EnsureGroup,
     RemoveGroup,
-    HandleNodeDeath(NodeDead),
+    HandleNodeDeath(NodeId),
     HandleNodeJoin
 );
 

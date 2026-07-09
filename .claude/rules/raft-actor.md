@@ -30,7 +30,7 @@ pub enum RaftCommand {
         command: messages::RaftCommand,
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
-    HandleNodeDeath { dead_node_id: NodeId },
+    HandleNodeDeath(NodeId),
     HandleNodeJoin {
         new_node_id: NodeId,
         affected_groups: Vec<ShardGroup>,

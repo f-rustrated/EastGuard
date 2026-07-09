@@ -2,7 +2,7 @@ use tokio::sync::oneshot;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::membership::{NodeDead, ShardGroupId};
+use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
 
@@ -80,7 +80,6 @@ impl_from_variant_via!(
     InboundRaftRpc,
     EnsureGroup,
     RemoveGroup,
-    NodeDead,
     HandleNodeJoin,
 );
 

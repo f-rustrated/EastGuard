@@ -1,55 +1,42 @@
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::messages::{HandleNodeJoin, MultiRaftActorCommand};
-use crate::impl_from_variant;
-
-#[derive(Debug)]
-pub struct NodeDead {
-    pub dead_node_id: NodeId,
-}
-
-#[derive(Debug)]
-pub struct NodeAlive {
-    pub node_id: NodeId,
-}
+use crate::control_plane::consensus::messages::{
+    HandleNodeJoin, MultiRaftActorCommand, RaftProtocolMessage,
+};
 
 #[derive(Debug)]
 pub enum MembershipEvent {
-    NodeAlive(NodeAlive),
-    NodeDead(NodeDead),
+    NodeAlive(NodeId),
+    NodeDead(NodeId),
 }
 
-impl_from_variant!(MembershipEvent, NodeAlive, NodeDead);
-
 impl MembershipEvent {
-    pub(crate) fn node_id(&self) -> &NodeId {
+    fn node_id(&self) -> &NodeId {
         match self {
-            MembershipEvent::NodeAlive(evt) => &evt.node_id,
-            MembershipEvent::NodeDead(evt) => &evt.dead_node_id,
+            MembershipEvent::NodeAlive(node_id) => node_id,
+            MembershipEvent::NodeDead(node_id) => node_id,
         }
     }
-}
 
-impl NodeDead {
-    pub fn new(dead_node_id: NodeId) -> Self {
-        Self { dead_node_id }
+    pub(crate) fn is_self(&self, other: &NodeId) -> bool {
+        self.node_id() == other
     }
-}
 
-impl MembershipEvent {
     /// Turn a membership event into the consensus-side notification command.
     /// The command intentionally carries no topology snapshot — handlers load
     /// fresh from the shared topology reader at processing time, so they see
     /// the latest cluster shape even if topology drifted between this event's
     /// emission and the handler running.
     pub(crate) fn into_raft_command(self, local_node_id: &NodeId) -> Option<MultiRaftActorCommand> {
-        if self.node_id() == local_node_id {
+        if self.is_self(local_node_id) {
             return None;
         }
         match self {
-            MembershipEvent::NodeDead(evt) => Some(evt.into()),
-            MembershipEvent::NodeAlive(evt) => Some(
+            MembershipEvent::NodeDead(node_id) => {
+                Some(RaftProtocolMessage::HandleNodeDeath(node_id).into())
+            }
+            MembershipEvent::NodeAlive(node_id) => Some(
                 HandleNodeJoin {
-                    new_node_id: evt.node_id,
+                    new_node_id: node_id,
                 }
                 .into(),
             ),
