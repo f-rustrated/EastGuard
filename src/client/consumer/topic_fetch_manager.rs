@@ -3,7 +3,9 @@ use super::RangeCursor;
 use crate::client::consumer::cursor::StartPolicy;
 use crate::client::consumer::group::{ConsumerGroup, ConsumerPosition};
 use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
-use crate::client::consumer::{ConsumerContext, ConsumerRecord, RangeCursorSet};
+use crate::client::consumer::{
+    ConsumerContext, ConsumerRecord, MergeSiblingState, PendingCursorStore,
+};
 use crate::client::{ClientError, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
@@ -13,16 +15,32 @@ use crate::test_traits::TAssertInvariant;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
+pub(crate) enum TopicFetchManagerCommand {
+    Pause {
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Resume {
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Seek {
+        range_id: RangeId,
+        absolute_offset: u64,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+    },
+}
+
 pub(crate) struct RangeDrained {
-    pub range_id: RangeId,
-    pub next_entry_id: EntryId,
+    pub cursor: RangeCursor,
     pub transition: RangeTransition,
 }
 
 pub(crate) struct TopicFetchManagerState {
-    cursors: RangeCursorSet,
+    pending_cursors: PendingCursorStore,
     senders: HashMap<RangeId, flume::Sender<RangeFetchActorCommand>>,
 
     /// The optional shared consumer group context for dynamic partition rebalancing.
@@ -33,13 +51,13 @@ pub(crate) struct TopicFetchManagerState {
 
 impl TopicFetchManagerState {
     pub(crate) fn new(
-        cursors: RangeCursorSet,
+        pending_cursors: PendingCursorStore,
         consumer_group: Option<Arc<ConsumerGroup>>,
         config: ConsumerConfig,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
-            cursors,
+            pending_cursors,
             senders: HashMap::new(),
             consumer_group,
             config,
@@ -54,7 +72,7 @@ impl TopicFetchManagerState {
     }
 
     pub(crate) fn should_exit(&self) -> bool {
-        self.cursors.is_empty() && self.consumer_group.is_none()
+        self.senders.is_empty() && self.pending_cursors.is_empty() && self.consumer_group.is_none()
     }
 
     fn provision_initial_tasks(&mut self, ctx: &Arc<ConsumerContext>) {
@@ -64,17 +82,23 @@ impl TopicFetchManagerState {
         if self.consumer_group.is_some() {
             return;
         }
-        for cursor in self.cursors.iter().cloned().collect::<Vec<_>>() {
+        for cursor in self.pending_cursors.iter().cloned().collect::<Vec<_>>() {
             self.spawn_and_register(cursor, ctx.clone());
         }
     }
 
     fn handle_cursor_drained(&mut self, event: RangeDrained, ctx: &Arc<ConsumerContext>) {
+        let range_id = event.cursor.range_id;
         // If not owned, it was already revoked — late drain event, safe to ignore.
-        if self.senders.remove(&event.range_id).is_none() {
+        if self.senders.remove(&range_id).is_none() {
             return;
         }
-        let added = self.cursors.apply_drained(event.range_id, event.transition);
+        let sibling_state = self.merge_sibling_state(&event.cursor, &event.transition);
+        let added = self.pending_cursors.apply_drained_cursor(
+            event.cursor,
+            event.transition,
+            sibling_state,
+        );
 
         for new_cursor in added {
             if self
@@ -85,6 +109,93 @@ impl TopicFetchManagerState {
                 continue;
             }
             self.spawn_and_register(new_cursor, ctx.clone());
+        }
+    }
+
+    fn merge_sibling_state(
+        &self,
+        drained: &RangeCursor,
+        transition: &RangeTransition,
+    ) -> MergeSiblingState {
+        let RangeTransition::Merged { merged_from, .. } = transition else {
+            return MergeSiblingState::Untracked;
+        };
+        let sibling = drained.merge_sibling(*merged_from);
+        if self.senders.contains_key(&sibling) || self.pending_cursors.contains(sibling) {
+            MergeSiblingState::Tracked
+        } else {
+            MergeSiblingState::Untracked
+        }
+    }
+
+    fn handle_command(&mut self, command: TopicFetchManagerCommand) {
+        match command {
+            TopicFetchManagerCommand::Pause { range_id, reply } => {
+                self.forward_actor_command("pause", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Pause { reply }
+                });
+            }
+            TopicFetchManagerCommand::Resume { range_id, reply } => {
+                self.forward_actor_command("resume", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Resume { reply }
+                });
+            }
+            TopicFetchManagerCommand::Seek {
+                range_id,
+                absolute_offset,
+                reply,
+            } => {
+                self.forward_actor_command("seek", range_id, reply, |reply| {
+                    RangeFetchActorCommand::Seek {
+                        absolute_offset,
+                        reply,
+                    }
+                });
+            }
+        }
+    }
+
+    fn forward_actor_command(
+        &self,
+        operation: &'static str,
+        range_id: RangeId,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+        callback_build: impl FnOnce(oneshot::Sender<()>) -> RangeFetchActorCommand,
+    ) {
+        let Some(tx) = self.senders.get(&range_id) else {
+            let reason = "no active fetch actor for range";
+            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            return;
+        };
+
+        let (actor_ack_tx, actor_ack_rx) = oneshot::channel();
+
+        if tx.try_send(callback_build(actor_ack_tx)).is_err() {
+            let reason = "fetch actor command queue is full or closed";
+            let _ = reply.send(Err(Self::control_error(operation, range_id, reason)));
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = actor_ack_rx.await.map_err(|_| {
+                let reason = "fetch actor stopped before acknowledging command";
+                Self::control_error(operation, range_id, reason)
+            });
+            let _ = reply.send(result);
+        });
+    }
+
+    fn control_error(
+        operation: &'static str,
+        range_id: RangeId,
+        reason: impl Into<String>,
+    ) -> ClientError {
+        let reason = reason.into();
+        tracing::warn!(operation, range_id = *range_id, reason);
+        ClientError::ConsumerControl {
+            operation,
+            range_id: *range_id,
+            reason,
         }
     }
 
@@ -105,7 +216,7 @@ impl TopicFetchManagerState {
                 if let Some(stop_tx) = self.senders.remove(range) {
                     let _ = stop_tx.send(RangeFetchActorCommand::Stop);
                 }
-                self.cursors.remove(*range);
+                self.pending_cursors.remove(*range);
             }
 
             let group = group.clone();
@@ -169,6 +280,7 @@ impl TopicFetchManagerState {
                         r_meta.keyspace_end.clone(),
                     )
                     .with_skip_batch_offsets_below(skip_below_offset)
+                    .with_skip_absolute_offsets_below(None)
                     .with_next_absolute_offset(next_absolute_offset),
                     ctx.clone(),
                 );
@@ -176,24 +288,17 @@ impl TopicFetchManagerState {
         }
     }
 
-    /// Spawn a fetch actor, register its stop channel, and update/add the cursor
-    /// in the cursor set.
+    /// Transfers a pending cursor into a live fetch actor.
     fn spawn_and_register(&mut self, cursor: RangeCursor, ctx: Arc<ConsumerContext>) {
         if self.senders.contains_key(&cursor.range_id) {
             return;
         }
-        let (stop_tx, stop_rx) = flume::bounded(1);
-        let actor = RangeFetchActor::new(
-            cursor.range_id,
-            cursor.next_entry_id,
-            cursor.skip_batch_offsets_below,
-            cursor.next_absolute_offset,
-            ctx,
-            self.record_tx.clone(),
-        );
+        self.pending_cursors.remove(cursor.range_id);
+        let (stop_tx, stop_rx) = flume::bounded(8);
+        let range_id = cursor.range_id;
+        let actor = RangeFetchActor::new(cursor, ctx, self.record_tx.clone());
         tokio::spawn(actor.run(stop_rx));
-        self.senders.insert(cursor.range_id, stop_tx);
-        self.cursors.add_or_update(cursor);
+        self.senders.insert(range_id, stop_tx);
     }
 
     /// Resolves the starting entry ID for a range cursor when it is dynamically started.
@@ -208,12 +313,15 @@ impl TopicFetchManagerState {
     ) -> Result<EntryId, ClientError> {
         // 1. Fetch the latest boundary from the replica if the start policy is Latest.
         if matches!(self.start_policy(), StartPolicy::Latest) {
-            let (_, tail_entry_id) = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
+            let (_, tail_entry_id) = ctx
+                .client
+                .fetch_range_entry_ids(&ctx.topic, range)
+                .await?;
             return Ok(tail_entry_id);
         }
 
         // 2. Fallback to the local cursor's next entry ID.
-        if let Some(cursor) = self.cursors.get(range) {
+        if let Some(cursor) = self.pending_cursors.get(range) {
             return Ok(cursor.next_entry_id);
         }
 
@@ -251,8 +359,8 @@ impl TopicFetchManagerState {
                 })
     }
 
-    /// Returns true if any descendant (split child or merge target) of the
-    /// given range is currently owned or has a live cursor.
+    /// Returns true if any descendant (split child or merge target) is already
+    /// represented either by a live actor or by a pending cursor.
     fn has_active_descendant(&self, range_id: RangeId, ranges: &[RangeDetail]) -> bool {
         let Some(r_meta) = ranges.iter().find(|r| r.range_id == range_id) else {
             return false;
@@ -262,7 +370,9 @@ impl TopicFetchManagerState {
             if self.senders.contains_key(&children.0) || self.senders.contains_key(&children.1) {
                 return true;
             }
-            if self.cursors.contains(children.0) || self.cursors.contains(children.1) {
+            if self.pending_cursors.contains(children.0)
+                || self.pending_cursors.contains(children.1)
+            {
                 return true;
             }
             if self.has_active_descendant(children.0, ranges)
@@ -276,7 +386,7 @@ impl TopicFetchManagerState {
             if self.senders.contains_key(&child) {
                 return true;
             }
-            if self.cursors.contains(child) {
+            if self.pending_cursors.contains(child) {
                 return true;
             }
             if self.has_active_descendant(child, ranges) {
@@ -340,6 +450,7 @@ impl TopicFetchManagerState {
 pub(crate) async fn run_topic_fetch_manager(
     mut state: TopicFetchManagerState,
     drain_event_rx: flume::Receiver<RangeDrained>,
+    command_rx: flume::Receiver<TopicFetchManagerCommand>,
     weak_ctx: std::sync::Weak<ConsumerContext>,
 ) {
     if let Some(ctx) = weak_ctx.upgrade() {
@@ -374,6 +485,11 @@ pub(crate) async fn run_topic_fetch_manager(
                 }
             }
 
+            res = command_rx.recv_async() => {
+                let Ok(command) = res else { break };
+                state.handle_command(command);
+            }
+
             _ = commit_interval.tick(), if state.consumer_group.is_some() => {
                 let group = state.consumer_group.as_ref().unwrap().clone();
                 tokio::spawn(async move {
@@ -385,7 +501,7 @@ pub(crate) async fn run_topic_fetch_manager(
                 if startup_grace_ticks > 0 {
                     startup_grace_ticks -= 1;
                 } else {
-                    if state.cursors.is_empty() {
+                    if state.pending_cursors.is_empty() {
                         let _ = ctx.refresh_metadata().await;
                     }
                     state.handle_rebalance(&ctx).await;
@@ -403,24 +519,17 @@ pub(crate) async fn run_topic_fetch_manager(
 #[cfg(any(test, debug_assertions))]
 impl TAssertInvariant for TopicFetchManagerState {
     fn assert_invariants(&self) {
-        // Invariant 1: Size constraint (active fetchers cannot exceed cursors)
-        assert!(
-            self.senders.len() <= self.cursors.len(),
-            "Invariant violated: More active fetch actors ({}) than cursors ({})",
-            self.senders.len(),
-            self.cursors.len()
-        );
-
-        // Invariant 2: Subset property (active fetcher must have an associated cursor)
+        // Invariant 1: active cursors are owned by actors; inactive/pending
+        // cursors are owned by the manager. A range must not be in both sets.
         for range_id in self.senders.keys() {
             assert!(
-                self.cursors.contains(*range_id),
-                "Invariant violated: Range {:?} has an active fetch actor in senders but is missing from self.cursors",
+                !self.pending_cursors.contains(*range_id),
+                "Invariant violated: Range {:?} has both an active fetch actor and a pending cursor",
                 range_id
             );
         }
 
-        // Invariant 3: a grouped consumer only fetches ranges it currently owns.
+        // Invariant 2: a grouped consumer only fetches ranges it currently owns.
         if let Some(group) = &self.consumer_group {
             let owned_ranges = group.owned_ranges.load();
             for range_id in self.senders.keys() {
@@ -437,7 +546,7 @@ impl TAssertInvariant for TopicFetchManagerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::consumer::cursor::RangeCursorSet;
+    use crate::client::consumer::cursor::PendingCursorStore;
     use crate::connections::protocol::SegmentDetail;
     use crate::control_plane::metadata::SegmentId;
     use std::collections::HashMap;
@@ -445,7 +554,7 @@ mod tests {
     fn manager_state() -> TopicFetchManagerState {
         let (record_tx, _record_rx) = flume::unbounded();
         TopicFetchManagerState::new(
-            RangeCursorSet::new(Vec::new()),
+            PendingCursorStore::new(Vec::new()),
             None,
             ConsumerConfig::new(StartPolicy::Earliest),
             record_tx,

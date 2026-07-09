@@ -9,7 +9,6 @@
 # Examples:
 #   scripts/stress_test.sh                              # produce_then_fetch_hot, 100 runs
 #   scripts/stress_test.sh produce_then_fetch_hot 200   # 200 runs
-#   scripts/stress_test.sh e2e_swim_raft_cluster_lifecycle 50 90
 #
 # Env:
 #   RUST_LOG   passed through to each run. Defaults to east_guard=debug so

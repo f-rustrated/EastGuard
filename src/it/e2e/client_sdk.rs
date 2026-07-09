@@ -28,6 +28,13 @@ static NODES: [NodeSpec; 3] = [
     ("node-3", 8083, 18003),
 ];
 
+static NODES_4: [NodeSpec; 4] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+    ("node-4", 8084, 18004),
+];
+
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
 /// count keep the run deterministic and fast (no node is restarted in these tests).
 fn sim_cluster(env: &mut Environment) {
@@ -38,6 +45,13 @@ fn sim_cluster(env: &mut Environment) {
 /// Client seeds = each node's resolved client address. Call inside a sim task.
 fn client_seeds() -> Vec<SocketAddr> {
     NODES
+        .iter()
+        .map(|(name, cp, _)| SocketAddr::new(turmoil::lookup(*name), *cp))
+        .collect()
+}
+
+fn client_seeds_4() -> Vec<SocketAddr> {
+    NODES_4
         .iter()
         .map(|(name, cp, _)| SocketAddr::new(turmoil::lookup(*name), *cp))
         .collect()
@@ -1379,6 +1393,222 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
 
         Ok(())
     });
+
+    sim.run()
+}
+
+#[test]
+#[serial_test::serial]
+fn consumer_pause_seek_resume_live_range() -> turmoil::Result {
+    let mut sim = build_sim(120);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("pause-seek-resume", policy())
+            .await
+            .expect("create topic");
+        client
+            .resolve_topic("pause-seek-resume")
+            .await
+            .expect("warm routing cache");
+
+        let producer = Producer::new(
+            client.clone(),
+            "pause-seek-resume".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_millis(50),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 3,
+                },
+                codec: CompressionCodec::None,
+            },
+        );
+
+        let (rec0, rec1, rec2) = tokio::join!(
+            producer.send(b"k", b"rec-0".to_vec()),
+            producer.send(b"k", b"rec-1".to_vec()),
+            producer.send(b"k", b"rec-2".to_vec()),
+        );
+        let rec0 = rec0.expect("rec-0");
+        assert_eq!(rec0, rec1.expect("rec-1"), "first records batch together");
+        assert_eq!(rec0, rec2.expect("rec-2"), "first records batch together");
+
+        let consumer = Consumer::new(
+            client.clone(),
+            "pause-seek-resume".to_string(),
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Latest),
+        )
+        .await
+        .expect("create consumer");
+
+        consumer.pause_range(RangeId(0)).await.expect("pause range");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        producer.send(b"k", b"rec-3".to_vec()).await.expect("rec-3");
+        let paused = tokio::time::timeout(Duration::from_millis(500), consumer.next_record()).await;
+        assert!(paused.is_err(), "paused consumer must not fetch rec-3");
+
+        consumer
+            .seek_range(RangeId(0), 1)
+            .await
+            .expect("seek range");
+        consumer
+            .resume_range(RangeId(0))
+            .await
+            .expect("resume range");
+
+        let mut values = Vec::new();
+        for _ in 0..3 {
+            let rec = consumer.next_record().await.expect("read").expect("record");
+            values.push(rec.value);
+        }
+        assert_eq!(
+            values,
+            [b"rec-1".to_vec(), b"rec-2".to_vec(), b"rec-3".to_vec()]
+        );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+#[serial_test::serial]
+fn consumer_seek_resume_after_sealed_segment_reassignment() -> turmoil::Result {
+    let mut sim = build_sim(360);
+    host_cluster(&mut sim, &NODES_4, |env| {
+        sim_cluster(env);
+        env.segment_size_limit_bytes = 2048;
+    });
+
+    let victim = Arc::new(Mutex::new(None::<String>));
+    let victim_w = victim.clone();
+
+    sim.client("test-client", async move {
+        let client = Arc::new(
+            Client::connect_with(
+                client_seeds_4(),
+                RetryPolicy {
+                    deadline: Duration::from_secs(120),
+                    initial_backoff: Duration::from_millis(50),
+                    max_backoff: Duration::from_secs(1),
+                },
+            )
+            .expect("client connects"),
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        client
+            .create_topic("pause-repair-seek", policy())
+            .await
+            .expect("create topic");
+
+        let producer = Producer::new(
+            client.clone(),
+            "pause-repair-seek".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_millis(10),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 1,
+                },
+                codec: CompressionCodec::None,
+            },
+        );
+
+        let record = |idx: usize| {
+            let mut value = format!("sealed-rec-{idx}").into_bytes();
+            value.resize(1024, b'-');
+            value
+        };
+
+        for idx in 0..3 {
+            producer
+                .send(b"k", record(idx))
+                .await
+                .expect("produce sealed record");
+        }
+        wait_for_segment_roll(&client, "pause-repair-seek", 0, 1).await;
+
+        let detail = client
+            .resolve_topic("pause-repair-seek")
+            .await
+            .expect("resolve after roll");
+        let sealed_replicas = detail
+            .ranges
+            .iter()
+            .find(|range| range.range_id == RangeId(0))
+            .and_then(|range| range.sealed_segments.first())
+            .map(|segment| {
+                segment
+                    .replica_set
+                    .iter()
+                    .map(|replica| replica.node_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .expect("sealed segment replica set");
+        assert_eq!(sealed_replicas.len(), 3, "RF=3 leaves one spare");
+
+        let victim_node = NODES_4
+            .iter()
+            .map(|(name, _, _)| *name)
+            .find(|name| sealed_replicas.iter().any(|id| id.starts_with(name)))
+            .expect("sealed segment replica to crash");
+
+        let consumer = Consumer::new(
+            client,
+            "pause-repair-seek".to_string(),
+            KeyInterest::AllKeys,
+            ConsumerConfig::new(StartPolicy::Latest),
+        )
+        .await
+        .expect("create consumer");
+        consumer
+            .pause_range(RangeId(0))
+            .await
+            .expect("pause before repair");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        *victim_w.lock().unwrap() = Some(victim_node.to_string());
+
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        consumer
+            .seek_range(RangeId(0), 0)
+            .await
+            .expect("seek into repaired sealed segment");
+        consumer
+            .resume_range(RangeId(0))
+            .await
+            .expect("resume after repair");
+
+        let first = consumer
+            .next_record()
+            .await
+            .expect("read repaired sealed record")
+            .expect("record");
+        assert_eq!(first.position.entry_id, EntryId(0));
+        assert_eq!(&first.value[..12], b"sealed-rec-0");
+
+        Ok(())
+    });
+
+    while victim.lock().unwrap().is_none() {
+        assert!(
+            sim.elapsed() < Duration::from_secs(180),
+            "client never chose a sealed replica to crash"
+        );
+        sim.step()?;
+    }
+    let victim_node = victim.lock().unwrap().clone().unwrap();
+    tracing::info!(
+        "[CONSUMER-REPAIR] crashing {victim_node} at {}s",
+        sim.elapsed().as_secs()
+    );
+    sim.crash(victim_node);
 
     sim.run()
 }

@@ -218,6 +218,39 @@ across; at a **merge**, hold the successor's first fetch until both parents drai
 
 ---
 
+## Manual fetch controls
+
+Each range fetcher is driven through a small mailbox. That keeps operational controls
+local to the range that needs them, without tearing down the consumer or rebuilding the
+cursor set.
+
+| Control | Effect | Why it exists |
+|---|---|---|
+| Pause | Stop issuing new fetches for one range, while keeping the cursor and task alive | Client-side backpressure: an application queue can fill without forcing the consumer to drop state or buffer unboundedly |
+| Resume | Let the paused range continue from its current cursor | Backpressure recovery: the same fetcher keeps going once the application has capacity |
+| Seek | Move the range to an absolute record offset, then resume by fetching physical entries and filtering inside batches | Operator and application control: replay history, skip ahead, or reposition without restarting the consumer |
+
+Pause is intentionally **not** a record-buffer drain. Records already delivered to the
+consumer's application queue may still be read by the application; the control only gates
+future broker fetches. Seek is user-facing and logical: the caller names an absolute
+record offset. The actor still fetches by entry id because that is the broker's storage
+coordinate; it starts at the range's physical beginning, skips whole fetched entries when
+their record counts prove they are below the target, and decodes only the boundary entry
+that may contain the requested record. Records before the target are filtered out before
+delivery.
+
+The metadata refresh on seek matters for historical reads. A paused consumer may seek
+back into a sealed segment after the cluster has repaired that segment's replica set
+because a node died. Refreshing before the resumed fetch lets the client use the current
+sealed-segment placement, so the read can land on the replacement replica after catch-up
+instead of depending on a stale pre-repair replica list.
+
+The CLI exposes the same range-scoped controls on `consume`: pause a range before the
+read loop, optionally resume it after a delay, and optionally seek a range to a specific
+absolute record offset before records are delivered.
+
+---
+
 ## What needs to be done
 
 1. **Consumer over the cursor library** — own a cursor set, drive fetches, feed every
@@ -240,13 +273,18 @@ across; at a **merge**, hold the successor's first fetch until both parents drai
    end, so a hand-off to a segment on another node doesn't stall on connect + cold-read
    latency. Driven entirely from cached per-segment placement — no server cooperation;
    off on the active tail.
-9. **Tests** — against the simulated cluster: ordered drain of a range, a split mid-
+9. **Manual fetch controls** — pause, resume, and seek an individual range fetcher through
+   the mailbox without restarting the consumer; seek by absolute record offset while the
+   actor continues to fetch by entry id and filters inside batches; verify seek refreshes
+   metadata before reading historical sealed data.
+10. **Tests** — against the simulated cluster: ordered drain of a range, a split mid-
    consume (fan-out to children, each key once), a merge mid-consume (both parents
    drained before successor), read from a non-leader replica, by-id fetch after
    resolving the topic id, skip-forward past a retention-deleted segment, a compressed
    entry decoded by its codec tag, record-level resume from the middle of a batched
    entry, and a historical read crossing a sealed-segment boundary onto a different
-   replica, served from a prewarmed next segment (no stall).
+   replica, served from a prewarmed next segment (no stall), plus pause / seek / resume
+   across a sealed-segment repair after node failure.
 
 ## See also
 

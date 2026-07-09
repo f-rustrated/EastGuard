@@ -1,62 +1,50 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-
-use super::ConsumerRecord;
+use super::{ConsumerContext, ConsumerRecord, RangeCursor};
+use crate::client::consumer::context::RangeLookupResult;
 use crate::client::consumer::group::ConsumerPosition;
 use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
-use crate::client::{Client, ClientError, CompressionCodec};
+use crate::client::{ClientError, CompressionCodec};
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
-    RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
+    ClientResponse, DataPlaneResponse, RangeProgressSignal, RangeTransition, SegmentDetail,
 };
-use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
-
-enum RangeLookupResult {
-    Found(SegmentDetail),
-    FellBehind {
-        first_start: EntryId,
-    },
-    NeedRefresh,
-    RangeSealedAndDrained {
-        progress_signal: RangeProgressSignal,
-    },
-}
-#[derive(Debug, Clone, Copy)]
+use crate::control_plane::metadata::{EntryId, RangeId};
 pub(crate) enum RangeFetchActorCommand {
     Stop,
+    Pause {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Resume {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Seek {
+        absolute_offset: u64,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 pub(crate) struct RangeFetchActor {
-    range_id: RangeId,
-    next_entry_id: EntryId,
-    skip_batch_offsets_below: Option<u64>,
-    next_absolute_offset: u64,
+    cursor: RangeCursor,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
 }
 
 impl RangeFetchActor {
     pub(crate) fn new(
-        range_id: RangeId,
-        next_entry_id: EntryId,
-        skip_batch_offsets_below: Option<u64>,
-        next_absolute_offset: u64,
+        cursor: RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
     ) -> Self {
         Self {
-            range_id,
-            next_entry_id,
-            skip_batch_offsets_below,
-            next_absolute_offset,
+            cursor,
             ctx,
             record_tx,
         }
     }
     pub(crate) async fn run(mut self, rx: flume::Receiver<RangeFetchActorCommand>) {
+        let mut paused = false;
         loop {
             if self.record_tx.is_disconnected() {
                 return;
@@ -68,9 +56,25 @@ impl RangeFetchActor {
                         Ok(RangeFetchActorCommand::Stop) | Err(_) => {
                             return; // Graceful shutdown
                         }
+                        Ok(RangeFetchActorCommand::Pause { reply }) => {
+                            paused = true;
+                            let _ = reply.send(());
+                        }
+                        Ok(RangeFetchActorCommand::Resume { reply }) => {
+                            paused = false;
+                            let _ = reply.send(());
+                        }
+                        Ok(RangeFetchActorCommand::Seek {
+                            absolute_offset,
+                            reply,
+                        }) => {
+                            self.cursor.seek_to_absolute_offset(absolute_offset);
+                            self.ctx.refresh_metadata().await.ok();
+                            let _ = reply.send(());
+                        }
                     }
                 }
-                res = self.step() => {
+                res = self.step(), if !paused => {
                     match res {
                         Ok(true) => continue, // Keep looping
                         Ok(false) => return,  // Graceful shutdown (e.g., drained)
@@ -93,10 +97,13 @@ impl RangeFetchActor {
         }
 
         // Read metadata snapshot.
-        let segment = match self.ctx.lookup_range(self.range_id, self.next_entry_id) {
+        let segment = match self
+            .ctx
+            .lookup_range(self.cursor.range_id, self.cursor.next_entry_id)
+        {
             RangeLookupResult::FellBehind { first_start } => {
-                self.next_entry_id = first_start;
-                self.skip_batch_offsets_below = None;
+                self.cursor.next_entry_id = first_start;
+                self.cursor.skip_batch_offsets_below = None;
                 return Ok(true);
             }
             RangeLookupResult::NeedRefresh => {
@@ -107,8 +114,7 @@ impl RangeFetchActor {
             RangeLookupResult::RangeSealedAndDrained { progress_signal } => {
                 if let RangeProgressSignal::Sealed { transition, .. } = progress_signal {
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
-                        range_id: self.range_id,
-                        next_entry_id: self.next_entry_id,
+                        cursor: self.cursor.clone(),
                         transition,
                     });
                 }
@@ -119,7 +125,7 @@ impl RangeFetchActor {
 
         let served = self
             .ctx
-            .fetch(&segment, self.range_id, self.next_entry_id)
+            .fetch(&segment, self.cursor.range_id, self.cursor.next_entry_id)
             .await?;
 
         let ClientResponse::DataPlane(dp_response) = served.response else {
@@ -145,38 +151,51 @@ impl RangeFetchActor {
                 }
 
                 for entry in entries.into_iter() {
+                    if self.should_skip_entry_by_absolute_offset(entry.record_count) {
+                        continue;
+                    }
+
                     let records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
                         .map_err(|e| {
-                            eprintln!("Failed to decompress entry payload: {}", e);
+                            tracing::error!("Failed to decompress entry payload: {}", e);
                             ClientError::UnexpectedResponse
                         })?;
 
-                    let skip_batch_offsets_below = if entry.entry_id == self.next_entry_id {
-                        self.skip_batch_offsets_below
+                    let skip_batch_offsets_below = if entry.entry_id == self.cursor.next_entry_id {
+                        self.cursor.skip_batch_offsets_below.take()
                     } else {
                         None
                     };
-                    if skip_batch_offsets_below.is_some() {
-                        self.skip_batch_offsets_below = None;
-                    }
 
                     for (i, rec) in records.into_iter().enumerate() {
                         if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
                             continue;
                         }
 
+                        let absolute_offset = self.cursor.next_absolute_offset;
+                        self.cursor.next_absolute_offset =
+                            self.cursor.next_absolute_offset.saturating_add(1);
+
+                        if self
+                            .cursor
+                            .skip_absolute_offsets_below
+                            .is_some_and(|target| absolute_offset < target)
+                        {
+                            continue;
+                        }
+                        self.cursor.skip_absolute_offsets_below = None;
+
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
-                            range_id: self.range_id,
+                            range_id: self.cursor.range_id,
                             position: ConsumerPosition {
                                 batch_offset: i as u64,
                                 entry_id: entry.entry_id,
-                                absolute_offset: self.next_absolute_offset,
+                                absolute_offset,
                             },
                             key: rec.key,
                             value: rec.value,
                         };
-                        self.next_absolute_offset = self.next_absolute_offset.saturating_add(1);
 
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {
                             return Ok(false); // Disconnected
@@ -196,29 +215,29 @@ impl RangeFetchActor {
                 } = progress_signal
                     && next_entry_id > end_entry_id
                 {
+                    self.cursor.next_entry_id = next_entry_id;
                     let _ = self.ctx.cursor_tx.send(RangeDrained {
-                        range_id: self.range_id,
-                        next_entry_id,
+                        cursor: self.cursor.clone(),
                         transition,
                     });
                     return Ok(false);
                 }
 
-                self.next_entry_id = next_entry_id;
+                self.cursor.next_entry_id = next_entry_id;
                 Ok(true)
             }
             DataPlaneResponse::EntryIdOutOfRange => {
-                let prev_entry_id = self.next_entry_id;
+                let prev_entry_id = self.cursor.next_entry_id;
                 let (start_id, _) = self
                     .ctx
                     .client
-                    .fetch_range_entry_ids(&self.ctx.topic, self.range_id)
+                    .fetch_range_entry_ids(&self.ctx.topic, self.cursor.range_id)
                     .await?;
 
-                if self.next_entry_id < start_id {
-                    self.next_entry_id = start_id;
+                if self.cursor.next_entry_id < start_id {
+                    self.cursor.next_entry_id = start_id;
                 }
-                if self.next_entry_id == prev_entry_id {
+                if self.cursor.next_entry_id == prev_entry_id {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     self.ctx.refresh_metadata().await?;
                 }
@@ -233,147 +252,21 @@ impl RangeFetchActor {
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
-}
 
-pub(crate) struct ConsumerContext {
-    pub(crate) client: Arc<Client>,
-    pub(crate) topic: String,
-    pub(crate) topic_id: TopicId,
-    pub(crate) metadata: ArcSwap<TopicDetail>,
-    pub(crate) cursor_tx: flume::Sender<RangeDrained>,
-}
-
-impl ConsumerContext {
-    /// Execute a single raw FetchById request.
-    async fn fetch(
-        &self,
-        segment: &SegmentDetail,
-        range_id: RangeId,
-        entry_id: EntryId,
-    ) -> Result<Served, ClientError> {
-        let addr = segment
-            .pick_replica()
-            .ok_or(ClientError::UnexpectedResponse)?;
-        let req = FetchByIdRequest {
-            topic_id: self.topic_id,
-            range_id,
-            entry_id,
-            max_bytes: 1024 * 1024,
-        };
-        self.client
-            .call(addr, ClientDataPlaneRequest::FetchById(req))
-            .await
-    }
-
-    /// Resolve a replica address for the given range, preferring the active segment's
-    /// replica, falling back to the last sealed segment's replica
-    pub(crate) fn pick_replica_for_range(&self, range_id: RangeId) -> Option<std::net::SocketAddr> {
-        self.metadata
-            .load()
-            .ranges
-            .iter()
-            .find(|r| r.range_id == range_id)
-            // Try the active segment, fallback to the last sealed segment
-            .and_then(|r| {
-                r.active_segment
-                    .as_ref()
-                    .or_else(|| r.sealed_segments.last())
-            })
-            // If we found either, try to pick a replica from it
-            .and_then(|seg| seg.pick_replica())
-    }
-
-    /// Refresh the cached metadata snapshot by resolving the topic against the cluster.
-    pub(crate) async fn refresh_metadata(&self) -> Result<(), ClientError> {
-        if let Ok(Ok(detail)) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.client.resolve_topic(&self.topic),
-        )
-        .await
-        {
-            self.metadata.store(Arc::new(detail));
-        }
-        Ok(())
-    }
-
-    /// Pure synchronous metadata lookup to isolate the non-Send arc_swap::Guard.
-    fn lookup_range(&self, range_id: RangeId, next_entry_id: EntryId) -> RangeLookupResult {
-        let meta = self.metadata.load();
-        let Some(r) = meta.ranges.iter().find(|r| r.range_id == range_id) else {
-            return RangeLookupResult::NeedRefresh;
+    fn should_skip_entry_by_absolute_offset(&mut self, record_count: u32) -> bool {
+        let Some(target) = self.cursor.skip_absolute_offsets_below else {
+            return false;
         };
 
-        // Try to find the segment directly
-        if let Some(segment) = r.find_segment_for_offset(next_entry_id) {
-            return RangeLookupResult::Found(segment.clone());
+        let next_entry_absolute_offset = self
+            .cursor
+            .next_absolute_offset
+            .saturating_add(u64::from(record_count));
+
+        if next_entry_absolute_offset <= target {
+            self.cursor.next_absolute_offset = next_entry_absolute_offset;
+            return true;
         }
-
-        // If sealed, check if we've drained it completely
-        if r.state != RangeState::Active {
-            let range_end_entry = r.end_entry_id();
-
-            if next_entry_id > range_end_entry {
-                if let Some(progress_signal) = compute_progress_signal(&meta, r) {
-                    return RangeLookupResult::RangeSealedAndDrained { progress_signal };
-                } else {
-                    return RangeLookupResult::NeedRefresh;
-                }
-            }
-        }
-
-        // (Common Fallback) Check if we fell behind the oldest available data,
-        // otherwise signal that a metadata refresh is needed to discover the new segment
-        if let Some(start_entry) = r.first_segment_start_offset()
-            && next_entry_id < start_entry
-        {
-            return RangeLookupResult::FellBehind {
-                first_start: start_entry,
-            };
-        }
-
-        RangeLookupResult::NeedRefresh
-    }
-
-    pub(crate) fn all_ranges(&self) -> Vec<RangeId> {
-        self.metadata
-            .load()
-            .ranges
-            .iter()
-            .map(|r| r.range_id)
-            .collect::<Vec<_>>()
-    }
-}
-
-pub fn compute_progress_signal(
-    detail: &TopicDetail,
-    range: &RangeDetail,
-) -> Option<RangeProgressSignal> {
-    let end_entry_id = range.end_entry_id();
-
-    if let Some((left_range_id, right_range_id)) = range.split_into {
-        Some(RangeProgressSignal::Sealed {
-            end_entry_id,
-            transition: RangeTransition::Split {
-                left_range_id,
-                right_range_id,
-                split_point: range.keyspace_end.clone(),
-            },
-        })
-    } else if let Some(merged_range_id) = range.merged_into {
-        let merged_range = detail
-            .ranges
-            .iter()
-            .find(|r| r.range_id == merged_range_id)?;
-        let (m_left, m_right) = merged_range.merged_from?;
-
-        Some(RangeProgressSignal::Sealed {
-            end_entry_id,
-            transition: RangeTransition::Merged {
-                merged_range_id,
-                merged_from: [m_left, m_right],
-            },
-        })
-    } else {
-        None
+        false
     }
 }

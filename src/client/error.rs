@@ -30,4 +30,12 @@ pub enum ClientError {
     /// Response didn't match the request — a wire/version mismatch, not routing.
     #[error("unexpected response for request")]
     UnexpectedResponse,
+
+    /// A consumer range-control command could not be delivered or acknowledged.
+    #[error("consumer {operation} failed for range {range_id}: {reason}")]
+    ConsumerControl {
+        operation: &'static str,
+        range_id: u64,
+        reason: String,
+    },
 }

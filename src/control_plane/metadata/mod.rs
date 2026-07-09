@@ -31,6 +31,12 @@ pub struct RangeId(pub(crate) u64);
 
 smart_pointer!(RangeId, u64);
 
+impl From<u64> for RangeId {
+    fn from(val: u64) -> Self {
+        RangeId(val)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct SegmentId(pub(crate) u64);
 

@@ -1,7 +1,6 @@
 mod client_protocol;
 mod client_sdk;
 mod consumer_group_test;
-mod lifecycle;
 
 use crate::StartUp;
 use crate::config::Environment;
