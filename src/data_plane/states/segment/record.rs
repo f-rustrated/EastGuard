@@ -46,7 +46,6 @@ impl RoutingHeader {
         buf.freeze()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn decode(data: &[u8]) -> io::Result<Self> {
         if data.len() < ROUTING_HEADER_SIZE {
             return Err(io::Error::new(

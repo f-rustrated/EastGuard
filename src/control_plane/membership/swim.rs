@@ -654,7 +654,6 @@ impl Swim {
                 self.pending_events.push(
                     NodeAlive {
                         node_id: node_id.clone(),
-                        addr: member.addr.cluster_addr(),
                     }
                     .into(),
                 );

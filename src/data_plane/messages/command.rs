@@ -253,7 +253,6 @@ impl_from_variant!(
 );
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ProduceAck {
     /// `entry_id` is the committed offset for this produce. Exact for a producer
     /// with one request in flight at a time (the common case); under pipelining

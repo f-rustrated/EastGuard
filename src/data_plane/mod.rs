@@ -6,13 +6,9 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::smart_pointer;
 
 pub(crate) mod actor;
-
 pub(crate) mod checkpoint;
-#[allow(dead_code)]
 pub(crate) mod cold_read;
 pub(crate) mod messages;
-
-#[allow(dead_code)]
 pub(crate) mod recovery;
 pub(crate) mod segment_writer;
 pub(crate) mod sparse_index;
@@ -33,13 +29,6 @@ pub struct SegmentKey {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct EntryPayload(Bytes);
-
-impl EntryPayload {
-    #[allow(dead_code)]
-    pub fn new(data: Bytes) -> Self {
-        Self(data)
-    }
-}
 
 smart_pointer!(EntryPayload, Bytes);
 

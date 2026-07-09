@@ -47,7 +47,6 @@ pub struct VirtualNodeToken {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ShardLeaderEntry {
     pub leader_node_id: NodeId,
     pub leader_addr: NodeAddress,
@@ -320,8 +319,8 @@ impl Topology {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&NodeId> {
+    #[cfg(test)]
+    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&NodeId> {
         let hash = hash_stable(key);
         self.token_owners_at(hash, n)
     }
@@ -406,13 +405,12 @@ impl Topology {
         true
     }
 
-    #[allow(dead_code)]
     pub fn shard_leader(&self, shard_group_id: ShardGroupId) -> Option<&ShardLeaderEntry> {
         self.shard_leaders.get(&shard_group_id)
     }
 
-    #[allow(dead_code)]
-    pub fn all_shard_leaders(&self) -> &HashMap<ShardGroupId, ShardLeaderEntry> {
+    #[cfg(test)]
+    fn all_shard_leaders(&self) -> &HashMap<ShardGroupId, ShardLeaderEntry> {
         &self.shard_leaders
     }
 }

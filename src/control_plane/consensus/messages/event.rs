@@ -16,7 +16,6 @@ pub struct LeaderChange {
     pub term: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct MetadataCommitted {
     pub shard_group_id: ShardGroupId,
@@ -25,7 +24,6 @@ pub struct MetadataCommitted {
     pub seal_context: Option<SealContext>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LogMutation {
     Append(LogEntry),

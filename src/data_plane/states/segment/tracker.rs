@@ -75,10 +75,6 @@ impl SegmentTracker {
         self.start_entry_id
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn segment_file_path(&self) -> &PathBuf {
-        &self.segment_file_path
-    }
     pub(crate) fn replica_set(&self) -> Vec<NodeId> {
         self.replica_set.clone()
     }
@@ -98,6 +94,8 @@ impl SegmentTracker {
             &[]
         }
     }
+
+    #[allow(dead_code)]
     pub(crate) fn uncheckpointed(&self) -> u64 {
         self.cache.load_write_cursor() - self.cache.load_eviction_frontier()
     }

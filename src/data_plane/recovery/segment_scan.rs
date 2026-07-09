@@ -15,7 +15,6 @@ use crate::data_plane::wal::{WalRecord, WalRecordType};
 /// Built only by [`scan_segment_file`]; callers read the fields, never set
 /// them — the pair always reflects one scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // staged: first consumed by the cursor map and replay
 pub(crate) struct SegmentScan {
     /// The segment's first entry id — the `start_offset` encoded in its filename.
     /// The replay appender uses it to build the file path and as the contiguity
@@ -38,7 +37,6 @@ impl SegmentScan {
 /// Whether a replayed WAL record should be appended to its segment file or
 /// skipped as already present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // staged: consumed by the replay appender
 pub(crate) enum Decision {
     /// The segment file already holds this entry (id ≤ its verified cursor).
     Skip,
@@ -52,7 +50,6 @@ pub(crate) enum Decision {
 /// replay. `decide` reads each segment's cursor; the appender reads
 /// `valid_len` to truncate a damaged tail before its first write.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // staged: built by scan_data_dir, consumed by replay, finalized as the inventory (commit 11)
 pub(crate) struct RecoveredSegments(HashMap<SegmentKey, SegmentScan>);
 
 impl RecoveredSegments {
@@ -65,7 +62,6 @@ impl RecoveredSegments {
     /// - a file whose name is not `{segment_id}-{start_offset}.seg` is skipped (`warn!`).
     ///
     /// Only genuine I/O failures and unreadable real segments propagate.
-    #[allow(dead_code)]
     pub(crate) fn scan_data_dir(data_dir: &Path) -> io::Result<Self> {
         let mut cursors = HashMap::new();
         for (topic_id, topic_path) in numeric_child_dirs(data_dir)? {
@@ -94,7 +90,6 @@ impl RecoveredSegments {
     /// Skip if the segment file already holds `header`'s record (its id is at or
     /// below the verified cursor); append otherwise — including every record of
     /// a segment that is absent or has no verified prefix.
-    #[allow(dead_code)]
     pub(crate) fn decide(&self, header: &RoutingHeader) -> Decision {
         match self
             .0
@@ -200,7 +195,6 @@ impl RecoveredSegments {
 ///   never checkpointed has nothing on disk.
 /// * A path whose filename is not a segment name is an `InvalidInput` error.
 /// * Genuine I/O failures propagate.
-#[allow(dead_code)]
 pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
     let (_segment_id, start_entry_id) = parse_segment_file(path)?;
     let file = match File::open(path) {

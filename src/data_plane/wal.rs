@@ -201,15 +201,6 @@ impl WalWriter {
     fn active_entry_mut(&mut self) -> &mut WalFileEntry {
         self.files.back_mut().expect("invariant: files non-empty")
     }
-
-    #[allow(dead_code)]
-    fn needs_rotation(&self) -> bool {
-        if let Some(entry) = self.files.back() {
-            entry.size >= self.max_file_size
-        } else {
-            false
-        }
-    }
 }
 
 impl WalStorage for WalWriter {

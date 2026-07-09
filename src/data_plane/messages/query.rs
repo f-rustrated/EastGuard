@@ -39,7 +39,6 @@ pub struct Fetch {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // `EntryIdOutOfRange` reserved for the cold-read path
 pub enum FetchResult {
     /// Records read from the segment (may be empty if the consumer is at the
     /// tail). `next_entry_id` is what the consumer should request next.
@@ -71,13 +70,10 @@ pub struct ListOffsets {
 }
 
 #[derive(Debug)]
-
 pub enum ListOffsetsResult {
     RangeOffsets {
         start_entry_id: EntryId,
         next_entry_id: EntryId,
     },
     SegmentNotLocal,
-    #[allow(dead_code)] // reserved for future failure modes
-    InternalError(String),
 }

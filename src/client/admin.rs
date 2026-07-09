@@ -58,15 +58,4 @@ impl Client {
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
-
-    /// Topics whose metadata is hosted by the node that answers (per-node, not a
-    /// global listing — global list is a future scatter-gather).
-    pub async fn list_hosted_topics(&self) -> Result<Box<[TopicSummary]>, ClientError> {
-        let request = ControlPlaneRequest::ListHostedTopics;
-        let served = self.call(self.next_known_node(), request).await?;
-        match served.response {
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),
-            _ => Err(ClientError::UnexpectedResponse),
-        }
-    }
 }

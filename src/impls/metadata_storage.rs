@@ -13,7 +13,6 @@ use crate::test_traits::TAssertInvariant;
 /// Key encoder for per-group entries in the default column family.
 /// Layout: `[group_id: u8×8][type_tag: u8]` for fixed-size keys (HardState, AppliedIndex, …)
 ///          `[group_id: u8×8][0x01][index: u8×8]` for LogEntry.
-#[allow(dead_code)]
 enum GroupKey {
     LogEntry(u64),
     Fixed(u8),

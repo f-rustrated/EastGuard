@@ -134,7 +134,6 @@ impl DataPlaneResponse {
                 next_entry_id,
             },
             ListOffsetsResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
-            ListOffsetsResult::InternalError(s) => DataPlaneResponse::InternalError(s),
         }
     }
 

@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{HandleNodeJoin, MultiRaftActorCommand};
 use crate::impl_from_variant;
@@ -9,11 +7,9 @@ pub struct NodeDead {
     pub dead_node_id: NodeId,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct NodeAlive {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
 }
 
 #[derive(Debug)]

@@ -368,7 +368,6 @@ impl Environment {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct DataNodeConfig {
     pub max_segment_age: std::time::Duration,

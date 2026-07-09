@@ -42,14 +42,11 @@ impl PacketReceiver {
     }
 }
 
-#[allow(dead_code)]
 struct TestHarness {
     pub tx_in: mpsc::Sender<SwimActorCommand>,
-    pub tx_out: mpsc::Sender<Box<[OutboundPacket]>>,
     pub rx_out: Option<mpsc::Receiver<Box<[OutboundPacket]>>>,
     pub ticker_tx: SchedulerSender<SwimTimer>,
     pub local_addr: SocketAddr,
-    pub config: JoinConfig,
 }
 
 impl TestHarness {
@@ -184,11 +181,9 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
 
     TestHarness {
         tx_in,
-        tx_out,
         rx_out: Some(rx_out),
         ticker_tx,
         local_addr: peer_addr,
-        config: join_config,
     }
 }
 

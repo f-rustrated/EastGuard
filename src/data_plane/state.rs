@@ -1289,6 +1289,7 @@ impl<W: WalStorage> DataPlane<W> {
             .unwrap_or(0)
     }
 
+    // Kept for the node-level cache budget pressure path described in D1.
     #[allow(dead_code)]
     fn submit_checkpoint_for_pressure(&mut self) {
         let mut candidates: Vec<(SegmentKey, u64)> = self

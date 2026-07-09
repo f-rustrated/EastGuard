@@ -26,11 +26,6 @@ pub(super) struct TransportState {
 }
 
 impl TransportState {
-    #[allow(dead_code)]
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-
     pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,

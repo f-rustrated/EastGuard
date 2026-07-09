@@ -45,7 +45,7 @@ pub struct FaultEvent {
     pub kind: FaultKind,
 }
 
-#[allow(dead_code, clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Serialize, Deserialize)]
 pub enum FaultKind {
     KillNode(u8),
@@ -59,7 +59,6 @@ pub struct CommandEvent {
     pub kind: CommandKind,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CommandKind {
     CreateTopic { name: String },

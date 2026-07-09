@@ -201,7 +201,11 @@ mod tests {
         let (pos2, matches2) = complete_impl("consume -", 9).unwrap();
         assert_eq!(pos2, 8);
         assert!(matches2.iter().any(|m| m.replacement == "--pause-range"));
-        assert!(matches2.iter().any(|m| m.replacement == "--resume-after-ms"));
+        assert!(
+            matches2
+                .iter()
+                .any(|m| m.replacement == "--resume-after-ms")
+        );
         assert!(matches2.iter().any(|m| m.replacement == "--seek-range"));
         assert!(matches2.iter().any(|m| m.replacement == "--seek-offset"));
     }

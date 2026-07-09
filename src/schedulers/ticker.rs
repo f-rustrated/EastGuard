@@ -2,7 +2,6 @@ use crate::schedulers::{ticker_message::TimerCommand, timer::TTimer};
 use std::collections::HashMap;
 
 pub const TICK_PERIOD_100_MS: u64 = 100;
-#[allow(dead_code)]
 pub const TICK_PERIOD_10_MS: u64 = 10;
 pub(crate) const PROBE_INTERVAL_TICKS: u64 = 10; // 10 × 100ms = 1s
 

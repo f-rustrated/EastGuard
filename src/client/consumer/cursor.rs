@@ -115,7 +115,6 @@ impl PendingCursorStore {
         self.fetchable.iter_mut()
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.fetchable.len()
     }

@@ -35,7 +35,6 @@ pub(crate) struct SealedSegmentLocation {
     pub(crate) segment_id: SegmentId,
     /// Last entry id in the segment (inclusive). Set at seal time from the
     /// tracker's `committed_entry_id`.
-    #[allow(dead_code)]
     pub(crate) end_entry_id: EntryId,
 }
 
@@ -43,7 +42,6 @@ pub(crate) struct SealedSegmentLocation {
 /// a live tracker) from "sealed" (cold reads via sparse index + segment file)
 /// so the fetch handler can pick the right read path. Named for the fetch
 /// path's consumer perspective, not its resolver origin.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SegmentReadState {
     Active(SegmentKey),

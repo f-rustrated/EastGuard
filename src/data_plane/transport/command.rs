@@ -19,7 +19,6 @@ pub(crate) struct DataTransportSendToCoordinator {
 pub(crate) enum DataTransportCommand {
     SendToTargets(DataTransportSendToTargets),
     SendToCoordinator(DataTransportSendToCoordinator),
-    #[allow(dead_code)]
     DisconnectPeer(NodeId),
 }
 

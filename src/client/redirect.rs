@@ -45,8 +45,8 @@ impl Default for RetryPolicy {
 /// (a follow/re-resolve happened), so the caller can refresh its cache.
 #[derive(Debug)]
 pub(crate) struct Served {
-    pub response: ClientResponse,
-    pub redirected: bool,
+    pub(crate) response: ClientResponse,
+    pub(crate) redirected: bool,
 }
 
 /// What to do with a response: terminal, jump to a hinted node, or re-resolve.

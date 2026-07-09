@@ -105,11 +105,6 @@ impl SegmentRingBuffer {
         self.write_cursor.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
-    pub async fn notified(&self) {
-        self.notify.notified().await;
-    }
-
     pub(crate) fn read_committed(&self, position: u64) -> Option<Arc<CachedEntry>> {
         let commit = self.read_cursor.load(Ordering::Acquire);
         let frontier = self.eviction_frontier.load(Ordering::Acquire);
