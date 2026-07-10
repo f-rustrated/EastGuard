@@ -11,7 +11,7 @@ use crate::connections::protocol::{
 };
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
-use crate::control_plane::metadata::{EntryId, RangeId};
+use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 use crate::it::helpers::{default_env, send_request, try_send_request};
 use crate::it::sim::invariants::{query_shard_info, query_shard_leader};
 
@@ -1664,8 +1664,30 @@ async fn produce_to(topic: &str, payload: &[u8], node: (&str, u16)) -> bool {
 
 /// Send one produce to a specific node and classify the response.
 async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> ProduceOutcome {
+    let range_id = match send_request(
+        node.0,
+        node.1,
+        ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic { name: topic.into() }),
+    )
+    .await
+    {
+        ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) => match d
+            .ranges
+            .iter()
+            .filter(|r| {
+                r.state == RangeState::Active && r.keyspace_start.as_slice() <= b"k".as_slice()
+            })
+            .max_by_key(|r| &r.keyspace_start)
+        {
+            Some(range) => range.range_id,
+            None => return ProduceOutcome::Retry,
+        },
+        _ => return ProduceOutcome::Retry,
+    };
+
     let req = ClientRequest::DataPlane(ClientDataPlaneRequest::Produce(ProduceRequest {
         topic_name: topic.into(),
+        range_id,
         routing_key: b"k".to_vec(),
         data: payload.to_vec(),
         record_count: 1,

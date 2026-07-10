@@ -1,4 +1,4 @@
-use super::producer::record::ProducerRecord;
+use crate::client::producer::buffers::{PendingRecord, Records};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Compression codec for opaque entry payloads.
@@ -44,8 +44,8 @@ impl CompressionCodec {
     }
 
     /// Helper to encode a batch of records into an opaque EntryPayload with a 1-byte codec tag.
-    pub fn encode_payload(&self, records: &[ProducerRecord]) -> Result<Vec<u8>, std::io::Error> {
-        let serialized = ProducerRecord::serialize_batch(records);
+    pub fn encode_payload(&self, records: &[PendingRecord]) -> Result<Vec<u8>, std::io::Error> {
+        let serialized = PendingRecord::serialize_batch(records);
         let compressed = self.compress(&serialized)?;
         let mut payload = Vec::with_capacity(1 + compressed.len());
         payload.push(*self as u8);
@@ -54,10 +54,7 @@ impl CompressionCodec {
     }
 
     /// Helper to decode an opaque EntryPayload (with 1-byte codec tag) into records.
-    pub fn decode_payload(
-        payload: &[u8],
-        record_count: u32,
-    ) -> Result<Box<[ProducerRecord]>, std::io::Error> {
+    pub fn decode_payload(payload: &[u8], record_count: u32) -> Result<Records, std::io::Error> {
         if payload.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -66,6 +63,6 @@ impl CompressionCodec {
         }
         let codec = Self::from_u8(payload[0])?;
         let decompressed = codec.decompress(&payload[1..])?;
-        ProducerRecord::deserialize_batch(&decompressed, record_count)
+        PendingRecord::deserialize_batch(&decompressed, record_count)
     }
 }

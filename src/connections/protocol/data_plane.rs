@@ -40,6 +40,7 @@ impl_from_variant!(
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ProduceRequest {
     pub topic_name: String,
+    pub range_id: RangeId,
     /// Used by the server to locate the target range; never stored.
     pub routing_key: Vec<u8>,
     /// Pre-serialized blob produced by the client: a leading 1-byte cleartext
@@ -109,6 +110,7 @@ pub enum DataPlaneResponse {
     ShardNotLocal {
         hint_node: Option<SocketAddr>,
     },
+    StaleRange,
     TopicNotFound,
     SegmentNotLocal,
     InternalError(String),

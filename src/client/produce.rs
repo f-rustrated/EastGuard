@@ -7,33 +7,48 @@ use crate::client::error::ClientError;
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, DataPlaneResponse, ProduceRequest,
 };
-use crate::control_plane::metadata::EntryId;
+use crate::control_plane::metadata::{EntryId, RangeId};
 
 impl Client {
-    /// Produce one entry under `routing_key`, returning the committed `entry_id`.
-    /// Routes to the cached write leader; a redirect self-corrects and drops the
-    /// stale entry so the next call re-resolves.
-    pub async fn produce(
+    pub(crate) async fn produce(
         &self,
         topic: &str,
         routing_key: &[u8],
         data: Vec<u8>,
         record_count: u32,
     ) -> Result<EntryId, ClientError> {
+        let routing = self.resolve_topic_if_missing(topic).await?;
+        let range_id = routing
+            .range_id(routing_key)
+            .ok_or(ClientError::TopicNotFound)?;
+
+        self.produce_to_range(topic, range_id, routing_key, data, record_count)
+            .await
+    }
+
+    /// Produce one entry under `routing_key`, returning the committed `entry_id`.
+    /// Routes to the cached write leader; a redirect self-corrects and drops the
+    /// stale entry so the next call re-resolves.
+    pub(crate) async fn produce_to_range(
+        &self,
+        topic: &str,
+        range_id: RangeId,
+        routing_key: &[u8],
+        data: Vec<u8>,
+        record_count: u32,
+    ) -> Result<EntryId, ClientError> {
         // Describe once to seed the cache (gives the first hop).
-        if self.cache.get(topic).is_none() {
-            self.resolve_topic(topic).await?;
-        }
+        let routing = self.resolve_topic_if_missing(topic).await?;
 
         // Start at the cached leader; fall back to a seed if the key has no cached
         // active range (the server will redirect).
-        let start = self
-            .cache
-            .write_leader(topic, routing_key)
+        let start = routing
+            .write_leader(routing_key)
             .unwrap_or(self.next_known_node());
 
         let request = ProduceRequest {
             topic_name: topic.to_string(),
+            range_id,
             routing_key: routing_key.to_vec(),
             data,
             record_count,
@@ -46,6 +61,10 @@ impl Client {
         }
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
+            ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
+                self.cache.invalidate(topic);
+                Err(ClientError::StaleRange)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -480,10 +480,10 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
                 .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
-            assert_eq!(decoded_records[0].key, b"ckey");
-            assert_eq!(decoded_records[0].value, b"cval1");
-            assert_eq!(decoded_records[1].key, b"ckey");
-            assert_eq!(decoded_records[1].value, b"cval2");
+            assert_eq!(decoded_records[0].0, b"ckey");
+            assert_eq!(decoded_records[0].1, b"cval1");
+            assert_eq!(decoded_records[1].0, b"ckey");
+            assert_eq!(decoded_records[1].1, b"cval2");
         } else {
             panic!("Expected Fetched response, got {:?}", served.response);
         }
@@ -577,10 +577,10 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
                 .expect("Decompress and decode batch");
 
             assert_eq!(decoded_records.len(), 2);
-            assert_eq!(decoded_records[0].key, b"zkey");
-            assert_eq!(decoded_records[0].value, b"zval1");
-            assert_eq!(decoded_records[1].key, b"zkey");
-            assert_eq!(decoded_records[1].value, b"zval2");
+            assert_eq!(decoded_records[0].0, b"zkey");
+            assert_eq!(decoded_records[0].1, b"zval1");
+            assert_eq!(decoded_records[1].0, b"zkey");
+            assert_eq!(decoded_records[1].1, b"zval2");
         } else {
             panic!("Expected Fetched response, got {:?}", served.response);
         }
@@ -1841,4 +1841,101 @@ async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64
         "Timed out waiting for retention deletion on range {}",
         range_id
     );
+}
+
+#[test]
+#[serial_test::serial]
+fn producer_split_fence_retry() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+        env.segment_size_limit_bytes = 10;
+    });
+
+    sim.client("test-client", async {
+        let client_admin = Arc::new(Client::connect(client_seeds()).expect("admin connects"));
+        let topic = "split-fence";
+
+        let mut policy = policy();
+        policy.partition_strategy = PartitionStrategy::AutoSplit;
+        client_admin
+            .create_topic(topic, policy)
+            .await
+            .expect("create topic");
+
+        let client1 = Arc::new(Client::connect(client_seeds()).expect("client1 connects"));
+        let detail_initial = client1
+            .resolve_topic(topic)
+            .await
+            .expect("resolve topic initial");
+        assert_eq!(detail_initial.ranges.len(), 1, "Must start with 1 range");
+
+        let producer = Arc::new(Producer::new(
+            client1.clone(),
+            topic.to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_secs(60),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 1000,
+                },
+                codec: CompressionCodec::None,
+            },
+        ));
+
+        // Both keys enter the parent batch before the range splits.
+        let left = {
+            let producer = producer.clone();
+            tokio::spawn(async move { producer.send(&[0x10], b"left".to_vec()).await })
+        };
+        let right = {
+            let producer = producer.clone();
+            tokio::spawn(async move { producer.send(&[0xF0], b"right".to_vec()).await })
+        };
+        tokio::task::yield_now().await;
+
+        for i in 0..3 {
+            client_admin
+                .produce(topic, b"k", b"longer_than_ten_bytes".to_vec(), 1)
+                .await
+                .expect("produce trigger record");
+            wait_for_segment_roll(&client_admin, topic, 0, (i + 1) as u64).await;
+        }
+
+        let detail_split = wait_for_split(&client_admin, topic).await;
+        assert_eq!(
+            detail_split.ranges.len(),
+            3,
+            "Topic must have split into 3 ranges"
+        );
+
+        producer.flush().await;
+        assert!(left.await.expect("left sender completes").is_ok());
+        assert!(right.await.expect("right sender completes").is_ok());
+
+        let refreshed = client1.resolve_topic(topic).await.expect("refresh routing");
+        let left_range = refreshed
+            .ranges
+            .iter()
+            .filter(|r| {
+                r.state == crate::control_plane::metadata::RangeState::Active
+                    && r.keyspace_start.as_slice() <= [0x10].as_slice()
+            })
+            .max_by_key(|r| &r.keyspace_start)
+            .expect("left child");
+        let right_range = refreshed
+            .ranges
+            .iter()
+            .filter(|r| {
+                r.state == crate::control_plane::metadata::RangeState::Active
+                    && r.keyspace_start.as_slice() <= [0xF0].as_slice()
+            })
+            .max_by_key(|r| &r.keyspace_start)
+            .expect("right child");
+        assert_ne!(left_range.range_id, right_range.range_id);
+
+        Ok(())
+    });
+
+    sim.run()
 }

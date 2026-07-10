@@ -291,6 +291,10 @@ impl ClientController {
             return Ok(DataPlaneResponse::TopicNotFound.into());
         };
 
+        if range.range_id != req.range_id {
+            return Ok(DataPlaneResponse::StaleRange.into());
+        }
+
         // Invariant: an active range has exactly one active segment.
         let Some(seg) = range.active_segment.and_then(|id| range.segments.get(&id)) else {
             return Ok(DataPlaneResponse::InternalError(
@@ -544,7 +548,7 @@ mod tests {
     };
     use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
-    use crate::control_plane::metadata::{TopicId, TopicMeta};
+    use crate::control_plane::metadata::{RangeId, TopicId, TopicMeta};
     use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
     use crate::data_plane::actor::DataPlaneSender;
     use crate::data_plane::messages::DataPlaneMessage;
@@ -616,6 +620,7 @@ mod tests {
     fn produce_req() -> ClientRequest {
         ClientRequest::DataPlane(ClientDataPlaneRequest::Produce(ProduceRequest {
             topic_name: "t1".into(),
+            range_id: RangeId(0),
             routing_key: b"k".to_vec(),
             data: b"hello".to_vec(),
             record_count: 1,

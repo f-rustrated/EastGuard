@@ -22,6 +22,7 @@ mod producer;
 mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
+use crate::client::routing::TopicRouting;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
@@ -96,6 +97,10 @@ impl Client {
                 }
             }
         }
+    }
+
+    pub(crate) fn get_routing(&self, topic: &str) -> Option<Arc<TopicRouting>> {
+        self.cache.get(topic)
     }
 
     /// Returns the range's surviving start and the next entry id to request at

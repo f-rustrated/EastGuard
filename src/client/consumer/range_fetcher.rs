@@ -163,7 +163,7 @@ impl RangeFetchActor {
                         None
                     };
 
-                    for (i, rec) in records.into_iter().enumerate() {
+                    for (i, (key, value)) in records.into_iter().enumerate() {
                         if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
                             continue;
                         }
@@ -189,8 +189,8 @@ impl RangeFetchActor {
                                 entry_id: entry.entry_id,
                                 absolute_offset,
                             },
-                            key: rec.key,
-                            value: rec.value,
+                            key,
+                            value,
                         };
 
                         if self.record_tx.send(Ok(consumer_rec)).is_err() {

@@ -1,4 +1,3 @@
-use super::ProducerRecord;
 use crate::client::producer::config::BufferConfig;
 use crate::control_plane::metadata::RangeId;
 use crate::{client::error::ClientError, control_plane::metadata::EntryId};
@@ -7,6 +6,8 @@ use dashmap::DashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
+
+pub(crate) type Records = Box<[(Vec<u8>, Vec<u8>)]>;
 
 /// A thread-safe, encapsulated manager for partition-level range buffers.
 pub struct ProducerBuffers {
@@ -24,7 +25,7 @@ pub struct RangeBuffer {
 impl RangeBuffer {
     fn push(&mut self, pending: PendingRecord) {
         // Estimate serialized size: key_len (4B) + value_len (4B) + content bytes
-        let record_bytes = 8 + pending.record.key.len() + pending.record.value.len();
+        let record_bytes = 8 + pending.key.len() + pending.value.len();
         self.current_bytes += record_bytes;
         self.records.push(pending);
         if self.first_added_at.is_none() {
@@ -48,10 +49,69 @@ impl RangeBuffer {
 }
 
 pub struct PendingRecord {
-    pub record: ProducerRecord,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
     pub producer_id: Uuid,
     pub sequence_number: u32,
     pub tx: oneshot::Sender<Result<EntryId, ClientError>>,
+}
+impl PendingRecord {
+    /// Serialize a slice of records into a byte buffer.
+    pub fn serialize_batch(records: &[PendingRecord]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for r in records {
+            buf.extend_from_slice(&(r.key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&r.key);
+            buf.extend_from_slice(&(r.value.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&r.value);
+        }
+        buf
+    }
+
+    /// Deserialize a byte buffer into a vector of records.
+    pub fn deserialize_batch(mut buf: &[u8], count: u32) -> Result<Records, std::io::Error> {
+        let mut records = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            if buf.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF reading key length",
+                ));
+            }
+            let key_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+            buf = &buf[4..];
+
+            if buf.len() < key_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF reading key data",
+                ));
+            }
+            let key = buf[..key_len].to_vec();
+            buf = &buf[key_len..];
+
+            if buf.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF reading value length",
+                ));
+            }
+            let val_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+            buf = &buf[4..];
+
+            if buf.len() < val_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF reading value data",
+                ));
+            }
+            let value = buf[..val_len].to_vec();
+            buf = &buf[val_len..];
+
+            records.push((key, value));
+        }
+        Ok(records.into_boxed_slice())
+    }
 }
 
 /// The action to be taken after pushing a record to the buffer.
