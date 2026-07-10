@@ -51,7 +51,7 @@ impl TopicRouting {
     /// The active range owning `routing_key` — mirrors the server's
     /// `route_active_range`: the active range with the greatest `keyspace_start ≤ key`.
     /// Returns its write leader.
-    fn write_leader(&self, routing_key: &[u8]) -> Option<SocketAddr> {
+    pub(crate) fn write_leader(&self, routing_key: &[u8]) -> Option<SocketAddr> {
         self.ranges
             .iter()
             .rev()
@@ -63,7 +63,7 @@ impl TopicRouting {
         self.ranges
             .iter()
             .rev()
-            .find(|r| r.keyspace_start.as_slice() <= routing_key)
+            .find(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
             .map(|r| r.range_id)
     }
 

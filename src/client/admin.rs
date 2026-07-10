@@ -5,11 +5,13 @@
 
 use crate::client::Client;
 use crate::client::error::ClientError;
+use crate::client::routing::TopicRouting;
 use crate::connections::protocol::{
     ClientRequest, ClientResponse, ControlPlaneRequest, ControlPlaneResponse, TopicDetail,
     TopicSummary,
 };
 use crate::control_plane::metadata::strategy::StoragePolicy;
+use std::sync::Arc;
 
 impl Client {
     /// Create a topic. `Ok(true)` if newly created, `Ok(false)` if it already existed.
@@ -44,6 +46,18 @@ impl Client {
         }
     }
 
+    /// Return a stable routing snapshot, resolving the topic when the cache is empty.
+    pub(crate) async fn resolve_topic_if_missing(
+        &self,
+        topic: &str,
+    ) -> Result<Arc<TopicRouting>, ClientError> {
+        loop {
+            if let Some(routing) = self.get_routing(topic) {
+                return Ok(routing);
+            }
+            self.resolve_topic(topic).await?;
+        }
+    }
     pub async fn resolve_topic(&self, name: &str) -> Result<TopicDetail, ClientError> {
         let request = ControlPlaneRequest::DescribeTopic {
             name: name.to_string(),
@@ -55,7 +69,10 @@ impl Client {
                 self.cache.insert(&detail);
                 Ok(detail)
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            err => {
+                tracing::error!("{err:?}{}{}", file!(), line!());
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 }

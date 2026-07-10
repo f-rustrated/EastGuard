@@ -33,6 +33,10 @@ pub enum ClientError {
     #[error("unexpected response for request")]
     UnexpectedResponse,
 
+    /// Expected range has split or metadata is stale.
+    #[error("stale range routing")]
+    StaleRange,
+
     /// A consumer range-control command could not be delivered or acknowledged.
     #[error("consumer {operation} failed for range {range_id}: {reason}")]
     ConsumerControl {

@@ -238,6 +238,7 @@ impl Client {
                     None => Redirect::Reresolve,
                 },
                 DataPlaneResponse::TopicNotFound => Redirect::NotFound,
+                DataPlaneResponse::StaleRange => Redirect::Done,
                 DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 DataPlaneResponse::SegmentNotLocal
                 | DataPlaneResponse::Produced { .. }
