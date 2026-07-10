@@ -137,7 +137,7 @@ fn at_most_once_auto_commit_commits_delivery() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            group_config_with_semantic(group_id.clone(), DeliverySemantic::AtMostOnce),
+            group_config_with_semantic(group_id.clone(), DeliverySemantic::AtMostOnceBestEffort),
         )
         .await
         .unwrap();
@@ -159,7 +159,7 @@ fn at_most_once_auto_commit_commits_delivery() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            group_config_with_semantic(group_id, DeliverySemantic::AtMostOnce),
+            group_config_with_semantic(group_id, DeliverySemantic::AtMostOnceBestEffort),
         )
         .await
         .unwrap();

@@ -357,19 +357,18 @@ impl ConsumerGroup {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(?range_id, error = ?e, "Failed to serialize offset payload");
-                    return; // Skip this range, retry on next tick
+                    return Err(ClientError::on_control("commit", range_id, e.to_string()));
                 }
             };
 
             //  Send over network
-            if let Err(e) = self
-                .offset_producer
+            self.offset_producer
                 .send(self.routing_key().as_bytes(), data)
                 .await
-            {
-                tracing::warn!(?range_id, error = ?e, "Failed to send offset commit to broker");
-                return; // Skip this range, retry on next tick
-            }
+                .map_err(|e| {
+                    tracing::warn!(?range_id, error = ?e, "Failed to send offset commit to broker");
+                    e
+                })?;
 
             // Update DashMap safely
             if let Some(mut entry) = self.offsets.get_mut(&range_id) {
@@ -379,9 +378,11 @@ impl ConsumerGroup {
                     entry.committed = Some(position);
                 }
             }
+            Ok(())
         });
 
-        futures::future::join_all(futures).await;
+        futures::future::try_join_all(futures).await?;
+
         Ok(())
     }
 
