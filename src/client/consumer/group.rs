@@ -181,7 +181,7 @@ impl ConsumerGroup {
                 name,
                 StoragePolicy {
                     retention_ms: None,
-                    replication_factor: 1, // TODO Single replica for system topics locally for now, or match cluster default
+                    replication_factor: 3,
                     partition_strategy: PartitionStrategy::AutoSplit,
                 },
             )
