@@ -47,7 +47,7 @@ impl ConsumerRecord {
 #[derive(Debug, Clone)]
 pub enum DeliverySemantic {
     AtLeastOnce,
-    AtMostOnce,
+    AtMostOnceBestEffort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +175,7 @@ impl Consumer {
 
         match self.delivery_semantic {
             DeliverySemantic::AtLeastOnce => group.ack_offset(record.range_id, record.position),
-            DeliverySemantic::AtMostOnce => Ok(()),
+            DeliverySemantic::AtMostOnceBestEffort => Ok(()),
         }
     }
 
@@ -256,7 +256,7 @@ impl Consumer {
                     DeliverySemantic::AtLeastOnce => {
                         group.record_delivery(rec.range_id, rec.position)?;
                     }
-                    DeliverySemantic::AtMostOnce => {
+                    DeliverySemantic::AtMostOnceBestEffort => {
                         group.record_delivery(rec.range_id, rec.position)?;
                         group.ack_offset(rec.range_id, rec.position)?;
                     }

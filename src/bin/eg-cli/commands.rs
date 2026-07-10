@@ -313,9 +313,9 @@ async fn handle_consume(client: &Arc<Client>, request: ConsumeRequest) -> anyhow
 fn parse_delivery_semantic(value: &str) -> anyhow::Result<DeliverySemantic> {
     match value {
         "at-least-once" => Ok(DeliverySemantic::AtLeastOnce),
-        "at-most-once" => Ok(DeliverySemantic::AtMostOnce),
+        "at-most-once" | "at-most-once-best-effort" => Ok(DeliverySemantic::AtMostOnceBestEffort),
         _ => anyhow::bail!(
-            "invalid --delivery '{}'; expected at-least-once or at-most-once",
+            "invalid --delivery '{}'; expected at-least-once or at-most-once-best-effort",
             value
         ),
     }
