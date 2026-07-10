@@ -10,13 +10,11 @@
 
 #![allow(dead_code, unused_imports)]
 
-mod admin;
 mod codec;
 mod consumer;
 mod error;
 mod nodes;
 mod pool;
-mod produce;
 mod producer;
 
 mod redirect;
@@ -37,10 +35,14 @@ pub use producer::{BufferConfig, Producer, ProducerConfig};
 
 use crate::client::consumer::group::SYSTEM_TOPIC_OFFSETS;
 use crate::client::consumer::group::{ConsumerPosition, OffsetCommitPayload};
-use crate::connections::protocol::{ClientResponse, DataPlaneResponse, RangeOffsetRequest};
+use crate::connections::protocol::{
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneRequest,
+    ControlPlaneResponse, DataPlaneResponse, ProduceRequest, RangeOffsetRequest,
+};
 use borsh::BorshDeserialize;
 
 pub use redirect::RetryPolicy;
+use redirect::{Redirect, RetryState, Served};
 use routing::RoutingCache;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -192,6 +194,267 @@ impl Client {
             }
         }
         Ok(map)
+    }
+
+    /// Create a topic. `Ok(true)` if newly created, `Ok(false)` if it already existed.
+    pub async fn create_topic(
+        &self,
+        name: &str,
+        storage_policy: StoragePolicy,
+    ) -> Result<bool, ClientError> {
+        let request = ControlPlaneRequest::CreateTopic {
+            name: name.to_string(),
+            storage_policy,
+        };
+        let served = self.call(self.next_known_node(), request).await?;
+        match served.response {
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated) => Ok(true),
+            ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => Ok(false),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Delete a topic. A missing topic surfaces as `ClientError::TopicNotFound`.
+    pub async fn delete_topic(&self, name: &str) -> Result<(), ClientError> {
+        let request = ControlPlaneRequest::DeleteTopic {
+            name: name.to_string(),
+        };
+        let served = self.call(self.next_known_node(), request).await?;
+        // The redirect loop already turned a `TopicNotFound` response into an error.
+        self.cache.invalidate(name);
+        match served.response {
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted) => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return a stable routing snapshot, resolving the topic when the cache is empty.
+    pub(crate) async fn resolve_topic_if_missing(
+        &self,
+        topic: &str,
+    ) -> Result<Arc<TopicRouting>, ClientError> {
+        loop {
+            if let Some(routing) = self.get_routing(topic) {
+                return Ok(routing);
+            }
+            self.resolve_topic(topic).await?;
+        }
+    }
+
+    pub async fn resolve_topic(&self, name: &str) -> Result<TopicDetail, ClientError> {
+        let request = ControlPlaneRequest::DescribeTopic {
+            name: name.to_string(),
+        };
+        let served = self.call(self.next_known_node(), request).await?;
+        match served.response {
+            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) => {
+                self.remember_nodes(&detail);
+                self.cache.insert(&detail);
+                Ok(detail)
+            }
+            err => {
+                tracing::error!("{err:?}{}{}", file!(), line!());
+                Err(ClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    pub(crate) async fn produce(
+        &self,
+        topic: &str,
+        routing_key: &[u8],
+        data: Vec<u8>,
+        record_count: u32,
+    ) -> Result<EntryId, ClientError> {
+        let routing = self.resolve_topic_if_missing(topic).await?;
+        let range_id = routing
+            .range_id(routing_key)
+            .ok_or(ClientError::TopicNotFound)?;
+
+        self.produce_to_range(topic, range_id, routing_key, data, record_count)
+            .await
+    }
+
+    /// Produce one entry under `routing_key`, returning the committed `entry_id`.
+    /// Routes to the cached write leader; a redirect self-corrects and drops the
+    /// stale entry so the next call re-resolves.
+    pub(crate) async fn produce_to_range(
+        &self,
+        topic: &str,
+        range_id: RangeId,
+        routing_key: &[u8],
+        data: Vec<u8>,
+        record_count: u32,
+    ) -> Result<EntryId, ClientError> {
+        // Describe once to seed the cache (gives the first hop).
+        let routing = self.resolve_topic_if_missing(topic).await?;
+
+        // Start at the cached leader; fall back to a seed if the key has no cached
+        // active range (the server will redirect).
+        let start = routing
+            .write_leader(routing_key)
+            .unwrap_or(self.next_known_node());
+
+        let request = ProduceRequest {
+            topic_name: topic.to_string(),
+            range_id,
+            routing_key: routing_key.to_vec(),
+            data,
+            record_count,
+        };
+
+        let served = self.call(start, request).await?;
+        // A redirect -> the cached leader was stale; drop it so the next produce re-describes.
+        if served.redirected {
+            self.cache.invalidate(topic);
+        }
+        match served.response {
+            ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
+            ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
+                self.cache.invalidate(topic);
+                Err(ClientError::StaleRange)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Drive `request` to completion from `start`, following redirects until the
+    /// deadline. Returns the serving response or a terminal error.
+    pub(crate) async fn call(
+        &self,
+        start: SocketAddr,
+        request: impl Into<ClientRequest>,
+    ) -> Result<Served, ClientError> {
+        let mut state = RetryState::new(start, &self.retry);
+        let mut last_error: Option<String> = None;
+
+        let request = request.into();
+        loop {
+            // Budget spent: not-found if that's all we saw, else timeout.
+            if Instant::now() >= state.deadline {
+                if state.saw_not_found {
+                    return Err(ClientError::TopicNotFound);
+                }
+                return Err(ClientError::Timeout {
+                    waited: self.retry.deadline,
+                    last_error,
+                });
+            }
+
+            // Cap the attempt at the remaining budget: a request on an established
+            // connection awaits a reply with no inner deadline, so a node that never
+            // answers (parked reply, half-open socket) can't outlast the call.
+            let attempt =
+                tokio::time::timeout(state.budget(), self.pool.send(state.addr, request.clone()));
+
+            let attempt_res = attempt.await;
+
+            if attempt_res.is_err() {
+                last_error = Some("request attempt timed out".to_string());
+                continue;
+            }
+
+            let res = attempt_res.unwrap();
+
+            match res {
+                Ok(response) => {
+                    let is_direct_to_node = matches!(
+                        request,
+                        ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(_))
+                            | ClientRequest::DataPlane(ClientDataPlaneRequest::ListOffsets(_))
+                    );
+
+                    let redirect = if is_direct_to_node {
+                        match &response {
+                            ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
+                                Redirect::Done
+                            }
+                            ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
+                                hint_node: None,
+                            }) => Redirect::Done,
+                            _ => Self::redirect_target(&response),
+                        }
+                    } else {
+                        Self::redirect_target(&response)
+                    };
+
+                    match redirect {
+                        Redirect::Done => {
+                            return Ok(Served {
+                                response,
+                                redirected: state.redirected,
+                            });
+                        }
+                        Redirect::Follow(next) => {
+                            // The hint is a node the server just pointed us at — remember it
+                            // so future re-resolves can reach it, not just the bootstrap set.
+                            self.known_nodes.remember(next);
+                            if state.try_follow(next) {
+                                continue;
+                            }
+                        }
+                        Redirect::NotFound => state.mark_not_found(),
+                        Redirect::Reresolve => state.mark_redirected(),
+                    }
+                }
+                // Pool dropped the dead connection; re-resolve like any transient.
+                Err(ClientError::Connection { addr, reason }) => {
+                    last_error = Some(format!("Connection to {} failed: {}", addr, reason));
+                    state.mark_redirected()
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Transient: back off (never past the deadline), then try a fresh seed.
+            let remaining = state.budget();
+            let sleep_for = state.prepare_reresolve(self.next_known_node(), self.retry.max_backoff);
+            tokio::time::sleep(sleep_for.min(remaining)).await;
+        }
+    }
+
+    /// Map a response to its action. All variants listed, so a new wire variant
+    /// won't compile until handled.
+    pub(crate) fn redirect_target(response: &ClientResponse) -> Redirect {
+        match response {
+            ClientResponse::ControlPlane(cp) => match cp {
+                ControlPlaneResponse::TopicMetadataRedirect { owner } => {
+                    Redirect::Follow(owner.client_addr)
+                }
+                ControlPlaneResponse::NotRaftLeader { leader_addr } => match leader_addr {
+                    Some(info) => Redirect::Follow(info.client_addr),
+                    None => Redirect::Reresolve,
+                },
+                ControlPlaneResponse::TopicNotFound => Redirect::NotFound,
+                ControlPlaneResponse::InternalError(_) => Redirect::Reresolve,
+                ControlPlaneResponse::TopicCreated
+                | ControlPlaneResponse::AlreadyExists
+                | ControlPlaneResponse::TopicDeleted
+                | ControlPlaneResponse::TopicList { .. }
+                | ControlPlaneResponse::TopicDetail(_) => Redirect::Done,
+            },
+            ClientResponse::DataPlane(dp) => match dp {
+                DataPlaneResponse::NotWriteLeader { leader_addr } => match leader_addr {
+                    Some(addr) => Redirect::Follow(*addr),
+                    None => Redirect::Reresolve,
+                },
+                DataPlaneResponse::ShardNotLocal { hint_node } => match hint_node {
+                    Some(addr) => Redirect::Follow(*addr),
+                    None => Redirect::Reresolve,
+                },
+                DataPlaneResponse::TopicNotFound => Redirect::NotFound,
+                DataPlaneResponse::StaleRange => Redirect::Done,
+                DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
+                DataPlaneResponse::SegmentNotLocal
+                | DataPlaneResponse::Produced { .. }
+                | DataPlaneResponse::Fetched { .. }
+                | DataPlaneResponse::EntryIdOutOfRange
+                | DataPlaneResponse::KeyspaceBoundNarrowed
+                | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
+            },
+            ClientResponse::Admin(_) => Redirect::Done,
+            // The server's writer-loop sentinel; a client never legitimately reads it.
+            ClientResponse::Stop => Redirect::Reresolve,
+        }
     }
 }
 
