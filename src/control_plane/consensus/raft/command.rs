@@ -9,7 +9,7 @@ use crate::{impl_from_variant, impl_from_variant_via};
 
 /// Outer Raft log payload. The peer set is part of the replicated state machine,
 /// mutated only when `AddPeer` / `RemovePeer` entries apply — never by direct mutation
-/// from gossip events. See `diagrams/metadata-management/metadata_management_roadmap.md`
+/// from gossip events. See `docs/metadata-management/metadata_management_roadmap.md`
 /// Phase 3d ("Membership Changes via the Log") for the rationale.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum RaftCommand {

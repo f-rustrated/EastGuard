@@ -1,6 +1,6 @@
 # MetadataStateMachine (Invariants)
 
-Application state machine for DS-RSM. One instance per shard group, owned by `Raft`. Manages topic, range, and segment metadata. Pure synchronous, no I/O. For the entity model and lifecycle, see `diagrams/metadata-management/mental-model.md` § "The entity model".
+Application state machine for DS-RSM. One instance per shard group, owned by `Raft`. Manages topic, range, and segment metadata. Pure synchronous, no I/O. For the entity model and lifecycle, see `docs/metadata-management/mental-model.md` § "The entity model".
 
 ## Entity Hierarchy
 

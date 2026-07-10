@@ -1326,7 +1326,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
 /// This is "the recovery payoff is observable only as a zero-transfer catch-up": the
 /// restarted node's on-disk copy is *reused* rather than re-downloaded, and orphan GC's
 /// confirmation-typed deletion (`recovery::orphan`) spares it because it is, by delete
-/// time, named again. See `diagrams/data-plane/d5_crash_recovery.md` § "Orphaned Data
+/// time, named again. See `docs/data-plane/d5_crash_recovery.md` § "Orphaned Data
 /// Cleanup".
 ///
 /// Specifically exercises the **capacity-return re-fill** (raft-actor.md #10), the harder

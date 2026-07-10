@@ -1,7 +1,7 @@
 //! Leader-crash seal-end recovery — a Raft-independent tracker.
 //!
 //! When a segment's write leader crashes, the coordinator must recover the
-//! committed end before sealing it (see `diagrams/data-plane/leader_crash_seal_boundary.md`).
+//! committed end before sealing it (see `docs/data-plane/leader_crash_seal_boundary.md`).
 //! This module owns that bookkeeping as a pure state machine: one [`SealEndGather`]
 //! per leader-crashed segment, polling the survivors for their durable extents
 //! and sealing at their `min`. It holds no Raft/transport/topology state — it

@@ -1,6 +1,6 @@
 # Storage Key Layout (Invariants)
 
-All shard groups share a single RocksDB default column family. Each key is prefixed with the shard group ID to isolate groups within the same keyspace. For the design rationale, see `diagrams/metadata-management/mental-model.md` § "Storage layout".
+All shard groups share a single RocksDB default column family. Each key is prefixed with the shard group ID to isolate groups within the same keyspace. For the design rationale, see `docs/metadata-management/mental-model.md` § "Storage layout".
 
 ## Key Structure
 

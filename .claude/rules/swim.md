@@ -1,6 +1,6 @@
 # SWIM (Invariants)
 
-`Swim` is the synchronous SWIM failure-detection state machine. `SwimActor` is the async wrapper that drives it. For the protocol explanation, see `diagrams/metadata-management/mental-model.md` § "SWIM — cluster membership and failure detection".
+`Swim` is the synchronous SWIM failure-detection state machine. `SwimActor` is the async wrapper that drives it. For the protocol explanation, see `docs/metadata-management/mental-model.md` § "SWIM — cluster membership and failure detection".
 
 ## Architecture (brief)
 

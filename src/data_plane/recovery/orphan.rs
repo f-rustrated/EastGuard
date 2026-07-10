@@ -9,7 +9,7 @@
 //! answered yes/no. "Named" spares the segment: its on-disk copy is reused by the catch-up.
 //! Only an unnamed segment is deleted — destruction is cluster-confirmed and last.
 //!
-//! See `diagrams/data-plane/d5_crash_recovery.md` § "Orphaned Data Cleanup".
+//! See `docs/data-plane/d5_crash_recovery.md` § "Orphaned Data Cleanup".
 
 use std::io;
 use std::path::Path;

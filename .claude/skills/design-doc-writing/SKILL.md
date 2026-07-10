@@ -2,7 +2,7 @@
 name: design-doc-writing
 description: >-
   Write or edit EastGuard design and architecture documentation — roadmaps, phase
-  design docs (like D1–D6 in diagrams/), mental-model explainers, subsystem
+  design docs (like D1–D6 in docs/), mental-model explainers, subsystem
   walkthroughs — in the project's concept-focused house style. Use this skill
   whenever creating, updating, or reviewing any design / architecture / conceptual
   doc for this project, even when the user just says "write the D5 doc", "document
@@ -16,7 +16,7 @@ description: >-
 
 # Writing EastGuard Design Docs
 
-EastGuard's design docs (the `diagrams/` roadmaps and phase docs, mental-model
+EastGuard's design docs (the `docs/` roadmaps and phase docs, mental-model
 explainers, subsystem walkthroughs) exist to make a reader *understand the system*
 — the shapes, the flows, the tradeoffs, and above all the **why**. They are read
 by people onboarding, by future contributors deciding how to extend a subsystem,
@@ -30,7 +30,7 @@ That goal drives every choice below.
 Apply this style to **design / architecture / conceptual docs** — anything whose
 job is to explain how and why the system works. Roadmaps, phase design docs,
 mental models, "how does X work" explainers. Wherever they live (not only under
-`diagrams/`).
+`docs/`).
 
 **Do NOT apply it to `.claude/rules/` invariant files.** Those are code contracts
 checked by `assert_invariants()` at runtime; they deliberately name exact types,
@@ -110,7 +110,7 @@ again after correction") rather than papering over them.
 ## Structure and voice
 
 Match the shape of the existing docs (read one or two siblings first — e.g. the
-D-series in `diagrams/data-plane/` — to calibrate tone and density). The
+D-series in `docs/data-plane/` — to calibrate tone and density). The
 recurring shape:
 
 - **Title**, then a one-paragraph `**Goal:**` (what this accomplishes and why) and

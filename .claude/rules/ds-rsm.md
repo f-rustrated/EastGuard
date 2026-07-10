@@ -1,6 +1,6 @@
 # DS-RSM (System-Level Invariants)
 
-Top-level architecture for EastGuard's metadata management. Sharded Raft groups across the cluster, SWIM for membership. For the full conceptual picture, see `diagrams/metadata-management/mental-model.md`.
+Top-level architecture for EastGuard's metadata management. Sharded Raft groups across the cluster, SWIM for membership. For the full conceptual picture, see `docs/metadata-management/mental-model.md`.
 
 ## Invariants
 

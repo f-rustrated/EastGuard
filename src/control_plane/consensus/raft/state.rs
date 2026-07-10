@@ -521,7 +521,7 @@ impl Raft {
 
         // Sealed (known-end): swap the replica set in place; catch-up re-replicates
         // to the new node. Boundary-unknown seals are excluded by the scan — see
-        // `diagrams/data-plane/leader_crash_seal_boundary.md`.
+        // `docs/data-plane/leader_crash_seal_boundary.md`.
         changed |= self.repair_segments(sealed, live_set, |segment_key, new_replica_set| {
             ReassignSegment {
                 segment_key,

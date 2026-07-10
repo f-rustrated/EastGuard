@@ -60,7 +60,7 @@ pub struct ReassignSegment {
 
 /// Retention: mark an oldest-first **prefix** of one range's sealed segments
 /// `Deleting`. Plural by nature — a retention sweep expires a run of old segments,
-/// not one. See `diagrams/data-plane/d7_retention_gc.md`.
+/// not one. See `docs/data-plane/d7_retention_gc.md`.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct DeleteSegments {
     pub topic_id: TopicId,

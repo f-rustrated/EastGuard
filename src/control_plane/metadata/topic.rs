@@ -169,7 +169,7 @@ impl TopicMeta {
     ///
     /// Boundary-unknown seals (`end_offset = None`, left by a leader-crash or
     /// idle-segment SWIM seal) are excluded: catch-up can't verify against an
-    /// unknown end. See `diagrams/data-plane/leader_crash_seal_boundary.md`.
+    /// unknown end. See `docs/data-plane/leader_crash_seal_boundary.md`.
     pub(crate) fn sealed_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,

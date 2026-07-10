@@ -187,7 +187,7 @@ pub struct CatchUpAck {
 //
 // `shard_group_id` rides the query so the survivor can address the report back
 // to the coordinator (a follower's tracker doesn't carry the real group id).
-// See `diagrams/data-plane/leader_crash_seal_boundary.md`.
+// See `docs/data-plane/leader_crash_seal_boundary.md`.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealBoundaryQuery {
     pub segment_key: SegmentKey,
