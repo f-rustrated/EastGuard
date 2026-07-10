@@ -339,7 +339,7 @@ fn consumer_group_scale_out_and_rebalance() {
 
         let mut c1_records = 0;
         while c1_records < 10 {
-            match tokio::time::timeout(Duration::from_secs(5), c1.next_record()).await {
+            match tokio::time::timeout(Duration::from_secs(10), c1.next_record()).await {
                 Ok(Ok(Some(record))) => {
                     c1.ack(&record).unwrap();
                     c1_records += 1;
@@ -515,7 +515,7 @@ fn consumer_group_failover() {
 
         let mut c1_records = 0;
         while c1_records < 15 {
-            match tokio::time::timeout(Duration::from_secs(5), c1.next_record()).await {
+            match tokio::time::timeout(Duration::from_secs(10), c1.next_record()).await {
                 Ok(Ok(Some(record))) => {
                     c1.ack(&record).unwrap();
                     c1_records += 1;

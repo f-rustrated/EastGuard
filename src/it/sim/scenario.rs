@@ -180,10 +180,6 @@ pub(super) fn make_create_topic_req(name: &str) -> ClientRequest {
     })
 }
 
-pub fn run_scenario(seed: u64) -> turmoil::Result {
-    run_for_scenario(&SimScenario::from_seed(seed))
-}
-
 pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -301,7 +297,24 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
         }
         match &fault.kind {
             FaultKind::KillNode(n) => sim.crash(node_name(*n).as_str()),
-            FaultKind::PartitionNode(_) | FaultKind::HealNode(_) => {}
+            FaultKind::PartitionNode(n) => {
+                let target_node = node_name(*n);
+                for j in 1..=node_count {
+                    if j != *n {
+                        turmoil::partition(target_node.as_str(), node_name(j).as_str());
+                    }
+                }
+                turmoil::partition(target_node.as_str(), "checker");
+            }
+            FaultKind::HealNode(n) => {
+                let target_node = node_name(*n);
+                for j in 1..=node_count {
+                    if j != *n {
+                        turmoil::repair(target_node.as_str(), node_name(j).as_str());
+                    }
+                }
+                turmoil::repair(target_node.as_str(), "checker");
+            }
         }
     }
 
@@ -321,7 +334,7 @@ mod tests {
     #[serial_test::serial]
     fn sim_loop_100() {
         for seed in 0..100 {
-            if let Err(e) = run_scenario(seed) {
+            if let Err(e) = run_for_scenario(&SimScenario::from_seed(seed)) {
                 let scenario = SimScenario::from_seed(seed);
                 let shrunk = shrink_scenario(&scenario);
                 let path = record_failure(&shrunk).expect("failed to write bugbase entry");
