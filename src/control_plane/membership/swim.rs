@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 
 const INDIRECT_PING_COUNT: usize = 3;
 const SWIM_GOSSIP_CAPACITY: usize = 64;
+const DEAD_RECHECK_PERIODS: u64 = 2;
 
 /// SWIM protocol state machine. No async, no channels, no timers.
 ///
@@ -49,11 +50,8 @@ const SWIM_GOSSIP_CAPACITY: usize = 64;
 ///        │                    │
 ///        │                    ▼
 ///        │                  Dead
-///        │                    │  step: higher-incarnation Alive gossip
-///        └────────────────────┘  └─ update_member() — higher inc currently wins
-///                                   (see TODO in update_member: per the original SWIM
-///                                    paper, Dead is a terminal state and should NOT
-///                                    be overridden by any incarnation number)
+///        │                    │  step: self observes Dead gossip after a healed partition
+///        └────────────────────┘  └─ refute at gossip incarnation + 1
 /// ```
 pub struct Swim {
     // Identity
@@ -70,6 +68,7 @@ pub struct Swim {
 
     // Sequence
     seq_counter: u64,
+    protocol_periods: u64,
     last_suspected_seqs: BTreeMap<NodeId, u64>,
 
     // Output buffers
@@ -96,6 +95,7 @@ impl Swim {
                 shard_leader_buffer_capacity,
             ),
             seq_counter: 0,
+            protocol_periods: 0,
             last_suspected_seqs: BTreeMap::new(),
             pending_events: Vec::new(),
             pending_indirect_pings: BTreeMap::new(),
@@ -134,6 +134,32 @@ impl Swim {
             shard_leaders,
         }
     }
+
+    fn generate_dead_recheck_header(&mut self, seq: u64, dead: SwimNode) -> SwimHeader {
+        let dead_size = dead.encoded_size();
+        let mut gossip = Vec::with_capacity(self.gossip_buffer.len() + 1);
+        let dead_node_id = dead.node_id.clone();
+        gossip.push(dead);
+        gossip.extend(
+            self.gossip_buffer
+                .collect(MAX_GOSSIP_BYTES.saturating_sub(dead_size))
+                .into_iter()
+                .filter(|m| m.node_id != dead_node_id),
+        );
+
+        let used: usize = gossip.iter().map(|member| member.size()).sum();
+        let shard_leaders = self
+            .shard_leader_buffer
+            .collect(MAX_GOSSIP_BYTES.saturating_sub(used));
+        SwimHeader {
+            seq,
+            source_node_id: self.node_id.clone(),
+            source_addr: self.self_addr,
+            source_incarnation: self.incarnation,
+            gossip,
+            shard_leaders,
+        }
+    }
     pub(crate) fn handle_join(&mut self, mut attempt: JoinAttempt) {
         tracing::debug!(seed = %attempt.seed_addr, "join attempt: pinging seed");
         let seq = self.next_seq();
@@ -160,7 +186,7 @@ impl Swim {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn handle_timeout(&mut self, event: SwimTimeOutCallback) {
         match event {
-            SwimTimeOutCallback::ProtocolPeriodElapsed => self.start_probe(),
+            SwimTimeOutCallback::ProtocolPeriodElapsed => self.handle_protocol_period(),
             SwimTimeOutCallback::TimedOut {
                 seq,
                 target_node_id,
@@ -171,6 +197,43 @@ impl Swim {
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
+    }
+
+    fn handle_protocol_period(&mut self) {
+        self.protocol_periods = self.protocol_periods.wrapping_add(1);
+        self.start_probe();
+        if self.protocol_periods.is_multiple_of(DEAD_RECHECK_PERIODS) {
+            self.recheck_one_dead_member();
+        }
+    }
+
+    /// A healed partition leaves both sides with terminal Dead observations and no
+    /// live probe edge between them. Rechecking one remembered dead address at a
+    /// low rate carries that exact observation back to the still-running process,
+    /// which can refute it at a higher incarnation and rejoin through normal gossip.
+    fn recheck_one_dead_member(&mut self) {
+        let dead_members: Vec<SwimNode> = self
+            .members
+            .values()
+            .filter(|member| member.node_id != self.node_id && member.state == SwimNodeState::Dead)
+            .cloned()
+            .collect();
+        if dead_members.is_empty() {
+            return;
+        }
+        let round = self.protocol_periods / DEAD_RECHECK_PERIODS;
+        let dead = dead_members[(round as usize) % dead_members.len()].clone();
+        tracing::debug!(
+            node = %self.node_id,
+            target = %dead.node_id,
+            incarnation = dead.incarnation,
+            "rechecking remembered dead member",
+        );
+        let seq = self.next_seq();
+        let target = dead.addr.cluster_addr();
+        let packet = SwimPacket::Ping(self.generate_dead_recheck_header(seq, dead));
+        self.pending_events
+            .push(SwimEvent::Packet(OutboundPacket::new(target, packet)));
     }
 
     fn handle_timed_out(&mut self, seq: u64, target_node_id: Option<NodeId>, phase: SwimTimerKind) {
@@ -495,7 +558,6 @@ impl Swim {
     }
 
     fn apply_membership_update(&mut self, member: SwimNode) {
-        // Refutation: only refute Suspect, not Dead (Dead is terminal per SWIM spec)
         if self.is_me(&member) {
             if self.should_refute(&member) {
                 let new_incarnation = member.incarnation + 1;
@@ -532,7 +594,8 @@ impl Swim {
     }
 
     fn should_refute(&self, member: &SwimNode) -> bool {
-        member.state == SwimNodeState::Suspect && self.incarnation <= member.incarnation
+        matches!(member.state, SwimNodeState::Suspect | SwimNodeState::Dead)
+            && self.incarnation <= member.incarnation
     }
 
     fn is_me(&self, member: &SwimNode) -> bool {
@@ -609,9 +672,6 @@ impl Swim {
             }
             Entry::Occupied(mut e) => {
                 let node = e.get_mut();
-                if node.state == SwimNodeState::Dead {
-                    return None;
-                }
                 // Adopt the incoming address when the info is at least as fresh
                 // as ours. A node's address is fixed within an incarnation, so an
                 // equal-or-higher incarnation carries authoritative addresses.
@@ -1009,6 +1069,25 @@ mod tests {
             // Ping from node-b with higher incarnation 5
             p.step(sender, ping(2, "node-b", 5, vec![]));
             let _ = p.take_packets();
+
+            let member = p.members.get("node-b").unwrap();
+            assert_eq!(member.state, SwimNodeState::Alive);
+            assert_eq!(member.incarnation, 5);
+        }
+
+        #[test]
+        fn higher_incarnation_resurrects_a_dead_member() {
+            let mut p = make_protocol("node-local", 8000);
+            let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+            p.update_member(
+                NodeId::new("node-b"),
+                NodeAddress::test(sender, sender),
+                SwimNodeState::Dead,
+                4,
+            );
+            p.take_events();
+
+            p.step(sender, ping(2, "node-b", 5, vec![]));
 
             let member = p.members.get("node-b").unwrap();
             assert_eq!(member.state, SwimNodeState::Alive);
@@ -1466,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_gossip_about_self_does_not_trigger_refutation() {
+    fn dead_gossip_about_self_refutes_after_partition_heals() {
         let mut p = make_protocol("node-local", 8000);
         let sender: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
@@ -1481,9 +1560,44 @@ mod tests {
         );
 
         assert_eq!(
-            p.incarnation, 0,
-            "Dead is terminal — must not trigger refutation"
+            p.incarnation, 1,
+            "a running node must outrank stale Dead gossip after a healed partition"
         );
+        let packets = p.take_packets();
+        assert!(packets.iter().any(|packet| {
+            packet.packet().gossip().iter().any(|member| {
+                member.node_id == NodeId::new("node-local")
+                    && member.state == SwimNodeState::Alive
+                    && member.incarnation == 1
+            })
+        }));
+    }
+
+    #[test]
+    fn dead_member_is_periodically_rechecked_with_its_dead_observation() {
+        let mut p = make_protocol("node-local", 8000);
+        let remote = node("node-remote", 9000, SwimNodeState::Dead, 4);
+        p.update_member(
+            remote.node_id.clone(),
+            remote.addr,
+            remote.state,
+            remote.incarnation,
+        );
+        p.take_events();
+
+        for _ in 0..DEAD_RECHECK_PERIODS {
+            p.handle_timeout(SwimTimeOutCallback::ProtocolPeriodElapsed);
+        }
+
+        let packets = p.take_packets();
+        assert!(packets.iter().any(|packet| {
+            packet.target == remote.addr.cluster_addr()
+                && packet.packet().gossip().iter().any(|member| {
+                    member.node_id == remote.node_id
+                        && member.state == SwimNodeState::Dead
+                        && member.incarnation == remote.incarnation
+                })
+        }));
     }
 
     // -------------------------------------------------------------------

@@ -18,8 +18,21 @@ it/sim/
 
 Defines `SimScenario` (node count, duration, fault events, command events) and two entry points:
 
-- **`SimScenario::from_seed(u64)`** — deterministically generates a scenario from a seed using `StdRng`. Same seed always produces the same topology, faults, and commands.
-- **`run_for_scenario(&SimScenario)`** — builds a `turmoil::Sim`, spawns one EastGuard process per node slot, and runs a `checker` client task that issues commands at their scheduled timestamps and calls invariant checkers at the end. Fault injection (node kills) is applied by stepping the virtual clock to `fault.at_secs` and calling `sim.crash()`.
+- **Seeded generation** — deterministically produces the same topology, commands,
+  and fault profile from the same seed. The first five seed classes deliberately
+  cover steady state, loss of a sealed data replica, partition/heal, an active
+  data-replica flap, and current metadata-leader partition/heal. The simulator
+  RNG, node identities, and node-local election randomness all derive from the
+  scenario seed, so replay preserves the network and election schedule as well
+  as the generated events.
+- **Scenario execution** — builds a simulated cluster, issues commands at their
+  scheduled timestamps, produces acknowledged records, forces a size-based
+  segment roll, applies faults on the virtual clock, and checks the surviving
+  cluster after its convergence window. The replica-loss profile verifies death
+  classification and acknowledged-record durability. Dedicated deterministic
+  repair scenarios verify replacement and catch-up completion. The flap profile
+  sends another record while the selected data replica is isolated, exercising
+  bounded client retries through the recovery window.
 
 Also provides shared helpers (`try_propose`, `make_create_topic_req`, `node_name`, `client_port`, `cluster_port`) used by both the checker task and `properties.rs`.
 
@@ -31,7 +44,12 @@ Reusable async functions that talk to live node APIs through the virtual network
 |---|---|
 | `assert_membership_converged` | All alive nodes return the same sorted set of `Alive` member IDs. Retries up to N times. |
 | `assert_single_leader` | All nodes that know a leader for a given shard group agree on the same one (no split-brain). |
-| `assert_topic_visible_on_quorum` | After a `CreateTopic` ack, all alive nodes eventually return the topic via `GetTopics`. |
+| Topic durability | After a create acknowledgment, an original shard quorum reports the topic whenever that quorum survives the scenario. |
+| Single-leader safety | Surviving shard members never report conflicting leaders. |
+| Record durability | Every acknowledged entry remains readable after the generated fault. |
+| Offset continuity | A size-triggered roll exposes a sealed end immediately followed by the successor start. |
+| Repair completion | A killed sealed replica is replaced, and the replacement serves the old entry. |
+| Client retry bound | Production during a replica flap must receive an acknowledgment within the recovery budget. |
 
 ### `properties.rs` — Concrete Property Tests
 
@@ -78,8 +96,14 @@ on Err ──► shrink_scenario(failing)  ← bugbase.rs
 # Run all property tests
 cargo test -p east-guard --test '*' it::sim
 
-# Run the 100-seed loop (slow, ignored by default)
-cargo test sim_loop_100 -- --ignored
+# Run the per-change campaign (10 seeds by default)
+cargo test sim_campaign -- --nocapture --test-threads=1
+
+# Run a larger local campaign
+EG_SIM_SEED_COUNT=500 cargo test sim_campaign -- --nocapture --test-threads=1
+
+# Replay exactly one generated seed
+EG_SIM_SEED=73 cargo test sim_campaign -- --nocapture --test-threads=1
 
 # Replay a saved bug scenario
 cargo test bugbase_regression
@@ -95,22 +119,20 @@ The data plane (`DataPlane<W>`, `WalStorage`, `SegmentTracker`, checkpoint, cold
 | **Produce/consume round-trip** | After `Produce` is acked, a consumer read against the same segment returns the same records in the same order. |
 | **Segment seal → checkpoint handoff** | When `MetadataStateMachine` commits a `RollSegment`, the data plane checkpoints the sealed segment and the new segment accepts subsequent writes without a gap. |
 
-Cross-node durability (no record lost across leader failure) requires replication (`TODO replication(D2)`) to be wired first. Until then, the three properties above are testable today and cover the highest-risk single-node data plane behaviors.
+The generated campaign covers cross-node replication, rolling, replica loss,
+sealed repair, and production during a replica flap. Targeted deterministic
+scenarios complement it with the longer multi-phase paths that are poor fits for
+random generation: active-leader crash boundary recovery, coordinator loss during
+repair, disk reuse after restart, range split consumption, and broker restart
+during consumer-group scale-out. The latter commits the pre-rebalance offsets and
+rejects any replay while the restarted group consumes the next batch.
 
 ## TODO
 
-### Phase 1 — Unblock the loop + add partitions
-- Fix the root cause of `sim_loop_100` failures (topic not visible after startup delay) and remove `#[ignore]`.
-- Implement `FaultKind::PartitionNode` / `HealNode` in `run_for_scenario` using `sim.partition()` / `sim.repair()`. Wire them into `SimScenario::from_seed` so the loop exercises partition faults. This covers split-brain scenarios that node kills cannot reach.
-
-### Phase 3 — Targeted fault sequences
-- Add `FaultKind::PartitionLeader` — resolves the current leader via `GetShardLeader` at fault time, then partitions it. Untargeted partition faults are much weaker.
-- Add `FaultKind::FlappingPartition { node, heal_after_secs }` — partition then heal within the same scenario, forcing SWIM death detection followed by rejoin. The hardest convergence case.
-
-### Phase 4 — Campaign runner
-- Promote the sim loop to a standalone binary (`src/bin/sim.rs`) with subcommands: `run`, `loop --n <N>`, `replay <hash>`, `list`.
-- Add a `--profile` flag to parameterize fault rates and scenario density without code changes.
-- Run `loop --n 500` nightly in CI and post failures to Slack.
+### Campaign runner
+- A standalone command could make corpus browsing more convenient, but replay and
+  bounded/extended execution are already available through the test entry point
+  and environment variables above.
 
 ## Constraints
 

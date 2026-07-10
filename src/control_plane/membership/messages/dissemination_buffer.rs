@@ -55,6 +55,10 @@ impl<T: Disseminable> DisseminationBuffer<T> {
         }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(in crate::control_plane::membership) fn enqueue(&mut self, item: T, cluster_size: usize) {
         if item.size() > MAX_GOSSIP_BYTES {
             tracing::error!(

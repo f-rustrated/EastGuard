@@ -671,7 +671,8 @@ impl Raft {
             changed |= self.propose_replace_peer(dead_node_id.clone(), replacement);
         }
 
-        changed || self.reconcile_segments(live_set)
+        let segments_changed = self.reconcile_segments(live_set);
+        changed || segments_changed
     }
 
     pub(crate) fn dead_nodes(&mut self, live: &HashSet<NodeId>) -> impl Iterator<Item = &NodeId> {
@@ -3841,6 +3842,62 @@ mod tests {
                 member
             );
         }
+    }
+
+    #[test]
+    fn node_death_reconciles_peer_and_sealed_replica_together() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+
+        let mut raft = three_node_raft_as_leader("node-1");
+        let dead = raft.peers_iter().next().expect("peer exists").clone();
+        let survivor = raft
+            .peers_iter()
+            .find(|peer| **peer != dead)
+            .expect("second peer exists")
+            .clone();
+        let spare = node("spare");
+
+        create_topic_in_raft(
+            &mut raft,
+            "t",
+            vec![dead.clone(), survivor.clone(), node("node-1")],
+        );
+        ack_to_last(&mut raft, &survivor);
+        raft.simulate_flush_and_apply();
+
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1"), survivor.clone(), spare.clone()],
+                end_entry_id: Some(100.into()),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        ack_to_last(&mut raft, &survivor);
+        raft.simulate_flush_and_apply();
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = HashSet::from([node("node-1"), survivor, spare]);
+        let topology = topology_reader_with(&["node-1", "spare"]);
+        assert!(raft.handle_node_death(&dead, &live, &topology));
+
+        let tail = &proposals_after_become_leader(&raft)[before..];
+        assert!(
+            tail.iter()
+                .any(|command| matches!(command, RaftCommand::RemovePeer(peer) if peer == &dead)),
+            "peer removal was not proposed: {tail:?}",
+        );
+        assert!(
+            tail.iter().any(|command| matches!(
+                command,
+                RaftCommand::Metadata(MetadataCommand::ReassignSegment(reassign))
+                    if reassign.segment_key == seg0
+            )),
+            "sealed data replica repair was skipped: {tail:?}",
+        );
     }
 
     // ── Capacity-return re-fill of under-replicated sealed segments (raft-actor.md #10) ──

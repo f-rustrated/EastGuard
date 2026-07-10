@@ -169,6 +169,18 @@ pub async fn assert_topic_visible_on_quorum(
     tick: Duration,
 ) -> turmoil::Result {
     let quorum = nodes.len() / 2 + 1;
+    assert_topic_visible_on_nodes(nodes, topic_name, quorum, max_attempts, tick).await
+}
+
+/// Retries until at least `required` queried nodes report the topic.
+pub async fn assert_topic_visible_on_nodes(
+    nodes: &[(&str, u16)],
+    topic_name: &str,
+    required: usize,
+    max_attempts: u32,
+    tick: Duration,
+) -> turmoil::Result {
+    assert!(required > 0 && required <= nodes.len());
     for attempt in 0..max_attempts {
         let mut visible_count = 0;
         for &(host, port) in nodes {
@@ -180,7 +192,7 @@ pub async fn assert_topic_visible_on_quorum(
                 visible_count += 1;
             }
         }
-        if visible_count >= quorum {
+        if visible_count >= required {
             return Ok(());
         }
         if attempt < max_attempts - 1 {
@@ -188,8 +200,8 @@ pub async fn assert_topic_visible_on_quorum(
         }
     }
     panic!(
-        "topic '{}' not visible on quorum of nodes after {} attempts",
-        topic_name, max_attempts
+        "topic '{}' visible on fewer than {} nodes after {} attempts",
+        topic_name, required, max_attempts
     );
 }
 
