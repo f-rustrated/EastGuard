@@ -216,17 +216,21 @@ impl TopicFetchManagerState {
             return;
         }
 
-        // Fetch committed offsets with a 5-second timeout, falling back to empty offsets on timeout/error.
-        let saved_offsets = tokio::time::timeout(
-            Duration::from_secs(5),
+        // Offset recovery must fail closed: an unavailable offsets topic is not
+        // evidence that this group has no committed offsets. Leave the ranges
+        // unstarted so the next rebalance tick retries recovery.
+        let Ok(Ok(saved_offsets)) = tokio::time::timeout(
+            Duration::from_secs(2),
             group
                 .client
                 .clone()
                 .fetch_all_saved_offsets(&group.group_id, &ctx.topic),
         )
         .await
-        .map(|res| res.unwrap_or_default())
-        .unwrap_or_default();
+        else {
+            tracing::warn!("failed to recover/time-out fetch_all_saved_offsets");
+            return;
+        };
 
         let metadata = ctx.metadata.load();
 
@@ -283,7 +287,13 @@ impl TopicFetchManagerState {
         self.pending_cursors.remove(cursor.range_id);
         let (stop_tx, stop_rx) = flume::bounded(8);
         let range_id = cursor.range_id;
-        let actor = RangeFetchActor::new(cursor, ctx, self.record_tx.clone());
+
+        let actor = RangeFetchActor::new(
+            cursor,
+            ctx,
+            self.record_tx.clone(),
+            self.consumer_group.is_some(),
+        );
         tokio::spawn(actor.run(stop_rx));
         self.senders.insert(range_id, stop_tx);
     }

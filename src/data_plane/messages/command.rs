@@ -185,13 +185,13 @@ pub struct CatchUpAck {
 //   coordinator ─SealBoundaryQuery──▶ each survivor  "what's your durable extent for `key`?"
 //   survivor    ─SealBoundaryReport─▶ coordinator    durable end (or `None` if it holds nothing)
 //
-// `shard_group_id` rides the query so the survivor can address the report back
-// to the coordinator (a follower's tracker doesn't carry the real group id).
+// The originating coordinator rides the query so every report returns to the
+// same gather even while shard-leader caches disagree during an election.
 // See `docs/data-plane/leader_crash_seal_boundary.md`.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct SealBoundaryQuery {
     pub segment_key: SegmentKey,
-    pub shard_group_id: ShardGroupId,
+    pub coordinator: NodeId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]

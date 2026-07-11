@@ -164,7 +164,27 @@ impl SegmentTracker {
     }
 
     pub(crate) fn commit_entry(&mut self, entry_id: EntryId) {
+        // Commit notifications can be retried across reconnect/reassignment.
+        // Once the cursor passed an entry, a stale duplicate is an idempotent
+        // no-op; advancing again would commit the following cached entry under
+        // the wrong id.
+        if entry_id < self.start_entry_id
+            || self
+                .last_committed_entry_id()
+                .is_some_and(|committed| entry_id <= committed)
+        {
+            return;
+        }
+
         let commit = self.cache.load_read_cursor();
+
+        if self
+            .cache
+            .load_published(commit)
+            .is_some_and(|entry| entry_id < entry.entry_id)
+        {
+            return;
+        }
 
         #[cfg(debug_assertions)]
         if let Some(entry) = self.cache.load_published(commit) {
@@ -404,7 +424,29 @@ pub mod tests {
             assert_eq!(t.cache_read_cursor(), i + 1);
             assert_eq!(t.committed_entry_id(), EntryId(i));
         }
+
+        t.commit_entry(EntryId(1));
+        assert_eq!(t.cache_read_cursor(), 3, "stale commit must not advance");
+        assert_eq!(t.committed_entry_id(), EntryId(2));
         t.assert_invariants();
+    }
+
+    #[test]
+    fn commit_before_successor_start_is_ignored() {
+        let mut t = SegmentTracker::new_with_start_entry_id(
+            PathBuf::new(),
+            SegmentRole::Follower,
+            vec![NodeId::new("leader"), NodeId::new("follower")],
+            ShardGroupId(1),
+            EntryId(2),
+        );
+        t.stage_entry_from_replica(test_key(), Bytes::from("entry-2").into(), 1, EntryId(2));
+        t.publish_staged(1);
+
+        t.commit_entry(EntryId(1));
+
+        assert_eq!(t.cache_read_cursor(), 0);
+        assert_eq!(t.last_committed_entry_id(), None);
     }
 
     #[test]

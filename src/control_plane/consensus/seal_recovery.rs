@@ -24,7 +24,6 @@ pub(crate) const GATHER_ATTEMPTS: u32 = 3;
 pub(crate) enum SealEndStep {
     /// (Re)send a boundary query to these survivors.
     Query {
-        shard_group_id: ShardGroupId,
         segment_key: SegmentKey,
         targets: Vec<NodeId>,
     },
@@ -150,15 +149,32 @@ impl SealEndRecovery {
                 self.gathers
                     .insert(segment_key, SealEndGather::new(group, survivors.clone()));
                 steps.push(SealEndStep::Query {
-                    shard_group_id: group,
                     segment_key,
                     targets: survivors,
                 });
                 continue;
             };
 
-            // Roll in flight — wait for it to apply and be pruned.
+            // Proposal delivery is at-least-once. A leadership change may
+            // truncate the first roll after `record` emitted it, so re-propose
+            // while metadata still exposes this segment as a candidate. Once
+            // applied, reconciliation no longer includes it and prunes us.
             if g.proposed {
+                if g.is_complete() {
+                    steps.push(g.seal(segment_key));
+                } else {
+                    // The unknown-end fallback was proposed after an incomplete
+                    // gather. It may have applied while a replica was down, but
+                    // the sealed segment remains a candidate. Start a fresh
+                    // round so a rejoined replica can close the boundary later.
+                    g.proposed = false;
+                    g.reports.clear();
+                    g.attempts_left = GATHER_ATTEMPTS;
+                    steps.push(SealEndStep::Query {
+                        segment_key,
+                        targets: g.nodes.clone(),
+                    });
+                }
                 continue;
             }
 
@@ -179,7 +195,6 @@ impl SealEndRecovery {
 
             g.attempts_left -= 1;
             steps.push(SealEndStep::Query {
-                shard_group_id: group,
                 segment_key,
                 targets: g.pending(),
             });
@@ -329,6 +344,10 @@ mod tests {
             recovery.advance(ShardGroupId(1), segments()).as_slice(),
             [SealEndStep::Seal { end: None, .. }]
         ));
+        assert!(matches!(
+            recovery.advance(ShardGroupId(1), segments()).as_slice(),
+            [SealEndStep::Query { targets, .. }] if targets == &[node("y"), node("z")]
+        ));
     }
 
     #[test]
@@ -347,6 +366,18 @@ mod tests {
         ));
         // A late/duplicate report after the roll is proposed is ignored.
         assert!(recovery.record(seg, node("y"), Some(EntryId(99))).is_none());
+
+        // Until metadata stops reporting the candidate, the proposal may have
+        // been truncated and must be emitted again.
+        assert!(matches!(
+            recovery
+                .advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])])
+                .as_slice(),
+            [SealEndStep::Seal {
+                end: Some(EntryId(40)),
+                ..
+            }]
+        ));
     }
 
     #[test]

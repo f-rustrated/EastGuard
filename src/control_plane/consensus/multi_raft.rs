@@ -563,10 +563,9 @@ impl MultiRaft {
     fn execute_seal_step(&mut self, step: SealEndStep) {
         match step {
             SealEndStep::Query {
-                shard_group_id,
                 segment_key,
                 targets,
-            } => self.emit_seal_boundary_queries(shard_group_id, segment_key, targets),
+            } => self.emit_seal_boundary_queries(segment_key, targets),
             SealEndStep::Seal {
                 shard_group_id,
                 segment_key,
@@ -578,8 +577,9 @@ impl MultiRaft {
 
     /// Propose the recovery roll: seal the crashed segment at `end` and reopen
     /// with a healthy set led by `recency_leader` (the most-complete survivor).
-    /// `end = None` reproduces the unknown-end fallback. A no-longer-active
-    /// segment (the roll already applied) is a no-op.
+    /// `end = None` reproduces the unknown-end fallback. Already-sealed
+    /// boundary-unknown segments accept the same command as an idempotent late
+    /// correction, so proposal loss during a leadership change can be retried.
     fn propose_recovered_roll(
         &mut self,
         group_id: ShardGroupId,
@@ -590,8 +590,8 @@ impl MultiRaft {
         let Some(raft) = self.groups.get_mut(&group_id) else {
             return;
         };
-        let Some(old_replica_set) = raft.get_active_replica_set(&segment_key) else {
-            return; // already rolled
+        let Some(old_replica_set) = raft.get_replica_set(&segment_key) else {
+            return;
         };
         let live_nodes = self.topology.live_nodes();
         let dead: Vec<NodeId> = old_replica_set
@@ -624,12 +624,7 @@ impl MultiRaft {
         }
     }
 
-    fn emit_seal_boundary_queries(
-        &mut self,
-        shard_group_id: ShardGroupId,
-        segment_key: SegmentKey,
-        targets: Vec<NodeId>,
-    ) {
+    fn emit_seal_boundary_queries(&mut self, segment_key: SegmentKey, targets: Vec<NodeId>) {
         if targets.is_empty() {
             return;
         }
@@ -637,7 +632,7 @@ impl MultiRaft {
             targets.to_vec(),
             SealBoundaryQuery {
                 segment_key,
-                shard_group_id,
+                coordinator: self.node_id.clone(),
             },
         );
         self.pending_events

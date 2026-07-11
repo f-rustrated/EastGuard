@@ -255,6 +255,17 @@ impl SegmentDetail {
         let idx = rand::rng().random_range(0..self.replica_set.len());
         Some(self.replica_set[idx].client_addr)
     }
+
+    /// Active tails must be read from the write leader because followers may
+    /// legitimately lag and report an empty tail. Sealed segments are immutable
+    /// and can be read from any replica.
+    pub fn pick_read_replica(&self) -> Option<SocketAddr> {
+        if self.end_entry_id.is_none() {
+            self.replica_set.first().map(|replica| replica.client_addr)
+        } else {
+            self.pick_replica()
+        }
+    }
 }
 
 /// A node identifier paired with its currently-known client address.

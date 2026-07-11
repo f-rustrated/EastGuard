@@ -483,15 +483,14 @@ impl<W: WalStorage> DataPlane<W> {
     fn handle_seal_boundary_query(&mut self, cmd: SealBoundaryQuery) {
         let durable_end = self.durable_end(&cmd.segment_key);
         self.out
-            .store_transport_cmd(DataTransportSendToCoordinator {
-                shard_group_id: cmd.shard_group_id,
-                message: SealBoundaryReport {
+            .store_transport_cmd(DataTransportCommand::send_to_targets(
+                vec![cmd.coordinator],
+                SealBoundaryReport {
                     segment_key: cmd.segment_key,
                     from: self.node_id.clone(),
                     durable_end,
-                }
-                .into(),
-            });
+                },
+            ));
     }
 
     // ── Replacement-side catch-up: receive → verify → register ────────────
@@ -3471,7 +3470,7 @@ mod tests {
     }
 
     /// A `SealBoundaryQuery` is answered with our durable extent, addressed back to
-    /// the coordinator of the query's shard group.
+    /// the coordinator that owns this gather.
     #[test]
     fn seal_boundary_query_replies_with_durable_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -3480,16 +3479,16 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SealBoundaryQuery {
                 segment_key: test_key(),
-                shard_group_id: ShardGroupId(9),
+                coordinator: NodeId::new("coordinator"),
             }
             .into(),
         ));
 
         assert_eq!(dp.out.transport_cmds.len(), 1);
-        let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("boundary report must route to the coordinator");
         };
-        assert_eq!(s.shard_group_id, ShardGroupId(9));
+        assert_eq!(s.targets.as_ref(), &[NodeId::new("coordinator")]);
         let DataPlaneInterNodeCommand::SealBoundaryReport(report) = &s.message else {
             panic!("expected a SealBoundaryReport");
         };

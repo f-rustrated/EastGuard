@@ -732,6 +732,10 @@ fn consumer_group_rebalance_survives_broker_restart_without_offset_replay() {
         sim.step().unwrap();
     }
     sim.bounce("n2");
+    let recovered_at = sim.elapsed() + Duration::from_secs(8);
+    while sim.elapsed() < recovered_at {
+        sim.step().unwrap();
+    }
     phase.store(3, Ordering::SeqCst);
     sim.run().unwrap();
 }
