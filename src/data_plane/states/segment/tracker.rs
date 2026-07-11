@@ -155,6 +155,14 @@ impl SegmentTracker {
             .map(|s| (s.data.clone(), s.record_count))
     }
 
+    // carrying over uncommitted data!
+    pub(crate) fn replayable_bytes(&self) -> usize {
+        self.uncommitted_entries()
+            .chain(self.staged_for_replay())
+            .map(|(data, _)| data.len())
+            .sum()
+    }
+
     pub(crate) fn checkpoint(&self, key: SegmentKey) -> CheckpointJob {
         CheckpointJob {
             segment_key: key,

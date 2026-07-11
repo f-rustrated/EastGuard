@@ -210,6 +210,21 @@ impl RangeDetail {
             self.active_segment.as_ref().map(|seg| seg.start_entry_id)
         }
     }
+
+    /// End-exclusive bound for a full-range scan. The active tracker alone can
+    /// be empty immediately after a roll while sealed segments still contain
+    /// records, so both sources contribute to the high-water mark.
+    pub(crate) fn scan_end_exclusive(&self, active_next: EntryId) -> Option<EntryId> {
+        let first = self.first_segment_start_offset()?;
+        let sealed_next = self
+            .sealed_segments
+            .last()
+            .and_then(|segment| segment.end_entry_id)
+            .map(|end| end.saturating_add(1))
+            .unwrap_or(EntryId::MIN);
+        let end = active_next.max(sealed_next);
+        (end > first).then_some(end)
+    }
 }
 
 /// Per-segment metadata exposed to consumers. The replica set carries resolved
@@ -274,4 +289,37 @@ impl SegmentDetail {
 pub struct NodeAddressInfo {
     pub node_id: String,
     pub client_addr: SocketAddr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_scan_includes_sealed_tail_when_active_is_empty() {
+        let range = RangeDetail {
+            range_id: RangeId(0),
+            keyspace_start: vec![],
+            keyspace_end: vec![u8::MAX],
+            state: RangeState::Active,
+            active_segment: Some(SegmentDetail {
+                segment_id: SegmentId(1),
+                start_entry_id: EntryId(1),
+                end_entry_id: None,
+                replica_set: vec![],
+            }),
+            sealed_segments: vec![SegmentDetail {
+                segment_id: SegmentId(0),
+                start_entry_id: EntryId(0),
+                end_entry_id: Some(EntryId(0)),
+                replica_set: vec![],
+            }]
+            .into_boxed_slice(),
+            split_into: None,
+            merged_into: None,
+            merged_from: None,
+        };
+
+        assert_eq!(range.scan_end_exclusive(EntryId(1)), Some(EntryId(1)));
+    }
 }

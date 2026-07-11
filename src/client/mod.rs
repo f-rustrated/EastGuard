@@ -170,11 +170,12 @@ impl Client {
         let detail = self.resolve_topic(SYSTEM_TOPIC_OFFSETS).await?;
         let mut unread_tails = HashMap::new();
         for range in &detail.ranges {
-            let (start_entry_id, next_entry_id) = self
+            let (_, active_next_entry_id) = self
                 .fetch_range_entry_ids(SYSTEM_TOPIC_OFFSETS, range.range_id)
                 .await?;
-            if next_entry_id > start_entry_id {
-                unread_tails.insert(range.range_id, next_entry_id);
+            // The important difference is how emptiness is determined:
+            if let Some(scan_end) = range.scan_end_exclusive(active_next_entry_id) {
+                unread_tails.insert(range.range_id, scan_end);
             }
         }
 
