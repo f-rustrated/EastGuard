@@ -543,11 +543,17 @@ impl MultiRaft {
     /// Feed a survivor's durable extent into the subsystem; if it completes a
     /// gather, execute the resulting seal.
     fn handle_seal_boundary_report(&mut self, report: SealBoundaryReport) {
-        if let Some(step) =
-            self.seal_recovery
-                .record(report.segment_key, report.from, report.durable_end)
+        match self
+            .seal_recovery
+            .record(report.segment_key, report.from, report.durable_end)
         {
-            self.execute_seal_step(step);
+            Ok(Some(step)) => self.execute_seal_step(step),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                segment = ?report.segment_key,
+                ?error,
+                "rejected seal-boundary report",
+            ),
         }
     }
 

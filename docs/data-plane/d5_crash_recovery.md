@@ -22,7 +22,8 @@ can be copied back from a healthy replica.
 already saw the old identity die, the cluster sealed every active segment it
 touched, and moved on. The restarted node resumes no leadership, no followership,
 and no active segment. It joins fresh, with a disk full of data from its previous
-life. (`Dead` is terminal in SWIM — a restart is never the old identity revived.)
+life. (While EastGuard's SWIM allows a running but partitioned node to refute its own
+`Dead` state, a restarted node gets a new `NodeId` and thus never revives its old identity.)
 
 Together these give recovery one job:
 

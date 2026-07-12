@@ -122,7 +122,57 @@ need removal.
 Snapshotting and compaction should be a 1.0 gate, or the release must carry
 explicit workload and lifetime limits.
 
+### High — resurrected nodes retain stale active-segment ownership
+
+SWIM now permits a still-running node to refute a `Dead` observation at a
+higher incarnation after a partition heals. The cluster may already have rolled
+every active segment that named that node and committed successor replica sets,
+but the resurrected process does not run crash recovery and may retain its old
+in-memory active-segment assignments.
+
+The restarted-node path does not close this gap: restart creates a fresh node
+identity, discards active ownership, and treats recovered files as passive sealed
+inventory. A live resurrection keeps the old identity and memory. It may therefore
+continue accepting requests against a segment the metadata authority has sealed,
+without receiving either the committed roll or an explicit revocation. Requiring
+all data replicas to acknowledge prevents those stale writes from committing in
+the usual partition case, but that is not an ownership fence and does not reclaim
+the stale state.
+
+Add an authoritative reconciliation path when a node resurrects:
+
+- Fence writes until its active assignments have been checked against committed
+  metadata.
+- Revoke and locally seal assignments that no longer name the node.
+- Preserve only data that can safely participate in sealed-segment catch-up;
+  discard or quarantine private uncommitted tails.
+- Make the reconciliation idempotent across repeated Alive gossip and another
+  partition during recovery.
+
+Cover this with a deterministic partition/heal test in which the old segment
+leader is declared dead, a successor segment commits, and the same process later
+refutes Dead. The test must prove that the old segment cannot accept a successful
+write after resurrection and that the successor remains the sole active segment.
+
 ## Important pre-1.0 gaps
+
+### Stale local Raft replicas are not retired after ring displacement
+
+A peer removed by a committed Raft membership change is no longer a replication
+target, so a partitioned copy cannot rely on receiving and applying the log entry
+that evicted it. Applying peer removal also does not invoke group destruction;
+that lifecycle is a separate explicit operation. After the partition heals, ring
+reconciliation can stage the node as a learner for groups it should host again,
+but groups it no longer owns can remain locally instantiated with obsolete logs
+and timers.
+
+Add local group-lifecycle reconciliation against the stable ring view. A group
+that no longer belongs on the node should stop elections and traffic promptly,
+then delete its persisted state only after a stability window protects against
+ring flapping. A group assigned back to the node should reuse its durable prefix
+only through learner catch-up, with the current leader remaining authoritative.
+Exercise both outcomes under partition/heal simulation: re-admission to the same
+group and permanent displacement from it.
 
 ### Offset restoration is expensive and can return a partial snapshot
 
@@ -137,15 +187,15 @@ O(total offset history) per rebalance.
 Offsets need compacted-key semantics, a direct lookup API, or an authoritative
 indexed state store.
 
-### Unknown-end sealed segments cannot be fully repaired
+### Unknown-end sealed-segment recovery [Resolved]
 
-When seal-boundary recovery exhausts its attempts, it falls back to an unknown
-end. Reconciliation explicitly skips sealed segments with unknown ends, as
-reflected by existing tests and the recovery path. Such segments can remain
-permanently under-replicated.
+Unknown-end segments remain durable recovery candidates after the initial gather
+budget expires. Periodic reconciliation and coordinator takeover restart boundary
+discovery; a later complete gather corrects the boundary exactly once and ordinary
+sealed-segment repair resumes.
 
-Define an operator-visible recovery state and a later retry/manual repair
-pathway rather than accepting permanent unknown-end metadata silently.
+Recovery remains automatic; there is no separate operator retry path to maintain.
+Unexpected and conflicting reports are rejected without changing gather progress.
 
 ### No stable wire or storage-format compatibility policy
 
@@ -203,6 +253,8 @@ Before 1.0, add deterministic coverage for:
 - Conflicting consumer-group membership views.
 - System-topic replica loss.
 - Network partitions during Raft membership transitions and segment rolls.
+- Same-identity SWIM resurrection after Raft-peer eviction and active-segment
+  replacement.
 - Rolling upgrades with mixed protocol/storage versions.
 - Long-running metadata growth and snapshot restore.
 
