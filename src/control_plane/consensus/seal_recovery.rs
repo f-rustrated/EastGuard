@@ -16,6 +16,17 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SealBoundaryReportError {
+    UnknownRecovery,
+    UnexpectedReporter(NodeId),
+    ConflictingReport {
+        reporter: NodeId,
+        previous: Option<EntryId>,
+        incoming: Option<EntryId>,
+    },
+}
+
 /// How many drive passes a gather waits for every survivor to report before
 /// giving up and sealing with an unknown end.
 pub(crate) const GATHER_ATTEMPTS: u32 = 3;
@@ -68,8 +79,34 @@ impl SealEndGather {
         self.nodes.contains(node)
     }
 
-    fn record(&mut self, from: NodeId, durable_end: Option<EntryId>) {
+    fn record(
+        &mut self,
+        segment_key: SegmentKey,
+        from: NodeId,
+        durable_end: Option<EntryId>,
+    ) -> Result<Option<SealEndStep>, SealBoundaryReportError> {
+        if self.proposed {
+            return Ok(None);
+        }
+        if !self.awaits(&from) {
+            return Err(SealBoundaryReportError::UnexpectedReporter(from));
+        }
+        if let Some(previous) = self.reports.get(&from) {
+            if *previous != durable_end {
+                return Err(SealBoundaryReportError::ConflictingReport {
+                    reporter: from,
+                    previous: *previous,
+                    incoming: durable_end,
+                });
+            }
+            return Ok(None);
+        }
         self.reports.insert(from, durable_end);
+        if !self.is_complete() {
+            return Ok(None);
+        }
+        self.proposed = true;
+        Ok(Some(self.seal(segment_key)))
     }
 
     fn is_complete(&self) -> bool {
@@ -210,17 +247,11 @@ impl SealEndRecovery {
         segment_key: SegmentKey,
         from: NodeId,
         durable_end: Option<EntryId>,
-    ) -> Option<SealEndStep> {
-        let g = self.gathers.get_mut(&segment_key)?;
-        if g.proposed || !g.awaits(&from) {
-            return None;
-        }
-        g.record(from, durable_end);
-        if !g.is_complete() {
-            return None;
-        }
-        g.proposed = true;
-        Some(g.seal(segment_key))
+    ) -> Result<Option<SealEndStep>, SealBoundaryReportError> {
+        self.gathers
+            .get_mut(&segment_key)
+            .ok_or(SealBoundaryReportError::UnknownRecovery)?
+            .record(segment_key, from, durable_end)
     }
 
     /// Drop `group`'s gathers whose segment is no longer leaderless.
@@ -280,8 +311,9 @@ mod tests {
     fn gather_with(reports: &[(&str, Option<u64>)]) -> SealEndGather {
         let nodes = reports.iter().map(|(n, _)| node(n)).collect();
         let mut g = SealEndGather::new(ShardGroupId(0), nodes);
+        let key = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
         for (n, end) in reports {
-            g.record(node(n), end.map(EntryId));
+            let _ = g.record(key, node(n), end.map(EntryId)).unwrap();
         }
         g
     }
@@ -356,16 +388,23 @@ mod tests {
         let mut recovery = SealEndRecovery::default();
         recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])]);
 
-        assert!(recovery.record(seg, node("y"), Some(EntryId(50))).is_none()); // partial
+        assert!(matches!(
+            recovery.record(seg, node("y"), Some(EntryId(50))),
+            Ok(None)
+        )); // partial
         let step = recovery
             .record(seg, node("z"), Some(EntryId(40)))
+            .expect("valid report")
             .expect("completes");
         assert!(matches!(
             step,
             SealEndStep::Seal { end: Some(EntryId(40)), leader: Some(l), .. } if l == node("y")
         ));
         // A late/duplicate report after the roll is proposed is ignored.
-        assert!(recovery.record(seg, node("y"), Some(EntryId(99))).is_none());
+        assert!(matches!(
+            recovery.record(seg, node("y"), Some(EntryId(99))),
+            Ok(None)
+        ));
 
         // Until metadata stops reporting the candidate, the proposal may have
         // been truncated and must be emitted again.
@@ -378,6 +417,31 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn conflicting_and_unexpected_reports_are_rejected() {
+        let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        let mut recovery = SealEndRecovery::default();
+        recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])]);
+
+        assert!(matches!(
+            recovery.record(seg, node("x"), Some(EntryId(10))),
+            Err(SealBoundaryReportError::UnexpectedReporter(reporter)) if reporter == node("x")
+        ));
+        assert!(matches!(
+            recovery.record(seg, node("y"), Some(EntryId(50))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            recovery.record(seg, node("y"), Some(EntryId(49))),
+            Err(SealBoundaryReportError::ConflictingReport {
+                reporter,
+                previous: Some(EntryId(50)),
+                incoming: Some(EntryId(49)),
+            }) if reporter == node("y")
+        ));
+        assert_eq!(recovery.gathers[&seg].reports.len(), 1);
     }
 
     #[test]

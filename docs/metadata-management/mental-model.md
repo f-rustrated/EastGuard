@@ -56,7 +56,7 @@ SWIM (Scalable Weakly-consistent Infection-style Membership) addresses the scali
 
 **Failure detection via probes.** Each protocol period, every node picks a random target and pings it. If the target does not reply, the prober asks K other nodes to ping the target on its behalf — *indirect probing*. This separates "the link to me is bad" from "the node is dead": the indirect probes reach the target via different network paths. Only if all indirect probes also fail is the target moved from Alive to Suspect.
 
-**The node state machine: Alive → Suspect → Dead.** Suspect is a probation state — the suspected node gets a chance to refute the suspicion. If it does not refute within a timeout, it moves to Dead.
+**The node state machine: Alive → Suspect → Dead.** Suspect is a probation state — the suspected node gets a chance to refute the suspicion. If it does not refute within a timeout, it moves to Dead. (In EastGuard, a running node can also transition from `Dead` back to `Alive` at a higher incarnation number to heal network partitions.)
 
 **Dissemination via gossip, not broadcast.** Once a node confirms a death, it does not broadcast — it piggybacks the fact on its ongoing probe traffic. "By the way, C is dead" rides as a small footer on the regular ping packet that was going to be sent anyway. The information spreads infection-style through the cluster.
 
@@ -184,9 +184,9 @@ For operational invariants, see `.claude/rules/storage-layout.md`.
 
 ## Eventual consistency is delayed truth, not fake truth
 
-A common misread of "eventually consistent" is "approximate" or "best-effort". SWIM is neither. With incarnation numbers and the suspect-then-confirm machinery, SWIM's view is **monotonic and eventually correct** — a node marked dead really is dead; it just took some gossip rounds for everyone to find out.
+A common misread of "eventually consistent" is "approximate" or "best-effort". SWIM is neither. With incarnation numbers and the suspect-then-confirm machinery, SWIM's view is **eventually correct**. While a node marked dead is treated as dead for ongoing operations, EastGuard allows **partition healing**: a running node that receives gossip claiming it is dead refutes the claim by incrementing its incarnation number, resurrecting itself back to Alive.
 
-So when SWIM says "X is dead", that is a real fact about the world. The only question is when each node learns it.
+Therefore, a node confirmed dead really is dead in the absence of a healed partition. When a partition heals, the resurrected node's higher incarnation overrides the terminal Dead state and the cluster adapts.
 
 This matters because it justifies trusting SWIM's *current snapshot* as a basis for action. We are not acting on a guess; we are acting on a truth that arrived with delay.
 
