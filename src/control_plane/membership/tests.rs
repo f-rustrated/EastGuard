@@ -187,6 +187,8 @@ async fn setup_with_config(port: u32, join_config: JoinConfig) -> TestHarness {
     }
 }
 
+// Simulates receiving a direct SwimPacket::Ping request from a remote peer.
+// Verifies that the SWIM actor immediately replies with a SwimPacket::Ack carrying the same sequence number as the received Ping.
 #[tokio::test]
 async fn test_ping_response() {
     let mut harness = setup_single().await;
@@ -194,8 +196,9 @@ async fn test_ping_response() {
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
     // 1. Simulate receiving a Ping from a remote node
-    let ping = SwimPacket::Ping(SwimHeader {
-        seq: 100,
+    let test_seq = 12345;
+    let swim_header = SwimHeader {
+        seq: test_seq,
         source_node_id: NodeId::new("node-remote"),
         source_addr: NodeAddress::test(
             "127.0.0.1:0".parse().unwrap(),
@@ -204,7 +207,8 @@ async fn test_ping_response() {
         source_incarnation: 0,
         gossip: vec![],
         shard_leaders: vec![],
-    });
+    };
+    let ping = SwimPacket::Ping(swim_header.clone());
 
     harness
         .tx_in
@@ -223,13 +227,22 @@ async fn test_ping_response() {
 
     assert_eq!(response.target, remote_addr);
     match response.packet() {
-        SwimPacket::Ack(SwimHeader { seq, .. }) => assert_eq!(*seq, 100),
+        SwimPacket::Ack(header) => {
+            assert_eq!(header.seq, test_seq);
+            assert_eq!(header.source_node_id, NodeId::new("node-local-8000"));
+            let gossip_ids: std::collections::HashSet<_> =
+                header.gossip.iter().map(|n| &n.node_id).collect();
+            assert!(gossip_ids.contains(&NodeId::new("node-remote")));
+            assert!(gossip_ids.contains(&NodeId::new("node-local-8000")));
+        }
         _ => panic!("Expected Ack packet"),
     }
 }
 
+// Simulates receiving a SwimPacket::Ping carrying a Suspect gossip entry for the local node.
+// Verifies that the local node refutes the suspicion by incrementing its incarnation and broadcasting its Alive status.
 #[tokio::test]
-async fn test_refutation_mechanism() {
+async fn test_refute_self_suspecting_ping() {
     let mut harness = setup_single().await;
     let mut rx_out = PacketReceiver::new(harness.rx_out.take().unwrap());
     let remote_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
@@ -243,8 +256,9 @@ async fn test_refutation_mechanism() {
         incarnation: 0,
     };
 
+    let test_seq = 200;
     let ping = SwimPacket::Ping(SwimHeader {
-        seq: 200,
+        seq: test_seq,
         source_node_id: NodeId::new("node-remote"),
         source_addr: NodeAddress::test(
             "127.0.0.1:0".parse().unwrap(),
@@ -269,11 +283,10 @@ async fn test_refutation_mechanism() {
     let response = rx_out.recv().await.unwrap();
 
     match response.packet() {
-        SwimPacket::Ack(SwimHeader {
-            source_incarnation, ..
-        }) => {
+        SwimPacket::Ack(header) => {
+            assert_eq!(header.seq, test_seq);
             assert_eq!(
-                *source_incarnation, 1,
+                header.source_incarnation, 1,
                 "Actor did not increment incarnation to refute suspicion!"
             );
         }
@@ -281,6 +294,8 @@ async fn test_refutation_mechanism() {
     }
 }
 
+// Feeds a Dead gossip update for a remote node to the local SWIM actor.
+// Verifies that the state change is successfully merged into the local member list and propagated in outbound Ping packets to other nodes.
 #[tokio::test]
 async fn test_gossip_propagation() {
     let mut harness = setup_single().await;
@@ -297,12 +312,13 @@ async fn test_gossip_propagation() {
         incarnation: 5,
     };
 
+    let test_seq = 300;
     harness
         .tx_in
         .send(SwimActorCommand::Command(SwimCommand::InboundRaftRpc {
             src: sender_addr,
             packet: SwimPacket::Ping(SwimHeader {
-                seq: 300,
+                seq: test_seq,
                 source_node_id: NodeId::new("node-sender"),
                 source_addr: NodeAddress::test(
                     "127.0.0.1:0".parse().unwrap(),
@@ -315,10 +331,19 @@ async fn test_gossip_propagation() {
         }))
         .await
         .unwrap();
+    // 2. The actor should immediately reply with an Ack for the first ping
+    let initial_ack = rx_out.recv().await.unwrap();
+    match initial_ack.packet() {
+        SwimPacket::Ack(header) => {
+            assert_eq!(header.seq, test_seq);
+        }
+        _ => panic!("Expected Ack for initial Ping"),
+    }
 
-    // 2. Retry Loop: Probe until we hear the rumor or timeout
+    // 3. Retry Loop: Probe until we hear the rumor or timeout
     // We give the actor 5 attempts (or 500ms) to propagate the info.
     let mut propagated = false;
+    let probe_seq_base = 400;
 
     for i in 0..5 {
         // Send a fresh probe
@@ -327,7 +352,7 @@ async fn test_gossip_propagation() {
             .send(SwimActorCommand::Command(SwimCommand::InboundRaftRpc {
                 src: probe_addr,
                 packet: SwimPacket::Ping(SwimHeader {
-                    seq: 400 + i, // Increment seq to keep packets distinct
+                    seq: probe_seq_base + i as u64, // Increment seq to keep packets distinct
                     source_node_id: NodeId::new("node-probe"),
                     source_addr: NodeAddress::test(
                         "127.0.0.1:0".parse().unwrap(),
@@ -343,10 +368,15 @@ async fn test_gossip_propagation() {
 
         // Wait for response
         if let Some(response) = rx_out.recv().await
-            && let SwimPacket::Ack(SwimHeader { gossip, .. }) = response.packet()
+            && let SwimPacket::Ack(header) = response.packet()
         {
+            assert_eq!(header.seq, probe_seq_base + i as u64);
             // Check if our rumor is in this specific Ack
-            if let Some(rumor) = gossip.iter().find(|m| m.addr.cluster_addr() == dead_node) {
+            if let Some(rumor) = header
+                .gossip
+                .iter()
+                .find(|m| m.addr.cluster_addr() == dead_node)
+            {
                 assert_eq!(rumor.state, SwimNodeState::Dead);
                 propagated = true;
                 break; // Success!
@@ -393,6 +423,8 @@ async fn wait_for_ping(harness: &TestHarness, rx_out: &mut PacketReceiver) -> So
     target_addr.expect("Actor should send a Ping within 3 protocol periods")
 }
 
+// Sets up a scenario where a direct Ping probe fails to receive an Ack in time.
+// Verifies that the local node schedules and sends PingReq requests to other active peers to query the target node indirectly.
 #[tokio::test]
 async fn test_indirect_ping_trigger() {
     let mut harness = setup_single().await;
@@ -400,12 +432,13 @@ async fn test_indirect_ping_trigger() {
     let peer_1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let peer_2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
+    let test_seq = 1;
     harness
         .tx_in
         .send(SwimActorCommand::Command(SwimCommand::InboundRaftRpc {
             src: peer_1,
             packet: SwimPacket::Ping(SwimHeader {
-                seq: 1,
+                seq: test_seq,
                 source_node_id: NodeId::new("node-peer-1"),
                 source_addr: NodeAddress::test(
                     "127.0.0.1:0".parse().unwrap(),
@@ -421,7 +454,11 @@ async fn test_indirect_ping_trigger() {
         }))
         .await
         .unwrap();
-    let _ack = rx_out.recv().await.unwrap();
+    let ack = rx_out.recv().await.unwrap();
+    match ack.packet() {
+        SwimPacket::Ack(header) => assert_eq!(header.seq, test_seq),
+        _ => panic!("Expected Ack"),
+    }
 
     let target_addr = wait_for_ping(&harness, &mut rx_out).await;
     force_ticks(&harness.ticker_tx, DIRECT_ACK_TIMEOUT_TICKS as usize).await;
@@ -443,6 +480,8 @@ async fn test_indirect_ping_trigger() {
     }
 }
 
+// Bootstraps a single SwimActor instance.
+// Verifies that on startup, the actor correctly registers its local physical address and virtual node tokens into the consistent hashing topology.
 #[tokio::test]
 async fn test_self_registers_in_topology_on_startup() {
     let harness = setup_single().await;
@@ -455,6 +494,8 @@ async fn test_self_registers_in_topology_on_startup() {
     );
 }
 
+// Simulates receiving Alive gossip for a new node.
+// Verifies that the node is discovered and its virtual node slots are populated into the consistent hashing ring topology.
 #[tokio::test]
 async fn test_alive_gossip_adds_node_to_topology() {
     let harness = setup_single().await;
@@ -491,6 +532,8 @@ async fn test_alive_gossip_adds_node_to_topology() {
     );
 }
 
+// First adds a node to the cluster via Alive gossip, then sends Dead gossip for it.
+// Verifies that the node and its virtual node slots are completely purged from the consistent hashing ring topology.
 #[tokio::test]
 async fn test_dead_gossip_removes_node_from_topology() {
     let harness = setup_single().await;
@@ -562,6 +605,8 @@ async fn test_dead_gossip_removes_node_from_topology() {
     );
 }
 
+// Configures three SWIM actors with mutual join seed configurations.
+// Simulates network ticks and verifies that all three nodes successfully discover each other and converge on a stable cluster topology.
 #[tokio::test]
 async fn cluster_formation_using_join() {
     let join_config = JoinConfig {

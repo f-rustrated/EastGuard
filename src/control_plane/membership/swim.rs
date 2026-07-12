@@ -974,6 +974,9 @@ mod tests {
         };
         use std::net::SocketAddr;
 
+        // Processes an incoming direct Ping packet from a node that is currently not tracked in our member list.
+        // Verifies that the sender is dynamically added as an Alive cluster member, and that a corresponding
+        // direct Ack packet is immediately sent back to the sender's socket address carrying the matching sequence number.
         #[test]
         fn ping_from_unknown_node() {
             let mut p = make_protocol("node-local", 8000);
@@ -997,6 +1000,9 @@ mod tests {
             ));
         }
 
+        // Processes a Ping request from a node that is already tracked in our member list as Alive.
+        // Verifies that its state and incarnation are preserved unchanged(no-op), and that a matching Ack response
+        // is returned to acknowledge the probe without modifying its metadata.
         #[test]
         fn ping_from_known_alive_node() {
             let mut p = make_protocol("node-local", 8000);
@@ -1025,6 +1031,9 @@ mod tests {
             ));
         }
 
+        // Processes an incoming Ping request carrying a list of membership gossip records.
+        // Verifies that the gossip entries are merged and applied to the local member list before the Ack response
+        // is constructed, so that the Ack's own gossip payload correctly reflects the newly integrated state.
         #[test]
         fn ping_with_gossip_applied_before_ack() {
             let mut p = make_protocol("node-local", 8000);

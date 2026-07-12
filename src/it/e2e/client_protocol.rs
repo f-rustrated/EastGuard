@@ -1011,14 +1011,14 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                     acked = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert!(acked, "produce {i} not acked");
         }
 
         let mut sealed = None;
-        for _ in 0..80 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
             if let Some(detail) = describe_topic(TOPIC, &NODES).await
                 && let Some(seg) = detail
                     .ranges
@@ -1072,8 +1072,8 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
         // A new metadata leader (≠ the crashed one) must emerge — the repair below can
         // only be driven by it. Any one survivor's view suffices (non-members reply None).
         let mut took_over = false;
-        'lead: for _ in 0..150 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        'lead: for _ in 0..50 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
             for &(h, p) in &live {
                 if let Ok(Some(new_leader)) = query_shard_leader(h, p, shard_group_id).await
                     && new_leader != leader_id
@@ -1091,8 +1091,8 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
         // The new leader's takeover backstop reassigns the dead coordinator's sealed
         // segment to the spare, which catches up and serves rec-0 by id.
         let mut served = false;
-        for _ in 0..120 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
             let fetch =
                 ClientRequest::DataPlane(ClientDataPlaneRequest::FetchById(FetchByIdRequest {
                     topic_id,

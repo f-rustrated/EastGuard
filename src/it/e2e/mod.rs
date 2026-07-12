@@ -40,3 +40,17 @@ pub(super) fn host_cluster(
         });
     }
 }
+
+/// (name, client_port, raft/cluster_port) for the standard 3-node cluster.
+pub static NODES: [NodeSpec; 3] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+];
+
+pub static NODES_4: [NodeSpec; 4] = [
+    ("node-1", 8081, 18001),
+    ("node-2", 8082, 18002),
+    ("node-3", 8083, 18003),
+    ("node-4", 8084, 18004),
+];

@@ -13,6 +13,8 @@ use crate::connections::protocol::RangeDetail;
 use crate::connections::protocol::RangeTransition;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::{RangeId, RangeState};
+
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use std::collections::HashSet;
 

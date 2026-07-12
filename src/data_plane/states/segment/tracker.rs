@@ -295,6 +295,10 @@ impl SegmentTracker {
     pub(crate) fn size_limit_reached(&self, limit: u64) -> bool {
         self.size_bytes >= limit
     }
+
+    pub fn cache(&self) -> Arc<SegmentRingBuffer> {
+        self.cache.clone()
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -343,11 +347,11 @@ pub mod tests {
             }
         }
     }
-
     impl SegmentTracker {
-        pub fn cache(&self) -> Arc<SegmentRingBuffer> {
-            self.cache.clone()
+        pub fn staged_entries(&self) -> &[StagedEntry] {
+            &self.staged_entries
         }
+
         pub fn next_entry_id(&self) -> EntryId {
             self.next_entry_id
         }
@@ -355,14 +359,13 @@ pub mod tests {
         pub fn cache_write_cursor(&self) -> u64 {
             self.cache.load_write_cursor()
         }
+
         pub fn cache_read_cursor(&self) -> u64 {
             self.cache.load_read_cursor()
         }
+
         pub fn size_bytes(&self) -> u64 {
             self.size_bytes
-        }
-        pub fn staged_entries(&self) -> &[StagedEntry] {
-            &self.staged_entries
         }
     }
 

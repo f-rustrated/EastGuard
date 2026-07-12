@@ -17,6 +17,7 @@ use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
+#[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;

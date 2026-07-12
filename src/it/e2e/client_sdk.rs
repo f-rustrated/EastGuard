@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use turmoil::Builder;
 
-use super::{NodeSpec, host_cluster};
+use super::host_cluster;
 use crate::client::{
     BufferConfig, Client, ClientError, CompressionCodec, Consumer, ConsumerConfig, KeyInterest,
     PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy, StoragePolicy,
@@ -20,20 +20,7 @@ use crate::client::{
 use crate::config::Environment;
 use crate::connections::protocol::ClientResponse;
 use crate::control_plane::metadata::{EntryId, RangeId};
-
-/// (name, client_port, raft/cluster_port) for the standard 3-node cluster.
-static NODES: [NodeSpec; 3] = [
-    ("node-1", 8081, 18001),
-    ("node-2", 8082, 18002),
-    ("node-3", 8083, 18003),
-];
-
-static NODES_4: [NodeSpec; 4] = [
-    ("node-1", 8081, 18001),
-    ("node-2", 8082, 18002),
-    ("node-3", 8083, 18003),
-    ("node-4", 8084, 18004),
-];
+use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
 /// count keep the run deterministic and fast (no node is restarted in these tests).
