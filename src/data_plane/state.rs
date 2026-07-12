@@ -24,6 +24,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
+use crate::data_plane::EntryPayload;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
 use crate::data_plane::states::segment_store::SegmentReadState;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
@@ -483,15 +484,14 @@ impl<W: WalStorage> DataPlane<W> {
     fn handle_seal_boundary_query(&mut self, cmd: SealBoundaryQuery) {
         let durable_end = self.durable_end(&cmd.segment_key);
         self.out
-            .store_transport_cmd(DataTransportSendToCoordinator {
-                shard_group_id: cmd.shard_group_id,
-                message: SealBoundaryReport {
+            .store_transport_cmd(DataTransportCommand::send_to_targets(
+                vec![cmd.coordinator],
+                SealBoundaryReport {
                     segment_key: cmd.segment_key,
                     from: self.node_id.clone(),
                     durable_end,
-                }
-                .into(),
-            });
+                },
+            ));
     }
 
     // ── Replacement-side catch-up: receive → verify → register ────────────
@@ -946,27 +946,21 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         };
 
-        let new_segment_key = cmd.old_segment_key.with_segment_id(cmd.new_segment_id);
         let shard_group_id = old_tracker.shard_group_id();
         let new_start_entry_id = old_tracker.successor_start_entry_id();
 
-        // Collect the tail to carry into the successor (owned) so the `old_tracker`
-        // borrow ends before we mutate the successor. Re-staged records reach cache
-        // via the normal flush path and are re-WAL'd with new headers; on recovery,
-        // metadata's seal boundary clips any duplicate. `uncommitted` (published)
-        // records were cleared from `buffer_byte_count` at flush, so re-staging
-        // re-adds their bytes; `staged` records are still counted, so they don't.
-        let uncommitted: Vec<_> = old_tracker.uncommitted_entries().collect();
-        let staged: Vec<_> = old_tracker.staged_for_replay().collect();
-        let followers = old_tracker.followers().to_vec();
-        let replayed_bytes: usize = uncommitted.iter().map(|(data, _)| data.len()).sum();
-
+        let replayed_bytes = old_tracker.replayable_bytes();
         let committed_entry_id = old_tracker.last_committed_entry_id();
 
-        if !followers.is_empty() {
+        let uncommitted_entry = old_tracker
+            .uncommitted_entries()
+            .chain(old_tracker.staged_for_replay())
+            .collect::<Box<[(EntryPayload, u32)]>>();
+
+        if !old_tracker.followers().is_empty() {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
-                    followers,
+                    old_tracker.followers().to_vec(),
                     SegmentSealed {
                         segment_key: cmd.old_segment_key,
                         committed_entry_id,
@@ -974,8 +968,10 @@ impl<W: WalStorage> DataPlane<W> {
                 ));
         }
 
-        self.replication
-            .segment_handoff(cmd.old_segment_key, new_segment_key);
+        self.replication.segment_handoff(
+            cmd.old_segment_key,
+            cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
+        );
         self.retire_old_segment(cmd.old_segment_key);
 
         // The successor may already exist: on a roll the coordinator co-dispatches a
@@ -984,23 +980,41 @@ impl<W: WalStorage> DataPlane<W> {
         // the existing tracker rather than a fresh one that `insert_active` would
         // silently refuse — which would drop the records (data loss) and strand the
         // counter.
-        if self.segments.get(&new_segment_key).is_none() {
+        if self
+            .segments
+            .get(&cmd.old_segment_key.with_segment_id(cmd.new_segment_id))
+            .is_none()
+        {
             let new_tracker = SegmentTracker::new_with_start_entry_id(
-                new_segment_key.file_path(&self.config.data_dir, new_start_entry_id),
+                cmd.old_segment_key
+                    .with_segment_id(cmd.new_segment_id)
+                    .file_path(&self.config.data_dir, new_start_entry_id),
                 SegmentRole::Leader,
                 cmd.new_replica_set,
                 shard_group_id,
                 new_start_entry_id,
             );
-            self.segments.insert_active(new_segment_key, new_tracker);
+            self.segments.insert_active(
+                cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
+                new_tracker,
+            );
         }
-        if let Some(successor) = self.segments.get_mut(&new_segment_key) {
-            for (data, record_count) in uncommitted.into_iter().chain(staged) {
-                successor.stage_entry(new_segment_key, data, record_count);
+
+        if let Some(successor) = self
+            .segments
+            .get_mut(&cmd.old_segment_key.with_segment_id(cmd.new_segment_id))
+        {
+            for (data, record_count) in uncommitted_entry {
+                successor.stage_entry(
+                    cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
+                    data,
+                    record_count,
+                );
             }
         }
         self.buffer_byte_count += replayed_bytes;
-        self.dirty_segments.insert(new_segment_key);
+        self.dirty_segments
+            .insert(cmd.old_segment_key.with_segment_id(cmd.new_segment_id));
         self.needs_flush = true;
     }
 
@@ -1089,6 +1103,13 @@ impl<W: WalStorage> DataPlane<W> {
     // records so cold reads can still serve them.
     fn retire_old_segment(&mut self, segment_key: SegmentKey) {
         if let Some(tracker) = self.segments.take_active_and_seal(segment_key) {
+            if tracker.role() == SegmentRole::Leader {
+                let staged_bytes: usize = tracker
+                    .staged_for_replay()
+                    .map(|(data, _)| data.len())
+                    .sum();
+                self.buffer_byte_count -= staged_bytes;
+            }
             self.out.store_checkpoint(tracker.checkpoint(segment_key));
         }
     }
@@ -3471,7 +3492,7 @@ mod tests {
     }
 
     /// A `SealBoundaryQuery` is answered with our durable extent, addressed back to
-    /// the coordinator of the query's shard group.
+    /// the coordinator that owns this gather.
     #[test]
     fn seal_boundary_query_replies_with_durable_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -3480,16 +3501,16 @@ mod tests {
         dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
             SealBoundaryQuery {
                 segment_key: test_key(),
-                shard_group_id: ShardGroupId(9),
+                coordinator: NodeId::new("coordinator"),
             }
             .into(),
         ));
 
         assert_eq!(dp.out.transport_cmds.len(), 1);
-        let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
+        let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("boundary report must route to the coordinator");
         };
-        assert_eq!(s.shard_group_id, ShardGroupId(9));
+        assert_eq!(s.targets.as_ref(), &[NodeId::new("coordinator")]);
         let DataPlaneInterNodeCommand::SealBoundaryReport(report) = &s.message else {
             panic!("expected a SealBoundaryReport");
         };

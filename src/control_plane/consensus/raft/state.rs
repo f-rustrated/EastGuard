@@ -481,15 +481,15 @@ impl Raft {
     }
 
     /// Repair this group's segments whose replica set still names a dead node:
-    ///   - active, only the leader died → stash for seal-end recovery (rolled later)
-    ///   - active, any other death → roll now with an unknown end (`RollSegment`)
+    ///   - active, one replica died → stash for seal-end recovery (rolled later)
+    ///   - active, multiple replicas died → roll now with an unknown end (`RollSegment`)
     ///   - sealed (known end) → swap the replica set (`ReassignSegment`); catch-up refills
     ///
     /// Runs per-death (`handle_node_death`) and as the takeover backfill sweep.
     pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
         let mut to_roll: Vec<(SegmentKey, ReplicaSet)> = Vec::new();
         for (key, rs) in self.active_segments_with_dead_members(live_set).into_vec() {
-            if Self::only_leader_dead(&rs, live_set) {
+            if Self::only_replica_dead(&rs, live_set) {
                 let survivors = rs
                     .iter()
                     .filter(|n| live_set.contains(*n))
@@ -500,6 +500,18 @@ impl Raft {
                 to_roll.push((key, rs));
             }
         }
+
+        let mut leaderless_segments = vec![];
+        for (key, rs) in self.boundary_unknown_segments() {
+            let survivors = rs
+                .iter()
+                .filter(|n| live_set.contains(*n))
+                .cloned()
+                .collect();
+            leaderless_segments.push((key, survivors));
+        }
+        self.leaderless_segments.extend(leaderless_segments);
+
         let sealed = self.sealed_segments_with_dead_members(live_set);
         let mut changed = false;
 
@@ -671,7 +683,8 @@ impl Raft {
             changed |= self.propose_replace_peer(dead_node_id.clone(), replacement);
         }
 
-        changed || self.reconcile_segments(live_set)
+        let segments_changed = self.reconcile_segments(live_set);
+        changed || segments_changed
     }
 
     pub(crate) fn dead_nodes(&mut self, live: &HashSet<NodeId>) -> impl Iterator<Item = &NodeId> {
@@ -704,23 +717,23 @@ impl Raft {
             .collect()
     }
 
-    /// True when the write leader (`replica_set[0]`) is dead and it is the *only*
-    /// dead member — the recoverable case (a leaderless segment) that seal-end recovery
-    /// handles. A follower death (leader alive) or a multi-death is not.
-    fn only_leader_dead(replica_set: &[NodeId], live: &HashSet<NodeId>) -> bool {
-        let dead = replica_set.iter().filter(|n| !live.contains(*n)).count();
-        let leader_dead = replica_set.first().is_some_and(|l| !live.contains(l));
-        leader_dead && (dead == 1)
+    pub(crate) fn boundary_unknown_segments(
+        &self,
+    ) -> impl Iterator<Item = (SegmentKey, ReplicaSet)> {
+        self.state_machine
+            .topics
+            .values()
+            .flat_map(|t| t.boundary_unknown_segments())
+    }
+
+    /// A single missing replica is recoverable: the remaining replicas can
+    /// report the all-ack committed minimum before the successor is opened.
+    fn only_replica_dead(replica_set: &[NodeId], live: &HashSet<NodeId>) -> bool {
+        replica_set.iter().filter(|n| !live.contains(*n)).count() == 1
     }
 
     pub(crate) fn has_topic(&self, topic_id: &TopicId) -> bool {
         self.state_machine.get_topic(topic_id).is_some()
-    }
-
-    pub(crate) fn get_active_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
-        let topic = self.state_machine.get_topic(&key.topic_id)?;
-        let seg = topic.get_active_segment(&key.range_id)?;
-        Some(seg.replica_set.clone())
     }
 
     pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
@@ -3843,6 +3856,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn node_death_reconciles_peer_and_sealed_replica_together() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+
+        let mut raft = three_node_raft_as_leader("node-1");
+        let dead = raft.peers_iter().next().expect("peer exists").clone();
+        let survivor = raft
+            .peers_iter()
+            .find(|peer| **peer != dead)
+            .expect("second peer exists")
+            .clone();
+        let spare = node("spare");
+
+        create_topic_in_raft(
+            &mut raft,
+            "t",
+            vec![dead.clone(), survivor.clone(), node("node-1")],
+        );
+        ack_to_last(&mut raft, &survivor);
+        raft.simulate_flush_and_apply();
+
+        let seg0 = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        raft.propose(
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: seg0,
+                sealed_at: 2000,
+                new_replica_set: vec![node("node-1"), survivor.clone(), spare.clone()],
+                end_entry_id: Some(100.into()),
+            })
+            .into(),
+        )
+        .expect("RollSegment propose failed");
+        ack_to_last(&mut raft, &survivor);
+        raft.simulate_flush_and_apply();
+
+        let before = proposals_after_become_leader(&raft).len();
+        let live = HashSet::from([node("node-1"), survivor, spare]);
+        let topology = topology_reader_with(&["node-1", "spare"]);
+        assert!(raft.handle_node_death(&dead, &live, &topology));
+
+        let tail = &proposals_after_become_leader(&raft)[before..];
+        assert!(
+            tail.iter()
+                .any(|command| matches!(command, RaftCommand::RemovePeer(peer) if peer == &dead)),
+            "peer removal was not proposed: {tail:?}",
+        );
+        assert!(
+            tail.iter().any(|command| matches!(
+                command,
+                RaftCommand::Metadata(MetadataCommand::ReassignSegment(reassign))
+                    if reassign.segment_key == seg0
+            )),
+            "sealed data replica repair was skipped: {tail:?}",
+        );
+    }
+
     // ── Capacity-return re-fill of under-replicated sealed segments (raft-actor.md #10) ──
 
     /// Single-node leader of a *real* ring group id, so `ring_replacements_for` resolves
@@ -4110,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_skips_sealed_segment_with_unknown_end() {
+    fn reconcile_redrives_seal_recovery_for_unknown_end() {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
         // Same shape, but seal with end_entry_id = None — a SWIM-death-style seal
@@ -4122,16 +4191,22 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: vec![node("node-1")],
+                new_replica_set: vec![node("y"), node("z"), node("node-1")],
                 end_entry_id: None,
             })
             .into(),
         )
         .expect("RollSegment propose failed");
         raft.simulate_flush_and_apply();
+        assert_eq!(
+            raft.get_replica_set(&seg0.with_segment_id(SegmentId(1))),
+            Some(vec![node("y"), node("z"), node("node-1")])
+        );
 
         let before = proposals_after_become_leader(&raft).len();
-        let live = live_set(&["node-1"]);
+        // The crashed write leader may already have bounced by the time this
+        // backstop runs; metadata's successor set identifies the true survivors.
+        let live = live_set(&["node-1", "x", "y", "z"]);
         raft.reconcile_segments(&live);
         let after = proposals_after_become_leader(&raft);
 
@@ -4152,22 +4227,27 @@ mod tests {
             "boundary-unknown sealed segment must not be reassigned (tail: {:?})",
             &after[before..]
         );
+        assert_eq!(
+            raft.take_leaderless_segments(),
+            vec![(seg0, vec![node("y"), node("z")])],
+            "unknown boundary remains a recovery candidate until corrected"
+        );
     }
 
     #[test]
-    fn only_leader_dead_classifies_the_death() {
+    fn only_replica_dead_classifies_the_death() {
         let rs = vec![node("x"), node("y"), node("z")]; // x is the write leader
         assert!(
-            Raft::only_leader_dead(&rs, &live_set(&["y", "z"])),
+            Raft::only_replica_dead(&rs, &live_set(&["y", "z"])),
             "only the leader (x) died → recoverable leader crash"
         );
         assert!(
-            !Raft::only_leader_dead(&rs, &live_set(&["x", "z"])),
-            "a follower (y) died, leader alive → not a leader crash"
+            Raft::only_replica_dead(&rs, &live_set(&["x", "z"])),
+            "one dead follower is also recoverable before rolling"
         );
         assert!(
-            !Raft::only_leader_dead(&rs, &live_set(&["z"])),
-            "leader x and follower y died → multi-death, not a sole crash"
+            !Raft::only_replica_dead(&rs, &live_set(&["z"])),
+            "leader x and follower y died → multi-death fallback"
         );
     }
 

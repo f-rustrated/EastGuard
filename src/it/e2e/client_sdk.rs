@@ -1532,12 +1532,7 @@ fn consumer_seek_resume_after_sealed_segment_reassignment() -> turmoil::Result {
                 .await
                 .expect("produce sealed record");
         }
-        wait_for_segment_roll(&client, "pause-repair-seek", 0, 1).await;
-
-        let detail = client
-            .resolve_topic("pause-repair-seek")
-            .await
-            .expect("resolve after roll");
+        let detail = wait_for_segment_roll(&client, "pause-repair-seek", 0, 1).await;
         let sealed_replicas = detail
             .ranges
             .iter()
@@ -1784,7 +1779,7 @@ async fn wait_for_segment_roll(
     topic: &str,
     range_id: u64,
     expected_segment_id: u64,
-) {
+) -> TopicDetail {
     for _ in 0..240 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         if let Ok(detail) = client.resolve_topic(topic).await
@@ -1794,12 +1789,13 @@ async fn wait_for_segment_roll(
                 .find(|r| r.range_id == RangeId(range_id))
         {
             if range.state == crate::control_plane::metadata::RangeState::Sealed {
-                return;
+                return detail;
             }
             if let Some(seg) = &range.active_segment
                 && *seg.segment_id >= expected_segment_id
+                && !range.sealed_segments.is_empty()
             {
-                return;
+                return detail;
             }
         }
     }

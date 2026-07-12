@@ -21,7 +21,7 @@ mpsc::Receiver<SwimCommand>
 
 ## Invariants
 
-1. **Self-incarnation monotonicity.** A node's own published incarnation number only increases. A node bumps its incarnation when it refutes a suspicion, never resets. Without this, false-positive suspicions could permanently shadow a healthy node.
+1. **Self-incarnation monotonicity.** A node's own published incarnation number only increases. A running node bumps its incarnation when it refutes suspicion or stale death gossip after a healed partition, never resets. Without this, false-positive suspicions or a healed partition could permanently shadow a healthy node.
 
 2. **Incarnation-then-state ordering decides conflicts.** Comparing two messages about node X: the one with the higher incarnation wins. For equal incarnations, Dead overrides Suspect overrides Alive. This single rule prevents gossip oscillation ("zombie loops") where contradicting state updates ping-pong forever.
 

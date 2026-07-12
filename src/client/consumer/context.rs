@@ -61,6 +61,29 @@ impl ConsumerContext {
         let addr = segment
             .pick_replica()
             .ok_or(ClientError::UnexpectedResponse)?;
+        self.fetch_from(addr, range_id, entry_id).await
+    }
+
+    pub(crate) async fn fetch_from_active_leader(
+        &self,
+        segment: &SegmentDetail,
+        range_id: RangeId,
+        entry_id: EntryId,
+    ) -> Result<Served, ClientError> {
+        let addr = segment
+            .replica_set
+            .first() // First being data leader
+            .map(|replica| replica.client_addr)
+            .ok_or(ClientError::UnexpectedResponse)?;
+        self.fetch_from(addr, range_id, entry_id).await
+    }
+
+    async fn fetch_from(
+        &self,
+        addr: std::net::SocketAddr,
+        range_id: RangeId,
+        entry_id: EntryId,
+    ) -> Result<Served, ClientError> {
         let req = FetchByIdRequest {
             topic_id: self.topic_id,
             range_id,

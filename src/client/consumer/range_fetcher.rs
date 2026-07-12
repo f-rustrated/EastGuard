@@ -11,6 +11,9 @@ use crate::connections::protocol::{
     ClientResponse, DataPlaneResponse, RangeProgressSignal, RangeTransition, SegmentDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId};
+
+const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
+
 pub(crate) enum RangeFetchActorCommand {
     Stop,
     Pause {
@@ -29,6 +32,8 @@ pub(crate) struct RangeFetchActor {
     cursor: RangeCursor,
     ctx: Arc<ConsumerContext>,
     record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+    consecutive_empty_fetches: u8,
+    group_fetch: bool,
 }
 
 impl RangeFetchActor {
@@ -36,11 +41,14 @@ impl RangeFetchActor {
         cursor: RangeCursor,
         ctx: Arc<ConsumerContext>,
         record_tx: flume::Sender<Result<ConsumerRecord, ClientError>>,
+        group_fetch: bool,
     ) -> Self {
         Self {
             cursor,
             ctx,
             record_tx,
+            consecutive_empty_fetches: 0,
+            group_fetch,
         }
     }
     pub(crate) async fn run(mut self, rx: flume::Receiver<RangeFetchActorCommand>) {
@@ -119,10 +127,15 @@ impl RangeFetchActor {
             RangeLookupResult::Found(segment) => segment,
         };
 
-        let served = self
-            .ctx
-            .fetch(&segment, self.cursor.range_id, self.cursor.next_entry_id)
-            .await?;
+        let served = if segment.end_entry_id.is_none() && self.group_fetch {
+            self.ctx
+                .fetch_from_active_leader(&segment, self.cursor.range_id, self.cursor.next_entry_id)
+                .await?
+        } else {
+            self.ctx
+                .fetch(&segment, self.cursor.range_id, self.cursor.next_entry_id)
+                .await?
+        };
 
         let ClientResponse::DataPlane(dp_response) = served.response else {
             return Err(ClientError::UnexpectedResponse);
@@ -144,6 +157,16 @@ impl RangeFetchActor {
                 if entries.is_empty() {
                     // ! short-polling backoff mechanism to prevent the consumer from unintentionally DDoS-ing the data plane server
                     tokio::time::sleep(Duration::from_millis(50)).await;
+                    if self.group_fetch {
+                        self.consecutive_empty_fetches =
+                            self.consecutive_empty_fetches.saturating_add(1);
+                        if self.consecutive_empty_fetches >= EMPTY_FETCHES_BEFORE_REFRESH {
+                            self.ctx.refresh_metadata().await?;
+                            self.consecutive_empty_fetches = 0;
+                        }
+                    }
+                } else {
+                    self.consecutive_empty_fetches = 0;
                 }
 
                 for entry in entries.into_iter() {

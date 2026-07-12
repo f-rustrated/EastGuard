@@ -113,6 +113,7 @@ pub struct ConsumerGroup {
     /// being committed and before their fetch tasks are aborted.
     pub owned_ranges: ArcSwap<HashSet<RangeId>>,
     pub offsets: DashMap<RangeId, OffsetTracker>,
+    commit_lock: tokio::sync::Mutex<()>,
 
     /// The last observed heartbeat sequence number for each active group peer.
     last_seen_sequences: DashMap<Uuid, u64>,
@@ -149,6 +150,7 @@ impl ConsumerGroup {
             active_peers,
             owned_ranges: ArcSwap::from_pointee(HashSet::new()),
             offsets: DashMap::new(),
+            commit_lock: tokio::sync::Mutex::new(()),
             _hb_stop_tx: hb_stop_tx,
             last_seen_sequences: DashMap::new(),
             stale_ticks: DashMap::new(),
@@ -271,6 +273,7 @@ impl ConsumerGroup {
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
+        let _guard = self.commit_lock.lock().await;
         // Collect commits synchronously to release DashMap locks before awaiting network calls.
         let committable: Vec<(RangeId, ConsumerPosition)> = self
             .offsets
@@ -327,6 +330,7 @@ impl ConsumerGroup {
     }
 
     pub async fn revoke_ranges(&self, ranges: &[RangeId]) -> Result<(), ClientError> {
+        let _guard = self.commit_lock.lock().await;
         // Collect commits synchronously to release DashMap locks before awaiting network calls.
         let mut commits = Vec::new();
         for &range in ranges {
@@ -512,8 +516,8 @@ async fn heartbeat_receiver(
     let mut backoff = Duration::from_millis(100);
     let max_backoff = Duration::from_secs(5);
 
-    let consumer = loop {
-        let consumer_res = Consumer::new(
+    loop {
+        let consumer = match Consumer::new(
             client.clone(),
             SYSTEM_TOPIC_ASSIGNMENTS.to_string(),
             KeyInterest::KeySpan {
@@ -522,42 +526,43 @@ async fn heartbeat_receiver(
             },
             ConsumerConfig::new(StartPolicy::Latest),
         )
-        .await;
-
-        match consumer_res {
-            Ok(c) => break c,
-            Err(e) => {
-                tracing::debug!("Failed to create heartbeat consumer, retrying: {:?}", e);
+        .await
+        {
+            Ok(consumer) => {
+                backoff = Duration::from_millis(100);
+                consumer
+            }
+            Err(error) => {
+                tracing::debug!(?error, "failed to create heartbeat consumer, retrying");
                 tokio::select! {
                     _ = stop_rx.recv_async() => return,
                     _ = tokio::time::sleep(backoff) => {
                         backoff = (backoff * 2).min(max_backoff);
                     }
                 }
+                continue;
             }
-        }
-    };
+        };
 
-    loop {
-        tokio::select! {
-            _ = stop_rx.recv_async() => {
-                break;
-            }
-            res = consumer.next_record() => {
-
-                let Ok(Some(record)) = res else {
-                    break;
-                };
-                if record.key_match(heartbeat_key.as_bytes().iter())
-                    && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
-                    && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
-                {
-                    if payload.sequence_number == 0 {
-                        // Peer is leaving gracefully; remove immediately
-                        active_peers.remove(&cid);
-                    } else {
-                        // Store the highest sequence number seen
-                        if let Some(mut current) = active_peers.get_mut(&cid) {
+        loop {
+            tokio::select! {
+                _ = stop_rx.recv_async() => return,
+                result = consumer.next_record() => {
+                    let record = match result {
+                        Ok(Some(record)) => record,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(?error, "heartbeat consumer stopped, recreating");
+                            break;
+                        }
+                    };
+                    if record.key_match(heartbeat_key.as_bytes().iter())
+                        && let Ok(payload) = HeartbeatPayload::try_from_slice(&record.value)
+                        && let Ok(cid) = Uuid::from_slice(&payload.consumer_id)
+                    {
+                        if payload.sequence_number == 0 {
+                            active_peers.remove(&cid);
+                        } else if let Some(mut current) = active_peers.get_mut(&cid) {
                             if payload.sequence_number > *current {
                                 *current = payload.sequence_number;
                             }
@@ -566,6 +571,13 @@ async fn heartbeat_receiver(
                         }
                     }
                 }
+            }
+        }
+
+        tokio::select! {
+            _ = stop_rx.recv_async() => return,
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(max_backoff);
             }
         }
     }

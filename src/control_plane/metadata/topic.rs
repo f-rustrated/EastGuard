@@ -191,6 +191,39 @@ impl TopicMeta {
         out.into_boxed_slice()
     }
 
+    /// Boundary-unknown sealed segments. These remain seal-end recovery
+    /// candidates until a recovered boundary is committed to metadata, even if
+    /// the crashed replica has rejoined by the next reconciliation pass.
+    pub(crate) fn boundary_unknown_segments(&self) -> Box<[(SegmentKey, ReplicaSet)]> {
+        let mut out = Vec::new();
+        for range in self.ranges.values() {
+            let active_replicas = range
+                .active_segment
+                .and_then(|id| range.segments.get(&id))
+                .map(|seg| &seg.replica_set);
+            for seg in range.segments.values() {
+                if seg.state == SegmentMetaState::Sealed && seg.end_entry_id.is_none() {
+                    // The successor was created without the failed replicas.
+                    // Intersecting with it retains the original survivors and
+                    // prevents a restarted failed node (which may report no live
+                    // tracker) from poisoning the recovered minimum.
+                    let survivors = active_replicas.map_or_else(Vec::new, |active| {
+                        seg.replica_set
+                            .iter()
+                            .filter(|node| active.contains(node))
+                            .cloned()
+                            .collect()
+                    });
+                    out.push((
+                        SegmentKey::new(self.id, range.range_id, seg.segment_id),
+                        survivors,
+                    ));
+                }
+            }
+        }
+        out.into_boxed_slice()
+    }
+
     pub(crate) fn under_replicated_sealed_segments(
         &self,
         replication_factor: usize,

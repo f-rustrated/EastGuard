@@ -15,7 +15,7 @@ pub(super) fn shrink_scenario(failing: &SimScenario) -> SimScenario {
         while i < best.faults.len() {
             let mut candidate = best.clone();
             candidate.faults.remove(i);
-            if run_for_scenario(&candidate).is_err() {
+            if candidate.is_valid() && run_for_scenario(&candidate).is_err() {
                 best = candidate;
                 fault_changed = true;
             } else {
@@ -32,7 +32,7 @@ pub(super) fn shrink_scenario(failing: &SimScenario) -> SimScenario {
         while i < best.commands.len() {
             let mut candidate = best.clone();
             candidate.commands.remove(i);
-            if run_for_scenario(&candidate).is_err() {
+            if candidate.is_valid() && run_for_scenario(&candidate).is_err() {
                 best = candidate;
                 cmd_changed = true;
             } else {
@@ -47,10 +47,14 @@ pub(super) fn shrink_scenario(failing: &SimScenario) -> SimScenario {
         candidate.node_count -= 1;
         let n = candidate.node_count;
         candidate.faults.retain(|f| match &f.kind {
-            FaultKind::KillNode(m) => *m <= n,
-            FaultKind::PartitionNode(m) | FaultKind::HealNode(m) => *m <= n,
+            FaultKind::KillNode(fault) => fault.node <= n,
+            FaultKind::KillDataReplica(_) => n >= 4,
+            FaultKind::PartitionNode(fault) => fault.node <= n,
+            FaultKind::HealNode(fault) => fault.node <= n,
+            FaultKind::FlappingPartition(_) => true,
+            FaultKind::PartitionLeader(_) => true,
         });
-        if run_for_scenario(&candidate).is_err() {
+        if candidate.is_valid() && run_for_scenario(&candidate).is_err() {
             best = candidate;
         } else {
             break;
@@ -66,7 +70,7 @@ pub(super) fn shrink_scenario(failing: &SimScenario) -> SimScenario {
         candidate.simulation_secs = mid;
         candidate.faults.retain(|f| f.at_secs + 20 < mid);
         candidate.commands.retain(|c| c.at_secs + 30 < mid);
-        if run_for_scenario(&candidate).is_err() {
+        if candidate.is_valid() && run_for_scenario(&candidate).is_err() {
             best = candidate;
             hi = mid;
         } else {

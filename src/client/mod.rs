@@ -134,7 +134,7 @@ impl Client {
                         .as_ref()
                         .or_else(|| r.sealed_segments.last())
                 })
-                .and_then(|seg| seg.pick_replica())
+                .and_then(|seg| seg.pick_read_replica())
                 .unwrap_or_else(|| self.next_known_node());
 
             let req = RangeOffsetRequest {
@@ -167,6 +167,22 @@ impl Client {
         topic: &str,
     ) -> Result<HashMap<RangeId, ConsumerPosition>, ClientError> {
         let mut map = HashMap::new();
+        let detail = self.resolve_topic(SYSTEM_TOPIC_OFFSETS).await?;
+        let mut unread_tails = HashMap::new();
+        for range in &detail.ranges {
+            let (_, active_next_entry_id) = self
+                .fetch_range_entry_ids(SYSTEM_TOPIC_OFFSETS, range.range_id)
+                .await?;
+            // The important difference is how emptiness is determined:
+            if let Some(scan_end) = range.scan_end_exclusive(active_next_entry_id) {
+                unread_tails.insert(range.range_id, scan_end);
+            }
+        }
+
+        if unread_tails.is_empty() {
+            return Ok(map);
+        }
+
         let offsets_consumer = Consumer::new(
             self,
             SYSTEM_TOPIC_OFFSETS.to_string(),
@@ -179,18 +195,24 @@ impl Client {
         let t_bytes = topic.as_bytes();
         let routing_key = g_bytes.iter().chain(b":".iter()).chain(t_bytes.iter());
 
-        let mut timeout_ms = 2000;
-        while let Ok(Ok(Some(record))) = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            offsets_consumer.next_record(),
-        )
-        .await
-        {
-            timeout_ms = 100;
-            let is_key_match = record.key_match(routing_key.clone());
-            if is_key_match && let Ok(payload) = OffsetCommitPayload::try_from_slice(&record.value)
+        while !unread_tails.is_empty() {
+            let Some(record) = offsets_consumer.next_record().await? else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+
+            if record.key_match(routing_key.clone())
+                && let Ok(payload) = OffsetCommitPayload::try_from_slice(&record.value)
             {
                 map.insert(payload.range_id, payload.position);
+            }
+
+            if unread_tails
+                .get(&record.range_id)
+                .is_some_and(|next_entry_id| {
+                    record.position.entry_id >= next_entry_id.saturating_sub(1)
+                })
+            {
+                unread_tails.remove(&record.range_id);
             }
         }
         Ok(map)
@@ -402,7 +424,7 @@ impl Client {
                     last_error = Some(format!("Connection to {} failed: {}", addr, reason));
                     state.mark_redirected()
                 }
-                Err(e) => return Err(e),
+                Err(error) => return Err(error),
             }
 
             // Transient: back off (never past the deadline), then try a fresh seed.

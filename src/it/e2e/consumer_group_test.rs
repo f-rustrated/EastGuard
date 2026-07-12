@@ -6,6 +6,7 @@ use crate::client::{
 use crate::control_plane::metadata::RangeState;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use turmoil::Builder;
 use uuid::Uuid;
@@ -607,6 +608,135 @@ fn consumer_group_independent_groups() {
         assert_eq!(beta_count, 10, "Group Beta should read all 10 messages independently");
         Ok(())
     });
+    sim.run().unwrap();
+}
+
+#[test]
+#[serial_test::serial]
+fn consumer_group_rebalance_survives_broker_restart_without_offset_replay() {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(10))
+        .simulation_duration(Duration::from_secs(90))
+        .rng_seed(187)
+        .build();
+
+    host_cluster(&mut sim, NODES, |env| {
+        env.node_id_suffix = Some("sim-187".to_string());
+        env.vnodes_per_node = 16;
+    });
+
+    // 0 = setup, 1 = second member about to join, 2 = broker crashed, 3 = restarted.
+    let phase = Arc::new(AtomicU8::new(0));
+    let client_phase = phase.clone();
+    sim.client("client", async move {
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let admin = Arc::new(Client::connect([client_addr]).unwrap());
+        let producer_client = Arc::new(Client::connect([client_addr]).unwrap());
+        let first_client = Arc::new(Client::connect([client_addr]).unwrap());
+        let second_client = Arc::new(Client::connect([client_addr]).unwrap());
+
+        let topic = "rebalance_restart_offsets";
+        create_group_test_topics(&admin, topic).await;
+        let producer = Producer::new(
+            producer_client,
+            topic.to_string(),
+            ProducerConfig::default(),
+        );
+        let group_id = "rebalance-restart-group".to_string();
+        let first = Consumer::new(
+            first_client,
+            topic.to_string(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        for index in 0..6 {
+            producer
+                .send(format!("initial-{index}").as_bytes(), b"initial".to_vec())
+                .await
+                .unwrap();
+        }
+        for _ in 0..6 {
+            let record = tokio::time::timeout(Duration::from_secs(8), first.next_record())
+                .await
+                .expect("initial consume timed out")
+                .expect("initial consume failed")
+                .expect("initial consumer closed");
+            assert_eq!(record.value, b"initial");
+            first.ack(&record).unwrap();
+        }
+        first.commit().await.unwrap();
+
+        client_phase.store(1, Ordering::SeqCst);
+        while client_phase.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = Consumer::new(
+            second_client,
+            topic.to_string(),
+            KeyInterest::AllKeys,
+            group_config(group_id),
+        )
+        .await
+        .unwrap();
+        while client_phase.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        for index in 0..6 {
+            producer
+                .send(format!("after-{index}").as_bytes(), b"after".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let mut consumed = 0;
+        while consumed < 6 {
+            tokio::select! {
+                result = first.next_record() => {
+                    let record = result.unwrap().expect("first consumer closed");
+                    assert_eq!(record.value, b"after", "committed pre-rebalance offset replayed");
+                    first.ack(&record).unwrap();
+                    consumed += 1;
+                }
+                result = second.next_record() => {
+                    let record = result.unwrap().expect("second consumer closed");
+                    assert_eq!(record.value, b"after", "committed pre-rebalance offset replayed");
+                    second.ack(&record).unwrap();
+                    consumed += 1;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    panic!("rebalance processed only {consumed}/6 post-restart records");
+                }
+            }
+        }
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+        Ok(())
+    });
+
+    while phase.load(Ordering::SeqCst) < 1 {
+        assert!(
+            sim.elapsed() < Duration::from_secs(45),
+            "client never began rebalance"
+        );
+        sim.step().unwrap();
+    }
+    sim.crash("n2");
+    phase.store(2, Ordering::SeqCst);
+    let restart_at = sim.elapsed() + Duration::from_secs(8);
+    while sim.elapsed() < restart_at {
+        sim.step().unwrap();
+    }
+    sim.bounce("n2");
+    let recovered_at = sim.elapsed() + Duration::from_secs(8);
+    while sim.elapsed() < recovered_at {
+        sim.step().unwrap();
+    }
+    phase.store(3, Ordering::SeqCst);
     sim.run().unwrap();
 }
 

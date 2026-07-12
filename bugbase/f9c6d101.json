@@ -1,0 +1,25 @@
+{
+  "seed": 41,
+  "node_count": 4,
+  "simulation_secs": 125,
+  "faults": [
+    {
+      "at_secs": 104,
+      "kind": {
+        "KillDataReplica": {
+          "topic_name": "topic-41-0"
+        }
+      }
+    }
+  ],
+  "commands": [
+    {
+      "at_secs": 22,
+      "kind": {
+        "CreateTopic": {
+          "name": "topic-41-0"
+        }
+      }
+    }
+  ]
+}

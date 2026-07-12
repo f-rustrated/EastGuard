@@ -1,0 +1,24 @@
+{
+  "seed": 2,
+  "node_count": 3,
+  "simulation_secs": 67,
+  "faults": [
+    {
+      "at_secs": 34,
+      "kind": {
+        "PartitionNode": {
+          "node": 2
+        }
+      }
+    },
+    {
+      "at_secs": 46,
+      "kind": {
+        "HealNode": {
+          "node": 2
+        }
+      }
+    }
+  ],
+  "commands": []
+}
