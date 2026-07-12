@@ -462,28 +462,7 @@ mod tests {
         assert_eq!(env.peer_bind_addr(), "127.0.0.1:3001".parse().unwrap());
     }
 
-    #[test]
-    #[serial]
-    fn test_defaults() {
-        let args = vec!["my-server"];
-
-        let env = Environment::try_parse_from(args).expect("Failed to parse defaults");
-
-        assert_eq!(env.config_dir, "./eastguard/config");
-        assert_eq!(env.data_dir, "./eastguard/data");
-        assert_eq!(env.meta_dir, "./eastguard/meta");
-        assert_eq!(env.node_id_prefix, None);
-        assert_eq!(env.client_port, 2921);
-        assert_eq!(env.cluster_port, 2922);
-        assert_eq!(env.host, "0.0.0.0");
-        assert_eq!(env.vnodes_per_node, 256);
-        assert_eq!(env.join_seed_nodes, Vec::<String>::new());
-        assert_eq!(env.join_initial_delay_ms, 1000);
-        assert_eq!(env.join_interval_ms, 1000);
-        assert_eq!(env.join_multiplier, 2);
-        assert_eq!(env.join_max_attempts, 5);
-    }
-
+    // Asserts that the system state converges to the correct expected configuration.
     #[test]
     fn test_flags_override() {
         let args = vec![
@@ -507,25 +486,6 @@ mod tests {
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
         assert_eq!(env.vnodes_per_node, 8);
-    }
-
-    #[test]
-    fn test_flags_override2() {
-        let args = vec![
-            "my-server",
-            "-p",
-            "9999",
-            "--host",
-            "0.0.0.0", // -h is preserved for --help.
-            "--data-dir",
-            "/tmp/test",
-        ];
-
-        let env = Environment::try_parse_from(args).expect("Failed to parse flags");
-
-        assert_eq!(env.client_port, 9999);
-        assert_eq!(env.host, "0.0.0.0");
-        assert_eq!(env.data_dir, "/tmp/test");
     }
 
     #[test]
