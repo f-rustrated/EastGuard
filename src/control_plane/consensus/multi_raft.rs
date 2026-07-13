@@ -1,7 +1,8 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    CoordinatorSealRequest, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
-    MultiRaftActorCommand, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
+    CoordinatorSealRequest, DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc,
+    LogMutation, MetadataProposal, MultiRaftActorCommand, RaftEvent, RaftProtocolMessage,
+    RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{LeaderlessSegments, Raft, TimerSeqs};
@@ -10,7 +11,9 @@ use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now
 use crate::control_plane::consensus::seal_recovery::{SealEndRecovery, SealEndStep};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
-use crate::control_plane::metadata::{EntryId, TopicId, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{
+    ConsumerGroupAssignment, EntryId, TopicId, TopicMeta, TopicStats,
+};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
     CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
@@ -19,6 +22,7 @@ use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 // dirty is owned here because it's a persistence concern — flush() drains it.
 pub(crate) struct MultiRaft {
@@ -247,6 +251,20 @@ impl MultiRaft {
                 self.deferred
                     .push(DeferredReply::GetTopicMetadata(reply, meta));
             }
+            MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
+                let value = self.get_consumer_group_assignment(
+                    &query.topic_name,
+                    &query.group_id,
+                    query.member_id,
+                );
+                self.deferred
+                    .push(DeferredReply::GetConsumerGroupAssignment(
+                        DeferredConsumerGroupAssignment {
+                            reply: query.reply,
+                            value,
+                        },
+                    ));
+            }
             MultiRaftActorCommand::Coordinator(req) => {
                 self.handle_seal_request(req);
             }
@@ -282,6 +300,9 @@ impl MultiRaft {
                 }
                 DeferredReply::GetTopicMetadata(sender, v) => {
                     let _ = sender.send(v);
+                }
+                DeferredReply::GetConsumerGroupAssignment(deferred) => {
+                    let _ = deferred.reply.send(deferred.value);
                 }
             }
         }
@@ -445,6 +466,17 @@ impl MultiRaft {
         self.groups
             .values()
             .find_map(|raft| raft.get_topic_by_name(name).cloned())
+    }
+
+    fn get_consumer_group_assignment(
+        &self,
+        topic_name: &str,
+        group_id: &str,
+        member_id: Uuid,
+    ) -> Option<ConsumerGroupAssignment> {
+        self.groups
+            .values()
+            .find_map(|raft| raft.get_consumer_group_assignment(topic_name, group_id, member_id))
     }
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)

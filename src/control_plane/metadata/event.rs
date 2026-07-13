@@ -1,11 +1,13 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
     CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment, SegmentSealed,
 };
+use crate::data_plane::offset_ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 
@@ -33,6 +35,7 @@ pub struct SegmentRolled {
     pub new_segment_key: SegmentKey,
     pub new_replica_set: Vec<NodeId>,
     pub end_entry_id: Option<EntryId>,
+    pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
 
 impl SegmentRolled {
@@ -61,6 +64,9 @@ impl SegmentRolled {
                     new_replica_set: self.new_replica_set,
                 },
             ));
+        }
+        for epoch in self.consumer_group_epochs {
+            v.extend(epoch.into_commands());
         }
         v
     }
@@ -105,6 +111,7 @@ pub struct RangeSplit {
     pub topic_id: TopicId,
     pub children: [(RangeId, SegmentId, Vec<NodeId>); 2],
     pub parent_active_segment: Option<(SegmentKey, Vec<NodeId>)>,
+    pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
 
 impl RangeSplit {
@@ -139,6 +146,10 @@ impl RangeSplit {
             ));
         }
 
+        for epoch in self.consumer_group_epochs {
+            cmds.extend(epoch.into_commands());
+        }
+
         cmds
     }
 }
@@ -147,12 +158,12 @@ impl RangeSplit {
 pub struct RangeMerged {
     pub segment_key: SegmentKey,
     pub replica_set: Vec<NodeId>,
+    pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
 impl RangeMerged {
-    pub fn into_command(self, shard_group_id: ShardGroupId) -> DataTransportCommand {
+    pub fn into_commands(self, shard_group_id: ShardGroupId) -> Vec<DataTransportCommand> {
         let target = self.replica_set[0].clone();
-
-        DataTransportCommand::send_to_targets(
+        let mut commands = vec![DataTransportCommand::send_to_targets(
             vec![target],
             SegmentAssignment {
                 segment_key: self.segment_key,
@@ -160,7 +171,57 @@ impl RangeMerged {
                 replica_set: self.replica_set,
                 start_entry_id: EntryId::MIN,
             },
-        )
+        )];
+        for epoch in self.consumer_group_epochs {
+            commands.extend(epoch.into_commands());
+        }
+        commands
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerGroupEpochSnapshot {
+    pub topic_id: TopicId,
+    pub group_id: String,
+    pub generation: GenerationId,
+    pub ranges: Box<[(RangeId, Vec<NodeId>)]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicDeleted {
+    pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
+}
+
+impl TopicDeleted {
+    pub fn into_commands(self) -> Vec<DataTransportCommand> {
+        self.consumer_group_epochs
+            .into_vec()
+            .into_iter()
+            .flat_map(ConsumerGroupEpochSnapshot::into_commands)
+            .collect()
+    }
+}
+
+impl ConsumerGroupEpochSnapshot {
+    pub fn into_commands(self) -> Vec<DataTransportCommand> {
+        self.ranges
+            .into_vec()
+            .into_iter()
+            .filter(|(_, replicas)| !replicas.is_empty())
+            .map(|(range_id, replicas)| {
+                DataTransportCommand::send_to_targets(
+                    replicas,
+                    EpochSeal {
+                        offset_key: ConsumerOffsetKey {
+                            topic_id: self.topic_id,
+                            range_id,
+                            group_id: self.group_id.clone(),
+                        },
+                        generation: self.generation,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -221,7 +282,8 @@ pub enum ApplyResult {
     SegmentReassigned(SegmentReassigned),
     SegmentsDeleted(SegmentsDeleted),
     SegmentSealCorrected(SegmentSealCorrected),
-    TopicDeleted,
+    ConsumerGroupChanged(ConsumerGroupEpochSnapshot),
+    TopicDeleted(TopicDeleted),
     Noop,
 }
 
@@ -233,5 +295,7 @@ impl_from_variant!(
     RangeMerged,
     SegmentReassigned,
     SegmentsDeleted,
-    SegmentSealCorrected
+    SegmentSealCorrected,
+    ConsumerGroupChanged(ConsumerGroupEpochSnapshot),
+    TopicDeleted
 );

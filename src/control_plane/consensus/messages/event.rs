@@ -67,13 +67,13 @@ impl MetadataCommitted {
             }
             ApplyResult::SegmentRolled(sr) => sr.into_command(self.seal_context, sgid),
             ApplyResult::RangeSplit(rs) => rs.into_command(sgid),
-            ApplyResult::RangeMerged(rm) => {
-                vec![rm.into_command(sgid)]
-            }
-            ApplyResult::TopicDeleted | ApplyResult::Noop => vec![],
+            ApplyResult::RangeMerged(rm) => rm.into_commands(sgid),
+            ApplyResult::TopicDeleted(deleted) => deleted.into_commands(),
+            ApplyResult::Noop => vec![],
             ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
             ApplyResult::SegmentsDeleted(d) => d.into_commands(),
             ApplyResult::SegmentSealCorrected(ssc) => ssc.into_commands(),
+            ApplyResult::ConsumerGroupChanged(epoch) => epoch.into_commands(),
         }
     }
 }
