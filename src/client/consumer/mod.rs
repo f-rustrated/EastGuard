@@ -2,7 +2,7 @@ use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 use crate::client::consumer::context::ConsumerContext;
-use crate::client::consumer::group::{ConsumerGroup, ConsumerPosition};
+use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::topic_fetch_manager::{
     PauseRange, RangeDrained, RecoverStaleCommit, ResumeRange, SeekRange, TopicFetchManagerCommand,
     TopicFetchManagerState, run_topic_fetch_manager,
@@ -14,6 +14,7 @@ use crate::connections::protocol::{
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
+use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
 
 pub(crate) mod context;
 pub(crate) mod cursor;
@@ -29,7 +30,7 @@ pub(crate) use cursor::{MergeSiblingState, PendingCursorStore, RangeCursor};
 pub struct ConsumerRecord {
     pub topic: String,
     pub range_id: RangeId,
-    pub position: ConsumerPosition,
+    pub position: ConsumerOffsetPosition,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }

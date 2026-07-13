@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::{ConsumerContext, ConsumerRecord, RangeCursor};
 use crate::client::consumer::context::RangeLookupResult;
-use crate::client::consumer::group::ConsumerPosition;
+
 use crate::client::consumer::topic_fetch_manager::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{ClientError, CompressionCodec};
@@ -11,6 +11,7 @@ use crate::connections::protocol::{
     ClientResponse, DataPlaneResponse, RangeProgressSignal, RangeTransition, SegmentDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId};
+use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
 
 const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
 
@@ -207,7 +208,7 @@ impl RangeFetchActor {
                         let consumer_rec = ConsumerRecord {
                             topic: self.ctx.topic.clone(),
                             range_id: self.cursor.range_id,
-                            position: ConsumerPosition {
+                            position: ConsumerOffsetPosition {
                                 batch_offset: i as u64,
                                 entry_id: entry.entry_id,
                                 absolute_offset,

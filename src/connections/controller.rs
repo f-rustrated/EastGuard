@@ -2,7 +2,7 @@ use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::metadata::RangeMeta;
+use crate::control_plane::metadata::{RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest};
 use crate::control_plane::{
     NodeAddress, NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
@@ -18,11 +18,31 @@ use crate::control_plane::{
 use crate::data_plane::EntryPayload;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{Produce, ProduceAck};
-use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
+use crate::data_plane::messages::command::{
+    CommitConsumerOffset, ConsumerOffsetCommitAck, Produce, ProduceAck,
+};
+use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset};
 use crate::net::TcpStream;
 use anyhow::Context;
 use tokio::sync::mpsc;
+
+enum MetadataProposalOutcome {
+    Committed,
+    Redirect(Option<NodeAddressInfo>),
+}
+
+impl MetadataProposalOutcome {
+    fn on_ok(self, committed: ControlPlaneResponse) -> ClientResponse {
+        match self {
+            Self::Committed => committed.into(),
+            Self::Redirect(redirect) => ControlPlaneResponse::NotRaftLeader {
+                leader_addr: redirect,
+            }
+            .into(),
+        }
+    }
+}
+
 /// # Client ↔ Server request_id protocol
 ///
 /// 1. **Client assigns** — before sending each request, the client obtains a
@@ -37,7 +57,6 @@ use tokio::sync::mpsc;
 ///
 /// This allows multiple requests to be in-flight on a single connection simultaneously,
 /// with responses arriving in any order.
-
 #[derive(Clone)]
 pub struct ClientController {
     node_id: NodeId,
@@ -104,14 +123,17 @@ impl ClientController {
     }
 
     async fn handle_control_plane(&self, request: ControlPlaneRequest) -> ClientResponse {
+        use ControlPlaneRequest::*;
+
         let res = match request {
-            ControlPlaneRequest::CreateTopic {
+            CreateTopic {
                 name,
                 storage_policy,
             } => self.handle_create_topic(name, storage_policy).await,
-            ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
-            ControlPlaneRequest::ListHostedTopics => return self.handle_list_hosted_topics().await,
-            ControlPlaneRequest::DescribeTopic { name } => self.handle_describe_topic(name).await,
+            DeleteTopic { name } => self.handle_delete_topic(name).await,
+            ListHostedTopics => return self.handle_list_hosted_topics().await,
+            DescribeTopic { name } => self.handle_describe_topic(name).await,
+            SyncConsumerGroup(req) => self.handle_sync_consumer_group(req).await,
         };
         match res {
             Ok(resp) => resp,
@@ -120,6 +142,51 @@ impl ClientController {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(e.to_string()))
             }
         }
+    }
+
+    async fn handle_sync_consumer_group(
+        &self,
+        req: SyncConsumerGroupRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let group = match self.route(req.topic_name.as_bytes().to_vec()).await? {
+            ShardRouting::Local(group) => group,
+            ShardRouting::Redirect(member) => {
+                return Ok(self.control_plane_redirect(member).into());
+            }
+        };
+
+        let proposal = self
+            .propose_topic_write(group.id, SyncConsumerGroup::new(req.clone()).into())
+            .await?;
+
+        if let MetadataProposalOutcome::Redirect(redirect) = proposal {
+            return Ok(ControlPlaneResponse::NotRaftLeader {
+                leader_addr: redirect,
+            }
+            .into());
+        };
+
+        if req.action == ConsumerGroupSyncAction::Leave {
+            return Ok(ControlPlaneResponse::ConsumerGroupLeft.into());
+        }
+
+        let Some(assignment) = self
+            .raft_sender
+            .get_consumer_group_assignment(req.topic_name, req.group_id, req.member_id)
+            .await
+        else {
+            return Ok(ControlPlaneResponse::InternalError(
+                "committed consumer group assignment is unavailable".into(),
+            )
+            .into());
+        };
+        Ok(
+            ControlPlaneResponse::ConsumerGroupAssignment(ConsumerGroupAssignmentResponse {
+                generation: assignment.generation,
+                ranges: assignment.ranges,
+            })
+            .into(),
+        )
     }
 
     /// If this node belongs to the topic's owning shard group, answers directly;
@@ -162,8 +229,10 @@ impl ClientController {
             replica_set: group.members,
             created_at,
         };
-        self.propose_topic_write(group.id, cmd.into(), ControlPlaneResponse::TopicCreated)
-            .await
+        Ok(self
+            .propose_topic_write(group.id, cmd.into())
+            .await?
+            .on_ok(ControlPlaneResponse::TopicCreated))
     }
 
     async fn handle_delete_topic(&self, topic_name: String) -> anyhow::Result<ClientResponse> {
@@ -175,8 +244,10 @@ impl ClientController {
         };
 
         let cmd = DeleteTopic { name: topic_name };
-        self.propose_topic_write(group.id, cmd.into(), ControlPlaneResponse::TopicDeleted)
-            .await
+        Ok(self
+            .propose_topic_write(group.id, cmd.into())
+            .await?
+            .on_ok(ControlPlaneResponse::TopicDeleted))
     }
 
     /// Route a key relative to this node — the single SWIM call behind every
@@ -206,20 +277,22 @@ impl ClientController {
         }
     }
 
-    /// Propose a control-plane write to the group's Raft leader. `on_ok` on success;
-    /// any non-leader / not-ready rejection becomes a retriable `NotRaftLeader` redirect.
+    /// Propose a control-plane write to the group's Raft leader. A committed
+    /// proposal is distinct from the retriable wire response returned when the
+    /// addressed node cannot currently accept it.
     async fn propose_topic_write(
         &self,
         group_id: ShardGroupId,
         cmd: MetadataCommand,
-        on_ok: ControlPlaneResponse,
-    ) -> anyhow::Result<ClientResponse> {
+    ) -> anyhow::Result<MetadataProposalOutcome> {
         let leader = match self
             .raft_sender
             .submit_metadata_command(group_id, cmd)
             .await
         {
-            Ok(()) => return Ok(on_ok.into()),
+            Ok(()) => {
+                return Ok(MetadataProposalOutcome::Committed);
+            }
             Err(ProposalError::NotLeader(leader)) => leader,
             Err(ProposalError::ShardNotFound | ProposalError::ShardGroupRemoved) => None,
         };
@@ -236,7 +309,7 @@ impl ClientController {
             }
             None => None,
         };
-        Ok(ControlPlaneResponse::NotRaftLeader { leader_addr }.into())
+        Ok(MetadataProposalOutcome::Redirect(leader_addr))
     }
 
     async fn handle_list_hosted_topics(&self) -> ClientResponse {
@@ -248,18 +321,22 @@ impl ClientController {
             .map(|name| TopicSummary {
                 name,
                 range_count: 0,
-                state: crate::connections::protocol::TopicState::Active,
+                state: TopicState::Active,
             })
             .collect();
         ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics })
     }
 
     async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {
+        use ClientDataPlaneRequest::*;
+
         let res = match request {
-            ClientDataPlaneRequest::Produce(req) => self.handle_produce(req).await,
-            ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
-            ClientDataPlaneRequest::FetchById(req) => self.handle_fetch_by_id(req).await,
-            ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
+            Produce(req) => self.handle_produce(req).await,
+            Fetch(req) => self.handle_fetch(req).await,
+            FetchById(req) => self.handle_fetch_by_id(req).await,
+            ListOffsets(req) => self.handle_list_offsets(req).await,
+            CommitConsumerOffset(req) => self.handle_commit_consumer_offset(req).await,
+            FetchConsumerOffset(req) => self.handle_fetch_consumer_offset(req).await,
         };
         match res {
             Ok(resp) => resp,
@@ -268,6 +345,42 @@ impl ClientController {
                 ClientResponse::DataPlane(DataPlaneResponse::InternalError(e.to_string()))
             }
         }
+    }
+
+    async fn handle_commit_consumer_offset(
+        &self,
+        req: CommitConsumerOffsetRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.data_plane_tx
+            .send_async(CommitConsumerOffset {
+                key: req.offset_key,
+                generation: req.generation,
+                position: req.position,
+                reply,
+            })
+            .await?;
+        Ok(match response.await? {
+            ConsumerOffsetCommitAck::Committed => DataPlaneResponse::ConsumerOffsetCommitted.into(),
+            ConsumerOffsetCommitAck::StaleEpoch { sealed_generation } => {
+                DataPlaneResponse::StaleConsumerGroupEpoch(sealed_generation).into()
+            }
+            ConsumerOffsetCommitAck::InternalError(error) => {
+                DataPlaneResponse::InternalError(error).into()
+            }
+        })
+    }
+
+    async fn handle_fetch_consumer_offset(
+        &self,
+        FetchConsumerOffsetRequest(key): FetchConsumerOffsetRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.data_plane_tx
+            .send_async(ReadConsumerOffset { key, reply })
+            .await?;
+
+        Ok(DataPlaneResponse::ConsumerOffset(response.await?).into())
     }
 
     /// Routes a produce to the active segment's write leader (`replica_set[0]`),
