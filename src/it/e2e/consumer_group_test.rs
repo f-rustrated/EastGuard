@@ -746,6 +746,7 @@ fn consumer_group_split_rebalance() {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(10))
         .simulation_duration(Duration::from_secs(60))
+        .rng_seed(188)
         .build();
 
     host_cluster(&mut sim, NODES, |env| {
