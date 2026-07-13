@@ -47,6 +47,12 @@ pub(crate) fn rebuild_sparse_entries(path: &Path, key: SegmentKey) -> io::Result
                     WalRecordType::Data => {
                         pending = Some((position, start_offset + completed, record.record_count))
                     }
+                    WalRecordType::ConsumerOffset => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "consumer offset record in segment file",
+                        ));
+                    }
                     WalRecordType::BatchEnd => {
                         if let Some((byte_start, entry_id, _)) = pending.take() {
                             if is_index_anchor(byte_start, entry_id) {

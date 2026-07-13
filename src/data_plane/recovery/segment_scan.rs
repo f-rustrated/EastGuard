@@ -221,6 +221,12 @@ pub(crate) fn scan_segment_file(path: &Path) -> io::Result<SegmentScan> {
                 consumed += record.encoded_size() as u64;
                 match record.record_type {
                     WalRecordType::Data => pending += 1,
+                    WalRecordType::ConsumerOffset => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "consumer offset record in segment file",
+                        ));
+                    }
                     WalRecordType::BatchEnd => {
                         verified += pending;
                         valid_len = consumed;

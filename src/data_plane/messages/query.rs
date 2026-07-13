@@ -11,15 +11,17 @@ use tokio::sync::oneshot;
 
 use crate::connections::protocol::RangeProgressSignal;
 use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
+use crate::data_plane::offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition};
 use crate::data_plane::states::segment::cache::CachedEntry;
 use crate::impl_from_variant;
 
 pub enum DataPlaneQuery {
     Fetch(Fetch),
     ListOffsets(ListOffsets),
+    ReadConsumerOffset(ReadConsumerOffset),
 }
 
-impl_from_variant!(DataPlaneQuery, Fetch, ListOffsets);
+impl_from_variant!(DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset);
 
 /// Consume read request from a client. The broker layer (`clients.rs`) resolves
 /// `topic_name → topic_id` and the range's current `progress_signal` via a
@@ -76,4 +78,9 @@ pub enum ListOffsetsResult {
         next_entry_id: EntryId,
     },
     SegmentNotLocal,
+}
+
+pub struct ReadConsumerOffset {
+    pub key: ConsumerOffsetKey,
+    pub reply: oneshot::Sender<Option<ConsumerOffsetPosition>>,
 }
