@@ -363,8 +363,16 @@ pub struct RangeSealHistory {
 
 impl RangeSealHistory {
     pub fn record_seal(&mut self, sealed_at: u64) {
-        self.seal_timestamps.push_back(sealed_at);
-        let cutoff = sealed_at.saturating_sub(MEASUREMENT_WINDOW_MS);
+        // Proposal timestamps are captured before Raft serialization, so a
+        // delayed proposal can commit after one with a newer wall-clock value.
+        // Preserve the event times while keeping the committed history ordered.
+        let position = self
+            .seal_timestamps
+            .partition_point(|timestamp| *timestamp <= sealed_at);
+        self.seal_timestamps.insert(position, sealed_at);
+
+        let newest = self.seal_timestamps.back().copied().unwrap_or(sealed_at);
+        let cutoff = newest.saturating_sub(MEASUREMENT_WINDOW_MS);
         while self.seal_timestamps.front().is_some_and(|&t| t <= cutoff) {
             self.seal_timestamps.pop_front();
         }
