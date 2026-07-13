@@ -33,15 +33,20 @@ struct RangeRoute {
 // See c1_routing_and_connections.md / d4.
 impl From<&RangeDetail> for RangeRoute {
     fn from(range: &RangeDetail) -> Self {
-        let replicas: Box<[SocketAddr]> = range
+        let placement = range
             .active_segment
             .as_ref()
+            .or_else(|| range.sealed_segments.last());
+        let replicas: Box<[SocketAddr]> = placement
             .map(|seg| seg.replica_set.iter().map(|n| n.client_addr).collect())
             .unwrap_or_default();
         RangeRoute {
             range_id: range.range_id,
             keyspace_start: range.keyspace_start.clone(),
-            write_leader: replicas.first().copied(),
+            write_leader: range
+                .active_segment
+                .as_ref()
+                .and_then(|_| replicas.first().copied()),
             replicas,
         }
     }
@@ -67,7 +72,7 @@ impl TopicRouting {
             .map(|r| r.range_id)
     }
 
-    fn replicas(&self, range_id: RangeId) -> Option<&[SocketAddr]> {
+    pub(crate) fn replicas(&self, range_id: RangeId) -> Option<&[SocketAddr]> {
         self.ranges
             .iter()
             .find(|r| r.range_id == range_id)

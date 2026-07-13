@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::segment_scan::RecoveredSegments;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
+use crate::data_plane::offset_ledger::OffsetLedger;
 
 /// What recovery verified for one on-disk segment: its `start_offset` (the filename base,
 /// needed to locate the file) and `verified_end` (the highest entry id a CRC-complete batch
@@ -69,6 +70,7 @@ impl LocalInventory {
 pub(crate) struct RecoveryOutput {
     pub(crate) inventory: LocalInventory,
     pub(crate) data_dir: PathBuf,
+    pub(crate) offsets: OffsetLedger,
 }
 
 #[cfg(test)]
@@ -124,6 +126,7 @@ mod tests {
         let output = RecoveryOutput {
             inventory: inv,
             data_dir: PathBuf::from("/var/lib/eastguard/data"),
+            offsets: OffsetLedger::default(),
         };
         assert_eq!(output.inventory.orphan_candidates().count(), 0);
         assert_eq!(output.data_dir, PathBuf::from("/var/lib/eastguard/data"));

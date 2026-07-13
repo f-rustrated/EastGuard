@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::client::RangeId;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 
 /// Errors a caller decides on. Redirect-following, reconnect, and retry-within-deadline
 /// are handled internally.
@@ -37,6 +38,14 @@ pub enum ClientError {
     #[error("stale range routing")]
     StaleRange,
 
+    #[error(
+        "consumer group generation {request_generation:?} is stale; data layer sealed at {sealed_generation:?}"
+    )]
+    StaleConsumerGroupEpoch {
+        request_generation: GenerationId,
+        sealed_generation: GenerationId,
+    },
+
     /// A consumer range-control command could not be delivered or acknowledged.
     #[error("consumer {operation} failed for range {range_id}: {reason}")]
     ConsumerControl {
@@ -44,6 +53,9 @@ pub enum ClientError {
         range_id: u64,
         reason: String,
     },
+
+    #[error("consumer commit failed: {reason}")]
+    ConsumerCommit { reason: String },
 }
 
 impl ClientError {
@@ -63,5 +75,11 @@ impl ClientError {
             range_id: *range_id,
             reason,
         }
+    }
+
+    pub(crate) fn on_commit(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        tracing::warn!(reason, "consumer commit failed");
+        ClientError::ConsumerCommit { reason }
     }
 }

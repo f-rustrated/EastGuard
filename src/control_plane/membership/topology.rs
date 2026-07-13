@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
 use crate::control_plane::{NodeAddress, NodeId, SwimNodeState};
-use crate::smart_pointer;
+use crate::impl_new_struct_wrapper;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 
@@ -27,7 +27,7 @@ impl ShardGroupId {
     }
 }
 
-smart_pointer!(ShardGroupId, u64);
+impl_new_struct_wrapper!(ShardGroupId, u64);
 
 /// A shard group: the set of physical nodes responsible for a key range on the ring.
 #[derive(Debug, Clone, PartialEq, Eq)]

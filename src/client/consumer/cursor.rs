@@ -125,6 +125,11 @@ impl PendingCursorStore {
         self.fetchable.is_empty()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.fetchable.clear();
+        self.merge_waits.clear();
+    }
+
     pub fn remove(&mut self, range_id: RangeId) -> Option<RangeCursor> {
         if let Some(idx) = self.fetchable.iter().position(|c| c.range_id == range_id) {
             return Some(self.fetchable.remove(idx));
