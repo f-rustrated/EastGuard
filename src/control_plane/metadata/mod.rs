@@ -1,5 +1,6 @@
 pub(crate) mod command;
 pub mod constants;
+pub(crate) mod consumer_group;
 
 pub mod error;
 pub(crate) mod event;
@@ -17,35 +18,31 @@ pub(crate) mod segment;
 use borsh::{BorshDeserialize as Deser, BorshSerialize as Ser};
 
 pub(crate) use command::*;
+pub(crate) use consumer_group::{ConsumerGroupAssignment, ConsumerGroupMeta, ConsumerMemberId};
 
 pub(crate) use segment::*;
 
-use crate::smart_pointer;
+use crate::impl_new_struct_wrapper;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct TopicId(pub(crate) u64);
 
-smart_pointer!(TopicId, u64);
+impl_new_struct_wrapper!(TopicId, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ser, Deser, PartialOrd, Ord)]
 pub struct RangeId(pub(crate) u64);
 
-smart_pointer!(RangeId, u64);
-
-impl From<u64> for RangeId {
-    fn from(val: u64) -> Self {
-        RangeId(val)
-    }
-}
+impl_new_struct_wrapper!(RangeId, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct SegmentId(pub(crate) u64);
 
-smart_pointer!(SegmentId, u64);
+impl_new_struct_wrapper!(SegmentId, u64);
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct EntryId(pub u64);
 
-smart_pointer!(EntryId, u64);
+impl_new_struct_wrapper!(EntryId, u64);
 
 impl EntryId {
     pub const MIN: EntryId = EntryId(0);
@@ -63,12 +60,6 @@ impl EntryId {
 impl std::fmt::Display for EntryId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
-    }
-}
-
-impl From<u64> for EntryId {
-    fn from(val: u64) -> Self {
-        EntryId(val)
     }
 }
 
