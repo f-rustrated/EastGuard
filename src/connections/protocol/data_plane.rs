@@ -12,8 +12,13 @@ use std::net::SocketAddr;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta},
-    data_plane::messages::query::{FetchResult, ListOffsetsResult},
+    control_plane::metadata::{
+        EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
+    },
+    data_plane::{
+        messages::query::{FetchResult, ListOffsetsResult},
+        offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition},
+    },
     impl_from_variant,
 };
 
@@ -27,6 +32,8 @@ pub enum ClientDataPlaneRequest {
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
     ListOffsets(RangeOffsetRequest),
+    CommitConsumerOffset(CommitConsumerOffsetRequest),
+    FetchConsumerOffset(FetchConsumerOffsetRequest),
 }
 
 impl_from_variant!(
@@ -35,6 +42,8 @@ impl_from_variant!(
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
     ListOffsets(RangeOffsetRequest),
+    CommitConsumerOffset(CommitConsumerOffsetRequest),
+    FetchConsumerOffset(FetchConsumerOffsetRequest),
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -82,6 +91,16 @@ pub struct RangeOffsetRequest {
     pub range_id: RangeId,
 }
 
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct CommitConsumerOffsetRequest {
+    pub offset_key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+    pub position: ConsumerOffsetPosition,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct FetchConsumerOffsetRequest(pub ConsumerOffsetKey);
+
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum DataPlaneResponse {
     // Produce
@@ -113,6 +132,10 @@ pub enum DataPlaneResponse {
     StaleRange,
     TopicNotFound,
     SegmentNotLocal,
+
+    ConsumerOffsetCommitted,
+    StaleConsumerGroupEpoch(GenerationId),
+    ConsumerOffset(Option<ConsumerOffsetPosition>),
     InternalError(String),
 }
 

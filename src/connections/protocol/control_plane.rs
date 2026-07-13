@@ -16,14 +16,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use crate::control_plane::NodeId;
+use crate::control_plane::metadata::consumer_group::GenerationId;
+use crate::control_plane::metadata::strategy::StoragePolicy;
+use crate::impl_from_variant;
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::control_plane::NodeId;
-use crate::control_plane::metadata::strategy::StoragePolicy;
-
 use crate::control_plane::metadata::{
-    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState, TopicId,
-    TopicMeta, TopicState as MetaTopicState,
+    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
+    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState as MetaTopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -39,6 +40,18 @@ pub enum ControlPlaneRequest {
     DescribeTopic {
         name: String,
     },
+    SyncConsumerGroup(SyncConsumerGroupRequest),
+}
+
+impl_from_variant!(
+    ControlPlaneRequest,
+    SyncConsumerGroup(SyncConsumerGroupRequest)
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ConsumerGroupSyncAction {
+    Heartbeat,
+    Leave,
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -64,8 +77,16 @@ pub enum ControlPlaneResponse {
     NotRaftLeader {
         leader_addr: Option<NodeAddressInfo>,
     },
+    ConsumerGroupAssignment(ConsumerGroupAssignmentResponse),
+    ConsumerGroupLeft,
     // All control plane operations
     InternalError(String),
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+pub struct ConsumerGroupAssignmentResponse {
+    pub generation: GenerationId,
+    pub ranges: Box<[RangeId]>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]

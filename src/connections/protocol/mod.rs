@@ -27,7 +27,9 @@ pub use data_plane::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-use crate::{impl_from_variant, impl_from_variant_via};
+use crate::{
+    control_plane::metadata::SyncConsumerGroupRequest, impl_from_variant, impl_from_variant_via,
+};
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
 
@@ -66,5 +68,9 @@ impl_from_variant_via!(
     ProduceRequest,
     FetchRequest,
     FetchByIdRequest,
-    RangeOffsetRequest
+    RangeOffsetRequest,
+    CommitConsumerOffsetRequest,
+    FetchConsumerOffsetRequest
 );
+
+impl_from_variant_via!(ClientRequest, ControlPlaneRequest, SyncConsumerGroupRequest);
