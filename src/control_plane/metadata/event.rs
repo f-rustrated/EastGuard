@@ -5,7 +5,8 @@ use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    CatchUpAssignment, DeleteSegments, SealResponse, SegmentAssignment, SegmentSealed,
+    CatchUpAssignment, DataPlaneInterNodeCommand, DeleteSegments, SealResponse, SegmentAssignment,
+    SegmentSealed,
 };
 use crate::data_plane::offset_ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -205,20 +206,19 @@ impl TopicDeleted {
 impl ConsumerGroupEpochSnapshot {
     pub fn into_commands(self) -> Vec<DataTransportCommand> {
         self.ranges
-            .into_vec()
             .into_iter()
             .filter(|(_, replicas)| !replicas.is_empty())
             .map(|(range_id, replicas)| {
                 DataTransportCommand::send_to_targets(
                     replicas,
-                    EpochSeal {
+                    DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(EpochSeal {
                         offset_key: ConsumerOffsetKey {
                             topic_id: self.topic_id,
                             range_id,
                             group_id: self.group_id.clone(),
                         },
                         generation: self.generation,
-                    },
+                    }),
                 )
             })
             .collect()

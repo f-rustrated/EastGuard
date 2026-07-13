@@ -1551,6 +1551,8 @@ impl Raft {
                 );
                 break;
             };
+
+            // ? At this point if apply failed when things are already committed, what'd that mean?
             match entry.command {
                 RaftCommand::Noop => {}
                 RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
@@ -1593,9 +1595,8 @@ impl Raft {
             ),
         }
         if self.role == Role::Leader {
-            for pending_cmd in self.state_machine.take_pending_proposals() {
-                self.pending_proposals.push(pending_cmd);
-            }
+            self.pending_proposals
+                .extend(self.state_machine.take_pending_proposals());
         }
     }
 

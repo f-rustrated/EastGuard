@@ -4,12 +4,14 @@ use super::segment::*;
 use super::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
+use crate::control_plane::metadata::ConsumerGroupAssignment;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
 use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use MetadataError::*;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 pub struct MetadataStateMachine {
     pub(crate) topics: HashMap<TopicId, TopicMeta>,
@@ -36,6 +38,20 @@ impl MetadataStateMachine {
         self.topic_name_index
             .get(name)
             .and_then(|id| self.topics.get(id))
+    }
+
+    pub(crate) fn get_consumer_group_assignment(
+        &self,
+        topic_name: &str,
+        group_id: &str,
+        member_id: Uuid,
+    ) -> Option<ConsumerGroupAssignment> {
+        Some(
+            self.get_topic_by_name(topic_name)?
+                .consumer_groups
+                .get(group_id)?
+                .assignment_for(member_id),
+        )
     }
 
     pub(crate) fn topic_names(&self) -> Box<[String]> {
@@ -81,9 +97,13 @@ impl MetadataStateMachine {
             RollSegment(cmd) => self.roll_segment(cmd)?,
             SplitRange(cmd) => self.split_range(cmd)?.into(),
             MergeRange(cmd) => self.merge_range(cmd)?.into(),
-            DeleteTopic(cmd) => self.delete_topic(cmd).map(|()| ApplyResult::TopicDeleted)?,
+            DeleteTopic(cmd) => self.delete_topic(cmd)?.into(),
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
             DeleteSegments(cmd) => self.delete_segments(cmd)?,
+            SyncConsumerGroup(cmd) => self
+                .sync_consumer_group(cmd)?
+                .map(ApplyResult::ConsumerGroupChanged)
+                .unwrap_or(ApplyResult::Noop),
         };
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -139,22 +159,36 @@ impl MetadataStateMachine {
 
         // If Active, Roll
         let new_segment_id = range.roll_segment(cmd.clone())?;
-        if range.should_split(cmd.sealed_at) && can_split {
-            match range.build_split_proposal(&cmd) {
-                Ok(p) => self.pending_proposals.push(p),
-                Err(e) => {
-                    tracing::debug!(
-                        "Split proposal skipped for range {:?}: {:?}",
-                        cmd.segment_key.range_id,
-                        e
-                    )
-                }
+        let split_proposal = (range.should_split(cmd.sealed_at) && can_split)
+            .then(|| range.build_split_proposal(&cmd));
+
+        // For segment roll, unless data nodes got changed, consumer
+        // TODO For now, it loops over EVERY consumger groups and take epoch snapshot for every topic.
+        // TODO To reduce the load, it should specifically target groups that are affected by the possible range split
+        let consumer_group_epochs = topic
+            .consumer_groups
+            .keys()
+            .filter_map(|group_id| topic.consumer_group_epoch(group_id))
+            .collect();
+        tracing::debug!("Consumer groups: {:?}", consumer_group_epochs);
+
+        if let Some(proposal) = split_proposal {
+            match proposal {
+                Ok(proposal) => self
+                    .pending_proposals
+                    .push(MetadataCommand::SplitRange(proposal)),
+                Err(error) => tracing::debug!(
+                    "Split proposal skipped for range {:?}: {:?}",
+                    cmd.segment_key.range_id,
+                    error
+                ),
             }
         }
         Ok(SegmentRolled {
             new_segment_key: cmd.segment_key.with_segment_id(new_segment_id),
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
+            consumer_group_epochs,
         }
         .into())
     }
@@ -235,6 +269,7 @@ impl MetadataStateMachine {
             .ranges
             .get(&cmd.range_id)
             .ok_or(MetadataError::RangeNotFound)?;
+
         let parent_active_segment = parent_range.active_segment.and_then(|seg_id| {
             let seg = parent_range.segments.get(&seg_id)?;
             Some((
@@ -244,6 +279,9 @@ impl MetadataStateMachine {
         });
 
         let (left_id, right_id) = topic.execute_split(cmd.clone())?;
+
+        let consumer_group_epochs = topic.rebalance_consumer_groups();
+
         Ok(RangeSplit {
             topic_id: cmd.topic_id,
             children: [
@@ -251,6 +289,7 @@ impl MetadataStateMachine {
                 (right_id, SegmentId(0), cmd.right_replica_set),
             ],
             parent_active_segment,
+            consumer_group_epochs,
         })
     }
 
@@ -263,10 +302,31 @@ impl MetadataStateMachine {
             .ok_or(TopicNotFound(topic_id))?;
         topic.validate_active()?;
         let merged_id = topic.execute_merge(cmd)?;
+        let consumer_group_epochs = topic.rebalance_consumer_groups();
+
         Ok(RangeMerged {
             segment_key: SegmentKey::new(topic_id, merged_id, SegmentId(0)),
             replica_set,
+            consumer_group_epochs,
         })
+    }
+
+    fn sync_consumer_group(
+        &mut self,
+        cmd: SyncConsumerGroup,
+    ) -> Result<Option<ConsumerGroupEpochSnapshot>, MetadataError> {
+        let group_id = cmd.group_id.clone();
+
+        let topic = self
+            .topic_name_index
+            .get(&cmd.topic_name)
+            .and_then(|topic_id| self.topics.get_mut(topic_id))
+            .ok_or_else(|| TopicNameNotFound(cmd.topic_name.clone()))?;
+        topic.validate_active()?;
+        if !topic.sync_consumer_group(cmd) {
+            return Ok(None);
+        }
+        Ok(topic.consumer_group_epoch(&group_id))
     }
 
     // ! SAFETY: When the loop evaluates the [1, 2] pair and decides it is mergeable,
@@ -286,7 +346,7 @@ impl MetadataStateMachine {
             .collect()
     }
 
-    fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
+    fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<TopicDeleted, MetadataError> {
         let topic_id = self
             .topic_name_index
             .get(&cmd.name)
@@ -295,10 +355,16 @@ impl MetadataStateMachine {
 
         // Safety: topic_name_index and topics are always in sync —
         // see invariant below.
-        self.topics.get_mut(&topic_id).unwrap().delete();
+        let topic = self.topics.get_mut(&topic_id).unwrap();
+        topic.delete();
+
+        let consumer_group_epochs = topic.rebalance_consumer_groups();
+
         self.topic_name_index.remove(&cmd.name);
 
-        Ok(())
+        Ok(TopicDeleted {
+            consumer_group_epochs,
+        })
     }
 }
 
@@ -335,6 +401,7 @@ mod tests {
     use super::super::constants::*;
     use super::super::range::*;
     use super::*;
+    use crate::connections::protocol::ConsumerGroupSyncAction;
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::{
         NodeId,
@@ -380,6 +447,48 @@ mod tests {
             ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn consumer_group_generation_is_applied_through_metadata_log_command() {
+        let mut sm = MetadataStateMachine::new(ShardGroupId(1));
+        create_topic(&mut sm, "orders");
+        let member = uuid::Uuid::new_v4();
+        let command = SyncConsumerGroup {
+            req: SyncConsumerGroupRequest {
+                topic_name: "orders".into(),
+                group_id: "workers".into(),
+                member_id: member,
+                action: ConsumerGroupSyncAction::Heartbeat,
+            },
+            observed_at: 100,
+            session_timeout_ms: 10_000,
+        };
+
+        let ApplyResult::ConsumerGroupChanged(epoch) = sm.apply(command.clone().into()).unwrap()
+        else {
+            panic!("first member must create a committed generation");
+        };
+        assert_eq!(*epoch.generation, 1);
+        assert_eq!(epoch.ranges.len(), 1);
+        let assignment = sm
+            .get_consumer_group_assignment("orders", "workers", member)
+            .unwrap();
+        assert_eq!(*assignment.generation, 1);
+        assert_eq!(assignment.ranges.as_ref(), &[RangeId(0)]);
+
+        let mut heartbeat = command;
+        heartbeat.observed_at = 200;
+        assert!(matches!(
+            sm.apply(heartbeat.into()).unwrap(),
+            ApplyResult::Noop
+        ));
+        assert_eq!(
+            *sm.get_consumer_group_assignment("orders", "workers", member)
+                .unwrap()
+                .generation,
+            1
+        );
     }
 
     fn roll_segment(
@@ -1140,6 +1249,26 @@ mod tests {
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.seal_history.seal_count(), 1);
+    }
+
+    #[test]
+    fn seal_history_orders_delayed_proposal_timestamps() {
+        let mut history = RangeSealHistory::default();
+        history.record_seal(2000);
+        history.record_seal(1000);
+        history.record_seal(1500);
+
+        assert_eq!(history.seal_timestamps, VecDeque::from([1000, 1500, 2000]));
+    }
+
+    #[test]
+    fn delayed_old_seal_is_pruned_against_newest_timestamp() {
+        let mut history = RangeSealHistory::default();
+        let newest = MEASUREMENT_WINDOW_MS + 2000;
+        history.record_seal(newest);
+        history.record_seal(1000);
+
+        assert_eq!(history.seal_timestamps, VecDeque::from([newest]));
     }
 
     #[test]
