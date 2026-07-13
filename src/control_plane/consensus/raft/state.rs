@@ -13,8 +13,8 @@ use crate::control_plane::metadata::command::DeleteSegments;
 use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    EntryId, MetadataCommand, RangeId, ReassignSegment, ReplicaSet, RollSegment, SegmentId,
-    TopicId, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, ConsumerMemberId, EntryId, MetadataCommand, RangeId, ReassignSegment,
+    ReplicaSet, RollSegment, SegmentId, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
@@ -204,6 +204,16 @@ impl Raft {
 
     pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
         self.state_machine.get_topic_by_name(name)
+    }
+
+    pub(crate) fn get_consumer_group_assignment(
+        &self,
+        topic_name: &str,
+        group_id: &str,
+        member_id: ConsumerMemberId,
+    ) -> Option<ConsumerGroupAssignment> {
+        self.state_machine
+            .get_consumer_group_assignment(topic_name, group_id, member_id)
     }
 
     pub(crate) fn active_segments_for_node(
