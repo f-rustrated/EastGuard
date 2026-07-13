@@ -1,3 +1,7 @@
+use crate::control_plane::metadata::consumer_group::GenerationId;
+use crate::data_plane::offset_ledger::ConsumerOffsetKey;
+use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
+use crate::data_plane::offset_ledger::EpochSeal;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -15,13 +19,15 @@ use crate::{
 
 pub enum DataPlaneCommand {
     Produce(Produce),
-    CheckpointComplete(CheckpointComplete),
+    SegmentCheckpointComplete(SegmentCheckpointComplete),
+    OffsetCheckpointComplete(OffsetCheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
     /// source read. The worker turns it into `CatchUpChunk`s on the transport.
     CatchUpReadComplete(CatchUpReadComplete),
     OrphanGcCheck(OrphanGcCheck),
+    CommitConsumerOffset(CommitConsumerOffset),
 }
 
 /// What the orphan-GC handler replies to the ticker: keep ticking while strays remain, or
@@ -42,6 +48,20 @@ pub struct Produce {
     pub data: EntryPayload,
     pub record_count: u32,
     pub reply: oneshot::Sender<ProduceAck>,
+}
+
+pub struct CommitConsumerOffset {
+    pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+    pub position: ConsumerOffsetPosition,
+    pub reply: oneshot::Sender<ConsumerOffsetCommitAck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerOffsetCommitAck {
+    Committed,
+    StaleEpoch { sealed_generation: GenerationId },
+    InternalError(String),
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -230,6 +250,7 @@ pub enum DataPlaneInterNodeCommand {
     SealBoundaryQuery(SealBoundaryQuery),
     SealBoundaryReport(SealBoundaryReport),
     DeleteSegments(DeleteSegments),
+    ConsumerGroupEpochSeal(EpochSeal),
 }
 
 impl_from_variant!(
@@ -250,6 +271,7 @@ impl_from_variant!(
     SealBoundaryQuery,
     SealBoundaryReport,
     DeleteSegments,
+    ConsumerGroupEpochSeal(EpochSeal),
 );
 
 #[derive(Debug)]
@@ -263,11 +285,15 @@ pub enum ProduceAck {
     Err(String),
 }
 
-pub struct CheckpointComplete {
+pub struct SegmentCheckpointComplete {
     pub segment_key: SegmentKey,
     pub checkpointed_lsn: u64,
     pub new_frontier: u64,
     pub checkpointed_bytes: u64,
+}
+
+pub struct OffsetCheckpointComplete {
+    pub checkpointed_lsn: u64,
 }
 
 /// The cold-read pool's reply for a catch-up *source* read.
@@ -283,9 +309,11 @@ pub struct CatchUpReadComplete {
 impl_from_variant!(
     DataPlaneCommand,
     Produce,
-    CheckpointComplete,
+    SegmentCheckpointComplete,
+    OffsetCheckpointComplete,
     CatchUpReadComplete,
     OrphanGcCheck,
+    CommitConsumerOffset,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );
