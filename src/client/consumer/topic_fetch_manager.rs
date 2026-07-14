@@ -1,43 +1,25 @@
 use super::RangeCursor;
 
-use crate::client::consumer::cursor::StartPolicy;
-use crate::client::consumer::group::{ConsumerGroup, ConsumerPosition};
+use super::messages::*;
+use crate::client::consumer::config::StartPolicy;
+use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
 use crate::client::consumer::{
     ConsumerContext, ConsumerRecord, MergeSiblingState, PendingCursorStore,
 };
 use crate::client::{ClientError, CommitMode, ConsumerConfig};
-use crate::connections::protocol::{RangeDetail, RangeTransition};
+use crate::connections::protocol::{RangeDetail, RangeTransition, RebalancePlan};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
+use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
+use crate::impl_from_variant;
 
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-
-pub(crate) enum TopicFetchManagerCommand {
-    Pause {
-        range_id: RangeId,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-    },
-    Resume {
-        range_id: RangeId,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-    },
-    Seek {
-        range_id: RangeId,
-        absolute_offset: u64,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-    },
-}
-
-pub(crate) struct RangeDrained {
-    pub cursor: RangeCursor,
-    pub transition: RangeTransition,
-}
 
 pub(crate) struct TopicFetchManagerState {
     pending_cursors: PendingCursorStore,
@@ -129,34 +111,78 @@ impl TopicFetchManagerState {
         }
     }
 
-    fn handle_command(&mut self, command: TopicFetchManagerCommand) {
+    async fn handle_command(
+        &mut self,
+        command: TopicFetchManagerCommand,
+        ctx: &Arc<ConsumerContext>,
+    ) {
         match command {
-            TopicFetchManagerCommand::Pause { range_id, reply } => {
-                self.forward_actor_command("pause", range_id, reply, |reply| {
+            TopicFetchManagerCommand::PauseRange(command) => {
+                self.dispatch_actor_command("pause", command.range_id, command.reply, |reply| {
                     RangeFetchActorCommand::Pause { reply }
                 });
             }
-            TopicFetchManagerCommand::Resume { range_id, reply } => {
-                self.forward_actor_command("resume", range_id, reply, |reply| {
+            TopicFetchManagerCommand::ResumeRange(command) => {
+                self.dispatch_actor_command("resume", command.range_id, command.reply, |reply| {
                     RangeFetchActorCommand::Resume { reply }
                 });
             }
-            TopicFetchManagerCommand::Seek {
-                range_id,
-                absolute_offset,
-                reply,
-            } => {
-                self.forward_actor_command("seek", range_id, reply, |reply| {
+            TopicFetchManagerCommand::SeekRange(command) => {
+                self.dispatch_actor_command("seek", command.range_id, command.reply, |reply| {
                     RangeFetchActorCommand::Seek {
-                        absolute_offset,
+                        absolute_offset: command.absolute_offset,
                         reply,
                     }
                 });
             }
+            TopicFetchManagerCommand::RetryCommitAfterEpochRefresh(command) => {
+                let result = self.retry_commit_after_epoch_refresh(ctx).await;
+                let _ = command.reply.send(result);
+            }
         }
     }
 
-    fn forward_actor_command(
+    async fn handle_commit(&mut self, ctx: &Arc<ConsumerContext>) -> Result<(), ClientError> {
+        let Some(group) = self.consumer_group.clone() else {
+            return Ok(());
+        };
+
+        match group.commit().await {
+            Err(ClientError::StaleConsumerGroupEpoch { .. }) => {
+                self.retry_commit_after_epoch_refresh(ctx).await
+            }
+            result => result,
+        }
+    }
+
+    async fn retry_commit_after_epoch_refresh(
+        &mut self,
+        ctx: &Arc<ConsumerContext>,
+    ) -> Result<(), ClientError> {
+        let Some(group) = self.consumer_group.clone() else {
+            return Ok(());
+        };
+        self.fence_group_fetchers(&group);
+
+        let plan = self.prepare_rebalance(&group, ctx).await?;
+
+        let commit_result = group.commit_owned(&plan.effective).await;
+        self.provision_range_actors(plan.to_start, ctx).await;
+        commit_result
+    }
+
+    // It stops all fetch actors deliberately because a stale epoch invalidates the manager’s entire ownership snapshot, not just one range.
+    // Until the latest assignment and lineage metadata are loaded, it cannot safely identify which actors remain valid.
+    fn fence_group_fetchers(&mut self, group: &ConsumerGroup) {
+        group.fence_delivery();
+        for (_, stop_tx) in self.senders.drain() {
+            let _ = stop_tx.send(RangeFetchActorCommand::Stop);
+        }
+        self.pending_cursors.clear();
+        group.clear_effective_ownership();
+    }
+
+    fn dispatch_actor_command(
         &self,
         operation: &'static str,
         range_id: RangeId,
@@ -187,44 +213,72 @@ impl TopicFetchManagerState {
     }
 
     async fn handle_rebalance(&mut self, ctx: &Arc<ConsumerContext>) {
-        let Some(group) = &self.consumer_group else {
+        let Some(group) = self.consumer_group.clone() else {
             return;
         };
 
-        // Perform rebalance inside ConsumerGroup
-        let (to_drop, to_start) =
-            group.rebalance(&ctx.all_ranges(), self.senders.keys().cloned().collect());
+        let Ok(plan) = self.prepare_rebalance(&group, ctx).await else {
+            return;
+        };
 
-        // Abort revoked tasks immediately and commit their offsets in the background
-        // to prevent blocking the main cursor manager loop.
-        if !to_drop.is_empty() {
-            for range in &to_drop {
-                // Revoke ownership: send Stop, remove cursor and stop channel.
-                if let Some(stop_tx) = self.senders.remove(range) {
-                    let _ = stop_tx.send(RangeFetchActorCommand::Stop);
-                }
-                self.pending_cursors.remove(*range);
-            }
+        self.provision_range_actors(plan.to_start, ctx).await;
+    }
 
-            let group = group.clone();
-            tokio::spawn(async move {
-                let _ = group.revoke_ranges(&to_drop).await;
-            });
+    async fn prepare_rebalance(
+        &mut self,
+        group: &ConsumerGroup,
+        ctx: &Arc<ConsumerContext>,
+    ) -> Result<RebalancePlan, ClientError> {
+        // Request first, then refresh only when the cached metadata cannot
+        // describe a range referenced by the assignment.
+
+        let assigned = group.request_assignment().await?;
+        let metadata_covers_assignment = {
+            let metadata = ctx.metadata.load();
+            assigned.iter().all(|assigned| {
+                metadata
+                    .ranges
+                    .iter()
+                    .any(|range| range.range_id == *assigned)
+            })
+        };
+
+        if !metadata_covers_assignment {
+            ctx.refresh_metadata().await?;
         }
 
+        let plan = ctx
+            .metadata
+            .load()
+            .rebalance(assigned, |range| !self.senders.contains_key(range));
+
+        // reconcile effective ownership
+        let to_drop = group.install_effective_ownership(plan.effective.clone());
+        for range in to_drop {
+            // Revoke ownership: send Stop, remove cursor and stop channel.
+            if let Some(stop_tx) = self.senders.remove(&range) {
+                let _ = stop_tx.send(RangeFetchActorCommand::Stop);
+            }
+            self.pending_cursors.remove(range);
+        }
+
+        Ok(plan)
+    }
+
+    async fn provision_range_actors(&mut self, to_start: Vec<RangeId>, ctx: &Arc<ConsumerContext>) {
         if to_start.is_empty() {
             return;
         }
 
-        // Offset recovery must fail closed: an unavailable offsets topic is not
-        // evidence that this group has no committed offsets. Leave the ranges
-        // unstarted so the next rebalance tick retries recovery.
+        let Some(group) = self.consumer_group.clone() else {
+            return;
+        };
+
+        // An unavailable offsets topic is not evidence that this group has no committed offsets.
+        // Leave the actor for this range unstarted so the next rebalance tick retries recovery.
         let Ok(Ok(saved_offsets)) = tokio::time::timeout(
             Duration::from_secs(2),
-            group
-                .client
-                .clone()
-                .fetch_all_saved_offsets(&group.group_id, &ctx.topic),
+            group.fetch_saved_offsets(ctx.all_ranges()),
         )
         .await
         else {
@@ -340,7 +394,7 @@ impl TopicFetchManagerState {
         &self,
         range_id: RangeId,
         ranges: &[RangeDetail],
-        saved_offsets: &HashMap<RangeId, ConsumerPosition>,
+        saved_offsets: &HashMap<RangeId, ConsumerOffsetPosition>,
         resolved_entry_id: EntryId,
     ) -> bool {
         self.has_active_descendant(range_id, ranges)
@@ -397,7 +451,7 @@ impl TopicFetchManagerState {
         &self,
         range_id: RangeId,
         ranges: &[RangeDetail],
-        saved_offsets: &HashMap<RangeId, ConsumerPosition>,
+        saved_offsets: &HashMap<RangeId, ConsumerOffsetPosition>,
     ) -> bool {
         for p in ranges.iter() {
             let is_parent = p
@@ -481,23 +535,17 @@ pub(crate) async fn run_topic_fetch_manager(
 
             res = command_rx.recv_async() => {
                 let Ok(command) = res else { break };
-                state.handle_command(command);
+                state.handle_command(command, &ctx).await;
             }
 
             _ = commit_interval.tick(), if state.should_auto_commit() => {
-                let group = state.consumer_group.as_ref().unwrap().clone();
-                tokio::spawn(async move {
-                    let _ = group.commit().await;
-                });
+                let _ = state.handle_commit(&ctx).await;
             }
 
             _ = rebalance_interval.tick(), if state.consumer_group.is_some() => {
                 if startup_grace_ticks > 0 {
                     startup_grace_ticks -= 1;
                 } else {
-                    if state.pending_cursors.is_empty() {
-                        let _ = ctx.refresh_metadata().await;
-                    }
                     state.handle_rebalance(&ctx).await;
                 }
             }
@@ -540,9 +588,10 @@ impl TAssertInvariant for TopicFetchManagerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::TopicDetail;
     use crate::client::consumer::cursor::PendingCursorStore;
-    use crate::connections::protocol::SegmentDetail;
-    use crate::control_plane::metadata::SegmentId;
+    use crate::connections::protocol::{SegmentDetail, TopicState};
+    use crate::control_plane::metadata::{SegmentId, TopicId};
     use std::collections::HashMap;
 
     fn manager_state() -> TopicFetchManagerState {
@@ -605,7 +654,7 @@ mod tests {
         let mut offsets = HashMap::new();
         offsets.insert(
             RangeId(0),
-            ConsumerPosition {
+            ConsumerOffsetPosition {
                 entry_id: EntryId(2),
                 batch_offset: 0,
                 absolute_offset: 2,
@@ -622,7 +671,7 @@ mod tests {
         let mut offsets = HashMap::new();
         offsets.insert(
             RangeId(0),
-            ConsumerPosition {
+            ConsumerOffsetPosition {
                 entry_id: EntryId(1),
                 batch_offset: 0,
                 absolute_offset: 1,
@@ -630,5 +679,36 @@ mod tests {
         );
 
         assert!(state.has_undrained_parent(RangeId(1), &ranges, &offsets));
+    }
+
+    #[test]
+    fn split_parent_is_delegated_to_exactly_one_child_owner() {
+        let ranges = split_ranges();
+
+        let topic = TopicDetail {
+            topic_id: TopicId(0),
+            name: "test".to_string(),
+            state: TopicState::Active,
+            ranges,
+        };
+
+        let left = topic.effective_group_ranges(HashSet::from([RangeId(1)]));
+        assert_eq!(left, HashSet::from([RangeId(0), RangeId(1)]));
+
+        let right = topic.effective_group_ranges(HashSet::from([RangeId(2)]));
+        assert_eq!(right, HashSet::from([RangeId(2)]));
+    }
+
+    #[test]
+    fn sealed_ancestor_sorts_before_split_children() {
+        let ranges = split_ranges();
+        let topic = TopicDetail {
+            topic_id: TopicId(0),
+            name: "test".to_string(),
+            state: TopicState::Active,
+            ranges,
+        };
+        assert!(topic.lineage_depth(RangeId(0)) < topic.lineage_depth(RangeId(1)));
+        assert!(topic.lineage_depth(RangeId(0)) < topic.lineage_depth(RangeId(2)));
     }
 }

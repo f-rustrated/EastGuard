@@ -18,7 +18,7 @@ use crate::control_plane::metadata::strategy::StoragePolicy;
 use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
 use crate::impl_from_variant;
 use borsh::{BorshDeserialize, BorshSerialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
     EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
@@ -146,6 +146,68 @@ impl TopicDetail {
             .map(|r| r.range_id)
             .collect()
     }
+
+    pub fn rebalance(
+        &self,
+        assigned: HashSet<RangeId>,
+        need_start: impl Fn(&RangeId) -> bool,
+    ) -> RebalancePlan {
+        let effective = self.effective_group_ranges(assigned);
+        let mut to_start: Vec<_> = effective
+            .iter()
+            .filter(|range| need_start(range))
+            .copied()
+            .collect();
+        to_start.sort_by_key(|range| self.lineage_depth(*range));
+
+        RebalancePlan {
+            effective,
+            to_start,
+        }
+    }
+
+    /// Expand the Raft-backed active-range assignment with sealed predecessors that
+    /// still need one SDK member to drain them. A split delegates its parent to the
+    /// first child; a merge delegates both parents to the merged child. Repeating
+    /// the expansion handles multi-level lineage while preserving a single owner.
+    pub fn effective_group_ranges(&self, mut effective: HashSet<RangeId>) -> HashSet<RangeId> {
+        loop {
+            let mut changed = false;
+            for range in &*self.ranges {
+                let delegated = range
+                    .split_into
+                    .is_some_and(|(first, _)| effective.contains(&first))
+                    || range
+                        .merged_into
+                        .is_some_and(|merged| effective.contains(&merged));
+                if delegated {
+                    changed |= effective.insert(range.range_id);
+                }
+            }
+            if !changed {
+                return effective;
+            }
+        }
+    }
+
+    pub fn lineage_depth(&self, range_id: RangeId) -> usize {
+        self.ranges
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .split_into
+                    .is_some_and(|children| children.0 == range_id || children.1 == range_id)
+                    || candidate.merged_into == Some(range_id)
+            })
+            .map(|parent| self.lineage_depth(parent.range_id).saturating_add(1))
+            .max()
+            .unwrap_or_default()
+    }
+}
+
+pub struct RebalancePlan {
+    pub effective: HashSet<RangeId>,
+    pub to_start: Vec<RangeId>,
 }
 
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)
