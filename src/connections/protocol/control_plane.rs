@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
     EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
-    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState as MetaTopicState,
+    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -94,12 +94,6 @@ pub struct TopicSummary {
     pub state: TopicState,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub enum TopicState {
-    Active,
-    Deleting,
-}
-
 /// Full metadata snapshot for a topic, returned by `DescribeTopic`. Includes every
 /// range — active, sealed, and deleting — so a consumer can walk lineage from any
 /// historical ancestor forward through splits and merges.
@@ -129,12 +123,7 @@ impl TopicDetail {
         TopicDetail {
             topic_id: meta.id,
             name: meta.name,
-            state: match meta.state {
-                MetaTopicState::Active => TopicState::Active,
-                // Wire-level coarsening: clients only see "tearing down"; the
-                // internal Sealed → Deleted progression is GC bookkeeping.
-                MetaTopicState::Sealed | MetaTopicState::Deleted => TopicState::Deleting,
-            },
+            state: meta.state,
             ranges,
         }
     }

@@ -409,8 +409,8 @@ impl TAssertInvariant for PendingCursorStore {
 mod tests {
     use super::*;
     use super::*;
-    use crate::connections::protocol::{RangeDetail, SegmentDetail, TopicState};
-    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId};
+    use crate::connections::protocol::{RangeDetail, SegmentDetail};
+    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId, TopicState};
 
     fn cursor(range_id: RangeId, next_entry_id: EntryId, start: &[u8], end: &[u8]) -> RangeCursor {
         RangeCursor::new(range_id, next_entry_id, start.to_vec(), end.to_vec())

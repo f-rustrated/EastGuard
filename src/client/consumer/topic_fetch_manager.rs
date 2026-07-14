@@ -590,8 +590,8 @@ mod tests {
     use super::*;
     use crate::client::TopicDetail;
     use crate::client::consumer::cursor::PendingCursorStore;
-    use crate::connections::protocol::{SegmentDetail, TopicState};
-    use crate::control_plane::metadata::{SegmentId, TopicId};
+    use crate::connections::protocol::SegmentDetail;
+    use crate::control_plane::metadata::{SegmentId, TopicId, TopicState};
     use std::collections::HashMap;
 
     fn manager_state() -> TopicFetchManagerState {

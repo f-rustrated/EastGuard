@@ -3,7 +3,9 @@ use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::metadata::{RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest};
+use crate::control_plane::metadata::{
+    RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest, TopicState,
+};
 use crate::control_plane::{
     NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
