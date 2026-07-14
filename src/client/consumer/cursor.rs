@@ -8,6 +8,7 @@
 //! `end_offset`. The store enforces this by making successors fetchable only
 //! after their predecessor requirements are satisfied.
 
+use crate::client::StartPolicy;
 use crate::client::TopicDetail;
 use crate::connections::protocol::RangeDetail;
 use crate::connections::protocol::RangeTransition;
@@ -52,23 +53,6 @@ impl KeyInterest {
             KeyInterest::KeySpan { start, end } => {
                 r.keyspace_start < *end && *start < r.keyspace_end
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartPolicy {
-    Latest,
-    Earliest,
-}
-
-impl std::str::FromStr for StartPolicy {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "latest" => Ok(StartPolicy::Latest),
-            "earliest" => Ok(StartPolicy::Earliest),
-            _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
         }
     }
 }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::client::consumer::topic_fetch_manager::RangeDrained;
+use crate::client::consumer::messages::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{

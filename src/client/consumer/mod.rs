@@ -4,9 +4,9 @@ use std::sync::Arc;
 use crate::client::consumer::context::ConsumerContext;
 use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::topic_fetch_manager::{
-    PauseRange, RangeDrained, RecoverStaleCommit, ResumeRange, SeekRange, TopicFetchManagerCommand,
     TopicFetchManagerState, run_topic_fetch_manager,
 };
+
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
@@ -16,13 +16,17 @@ use crate::connections::protocol::{
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
 
+pub mod config;
+pub use config::*;
 pub(crate) mod context;
 pub(crate) mod cursor;
 pub(crate) mod group;
+mod messages;
+use messages::*;
 pub(crate) mod range_fetcher;
 pub(crate) mod topic_fetch_manager;
 
-pub use cursor::{KeyInterest, StartPolicy};
+pub use cursor::KeyInterest;
 pub(crate) use cursor::{MergeSiblingState, PendingCursorStore, RangeCursor};
 
 /// A record returned to the consumer application.
@@ -38,40 +42,6 @@ pub struct ConsumerRecord {
 impl ConsumerRecord {
     pub fn key_match<'a>(&'a self, key: impl Iterator<Item = &'a u8>) -> bool {
         self.key.iter().eq(key)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum DeliverySemantic {
-    AtLeastOnce,
-    AtMostOnceBestEffort,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommitMode {
-    Auto,
-    Manual,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConsumerConfig {
-    /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
-    pub start_policy: StartPolicy,
-    pub group_id: Option<String>,
-    pub auto_commit_interval_ms: u64,
-    pub delivery_semantic: DeliverySemantic,
-    pub commit_mode: CommitMode,
-}
-
-impl ConsumerConfig {
-    pub fn new(start_policy: StartPolicy) -> Self {
-        Self {
-            start_policy,
-            group_id: None,
-            auto_commit_interval_ms: 5000, // Default to 1 second for groups
-            delivery_semantic: DeliverySemantic::AtLeastOnce,
-            commit_mode: CommitMode::Auto,
-        }
     }
 }
 
@@ -176,7 +146,7 @@ impl Consumer {
                 group.fence_delivery();
                 let (reply, response) = tokio::sync::oneshot::channel();
                 self.command_tx
-                    .send_async(RecoverStaleCommit { reply }.into())
+                    .send_async(RetryCommitAfterEpochRefresh { reply }.into())
                     .await
                     .map_err(|_| ClientError::on_commit("manager is not running"))?;
                 response

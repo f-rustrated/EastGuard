@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use super::{ConsumerContext, ConsumerRecord, RangeCursor};
 use crate::client::consumer::context::RangeLookupResult;
-
-use crate::client::consumer::topic_fetch_manager::RangeDrained;
+use crate::client::consumer::messages::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{ClientError, CompressionCodec};
 use crate::connections::protocol::{
