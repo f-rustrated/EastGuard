@@ -73,7 +73,7 @@ impl ConsumerGroup {
             commit_lock: tokio::sync::Mutex::new(()),
         };
         let ranges = group.request_assignment().await?;
-        group.install_effective_ownership(ranges);
+        let _ = group.install_effective_ownership(ranges);
         Ok(group)
     }
 
@@ -212,11 +212,25 @@ impl ConsumerGroup {
         Ok(assignment.ranges.into_vec().into_iter().collect())
     }
 
-    pub(crate) fn install_effective_ownership(&self, ranges: HashSet<RangeId>) {
+    pub(crate) fn install_effective_ownership(&self, ranges: HashSet<RangeId>) -> Box<[RangeId]> {
+        let previous = self.owned_ranges.load_full();
+
+        let to_drop = previous.difference(&ranges).copied().collect();
+
+        //  Commit the new state
         let ranges = Arc::new(ranges);
         self.owned_ranges.store(ranges.clone());
-        self.offsets.retain(|range, _| ranges.contains(range));
+
+        // Clean up dropped ranges
+        // self.offsets.retain(|range, _| ranges.contains(range));
+        for range in &to_drop {
+            self.offsets.remove(range);
+        }
+
+        // Release the fence
         self.delivery_fenced.store(false, AtomicOrdering::Release);
+
+        to_drop
     }
 
     pub(crate) fn fence_delivery(&self) {
