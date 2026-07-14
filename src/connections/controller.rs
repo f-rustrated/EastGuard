@@ -1,6 +1,7 @@
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest};
 use crate::control_plane::{
@@ -648,10 +649,10 @@ pub async fn handle_client_stream(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
-        ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, NodeAddressInfo, NodeState,
-        ProduceRequest,
+        ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, NodeState, ProduceRequest,
     };
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
@@ -667,8 +668,6 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use std::net::SocketAddr;
-
-    use super::ClientController;
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()

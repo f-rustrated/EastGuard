@@ -18,9 +18,9 @@ use crate::client::{
     TopicDetail,
 };
 use crate::config::Environment;
-use crate::connections::protocol::{ClientResponse, NodeAddressInfo};
+use crate::connections::protocol::ClientResponse;
 use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::control_plane::{NodeAddress, NodeId};
+use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
 use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode

@@ -13,14 +13,12 @@
 //! stale or absent target costs a retry, never correctness. See
 //! d4_consumer_range_tracking.md §Bootstrap and d6_produce_consume_api.md.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-
-use crate::control_plane::NodeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
+use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
 use crate::impl_from_variant;
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::HashMap;
 
 use crate::control_plane::metadata::{
     EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
@@ -122,7 +120,7 @@ pub struct TopicDetail {
 // boundary (SWIM round-trip) and threaded through synchronously so the
 // describe path has no per-replica awaits.
 impl TopicDetail {
-    pub(crate) fn from_meta(meta: TopicMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    pub(crate) fn from_meta(meta: TopicMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let ranges = meta
             .ranges
             .into_values()
@@ -176,7 +174,7 @@ impl RangeDetail {
             .and_then(|s| s.end_entry_id)
             .unwrap_or(EntryId::MIN)
     }
-    fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let active_segment = range
             .active_segment
             .and_then(|id| range.segments.get(&id))
@@ -261,14 +259,14 @@ pub struct SegmentDetail {
 }
 
 impl SegmentDetail {
-    fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let replica_set = seg
             .replica_set
             .iter()
             .filter_map(|node| {
                 addresses.get(node).map(|addr| NodeAddressInfo {
-                    node_id: node.to_string(),
-                    client_addr: *addr,
+                    node_id: node.clone(),
+                    addr: *addr,
                 })
             })
             .collect();
@@ -282,34 +280,26 @@ impl SegmentDetail {
 
     /// Pick a replica from the segment's replica set.
     /// load-balances randomly across all replicas
-    pub fn pick_replica(&self) -> Option<SocketAddr> {
+    pub fn pick_replica(&self) -> Option<NodeAddressInfo> {
         if self.replica_set.is_empty() {
             return None;
         }
 
         use rand::RngExt;
         let idx = rand::rng().random_range(0..self.replica_set.len());
-        Some(self.replica_set[idx].client_addr)
+        Some(self.replica_set[idx].clone())
     }
 
     /// Active tails must be read from the write leader because followers may
     /// legitimately lag and report an empty tail. Sealed segments are immutable
     /// and can be read from any replica.
-    pub fn pick_read_replica(&self) -> Option<SocketAddr> {
+    pub fn pick_read_replica(&self) -> Option<NodeAddressInfo> {
         if self.end_entry_id.is_none() {
-            self.replica_set.first().map(|replica| replica.client_addr)
+            self.replica_set.first().cloned()
         } else {
             self.pick_replica()
         }
     }
-}
-
-/// A node identifier paired with its currently-known client address.
-/// Addresses come from SWIM membership; consumers cache them.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct NodeAddressInfo {
-    pub node_id: String,
-    pub client_addr: SocketAddr,
 }
 
 #[cfg(test)]

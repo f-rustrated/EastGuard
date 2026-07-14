@@ -122,8 +122,8 @@ impl RetryState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeId;
-    use crate::connections::protocol::NodeAddressInfo;
+    use crate::{NodeId, control_plane::NodeAddressInfo};
+
     use crate::control_plane::NodeAddress;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 

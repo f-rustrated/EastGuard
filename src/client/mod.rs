@@ -21,9 +21,10 @@ mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
 use crate::client::routing::TopicRouting;
-#[cfg(test)]
-use crate::connections::protocol::NodeAddressInfo;
+
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
+#[cfg(test)]
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};

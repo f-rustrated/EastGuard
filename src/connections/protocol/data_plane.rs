@@ -9,9 +9,12 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    connections::protocol::NodeAddressInfo,
-    control_plane::metadata::{
-        EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
+    control_plane::{
+        NodeAddressInfo,
+        metadata::{
+            EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta,
+            consumer_group::GenerationId,
+        },
     },
     data_plane::{
         messages::query::{FetchResult, ListOffsetsResult},

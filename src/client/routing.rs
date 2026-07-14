@@ -2,7 +2,8 @@
 //! routes without a metadata round-trip. A hint, never the truth: the server's
 //! per-request check corrects a stale entry with a redirect (`redirect.rs`), so the
 //! cache only ever costs an extra hop, never a wrong target.
-use crate::connections::protocol::{NodeAddressInfo, RangeDetail, TopicDetail};
+use crate::connections::protocol::{RangeDetail, TopicDetail};
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::{RangeId, TopicId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;

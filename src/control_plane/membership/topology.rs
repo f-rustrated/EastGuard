@@ -1,17 +1,14 @@
+use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
+use crate::control_plane::{NodeAddressInfo, NodeId, SwimNodeState};
+use crate::impl_new_struct_wrapper;
+#[cfg(any(test, debug_assertions))]
+use crate::test_traits::TAssertInvariant;
 use arc_swap::ArcSwap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use murmur3::murmur3_32;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
-
 use std::sync::Arc;
-
-use crate::connections::protocol::NodeAddressInfo;
-use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
-use crate::control_plane::{NodeId, SwimNodeState};
-use crate::impl_new_struct_wrapper;
-#[cfg(any(test, debug_assertions))]
-use crate::test_traits::TAssertInvariant;
 
 /// Deterministic identifier for a shard group, derived from the hash of the first
 /// virtual node on the consistent hash ring for a given key.

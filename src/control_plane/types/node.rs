@@ -7,6 +7,30 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::SwimNodeState::Alive;
 
+/// A node identifier paired with its currently-known client address.
+/// Addresses come from SWIM membership; consumers cache them.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct NodeAddressInfo {
+    pub node_id: NodeId,
+    pub addr: NodeAddress,
+}
+
+impl NodeAddressInfo {
+    pub fn new(node: NodeId, addr: NodeAddress) -> Self {
+        Self {
+            node_id: node,
+            addr,
+        }
+    }
+    pub(crate) fn client_addr(&self) -> SocketAddr {
+        self.addr.client_addr
+    }
+
+    pub(crate) fn cluster_addr(&self) -> SocketAddr {
+        self.addr.cluster_addr
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct NodeAddress {
     pub cluster_addr: SocketAddr,

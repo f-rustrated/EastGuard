@@ -5,8 +5,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::channels::BatchSender;
-use crate::connections::protocol::NodeAddressInfo;
 use crate::control_plane::NodeAddress;
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::NodeId;
 use crate::control_plane::SwimNode;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
