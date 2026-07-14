@@ -78,6 +78,13 @@ impl TopicRouting {
             .find(|r| r.range_id == range_id)
             .map(|r| r.replicas.as_ref())
     }
+
+    pub(crate) fn write_leader_for_range(&self, range_id: RangeId) -> Option<SocketAddr> {
+        self.ranges
+            .iter()
+            .find(|range| range.range_id == range_id)
+            .and_then(|range| range.replicas.first().copied())
+    }
 }
 
 /// Thread-safe, lock-free per-topic cache. Entries are replaced on refresh and
