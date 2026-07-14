@@ -4,7 +4,7 @@ use std::sync::Arc;
 use flume::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::offset_ledger::OffsetLedger;
+use crate::data_plane::consumer_offset_management::ledger::OffsetLedger;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 use crate::data_plane::wal::WalRecord;
 

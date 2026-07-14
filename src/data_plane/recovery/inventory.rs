@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::segment_scan::RecoveredSegments;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
-use crate::data_plane::offset_ledger::OffsetLedger;
+use crate::data_plane::consumer_offset_management::ledger::OffsetLedger;
 
 /// What recovery verified for one on-disk segment: its `start_offset` (the filename base,
 /// needed to locate the file) and `verified_end` (the highest entry id a CRC-complete batch

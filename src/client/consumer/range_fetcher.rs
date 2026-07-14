@@ -10,7 +10,7 @@ use crate::connections::protocol::{
     ClientResponse, DataPlaneResponse, RangeProgressSignal, RangeTransition, SegmentDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
 
 const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
 

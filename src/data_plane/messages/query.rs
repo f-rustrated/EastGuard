@@ -12,7 +12,9 @@ use tokio::sync::oneshot;
 use crate::connections::protocol::RangeProgressSignal;
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
-use crate::data_plane::offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition};
+use crate::data_plane::consumer_offset_management::ledger::{
+    ConsumerOffsetKey, ConsumerOffsetPosition,
+};
 use crate::data_plane::states::segment::cache::CachedEntry;
 use crate::impl_from_variant;
 

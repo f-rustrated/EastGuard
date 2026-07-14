@@ -1,7 +1,7 @@
 use crate::control_plane::metadata::consumer_group::GenerationId;
-use crate::data_plane::offset_ledger::ConsumerOffsetKey;
-use crate::data_plane::offset_ledger::ConsumerOffsetPosition;
-use crate::data_plane::offset_ledger::EpochSeal;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
+use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};

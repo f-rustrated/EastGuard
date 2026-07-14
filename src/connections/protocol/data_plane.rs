@@ -17,8 +17,8 @@ use crate::{
         },
     },
     data_plane::{
+        consumer_offset_management::ledger::{ConsumerOffsetKey, ConsumerOffsetPosition},
         messages::query::{FetchResult, ListOffsetsResult},
-        offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition},
     },
     impl_from_variant,
 };

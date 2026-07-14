@@ -13,7 +13,9 @@ use crate::connections::protocol::{
 };
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SyncConsumerGroupRequest, TopicId};
-use crate::data_plane::offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition};
+use crate::data_plane::consumer_offset_management::ledger::{
+    ConsumerOffsetKey, ConsumerOffsetPosition,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct OffsetTracker {

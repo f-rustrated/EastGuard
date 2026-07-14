@@ -17,11 +17,12 @@ use self::inventory::{LocalInventory, RecoveryOutput};
 use self::replay::ReplayWriter;
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
-use crate::data_plane::offset_ledger::{OffsetLedger, OffsetRecord};
+use crate::data_plane::consumer_offset_management::ledger::{OffsetLedger, OffsetRecord};
 use crate::data_plane::sparse_index::SparseIndex;
 use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::WalRecordType;
 use borsh::BorshDeserialize;
+
 use std::io;
 use std::path::PathBuf;
 
@@ -174,7 +175,7 @@ mod tests {
     use super::*;
     use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::SegmentKey;
-    use crate::data_plane::offset_ledger::{
+    use crate::data_plane::consumer_offset_management::ledger::{
         ConsumerOffsetKey, ConsumerOffsetPosition, EpochSeal, OffsetRecord,
     };
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
