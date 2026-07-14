@@ -1,12 +1,11 @@
 use super::*;
-
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::channels::BatchSender;
+use crate::connections::protocol::NodeAddressInfo;
 use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeId;
 use crate::control_plane::SwimNode;
@@ -146,7 +145,7 @@ pub(crate) enum ShardRouting {
     Local(ShardGroup),
     /// Not local; redirect the client to a member. `None` until the ring/addresses
     /// converge here — still retriable.
-    Redirect(Option<(NodeId, NodeAddress)>),
+    Redirect(Option<NodeAddressInfo>),
 }
 
 #[derive(Clone, Debug)]
@@ -205,10 +204,13 @@ impl SwimSender {
     pub(crate) async fn resolve_any(
         &self,
         members: &[NodeId],
-    ) -> anyhow::Result<Option<(NodeId, NodeAddress)>> {
+    ) -> anyhow::Result<Option<NodeAddressInfo>> {
         for member in members {
             if let Some(addr) = self.resolve_address(member.clone()).await? {
-                return Ok(Some((member.clone(), addr)));
+                return Ok(Some(NodeAddressInfo {
+                    node_id: member.clone(),
+                    addr,
+                }));
             }
         }
         Ok(None)
@@ -233,12 +235,12 @@ impl SwimSender {
 
     pub(crate) async fn list_all_node_addresses(
         &self,
-    ) -> anyhow::Result<HashMap<NodeId, SocketAddr>> {
+    ) -> anyhow::Result<HashMap<NodeId, NodeAddress>> {
         Ok(self
             .get_members()
             .await?
             .into_iter()
-            .map(|m| (m.node_id, m.addr.client_addr()))
+            .map(|m| (m.node_id, m.addr))
             .collect())
     }
 }

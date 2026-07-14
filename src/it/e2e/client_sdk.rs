@@ -18,8 +18,9 @@ use crate::client::{
     TopicDetail,
 };
 use crate::config::Environment;
-use crate::connections::protocol::ClientResponse;
+use crate::connections::protocol::{ClientResponse, NodeAddressInfo};
 use crate::control_plane::metadata::{EntryId, RangeId};
+use crate::control_plane::{NodeAddress, NodeId};
 use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
@@ -266,11 +267,15 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
             .cached_write_leader("stale", b"k")
             .expect("write leader cached after describe");
         // Poison the cache: point at a different live node (a replica, not the leader).
-        let wrong = client_seeds()
+        let wrong_addr = client_seeds()
             .into_iter()
-            .find(|a| *a != real)
+            .find(|a| *a != real.client_addr())
             .expect("another node");
-        client.poison_cache("stale", wrong);
+        let wrong = NodeAddressInfo::new(
+            NodeId::new("wrong"),
+            NodeAddress::test(wrong_addr, wrong_addr),
+        );
+        client.poison_cache("stale", wrong.clone());
         assert_eq!(
             client.cached_write_leader("stale", b"k"),
             Some(wrong),
@@ -433,7 +438,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
         let topic_id = detail.topic_id;
         let range = &detail.ranges[0];
         let range_id = range.range_id;
-        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr();
 
         // Perform a raw FetchById to retrieve the exact stored payload from the leader
         let fetch_req = FetchByIdRequest {
@@ -530,7 +535,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
         let topic_id = detail.topic_id;
         let range = &detail.ranges[0];
         let range_id = range.range_id;
-        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr;
+        let leader_addr = range.active_segment.as_ref().unwrap().replica_set[0].client_addr();
 
         // Perform a raw FetchById to retrieve the exact stored payload from the leader
         let fetch_req = FetchByIdRequest {

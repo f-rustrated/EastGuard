@@ -6,8 +6,9 @@ use std::io::Cursor;
 
 use std::sync::Arc;
 
+use crate::connections::protocol::NodeAddressInfo;
 use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
-use crate::control_plane::{NodeAddress, NodeId, SwimNodeState};
+use crate::control_plane::{NodeId, SwimNodeState};
 use crate::impl_new_struct_wrapper;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -48,8 +49,7 @@ pub struct VirtualNodeToken {
 
 #[derive(Debug, Clone)]
 pub struct ShardLeaderEntry {
-    pub leader_node_id: NodeId,
-    pub leader_addr: NodeAddress,
+    pub leader: NodeAddressInfo,
     pub term: u64,
 }
 
@@ -396,8 +396,7 @@ impl Topology {
         self.shard_leaders.insert(
             info.shard_group_id,
             ShardLeaderEntry {
-                leader_node_id: info.leader_node_id.clone(),
-                leader_addr: info.leader_addr,
+                leader: NodeAddressInfo::new(info.leader_node_id.clone(), info.leader_addr),
                 term: info.term,
             },
         );
@@ -523,6 +522,8 @@ pub mod props {
 
 #[cfg(test)]
 mod tests {
+    use crate::control_plane::NodeAddress;
+
     use super::*;
     use std::net::SocketAddr;
 
@@ -1087,13 +1088,13 @@ mod tests {
         assert!(topology.update_shard_leader(&info));
 
         let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
-        assert_eq!(entry.leader_node_id, NodeId::new("node-0"));
+        assert_eq!(entry.leader.node_id, NodeId::new("node-0"));
         assert_eq!(
-            entry.leader_addr.cluster_addr,
+            entry.leader.cluster_addr(),
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            entry.leader_addr.client_addr(),
+            entry.leader.client_addr(),
             "127.0.0.1:7080".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(entry.term, 1);
@@ -1138,7 +1139,7 @@ mod tests {
         assert!(topology.take_dirty(), "higher-term update must mark dirty");
 
         let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
-        assert_eq!(entry.leader_node_id, NodeId::new("node-1"));
+        assert_eq!(entry.leader.node_id, NodeId::new("node-1"));
         assert_eq!(entry.term, 3);
     }
 
@@ -1197,7 +1198,7 @@ mod tests {
         );
 
         let entry = topology.shard_leader(ShardGroupId(42)).unwrap();
-        assert_eq!(entry.leader_node_id, NodeId::new("node-0"));
+        assert_eq!(entry.leader.node_id, NodeId::new("node-0"));
         assert_eq!(entry.term, 5);
     }
 
@@ -1229,7 +1230,7 @@ mod tests {
             entry.is_some(),
             "shard leader entry must survive node death"
         );
-        assert_eq!(entry.unwrap().leader_node_id, NodeId::new("node-0"));
+        assert_eq!(entry.unwrap().leader.node_id, NodeId::new("node-0"));
     }
 
     #[test]

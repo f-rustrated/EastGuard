@@ -414,14 +414,20 @@ impl TopicMeta {
         )
     }
 
-    pub(crate) fn rebalance_consumer_groups(&mut self) -> Box<[String]> {
+    pub(crate) fn rebalance_consumer_groups(&mut self) -> Box<[ConsumerGroupEpochSnapshot]> {
+        let mut groups = Vec::with_capacity(self.consumer_groups.len());
+
         self.consumer_groups
             .iter_mut()
-            .filter_map(|(group_id, group)| {
-                group
-                    .rebalance_for_ranges(&self.active_ranges)
-                    .then(|| group_id.clone())
-            })
+            .for_each(|(group_id, group)| {
+                if group.rebalance_for_ranges(&self.active_ranges) {
+                    groups.push(group_id.clone());
+                }
+            });
+
+        groups
+            .into_iter()
+            .filter_map(|g| self.consumer_group_epoch(&g))
             .collect()
     }
 

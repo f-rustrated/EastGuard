@@ -21,6 +21,8 @@ mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
 use crate::client::routing::TopicRouting;
+#[cfg(test)]
+use crate::connections::protocol::NodeAddressInfo;
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
 use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
@@ -99,7 +101,7 @@ impl Client {
         for range in &detail.ranges {
             if let Some(seg) = &range.active_segment {
                 for replica in &seg.replica_set {
-                    self.known_nodes.remember(replica.client_addr);
+                    self.known_nodes.remember(replica.client_addr());
                 }
             }
         }
@@ -139,6 +141,7 @@ impl Client {
                         .or_else(|| r.sealed_segments.last())
                 })
                 .and_then(|seg| seg.pick_read_replica())
+                .map(|addr| addr.client_addr())
                 .unwrap_or_else(|| self.next_known_node());
 
             let req = RangeOffsetRequest {
@@ -177,7 +180,7 @@ impl Client {
             .ok_or(ClientError::StaleRange)?;
         let request_generation = request.generation;
 
-        let served = self.call(leader, request).await?;
+        let served = self.call(leader.client_addr(), request).await?;
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffsetCommitted) => Ok(()),
             ClientResponse::DataPlane(DataPlaneResponse::StaleConsumerGroupEpoch(stale)) => {
@@ -205,7 +208,7 @@ impl Client {
                     .write_leader_for_range(range_id)
                     .ok_or(ClientError::StaleRange)?;
                 let served = self
-                    .call(leader, FetchConsumerOffsetRequest(offset))
+                    .call(leader.client_addr(), FetchConsumerOffsetRequest(offset))
                     .await?;
                 match served.response {
                     ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffset(position)) => {
@@ -316,7 +319,8 @@ impl Client {
         // active range (the server will redirect).
         let start = routing
             .write_leader(routing_key)
-            .unwrap_or(self.next_known_node());
+            .map(|addr| addr.client_addr())
+            .unwrap_or_else(|| self.next_known_node());
 
         let request = ProduceRequest {
             topic_name: topic.to_string(),
@@ -441,10 +445,10 @@ impl Client {
         match response {
             ClientResponse::ControlPlane(cp) => match cp {
                 ControlPlaneResponse::TopicMetadataRedirect { owner } => {
-                    Redirect::Follow(owner.client_addr)
+                    Redirect::Follow(owner.client_addr())
                 }
                 ControlPlaneResponse::NotRaftLeader { leader_addr } => match leader_addr {
-                    Some(info) => Redirect::Follow(info.client_addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 ControlPlaneResponse::TopicNotFound => Redirect::NotFound,
@@ -459,11 +463,11 @@ impl Client {
             },
             ClientResponse::DataPlane(dp) => match dp {
                 DataPlaneResponse::NotWriteLeader { leader_addr } => match leader_addr {
-                    Some(addr) => Redirect::Follow(*addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 DataPlaneResponse::ShardNotLocal { hint_node } => match hint_node {
-                    Some(addr) => Redirect::Follow(*addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 DataPlaneResponse::TopicNotFound => Redirect::NotFound,
@@ -490,12 +494,12 @@ impl Client {
 impl Client {
     /// Test seam: poison the cached write leader for `topic` to a wrong (but live)
     /// node, to exercise stale-cache self-correction.
-    pub(crate) fn poison_cache(&self, topic: &str, wrong: SocketAddr) {
+    pub(crate) fn poison_cache(&self, topic: &str, wrong: NodeAddressInfo) {
         self.cache.poison_write_leaders(topic, wrong);
     }
 
     /// Test seam: read the currently-cached write leader for a routing key.
-    pub(crate) fn cached_write_leader(&self, topic: &str, key: &[u8]) -> Option<SocketAddr> {
+    pub(crate) fn cached_write_leader(&self, topic: &str, key: &[u8]) -> Option<NodeAddressInfo> {
         self.cache.write_leader(topic, key)
     }
 

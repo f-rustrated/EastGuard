@@ -122,7 +122,9 @@ impl RetryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NodeId;
     use crate::connections::protocol::NodeAddressInfo;
+    use crate::control_plane::NodeAddress;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     fn addr(port: u16) -> SocketAddr {
@@ -131,8 +133,8 @@ mod tests {
 
     fn info(port: u16) -> NodeAddressInfo {
         NodeAddressInfo {
-            node_id: format!("node-{port}"),
-            client_addr: addr(port),
+            node_id: NodeId::new(format!("node-{port}")),
+            addr: NodeAddress::test(addr(port), addr(port)),
         }
     }
 
@@ -186,7 +188,7 @@ mod tests {
         assert_eq!(
             classify(&ClientResponse::DataPlane(
                 DataPlaneResponse::NotWriteLeader {
-                    leader_addr: Some(addr(8083))
+                    leader_addr: Some(info(8083))
                 }
             )),
             "follow"

@@ -10,7 +10,7 @@ use crate::control_plane::SwimNodeState::Alive;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct NodeAddress {
     pub cluster_addr: SocketAddr,
-    client_addr: SocketAddr,
+    pub client_addr: SocketAddr,
     data_addr: SocketAddr,
 }
 

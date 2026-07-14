@@ -6,12 +6,10 @@
 //! routing cache. When this node is not the right destination, a redirect
 //! error is returned so the client can reconnect and retry. Stale targeting
 //! costs a retry, never correctness.
-
-use std::net::SocketAddr;
-
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
+    connections::protocol::NodeAddressInfo,
     control_plane::metadata::{
         EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
     },
@@ -124,10 +122,10 @@ pub enum DataPlaneResponse {
     // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
     // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
     NotWriteLeader {
-        leader_addr: Option<SocketAddr>,
+        leader_addr: Option<NodeAddressInfo>,
     },
     ShardNotLocal {
-        hint_node: Option<SocketAddr>,
+        hint_node: Option<NodeAddressInfo>,
     },
     StaleRange,
     TopicNotFound,
