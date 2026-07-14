@@ -60,6 +60,7 @@ pub struct CommitConsumerOffset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsumerOffsetCommitAck {
     Committed,
+    NotWriteLeader(Option<NodeId>),
     StaleEpoch { sealed_generation: GenerationId },
     InternalError(String),
 }
@@ -93,6 +94,39 @@ pub struct ReplicaAck {
     pub segment_key: SegmentKey,
     pub entry_id: EntryId,
     pub from: NodeId,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReplicaOffsetCommit {
+    pub operation_id: u64,
+    pub leader: NodeId,
+    pub replica_set: Vec<NodeId>,
+    pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+    pub position: ConsumerOffsetPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ReplicaOffsetStaleEpoch {
+    pub sealed_generation: GenerationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ReplicaOffsetAckResult {
+    Committed,
+    StaleEpoch(ReplicaOffsetStaleEpoch),
+}
+
+impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch(ReplicaOffsetStaleEpoch));
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReplicaOffsetAck {
+    pub operation_id: u64,
+    pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+    pub position: ConsumerOffsetPosition,
+    pub from: NodeId,
+    pub result: ReplicaOffsetAckResult,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -238,6 +272,8 @@ pub enum DataPlaneInterNodeCommand {
     SegmentAssignmentAck(SegmentAssignmentAck),
     ReplicaAppend(ReplicaAppend),
     ReplicaAck(ReplicaAck),
+    ReplicaOffsetCommit(ReplicaOffsetCommit),
+    ReplicaOffsetAck(ReplicaOffsetAck),
     CommitAdvance(CommitAdvance),
     SealRequest(SealRequest),
     SealResponse(SealResponse),
@@ -259,6 +295,8 @@ impl_from_variant!(
     SegmentAssignmentAck,
     ReplicaAppend,
     ReplicaAck,
+    ReplicaOffsetCommit,
+    ReplicaOffsetAck,
     CommitAdvance,
     SealRequest,
     SealResponse,
