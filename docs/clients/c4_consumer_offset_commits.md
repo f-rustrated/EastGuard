@@ -1,148 +1,72 @@
 # Phase C4: Consumer Offset Commits
 
-**Goal:** durable consumer offsets represent records the application has decided are safe
-to advance past. The consumer SDK must distinguish records it fetched, records it delivered,
-and records the application acknowledged, so auto-commit can stay fast without turning
-processing failures into skipped records.
+**Goal:** Make durable consumer progress mean “the application may safely resume after this
+record,” while preserving that meaning across batching, rebalances, range lineage, and broker
+restarts.
 
-**Depends on:** [c3_consumer.md](c3_consumer.md) for record positions and
-[d8_consumer_offset_management.md](../data-plane/d8_consumer_offset_management.md) for the
-current offset-storage path.
-
----
-
-## Why C4 Exists
-
-C3 defines how a consumer reads records across ranges and lineage. D8 defines where durable
-offsets are stored today: an internal offsets topic used by consumer groups. C4 defines the
-missing client-side contract between those two pieces:
-
-> *when is a delivered record eligible to become a durable committed offset?*
-
-That boundary cannot be the broker's job. The broker serves committed log entries, but it
-does not know whether application processing succeeded. Only the client side can decide
-whether a record should be replayed, skipped, retried, or dead-lettered.
+**Depends on:** [C3: Consumer](c3_consumer.md) for record positions and lineage, and
+[D8: Consumer Offset Management](../data-plane/d8_consumer_offset_management.md) for
+generation fencing, storage, and replication.
 
 ---
 
-## The Bug C4 Prevents
+## The Client-Side Boundary
 
-If the SDK marks a record committable when it is merely returned to application code, the
-auto-commit timer can write an offset before processing succeeds.
+The broker knows which records are committed to the range log. It does not know whether an
+application successfully processed a delivered record. C4 defines the boundary between those
+events.
+
+If delivery itself made a record committable in the default mode, an auto-commit could race
+ahead of application processing:
 
 ```
-fetch worker        SDK consumer API        application          commit timer
-    |                      |                    |                     |
-    | -- record ---------> |                    |                     |
-    |                      | -- returns rec --> |                     |
-    |                      | marks committable  |                     |
-    |                      |                    | -- processing ...   |
-    |                      |                    |                     | -- commits rec
-    |                      |                    | -- fails/crashes    |
+fetch actor          consumer API          application          commit timer
+    │                     │                    │                     │
+    │── record ──────────►│                    │                     │
+    │                     │── returns ────────►│                     │
+    │                     │                    │── processing ...    │
+    │                     │                    │                     │── commit
+    │                     │                    │── crash             │
 ```
 
-After restart, the consumer resumes after the committed position. The failed record can be
-skipped permanently. That is at-most-once relative to application processing, even if the
-caller expected the safer at-least-once behavior.
+Restart would resume after a record whose processing never completed. The client therefore
+separates delivery, acknowledgement, and durable commit.
 
 ---
 
-## Three Positions
+## Local Progress per Range
 
-A consumer that writes durable offsets tracks three positions per owned range:
+For each effectively owned range, the client tracks:
 
-| Position | Meaning | Durable commit source? |
+| Position | Meaning | Durable? |
 |---|---|---|
-| Fetched | Highest record pulled from the broker by the SDK | No |
-| Delivered | Highest record returned to application code | Only in at-most-once mode |
-| Acknowledged | Highest record the application marked terminal | Yes in at-least-once mode |
+| Delivered | Highest record returned to application code | No |
+| Committable | Highest record allowed by the selected delivery semantic | No |
+| Committed | Highest position successfully acknowledged by the data plane | Yes |
 
-The stored coordinate is still the C3 record position: range, entry id, batch offset, and
-absolute offset. C4 changes which lifecycle event makes that coordinate committable.
+The range cursor separately tracks fetched progress. Fetching can run ahead of delivery and
+therefore never makes a position committable by itself.
 
-```
-at least once: fetched -> delivered -> acknowledged -> committed
-at most once:  fetched -> delivered ---------------> committed
-```
+The durable coordinate contains the entry id, the record's offset within that entry, and its
+absolute record offset. This lets resume fetch the containing batch, skip records already
+processed inside it, and continue absolute numbering correctly.
+
+All three local positions move monotonically. A commit is skipped when it would not advance
+beyond the last successful commit.
 
 ---
 
 ## Delivery Semantics
 
-Delivery semantics are explicit configuration, not an implicit side effect of using the
-same consumer API from a different binary.
-
-| Semantic | Commit eligibility | Failure behavior | Default |
-|---|---|---|---|
-| At least once | Acknowledged records only | Unacknowledged records may replay | SDK default |
-| At most once | Delivered records | Delivered records may be skipped if processing fails | CLI default |
-
-The SDK default is at-least-once because application code usually has durable side effects.
-If the application crashes before acknowledging a record, replay is safer than silent loss.
-
-The CLI defaults to at-most-once because a consume command is usually an inspection tool:
-displaying the record is the useful action. The CLI still exposes a delivery flag for
-debugging replay behavior:
-
-```
-eg-cli consume --delivery at-least-once
-eg-cli consume --delivery at-most-once
-```
-
-The SDK should not detect that it is being called by the CLI. The CLI chooses at-most-once
-explicitly in its consumer configuration.
-
----
-
-## Commit Modes
-
-Delivery semantics decide *what* can be committed. Commit mode decides *when* committable
-progress is flushed to the broker.
-
-| Mode | Commit source | Flush behavior |
+| Semantic | When a record becomes committable | Intended tradeoff |
 |---|---|---|
-| Auto + at least once | Terminal application outcomes | SDK periodically writes acknowledged positions |
-| Manual + at least once | Terminal application outcomes | Application calls commit to write acknowledged positions |
-| Auto + at most once | Delivered records | SDK periodically writes delivered positions |
-| Manual + at most once | Delivered records | Application calls commit to write delivered positions |
+| At least once | Application acknowledges it | Processing failures replay rather than silently skip |
+| At most once, best effort | Consumer returns it to the application | Inspection stays convenient, but a crash may skip delivered work |
 
-Auto-commit remains the normal application default. It is not unsafe by itself; it becomes
-unsafe only if the position being flushed is based on delivery rather than processing
-outcome. In the default at-least-once mode, acknowledgement is local and cheap, while the
-timer batches durable offset writes.
+At least once is the SDK default. The explicit best-effort mode is useful for inspection
+tools and disposable processing, where displaying the record is itself the useful action.
 
-Manual commit means "sync the current committable position now." It is useful for shutdown,
-batch boundaries, tests, and operators who need a known checkpoint. It should not be
-required for normal correctness, because forcing a broker round trip per record would harm
-throughput.
-
----
-
-## Processing Outcomes
-
-In at-least-once mode, a record becomes committable only after it reaches a terminal
-application outcome.
-
-| Outcome | Commit effect |
-|---|---|
-| Processing succeeds | Acknowledge the record |
-| Processing fails but will retry | Do not acknowledge |
-| Retries are exhausted and policy is fail-stop | Do not acknowledge; stop or return the error |
-| Retries are exhausted and policy is skip | Mark terminal, then acknowledge |
-| Retries are exhausted and policy is dead-letter | Acknowledge only after the dead-letter write succeeds |
-
-For the pull API, the application owns retries because the SDK does not run the processing
-callback. A later handler-style API could own retries around a callback and acknowledge,
-dead-letter, or fail-stop according to policy.
-
-Skipping after retry exhaustion is useful, but it is still application-level data loss
-unless the failed record is captured somewhere else. That choice must be explicit.
-
----
-
-## API Shape
-
-The pull API exposes acknowledgement directly:
+Application acknowledgement is local and cheap:
 
 ```rust
 let record = consumer.next_record().await?;
@@ -150,8 +74,25 @@ process(&record).await?;
 consumer.ack(&record)?;
 ```
 
-Batch users can acknowledge records locally and flush the durable checkpoint at a batch
-boundary:
+Acknowledgement is a no-op in best-effort at-most-once mode because delivery already advanced
+the committable position.
+
+---
+
+## Auto and Manual Commit
+
+Delivery semantics decide **what** may be committed. Commit mode decides **when** current
+committable progress is sent to the broker.
+
+| Mode | Behavior |
+|---|---|
+| Auto | The manager periodically commits committable positions for owned ranges |
+| Manual | The application calls commit at a shutdown point, batch boundary, or explicit checkpoint |
+
+Auto-commit is safe in at-least-once mode because the timer flushes acknowledgements; it does
+not infer processing success from delivery. Manual commit synchronizes all currently
+committable owned ranges and returns only after their data replica sets have durably stored
+the positions.
 
 ```rust
 for record in batch {
@@ -161,83 +102,154 @@ for record in batch {
 consumer.commit().await?;
 ```
 
-A direct-position acknowledgement is useful for custom batching:
+The client serializes commit rounds for a group member so overlapping auto and manual commits
+cannot race their local committed markers.
 
-```rust
-consumer.ack_position(range, position)?;
+---
+
+## Acknowledgement Validation
+
+An acknowledgement is accepted only when:
+
+1. Delivery is not fenced during stale-generation recovery.
+2. The range is in the member's current effective ownership.
+3. This consumer delivered a record for the range.
+4. The acknowledged position does not exceed the highest delivered position.
+
+Older acknowledgements are harmless no-ops. These checks prevent delayed application work
+from advancing a range after revocation and prevent fabricated positions from skipping data.
+
+---
+
+## Assignment and Effective Ownership
+
+The control plane assigns active ranges. The client expands that assignment through range
+lineage because a sealed predecessor may still need draining before its split children or
+merge successor can safely progress.
+
+```
+control-plane assignment: child L
+effective ownership:      sealed parent P + child L
 ```
 
-Acknowledgement APIs are no-ops in at-most-once mode, so shared application code can call
-them without branching on delivery semantic.
+Exactly one child owner receives responsibility for a split parent. A merged successor waits
+until the relevant predecessor progress is durable. Ancestor actors start before descendants
+so a descendant cannot suppress the only actor capable of draining its predecessor.
+
+Normal rebalances reconcile incrementally:
+
+- revoked actors stop and lose their local offset trackers;
+- unchanged actors continue fetching;
+- new or previously unprovisioned actors start from durable offsets;
+- metadata refresh occurs only when the cached range details cannot describe the assignment.
+
+The client does **not** commit a revoked range using the new generation. Its uncommitted work
+must replay at the new owner; relabeling that progress with a newer generation would bypass
+the ownership fence.
 
 ---
 
-## Validation Rules
+## Stale-Generation Recovery
 
-Acknowledgements are local state transitions, but they still need guardrails:
+A commit can be rejected because membership or range topology advanced the group generation.
+That signal invalidates the manager's current ownership snapshot.
 
-1. **Current ownership.** Acknowledgement is accepted only for a range currently owned by
-   this consumer member.
-2. **Delivered cap.** Acknowledgement cannot move beyond the highest position this
-   consumer has delivered for that range.
-3. **Monotonicity.** Older acknowledgements are no-ops.
-4. **Commit deduplication.** Durable writes are skipped if the committable position is not
-   newer than the last successful commit.
+```
+commit rejected as stale
+        │
+        ▼
+fence delivery and stop every range actor
+        │
+        ▼
+request latest assignment + generation
+refresh metadata if assigned ranges are unknown
+        │
+        ▼
+install effective lineage ownership
+        │
+        ▼
+retry only positions still effectively owned
+        │
+        ▼
+reload durable offsets and restart owned actors
+```
 
-These checks keep stale application work from advancing a range after rebalance, and they
-prevent accidental commits for records this consumer instance never delivered.
+Stopping every actor is deliberately conservative. Until the refreshed assignment and
+lineage are known, the manager cannot identify which actor remains valid. Delivery fencing is
+immediate, so late records or acknowledgements are rejected while asynchronous stop commands
+are still being processed.
 
----
-
-## Rebalance Revocation
-
-When a range is revoked, the consumer must flush only the position allowed by the selected
-semantic:
-
-1. Stop accepting new acknowledgements for the revoked range.
-2. Stop the range fetcher.
-3. Flush the highest committable position.
-4. Remove local tracking for the range.
-
-In at-least-once mode, delivered but unacknowledged records can replay on the next owner.
-In at-most-once mode, delivered records can be skipped after revocation because the caller
-explicitly chose delivery-time commits.
-
-The zero-controller group design can still produce short duplicate-delivery windows while
-members converge. C4's responsibility is narrower: duplicates are acceptable; premature
-commits that skip unprocessed records are not acceptable in at-least-once mode.
+Retrying positions still owned preserves acknowledged application work. Positions for
+revoked ranges have already been discarded and are not included in the retry.
 
 ---
 
-## Test Coverage
+## Durable Commit and Resume
 
-C4 needs e2e tests because the bug lives across multiple async layers: range fetchers,
-public consumer delivery, auto-commit, offset-topic storage, and group resume.
+The client sends one commit to the range's data leader. Server-side replication, generation
+validation, shared-WAL durability, and leader redirects are described in D8.
 
-| Scenario | Expected behavior |
+When an actor starts, it first reads the group's durable position for its range:
+
+- If present, fetch begins at the containing entry and filters batch records through the
+  committed record offset.
+- If absent, the configured earliest/latest start policy applies.
+- If the durable read is unavailable or times out, the actor does not start. A later rebalance
+  retries instead of assuming no offset exists.
+
+This fail-closed behavior prevents a temporary broker failure from replaying an entire range
+or skipping to its tail under the fallback start policy.
+
+---
+
+## Processing Outcomes
+
+In at-least-once mode, application policy decides when a failed record becomes terminal:
+
+| Outcome | Acknowledgement |
 |---|---|
-| At-least-once auto-commit, delivered but unacknowledged | Restart replays the record |
-| At-least-once auto-commit, acknowledged | Restart resumes after the record |
-| At-least-once manual commit, partial acknowledgement | Restart resumes after the acknowledged subset only |
-| At-least-once revocation | New owner replays delivered but unacknowledged records |
-| At-most-once auto-commit | Restart skips delivered records even without acknowledgement |
-| Stale acknowledgement after revocation | Old owner cannot advance the range |
+| Processing succeeds | Acknowledge |
+| Processing will retry | Do not acknowledge |
+| Retry policy is fail-stop | Do not acknowledge |
+| Explicit skip policy | Acknowledge only after accepting the loss |
+| Dead-letter policy | Acknowledge only after the dead-letter write succeeds |
 
-The key regression test is the first one. It must wait past the auto-commit interval after
-delivery but before acknowledgement, then verify that the restarted group receives the same
-record again.
+The pull API does not implement retries or dead-lettering itself. It exposes records and local
+acknowledgement; the application owns those policies.
+
+---
+
+## Coverage Contract
+
+The behavior spans fetch actors, application delivery, group generations, range lineage, and
+data-plane durability, so both focused state tests and end-to-end tests are required.
+
+| Scenario | Expected behavior | Current coverage |
+|---|---|---|
+| Delivered but unacknowledged in at-least-once mode | Restart replays the record | End to end |
+| Acknowledged and committed | Restart resumes after the record | End to end |
+| Best-effort at-most-once delivery | Restart may skip the delivered record | End to end |
+| Membership rebalance | Revoked progress is not committed by the old owner | End to end |
+| Broker restart during rebalance | Durable progress resumes without replay | End to end |
+| Split rebalance | Sealed parent drains before assigned children progress | End to end |
+| Direct request to a follower | Redirect; follower does not accept a client commit | Gap: explicit rejection test still needed |
+| Replicated commit | Client success waits for every follower's durable acknowledgement | Data-plane state test |
 
 ---
 
 ## Rules
 
-1. **At-least-once is the SDK default.** Most application consumers prefer duplicate work
-   over silent loss.
-2. **Auto-commit flushes committable progress only.** The timer is a batching mechanism, not
-   a processing signal.
-3. **Acknowledgement is local; commit is durable.** This keeps the hot path cheap while
-   preserving a clear checkpoint operation.
-4. **At-most-once is explicit.** It is useful for inspection tools and disposable
-   processing, but callers must opt into delivery-time commits.
-5. **Revocation obeys the configured semantic.** Rebalance must not upgrade delivered
-   records into processed records under at-least-once mode.
+1. **At-least-once is the SDK default.** Duplicate processing is safer than silent loss for
+   applications with durable side effects.
+2. **Acknowledgement is local; commit is durable.** The processing hot path stays cheap while
+   the checkpoint boundary remains explicit.
+3. **Auto-commit flushes only committable progress.** A timer batches decisions; it does not
+   create processing decisions.
+4. **Only effective ownership may commit.** Active assignment alone is insufficient while a
+   sealed predecessor is still draining.
+5. **Revoked progress is discarded, not promoted to a new generation.** The new owner must
+   recover from the last durable checkpoint.
+6. **Offset recovery fails closed.** An unavailable durable-offset read must not be treated as
+   an empty checkpoint.
+7. **At-most-once behavior is explicit and best effort.** Delivery-time progress can skip
+   application work after a crash, so callers must opt in.

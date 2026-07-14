@@ -1,113 +1,256 @@
 # D8: Consumer Offset Management
 
-**Goal:** Enable consumers to durably record their progress (offsets) and collaboratively distribute work across ranges (Consumer Groups) without introducing a massive, complex server-side state machine.
-**Depends on:** [D6: Produce/Consume API](d6_produce_consume_api.md)
+**Goal:** Persist consumer-group progress on the data plane with the same durability and
+placement model as range data, while using control-plane generations to prevent a previous
+owner from advancing a range after reassignment.
+
+**Depends on:** [D2: Segment Replication](d2_segment_replication.md),
+[D4: Consumer Range Tracking](d4_consumer_range_tracking.md), and
+[D6: Produce/Consume API](d6_produce_consume_api.md).
 
 ---
 
-## The Landscape: How Others Do It
+## Responsibility Split
 
-Building a robust consumer group mechanism is historically one of the most complex parts of a streaming broker. Before defining EastGuard's approach, we evaluate the industry standards:
+Consumer groups cross three layers, but each layer owns a different kind of state:
 
-1. **Kafka (Heavy Server Coordinator):**
-   - Uses an internal `__consumer_offsets` topic for storage.
-   - A server-side "Group Coordinator" manages complex JoinGroup/SyncGroup/Heartbeat state machines.
-   - *Tradeoff:* Extremely robust, but building the coordinator state machine is a massive engineering investment (tens of thousands of lines of code).
+| Layer | Responsibility | Why it belongs there |
+|---|---|---|
+| Control plane | Membership, active-range assignment, monotonic generation | Assignment changes are ordered metadata decisions and need one authoritative fence |
+| Client | Delivery, acknowledgement, effective lineage ownership, auto/manual commit timing | Only the application side knows when processing is complete |
+| Data plane | Durable offset value, generation validation, replication, recovery | Offset commits are frequent writes and should not enter the Raft log |
 
-2. **Pulsar (Broker-managed Subscriptions):**
-   - The broker actively serving a partition also manages the consumer cursors in-memory, writing them durably to BookKeeper.
-   - *Tradeoff:* Couples data routing with consumer state. In EastGuard, ranges split/merge and segments move dynamically, making it difficult to pin cursor state to a specific data node.
+This is neither a hidden internal topic nor a client-only lease protocol. Group membership is
+committed through the topic's metadata shard. Offset values are stored directly by the data
+replicas that own the corresponding range.
 
-3. **NATS JetStream (Server-side Tracking):**
-   - The server entirely owns the consumer state, tracking per-message ACKs or sequence cursors via Raft.
-   - *Tradeoff:* High operational overhead on the consensus layer if not carefully sharded.
+```
+                 control plane (Raft)
+                membership + assignment
+                         │
+                  generation seal
+                         ▼
+client ── offset commit ──► range data leader ──► followers
+  │                              │                    │
+  └── assignment heartbeat       └──── shared WAL ────┘
+```
 
----
-
-## The EastGuard Approach: Decoupled & Resource-Efficient
-
-EastGuard draws architectural inspiration from systems like LinkedIn's Northguard, cleanly separating the control plane (metadata) from the data plane (payloads). To achieve horizontal scalability far beyond what centralized coordinators can manage, EastGuard rejects the monolithic Kafka-style Group Coordinator entirely.
-
-Instead, we solve Consumer Groups by combining our two existing, battle-tested primitives:
-
-1. **High-throughput offset storage:** Use the Data Plane (an internal topic `__eastguard_offsets`).
-2. **Client-side work assignment:** Use the Data Plane for peer discovery (`__eastguard_assignments`).
-
-This completely eliminates the need for a dedicated "Coordinator" subsystem.
+The split keeps high-frequency commits off Raft without giving up fencing. Raft decides who
+may write; the data plane makes those writes durable.
 
 ---
 
-## 1. Offset Storage: The Internal Topic
+## Offset Identity and Position
 
-Offsets change thousands of times per second. They belong in the data plane.
+A durable offset is keyed by:
 
-We introduce a system topic: `__eastguard_offsets`.
-- **Producing (Frequency):** The client acts strictly as a Producer to this topic during normal operation. The frequency of commits is controlled by the client SDK:
-  - *Auto-commit:* The client automatically publishes the highest processed offset in the background (e.g., every 5000ms).
-  - *Manual commit:* The application developer disables auto-commit and explicitly calls `consumer.commit()` after processing a batch.
-- **Consuming (On Range Assignment):** The client does *not* continuously subscribe to this topic. It performs a one-off read **only at the exact moment** it takes ownership of a range (either during application startup or when taking over a crashed peer's range) to find its starting position.
-  - *Offset Found:* If a saved `next_entry_id` exists, the consumer resumes from that exact entry, ignoring the user's configured `StartPolicy`.
-  - *No Offset Found:* If this is a brand new consumer group, it falls back to the user's `StartPolicy` (e.g., `Earliest` starts at 0, `Latest` starts at the current end of the log and waits for new messages).
-- **Compaction:** Because offsets represent a continuous state overwrite, the `__eastguard_offsets` topic will eventually utilize log compaction (retaining only the latest payload per key) to bound its size.
+```
+(topic, range, consumer group)
+```
 
-*Why this works:* We get replication, durability, and high throughput for offset commits entirely for free by reusing the D6 Produce/Consume API.
+The value identifies the last processed record using three coordinates:
 
----
+| Coordinate | Purpose |
+|---|---|
+| Entry id | Locates the physical batch in the range log |
+| Batch offset | Locates the record within that batch |
+| Absolute offset | Preserves the record-level resume position exposed by the client |
 
-## 2. Work Distribution: Client-Side Cooperative Assignment (Zero-Controller)
+Offsets are range-scoped. A segment roll keeps the same range and therefore the same offset
+key. A split or merge creates new ranges with new offset keys; lineage handling decides when
+the predecessor is drained and when successors may start.
 
-Using the Control Plane (`MetadataStateMachine` / Raft) to manage ephemeral consumer leases or heartbeats is fundamentally incompatible with EastGuard's design:
-- It pollutes structural metadata with ephemeral client state.
-- It injects wall-clock time requirements into a purely deterministic state machine.
-- High-volume heartbeats would crush the consensus layer, destroying performance.
-
-Instead, we push work distribution entirely to the client side, using the Data Plane as our communication channel. 
-
-We introduce a second system topic: `__eastguard_assignments`.
-- **Heartbeats & Discovery:** The client runs a background publisher that periodically produces a heartbeat payload (e.g., `[group_id, consumer_id] -> timestamp`) to this topic. Crucially, the client also holds a **continuous background receiver** on this topic to constantly monitor the health of all its peers.
-- **Deterministic Assignment:** Once a consumer knows the current active membership of its group, it deterministically hashes and divides the available ranges (discovered via standard metadata `DescribeTopic` calls) among the live members. 
-- **Conflict Resolution (Zero-Controller):** Because all consumers consume the same `__eastguard_assignments` log, they eventually reach a consistent view of the group membership. There is no server-side "Coordinator" tracking generations or leases.
-- **Failover (Timeout):** If a consumer (e.g., Consumer B) crashes, it stops publishing heartbeats. Because the surviving peers (like Consumer A) are actively reading the assignment log, they will notice that B's heartbeat is missing for a defined threshold (e.g., 10 seconds). The peers deterministically remove B from their active lists, recalculate the hash assignment, and seamlessly take over B's orphaned ranges.
-
-*Why this works:* It shifts the complexity of work-balancing entirely to the client edge and keeps the server completely agnostic to consumer groups. The Control Plane remains strictly focused on cluster topology and range structural metadata.
+The stored value advances monotonically by the structural coordinate. A duplicate or older
+commit cannot move progress backward.
 
 ---
 
-## 3. System Topic Keyspace Routing & Scaling
+## Group Generations
 
-Because EastGuard brokers treat `__eastguard_offsets` and `__eastguard_assignments` as completely ordinary topics, they are fully compatible with EastGuard's dynamic **keyspace routing** and **auto-splitting**.
+Every membership or active-range topology change recomputes the complete assignment and
+advances the consumer-group generation. A heartbeat that changes neither leaves the
+generation unchanged.
 
-Unlike older systems that route internal topics using a fixed partition index (`hash(group_id) % N`), EastGuard clients route by mapping their group to a point in the `u64` keyspace:
+When a new generation commits, the control plane publishes that generation to the data
+replicas for every range in the topic, including the last placement of a sealed range. The
+data plane durably records this **epoch seal** before accepting commits at that generation.
 
-1. **The Routing Key:** 
-   - For `__eastguard_assignments`, the routing key is the `group_id`.
-   - For `__eastguard_offsets`, the routing key is `[group_id, topic_id]`.
-2. **Deterministic Hashing:** The client SDK hashes this key into a deterministic `u64` keyspace value.
-3. **Range Discovery:** The client issues a `DescribeTopic` request for the system topic. It inspects the active ranges and finds the specific range whose `[keyspace_start, keyspace_end]` boundaries contain its `u64` hash. It then routes its heartbeats/commits to that range.
-4. **Transparent Auto-Splitting:** If a system topic range gets too hot, the EastGuard data plane dynamically splits it. The keyspace is divided, but the client's `u64` hash remains the same. Upon the next metadata refresh, the client naturally discovers the new child range that inherited its portion of the keyspace, seamlessly transitioning its traffic without any central coordination.
+For an incoming commit:
 
----
+| Commit generation | Data-plane action |
+|---|---|
+| Older than sealed generation | Reject as stale |
+| Equal to sealed generation | Write and replicate |
+| Newer than sealed generation | Park until the matching epoch seal arrives |
 
-## 4. Transition Handling (Splits and Merges)
-
-Because EastGuard dynamically splits and merges ranges, consumer groups must navigate lineage cleanly.
-
-When a consumer is assigned to a range that becomes sealed (e.g., a Split):
-1. The consumer drains the final segment and discovers the in-band transition signal (as defined in D4).
-2. The consumer commits its final offset to the `__eastguard_offsets` topic.
-3. The consumer publishes a "Range Sealed" metadata event to the `__eastguard_assignments` heartbeat topic.
-4. The consumer group observes the split/seal event from the assignment topic, issues a fresh `DescribeTopic` to the Control Plane to discover the new child ranges, and re-runs the deterministic hash to assign the new ranges across the group.
-
-If the consumer crashes during the transition, another consumer in the group will eventually take over the child ranges during the next deterministic rebalance round.
+Parking handles normal propagation reordering: a client can learn the committed assignment
+before the data replicas receive its seal. Accepting immediately would bypass fencing;
+rejecting permanently would turn harmless propagation delay into an application failure.
 
 ---
 
+## Leader-Coordinated Commit Path
 
-## 4. Architectural Rules
+Offset writes use the data replica set of the range, not the Raft replica set. The first data
+replica is the offset coordinator, matching the range's data-write leader.
 
-1. **Eventual Consistency in Assignment.**
-   *Why:* Because assignment relies on a data plane heartbeat topic, short-lived duplicate assignments (two consumers reading the same range) may occur during network partitions before they converge on a consistent view. Consumer applications must tolerate this (e.g., via idempotent processing).
-2. **Offset commits are completely unverified by the storage engine.**
-   *Why:* The data plane does not parse or validate the contents of the `__eastguard_offsets` topic. It treats commits as opaque bytes. This maintains the strict boundary where the data plane is unaware of consumer logic.
-3. **The Control Plane is completely oblivious to consumer state.**
-   *Why:* `MetadataStateMachine` only tracks ranges and physical placement. Ephemeral group membership, heartbeats, and offsets belong strictly in the data plane.
+```
+client                 range leader                 followers
+  │                         │                           │
+  │── commit(key, epoch) ──►│                           │
+  │                         │ validate leadership      │
+  │                         │ validate generation      │
+  │                         │ append shared WAL        │
+  │                         │ fsync                     │
+  │                         │── replicate commit ─────►│
+  │                         │                           │ append shared WAL
+  │                         │                           │ fsync
+  │                         │◄──── durable ack ─────────│
+  │◄──── committed ─────────│ after every follower ack │
+```
+
+The client sends one request to the leader. It does not fan out commits itself. A request that
+lands on a follower receives a write-leader redirect; the ordinary client retry path follows
+that redirect.
+
+The leader acknowledges only after its own WAL fsync and every follower's durable
+acknowledgement. With a single replica, local fsync is sufficient. This matches the durability
+contract of produced data and prevents an acknowledged offset from disappearing during
+leader failover.
+
+Reads are leader-authoritative as well. Reading a random replica could return a value behind
+the acknowledged commit while replication or commit notification is in flight.
+
+---
+
+## Shared WAL, Separate State
+
+Consumer offsets use the existing data-plane WAL rather than a second write path. Segment
+records, epoch seals, and offset commits can share one batch and one fsync.
+
+After fsync, the record type determines which in-memory state is updated:
+
+- Segment records publish into the segment cache.
+- Epoch seals advance the accepted generation for one offset key.
+- Offset commits update the consumer-offset ledger.
+
+This preserves sequential disk writes. A logically separate offset ledger does not imply a
+second synchronous file write.
+
+Follower acknowledgements are emitted only after the follower's shared WAL fsync. Applying a
+record to the in-memory ledger before fsync is not a durability acknowledgement.
+
+---
+
+## Snapshotting and WAL Reclamation
+
+The in-memory ledger is periodically materialized as one snapshot, but not once per commit.
+The WAL remains authoritative until the snapshot covers the corresponding log positions.
+
+```
+offset commit fsync
+      │
+      ├── update in-memory ledger
+      └── remember uncheckpointed WAL position
+                         │
+                  WAL file becomes reclaimable
+                         │
+                         ▼
+             clone ledger for checkpoint worker
+                         │
+                  write + fsync snapshot
+                         │
+                         ▼
+             advance offset checkpoint watermark
+                         │
+                  reclaim older WAL files
+```
+
+Snapshot creation is driven by reclamation pressure. Many commits therefore collapse into a
+single asynchronous snapshot. WAL deletion uses the minimum safe watermark across segment
+checkpoints and consumer-offset checkpoints; neither state family can delete recovery data
+still needed by the other.
+
+On restart, recovery loads the latest snapshot and replays later offset records from the
+shared WAL. Recovery then writes the consolidated snapshot before removing the replayed WAL.
+
+---
+
+## Range Lifecycle and Placement
+
+Offset coordination is range-scoped, while live data actors are segment-scoped. That
+difference matters at transitions.
+
+### Segment roll
+
+A roll creates a successor segment in the same range. Offset identity does not change, and
+the retained range placement follows the successor replica set.
+
+### Split or merge
+
+A sealed predecessor can remain effectively owned until it is drained, even though its live
+segment actor has retired. The data plane therefore retains the range's last known placement
+independently of the live segment actor. This allows the predecessor's final offset to be
+committed and read after the transition.
+
+The client expands active assignments through lineage so exactly one successor owner drains
+each sealed predecessor. Once effective ownership drops the predecessor, its local tracker is
+discarded and a stale generation cannot commit it.
+
+---
+
+## Rebalance and Stale-Commit Recovery
+
+A normal rebalance is incremental:
+
+1. Request the current assignment and generation.
+2. Refresh metadata only if the cache cannot describe an assigned range.
+3. Expand active assignment into effective lineage ownership.
+4. Stop revoked range actors.
+5. Load durable offsets and start newly owned or previously unprovisioned ranges.
+
+Unchanged actors continue running. Rebuilding every actor on each heartbeat would cause
+avoidable duplicate delivery and control-plane traffic.
+
+A stale commit is a stronger signal. The client fences delivery, stops all range actors,
+rebuilds effective ownership from the latest generation, retries only positions still owned,
+and provisions those actors again from durable offsets. The fence rejects late application
+acknowledgements while the asynchronous actor stops are in flight.
+
+---
+
+## Failure Handling
+
+| Failure | Behavior |
+|---|---|
+| Client routes to follower | Redirect to current data leader |
+| Assignment arrives before epoch seal | Commit parks until the seal arrives |
+| Old owner commits after reassignment | Rejected by generation fence |
+| Leader WAL fsync fails | Commit fails; no replication acknowledgement |
+| Follower WAL fsync fails or connection disappears | Leader does not acknowledge the commit |
+| Offset snapshot fails | WAL remains pinned and recovery stays possible |
+| Durable-offset read is unavailable | New range actor remains unstarted; a later rebalance retries |
+| Broker restarts | Snapshot plus shared-WAL replay reconstructs the ledger |
+
+---
+
+## Rules
+
+1. **Only the current generation may change an offset.** This prevents a previous owner from
+   advancing progress after reassignment.
+2. **The range data leader coordinates offset replication.** The client sends one logical
+   commit; replication topology remains a server responsibility.
+3. **Acknowledgement means every data replica is durable.** Returning earlier could lose an
+   acknowledged checkpoint during failover.
+4. **Offset records share the data WAL.** Separate synchronous write paths would defeat WAL
+   batching and add another ordering boundary.
+5. **Snapshots are reclamation-driven.** Per-commit snapshots would turn a batched WAL path
+   into random-write amplification.
+6. **Sealed predecessors retain offset placement until their final progress is durable.** A
+   segment actor's retirement must not orphan the range-level checkpoint.
+7. **Unavailable durable offsets fail closed.** Absence of a response is not evidence that a
+   group has no saved progress.
+
+See [C4: Consumer Offset Commits](../clients/c4_consumer_offset_commits.md) for the
+application acknowledgement contract and
+[D4: Consumer Range Tracking](d4_consumer_range_tracking.md) for lineage ordering.

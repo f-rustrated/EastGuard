@@ -16,12 +16,11 @@ The produce/consume API has two sides, and most of it is not server work:
 - **Server (data plane) — this doc.** The handlers and the *entire consume path* are
   already built in D1–D5; the only gap is making **writes return redirects instead of
   `InternalError`**. A small redirect completion — the thin terminal data-plane item.
-- **Client — future work, not yet designed.** The client API surface, the
-  routing/metadata cache, connection management, redirect-following + retry, and
-  turning the consumer cursor library (already built, `src/consumer/`) into an actual
-  consumer. A client SDK, unbuilt, no current doc. It rides on the redirects this
-  phase delivers (cache metadata, follow `NotWriteLeader` / `ShardNotLocal`, refresh
-  on staleness — the Kafka model). Consumer groups and durable offsets are further out.
+- **Client — a separate track.** The client API, routing cache, connection pooling,
+  redirect-following, range actors, and consumer groups are documented under
+  [clients/](../clients/client_roadmap.md). They ride on the redirects this server phase
+  defines. Durable group progress is described in
+  [D8](d8_consumer_offset_management.md).
 
 ## The model: redirects, not proxy
 
