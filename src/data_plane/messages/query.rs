@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::connections::protocol::RangeProgressSignal;
+use crate::control_plane::NodeId;
 use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
 use crate::data_plane::offset_ledger::{ConsumerOffsetKey, ConsumerOffsetPosition};
 use crate::data_plane::states::segment::cache::CachedEntry;
@@ -82,5 +83,10 @@ pub enum ListOffsetsResult {
 
 pub struct ReadConsumerOffset {
     pub key: ConsumerOffsetKey,
-    pub reply: oneshot::Sender<Option<ConsumerOffsetPosition>>,
+    pub reply: oneshot::Sender<ReadConsumerOffsetResult>,
+}
+
+pub enum ReadConsumerOffsetResult {
+    Offset(Option<ConsumerOffsetPosition>),
+    NotLeader(Option<NodeId>),
 }
