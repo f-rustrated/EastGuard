@@ -141,6 +141,7 @@ pub(crate) fn parse_wal_filename(name: &str) -> Option<u64> {
 
 pub trait WalStorage {
     fn buf(&mut self) -> &mut Vec<u8>;
+    fn clear_buf(&mut self);
     fn next_lsn(&self) -> u64;
     fn flush_batch(&mut self) -> io::Result<u64>;
     fn maybe_rotate(&mut self) -> io::Result<()>;
@@ -224,6 +225,10 @@ impl WalWriter {
 impl WalStorage for WalWriter {
     fn buf(&mut self) -> &mut Vec<u8> {
         &mut self.batch_buf
+    }
+
+    fn clear_buf(&mut self) {
+        self.batch_buf.clear();
     }
 
     fn next_lsn(&self) -> u64 {
