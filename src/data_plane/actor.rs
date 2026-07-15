@@ -73,13 +73,9 @@ impl DataPlaneActor {
 
         // Built in the worker context: recovery ran in bootstrap (before this node joined the cluster),
         // leaving the WAL dir empty with a verified inventory; open the fresh WAL in that dir.
-        let RecoveryOutput {
-            inventory,
-            data_dir,
-        } = recovery;
         // A node that can't open its WAL cannot serve the data plane — fail hard
         // rather than silently leaving the worker dead.
-        let wal = WalWriter::new(data_dir).expect("data-plane WAL init failed");
+        let wal = WalWriter::new(recovery.data_dir.clone()).expect("data-plane WAL init failed");
         let out = DataPlaneOutputs::new(
             checkpoint_tx,
             batch_scheduler_tx,
@@ -92,7 +88,7 @@ impl DataPlaneActor {
         // blocking (tokio's `blocking_send` panics inside a runtime).
         let worker = async move {
             let mut state =
-                DataPlane::new(node_id, config, wal, cold_read_tx, self_tx, out, inventory);
+                DataPlane::new(node_id, config, wal, cold_read_tx, self_tx, out, recovery);
             while let Ok(msg) = mailbox.recv_async().await {
                 state.process(msg);
                 while let Ok(next) = mailbox.try_recv() {

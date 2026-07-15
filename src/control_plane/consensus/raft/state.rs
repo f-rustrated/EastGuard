@@ -13,8 +13,8 @@ use crate::control_plane::metadata::command::DeleteSegments;
 use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    EntryId, MetadataCommand, RangeId, ReassignSegment, ReplicaSet, RollSegment, SegmentId,
-    TopicId, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, ConsumerMemberId, EntryId, MetadataCommand, RangeId, ReassignSegment,
+    ReplicaSet, RollSegment, SegmentId, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
@@ -92,19 +92,23 @@ pub struct Raft {
     // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
+
+    // -- LOG STATE
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
-    pending_log_mutations: Vec<LogMutation>, // must persist
-    events: Vec<RaftEvent>,                  // volatile side effects
-    commit_index: u64,                       // majority voted
-    stabled_index: u64,                      // flushed to disk
-    last_applied_index: u64,                 // applied to state machine
+    stabled_index: u64, // flushed to disk
+
+    // -- APPLICATION STATE
+    state_machine: MetadataStateMachine,
+    last_applied_index: u64, // applied to state machine
+
+    // Transient State (Volatile Consensus & Coordinator Metadata)
+    commit_index: u64, // majority voted
     role: Role,
     /// Tracks who the current leader is — set when this node becomes leader
     /// or when a valid `AppendEntries` is received from a leader.
     current_leader: Option<NodeId>,
-
     peers: HashSet<NodeId>,
     // LEADER-ONLY volatile state
     peer_states: HashMap<NodeId, PeerState>,
@@ -116,13 +120,11 @@ pub struct Raft {
     /// (`maybe_promote_learner`). Re-derived on takeover (leader-volatile). Disjoint
     /// from `peers`; empty on followers.
     learner_states: HashMap<NodeId, PeerState>,
-    state_machine: MetadataStateMachine,
-    election_jitter: ElectionJitter,
-    timer_seqs: TimerSeqs,
     /// Election-timer generation. Bumped whenever the election timer is
     /// (re)armed or cancelled; a fired `ElectionTimeout` carrying an older
     /// epoch raced its own cancellation in flight and must be ignored
     election_epoch: u64,
+    election_jitter: ElectionJitter,
     /// Segments whose data-leader has acked its
     /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
@@ -131,9 +133,7 @@ pub struct Raft {
     /// heartbeat sweep re-drives until acked. Leader-volatile — cleared on step-down.
     catch_up: CatchUpRepairs,
     pending_proposals: Vec<MetadataCommand>,
-
     leaderless_segments: LeaderlessSegments,
-
     /// Tracks the ring membership seen during the last check, along with a count
     /// of how many times we've seen this exact membership in a row (#135).
     ///
@@ -142,6 +142,11 @@ pub struct Raft {
     /// stable ring over time to "re-earn confidence" before it is allowed to
     /// evict anyone.
     ring_observation_streak: Option<(BTreeSet<NodeId>, u32)>,
+
+    pending_log_mutations: Vec<LogMutation>, // must persist
+    events: Vec<RaftEvent>,                  // volatile side effects
+
+    timer_seqs: TimerSeqs,
 }
 
 pub(crate) struct TimerSeqs {
@@ -204,6 +209,16 @@ impl Raft {
 
     pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
         self.state_machine.get_topic_by_name(name)
+    }
+
+    pub(crate) fn get_consumer_group_assignment(
+        &self,
+        topic_name: &str,
+        group_id: &str,
+        member_id: ConsumerMemberId,
+    ) -> Option<ConsumerGroupAssignment> {
+        self.state_machine
+            .get_consumer_group_assignment(topic_name, group_id, member_id)
     }
 
     pub(crate) fn active_segments_for_node(
@@ -1536,6 +1551,8 @@ impl Raft {
                 );
                 break;
             };
+
+            // ? At this point if apply failed when things are already committed, what'd that mean?
             match entry.command {
                 RaftCommand::Noop => {}
                 RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
@@ -1578,9 +1595,8 @@ impl Raft {
             ),
         }
         if self.role == Role::Leader {
-            for pending_cmd in self.state_machine.take_pending_proposals() {
-                self.pending_proposals.push(pending_cmd);
-            }
+            self.pending_proposals
+                .extend(self.state_machine.take_pending_proposals());
         }
     }
 

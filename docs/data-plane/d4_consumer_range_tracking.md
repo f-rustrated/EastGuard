@@ -4,7 +4,11 @@
 
 **Depends on:** Phase D3 (segment lifecycle integration — split/merge/seal committed through the coordinator, segment assignments delivered to the data plane).
 
-D4 is single-consumer range tracking. Consumer groups, shared work, and durable offset commits are out of scope (see the roadmap backlog). The full client-facing consume protocol and connection management land in D6 — D4 establishes the tracking semantics that protocol relies on.
+D4 is single-consumer range tracking. Consumer groups, shared work, and durable offset
+commits are out of scope for this phase; [D8](d8_consumer_offset_management.md) layers those
+features on the lineage semantics defined here. The full client-facing consume protocol and
+connection management land in D6 — D4 establishes the tracking semantics that protocol
+relies on.
 
 ---
 

@@ -13,17 +13,16 @@
 //! stale or absent target costs a retry, never correctness. See
 //! d4_consumer_range_tracking.md §Bootstrap and d6_produce_consume_api.md.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-
-use borsh::{BorshDeserialize, BorshSerialize};
-
-use crate::control_plane::NodeId;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::strategy::StoragePolicy;
+use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
+use crate::impl_from_variant;
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
-    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState, TopicId,
-    TopicMeta, TopicState as MetaTopicState,
+    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
+    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -39,6 +38,18 @@ pub enum ControlPlaneRequest {
     DescribeTopic {
         name: String,
     },
+    SyncConsumerGroup(SyncConsumerGroupRequest),
+}
+
+impl_from_variant!(
+    ControlPlaneRequest,
+    SyncConsumerGroup(SyncConsumerGroupRequest)
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ConsumerGroupSyncAction {
+    Heartbeat,
+    Leave,
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -64,8 +75,16 @@ pub enum ControlPlaneResponse {
     NotRaftLeader {
         leader_addr: Option<NodeAddressInfo>,
     },
+    ConsumerGroupAssignment(ConsumerGroupAssignmentResponse),
+    ConsumerGroupLeft,
     // All control plane operations
     InternalError(String),
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+pub struct ConsumerGroupAssignmentResponse {
+    pub generation: GenerationId,
+    pub ranges: Box<[RangeId]>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -73,12 +92,6 @@ pub struct TopicSummary {
     pub name: String,
     pub range_count: u32,
     pub state: TopicState,
-}
-
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub enum TopicState {
-    Active,
-    Deleting,
 }
 
 /// Full metadata snapshot for a topic, returned by `DescribeTopic`. Includes every
@@ -101,7 +114,7 @@ pub struct TopicDetail {
 // boundary (SWIM round-trip) and threaded through synchronously so the
 // describe path has no per-replica awaits.
 impl TopicDetail {
-    pub(crate) fn from_meta(meta: TopicMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    pub(crate) fn from_meta(meta: TopicMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let ranges = meta
             .ranges
             .into_values()
@@ -110,12 +123,7 @@ impl TopicDetail {
         TopicDetail {
             topic_id: meta.id,
             name: meta.name,
-            state: match meta.state {
-                MetaTopicState::Active => TopicState::Active,
-                // Wire-level coarsening: clients only see "tearing down"; the
-                // internal Sealed → Deleted progression is GC bookkeeping.
-                MetaTopicState::Sealed | MetaTopicState::Deleted => TopicState::Deleting,
-            },
+            state: meta.state,
             ranges,
         }
     }
@@ -127,6 +135,68 @@ impl TopicDetail {
             .map(|r| r.range_id)
             .collect()
     }
+
+    pub fn rebalance(
+        &self,
+        assigned: HashSet<RangeId>,
+        need_start: impl Fn(&RangeId) -> bool,
+    ) -> RebalancePlan {
+        let effective = self.effective_group_ranges(assigned);
+        let mut to_start: Vec<_> = effective
+            .iter()
+            .filter(|range| need_start(range))
+            .copied()
+            .collect();
+        to_start.sort_by_key(|range| self.lineage_depth(*range));
+
+        RebalancePlan {
+            effective,
+            to_start,
+        }
+    }
+
+    /// Expand the Raft-backed active-range assignment with sealed predecessors that
+    /// still need one SDK member to drain them. A split delegates its parent to the
+    /// first child; a merge delegates both parents to the merged child. Repeating
+    /// the expansion handles multi-level lineage while preserving a single owner.
+    pub fn effective_group_ranges(&self, mut effective: HashSet<RangeId>) -> HashSet<RangeId> {
+        loop {
+            let mut changed = false;
+            for range in &*self.ranges {
+                let delegated = range
+                    .split_into
+                    .is_some_and(|(first, _)| effective.contains(&first))
+                    || range
+                        .merged_into
+                        .is_some_and(|merged| effective.contains(&merged));
+                if delegated {
+                    changed |= effective.insert(range.range_id);
+                }
+            }
+            if !changed {
+                return effective;
+            }
+        }
+    }
+
+    pub fn lineage_depth(&self, range_id: RangeId) -> usize {
+        self.ranges
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .split_into
+                    .is_some_and(|children| children.0 == range_id || children.1 == range_id)
+                    || candidate.merged_into == Some(range_id)
+            })
+            .map(|parent| self.lineage_depth(parent.range_id).saturating_add(1))
+            .max()
+            .unwrap_or_default()
+    }
+}
+
+pub struct RebalancePlan {
+    pub effective: HashSet<RangeId>,
+    pub to_start: Vec<RangeId>,
 }
 
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)
@@ -155,7 +225,7 @@ impl RangeDetail {
             .and_then(|s| s.end_entry_id)
             .unwrap_or(EntryId::MIN)
     }
-    fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(range: RangeMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let active_segment = range
             .active_segment
             .and_then(|id| range.segments.get(&id))
@@ -240,14 +310,14 @@ pub struct SegmentDetail {
 }
 
 impl SegmentDetail {
-    fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, SocketAddr>) -> Self {
+    fn from_meta(seg: &SegmentMeta, addresses: &HashMap<NodeId, NodeAddress>) -> Self {
         let replica_set = seg
             .replica_set
             .iter()
             .filter_map(|node| {
                 addresses.get(node).map(|addr| NodeAddressInfo {
-                    node_id: node.to_string(),
-                    client_addr: *addr,
+                    node_id: node.clone(),
+                    addr: *addr,
                 })
             })
             .collect();
@@ -261,34 +331,26 @@ impl SegmentDetail {
 
     /// Pick a replica from the segment's replica set.
     /// load-balances randomly across all replicas
-    pub fn pick_replica(&self) -> Option<SocketAddr> {
+    pub fn pick_replica(&self) -> Option<NodeAddressInfo> {
         if self.replica_set.is_empty() {
             return None;
         }
 
         use rand::RngExt;
         let idx = rand::rng().random_range(0..self.replica_set.len());
-        Some(self.replica_set[idx].client_addr)
+        Some(self.replica_set[idx].clone())
     }
 
     /// Active tails must be read from the write leader because followers may
     /// legitimately lag and report an empty tail. Sealed segments are immutable
     /// and can be read from any replica.
-    pub fn pick_read_replica(&self) -> Option<SocketAddr> {
+    pub fn pick_read_replica(&self) -> Option<NodeAddressInfo> {
         if self.end_entry_id.is_none() {
-            self.replica_set.first().map(|replica| replica.client_addr)
+            self.replica_set.first().cloned()
         } else {
             self.pick_replica()
         }
     }
-}
-
-/// A node identifier paired with its currently-known client address.
-/// Addresses come from SWIM membership; consumers cache them.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct NodeAddressInfo {
-    pub node_id: String,
-    pub client_addr: SocketAddr,
 }
 
 #[cfg(test)]

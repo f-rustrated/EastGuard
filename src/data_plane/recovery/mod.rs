@@ -17,8 +17,12 @@ use self::inventory::{LocalInventory, RecoveryOutput};
 use self::replay::ReplayWriter;
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
+use crate::data_plane::consumer_offset_management::ledger::{OffsetLedger, OffsetRecord};
 use crate::data_plane::sparse_index::SparseIndex;
 use crate::data_plane::states::segment::record::RoutingHeader;
+use crate::data_plane::wal::WalRecordType;
+use borsh::BorshDeserialize;
+
 use std::io;
 use std::path::PathBuf;
 
@@ -52,6 +56,7 @@ struct Replaying {
     data_dir: PathBuf,
     writer: ReplayWriter,
     scanner: WalScanner,
+    offsets: OffsetLedger,
 }
 
 impl Replaying {
@@ -59,10 +64,12 @@ impl Replaying {
         let recovered = RecoveredSegments::scan_data_dir(&data_dir)?;
         let writer = ReplayWriter::new(data_dir.clone(), recovered);
         let scanner = WalScanner::open(&data_dir)?;
+        let offsets = OffsetLedger::load_snapshot(&data_dir)?;
         Ok(Self {
             data_dir,
             writer,
             scanner,
+            offsets,
         })
     }
 
@@ -76,12 +83,23 @@ impl Replaying {
             match self.scanner.next_batch() {
                 Ok(Some(batch)) => {
                     for record in &batch.records {
-                        // Fails only if a record that already passed the WAL CRC
-                        // has a payload shorter than the 36-byte routing header.
-                        let (header, entry_data) =
-                            RoutingHeader::split_wal_payload(&record.payload)?;
-                        // Fails only on a real disk error.
-                        self.writer.replay(&header, entry_data)?;
+                        match record.record_type {
+                            WalRecordType::Data => {
+                                // Fails only if a record that already passed the WAL CRC
+                                // has a payload shorter than the routing header.
+                                let (header, entry_data) =
+                                    RoutingHeader::split_wal_payload(&record.payload)?;
+                                self.writer.replay(&header, entry_data)?;
+                            }
+                            WalRecordType::ConsumerOffset => {
+                                let offset = OffsetRecord::try_from_slice(&record.payload)
+                                    .map_err(io::Error::other)?;
+                                self.offsets.apply(offset);
+                            }
+                            WalRecordType::BatchEnd => {
+                                unreachable!("batch markers are consumed by WalScanner")
+                            }
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -105,6 +123,7 @@ impl Replaying {
             data_dir: self.data_dir,
             scanner: self.scanner,
             recovered,
+            offsets: self.offsets,
         })
     }
 }
@@ -113,6 +132,7 @@ struct Durable {
     data_dir: PathBuf,
     scanner: WalScanner,
     recovered: RecoveredSegments,
+    offsets: OffsetLedger,
 }
 
 impl Durable {
@@ -134,10 +154,12 @@ impl Durable {
         }
 
         let inventory = LocalInventory::from_recovered(&self.recovered);
+        self.offsets.write_snapshot(&self.data_dir)?;
         self.scanner.delete_files()?;
         Ok(RecoveryOutput {
             inventory,
             data_dir: self.data_dir,
+            offsets: self.offsets,
         })
     }
 }
@@ -153,6 +175,9 @@ mod tests {
     use super::*;
     use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::SegmentKey;
+    use crate::data_plane::consumer_offset_management::ledger::{
+        ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
+    };
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
 
     /// One bare-payload `(Data, BatchEnd)` batch — the segment-file framing the
@@ -172,6 +197,10 @@ mod tests {
         let wal_payload = RoutingHeader::new(key, EntryId(entry_id), record_count)
             .build_wal_payload(payload.as_bytes());
         WalRecord::data(wal_payload, record_count)
+    }
+
+    fn wal_offset(record: OffsetRecord) -> WalRecord {
+        WalRecord::consumer_offset(borsh::to_vec(&record).unwrap().into())
     }
 
     /// Encodes `records` followed by a batch-end marker — one fsynced WAL batch.
@@ -245,6 +274,46 @@ mod tests {
         // The segment files actually gained the replayed suffix.
         assert_eq!(last_id(&data_dir, a, 0), Some(2));
         assert_eq!(last_id(&data_dir, b, 0), Some(1));
+    }
+
+    #[test]
+    fn recovers_consumer_offsets_from_the_shared_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let key = ConsumerOffsetKey {
+            topic_id: TopicId(1),
+            range_id: RangeId(2),
+            group_id: "group".into(),
+        };
+        let position = ConsumerOffsetPosition {
+            entry_id: EntryId(7),
+            batch_offset: 3,
+            absolute_offset: 12,
+        };
+        write_wal(
+            &data_dir,
+            1,
+            &wal_batch(&[
+                wal_offset(OffsetRecord::EpochSeal(EpochSeal {
+                    key: key.clone(),
+                    generation: 4.into(),
+                })),
+                wal_offset(OffsetRecord::OffsetCommit(ConsumerOffsetUpdate {
+                    key: key.clone(),
+                    generation: 4.into(),
+                    position,
+                })),
+            ]),
+        );
+
+        let (_db_dir, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+        assert_eq!(*output.offsets.generation(&key), 4);
+        assert_eq!(output.offsets.offset(&key), Some(position));
+
+        let restarted = run(data_dir, &db).unwrap();
+        assert_eq!(*restarted.offsets.generation(&key), 4);
+        assert_eq!(restarted.offsets.offset(&key), Some(position));
     }
 
     #[test]

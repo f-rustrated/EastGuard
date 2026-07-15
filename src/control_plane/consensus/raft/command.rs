@@ -4,6 +4,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::ReassignSegment;
 use crate::control_plane::metadata::command::{
     CreateTopic, DeleteSegments, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
+    SyncConsumerGroup,
 };
 use crate::{impl_from_variant, impl_from_variant_via};
 
@@ -29,5 +30,6 @@ impl_from_variant_via!(
     MergeRange,
     DeleteTopic,
     ReassignSegment,
-    DeleteSegments
+    DeleteSegments,
+    SyncConsumerGroup
 );

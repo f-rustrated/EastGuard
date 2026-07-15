@@ -3,11 +3,12 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
-use crate::smart_pointer;
+use crate::impl_new_struct_wrapper;
 
 pub(crate) mod actor;
 pub(crate) mod checkpoint;
 pub(crate) mod cold_read;
+pub(crate) mod consumer_offset_management;
 pub(crate) mod messages;
 pub(crate) mod recovery;
 pub(crate) mod segment_writer;
@@ -30,13 +31,7 @@ pub struct SegmentKey {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct EntryPayload(Bytes);
 
-smart_pointer!(EntryPayload, Bytes);
-
-impl From<Bytes> for EntryPayload {
-    fn from(b: Bytes) -> Self {
-        Self(b)
-    }
-}
+impl_new_struct_wrapper!(EntryPayload, Bytes);
 
 impl From<Vec<u8>> for EntryPayload {
     fn from(v: Vec<u8>) -> Self {

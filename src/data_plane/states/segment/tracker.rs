@@ -116,7 +116,11 @@ impl SegmentTracker {
         !self.staged_entries.is_empty()
     }
 
-    pub(crate) fn publish_staged(&mut self, lsn: u64) -> Vec<Arc<CachedEntry>> {
+    pub(crate) fn abort_staged(&mut self) {
+        self.staged_entries.clear();
+    }
+
+    pub(crate) fn publish_staged(&mut self, lsn: u64) -> Box<[Arc<CachedEntry>]> {
         self.staged_entries
             .drain(..)
             .map(|s| {

@@ -50,7 +50,7 @@ impl DataTransportActor {
                                 // ring is the durable group membership; the map only accelerates the
                                 // common case.
                                 if let Some(entry) = topology.shard_leader(cmd.shard_group_id) {
-                                    state.send(&[entry.leader_node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
+                                    state.send(&[entry.leader.node_id], &cmd.message, &swim_tx, &data_plane_tx, &disconnect_tx).await;
                                 } else if let Some(members) = topology.group_ring_members(cmd.shard_group_id)
                                     && !members.is_empty()
                                 {

@@ -7,6 +7,7 @@ use crate::{
         NodeId,
         metadata::{
             error::MetadataError,
+            event::ConsumerGroupEpochSnapshot,
             strategy::{PartitionStrategy, StoragePolicy},
         },
     },
@@ -30,6 +31,7 @@ pub struct TopicMeta {
     pub active_ranges: Vec<RangeId>,
     pub ranges: HashMap<RangeId, RangeMeta>,
     pub next_range_id: u64,
+    pub(crate) consumer_groups: HashMap<String, ConsumerGroupMeta>,
 }
 impl TopicMeta {
     pub(crate) fn new(
@@ -56,6 +58,7 @@ impl TopicMeta {
             active_ranges: vec![range_id],
             ranges: HashMap::from([(range_id, range)]),
             next_range_id: 1,
+            consumer_groups: HashMap::new(),
         }
     }
 
@@ -396,6 +399,69 @@ impl TopicMeta {
         Ok(merged_id)
     }
 
+    pub(crate) fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> bool {
+        let consumer_group_meta = self
+            .consumer_groups
+            .entry(cmd.group_id.clone())
+            .or_insert_with(ConsumerGroupMeta::new);
+
+        consumer_group_meta.sync_member(
+            cmd.member_id,
+            cmd.action,
+            cmd.observed_at,
+            cmd.session_timeout_ms,
+            &self.active_ranges,
+        )
+    }
+
+    pub(crate) fn rebalance_consumer_groups(&mut self) -> Box<[ConsumerGroupEpochSnapshot]> {
+        let mut groups = Vec::with_capacity(self.consumer_groups.len());
+
+        self.consumer_groups
+            .iter_mut()
+            .for_each(|(group_id, group)| {
+                if group.rebalance_for_ranges(&self.active_ranges) {
+                    groups.push(group_id.clone());
+                }
+            });
+
+        groups
+            .into_iter()
+            .filter_map(|g| self.consumer_group_epoch(&g))
+            .collect()
+    }
+
+    // Generate event that'd go to other data node(not to client) so it can fence older generation
+    pub(crate) fn consumer_group_epoch(
+        &self,
+        group_id: &str,
+    ) -> Option<ConsumerGroupEpochSnapshot> {
+        let group = self.consumer_groups.get(group_id)?;
+        let ranges = self
+            .ranges
+            .values()
+            .filter_map(|range| {
+                let segment = range
+                    .active_segment
+                    .and_then(|id| range.segments.get(&id))
+                    .or_else(|| {
+                        range
+                            .segments
+                            .values()
+                            .max_by_key(|segment| segment.segment_id)
+                    })?;
+                Some((range.range_id, segment.replica_set.clone()))
+            })
+            .collect();
+
+        Some(ConsumerGroupEpochSnapshot {
+            topic_id: self.id,
+            group_id: group_id.to_string(),
+            generation: group.generation,
+            ranges,
+        })
+    }
+
     pub(crate) fn insert_range_sorted(&mut self, range_id: RangeId) {
         let start = &self.ranges[&range_id].keyspace_start;
         let pos = self
@@ -441,6 +507,9 @@ pub mod props {
                 range.assert_invariants();
 
                 self.assert_split_children_cooldown(range);
+            }
+            for group in self.consumer_groups.values() {
+                group.assert_assignments(&self.active_ranges);
             }
         }
     }

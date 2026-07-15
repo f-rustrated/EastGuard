@@ -1796,7 +1796,7 @@ mod tests {
             let entry = h.protocol.topology.shard_leader(ShardGroupId(42));
             assert!(entry.is_some(), "Topology should have shard leader entry");
             let entry = entry.unwrap();
-            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
+            assert_eq!(entry.leader.node_id, NodeId::new("node-b"));
             assert_eq!(entry.term, 3);
         }
 
@@ -1893,7 +1893,7 @@ mod tests {
 
             let entry = h.protocol.topology.shard_leader(ShardGroupId(42)).unwrap();
             assert_eq!(
-                entry.leader_node_id,
+                entry.leader.node_id,
                 NodeId::new("node-b"),
                 "Leader should not be overwritten by stale info"
             );
@@ -1939,7 +1939,7 @@ mod tests {
                 let entry = b.topology.shard_leader(ShardGroupId(42));
                 assert!(entry.is_some(), "B should learn about group 42 leader");
                 let entry = entry.unwrap();
-                assert_eq!(entry.leader_node_id, NodeId::new("node-a"));
+                assert_eq!(entry.leader.node_id, NodeId::new("node-a"));
                 assert_eq!(entry.term, 1);
             }
         }
@@ -1957,9 +1957,9 @@ mod tests {
             let entry = h.protocol.topology.shard_leader(ShardGroupId(42));
             assert!(entry.is_some(), "topology should have shard leader entry");
             let entry = entry.unwrap();
-            assert_eq!(entry.leader_node_id, NodeId::new("node-local"));
-            assert_eq!(entry.leader_addr.cluster_addr(), peer_addr);
-            assert_eq!(entry.leader_addr.client_addr(), client_addr);
+            assert_eq!(entry.leader.node_id, NodeId::new("node-local"));
+            assert_eq!(entry.leader.cluster_addr(), peer_addr);
+            assert_eq!(entry.leader.client_addr(), client_addr);
             assert_eq!(entry.term, 1);
         }
 
@@ -1991,7 +1991,7 @@ mod tests {
             let entry = h.protocol.topology.shard_leader(ShardGroupId(99));
             assert!(entry.is_some(), "topology should have received leader info");
             let entry = entry.unwrap();
-            assert_eq!(entry.leader_node_id, NodeId::new("node-b"));
+            assert_eq!(entry.leader.node_id, NodeId::new("node-b"));
             assert_eq!(entry.term, 7);
         }
     }

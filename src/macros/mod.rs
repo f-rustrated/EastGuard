@@ -24,6 +24,19 @@ macro_rules! impl_from_variant {
     };
 }
 
+#[macro_export]
+macro_rules! impl_new_struct_wrapper {
+    ($wrapper_name:ident,$type:ty) => {
+        impl From<$type> for $wrapper_name {
+            fn from(val: $type) -> Self {
+                $wrapper_name(val)
+            }
+        }
+
+        $crate::smart_pointer!($wrapper_name, $type);
+    };
+}
+
 /// Generates transitive `From` impls: `InnerType → MiddleEnum → OuterEnum`.
 /// Requires `From<InnerType> for MiddleEnum` (via `impl_from_variant!`)
 /// and `From<MiddleEnum> for OuterEnum` to already exist.

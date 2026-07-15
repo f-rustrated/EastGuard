@@ -14,6 +14,7 @@ const TRAILING_LENGTH_SIZE: usize = 4;
 pub(crate) enum WalRecordType {
     Data = 0,
     BatchEnd = 1,
+    ConsumerOffset = 2,
 }
 
 impl WalRecordType {
@@ -21,6 +22,7 @@ impl WalRecordType {
         match v {
             0 => Ok(WalRecordType::Data),
             1 => Ok(WalRecordType::BatchEnd),
+            2 => Ok(WalRecordType::ConsumerOffset),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown record type",
@@ -53,6 +55,14 @@ impl WalRecord {
             record_type: WalRecordType::BatchEnd,
             record_count: 0,
             payload: Bytes::new(),
+        }
+    }
+
+    pub(crate) fn consumer_offset(payload: Bytes) -> Self {
+        WalRecord {
+            record_type: WalRecordType::ConsumerOffset,
+            record_count: 0,
+            payload,
         }
     }
 
@@ -131,10 +141,14 @@ pub(crate) fn parse_wal_filename(name: &str) -> Option<u64> {
 
 pub trait WalStorage {
     fn buf(&mut self) -> &mut Vec<u8>;
+    fn clear_buf(&mut self);
     fn next_lsn(&self) -> u64;
     fn flush_batch(&mut self) -> io::Result<u64>;
     fn maybe_rotate(&mut self) -> io::Result<()>;
     fn delete_below(&mut self, watermark_lsn: u64);
+    /// Highest LSN in an inactive WAL file, if rotation has made any file
+    /// eligible for reclamation. The active file is never reclaimable.
+    fn reclaimable_lsn(&self) -> Option<u64>;
 
     #[cfg(any(test, debug_assertions))]
     fn assert_invariants(&self);
@@ -201,11 +215,20 @@ impl WalWriter {
     fn active_entry_mut(&mut self) -> &mut WalFileEntry {
         self.files.back_mut().expect("invariant: files non-empty")
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_file_size(&mut self, max_file_size: u64) {
+        self.max_file_size = max_file_size;
+    }
 }
 
 impl WalStorage for WalWriter {
     fn buf(&mut self) -> &mut Vec<u8> {
         &mut self.batch_buf
+    }
+
+    fn clear_buf(&mut self) {
+        self.batch_buf.clear();
     }
 
     fn next_lsn(&self) -> u64 {
@@ -258,6 +281,15 @@ impl WalStorage for WalWriter {
             let entry = self.files.pop_front().unwrap();
             let _ = fs::remove_file(&entry.path);
         }
+    }
+
+    fn reclaimable_lsn(&self) -> Option<u64> {
+        // * Gets second-to-last-wal file
+        // * Why second-to-last? last file is the active WAL file and cannot be deleted
+        // * the second-to-last file is the newest inactive—and thus potentially reclaimable—file.
+        self.files
+            .get(self.files.len().checked_sub(2)?)
+            .map(|entry| entry.max_lsn)
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -334,11 +366,13 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = WalWriter::new(dir.path().to_path_buf()).unwrap();
         wal.max_file_size = 100;
+        assert_eq!(wal.reclaimable_lsn(), None);
 
         let big_data = vec![0u8; 150];
-        wal_write(&mut wal, &big_data).unwrap();
+        let lsn = wal_write(&mut wal, &big_data).unwrap();
 
         assert_eq!(wal.files.len(), 2);
+        assert_eq!(wal.reclaimable_lsn(), Some(lsn));
 
         wal.assert_invariants();
     }

@@ -1,3 +1,7 @@
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
+use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
+use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
+use crate::data_plane::consumer_offset_management::types::ReplicaOffsetCommit;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -15,13 +19,15 @@ use crate::{
 
 pub enum DataPlaneCommand {
     Produce(Produce),
-    CheckpointComplete(CheckpointComplete),
+    SegmentCheckpointComplete(SegmentCheckpointComplete),
+    OffsetCheckpointComplete(OffsetCheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
     /// source read. The worker turns it into `CatchUpChunk`s on the transport.
     CatchUpReadComplete(CatchUpReadComplete),
     OrphanGcCheck(OrphanGcCheck),
+    CommitConsumerOffset(CommitConsumerOffset),
 }
 
 /// What the orphan-GC handler replies to the ticker: keep ticking while strays remain, or
@@ -42,6 +48,19 @@ pub struct Produce {
     pub data: EntryPayload,
     pub record_count: u32,
     pub reply: oneshot::Sender<ProduceAck>,
+}
+
+pub struct CommitConsumerOffset {
+    pub update: ConsumerOffsetUpdate,
+    pub reply: oneshot::Sender<ConsumerOffsetCommitAck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsumerOffsetCommitAck {
+    Committed,
+    NotWriteLeader(Option<NodeId>),
+    StaleEpoch(StaleEpoch),
+    InternalError(String),
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -73,6 +92,22 @@ pub struct ReplicaAck {
     pub segment_key: SegmentKey,
     pub entry_id: EntryId,
     pub from: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ReplicaOffsetAckResult {
+    Committed,
+    StaleEpoch(StaleEpoch),
+}
+
+// impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch);
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReplicaOffsetAck {
+    pub seq: u64,
+    pub update: ConsumerOffsetUpdate,
+    pub from: NodeId,
+    pub result: ReplicaOffsetAckResult,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -218,6 +253,8 @@ pub enum DataPlaneInterNodeCommand {
     SegmentAssignmentAck(SegmentAssignmentAck),
     ReplicaAppend(ReplicaAppend),
     ReplicaAck(ReplicaAck),
+    ReplicaOffsetCommit(ReplicaOffsetCommit),
+    ReplicaOffsetAck(ReplicaOffsetAck),
     CommitAdvance(CommitAdvance),
     SealRequest(SealRequest),
     SealResponse(SealResponse),
@@ -230,6 +267,7 @@ pub enum DataPlaneInterNodeCommand {
     SealBoundaryQuery(SealBoundaryQuery),
     SealBoundaryReport(SealBoundaryReport),
     DeleteSegments(DeleteSegments),
+    ConsumerGroupEpochSeal(EpochSeal),
 }
 
 impl_from_variant!(
@@ -238,6 +276,8 @@ impl_from_variant!(
     SegmentAssignmentAck,
     ReplicaAppend,
     ReplicaAck,
+    ReplicaOffsetCommit,
+    ReplicaOffsetAck,
     CommitAdvance,
     SealRequest,
     SealResponse,
@@ -250,6 +290,7 @@ impl_from_variant!(
     SealBoundaryQuery,
     SealBoundaryReport,
     DeleteSegments,
+    ConsumerGroupEpochSeal(EpochSeal),
 );
 
 #[derive(Debug)]
@@ -263,11 +304,15 @@ pub enum ProduceAck {
     Err(String),
 }
 
-pub struct CheckpointComplete {
+pub struct SegmentCheckpointComplete {
     pub segment_key: SegmentKey,
     pub checkpointed_lsn: u64,
     pub new_frontier: u64,
     pub checkpointed_bytes: u64,
+}
+
+pub struct OffsetCheckpointComplete {
+    pub checkpointed_lsn: u64,
 }
 
 /// The cold-read pool's reply for a catch-up *source* read.
@@ -283,9 +328,11 @@ pub struct CatchUpReadComplete {
 impl_from_variant!(
     DataPlaneCommand,
     Produce,
-    CheckpointComplete,
+    SegmentCheckpointComplete,
+    OffsetCheckpointComplete,
     CatchUpReadComplete,
     OrphanGcCheck,
+    CommitConsumerOffset,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
 );

@@ -8,7 +8,7 @@ use query::DataPlaneQuery;
 
 use crate::{
     data_plane::{
-        messages::query::{Fetch, ListOffsets},
+        messages::query::{Fetch, ListOffsets, ReadConsumerOffset},
         timer::DataPlaneTimeoutCallback,
     },
     impl_from_variant, impl_from_variant_via,
@@ -29,10 +29,17 @@ impl_from_variant_via!(
     DataPlaneMessage,
     DataPlaneCommand,
     Produce,
-    CheckpointComplete,
+    SegmentCheckpointComplete,
     DataPlaneTimeoutCallback,
     DataPlaneInterNodeCommand,
-    CatchUpReadComplete
+    CatchUpReadComplete,
+    CommitConsumerOffset
 );
 
-impl_from_variant_via!(DataPlaneMessage, DataPlaneQuery, Fetch, ListOffsets);
+impl_from_variant_via!(
+    DataPlaneMessage,
+    DataPlaneQuery,
+    Fetch,
+    ListOffsets,
+    ReadConsumerOffset
+);

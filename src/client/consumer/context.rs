@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::client::consumer::topic_fetch_manager::RangeDrained;
+use crate::client::consumer::messages::RangeDrained;
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
@@ -61,7 +61,8 @@ impl ConsumerContext {
         let addr = segment
             .pick_replica()
             .ok_or(ClientError::UnexpectedResponse)?;
-        self.fetch_from(addr, range_id, entry_id).await
+        self.fetch_from(addr.client_addr(), range_id, entry_id)
+            .await
     }
 
     pub(crate) async fn fetch_from_active_leader(
@@ -73,7 +74,7 @@ impl ConsumerContext {
         let addr = segment
             .replica_set
             .first() // First being data leader
-            .map(|replica| replica.client_addr)
+            .map(|replica| replica.client_addr())
             .ok_or(ClientError::UnexpectedResponse)?;
         self.fetch_from(addr, range_id, entry_id).await
     }

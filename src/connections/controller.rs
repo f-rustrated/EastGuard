@@ -1,10 +1,13 @@
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::metadata::RangeMeta;
+use crate::control_plane::metadata::{
+    RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest, TopicState,
+};
 use crate::control_plane::{
-    NodeAddress, NodeId, SwimNodeState,
+    NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
     membership::{
         ShardGroupId,
@@ -18,11 +21,34 @@ use crate::control_plane::{
 use crate::data_plane::EntryPayload;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{Produce, ProduceAck};
-use crate::data_plane::messages::query::{DataPlaneQuery, Fetch, ListOffsets};
+use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
+use crate::data_plane::messages::command::{
+    CommitConsumerOffset, ConsumerOffsetCommitAck, Produce, ProduceAck,
+};
+use crate::data_plane::messages::query::{
+    DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset, ReadConsumerOffsetResult,
+};
 use crate::net::TcpStream;
 use anyhow::Context;
 use tokio::sync::mpsc;
+
+enum MetadataProposalOutcome {
+    Committed,
+    Redirect(Option<NodeAddressInfo>),
+}
+
+impl MetadataProposalOutcome {
+    fn on_ok(self, committed: ControlPlaneResponse) -> ClientResponse {
+        match self {
+            Self::Committed => committed.into(),
+            Self::Redirect(redirect) => ControlPlaneResponse::NotRaftLeader {
+                leader_addr: redirect,
+            }
+            .into(),
+        }
+    }
+}
+
 /// # Client ↔ Server request_id protocol
 ///
 /// 1. **Client assigns** — before sending each request, the client obtains a
@@ -37,7 +63,6 @@ use tokio::sync::mpsc;
 ///
 /// This allows multiple requests to be in-flight on a single connection simultaneously,
 /// with responses arriving in any order.
-
 #[derive(Clone)]
 pub struct ClientController {
     node_id: NodeId,
@@ -104,14 +129,17 @@ impl ClientController {
     }
 
     async fn handle_control_plane(&self, request: ControlPlaneRequest) -> ClientResponse {
+        use ControlPlaneRequest::*;
+
         let res = match request {
-            ControlPlaneRequest::CreateTopic {
+            CreateTopic {
                 name,
                 storage_policy,
             } => self.handle_create_topic(name, storage_policy).await,
-            ControlPlaneRequest::DeleteTopic { name } => self.handle_delete_topic(name).await,
-            ControlPlaneRequest::ListHostedTopics => return self.handle_list_hosted_topics().await,
-            ControlPlaneRequest::DescribeTopic { name } => self.handle_describe_topic(name).await,
+            DeleteTopic { name } => self.handle_delete_topic(name).await,
+            ListHostedTopics => return self.handle_list_hosted_topics().await,
+            DescribeTopic { name } => self.handle_describe_topic(name).await,
+            SyncConsumerGroup(req) => self.handle_sync_consumer_group(req).await,
         };
         match res {
             Ok(resp) => resp,
@@ -120,6 +148,51 @@ impl ClientController {
                 ClientResponse::ControlPlane(ControlPlaneResponse::InternalError(e.to_string()))
             }
         }
+    }
+
+    async fn handle_sync_consumer_group(
+        &self,
+        req: SyncConsumerGroupRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let group = match self.route(req.topic_name.as_bytes().to_vec()).await? {
+            ShardRouting::Local(group) => group,
+            ShardRouting::Redirect(member) => {
+                return Ok(self.control_plane_redirect(member).into());
+            }
+        };
+
+        let proposal = self
+            .propose_topic_write(group.id, SyncConsumerGroup::new(req.clone()).into())
+            .await?;
+
+        if let MetadataProposalOutcome::Redirect(redirect) = proposal {
+            return Ok(ControlPlaneResponse::NotRaftLeader {
+                leader_addr: redirect,
+            }
+            .into());
+        };
+
+        if req.action == ConsumerGroupSyncAction::Leave {
+            return Ok(ControlPlaneResponse::ConsumerGroupLeft.into());
+        }
+
+        let Some(assignment) = self
+            .raft_sender
+            .get_consumer_group_assignment(req.topic_name, req.group_id, req.member_id)
+            .await
+        else {
+            return Ok(ControlPlaneResponse::InternalError(
+                "committed consumer group assignment is unavailable".into(),
+            )
+            .into());
+        };
+        Ok(
+            ControlPlaneResponse::ConsumerGroupAssignment(ConsumerGroupAssignmentResponse {
+                generation: assignment.generation,
+                ranges: assignment.ranges,
+            })
+            .into(),
+        )
     }
 
     /// If this node belongs to the topic's owning shard group, answers directly;
@@ -162,8 +235,10 @@ impl ClientController {
             replica_set: group.members,
             created_at,
         };
-        self.propose_topic_write(group.id, cmd.into(), ControlPlaneResponse::TopicCreated)
-            .await
+        Ok(self
+            .propose_topic_write(group.id, cmd.into())
+            .await?
+            .on_ok(ControlPlaneResponse::TopicCreated))
     }
 
     async fn handle_delete_topic(&self, topic_name: String) -> anyhow::Result<ClientResponse> {
@@ -175,8 +250,10 @@ impl ClientController {
         };
 
         let cmd = DeleteTopic { name: topic_name };
-        self.propose_topic_write(group.id, cmd.into(), ControlPlaneResponse::TopicDeleted)
-            .await
+        Ok(self
+            .propose_topic_write(group.id, cmd.into())
+            .await?
+            .on_ok(ControlPlaneResponse::TopicDeleted))
     }
 
     /// Route a key relative to this node — the single SWIM call behind every
@@ -189,54 +266,47 @@ impl ClientController {
 
     /// Structural redirect for a control-plane op that isn't local: to the member if
     /// one resolves, else a retriable error (no member's address known here yet).
-    fn control_plane_redirect(
-        &self,
-        member: Option<(NodeId, NodeAddress)>,
-    ) -> ControlPlaneResponse {
+    fn control_plane_redirect(&self, member: Option<NodeAddressInfo>) -> ControlPlaneResponse {
         match member {
-            Some((node_id, addr)) => ControlPlaneResponse::TopicMetadataRedirect {
-                owner: NodeAddressInfo {
-                    node_id: node_id.to_string(),
-                    client_addr: addr.client_addr(),
-                },
-            },
+            Some(node_addr) => ControlPlaneResponse::TopicMetadataRedirect { owner: node_addr },
             None => {
                 ControlPlaneResponse::InternalError("no reachable member of the shard group".into())
             }
         }
     }
 
-    /// Propose a control-plane write to the group's Raft leader. `on_ok` on success;
-    /// any non-leader / not-ready rejection becomes a retriable `NotRaftLeader` redirect.
+    /// Propose a control-plane write to the group's Raft leader. A committed
+    /// proposal is distinct from the retriable wire response returned when the
+    /// addressed node cannot currently accept it.
     async fn propose_topic_write(
         &self,
         group_id: ShardGroupId,
         cmd: MetadataCommand,
-        on_ok: ControlPlaneResponse,
-    ) -> anyhow::Result<ClientResponse> {
+    ) -> anyhow::Result<MetadataProposalOutcome> {
         let leader = match self
             .raft_sender
             .submit_metadata_command(group_id, cmd)
             .await
         {
-            Ok(()) => return Ok(on_ok.into()),
+            Ok(()) => {
+                return Ok(MetadataProposalOutcome::Committed);
+            }
             Err(ProposalError::NotLeader(leader)) => leader,
             Err(ProposalError::ShardNotFound | ProposalError::ShardGroupRemoved) => None,
         };
 
-        let leader_addr = match leader {
-            Some(l) => {
-                self.swim_sender
-                    .resolve_address(l.clone())
-                    .await?
-                    .map(|a| NodeAddressInfo {
-                        node_id: l.to_string(),
-                        client_addr: a.client_addr(),
-                    })
-            }
-            None => None,
-        };
-        Ok(ControlPlaneResponse::NotRaftLeader { leader_addr }.into())
+        Ok(MetadataProposalOutcome::Redirect(
+            self.resolve_id_to_addr(leader).await,
+        ))
+    }
+
+    async fn resolve_id_to_addr(&self, node_id: Option<NodeId>) -> Option<NodeAddressInfo> {
+        let node_id = node_id?;
+        self.swim_sender
+            .resolve_address(node_id.clone())
+            .await
+            .ok()?
+            .map(|addr| NodeAddressInfo { node_id, addr })
     }
 
     async fn handle_list_hosted_topics(&self) -> ClientResponse {
@@ -248,18 +318,22 @@ impl ClientController {
             .map(|name| TopicSummary {
                 name,
                 range_count: 0,
-                state: crate::connections::protocol::TopicState::Active,
+                state: TopicState::Active,
             })
             .collect();
         ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics })
     }
 
     async fn handle_data_plane(&self, request: ClientDataPlaneRequest) -> ClientResponse {
+        use ClientDataPlaneRequest::*;
+
         let res = match request {
-            ClientDataPlaneRequest::Produce(req) => self.handle_produce(req).await,
-            ClientDataPlaneRequest::Fetch(req) => self.handle_fetch(req).await,
-            ClientDataPlaneRequest::FetchById(req) => self.handle_fetch_by_id(req).await,
-            ClientDataPlaneRequest::ListOffsets(req) => self.handle_list_offsets(req).await,
+            Produce(req) => self.handle_produce(req).await,
+            Fetch(req) => self.handle_fetch(req).await,
+            FetchById(req) => self.handle_fetch_by_id(req).await,
+            ListOffsets(req) => self.handle_list_offsets(req).await,
+            CommitConsumerOffset(req) => self.handle_commit_consumer_offset(req).await,
+            FetchConsumerOffset(req) => self.handle_fetch_consumer_offset(req).await,
         };
         match res {
             Ok(resp) => resp,
@@ -270,16 +344,61 @@ impl ClientController {
         }
     }
 
+    async fn handle_commit_consumer_offset(
+        &self,
+        req: CommitConsumerOffsetRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.data_plane_tx
+            .send_async(CommitConsumerOffset {
+                update: req.0,
+                reply,
+            })
+            .await?;
+        Ok(match response.await? {
+            ConsumerOffsetCommitAck::Committed => DataPlaneResponse::ConsumerOffsetCommitted.into(),
+            ConsumerOffsetCommitAck::NotWriteLeader(leader) => DataPlaneResponse::NotWriteLeader {
+                leader_addr: self.resolve_id_to_addr(leader).await,
+            }
+            .into(),
+            ConsumerOffsetCommitAck::StaleEpoch(StaleEpoch(sealed_generation)) => {
+                DataPlaneResponse::StaleConsumerGroupEpoch(sealed_generation).into()
+            }
+            ConsumerOffsetCommitAck::InternalError(error) => {
+                DataPlaneResponse::InternalError(error).into()
+            }
+        })
+    }
+
+    async fn handle_fetch_consumer_offset(
+        &self,
+        FetchConsumerOffsetRequest(key): FetchConsumerOffsetRequest,
+    ) -> anyhow::Result<ClientResponse> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.data_plane_tx
+            .send_async(ReadConsumerOffset { key, reply })
+            .await?;
+
+        Ok(match response.await? {
+            ReadConsumerOffsetResult::Offset(offset) => {
+                DataPlaneResponse::ConsumerOffset(offset).into()
+            }
+            ReadConsumerOffsetResult::NotLeader(leader) => DataPlaneResponse::NotWriteLeader {
+                leader_addr: self.resolve_id_to_addr(leader).await,
+            }
+            .into(),
+        })
+    }
+
     /// Routes a produce to the active segment's write leader (`replica_set[0]`),
     /// redirecting if this node isn't it. Membership-first (like `handle_describe_topic`)
     /// so we can tell "topic absent" from "not hosted here".
     async fn handle_produce(&self, req: ProduceRequest) -> anyhow::Result<ClientResponse> {
         // Not local (ring unconverged or this node isn't a member) → retriable
         // redirect; the hint is best-effort, absent until SWIM converges.
-        if let ShardRouting::Redirect(member) =
+        if let ShardRouting::Redirect(hint_node) =
             self.route(req.topic_name.as_bytes().to_vec()).await?
         {
-            let hint_node = member.map(|(_, addr)| addr.client_addr());
             return Ok(DataPlaneResponse::ShardNotLocal { hint_node }.into());
         }
 
@@ -304,14 +423,9 @@ impl ClientController {
         };
 
         if seg.replica_set.first() != Some(&self.node_id) {
-            let leader_addr = match seg.replica_set.first() {
-                Some(leader) => self
-                    .swim_sender
-                    .resolve_address(leader.clone())
-                    .await?
-                    .map(|a| a.client_addr()),
-                None => None,
-            };
+            let leader_addr = self
+                .resolve_id_to_addr(seg.replica_set.first().cloned())
+                .await;
             return Ok(DataPlaneResponse::NotWriteLeader { leader_addr }.into());
         }
 
@@ -482,8 +596,8 @@ impl ClientController {
             .await?
             .map(|(group, leader)| ShardDetail {
                 shard_group_id: group.id,
-                leader_node_id: leader.as_ref().map(|e| e.leader_node_id.to_string()),
-                leader_addr: leader.map(|e| e.leader_addr.client_addr()),
+                leader_node_id: leader.as_ref().map(|e| e.leader.node_id.to_string()),
+                leader_addr: leader.map(|e| e.leader.client_addr()),
                 member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
             });
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
@@ -536,6 +650,7 @@ pub async fn handle_client_stream(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::connections::protocol::{
         AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
         ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, NodeState, ProduceRequest,
@@ -554,8 +669,6 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use std::net::SocketAddr;
-
-    use super::ClientController;
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -690,7 +803,7 @@ mod tests {
         let ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal { hint_node }) = resp else {
             panic!("expected ShardNotLocal, got {resp:?}");
         };
-        assert_eq!(hint_node, Some(addr(8083)));
+        assert_eq!(hint_node.unwrap().client_addr(), addr(8083));
     }
 
     /// A member but not the segment's write leader → `NotWriteLeader` carrying the
@@ -727,7 +840,7 @@ mod tests {
         else {
             panic!("expected NotWriteLeader, got {resp:?}");
         };
-        assert_eq!(a, addr(8084));
+        assert_eq!(a.client_addr(), addr(8084));
     }
 
     /// This node is the segment's write leader → dispatch and ack as `Produced`.
@@ -795,8 +908,8 @@ mod tests {
         else {
             panic!("expected TopicMetadataRedirect, got {resp:?}");
         };
-        assert_eq!(redirect_owner.node_id, "owner");
-        assert_eq!(redirect_owner.client_addr, addr(8085));
+        assert_eq!(&*redirect_owner.node_id, "owner");
+        assert_eq!(redirect_owner.addr.client_addr, addr(8085));
     }
 
     #[tokio::test]
@@ -946,8 +1059,8 @@ mod tests {
         else {
             panic!("expected TopicMetadataRedirect, got {resp:?}");
         };
-        assert_eq!(redirect_owner.node_id, "owner");
-        assert_eq!(redirect_owner.client_addr, addr(8082));
+        assert_eq!(&*redirect_owner.node_id, "owner");
+        assert_eq!(redirect_owner.addr.client_addr, addr(8082));
     }
 
     /// When the addressed node IS in the owning shard group but the topic
@@ -1029,8 +1142,7 @@ mod tests {
         let node_addr = NodeAddress::test(addr(18001), addr(8081));
         let group = test_shard_group();
         let leader = ShardLeaderEntry {
-            leader_node_id: node_id("n1"),
-            leader_addr: node_addr,
+            leader: NodeAddressInfo::new(node_id("n1"), node_addr),
             term: 3,
         };
         let swim = {

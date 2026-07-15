@@ -21,9 +21,17 @@ mod redirect;
 mod routing;
 use crate::client::nodes::KnownNodes;
 use crate::client::routing::TopicRouting;
+
 pub use crate::connections::protocol::{TopicDetail, TopicSummary};
+#[cfg(test)]
+use crate::control_plane::NodeAddressInfo;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
+use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
+use crate::data_plane::consumer_offset_management::ledger::{
+    ConsumerOffsetKey, ConsumerOffsetPosition,
+};
 pub use codec::CompressionCodec;
 pub use consumer::{
     CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
@@ -32,15 +40,16 @@ pub use consumer::{
 pub use error::ClientError;
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};
+use uuid::Uuid;
 
-use crate::client::consumer::group::SYSTEM_TOPIC_OFFSETS;
-use crate::client::consumer::group::{ConsumerPosition, OffsetCommitPayload};
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneResponse, ProduceRequest, RangeOffsetRequest,
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, CommitConsumerOffsetRequest,
+    ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
+    ControlPlaneResponse, DataPlaneResponse, FetchConsumerOffsetRequest, ProduceRequest,
+    RangeOffsetRequest,
 };
-use borsh::BorshDeserialize;
 
+use futures::{StreamExt, stream::FuturesUnordered};
 pub use redirect::RetryPolicy;
 use redirect::{Redirect, RetryState, Served};
 use routing::RoutingCache;
@@ -95,7 +104,7 @@ impl Client {
         for range in &detail.ranges {
             if let Some(seg) = &range.active_segment {
                 for replica in &seg.replica_set {
-                    self.known_nodes.remember(replica.client_addr);
+                    self.known_nodes.remember(replica.client_addr());
                 }
             }
         }
@@ -135,6 +144,7 @@ impl Client {
                         .or_else(|| r.sealed_segments.last())
                 })
                 .and_then(|seg| seg.pick_read_replica())
+                .map(|addr| addr.client_addr())
                 .unwrap_or_else(|| self.next_known_node());
 
             let req = RangeOffsetRequest {
@@ -161,61 +171,60 @@ impl Client {
         }
     }
 
-    pub async fn fetch_all_saved_offsets(
-        self: Arc<Self>,
-        group_id: &str,
-        topic: &str,
-    ) -> Result<HashMap<RangeId, ConsumerPosition>, ClientError> {
-        let mut map = HashMap::new();
-        let detail = self.resolve_topic(SYSTEM_TOPIC_OFFSETS).await?;
-        let mut unread_tails = HashMap::new();
-        for range in &detail.ranges {
-            let (_, active_next_entry_id) = self
-                .fetch_range_entry_ids(SYSTEM_TOPIC_OFFSETS, range.range_id)
-                .await?;
-            // The important difference is how emptiness is determined:
-            if let Some(scan_end) = range.scan_end_exclusive(active_next_entry_id) {
-                unread_tails.insert(range.range_id, scan_end);
-            }
-        }
+    pub(crate) async fn commit_consumer_offset(
+        &self,
+        topic_name: &str,
+        request: impl Into<CommitConsumerOffsetRequest>,
+    ) -> Result<(), ClientError> {
+        let req = request.into();
 
-        if unread_tails.is_empty() {
-            return Ok(map);
-        }
+        // resolve routing
+        let routing = self.resolve_topic_if_missing(topic_name).await?;
+        let leader = routing
+            .write_leader_for_range(req.key.range_id)
+            .ok_or(ClientError::StaleRange)?;
+        let request_generation = req.generation;
 
-        let offsets_consumer = Consumer::new(
-            self,
-            SYSTEM_TOPIC_OFFSETS.to_string(),
-            KeyInterest::AllKeys,
-            ConsumerConfig::new(StartPolicy::Earliest),
-        )
-        .await?;
-
-        let g_bytes = group_id.as_bytes();
-        let t_bytes = topic.as_bytes();
-        let routing_key = g_bytes.iter().chain(b":".iter()).chain(t_bytes.iter());
-
-        while !unread_tails.is_empty() {
-            let Some(record) = offsets_consumer.next_record().await? else {
-                return Err(ClientError::UnexpectedResponse);
-            };
-
-            if record.key_match(routing_key.clone())
-                && let Ok(payload) = OffsetCommitPayload::try_from_slice(&record.value)
-            {
-                map.insert(payload.range_id, payload.position);
-            }
-
-            if unread_tails
-                .get(&record.range_id)
-                .is_some_and(|next_entry_id| {
-                    record.position.entry_id >= next_entry_id.saturating_sub(1)
+        let served = self.call(leader.client_addr(), req).await?;
+        match served.response {
+            ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffsetCommitted) => Ok(()),
+            ClientResponse::DataPlane(DataPlaneResponse::StaleConsumerGroupEpoch(stale)) => {
+                Err(ClientError::StaleConsumerGroupEpoch {
+                    request_generation,
+                    sealed_generation: stale,
                 })
-            {
-                unread_tails.remove(&record.range_id);
             }
+            _ => Err(ClientError::UnexpectedResponse),
         }
-        Ok(map)
+    }
+
+    pub(crate) async fn fetch_consumer_offsets(
+        &self,
+        topic_name: &str,
+        consumer_offset_keys: Box<[ConsumerOffsetKey]>,
+    ) -> Result<HashMap<RangeId, ConsumerOffsetPosition>, ClientError> {
+        let routing = self.resolve_topic_if_missing(topic_name).await?;
+
+        let futures = consumer_offset_keys.into_vec().into_iter().map(|offset| {
+            let routing = routing.clone();
+            async move {
+                let range_id = offset.range_id;
+                let leader = routing
+                    .write_leader_for_range(range_id)
+                    .ok_or(ClientError::StaleRange)?;
+                let served = self
+                    .call(leader.client_addr(), FetchConsumerOffsetRequest(offset))
+                    .await?;
+                match served.response {
+                    ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffset(position)) => {
+                        Ok(position.map(|p| (range_id, p)))
+                    }
+                    _ => Err(ClientError::UnexpectedResponse),
+                }
+            }
+        });
+        let results = futures::future::try_join_all(futures).await?;
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Create a topic. `Ok(true)` if newly created, `Ok(false)` if it already existed.
@@ -315,7 +324,8 @@ impl Client {
         // active range (the server will redirect).
         let start = routing
             .write_leader(routing_key)
-            .unwrap_or(self.next_known_node());
+            .map(|addr| addr.client_addr())
+            .unwrap_or_else(|| self.next_known_node());
 
         let request = ProduceRequest {
             topic_name: topic.to_string(),
@@ -440,10 +450,10 @@ impl Client {
         match response {
             ClientResponse::ControlPlane(cp) => match cp {
                 ControlPlaneResponse::TopicMetadataRedirect { owner } => {
-                    Redirect::Follow(owner.client_addr)
+                    Redirect::Follow(owner.client_addr())
                 }
                 ControlPlaneResponse::NotRaftLeader { leader_addr } => match leader_addr {
-                    Some(info) => Redirect::Follow(info.client_addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 ControlPlaneResponse::TopicNotFound => Redirect::NotFound,
@@ -451,16 +461,18 @@ impl Client {
                 ControlPlaneResponse::TopicCreated
                 | ControlPlaneResponse::AlreadyExists
                 | ControlPlaneResponse::TopicDeleted
+                | ControlPlaneResponse::ConsumerGroupAssignment(_)
+                | ControlPlaneResponse::ConsumerGroupLeft
                 | ControlPlaneResponse::TopicList { .. }
                 | ControlPlaneResponse::TopicDetail(_) => Redirect::Done,
             },
             ClientResponse::DataPlane(dp) => match dp {
                 DataPlaneResponse::NotWriteLeader { leader_addr } => match leader_addr {
-                    Some(addr) => Redirect::Follow(*addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 DataPlaneResponse::ShardNotLocal { hint_node } => match hint_node {
-                    Some(addr) => Redirect::Follow(*addr),
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
                 DataPlaneResponse::TopicNotFound => Redirect::NotFound,
@@ -472,6 +484,9 @@ impl Client {
                 | DataPlaneResponse::EntryIdOutOfRange
                 | DataPlaneResponse::KeyspaceBoundNarrowed
                 | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
+                DataPlaneResponse::ConsumerOffsetCommitted
+                | DataPlaneResponse::StaleConsumerGroupEpoch(_)
+                | DataPlaneResponse::ConsumerOffset(_) => Redirect::Done,
             },
             ClientResponse::Admin(_) => Redirect::Done,
             // The server's writer-loop sentinel; a client never legitimately reads it.
@@ -484,12 +499,12 @@ impl Client {
 impl Client {
     /// Test seam: poison the cached write leader for `topic` to a wrong (but live)
     /// node, to exercise stale-cache self-correction.
-    pub(crate) fn poison_cache(&self, topic: &str, wrong: SocketAddr) {
+    pub(crate) fn poison_cache(&self, topic: &str, wrong: NodeAddressInfo) {
         self.cache.poison_write_leaders(topic, wrong);
     }
 
     /// Test seam: read the currently-cached write leader for a routing key.
-    pub(crate) fn cached_write_leader(&self, topic: &str, key: &[u8]) -> Option<SocketAddr> {
+    pub(crate) fn cached_write_leader(&self, topic: &str, key: &[u8]) -> Option<NodeAddressInfo> {
         self.cache.write_leader(topic, key)
     }
 

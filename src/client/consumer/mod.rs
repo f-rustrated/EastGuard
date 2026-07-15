@@ -1,31 +1,32 @@
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use std::str::FromStr;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::client::consumer::context::ConsumerContext;
-use crate::client::consumer::group::{
-    ConsumerGroup, ConsumerPosition, OffsetCommitPayload, SYSTEM_TOPIC_OFFSETS,
-};
+use crate::client::consumer::group::ConsumerGroup;
 use crate::client::consumer::topic_fetch_manager::{
-    RangeDrained, TopicFetchManagerCommand, TopicFetchManagerState, run_topic_fetch_manager,
+    TopicFetchManagerState, run_topic_fetch_manager,
 };
+
 use crate::client::redirect::Served;
-use crate::client::{Client, ClientError, Producer, ProducerConfig};
+use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
 
+pub mod config;
+pub use config::*;
 pub(crate) mod context;
 pub(crate) mod cursor;
 pub(crate) mod group;
+mod messages;
+use messages::*;
 pub(crate) mod range_fetcher;
 pub(crate) mod topic_fetch_manager;
 
-pub use cursor::{KeyInterest, StartPolicy};
+pub use cursor::KeyInterest;
 pub(crate) use cursor::{MergeSiblingState, PendingCursorStore, RangeCursor};
 
 /// A record returned to the consumer application.
@@ -33,7 +34,7 @@ pub(crate) use cursor::{MergeSiblingState, PendingCursorStore, RangeCursor};
 pub struct ConsumerRecord {
     pub topic: String,
     pub range_id: RangeId,
-    pub position: ConsumerPosition,
+    pub position: ConsumerOffsetPosition,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
@@ -41,40 +42,6 @@ pub struct ConsumerRecord {
 impl ConsumerRecord {
     pub fn key_match<'a>(&'a self, key: impl Iterator<Item = &'a u8>) -> bool {
         self.key.iter().eq(key)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum DeliverySemantic {
-    AtLeastOnce,
-    AtMostOnceBestEffort,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommitMode {
-    Auto,
-    Manual,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConsumerConfig {
-    /// The policy (Earliest/Latest) used to start consumption on newly assigned ranges.
-    pub start_policy: StartPolicy,
-    pub group_id: Option<String>,
-    pub auto_commit_interval_ms: u64,
-    pub delivery_semantic: DeliverySemantic,
-    pub commit_mode: CommitMode,
-}
-
-impl ConsumerConfig {
-    pub fn new(start_policy: StartPolicy) -> Self {
-        Self {
-            start_policy,
-            group_id: None,
-            auto_commit_interval_ms: 5000, // Default to 1 second for groups
-            delivery_semantic: DeliverySemantic::AtLeastOnce,
-            commit_mode: CommitMode::Auto,
-        }
     }
 }
 
@@ -101,8 +68,15 @@ impl Consumer {
 
         // Consolidate all group-specific logic into a single block
         if let Some(gid) = config.group_id.clone() {
-            let group =
-                Arc::new(ConsumerGroup::new(client.clone(), gid.to_string(), topic.clone()).await?);
+            let group = Arc::new(
+                ConsumerGroup::new(
+                    client.clone(),
+                    gid.to_string(),
+                    topic.clone(),
+                    detail.topic_id,
+                )
+                .await?,
+            );
             consumer_group = Some(group);
             // If in a consumer group, initialize with empty cursors;
             // assignments will be dynamically resolved and started by the rebalancer.
@@ -162,10 +136,25 @@ impl Consumer {
     }
 
     pub async fn commit(&self) -> Result<(), ClientError> {
-        if let Some(group) = &self.group {
-            group.commit().await?;
+        let Some(group) = &self.group else {
+            return Ok(());
+        };
+        match group.commit().await {
+            Err(ClientError::StaleConsumerGroupEpoch { .. }) => {
+                // Fence delivery before waiting for the manager mailbox.
+                // The manager will stop actors and rebuild effective lineage ownership from the new assignment.
+                group.fence_delivery();
+                let (reply, response) = tokio::sync::oneshot::channel();
+                self.command_tx
+                    .send_async(RetryCommitAfterEpochRefresh { reply }.into())
+                    .await
+                    .map_err(|_| ClientError::on_commit("manager is not running"))?;
+                response
+                    .await
+                    .map_err(|_| ClientError::on_commit("manager dropped the reply"))?
+            }
+            result => result,
         }
-        Ok(())
     }
 
     pub fn ack(&self, record: &ConsumerRecord) -> Result<(), ClientError> {
@@ -183,7 +172,7 @@ impl Consumer {
         const OPERATION: &str = "pause";
         let (reply, response) = tokio::sync::oneshot::channel();
         self.command_tx
-            .send_async(TopicFetchManagerCommand::Pause { range_id, reply })
+            .send_async(PauseRange { range_id, reply }.into())
             .await
             .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
         response
@@ -195,7 +184,7 @@ impl Consumer {
         const OPERATION: &str = "resume";
         let (reply, response) = tokio::sync::oneshot::channel();
         self.command_tx
-            .send_async(TopicFetchManagerCommand::Resume { range_id, reply })
+            .send_async(ResumeRange { range_id, reply }.into())
             .await
             .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
         response
@@ -211,11 +200,14 @@ impl Consumer {
         const OPERATION: &str = "seek";
         let (reply, response) = tokio::sync::oneshot::channel();
         self.command_tx
-            .send_async(TopicFetchManagerCommand::Seek {
-                range_id,
-                absolute_offset,
-                reply,
-            })
+            .send_async(
+                SeekRange {
+                    range_id,
+                    absolute_offset,
+                    reply,
+                }
+                .into(),
+            )
             .await
             .map_err(|_| Self::control_error(OPERATION, range_id, "manager is not running"))?;
         response

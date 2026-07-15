@@ -207,7 +207,10 @@ position < eviction_frontier?
             └── yes → TAILING: cache.notified().await — wake on read_cursor advance
 ```
 
-Consumer offset tracking: consumers track their read position client-side via `(entry_id, record_index)`. The server is stateless with respect to consumer position. Consumer group offset commit and resume semantics are deferred (see roadmap backlog "Consumer Groups").
+Fetch cursors remain client-side: a normal consume request carries the range and record
+position and leaves no server-side session behind. Consumer groups add a separate durable
+checkpoint keyed by topic, range, and group; those checkpoints share this WAL but live in a
+dedicated in-memory ledger. See [D8](d8_consumer_offset_management.md).
 
 **Hot/cold transition:** Consumer checks `eviction_frontier` on each iteration. When reading behind the frontier, it dispatches to cold read pool. Once its position catches up to `eviction_frontier`, the next read switches to the hot cache path (direct `Arc` clone from the ring buffer). The transition is seamless — same consumer task, same stream, just a different data source.
 

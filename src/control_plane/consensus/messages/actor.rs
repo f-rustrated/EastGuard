@@ -1,9 +1,10 @@
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{TopicMeta, TopicStats};
+use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
 
 use super::command::{
@@ -11,6 +12,7 @@ use super::command::{
     RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
+use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 
 pub enum MultiRaftActorCommand {
@@ -48,6 +50,7 @@ pub enum MultiRaftActorCommand {
         topic_name: String,
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
+    GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data plane SealRequest forwarded to coordinator for Raft proposal.
     Coordinator(CoordinatorSealRequest),
     /// Data-leader confirmation that it received a `SegmentAssignment`. Marks the
@@ -60,6 +63,13 @@ pub enum MultiRaftActorCommand {
     /// `sealed_end`. Clears the member from the coordinator's catch-up re-drive so
     /// the heartbeat sweep stops re-announcing the assignment.
     CatchUpAck(CatchUpAck),
+}
+
+pub struct GetConsumerGroupAssignment {
+    pub(crate) topic_name: String,
+    pub(crate) group_id: String,
+    pub(crate) member_id: Uuid,
+    pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
 }
 
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {
@@ -82,6 +92,13 @@ impl_from_variant_via!(
     RemoveGroup,
 );
 
+impl_from_variant!(MultiRaftActorCommand, GetConsumerGroupAssignment);
+
+pub(crate) struct DeferredConsumerGroupAssignment {
+    pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
+    pub(crate) value: Option<ConsumerGroupAssignment>,
+}
+
 pub(crate) enum DeferredReply {
     GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
     GetPeers(oneshot::Sender<Box<[NodeId]>>, Box<[NodeId]>),
@@ -92,4 +109,5 @@ pub(crate) enum DeferredReply {
     GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
     GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),
     GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Option<TopicMeta>),
+    GetConsumerGroupAssignment(DeferredConsumerGroupAssignment),
 }

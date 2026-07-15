@@ -3,6 +3,7 @@
 //! per-request check corrects a stale entry with a redirect (`redirect.rs`), so the
 //! cache only ever costs an extra hop, never a wrong target.
 use crate::connections::protocol::{RangeDetail, TopicDetail};
+use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::{RangeId, TopicId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -22,8 +23,8 @@ struct RangeRoute {
     keyspace_start: Vec<u8>,
     /// `replica_set[0]` of the active segment, the produce target. `None` when the
     /// range has no active segment (sealed/deleting) or its replica set is empty.
-    write_leader: Option<SocketAddr>,
-    replicas: Box<[SocketAddr]>,
+    write_leader: Option<NodeAddressInfo>,
+    replicas: Box<[NodeAddressInfo]>,
 }
 
 // Active segment only — correct for produce (the write head) and a tailing consumer.
@@ -33,15 +34,20 @@ struct RangeRoute {
 // See c1_routing_and_connections.md / d4.
 impl From<&RangeDetail> for RangeRoute {
     fn from(range: &RangeDetail) -> Self {
-        let replicas: Box<[SocketAddr]> = range
+        let placement = range
             .active_segment
             .as_ref()
-            .map(|seg| seg.replica_set.iter().map(|n| n.client_addr).collect())
+            .or_else(|| range.sealed_segments.last());
+        let replicas: Box<[NodeAddressInfo]> = placement
+            .map(|seg| seg.replica_set.iter().cloned().collect())
             .unwrap_or_default();
         RangeRoute {
             range_id: range.range_id,
             keyspace_start: range.keyspace_start.clone(),
-            write_leader: replicas.first().copied(),
+            write_leader: range
+                .active_segment
+                .as_ref()
+                .and_then(|_| replicas.first().cloned()),
             replicas,
         }
     }
@@ -51,12 +57,12 @@ impl TopicRouting {
     /// The active range owning `routing_key` — mirrors the server's
     /// `route_active_range`: the active range with the greatest `keyspace_start ≤ key`.
     /// Returns its write leader.
-    pub(crate) fn write_leader(&self, routing_key: &[u8]) -> Option<SocketAddr> {
+    pub(crate) fn write_leader(&self, routing_key: &[u8]) -> Option<NodeAddressInfo> {
         self.ranges
             .iter()
             .rev()
             .find(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
-            .and_then(|r| r.write_leader)
+            .and_then(|r| r.write_leader.clone())
     }
 
     pub(crate) fn range_id(&self, routing_key: &[u8]) -> Option<RangeId> {
@@ -67,11 +73,18 @@ impl TopicRouting {
             .map(|r| r.range_id)
     }
 
-    fn replicas(&self, range_id: RangeId) -> Option<&[SocketAddr]> {
+    pub(crate) fn replicas(&self, range_id: RangeId) -> Option<&[NodeAddressInfo]> {
         self.ranges
             .iter()
             .find(|r| r.range_id == range_id)
             .map(|r| r.replicas.as_ref())
+    }
+
+    pub(crate) fn write_leader_for_range(&self, range_id: RangeId) -> Option<NodeAddressInfo> {
+        self.ranges
+            .iter()
+            .find(|range| range.range_id == range_id)
+            .and_then(|range| range.replicas.first().cloned())
     }
 }
 
@@ -128,13 +141,17 @@ impl RoutingCache {
 
     /// Cached write leader for `routing_key` in `topic`, if the topic is cached and
     /// the key falls in an active range.
-    pub(crate) fn write_leader(&self, topic: &str, routing_key: &[u8]) -> Option<SocketAddr> {
+    pub(crate) fn write_leader(&self, topic: &str, routing_key: &[u8]) -> Option<NodeAddressInfo> {
         self.get(topic)?.write_leader(routing_key)
     }
 
     /// Cached *active-segment* replica addresses for a range (C3 tailing fetch).
     /// Historical reads need the sealed-segment extension — see `RangeRoute`.
-    pub(crate) fn replicas(&self, topic: &str, range_id: RangeId) -> Option<Box<[SocketAddr]>> {
+    pub(crate) fn replicas(
+        &self,
+        topic: &str,
+        range_id: RangeId,
+    ) -> Option<Box<[NodeAddressInfo]>> {
         Some(self.get(topic)?.replicas(range_id)?.into())
     }
 }
@@ -144,7 +161,7 @@ impl RoutingCache {
     /// Test seam: rewrite every active range's cached write leader for `topic` to
     /// `wrong`, simulating a stale cache (the real leader has moved). A produce then
     /// self-corrects via the server's `NotWriteLeader` redirect.
-    pub(crate) fn poison_write_leaders(&self, topic: &str, wrong: SocketAddr) {
+    pub(crate) fn poison_write_leaders(&self, topic: &str, wrong: NodeAddressInfo) {
         self.topics.rcu(|current_topics| {
             let Some(routing) = current_topics.get(topic) else {
                 return current_topics.clone();
@@ -156,7 +173,7 @@ impl RoutingCache {
                 .map(|r| RangeRoute {
                     range_id: r.range_id,
                     keyspace_start: r.keyspace_start.clone(),
-                    write_leader: r.write_leader.map(|_| wrong),
+                    write_leader: r.write_leader.as_ref().map(|_| wrong.clone()),
                     replicas: r.replicas.clone(),
                 })
                 .collect();

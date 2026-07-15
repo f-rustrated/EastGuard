@@ -8,6 +8,7 @@
 //! `end_offset`. The store enforces this by making successors fetchable only
 //! after their predecessor requirements are satisfied.
 
+use crate::client::StartPolicy;
 use crate::client::TopicDetail;
 use crate::connections::protocol::RangeDetail;
 use crate::connections::protocol::RangeTransition;
@@ -52,23 +53,6 @@ impl KeyInterest {
             KeyInterest::KeySpan { start, end } => {
                 r.keyspace_start < *end && *start < r.keyspace_end
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartPolicy {
-    Latest,
-    Earliest,
-}
-
-impl std::str::FromStr for StartPolicy {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "latest" => Ok(StartPolicy::Latest),
-            "earliest" => Ok(StartPolicy::Earliest),
-            _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
         }
     }
 }
@@ -123,6 +107,11 @@ impl PendingCursorStore {
 
     pub fn is_empty(&self) -> bool {
         self.fetchable.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.fetchable.clear();
+        self.merge_waits.clear();
     }
 
     pub fn remove(&mut self, range_id: RangeId) -> Option<RangeCursor> {
@@ -420,8 +409,8 @@ impl TAssertInvariant for PendingCursorStore {
 mod tests {
     use super::*;
     use super::*;
-    use crate::connections::protocol::{RangeDetail, SegmentDetail, TopicState};
-    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId};
+    use crate::connections::protocol::{RangeDetail, SegmentDetail};
+    use crate::control_plane::metadata::{RangeId, RangeState, SegmentId, TopicId, TopicState};
 
     fn cursor(range_id: RangeId, next_entry_id: EntryId, start: &[u8], end: &[u8]) -> RangeCursor {
         RangeCursor::new(range_id, next_entry_id, start.to_vec(), end.to_vec())

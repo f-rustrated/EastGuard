@@ -10,11 +10,14 @@ use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
-use crate::control_plane::metadata::{MetadataCommand, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{
+    ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
+};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
 
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub struct MultiRaftActor {
     store: MultiRaft,
@@ -241,6 +244,24 @@ impl MutlRaftSender {
             .send(MultiRaftActorCommand::GetTopicMetadata { topic_name, reply })
             .await;
 
+        recv.await.unwrap_or_default()
+    }
+
+    pub(crate) async fn get_consumer_group_assignment(
+        &self,
+        topic_name: String,
+        group_id: String,
+        member_id: Uuid,
+    ) -> Option<ConsumerGroupAssignment> {
+        let (reply, recv) = tokio::sync::oneshot::channel();
+        let _ = self
+            .send(GetConsumerGroupAssignment {
+                topic_name,
+                group_id,
+                member_id,
+                reply,
+            })
+            .await;
         recv.await.unwrap_or_default()
     }
 

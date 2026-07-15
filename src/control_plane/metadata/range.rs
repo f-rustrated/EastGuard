@@ -4,8 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::control_plane::metadata::{
     EntryId, RangeId, ReplicaSet, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
-    command::{MetadataCommand, RollSegment},
-    error::MetadataError,
+    command::RollSegment, error::MetadataError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -140,19 +139,22 @@ impl RangeMeta {
     pub(crate) fn build_split_proposal(
         &self,
         cmd: &RollSegment,
-    ) -> Result<MetadataCommand, MetadataError> {
+    ) -> Result<SplitRange, MetadataError> {
         let mid = self.compute_midpoint();
         if !self.valid_split_point(&mid) {
             return Err(MetadataError::InvalidSplitPoint);
         }
-        Ok(MetadataCommand::SplitRange(SplitRange {
+
+        // TODO on split, replica set may be dynamically decided based on loads.
+        // Currently, we are just cloning `new_replica_set`
+        Ok(SplitRange {
             topic_id: cmd.segment_key.topic_id,
             range_id: cmd.segment_key.range_id,
             split_point: mid,
             created_at: cmd.sealed_at,
             left_replica_set: cmd.new_replica_set.clone(),
             right_replica_set: cmd.new_replica_set.clone(),
-        }))
+        })
     }
 
     pub(crate) fn roll_segment(&mut self, cmd: RollSegment) -> Result<SegmentId, MetadataError> {
@@ -363,8 +365,16 @@ pub struct RangeSealHistory {
 
 impl RangeSealHistory {
     pub fn record_seal(&mut self, sealed_at: u64) {
-        self.seal_timestamps.push_back(sealed_at);
-        let cutoff = sealed_at.saturating_sub(MEASUREMENT_WINDOW_MS);
+        // Proposal timestamps are captured before Raft serialization, so a
+        // delayed proposal can commit after one with a newer wall-clock value.
+        // Preserve the event times while keeping the committed history ordered.
+        let position = self
+            .seal_timestamps
+            .partition_point(|timestamp| *timestamp <= sealed_at);
+        self.seal_timestamps.insert(position, sealed_at);
+
+        let newest = self.seal_timestamps.back().copied().unwrap_or(sealed_at);
+        let cutoff = newest.saturating_sub(MEASUREMENT_WINDOW_MS);
         while self.seal_timestamps.front().is_some_and(|&t| t <= cutoff) {
             self.seal_timestamps.pop_front();
         }

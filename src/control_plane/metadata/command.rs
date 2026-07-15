@@ -1,6 +1,10 @@
+use std::ops::Deref;
+
 use borsh::{BorshDeserialize, BorshSerialize};
+use uuid::Uuid;
 
 use crate::{
+    connections::protocol::ConsumerGroupSyncAction,
     control_plane::{
         NodeId,
         metadata::{EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
@@ -70,6 +74,45 @@ pub struct DeleteSegments {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SyncConsumerGroup {
+    pub req: SyncConsumerGroupRequest,
+    // TODO consider using logical clock
+    pub observed_at: u64,
+    pub session_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct SyncConsumerGroupRequest {
+    pub topic_name: String,
+    pub group_id: String,
+    pub member_id: Uuid,
+    pub action: ConsumerGroupSyncAction,
+}
+
+impl Deref for SyncConsumerGroup {
+    type Target = SyncConsumerGroupRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.req
+    }
+}
+
+impl SyncConsumerGroup {
+    pub(crate) fn new(req: SyncConsumerGroupRequest) -> Self {
+        const SESSION_TIMEOUT_MS: u64 = 10_000;
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        SyncConsumerGroup {
+            req,
+            observed_at,
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum MetadataCommand {
     CreateTopic(CreateTopic),
     RollSegment(RollSegment),
@@ -78,6 +121,7 @@ pub enum MetadataCommand {
     DeleteTopic(DeleteTopic),
     ReassignSegment(ReassignSegment),
     DeleteSegments(DeleteSegments),
+    SyncConsumerGroup(SyncConsumerGroup),
 }
 
 impl_from_variant!(
@@ -88,5 +132,6 @@ impl_from_variant!(
     MergeRange,
     DeleteTopic,
     ReassignSegment,
-    DeleteSegments
+    DeleteSegments,
+    SyncConsumerGroup
 );

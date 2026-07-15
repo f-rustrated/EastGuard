@@ -94,6 +94,17 @@ impl SegmentStore {
         self.by_key.len()
     }
 
+    // Looks at all active data segments in memory and finds the lowest checkpoint_lsn.
+    // If a segment hasn't flushed its recent data to its dedicated '.log' file,
+    // the WAL entries containing that data must be kept so it can be recovered upon restart.
+    pub(crate) fn reclamation_watermark(&self, reclaimable_lsn: u64) -> u64 {
+        self.values()
+            .map(|tracker| tracker.checkpoint_lsn())
+            .min()
+            .unwrap_or(reclaimable_lsn)
+            .min(reclaimable_lsn)
+    }
+
     /// Insert an active tracker AND its `active_by_range` index entry.
     /// Idempotent — if the key already exists the new tracker is dropped, so
     /// callers can blindly retry a SegmentAssignment without checking first.

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use flume::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::consumer_offset_management::ledger::OffsetLedger;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 use crate::data_plane::wal::WalRecord;
 
@@ -66,6 +67,19 @@ impl CheckpointWorker {
                         tracing::warn!("retention index delete failed for {segment_key:?}: {e}");
                     }
                 }
+
+                // A snapshot is created only when WAL reclamation would cross an uncheckpointed offset record.
+                CheckpointTask::ConsumerOffsets(job) => {
+                    if let Err(e) = job.offsets.write_snapshot(&job.data_dir) {
+                        tracing::error!("consumer offset checkpoint failed: {e}");
+                        continue;
+                    }
+                    let completion: DataPlaneCommand = OffsetCheckpointComplete {
+                        checkpointed_lsn: job.checkpointed_lsn,
+                    }
+                    .into();
+                    let _ = data_plane_tx.send(DataPlaneMessage::Command(completion));
+                }
             }
         }
     }
@@ -97,7 +111,7 @@ impl CheckpointWorker {
         // via CheckpointComplete to prevent an invariant race condition where the frontier
         // advances before checkpoint_lsn is updated.
 
-        let completion: DataPlaneCommand = CheckpointComplete {
+        let completion: DataPlaneCommand = SegmentCheckpointComplete {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),
             new_frontier: checkpoint.new_frontier,
@@ -120,10 +134,19 @@ pub(crate) enum CheckpointTask {
     PutAnchors(Box<[SparseEntry]>),
     /// Retention (D7): remove a reclaimed segment's sparse-index entries.
     DeleteSegmentIndex(SegmentKey),
+    /// Snapshot the consumer-offset cache after its corresponding shared-WAL
+    /// batch is durable. This runs off the data-plane write path.
+    ConsumerOffsets(OffsetCheckpointJob),
 }
 
 pub struct CheckpointJob {
     pub segment_key: SegmentKey,
     pub cache: Arc<SegmentRingBuffer>,
     pub segment_file_path: PathBuf,
+}
+
+pub struct OffsetCheckpointJob {
+    pub offsets: OffsetLedger,
+    pub data_dir: PathBuf,
+    pub checkpointed_lsn: u64,
 }

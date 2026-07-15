@@ -121,7 +121,9 @@ impl WalFileReader {
                 Ok(record) => {
                     self.consumed += record.encoded_size() as u64;
                     match record.record_type {
-                        WalRecordType::Data => self.pending.push(record),
+                        WalRecordType::Data | WalRecordType::ConsumerOffset => {
+                            self.pending.push(record);
+                        }
                         WalRecordType::BatchEnd => {
                             self.credited = self.consumed;
                             let records = std::mem::take(&mut self.pending).into_boxed_slice();

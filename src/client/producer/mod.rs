@@ -4,7 +4,7 @@ pub(crate) mod record;
 use crate::client::error::ClientError;
 use crate::client::{Client, CompressionCodec};
 use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::smart_pointer;
+use crate::impl_new_struct_wrapper;
 use buffers::{PendingRecord, ProducerBuffers, PushResult};
 pub use config::{BufferConfig, ProducerConfig};
 
@@ -20,7 +20,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Producer(Arc<Inner>);
 
-smart_pointer!(Producer, Arc<Inner>);
+impl_new_struct_wrapper!(Producer, Arc<Inner>);
 
 pub struct Inner {
     client: Arc<Client>,

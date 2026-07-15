@@ -219,6 +219,12 @@ impl ColdReadPool {
                 // `BatchEnd` is a per-entry separator in segment files, not the
                 // end of the stream — keep going.
                 WalRecordType::BatchEnd => continue,
+                WalRecordType::ConsumerOffset => {
+                    return Err(ColdReadError::Decode(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "consumer offset record in segment file",
+                    )));
+                }
                 WalRecordType::Data => {
                     let entry_id = current_entry_id;
                     current_entry_id += 1u64;

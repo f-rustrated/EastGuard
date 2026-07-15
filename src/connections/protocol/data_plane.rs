@@ -6,15 +6,23 @@
 //! routing cache. When this node is not the right destination, a redirect
 //! error is returned so the client can reconnect and retry. Stale targeting
 //! costs a retry, never correctness.
-
-use std::net::SocketAddr;
-
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta},
-    data_plane::messages::query::{FetchResult, ListOffsetsResult},
-    impl_from_variant,
+    control_plane::{
+        NodeAddressInfo,
+        metadata::{
+            EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta,
+            consumer_group::GenerationId,
+        },
+    },
+    data_plane::{
+        consumer_offset_management::ledger::{
+            ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
+        },
+        messages::query::{FetchResult, ListOffsetsResult},
+    },
+    impl_from_variant, impl_new_struct_wrapper,
 };
 
 /// Client → broker data-plane request. Every variant carries a `Client*Request`
@@ -27,6 +35,8 @@ pub enum ClientDataPlaneRequest {
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
     ListOffsets(RangeOffsetRequest),
+    CommitConsumerOffset(CommitConsumerOffsetRequest),
+    FetchConsumerOffset(FetchConsumerOffsetRequest),
 }
 
 impl_from_variant!(
@@ -35,6 +45,8 @@ impl_from_variant!(
     Fetch(FetchRequest),
     FetchById(FetchByIdRequest),
     ListOffsets(RangeOffsetRequest),
+    CommitConsumerOffset(CommitConsumerOffsetRequest),
+    FetchConsumerOffset(FetchConsumerOffsetRequest),
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -82,6 +94,13 @@ pub struct RangeOffsetRequest {
     pub range_id: RangeId,
 }
 
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct CommitConsumerOffsetRequest(pub ConsumerOffsetUpdate);
+impl_new_struct_wrapper!(CommitConsumerOffsetRequest, ConsumerOffsetUpdate);
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct FetchConsumerOffsetRequest(pub ConsumerOffsetKey);
+
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum DataPlaneResponse {
     // Produce
@@ -105,14 +124,18 @@ pub enum DataPlaneResponse {
     // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
     // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
     NotWriteLeader {
-        leader_addr: Option<SocketAddr>,
+        leader_addr: Option<NodeAddressInfo>,
     },
     ShardNotLocal {
-        hint_node: Option<SocketAddr>,
+        hint_node: Option<NodeAddressInfo>,
     },
     StaleRange,
     TopicNotFound,
     SegmentNotLocal,
+
+    ConsumerOffsetCommitted,
+    StaleConsumerGroupEpoch(GenerationId),
+    ConsumerOffset(Option<ConsumerOffsetPosition>),
     InternalError(String),
 }
 

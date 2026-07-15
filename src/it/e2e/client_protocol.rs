@@ -351,13 +351,13 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
                 }) => {
                     // Follow the redirect — owner.client_addr is the SWIM-resolved
                     // address; for turmoil tests we use the well-known port map.
-                    let owner_port = match owner.node_id.as_str() {
+                    let owner_port = match &*owner.node_id {
                         "node-1" => 8081,
                         "node-2" => 8082,
                         "node-3" => 8083,
                         other => panic!("unexpected redirect to {other}"),
                     };
-                    let owner_host = owner.node_id.as_str();
+                    let owner_host = &*owner.node_id;
                     let resp2 = send_request(owner_host, owner_port, describe.clone()).await;
                     if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) =
                         resp2
@@ -683,7 +683,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
                 let replicas = seg
                     .replica_set
                     .iter()
-                    .map(|r| r.node_id.clone())
+                    .map(|r| r.node_id.to_string())
                     .collect::<Vec<String>>();
                 sealed = Some((detail.topic_id, replicas));
                 break;
@@ -1029,7 +1029,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                 let replicas = seg
                     .replica_set
                     .iter()
-                    .map(|r| r.node_id.clone())
+                    .map(|r| r.node_id.to_string())
                     .collect::<Vec<String>>();
                 sealed = Some((detail.topic_id, replicas));
                 break;
@@ -1216,7 +1216,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
                 let replicas = seg
                     .replica_set
                     .iter()
-                    .map(|r| r.node_id.clone())
+                    .map(|r| r.node_id.to_string())
                     .collect::<Vec<String>>();
                 sealed = Some((detail.topic_id, replicas));
                 break;
@@ -1592,9 +1592,9 @@ async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_f
                 ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
                 | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => return,
                 ClientResponse::ControlPlane(ControlPlaneResponse::NotRaftLeader {
-                    leader_addr: Some(info),
+                    leader_addr: Some(addr),
                 }) => {
-                    if let Some((lh, lp)) = redirect_addr_to_node(info.client_addr, nodes)
+                    if let Some((lh, lp)) = redirect_addr_to_node(addr.client_addr(), nodes)
                         && matches!(
                             send_request(lh, lp, req.clone()).await,
                             ClientResponse::ControlPlane(
@@ -1696,10 +1696,10 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
         ClientResponse::DataPlane(DataPlaneResponse::Produced { .. }) => ProduceOutcome::Acked,
         ClientResponse::DataPlane(DataPlaneResponse::NotWriteLeader {
             leader_addr: Some(addr),
-        }) => ProduceOutcome::Redirect(addr),
+        }) => ProduceOutcome::Redirect(addr.client_addr()),
         ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
             hint_node: Some(addr),
-        }) => ProduceOutcome::Redirect(addr),
+        }) => ProduceOutcome::Redirect(addr.client_addr()),
         _ => ProduceOutcome::Retry,
     }
 }
