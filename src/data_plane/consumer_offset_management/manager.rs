@@ -1,6 +1,6 @@
-use crate::control_plane::NodeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{RangeId, TopicId};
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::checkpoint::OffsetCheckpointJob;
 use crate::data_plane::consumer_offset_management::ledger::{
@@ -135,9 +135,11 @@ impl ConsumerOffsetManager {
             return;
         }
 
+        let replicas = Replicas::new(replica_set);
+        let leader = replicas.leader().cloned().unwrap();
         self.offset_placements.insert(
             (segment_key.topic_id, segment_key.range_id),
-            OffsetPlacement { replica_set },
+            OffsetPlacement { leader, replicas },
         );
     }
 
@@ -145,17 +147,14 @@ impl ConsumerOffsetManager {
         &self,
         key: &ConsumerOffsetKey,
         node_id: &NodeId,
-    ) -> Result<Vec<NodeId>, Option<NodeId>> {
+    ) -> Result<Replicas, Option<NodeId>> {
         let Some(placement) = self.offset_placements.get(&(key.topic_id, key.range_id)) else {
             return Err(None);
         };
-        let Some(leader) = placement.replica_set.first() else {
-            return Err(None);
-        };
-        if leader != node_id {
-            return Err(Some(leader.clone()));
+        if placement.leader != *node_id {
+            return Err(Some(placement.leader.clone()));
         }
-        Ok(placement.replica_set.clone())
+        Ok(placement.replicas.clone())
     }
 
     pub(crate) fn has_pending_offsets(&self) -> bool {
@@ -297,29 +296,32 @@ impl ConsumerOffsetManager {
                         continue;
                     };
 
-                    let followers: Vec<NodeId> =
-                        commit.replica_set.iter().skip(1).cloned().collect();
+                    let followers: Vec<NodeId> = commit.replica_set.followers().cloned().collect();
                     if followers.is_empty() {
                         let _ = commit.reply.send(ConsumerOffsetCommitAck::Committed);
                         continue;
                     }
 
-                    let replication = self.offset_replication.begin(
-                        commit.replica_set,
+                    let seq = self.offset_replication.begin(
+                        followers.clone().into_iter().collect(),
                         offset_commit.clone(),
                         commit.reply,
                     );
                     transports.push(DataTransportCommand::send_to_targets(
                         followers,
-                        replication,
+                        ReplicaOffsetCommit {
+                            seq,
+                            replica_set: commit.replica_set,
+                            update: offset_commit,
+                        },
                     ));
                 }
                 OffsetMutationCompletion::ReplicaCommit(commit) => {
-                    let Some(leader) = commit.replica_set.first().cloned() else {
+                    let Some(leader) = commit.replica_set.leader() else {
                         continue;
                     };
                     transports.push(DataTransportCommand::send_to_targets(
-                        vec![leader],
+                        vec![leader.clone()],
                         ReplicaOffsetAck {
                             seq: commit.seq,
                             update: commit.update,
@@ -339,6 +341,8 @@ impl ConsumerOffsetManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::control_plane::metadata::EntryId;
     use crate::data_plane::consumer_offset_management::ledger::{
@@ -375,7 +379,7 @@ mod tests {
                     position: position(),
                 }),
                 LeaderOffsetCommitApplied {
-                    replica_set: vec![NodeId::new("leader")],
+                    replica_set: Replicas::new(vec![NodeId::new("leader")]),
                     reply: pending_reply,
                 },
             ));
@@ -395,7 +399,7 @@ mod tests {
 
         let (replication_reply, mut replication_response) = oneshot::channel();
         manager.offset_replication.begin(
-            vec![NodeId::new("leader"), NodeId::new("follower")],
+            HashSet::from_iter([NodeId::new("follower")]),
             ConsumerOffsetUpdate {
                 key: key(),
                 generation: GenerationId(1),

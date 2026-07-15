@@ -6,6 +6,7 @@ use std::time::Duration;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::SwimNodeState::Alive;
+use crate::impl_new_struct_wrapper;
 
 /// A node identifier paired with its currently-known client address.
 /// Addresses come from SWIM membership; consumers cache them.
@@ -134,5 +135,24 @@ impl std::ops::Deref for NodeId {
 impl std::borrow::Borrow<str> for NodeId {
     fn borrow(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+pub struct Replicas(Vec<NodeId>);
+crate::smart_pointer!(Replicas, Vec<NodeId>);
+
+impl Replicas {
+    pub fn new(nodes: Vec<NodeId>) -> Self {
+        assert!(!nodes.is_empty(), "Replica set cannot be empty");
+        Self(nodes)
+    }
+
+    pub fn leader(&self) -> Option<&NodeId> {
+        self.first()
+    }
+
+    pub fn followers(&self) -> impl Iterator<Item = &NodeId> {
+        self.iter().skip(1)
     }
 }

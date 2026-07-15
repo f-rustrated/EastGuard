@@ -1,6 +1,5 @@
 use crate::control_plane::NodeId;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
-use crate::data_plane::consumer_offset_management::types::ReplicaOffsetCommit;
 use crate::data_plane::messages::command::{
     ConsumerOffsetCommitAck, ReplicaOffsetAck, ReplicaOffsetAckResult,
 };
@@ -32,13 +31,12 @@ impl PendingOffsetReplication {
 impl OffsetReplicationState {
     pub(crate) fn begin(
         &mut self,
-        replica_set: Vec<NodeId>,
+        followers: HashSet<NodeId>,
         update: ConsumerOffsetUpdate,
         reply: oneshot::Sender<ConsumerOffsetCommitAck>,
-    ) -> ReplicaOffsetCommit {
+    ) -> u64 {
         self.pending.retain(|_, pending| !pending.reply.is_closed());
         self.seq = self.seq.wrapping_add(1);
-        let followers = replica_set.iter().skip(1).cloned().collect();
         self.pending.insert(
             self.seq,
             PendingOffsetReplication {
@@ -47,11 +45,7 @@ impl OffsetReplicationState {
                 reply,
             },
         );
-        ReplicaOffsetCommit {
-            seq: self.seq,
-            replica_set,
-            update,
-        }
+        self.seq
     }
 
     pub(crate) fn process_ack(&mut self, ack: ReplicaOffsetAck) {

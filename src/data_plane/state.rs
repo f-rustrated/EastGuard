@@ -945,7 +945,7 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
-        let Some(leader) = cmd.replica_set.first().cloned() else {
+        let Some(leader) = cmd.replica_set.leader().cloned() else {
             return;
         };
         if leader == self.node_id {
@@ -1572,6 +1572,7 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::control_plane::Replicas;
     use crate::data_plane::consumer_offset_management::ledger::{
         ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetLedger,
     };
@@ -1885,7 +1886,7 @@ mod tests {
         dp.process(DataPlaneInterNodeCommand::ReplicaOffsetCommit(
             ReplicaOffsetCommit {
                 seq: 9,
-                replica_set: vec![leader, test_node_id()],
+                replica_set: Replicas::new(vec![leader, test_node_id()]),
                 update: ConsumerOffsetUpdate {
                     key: consumer_offset_key(),
                     generation: 0.into(),
