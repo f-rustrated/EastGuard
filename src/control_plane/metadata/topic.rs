@@ -4,7 +4,7 @@ use super::constants::*;
 use super::*;
 use crate::{
     control_plane::{
-        NodeId,
+        NodeId, Replicas,
         metadata::{
             error::MetadataError,
             event::ConsumerGroupEpochSnapshot,
@@ -37,7 +37,7 @@ impl TopicMeta {
     pub(crate) fn new(
         name: String,
         id: TopicId,
-        replica_set: ReplicaSet,
+        replica_set: Replicas,
         created_at: u64,
         storage_policy: StoragePolicy,
     ) -> Self {
@@ -103,7 +103,7 @@ impl TopicMeta {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         if self.state != TopicState::Active {
             return Box::new([]);
         }
@@ -125,7 +125,7 @@ impl TopicMeta {
     /// the leader's periodic assignment re-drive. Returns `(key, replica_set,
     /// start_offset)` so a re-driven `SegmentAssignment` can recreate a segment
     /// that missed its one-shot delivery with the correct starting offset.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, EntryId)]> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         if self.state != TopicState::Active {
             return Box::new([]);
         }
@@ -147,7 +147,7 @@ impl TopicMeta {
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &std::collections::HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         if self.state != TopicState::Active {
             return Box::new([]);
         }
@@ -176,7 +176,7 @@ impl TopicMeta {
     pub(crate) fn sealed_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         let mut out = Vec::new();
         for range in self.ranges.values() {
             for seg in range.segments.values() {
@@ -197,7 +197,7 @@ impl TopicMeta {
     /// Boundary-unknown sealed segments. These remain seal-end recovery
     /// candidates until a recovered boundary is committed to metadata, even if
     /// the crashed replica has rejoined by the next reconciliation pass.
-    pub(crate) fn boundary_unknown_segments(&self) -> Box<[(SegmentKey, ReplicaSet)]> {
+    pub(crate) fn boundary_unknown_segments(&self) -> Box<[(SegmentKey, Vec<NodeId>)]> {
         let mut out = Vec::new();
         for range in self.ranges.values() {
             let active_replicas = range
@@ -230,7 +230,7 @@ impl TopicMeta {
     pub(crate) fn under_replicated_sealed_segments(
         &self,
         replication_factor: usize,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         self.ranges
             .values()
             .flat_map(|range| {
@@ -253,7 +253,7 @@ impl TopicMeta {
     /// when leadership changed isn't stranded.
     pub(crate) fn known_end_sealed_segments(
         &self,
-    ) -> Vec<(SegmentKey, EntryId, EntryId, ReplicaSet)> {
+    ) -> Vec<(SegmentKey, EntryId, EntryId, Replicas)> {
         let mut out = Vec::new();
         for range in self.ranges.values() {
             for seg in range.segments.values() {
@@ -356,7 +356,7 @@ impl TopicMeta {
             .active_segment
             .and_then(|sid| r1.segments.get(&sid))
             .map(|s| s.replica_set.clone())
-            .unwrap_or_default();
+            .unwrap();
         Some(MetadataCommand::MergeRange(MergeRange {
             topic_id: self.id,
             range_id_1: r1.range_id,
@@ -635,7 +635,13 @@ mod routing_tests {
     }
 
     fn topic() -> TopicMeta {
-        TopicMeta::new("t".into(), TopicId(1), vec![NodeId::new("n")], 0, policy())
+        TopicMeta::new(
+            "t".into(),
+            TopicId(1),
+            Replicas::new(vec![NodeId::new("n")]),
+            0,
+            policy(),
+        )
     }
 
     #[test]
@@ -658,8 +664,8 @@ mod routing_tests {
                 range_id: RangeId(0),
                 split_point: vec![0x80],
                 created_at: 1,
-                left_replica_set: vec![NodeId::new("n")],
-                right_replica_set: vec![NodeId::new("n")],
+                left_replica_set: Replicas::new(vec![NodeId::new("n")]),
+                right_replica_set: Replicas::new(vec![NodeId::new("n")]),
             })
             .unwrap();
         // left = [MIN, 0x80), right = [0x80, MAX].

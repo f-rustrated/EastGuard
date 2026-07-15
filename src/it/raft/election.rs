@@ -7,12 +7,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use turmoil::Builder;
 
-use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MultiRaftActor;
 use crate::control_plane::consensus::messages::{EnsureGroup, MultiRaftActorCommand, RaftTimer};
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
+use crate::control_plane::{NodeId, Replicas};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 
@@ -171,14 +171,14 @@ fn three_node_raft_elects_leader() -> turmoil::Result {
         .build();
 
     let group_id = ShardGroupId(42);
-    let members: Vec<NodeId> = vec![
+    let members = Replicas::new(vec![
         NodeId::new("node-1"),
         NodeId::new("node-2"),
         NodeId::new("node-3"),
-    ];
+    ]);
     let group = ShardGroup {
         id: group_id,
-        members,
+        replicas: members,
     };
 
     for (name, port, peers) in [

@@ -181,7 +181,7 @@ pub struct CatchUpAssignment {
     pub shard_group_id: ShardGroupId,
     pub start_entry_id: EntryId,
     pub sealed_end_entry_id: EntryId,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]

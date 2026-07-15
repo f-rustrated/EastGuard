@@ -7,10 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::event::SegmentReassigned;
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::CatchUpAssignment;
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -21,7 +21,7 @@ use crate::data_plane::transport::command::DataTransportCommand;
 struct CatchUpRepair {
     start_entry_id: EntryId,
     sealed_end: EntryId,
-    replica_set: Vec<NodeId>,
+    replica_set: Replicas,
     pending: HashSet<NodeId>,
 }
 
@@ -54,7 +54,7 @@ impl CatchUpRepairs {
         segment_key: SegmentKey,
         start_entry_id: EntryId,
         sealed_end: EntryId,
-        replica_set: Vec<NodeId>,
+        replica_set: Replicas,
     ) {
         let pending = replica_set.iter().cloned().collect();
         self.repairs.insert(
@@ -113,6 +113,7 @@ impl CatchUpRepairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::Replicas;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
 
@@ -127,7 +128,7 @@ mod tests {
             segment_key: seg(),
             start_entry_id: 0.into(),
             sealed_end: sealed_end.map(EntryId),
-            new_replica_set: members.iter().map(|n| node(n)).collect(),
+            new_replica_set: Replicas::new(members.iter().map(|n| node(n)).collect()),
         }
     }
     /// Sorted targets of the re-drive commands.

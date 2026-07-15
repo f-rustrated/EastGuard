@@ -1,7 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::{
-    NodeId,
+    Replicas,
     metadata::{EntryId, SegmentId, error::MetadataError},
 };
 
@@ -12,12 +12,11 @@ pub enum SegmentMetaState {
     Deleting,
 }
 
-pub(crate) type ReplicaSet = Vec<NodeId>;
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SegmentMeta {
     pub segment_id: SegmentId,
     pub state: SegmentMetaState,
-    pub replica_set: ReplicaSet,
+    pub replica_set: Replicas,
     pub size_bytes: u64,
     pub start_entry_id: EntryId,
     pub end_entry_id: Option<EntryId>,
@@ -28,7 +27,7 @@ pub struct SegmentMeta {
 impl SegmentMeta {
     pub(crate) fn new(
         segment_id: SegmentId,
-        replica_set: ReplicaSet,
+        replica_set: Replicas,
         start_entry_id: EntryId,
         created_at: u64,
     ) -> Self {
@@ -64,7 +63,7 @@ impl SegmentMeta {
     /// the state stays `Sealed`. Returns whether the set actually changed:
     /// an identical set is an idempotent no-op, tolerating duplicate death detection
     /// and no-leader re-proposals (cf. `RollSegment` idempotency).
-    pub(crate) fn reassign(&mut self, new_replica_set: ReplicaSet) -> Result<bool, MetadataError> {
+    pub(crate) fn reassign(&mut self, new_replica_set: Replicas) -> Result<bool, MetadataError> {
         if self.state != SegmentMetaState::Sealed {
             return Err(MetadataError::SegmentNotSealed);
         }

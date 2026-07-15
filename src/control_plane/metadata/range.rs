@@ -2,9 +2,12 @@ use super::constants::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, VecDeque};
 
-use crate::control_plane::metadata::{
-    EntryId, RangeId, ReplicaSet, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
-    command::RollSegment, error::MetadataError,
+use crate::control_plane::{
+    Replicas,
+    metadata::{
+        EntryId, RangeId, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
+        command::RollSegment, error::MetadataError,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -35,7 +38,7 @@ impl RangeMeta {
         range_id: RangeId,
         keyspace_start: Vec<u8>,
         keyspace_end: Vec<u8>,
-        replica_set: ReplicaSet,
+        replica_set: Replicas,
         created_at: u64,
     ) -> Self {
         let segment_id = SegmentId(0);
@@ -113,7 +116,7 @@ impl RangeMeta {
         &mut self,
         segment_id: SegmentId,
         end_entry_id: EntryId,
-    ) -> Option<ReplicaSet> {
+    ) -> Option<Replicas> {
         let seg = self.segments.get_mut(&segment_id)?;
 
         if seg.state != SegmentMetaState::Sealed || seg.end_entry_id.is_some() {
@@ -186,7 +189,7 @@ impl RangeMeta {
         &mut self,
         other: &mut RangeMeta,
         merged_id: RangeId,
-        replica_set: ReplicaSet,
+        replica_set: Replicas,
         requested_at: u64,
     ) -> Result<RangeMeta, MetadataError> {
         self.validate_mergeable(other)?;
@@ -220,7 +223,7 @@ impl RangeMeta {
         &self,
         other: &RangeMeta,
         merged_id: RangeId,
-        replica_set: ReplicaSet,
+        replica_set: Replicas,
         requested_at: u64,
     ) -> RangeMeta {
         let (merged_start, merged_end) = self.merged_keyspace(other);

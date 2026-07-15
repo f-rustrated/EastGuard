@@ -1,8 +1,9 @@
 use super::command::*;
 use super::event::*;
-use super::segment::*;
+
 use super::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::NodeId;
+use crate::control_plane::Replicas;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::ConsumerGroupAssignment;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
@@ -74,7 +75,7 @@ impl MetadataStateMachine {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segments_for_node(node_id))
@@ -83,7 +84,7 @@ impl MetadataStateMachine {
 
     /// Every active segment across all topics with its replica set and start
     /// offset, for the leader's periodic assignment re-drive.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, EntryId)]> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         self.topics
             .values()
             .flat_map(|t| t.active_segment_assignments())
@@ -235,7 +236,7 @@ impl MetadataStateMachine {
             return Ok(ApplyResult::Noop);
         }
         // Group the deleted segments by replica_set here.
-        let mut groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)> = Vec::new();
+        let mut groups: Vec<(Replicas, Vec<SegmentKey>)> = Vec::new();
         for sid in &deleted_ids {
             let Some(seg) = range.segments.get(sid) else {
                 continue;
@@ -400,6 +401,7 @@ impl crate::test_traits::TAssertInvariant for MetadataStateMachine {
 mod tests {
     use super::super::constants::*;
     use super::super::range::*;
+    use super::super::segment::*;
     use super::*;
     use crate::connections::protocol::ConsumerGroupSyncAction;
     use crate::control_plane::membership::ShardGroupId;
@@ -428,12 +430,12 @@ mod tests {
         }
     }
 
-    fn replica_set() -> Vec<NodeId> {
-        vec![
+    fn replica_set() -> Replicas {
+        Replicas::new(vec![
             NodeId::new("node-1"),
             NodeId::new("node-2"),
             NodeId::new("node-3"),
-        ]
+        ])
     }
 
     fn create_topic(sm: &mut MetadataStateMachine, name: &str) -> TopicId {
@@ -705,12 +707,12 @@ mod tests {
 
     /// A surviving subset plus a fresh replacement — what the coordinator picks
     /// when a replica of a sealed segment dies (node-3 → node-4 here).
-    fn replacement_set() -> Vec<NodeId> {
-        vec![
+    fn replacement_set() -> Replicas {
+        Replicas::new(vec![
             NodeId::new("node-1"),
             NodeId::new("node-2"),
             NodeId::new("node-4"),
-        ]
+        ])
     }
 
     // --- ReassignSegment ---

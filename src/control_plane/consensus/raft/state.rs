@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::catch_up::CatchUpRepairs;
 use crate::control_plane::consensus::raft::command::RaftCommand;
@@ -14,8 +13,9 @@ use crate::control_plane::metadata::event::ApplyResult;
 use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, ConsumerMemberId, EntryId, MetadataCommand, RangeId, ReassignSegment,
-    ReplicaSet, RollSegment, SegmentId, TopicId, TopicMeta, TopicStats,
+    RollSegment, SegmentId, TopicId, TopicMeta, TopicStats,
 };
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -224,14 +224,14 @@ impl Raft {
     pub(crate) fn active_segments_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         self.state_machine.active_segments_for_node(node_id)
     }
 
     /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
     /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
     /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, ReplicaSet, EntryId)]> {
+    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         self.state_machine.active_segment_assignments()
     }
 
@@ -502,7 +502,7 @@ impl Raft {
     ///
     /// Runs per-death (`handle_node_death`) and as the takeover backfill sweep.
     pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
-        let mut to_roll: Vec<(SegmentKey, ReplicaSet)> = Vec::new();
+        let mut to_roll: Vec<(SegmentKey, Replicas)> = Vec::new();
         for (key, rs) in self.active_segments_with_dead_members(live_set).into_vec() {
             if Self::only_replica_dead(&rs, live_set) {
                 let survivors = rs
@@ -561,12 +561,12 @@ impl Raft {
 
     fn repair_segments<F>(
         &mut self,
-        segments: Box<[(SegmentKey, ReplicaSet)]>,
+        segments: Box<[(SegmentKey, Replicas)]>,
         live_set: &HashSet<NodeId>,
         build_cmd: F,
     ) -> bool
     where
-        F: Fn(SegmentKey, Vec<NodeId>) -> MetadataCommand,
+        F: Fn(SegmentKey, Replicas) -> MetadataCommand,
     {
         let live_nodes: Vec<NodeId> = live_set.iter().cloned().collect();
         let mut changed = false;
@@ -593,7 +593,7 @@ impl Raft {
 
     /// Re-fill known-end sealed segments left under-replicated by an earlier death
     fn refill_under_replicated_segments(&mut self, topology: &TopologyReader) -> bool {
-        let targets: Box<[(SegmentKey, Vec<NodeId>)]> = self
+        let targets: Box<[(SegmentKey, Replicas)]> = self
             .state_machine
             .topics
             .values()
@@ -711,7 +711,7 @@ impl Raft {
     pub(crate) fn active_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         self.state_machine
             .topics
             .values()
@@ -724,7 +724,7 @@ impl Raft {
     pub(crate) fn sealed_segments_with_dead_members(
         &self,
         live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, ReplicaSet)]> {
+    ) -> Box<[(SegmentKey, Replicas)]> {
         self.state_machine
             .topics
             .values()
@@ -734,7 +734,7 @@ impl Raft {
 
     pub(crate) fn boundary_unknown_segments(
         &self,
-    ) -> impl Iterator<Item = (SegmentKey, ReplicaSet)> {
+    ) -> impl Iterator<Item = (SegmentKey, Vec<NodeId>)> {
         self.state_machine
             .topics
             .values()
@@ -751,7 +751,7 @@ impl Raft {
         self.state_machine.get_topic(topic_id).is_some()
     }
 
-    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<ReplicaSet> {
+    pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<Replicas> {
         let topic = self.state_machine.get_topic(&key.topic_id)?;
         let range = topic.ranges.get(&key.range_id)?;
         let seg = range.segments.get(&key.segment_id)?;
@@ -2922,7 +2922,7 @@ mod tests {
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
-            replica_set: vec![node("node-1"), node("node-2"), node("node-3")],
+            replica_set: Replicas::new(vec![node("node-1"), node("node-2"), node("node-3")]),
             created_at: 1000,
         });
 
@@ -3052,7 +3052,7 @@ mod tests {
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
-            replica_set: vec![node("n1"), node("n2"), node("n3")],
+            replica_set: Replicas::new(vec![node("n1"), node("n2"), node("n3")]),
             created_at: 1000,
         })
     }
@@ -3414,7 +3414,7 @@ mod tests {
                 replication_factor: rf as u64,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
-            replica_set,
+            replica_set: Replicas::new(replica_set),
             created_at: 1000,
         })
         .into();
@@ -3509,7 +3509,7 @@ mod tests {
     /// Leader over a real ring group plus the named extra "stale" voters.
     /// Ring peers have granted the election; nothing is acked yet, so
     /// commit_index is 0 until the test drives `ack_to_last`.
-    fn ring_raft_with_stale(stale_names: &[&str]) -> (Raft, TopologyReader, Vec<NodeId>) {
+    fn ring_raft_with_stale(stale_names: &[&str]) -> (Raft, TopologyReader, Replicas) {
         let reader = topology_reader_with(&["node-1", "node-2", "node-3"]);
         let group = reader
             .shard_groups_for_node(&node("node-1"))
@@ -3518,7 +3518,7 @@ mod tests {
             .clone();
 
         let mut peers: HashSet<NodeId> = group
-            .members
+            .replicas
             .iter()
             .filter(|m| **m != node("node-1"))
             .cloned()
@@ -3540,7 +3540,7 @@ mod tests {
             epoch: u64::MAX,
         });
         let term = raft.current_term();
-        for peer in group.members.iter().filter(|m| **m != node("node-1")) {
+        for peer in group.replicas.iter().filter(|m| **m != node("node-1")) {
             raft.handle_rpc(
                 peer.clone(),
                 RaftRpc::RequestVoteResponse(RequestVoteResponse {
@@ -3553,7 +3553,7 @@ mod tests {
         drain(&mut raft);
         assert_eq!(raft.role, Role::Leader, "must be leader after election");
 
-        let members = group.members.clone();
+        let members = group.replicas.clone();
         (raft, reader, members)
     }
 
@@ -3780,7 +3780,7 @@ mod tests {
         );
         match &after[before] {
             RaftCommand::Metadata(MetadataCommand::RollSegment(roll)) => {
-                for member in &roll.new_replica_set {
+                for member in &roll.new_replica_set.0 {
                     assert!(
                         live.contains(member),
                         "new replica_set must contain only live nodes, found {:?}",
@@ -3836,7 +3836,7 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: vec![node("node-1")],
+                new_replica_set: Replicas::new(vec![node("node-1")]),
                 end_entry_id: Some(100.into()),
             })
             .into(),
@@ -3863,7 +3863,7 @@ mod tests {
             &after[before..]
         );
         assert_eq!(reassigns[0].segment_key, seg0);
-        for member in &reassigns[0].replica_set {
+        for member in &reassigns[0].replica_set.0 {
             assert!(
                 live.contains(member),
                 "reassigned replica_set must be all-live, found {:?}",
@@ -3898,7 +3898,11 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: vec![node("node-1"), survivor.clone(), spare.clone()],
+                new_replica_set: Replicas::new(vec![
+                    node("node-1"),
+                    survivor.clone(),
+                    spare.clone(),
+                ]),
                 end_entry_id: Some(100.into()),
             })
             .into(),
@@ -3966,7 +3970,7 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: sealed_set,
+                new_replica_set: Replicas::new(sealed_set),
                 end_entry_id: Some(100.into()),
             })
             .into(),
@@ -3976,7 +3980,7 @@ mod tests {
         seg0
     }
 
-    fn reassigns_in(proposals: &[RaftCommand]) -> Vec<(SegmentKey, ReplicaSet)> {
+    fn reassigns_in(proposals: &[RaftCommand]) -> Vec<(SegmentKey, Replicas)> {
         proposals
             .iter()
             .filter_map(|c| match c {
@@ -4095,7 +4099,7 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: vec![node("node-1")],
+                new_replica_set: Replicas::new(vec![node("node-1")]),
                 end_entry_id: Some(100.into()),
             })
             .into(),
@@ -4105,7 +4109,7 @@ mod tests {
         raft.propose(
             MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: seg0,
-                replica_set: new_set,
+                replica_set: Replicas::new(new_set),
             })
             .into(),
         )
@@ -4154,7 +4158,7 @@ mod tests {
             assert_eq!(a.shard_group_id, TEST_SHARD);
             assert_eq!(a.start_entry_id, 0.into());
             assert_eq!(a.sealed_end_entry_id, 100.into());
-            assert_eq!(a.replica_set, members);
+            assert_eq!(a.replica_set.0, members);
         }
     }
 
@@ -4207,7 +4211,7 @@ mod tests {
             MetadataCommand::RollSegment(RollSegment {
                 segment_key: seg0,
                 sealed_at: 2000,
-                new_replica_set: vec![node("y"), node("z"), node("node-1")],
+                new_replica_set: Replicas::new(vec![node("y"), node("z"), node("node-1")]),
                 end_entry_id: None,
             })
             .into(),
@@ -4216,7 +4220,7 @@ mod tests {
         raft.simulate_flush_and_apply();
         assert_eq!(
             raft.get_replica_set(&seg0.with_segment_id(SegmentId(1))),
-            Some(vec![node("y"), node("z"), node("node-1")])
+            Some(Replicas::new(vec![node("y"), node("z"), node("node-1")]))
         );
 
         let before = proposals_after_become_leader(&raft).len();

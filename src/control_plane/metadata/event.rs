@@ -1,8 +1,8 @@
+use crate::control_plane::Replicas;
 use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
-use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
@@ -15,7 +15,7 @@ use crate::impl_from_variant;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicCreated {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
 }
 impl TopicCreated {
     pub fn into_command(self, shard_group_id: ShardGroupId) -> DataTransportCommand {
@@ -24,7 +24,7 @@ impl TopicCreated {
             SegmentAssignment {
                 segment_key: self.segment_key,
                 shard_group_id,
-                replica_set: Replicas::new(self.replica_set),
+                replica_set: self.replica_set,
                 start_entry_id: EntryId::MIN,
             },
         )
@@ -34,7 +34,7 @@ impl TopicCreated {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentRolled {
     pub new_segment_key: SegmentKey,
-    pub new_replica_set: Vec<NodeId>,
+    pub new_replica_set: Replicas,
     pub end_entry_id: Option<EntryId>,
     pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
@@ -51,7 +51,7 @@ impl SegmentRolled {
             SegmentAssignment {
                 segment_key: self.new_segment_key,
                 shard_group_id,
-                replica_set: Replicas::new(self.new_replica_set.clone()),
+                replica_set: self.new_replica_set.clone(),
                 start_entry_id: start,
             },
         )];
@@ -62,7 +62,7 @@ impl SegmentRolled {
                 SealResponse {
                     old_segment_key: ctx.segment_key,
                     new_segment_id: self.new_segment_key.segment_id,
-                    new_replica_set: Replicas::new(self.new_replica_set),
+                    new_replica_set: self.new_replica_set,
                 },
             ));
         }
@@ -81,7 +81,7 @@ pub struct SegmentReassigned {
     /// was never established; those aren't selected for reassignment, so the
     /// dispatch just emits nothing.
     pub sealed_end: Option<EntryId>,
-    pub new_replica_set: Vec<NodeId>,
+    pub new_replica_set: Replicas,
 }
 
 impl SegmentReassigned {
@@ -110,8 +110,8 @@ impl SegmentReassigned {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeSplit {
     pub topic_id: TopicId,
-    pub children: [(RangeId, SegmentId, Vec<NodeId>); 2],
-    pub parent_active_segment: Option<(SegmentKey, Vec<NodeId>)>,
+    pub children: [(RangeId, SegmentId, Replicas); 2],
+    pub parent_active_segment: Option<(SegmentKey, Replicas)>,
     pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
 
@@ -127,7 +127,7 @@ impl RangeSplit {
                     SegmentAssignment {
                         segment_key: SegmentKey::new(self.topic_id, range_id, segment_id),
                         shard_group_id,
-                        replica_set: Replicas::new(replica_set),
+                        replica_set,
                         start_entry_id: EntryId::MIN,
                     },
                 )
@@ -139,7 +139,7 @@ impl RangeSplit {
             && !parent_replica_set.is_empty()
         {
             cmds.push(DataTransportCommand::send_to_targets(
-                parent_replica_set,
+                parent_replica_set.0,
                 SegmentSealed {
                     segment_key: parent_key,
                     committed_entry_id: None,
@@ -158,7 +158,7 @@ impl RangeSplit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeMerged {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]>,
 }
 impl RangeMerged {
@@ -169,7 +169,7 @@ impl RangeMerged {
             SegmentAssignment {
                 segment_key: self.segment_key,
                 shard_group_id,
-                replica_set: Replicas::new(self.replica_set),
+                replica_set: self.replica_set,
                 start_entry_id: EntryId::MIN,
             },
         )];
@@ -185,7 +185,7 @@ pub struct ConsumerGroupEpochSnapshot {
     pub topic_id: TopicId,
     pub group_id: String,
     pub generation: GenerationId,
-    pub ranges: Box<[(RangeId, Vec<NodeId>)]>,
+    pub ranges: Box<[(RangeId, Replicas)]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +210,7 @@ impl ConsumerGroupEpochSnapshot {
             .filter(|(_, replicas)| !replicas.is_empty())
             .map(|(range_id, replicas)| {
                 DataTransportCommand::send_to_targets(
-                    replicas,
+                    replicas.0,
                     DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(EpochSeal {
                         key: ConsumerOffsetKey {
                             topic_id: self.topic_id,
@@ -231,7 +231,7 @@ impl ConsumerGroupEpochSnapshot {
 /// different replica sets, so there may be several groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentsDeleted {
-    pub groups: Vec<(Vec<NodeId>, Vec<SegmentKey>)>,
+    pub groups: Vec<(Replicas, Vec<SegmentKey>)>,
 }
 
 impl SegmentsDeleted {
@@ -240,7 +240,7 @@ impl SegmentsDeleted {
             .into_iter()
             .map(|(replica_set, keys)| {
                 DataTransportCommand::send_to_targets(
-                    replica_set,
+                    replica_set.0,
                     DeleteSegments {
                         segment_keys: keys.into_boxed_slice(),
                     },
@@ -253,7 +253,7 @@ impl SegmentsDeleted {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentSealCorrected {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub committed_entry_id: Option<EntryId>,
 }
 
@@ -263,7 +263,7 @@ impl SegmentSealCorrected {
             vec![]
         } else {
             vec![DataTransportCommand::send_to_targets(
-                self.replica_set,
+                self.replica_set.0,
                 SegmentSealed {
                     segment_key: self.segment_key,
                     committed_entry_id: self.committed_entry_id,

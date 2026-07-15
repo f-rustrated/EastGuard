@@ -232,7 +232,7 @@ impl ClientController {
         let cmd = CreateTopic {
             storage_policy,
             name,
-            replica_set: group.members,
+            replica_set: group.replicas,
             created_at,
         };
         Ok(self
@@ -598,7 +598,7 @@ impl ClientController {
                 shard_group_id: group.id,
                 leader_node_id: leader.as_ref().map(|e| e.leader.node_id.to_string()),
                 leader_addr: leader.map(|e| e.leader.client_addr()),
-                member_node_ids: group.members.iter().map(|n| n.to_string()).collect(),
+                member_node_ids: group.replicas.iter().map(|n| n.to_string()).collect(),
             });
         Ok(ClientResponse::Admin(AdminResponse::ShardInfo { detail }))
     }
@@ -664,7 +664,7 @@ mod tests {
     use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
     use crate::control_plane::metadata::{RangeId, TopicId, TopicMeta};
-    use crate::control_plane::{NodeAddress, NodeId, SwimNode, SwimNodeState};
+    use crate::control_plane::{NodeAddress, NodeId, Replicas, SwimNode, SwimNodeState};
     use crate::data_plane::actor::DataPlaneSender;
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
@@ -681,7 +681,7 @@ mod tests {
     fn test_shard_group() -> ShardGroup {
         ShardGroup {
             id: ShardGroupId(42),
-            members: vec![node_id("node-1")],
+            replicas: Replicas::new(vec![node_id("node-1")]),
         }
     }
 
@@ -745,7 +745,7 @@ mod tests {
         TopicMeta::new(
             "t1".into(),
             TopicId(1),
-            vec![node_id(leader)],
+            Replicas::new(vec![node_id(leader)]),
             0,
             StoragePolicy {
                 retention_ms: Some(3_600_000),
@@ -785,7 +785,7 @@ mod tests {
         let owner_addr = NodeAddress::test(addr(18003), addr(8083));
         let group = ShardGroup {
             id: ShardGroupId(42),
-            members: vec![owner.clone()],
+            replicas: Replicas::new(vec![owner.clone()]),
         };
         let swim = swim_sender_with(move |cmd| match cmd {
             SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
@@ -815,7 +815,7 @@ mod tests {
         let leader_addr = NodeAddress::test(addr(18004), addr(8084));
         let group = ShardGroup {
             id: ShardGroupId(1),
-            members: vec![me.clone(), leader.clone()],
+            replicas: Replicas::new(vec![me.clone(), leader.clone()]),
         };
         let swim = swim_sender_with(move |cmd| match cmd {
             SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
@@ -849,7 +849,7 @@ mod tests {
         let me = node_id("self");
         let group = ShardGroup {
             id: ShardGroupId(1),
-            members: vec![me.clone()],
+            replicas: Replicas::new(vec![me.clone()]),
         };
         let swim = swim_sender_with(move |cmd| {
             if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
@@ -878,7 +878,7 @@ mod tests {
         let owner_addr = NodeAddress::test(addr(18005), addr(8085));
         let group = ShardGroup {
             id: ShardGroupId(9),
-            members: vec![owner.clone()],
+            replicas: Replicas::new(vec![owner.clone()]),
         };
         let swim = swim_sender_with(move |cmd| match cmd {
             SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
@@ -1030,7 +1030,7 @@ mod tests {
         let owner_addr = NodeAddress::test(addr(18002), addr(8082));
         let group = ShardGroup {
             id: ShardGroupId(42),
-            members: vec![owner.clone()],
+            replicas: Replicas::new(vec![owner.clone()]),
         };
         let swim = {
             let group = group.clone();
@@ -1071,7 +1071,7 @@ mod tests {
         let me = node_id("self");
         let group = ShardGroup {
             id: ShardGroupId(7),
-            members: vec![me.clone()],
+            replicas: Replicas::new(vec![me.clone()]),
         };
         let swim = swim_sender_with(move |cmd| {
             if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {

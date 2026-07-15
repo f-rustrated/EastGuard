@@ -147,7 +147,10 @@ impl MultiRaft {
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let target_members = self.topology.group_ring_members(shard_group_id);
 
-        self.reconcile_membership(shard_group_id, target_members);
+        self.reconcile_membership(
+            shard_group_id,
+            target_members.map(|e| e.0.into_boxed_slice()),
+        );
 
         // Takeover backstop: the catch-up tracker is leader-volatile, so a repair
         // in flight when leadership changed left it empty here. Re-seed it; the
@@ -323,12 +326,12 @@ impl MultiRaft {
         if self.groups.contains_key(&group.id) {
             return;
         }
-        if !group.members.contains(&self.node_id) {
+        if !group.replicas.contains(&self.node_id) {
             return;
         }
 
         let peers: HashSet<NodeId> = group
-            .members
+            .replicas
             .iter()
             .filter(|id| *id != &self.node_id)
             .cloned()
@@ -931,6 +934,7 @@ impl MultiRaft {
 mod tests {
     use super::*;
 
+    use crate::control_plane::Replicas;
     use crate::control_plane::consensus::raft::storage::RaftPersistentState;
     use crate::control_plane::consensus::seal_recovery;
     use crate::impls::metadata_storage::MetadataStorage;
@@ -944,7 +948,7 @@ mod tests {
     fn shard(id: u64, members: Vec<NodeId>) -> ShardGroup {
         ShardGroup {
             id: ShardGroupId(id),
-            members,
+            replicas: Replicas::new(members),
         }
     }
 
@@ -1386,7 +1390,7 @@ mod tests {
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
-            replica_set: vec![node("n1"), node("n2"), node("n3")],
+            replica_set: Replicas::new(vec![node("n1"), node("n2"), node("n3")]),
             created_at: 1000,
         });
 
@@ -1458,7 +1462,7 @@ mod tests {
                     replication_factor: 3,
                     partition_strategy: PartitionStrategy::AutoSplit,
                 },
-                replica_set: vec![node("n1"), node("n2"), node("n3")],
+                replica_set: Replicas::new(vec![node("n1"), node("n2"), node("n3")]),
                 created_at: 1000,
             })
         };
@@ -1716,7 +1720,7 @@ mod tests {
             .find(|id| {
                 new_topology
                     .group(*id)
-                    .is_some_and(|g| g.members.contains(&node("n4")))
+                    .is_some_and(|g| g.replicas.contains(&node("n4")))
             })
             .expect("some group of n1 must gain n4 after the join");
 
@@ -1775,7 +1779,7 @@ mod tests {
             .topology
             .shard_groups_for_node(&n1)
             .iter()
-            .find(|g| !g.members.contains(&node("n9")))
+            .find(|g| !g.replicas.contains(&node("n9")))
             .map(|g| g.id)
             .expect("some group of n1 must exclude n9");
 
@@ -1849,7 +1853,7 @@ mod tests {
                         replication_factor: rf,
                         partition_strategy: PartitionStrategy::AutoSplit,
                     },
-                    replica_set,
+                    replica_set: Replicas::new(replica_set),
                     created_at: 1000,
                 }),
             })

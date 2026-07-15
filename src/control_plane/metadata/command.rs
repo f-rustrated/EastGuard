@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{
     connections::protocol::ConsumerGroupSyncAction,
     control_plane::{
-        NodeId,
+        Replicas,
         metadata::{EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
     },
     data_plane::SegmentKey,
@@ -17,7 +17,7 @@ use crate::{
 pub struct CreateTopic {
     pub name: String,
     pub storage_policy: StoragePolicy,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub created_at: u64,
 }
 
@@ -25,7 +25,7 @@ pub struct CreateTopic {
 pub struct RollSegment {
     pub segment_key: SegmentKey,
     pub sealed_at: u64,
-    pub new_replica_set: Vec<NodeId>,
+    pub new_replica_set: Replicas,
     /// None for SWIM-death-triggered seals — the coordinator doesn't know
     /// the actual committed offset. Corrected later via `correct_end_offset`
     /// or D5 sealed segment repair.
@@ -38,8 +38,8 @@ pub struct SplitRange {
     pub range_id: RangeId,
     pub split_point: Vec<u8>,
     pub created_at: u64,
-    pub left_replica_set: Vec<NodeId>,
-    pub right_replica_set: Vec<NodeId>,
+    pub left_replica_set: Replicas,
+    pub right_replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -48,7 +48,7 @@ pub struct MergeRange {
     pub range_id_1: RangeId,
     pub range_id_2: RangeId,
     pub created_at: u64,
-    pub merged_replica_set: Vec<NodeId>,
+    pub merged_replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -59,7 +59,7 @@ pub struct DeleteTopic {
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ReassignSegment {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
 }
 
 /// Retention: mark an oldest-first **prefix** of one range's sealed segments

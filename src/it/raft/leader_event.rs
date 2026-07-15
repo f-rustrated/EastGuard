@@ -14,7 +14,7 @@ use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{
     QueryCommand, ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand,
 };
-use crate::control_plane::{NodeAddress, NodeId};
+use crate::control_plane::{NodeAddress, NodeId, Replicas};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
@@ -60,11 +60,11 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
     let group_id = ShardGroupId(77);
     let group = ShardGroup {
         id: group_id,
-        members: vec![
+        replicas: Replicas::new(vec![
             NodeId::new("node-1"),
             NodeId::new("node-2"),
             NodeId::new("node-3"),
-        ],
+        ]),
     };
 
     for (name, port, peers) in [

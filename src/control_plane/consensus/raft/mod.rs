@@ -1,4 +1,4 @@
-use crate::control_plane::NodeId;
+use crate::control_plane::{NodeId, Replicas};
 
 pub(crate) mod catch_up;
 pub(crate) mod command;
@@ -18,7 +18,7 @@ pub(crate) fn compute_replacement_replica_set(
     old: &[NodeId],
     dead_nodes: &[NodeId],
     live_nodes: &[NodeId],
-) -> Vec<NodeId> {
+) -> Replicas {
     let replication_factor = old.len();
     let mut new_set: Vec<NodeId> = old
         .iter()
@@ -33,8 +33,6 @@ pub(crate) fn compute_replacement_replica_set(
             new_set.push(candidate.clone());
         }
     }
-    if new_set.is_empty() {
-        tracing::error!("All replicas dead for segment — empty replica set");
-    }
-    new_set
+
+    Replicas::new(new_set)
 }
