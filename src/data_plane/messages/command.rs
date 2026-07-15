@@ -99,7 +99,6 @@ pub struct ReplicaAck {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaOffsetCommit {
     pub seq: u64,
-    pub leader: NodeId,
     pub replica_set: Vec<NodeId>,
     pub key: ConsumerOffsetKey,
     pub generation: GenerationId,
