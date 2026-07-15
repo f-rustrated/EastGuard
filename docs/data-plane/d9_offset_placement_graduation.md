@@ -109,6 +109,25 @@ When the joining replica receives this historical data, it merges it **monotonic
 
 To survive crashes, the imported data and a special "bootstrap-completion marker" must both be written safely to the disk log (WAL). The joining replica only graduates to "ready" *after* this disk save is complete. If the node crashes halfway through, it wakes up, sees the data but no completion marker, and knows it needs to resume the import rather than blindly trusting incomplete data.
 
+The completion acknowledgement does not immediately make the replica ready. The leader also
+waits for every ordinary offset commit already sent to that replica while it was joining to
+acknowledge its WAL write. This closes the race where the snapshot becomes durable, a newer
+commit is still in flight, and the replica crashes after being promoted but before storing
+that commit.
+
+```text
+bootstrap durable
+       │
+       ▼
+bootstrap acknowledged
+       │
+       ▼
+all earlier joining-period commits acknowledged
+       │
+       ▼
+replica becomes ready
+```
+
 ---
 
 ## Coordination and Retries
@@ -217,7 +236,10 @@ offset reads remain unavailable until a replica is safely graduated.
 While the new replicas are catching up, the system keeps working:
 
 - The existing "ready" leader continues serving read requests.
-- New offset commits are still accepted. They are sent to the new replicas too, where they safely merge with the historical data being transferred.
+- New offset commits are still accepted and sent to every placed replica.
+- Client success waits for every ready replica, but not for replicas that are still joining.
+- Joining-replica acknowledgements are tracked so graduation waits for their in-flight commits
+  to drain.
 
 **A joining replica CAN:**
 
@@ -244,11 +266,13 @@ If a client accidentally asks a joining replica for data, the replica will retur
 | The "I am done" message is lost | The source resends the data. The joining replica safely ignores the duplicate data. |
 | Joining replica crashes before saving to disk | When it restarts, it sees no completion marker and stays in the "joining" state. |
 | Joining replica crashes after saving to disk | When it restarts, it sees the completion marker and resumes as "ready". |
+| A replica restarts in the same placement after missing a group-epoch seal | A replicated commit from the newer epoch stays parked and prompts the replica to request the current range snapshot from the leader. After the snapshot and completion marker are durable, the parked commit is applied and acknowledged. |
 | The source replica dies during transfer | Another ready replica takes over and resends. |
 | Metadata leader changes | The new leader re-drives the same committed placement token. |
 | Range data leader changes | A new roll supersedes the old token and a ready survivor resumes coordination. |
 | An old transfer arrives after another roll | Its data may merge monotonically, but it cannot complete the new token. |
 | A new commit arrives at the exact same time | The monotonic merge ensures the newer (greater) commit is kept. |
+| Bootstrap finishes while a commit is in flight | The replica stays joining until that commit acknowledges durability. |
 | All ready replicas are unavailable | Reads fail closed until a ready replica returns or trusted state is recovered. |
 | A consumer group is completely idle | The bootstrap still copies its old checkpoint safely. |
 
@@ -275,6 +299,8 @@ These are the strict goals we are aiming for:
 4. **Disk durability:** Graduation only happens after the data is physically on the disk.
 5. **Only copy from the good ones:** We never use an incomplete replica as a source.
 6. **When in doubt, fail closed:** A joining replica must never return an empty checkpoint if it isn't sure.
+7. **Joining replicas do not delay client commits:** Commits are sent to them, but only ready
+   replicas are required for client acknowledgement until graduation.
 
 ---
 
