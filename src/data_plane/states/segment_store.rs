@@ -331,6 +331,7 @@ impl SegmentStore {
 mod tests {
     use super::*;
     use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::{NodeId, Replicas};
     use crate::data_plane::states::segment::tracker::SegmentRole;
     use std::path::PathBuf;
 
@@ -342,7 +343,7 @@ mod tests {
         SegmentTracker::new_with_start_entry_id(
             PathBuf::from("/tmp"),
             SegmentRole::Leader,
-            vec![],
+            Replicas::new(vec![NodeId::new("tracker")]),
             ShardGroupId(1),
             EntryId(start),
         )

@@ -1,8 +1,8 @@
-use crate::control_plane::NodeId;
 use crate::control_plane::consensus::multi_raft::SealContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
@@ -24,7 +24,7 @@ impl TopicCreated {
             SegmentAssignment {
                 segment_key: self.segment_key,
                 shard_group_id,
-                replica_set: self.replica_set,
+                replica_set: Replicas::new(self.replica_set),
                 start_entry_id: EntryId::MIN,
             },
         )
@@ -51,7 +51,7 @@ impl SegmentRolled {
             SegmentAssignment {
                 segment_key: self.new_segment_key,
                 shard_group_id,
-                replica_set: self.new_replica_set.clone(),
+                replica_set: Replicas::new(self.new_replica_set.clone()),
                 start_entry_id: start,
             },
         )];
@@ -62,7 +62,7 @@ impl SegmentRolled {
                 SealResponse {
                     old_segment_key: ctx.segment_key,
                     new_segment_id: self.new_segment_key.segment_id,
-                    new_replica_set: self.new_replica_set,
+                    new_replica_set: Replicas::new(self.new_replica_set),
                 },
             ));
         }
@@ -127,7 +127,7 @@ impl RangeSplit {
                     SegmentAssignment {
                         segment_key: SegmentKey::new(self.topic_id, range_id, segment_id),
                         shard_group_id,
-                        replica_set,
+                        replica_set: Replicas::new(replica_set),
                         start_entry_id: EntryId::MIN,
                     },
                 )
@@ -169,7 +169,7 @@ impl RangeMerged {
             SegmentAssignment {
                 segment_key: self.segment_key,
                 shard_group_id,
-                replica_set: self.replica_set,
+                replica_set: Replicas::new(self.replica_set),
                 start_entry_id: EntryId::MIN,
             },
         )];

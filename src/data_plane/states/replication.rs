@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use crate::control_plane::NodeId;
 use crate::control_plane::metadata::EntryId;
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{ProduceAck, ReplicaAppend};
 use crate::data_plane::states::segment::cache::CachedEntry;
@@ -32,7 +32,7 @@ pub(crate) struct AckCommitted {
 pub(crate) struct PendingReplicationBatch {
     pub segment_key: SegmentKey,
     pub entry: Arc<CachedEntry>,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub followers: Vec<NodeId>,
 }
 
@@ -41,7 +41,7 @@ impl PendingReplicationBatch {
         let targets = self.followers;
         let message = ReplicaAppend {
             segment_key: self.segment_key,
-            replica_set: self.replica_set,
+            replicas: self.replica_set,
             data: self.entry.data.clone(),
             record_count: self.entry.record_count,
             entry_id: self.entry.entry_id,
@@ -241,7 +241,7 @@ mod tests {
         PendingReplicationBatch {
             segment_key,
             entry: cached_entry(entry_id),
-            replica_set: vec![node("leader")],
+            replica_set: Replicas::new(vec![node("leader")]),
             followers,
         }
     }

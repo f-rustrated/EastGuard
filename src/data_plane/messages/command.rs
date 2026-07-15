@@ -69,7 +69,7 @@ pub enum ConsumerOffsetCommitAck {
 pub struct SegmentAssignment {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub start_entry_id: EntryId,
 }
 
@@ -83,7 +83,7 @@ pub struct SegmentAssignmentAck {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaAppend {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replicas: Replicas,
     pub data: EntryPayload,
     pub record_count: u32,
     pub entry_id: EntryId,
@@ -151,7 +151,7 @@ pub struct SealRequest {
 pub struct SealResponse {
     pub old_segment_key: SegmentKey,
     pub new_segment_id: SegmentId,
-    pub new_replica_set: Vec<NodeId>,
+    pub new_replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]

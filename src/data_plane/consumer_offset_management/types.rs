@@ -1,6 +1,12 @@
+use std::collections::HashSet;
+
+use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::{NodeId, Replicas};
+use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetUpdate, OffsetRecord};
-use crate::data_plane::messages::command::{CommitConsumerOffset, ConsumerOffsetCommitAck};
+use crate::data_plane::messages::command::{
+    BootstrapConsumerOffsetAck, CommitConsumerOffset, ConsumerOffsetCommitAck,
+};
 use crate::impl_from_variant;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -24,6 +30,7 @@ impl PendingOffsetMutation {
 
 pub(crate) struct LeaderOffsetCommitApplied {
     pub(crate) replica_set: Replicas,
+    pub(crate) required_followers: HashSet<NodeId>,
     pub(crate) reply: oneshot::Sender<ConsumerOffsetCommitAck>,
 }
 
@@ -31,12 +38,14 @@ pub(crate) enum OffsetMutationCompletion {
     EpochSeal,
     LeaderCommit(LeaderOffsetCommitApplied),
     ReplicaCommit(ReplicaOffsetCommit),
+    Bootstrap(BootstrapConsumerOffsetAck),
 }
 
 impl_from_variant!(
     OffsetMutationCompletion,
     LeaderCommit(LeaderOffsetCommitApplied),
-    ReplicaCommit(ReplicaOffsetCommit)
+    ReplicaCommit(ReplicaOffsetCommit),
+    Bootstrap(BootstrapConsumerOffsetAck)
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -52,6 +61,11 @@ pub(crate) enum FutureOffsetCommit {
 }
 
 pub(crate) struct OffsetPlacement {
+    pub(crate) segment_key: SegmentKey,
+    pub(crate) shard_group_id: ShardGroupId,
     pub(crate) leader: NodeId,
     pub(crate) replicas: Replicas,
+    pub(crate) ready_replicas: HashSet<NodeId>,
+    pub(crate) bootstrap_acked: HashSet<NodeId>,
+    pub(crate) assignment_ack_sent: bool,
 }

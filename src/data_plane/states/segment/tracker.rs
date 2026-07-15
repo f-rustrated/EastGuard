@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
@@ -23,7 +23,7 @@ pub(crate) struct SegmentTracker {
     checkpoint_lsn: u64,
     segment_file_path: PathBuf,
     role: SegmentRole,
-    replica_set: Vec<NodeId>,
+    replicas: Replicas,
     shard_group_id: ShardGroupId,
     committed_entry_id: EntryId,
     next_entry_id: EntryId,
@@ -39,7 +39,7 @@ impl SegmentTracker {
     pub(crate) fn new(
         path: PathBuf,
         role: SegmentRole,
-        replica_set: Vec<NodeId>,
+        replicas: Replicas,
         shard_group_id: ShardGroupId,
     ) -> Self {
         Self {
@@ -48,7 +48,7 @@ impl SegmentTracker {
             checkpoint_lsn: 0,
             segment_file_path: path,
             role,
-            replica_set,
+            replicas,
             shard_group_id,
             committed_entry_id: EntryId::MIN,
             next_entry_id: EntryId::MIN,
@@ -61,7 +61,7 @@ impl SegmentTracker {
     pub(crate) fn new_with_start_entry_id(
         path: PathBuf,
         role: SegmentRole,
-        replica_set: Vec<NodeId>,
+        replica_set: Replicas,
         shard_group_id: ShardGroupId,
         start_entry_id: EntryId,
     ) -> Self {
@@ -75,12 +75,12 @@ impl SegmentTracker {
         self.start_entry_id
     }
 
-    pub(crate) fn replica_set(&self) -> Vec<NodeId> {
-        self.replica_set.clone()
+    pub(crate) fn replica_set(&self) -> Replicas {
+        self.replicas.clone()
     }
 
     pub(crate) fn leader_node(&self) -> NodeId {
-        self.replica_set[0].clone()
+        self.replicas[0].clone()
     }
 
     pub(crate) fn role(&self) -> SegmentRole {
@@ -88,8 +88,8 @@ impl SegmentTracker {
     }
 
     pub(crate) fn followers(&self) -> &[NodeId] {
-        if self.replica_set.len() > 1 {
-            &self.replica_set[1..]
+        if self.replicas.len() > 1 {
+            &self.replicas[1..]
         } else {
             &[]
         }
@@ -381,7 +381,7 @@ pub mod tests {
         SegmentTracker::new(
             PathBuf::from("/tmp/test.seg"),
             role,
-            vec![NodeId::new("leader"), NodeId::new("follower")],
+            Replicas::new(vec![NodeId::new("leader"), NodeId::new("follower")]),
             ShardGroupId(1),
         )
     }
@@ -401,7 +401,7 @@ pub mod tests {
         let mut t = SegmentTracker::new_with_start_entry_id(
             PathBuf::from("/tmp/test.seg"),
             SegmentRole::Follower,
-            vec![NodeId::new("leader"), NodeId::new("follower")],
+            Replicas::new(vec![NodeId::new("leader"), NodeId::new("follower")]),
             ShardGroupId(1),
             EntryId(5),
         );
@@ -451,7 +451,7 @@ pub mod tests {
         let mut t = SegmentTracker::new_with_start_entry_id(
             PathBuf::new(),
             SegmentRole::Follower,
-            vec![NodeId::new("leader"), NodeId::new("follower")],
+            Replicas::new(vec![NodeId::new("leader"), NodeId::new("follower")]),
             ShardGroupId(1),
             EntryId(2),
         );
@@ -492,7 +492,7 @@ pub mod tests {
         let single = SegmentTracker::new(
             PathBuf::from("/tmp/t.seg"),
             SegmentRole::Leader,
-            vec![NodeId::new("solo")],
+            Replicas::new(vec![NodeId::new("solo")]),
             ShardGroupId(1),
         );
         assert!(single.followers().is_empty());
