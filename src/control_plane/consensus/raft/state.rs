@@ -609,7 +609,8 @@ impl Raft {
                 continue; // ring can't grow it yet — retried on the next ring check
             }
 
-            replica_set.extend(additions.iter().cloned());
+            replica_set.extend(&additions);
+
             let cmd = ReassignSegment {
                 segment_key,
                 replica_set,
@@ -4158,7 +4159,7 @@ mod tests {
             assert_eq!(a.shard_group_id, TEST_SHARD);
             assert_eq!(a.start_entry_id, 0.into());
             assert_eq!(a.sealed_end_entry_id, 100.into());
-            assert_eq!(a.replica_set.0, members);
+            assert_eq!(a.replica_set.0, members.clone().into_boxed_slice());
         }
     }
 

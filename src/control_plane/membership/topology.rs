@@ -1047,7 +1047,7 @@ mod tests {
         let owners_5 = topology.token_owners_at(group.id.0 as u32, 5);
 
         assert_eq!(owners_5.len(), 5);
-        assert_eq!(&owners_5[..3], group.replicas.as_slice());
+        assert_eq!(&owners_5[..3], &group.replicas[..3]);
         let expected_successors = &owners_5[3..];
 
         let current: HashSet<NodeId> = group.replicas.iter().cloned().collect();

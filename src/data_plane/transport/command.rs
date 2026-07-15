@@ -31,11 +31,11 @@ impl_from_variant!(
 
 impl DataTransportCommand {
     pub(crate) fn send_to_targets(
-        targets: Vec<NodeId>,
+        targets: impl Into<Box<[NodeId]>>,
         message: impl Into<DataPlaneInterNodeCommand>,
     ) -> Self {
         Self::SendToTargets(DataTransportSendToTargets {
-            targets: targets.into_boxed_slice(),
+            targets: targets.into(),
             message: message.into(),
         })
     }

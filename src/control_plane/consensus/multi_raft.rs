@@ -147,10 +147,7 @@ impl MultiRaft {
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let target_members = self.topology.group_ring_members(shard_group_id);
 
-        self.reconcile_membership(
-            shard_group_id,
-            target_members.map(|e| e.0.into_boxed_slice()),
-        );
+        self.reconcile_membership(shard_group_id, target_members.map(|e| e.0));
 
         // Takeover backstop: the catch-up tracker is leader-volatile, so a repair
         // in flight when leadership changed left it empty here. Re-seed it; the
@@ -647,8 +644,7 @@ impl MultiRaft {
         if let Some(leader) = recency_leader
             && let Some(pos) = new_replica_set.iter().position(|n| *n == leader)
         {
-            let node = new_replica_set.remove(pos);
-            new_replica_set.insert(0, node);
+            new_replica_set.change_leader(pos);
         }
 
         let cmd = RollSegment {
