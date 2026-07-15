@@ -139,7 +139,7 @@ impl std::borrow::Borrow<str> for NodeId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
-pub struct Replicas(Vec<NodeId>);
+pub struct Replicas(pub Vec<NodeId>);
 crate::smart_pointer!(Replicas, Vec<NodeId>);
 
 impl Replicas {
