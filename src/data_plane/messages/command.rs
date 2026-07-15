@@ -97,7 +97,7 @@ pub struct ReplicaAck {
 pub struct ReplicaOffsetCommit {
     pub seq: u64,
     pub replica_set: Vec<NodeId>,
-    pub offset_commit: ConsumerOffsetUpdate,
+    pub update: ConsumerOffsetUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -116,7 +116,7 @@ impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch(ReplicaOffsetStaleEpoch));
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaOffsetAck {
     pub seq: u64,
-    pub offset_commit: ConsumerOffsetUpdate,
+    pub update: ConsumerOffsetUpdate,
     pub from: NodeId,
     pub result: ReplicaOffsetAckResult,
 }

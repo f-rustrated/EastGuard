@@ -8,9 +8,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::client::{Client, ClientError};
-use crate::connections::protocol::{
-    ClientResponse, CommitConsumerOffsetRequest, ConsumerGroupSyncAction, ControlPlaneResponse,
-};
+use crate::connections::protocol::{ClientResponse, ConsumerGroupSyncAction, ControlPlaneResponse};
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SyncConsumerGroupRequest, TopicId};
 use crate::data_plane::consumer_offset_management::ledger::{
