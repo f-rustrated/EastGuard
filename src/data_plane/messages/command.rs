@@ -1,6 +1,6 @@
-use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
+use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -58,7 +58,7 @@ pub struct CommitConsumerOffset {
 pub enum ConsumerOffsetCommitAck {
     Committed,
     NotWriteLeader(Option<NodeId>),
-    StaleEpoch { sealed_generation: GenerationId },
+    StaleEpoch(StaleEpoch),
     InternalError(String),
 }
 
@@ -101,17 +101,12 @@ pub struct ReplicaOffsetCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaOffsetStaleEpoch {
-    pub sealed_generation: GenerationId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum ReplicaOffsetAckResult {
     Committed,
-    StaleEpoch(ReplicaOffsetStaleEpoch),
+    StaleEpoch(StaleEpoch),
 }
 
-impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch(ReplicaOffsetStaleEpoch));
+// impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch);
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaOffsetAck {

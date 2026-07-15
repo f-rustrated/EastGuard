@@ -21,6 +21,7 @@ use crate::control_plane::{
 use crate::data_plane::EntryPayload;
 use crate::data_plane::SegmentKey;
 use crate::data_plane::actor::DataPlaneSender;
+use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
 use crate::data_plane::messages::command::{
     CommitConsumerOffset, ConsumerOffsetCommitAck, Produce, ProduceAck,
 };
@@ -360,7 +361,7 @@ impl ClientController {
                 leader_addr: self.resolve_id_to_addr(leader).await,
             }
             .into(),
-            ConsumerOffsetCommitAck::StaleEpoch { sealed_generation } => {
+            ConsumerOffsetCommitAck::StaleEpoch(StaleEpoch(sealed_generation)) => {
                 DataPlaneResponse::StaleConsumerGroupEpoch(sealed_generation).into()
             }
             ConsumerOffsetCommitAck::InternalError(error) => {

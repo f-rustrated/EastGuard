@@ -28,7 +28,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::EntryPayload;
 use crate::data_plane::consumer_offset_management::ConsumerOffsetManager;
-use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
+use crate::data_plane::consumer_offset_management::ledger::{EpochSeal, StaleEpoch};
 use crate::data_plane::consumer_offset_management::types::*;
 use crate::data_plane::messages::query::ReadConsumerOffset;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
@@ -963,7 +963,7 @@ impl<W: WalStorage> DataPlane<W> {
                     seq: cmd.seq,
                     update: cmd.update,
                     from: self.node_id.clone(),
-                    result: ReplicaOffsetStaleEpoch { sealed_generation }.into(),
+                    result: ReplicaOffsetAckResult::StaleEpoch(StaleEpoch(sealed_generation)),
                 },
             );
             self.out.store_transport_cmd(transport);
@@ -1748,9 +1748,7 @@ mod tests {
         });
         assert_eq!(
             response.try_recv().unwrap(),
-            ConsumerOffsetCommitAck::StaleEpoch {
-                sealed_generation: 4.into()
-            }
+            ConsumerOffsetCommitAck::StaleEpoch(StaleEpoch(4.into()))
         );
     }
 

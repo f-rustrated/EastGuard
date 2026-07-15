@@ -46,6 +46,9 @@ pub struct EpochSeal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct StaleEpoch(pub GenerationId); // sealed gid
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ConsumerOffsetUpdate {
     pub key: ConsumerOffsetKey,
     pub generation: GenerationId,
