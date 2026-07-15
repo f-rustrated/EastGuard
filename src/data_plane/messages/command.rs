@@ -1,3 +1,5 @@
+use crate::control_plane::Replicas;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetSnapshot;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
@@ -12,7 +14,7 @@ use tokio::sync::oneshot;
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
-    control_plane::metadata::{EntryId, SegmentId},
+    control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId},
     data_plane::states::segment::cache::CachedEntry,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
@@ -108,6 +110,27 @@ pub struct ReplicaOffsetAck {
     pub update: ConsumerOffsetUpdate,
     pub from: NodeId,
     pub result: ReplicaOffsetAckResult,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct BootstrapConsumerOffset {
+    pub segment_key: SegmentKey,
+    pub replica_set: Replicas,
+    pub entries: Box<[ConsumerOffsetSnapshot]>,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct BootstrapConsumerOffsetRequest {
+    pub topic_id: TopicId,
+    pub range_id: RangeId,
+    pub requester: NodeId,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct BootstrapConsumerOffsetAck {
+    pub segment_key: SegmentKey,
+    pub from: NodeId,
+    pub leader: NodeId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -255,6 +278,9 @@ pub enum DataPlaneInterNodeCommand {
     ReplicaAck(ReplicaAck),
     ReplicaOffsetCommit(ReplicaOffsetCommit),
     ReplicaOffsetAck(ReplicaOffsetAck),
+    BootstrapConsumerOffset(BootstrapConsumerOffset),
+    BootstrapConsumerOffsetRequest(BootstrapConsumerOffsetRequest),
+    BootstrapConsumerOffsetAck(BootstrapConsumerOffsetAck),
     CommitAdvance(CommitAdvance),
     SealRequest(SealRequest),
     SealResponse(SealResponse),
@@ -278,6 +304,9 @@ impl_from_variant!(
     ReplicaAck,
     ReplicaOffsetCommit,
     ReplicaOffsetAck,
+    BootstrapConsumerOffset,
+    BootstrapConsumerOffsetRequest,
+    BootstrapConsumerOffsetAck,
     CommitAdvance,
     SealRequest,
     SealResponse,
