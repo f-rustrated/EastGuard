@@ -1634,7 +1634,7 @@ mod tests {
         dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
             EpochSeal {
                 generation: 2.into(),
-                offset_key: ConsumerOffsetKey {
+                key: ConsumerOffsetKey {
                     topic_id: TopicId(1),
                     range_id: RangeId(0),
                     group_id: "group".into(),
@@ -1726,7 +1726,7 @@ mod tests {
         dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
             EpochSeal {
                 generation: 4.into(),
-                offset_key: ConsumerOffsetKey {
+                key: ConsumerOffsetKey {
                     topic_id: TopicId(1),
                     range_id: RangeId(0),
                     group_id: "group".into(),
@@ -1806,7 +1806,7 @@ mod tests {
         dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
             EpochSeal {
                 generation: 1.into(),
-                offset_key: consumer_offset_key(),
+                key: consumer_offset_key(),
             },
         ));
         dp.flush_batch();

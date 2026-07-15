@@ -295,7 +295,7 @@ mod tests {
             1,
             &wal_batch(&[
                 wal_offset(OffsetRecord::EpochSeal(EpochSeal {
-                    offset_key: key.clone(),
+                    key: key.clone(),
                     generation: 4.into(),
                 })),
                 wal_offset(OffsetRecord::OffsetCommit(ConsumerOffsetUpdate {

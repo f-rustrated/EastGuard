@@ -212,7 +212,7 @@ impl ConsumerGroupEpochSnapshot {
                 DataTransportCommand::send_to_targets(
                     replicas,
                     DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(EpochSeal {
-                        offset_key: ConsumerOffsetKey {
+                        key: ConsumerOffsetKey {
                             topic_id: self.topic_id,
                             range_id,
                             group_id: self.group_id.clone(),
