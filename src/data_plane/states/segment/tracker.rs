@@ -121,10 +121,6 @@ impl SegmentTracker {
     }
 
     pub(crate) fn publish_staged(&mut self, lsn: u64) -> Box<[Arc<CachedEntry>]> {
-        if !self.has_staged() {
-            return Box::new([]);
-        }
-
         self.staged_entries
             .drain(..)
             .map(|s| {
