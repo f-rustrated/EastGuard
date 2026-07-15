@@ -1,6 +1,5 @@
 use crate::control_plane::metadata::consumer_group::GenerationId;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
@@ -51,9 +50,7 @@ pub struct Produce {
 }
 
 pub struct CommitConsumerOffset {
-    pub key: ConsumerOffsetKey,
-    pub generation: GenerationId,
-    pub position: ConsumerOffsetPosition,
+    pub update: ConsumerOffsetUpdate,
     pub reply: oneshot::Sender<ConsumerOffsetCommitAck>,
 }
 
@@ -100,9 +97,7 @@ pub struct ReplicaAck {
 pub struct ReplicaOffsetCommit {
     pub seq: u64,
     pub replica_set: Vec<NodeId>,
-    pub key: ConsumerOffsetKey,
-    pub generation: GenerationId,
-    pub position: ConsumerOffsetPosition,
+    pub offset_commit: ConsumerOffsetUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -121,9 +116,7 @@ impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch(ReplicaOffsetStaleEpoch));
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ReplicaOffsetAck {
     pub seq: u64,
-    pub key: ConsumerOffsetKey,
-    pub generation: GenerationId,
-    pub position: ConsumerOffsetPosition,
+    pub offset_commit: ConsumerOffsetUpdate,
     pub from: NodeId,
     pub result: ReplicaOffsetAckResult,
 }

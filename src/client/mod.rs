@@ -174,16 +174,18 @@ impl Client {
     pub(crate) async fn commit_consumer_offset(
         &self,
         topic_name: &str,
-        request: CommitConsumerOffsetRequest,
+        request: impl Into<CommitConsumerOffsetRequest>,
     ) -> Result<(), ClientError> {
+        let req = request.into();
+
         // resolve routing
         let routing = self.resolve_topic_if_missing(topic_name).await?;
         let leader = routing
-            .write_leader_for_range(request.offset_key.range_id)
+            .write_leader_for_range(req.key.range_id)
             .ok_or(ClientError::StaleRange)?;
-        let request_generation = request.generation;
+        let request_generation = req.generation;
 
-        let served = self.call(leader.client_addr(), request).await?;
+        let served = self.call(leader.client_addr(), req).await?;
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffsetCommitted) => Ok(()),
             ClientResponse::DataPlane(DataPlaneResponse::StaleConsumerGroupEpoch(stale)) => {

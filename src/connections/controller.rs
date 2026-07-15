@@ -350,9 +350,7 @@ impl ClientController {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.data_plane_tx
             .send_async(CommitConsumerOffset {
-                key: req.offset_key,
-                generation: req.generation,
-                position: req.position,
+                update: req.0,
                 reply,
             })
             .await?;

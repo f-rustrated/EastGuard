@@ -17,10 +17,12 @@ use crate::{
         },
     },
     data_plane::{
-        consumer_offset_management::ledger::{ConsumerOffsetKey, ConsumerOffsetPosition},
+        consumer_offset_management::ledger::{
+            ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
+        },
         messages::query::{FetchResult, ListOffsetsResult},
     },
-    impl_from_variant,
+    impl_from_variant, impl_new_struct_wrapper,
 };
 
 /// Client → broker data-plane request. Every variant carries a `Client*Request`
@@ -93,11 +95,8 @@ pub struct RangeOffsetRequest {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CommitConsumerOffsetRequest {
-    pub offset_key: ConsumerOffsetKey,
-    pub generation: GenerationId,
-    pub position: ConsumerOffsetPosition,
-}
+pub struct CommitConsumerOffsetRequest(pub ConsumerOffsetUpdate);
+impl_new_struct_wrapper!(CommitConsumerOffsetRequest, ConsumerOffsetUpdate);
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct FetchConsumerOffsetRequest(pub ConsumerOffsetKey);

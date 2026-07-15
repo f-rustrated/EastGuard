@@ -14,7 +14,7 @@ use crate::connections::protocol::{
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SyncConsumerGroupRequest, TopicId};
 use crate::data_plane::consumer_offset_management::ledger::{
-    ConsumerOffsetKey, ConsumerOffsetPosition,
+    ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -169,8 +169,8 @@ impl ConsumerGroup {
                 self.client
                     .commit_consumer_offset(
                         &self.topic,
-                        CommitConsumerOffsetRequest {
-                            offset_key: self.consumer_offset_key(range_id),
+                        ConsumerOffsetUpdate {
+                            key: self.consumer_offset_key(range_id),
                             generation,
                             position,
                         },

@@ -176,7 +176,7 @@ mod tests {
     use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
     use crate::data_plane::SegmentKey;
     use crate::data_plane::consumer_offset_management::ledger::{
-        ConsumerOffsetKey, ConsumerOffsetPosition, EpochSeal, OffsetRecord,
+        ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
     };
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
 
@@ -298,11 +298,11 @@ mod tests {
                     offset_key: key.clone(),
                     generation: 4.into(),
                 })),
-                wal_offset(OffsetRecord::OffsetCommit {
+                wal_offset(OffsetRecord::OffsetCommit(ConsumerOffsetUpdate {
                     key: key.clone(),
                     generation: 4.into(),
                     position,
-                }),
+                })),
             ]),
         );
 
