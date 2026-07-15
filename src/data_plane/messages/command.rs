@@ -1,6 +1,7 @@
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
+use crate::data_plane::consumer_offset_management::types::ReplicaOffsetCommit;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -91,13 +92,6 @@ pub struct ReplicaAck {
     pub segment_key: SegmentKey,
     pub entry_id: EntryId,
     pub from: NodeId,
-}
-
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaOffsetCommit {
-    pub seq: u64,
-    pub replica_set: Vec<NodeId>,
-    pub update: ConsumerOffsetUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

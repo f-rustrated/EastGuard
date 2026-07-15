@@ -10,7 +10,6 @@ use crate::data_plane::consumer_offset_management::replication::OffsetReplicatio
 
 use crate::data_plane::messages::command::{
     CommitConsumerOffset, ConsumerOffsetCommitAck, ReplicaOffsetAck, ReplicaOffsetAckResult,
-    ReplicaOffsetCommit,
 };
 
 use crate::data_plane::transport::command::DataTransportCommand;

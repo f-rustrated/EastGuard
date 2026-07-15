@@ -1,10 +1,9 @@
 use crate::control_plane::NodeId;
-use crate::data_plane::consumer_offset_management::ledger::OffsetRecord;
-use crate::data_plane::messages::command::{
-    CommitConsumerOffset, ConsumerOffsetCommitAck, ReplicaOffsetCommit,
-};
+use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetUpdate, OffsetRecord};
+use crate::data_plane::messages::command::{CommitConsumerOffset, ConsumerOffsetCommitAck};
 use crate::impl_from_variant;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use tokio::sync::oneshot;
 
 pub(crate) struct PendingOffsetMutation {
@@ -39,6 +38,13 @@ impl_from_variant!(
     LeaderCommit(LeaderOffsetCommitApplied),
     ReplicaCommit(ReplicaOffsetCommit)
 );
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReplicaOffsetCommit {
+    pub seq: u64,
+    pub replica_set: Vec<NodeId>,
+    pub update: ConsumerOffsetUpdate,
+}
 
 pub(crate) enum FutureOffsetCommit {
     Client(CommitConsumerOffset),
