@@ -357,9 +357,7 @@ impl<W: WalStorage> DataPlane<W> {
             .consumer_offsets
             .get_replica_set_if_leader(&query.key, &self.node_id)
         {
-            Ok(_) => ReadConsumerOffsetResult::Offset(
-                self.consumer_offsets.offset_ledger.offset(&query.key),
-            ),
+            Ok(_) => ReadConsumerOffsetResult::Offset(self.consumer_offsets.offset(&query.key)),
             Err(leader) => ReadConsumerOffsetResult::NotLeader(leader),
         };
         let _ = query.reply.send(result);
@@ -977,7 +975,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
         self.consumer_offsets
-            .place(&cmd.segment_key, cmd.replica_set.clone());
+            .add_placement(&cmd.segment_key, cmd.replica_set.clone());
 
         if !self.segments.contains_key(&cmd.segment_key) {
             let tracker = SegmentTracker::new_with_start_entry_id(
@@ -1035,7 +1033,8 @@ impl<W: WalStorage> DataPlane<W> {
             );
         }
 
-        self.consumer_offsets.place(&cmd.segment_key, replica_set);
+        self.consumer_offsets
+            .add_placement(&cmd.segment_key, replica_set);
 
         let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
             return;
@@ -1095,7 +1094,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         self.consumer_offsets
-            .place(&cmd.old_segment_key, cmd.new_replica_set.clone());
+            .add_placement(&cmd.old_segment_key, cmd.new_replica_set.clone());
 
         self.replication.segment_handoff(
             cmd.old_segment_key,
@@ -1651,9 +1650,7 @@ mod tests {
             ConsumerOffsetCommitAck::Committed
         );
         assert_eq!(
-            dp.consumer_offsets
-                .offset_ledger
-                .offset(&consumer_offset_key()),
+            dp.consumer_offsets.offset(&consumer_offset_key()),
             Some(position)
         );
         assert_eq!(
@@ -1784,9 +1781,7 @@ mod tests {
             ConsumerOffsetCommitAck::Committed
         );
         assert_eq!(
-            dp.consumer_offsets
-                .offset_ledger
-                .offset(&consumer_offset_key()),
+            dp.consumer_offsets.offset(&consumer_offset_key()),
             Some(position)
         );
     }
@@ -1902,9 +1897,7 @@ mod tests {
 
         dp.flush_batch();
         assert_eq!(
-            dp.consumer_offsets
-                .offset_ledger
-                .offset(&consumer_offset_key()),
+            dp.consumer_offsets.offset(&consumer_offset_key()),
             Some(position)
         );
         assert!(dp.out.transport_cmds.iter().any(|command| matches!(
