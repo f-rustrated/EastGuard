@@ -9,6 +9,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use crate::client::RangeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, TopicId};
+use crate::data_plane::SegmentKey;
 
 const SNAPSHOT_FILE: &str = "consumer-offsets.snapshot";
 const SNAPSHOT_TEMP_FILE: &str = "consumer-offsets.snapshot.tmp";
@@ -18,6 +19,12 @@ pub(crate) struct ConsumerOffsetKey {
     pub(crate) topic_id: TopicId,
     pub(crate) range_id: RangeId,
     pub(crate) group_id: String,
+}
+
+impl ConsumerOffsetKey {
+    pub(crate) fn placement_key(&self) -> (TopicId, RangeId) {
+        (self.topic_id, self.range_id)
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -54,19 +61,30 @@ pub struct ConsumerOffsetUpdate {
     pub generation: GenerationId,
     pub position: ConsumerOffsetPosition,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ConsumerOffsetSnapshot {
+    pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+    pub position: Option<ConsumerOffsetPosition>,
+}
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub(crate) enum OffsetRecord {
     EpochSeal(EpochSeal),
     OffsetCommit(ConsumerOffsetUpdate),
+    BootstrapEntry(ConsumerOffsetSnapshot),
+    PlacementReady(SegmentKey),
 }
 
-/// Durable consumer-group state. Live mutations are persisted by the shared
+/// "Durable" consumer-group state. Live mutations are persisted by the shared
 /// data-plane WAL; this type is only the in-memory cache and its asynchronous
 /// WAL-reclamation snapshot.
 #[derive(Debug, Clone, Default, BorshSerialize, BorshDeserialize)]
 pub(crate) struct OffsetLedger {
     epochs: HashMap<ConsumerOffsetKey, GenerationId>,
     offsets: HashMap<ConsumerOffsetKey, ConsumerOffsetPosition>,
+    ready_placements: HashMap<(TopicId, RangeId), SegmentKey>,
 }
 
 impl OffsetLedger {
@@ -123,11 +141,55 @@ impl OffsetLedger {
                     })
                     .or_insert(position);
             }
+            OffsetRecord::BootstrapEntry(snapshot) => {
+                self.epochs
+                    .entry(snapshot.key.clone())
+                    .and_modify(|generation| *generation = (*generation).max(snapshot.generation))
+                    .or_insert(snapshot.generation);
+                if let Some(position) = snapshot.position {
+                    self.offsets
+                        .entry(snapshot.key)
+                        .and_modify(|current| *current = (*current).max(position))
+                        .or_insert(position);
+                }
+            }
+            OffsetRecord::PlacementReady(segment_key) => {
+                self.ready_placements
+                    .entry((segment_key.topic_id, segment_key.range_id))
+                    .and_modify(|current| {
+                        if segment_key.segment_id > current.segment_id {
+                            *current = segment_key;
+                        }
+                    })
+                    .or_insert(segment_key);
+            }
         }
     }
 
     pub(crate) fn offset(&self, key: &ConsumerOffsetKey) -> Option<ConsumerOffsetPosition> {
         self.offsets.get(key).copied()
+    }
+
+    pub(crate) fn is_placement_ready(&self, segment_key: &SegmentKey) -> bool {
+        self.ready_placements
+            .get(&(segment_key.topic_id, segment_key.range_id))
+            == Some(segment_key)
+    }
+
+    pub(crate) fn snapshot_range(
+        &self,
+        topic_id: TopicId,
+        range_id: RangeId,
+    ) -> Box<[ConsumerOffsetSnapshot]> {
+        self.epochs
+            .iter()
+            .filter(|(key, _)| key.topic_id == topic_id && key.range_id == range_id)
+            .map(|(key, generation)| ConsumerOffsetSnapshot {
+                key: key.clone(),
+                generation: *generation,
+                position: self.offsets.get(key).copied(),
+            })
+            .collect()
     }
 }
 
