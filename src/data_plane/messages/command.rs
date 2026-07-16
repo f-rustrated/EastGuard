@@ -24,12 +24,18 @@ pub enum DataPlaneCommand {
     SegmentCheckpointComplete(SegmentCheckpointComplete),
     OffsetCheckpointComplete(OffsetCheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
-    DataPlanePeerMessage(DataPlanePeerMessage),
+    ReceivePeerMessage(ReceivePeerMessage),
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
     /// source read. The worker turns it into `CatchUpEntries`s on the transport.
     CatchUpReadComplete(CatchUpReadComplete),
     OrphanGcCheck(OrphanGcCheck),
     CommitConsumerOffset(CommitConsumerOffset),
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReceivePeerMessage {
+    pub from: NodeId,
+    pub message: Box<DataPlanePeerMessage>,
 }
 
 /// What the orphan-GC handler replies to the ticker: keep ticking while strays remain, or
@@ -363,7 +369,7 @@ impl_from_variant!(
     OrphanGcCheck,
     CommitConsumerOffset,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
-    DataPlanePeerMessage(DataPlanePeerMessage),
+    ReceivePeerMessage,
 );
 
 use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};

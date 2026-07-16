@@ -31,7 +31,7 @@ impl_from_variant_via!(
     Produce,
     SegmentCheckpointComplete,
     DataPlaneTimeoutCallback,
-    DataPlanePeerMessage,
+    ReceivePeerMessage,
     CatchUpReadComplete,
     CommitConsumerOffset
 );
