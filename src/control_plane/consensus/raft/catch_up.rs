@@ -1,6 +1,6 @@
 //! Sealed-segment catch-up re-drive — a `Raft`-owned tracker.
 //!
-//! A committed `ReassignSegment` dispatches its `CatchUpAssignment` once
+//! A committed `ReassignSegment` dispatches its `AssignSegmentCatchUp` once
 //! (fire-and-forget). Seeded at apply and driven by the leader's heartbeat, this
 //! tracker re-drives the assignment to each member until it acks, so a lost
 //! message can't strand the repair. See `.claude/rules/raft-actor.md` #9.
@@ -12,7 +12,7 @@ use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::event::SegmentReassigned;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::CatchUpAssignment;
+use crate::data_plane::messages::command::AssignSegmentCatchUp;
 use crate::data_plane::transport::command::DataTransportCommand;
 
 /// One in-flight repair: re-drive each member in `pending` until it acks.
@@ -86,7 +86,7 @@ impl CatchUpRepairs {
             for member in &repair.pending {
                 cmds.push(DataTransportCommand::send_to_targets(
                     vec![member.clone()],
-                    CatchUpAssignment {
+                    AssignSegmentCatchUp {
                         segment_key: *segment_key,
                         shard_group_id,
                         start_entry_id: repair.start_entry_id,
@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use crate::control_plane::Replicas;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
-    use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+    use crate::data_plane::messages::command::DataPlanePeerMessage;
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
@@ -165,8 +165,8 @@ mod tests {
         let DataTransportCommand::SendToTargets(s) = &cmds[0] else {
             panic!("expected SendToTargets");
         };
-        let DataPlaneInterNodeCommand::CatchUpAssignment(a) = &s.message else {
-            panic!("expected CatchUpAssignment");
+        let DataPlanePeerMessage::AssignSegmentCatchUp(a) = &s.message else {
+            panic!("expected AssignSegmentCatchUp");
         };
         assert_eq!(a.shard_group_id, ShardGroupId(7));
         assert_eq!(a.sealed_end_entry_id, EntryId(100));

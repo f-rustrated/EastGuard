@@ -6,7 +6,7 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
-    CatchUpAssignment, DataPlaneInterNodeCommand, DeleteSegments, SegmentAssignment,
+    AssignSegmentCatchUp, AssignSegmentReplica, DataPlanePeerMessage, DeleteSegments,
     SegmentRollCommitted, SegmentSealed,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -21,7 +21,7 @@ impl TopicCreated {
     pub fn into_command(self, shard_group_id: ShardGroupId) -> DataTransportCommand {
         DataTransportCommand::send_to_targets(
             vec![self.replica_set[0].clone()],
-            SegmentAssignment {
+            AssignSegmentReplica {
                 segment_key: self.segment_key,
                 shard_group_id,
                 replica_set: self.replica_set,
@@ -48,7 +48,7 @@ impl SegmentRolled {
         let start = self.end_entry_id.map_or(EntryId::MIN, |id| id + 1);
         let mut v = vec![DataTransportCommand::send_to_targets(
             vec![self.new_replica_set[0].clone()],
-            SegmentAssignment {
+            AssignSegmentReplica {
                 segment_key: self.new_segment_key,
                 shard_group_id,
                 replica_set: self.new_replica_set.clone(),
@@ -94,7 +94,7 @@ impl SegmentReassigned {
             .map(|member| {
                 DataTransportCommand::send_to_targets(
                     vec![member.clone()],
-                    CatchUpAssignment {
+                    AssignSegmentCatchUp {
                         segment_key: self.segment_key,
                         shard_group_id,
                         start_entry_id: self.start_entry_id,
@@ -124,7 +124,7 @@ impl RangeSplit {
                 let target = replica_set[0].clone();
                 DataTransportCommand::send_to_targets(
                     vec![target],
-                    SegmentAssignment {
+                    AssignSegmentReplica {
                         segment_key: SegmentKey::new(self.topic_id, range_id, segment_id),
                         shard_group_id,
                         replica_set,
@@ -166,7 +166,7 @@ impl RangeMerged {
         let target = self.replica_set[0].clone();
         let mut commands = vec![DataTransportCommand::send_to_targets(
             vec![target],
-            SegmentAssignment {
+            AssignSegmentReplica {
                 segment_key: self.segment_key,
                 shard_group_id,
                 replica_set: self.replica_set,
@@ -211,7 +211,7 @@ impl ConsumerGroupEpochSnapshot {
             .map(|(range_id, replicas)| {
                 DataTransportCommand::send_to_targets(
                     replicas.0,
-                    DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(EpochSeal {
+                    DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
                         key: ConsumerOffsetKey {
                             topic_id: self.topic_id,
                             range_id,

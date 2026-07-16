@@ -5,7 +5,7 @@ use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetUpdate, OffsetRecord};
 use crate::data_plane::messages::command::{
-    BootstrapConsumerOffsetAck, CommitConsumerOffset, ConsumerOffsetCommitAck,
+    CommitConsumerOffset, ConsumerOffsetCommitAck, ConsumerOffsetSnapshotInstalled,
 };
 use crate::impl_from_variant;
 
@@ -37,19 +37,19 @@ pub(crate) struct LeaderOffsetCommitApplied {
 pub(crate) enum OffsetMutationCompletion {
     EpochSeal,
     LeaderCommit(LeaderOffsetCommitApplied),
-    ReplicaCommit(ReplicaOffsetCommit),
-    Bootstrap(BootstrapConsumerOffsetAck),
+    ReplicaCommit(ReplicateConsumerOffset),
+    Bootstrap(ConsumerOffsetSnapshotInstalled),
 }
 
 impl_from_variant!(
     OffsetMutationCompletion,
     LeaderCommit(LeaderOffsetCommitApplied),
-    ReplicaCommit(ReplicaOffsetCommit),
-    Bootstrap(BootstrapConsumerOffsetAck)
+    ReplicaCommit(ReplicateConsumerOffset),
+    Bootstrap(ConsumerOffsetSnapshotInstalled)
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaOffsetCommit {
+pub struct ReplicateConsumerOffset {
     pub seq: u64,
     pub replica_set: Replicas,
     pub update: ConsumerOffsetUpdate,
@@ -57,7 +57,7 @@ pub struct ReplicaOffsetCommit {
 
 pub(crate) enum FutureOffsetCommit {
     Client(CommitConsumerOffset),
-    Replica(ReplicaOffsetCommit),
+    Replica(ReplicateConsumerOffset),
 }
 
 pub(crate) struct OffsetPlacement {

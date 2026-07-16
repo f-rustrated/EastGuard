@@ -17,7 +17,7 @@ use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SealBoundaryReportError {
+pub(crate) enum DurableSegmentEndReportedError {
     UnknownRecovery,
     UnexpectedReporter(NodeId),
     ConflictingReport {
@@ -84,16 +84,16 @@ impl SealEndGather {
         segment_key: SegmentKey,
         from: NodeId,
         durable_end: Option<EntryId>,
-    ) -> Result<Option<SealEndStep>, SealBoundaryReportError> {
+    ) -> Result<Option<SealEndStep>, DurableSegmentEndReportedError> {
         if self.proposed {
             return Ok(None);
         }
         if !self.awaits(&from) {
-            return Err(SealBoundaryReportError::UnexpectedReporter(from));
+            return Err(DurableSegmentEndReportedError::UnexpectedReporter(from));
         }
         if let Some(previous) = self.reports.get(&from) {
             if *previous != durable_end {
-                return Err(SealBoundaryReportError::ConflictingReport {
+                return Err(DurableSegmentEndReportedError::ConflictingReport {
                     reporter: from,
                     previous: *previous,
                     incoming: durable_end,
@@ -247,10 +247,10 @@ impl SealEndRecovery {
         segment_key: SegmentKey,
         from: NodeId,
         durable_end: Option<EntryId>,
-    ) -> Result<Option<SealEndStep>, SealBoundaryReportError> {
+    ) -> Result<Option<SealEndStep>, DurableSegmentEndReportedError> {
         self.gathers
             .get_mut(&segment_key)
-            .ok_or(SealBoundaryReportError::UnknownRecovery)?
+            .ok_or(DurableSegmentEndReportedError::UnknownRecovery)?
             .record(segment_key, from, durable_end)
     }
 
@@ -427,7 +427,7 @@ mod tests {
 
         assert!(matches!(
             recovery.record(seg, node("x"), Some(EntryId(10))),
-            Err(SealBoundaryReportError::UnexpectedReporter(reporter)) if reporter == node("x")
+            Err(DurableSegmentEndReportedError::UnexpectedReporter(reporter)) if reporter == node("x")
         ));
         assert!(matches!(
             recovery.record(seg, node("y"), Some(EntryId(50))),
@@ -435,7 +435,7 @@ mod tests {
         ));
         assert!(matches!(
             recovery.record(seg, node("y"), Some(EntryId(49))),
-            Err(SealBoundaryReportError::ConflictingReport {
+            Err(DurableSegmentEndReportedError::ConflictingReport {
                 reporter,
                 previous: Some(EntryId(50)),
                 incoming: Some(EntryId(49)),

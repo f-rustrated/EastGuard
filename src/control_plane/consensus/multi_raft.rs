@@ -15,7 +15,7 @@ use crate::control_plane::metadata::{
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
+    DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentReplicaAssigned,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -270,10 +270,10 @@ impl MultiRaft {
             MultiRaftActorCommand::AssignmentAck(ack) => {
                 self.handle_assignment_ack(ack);
             }
-            MultiRaftActorCommand::SealBoundaryReport(report) => {
+            MultiRaftActorCommand::DurableSegmentEndReported(report) => {
                 self.handle_seal_boundary_report(report);
             }
-            MultiRaftActorCommand::CatchUpAck(ack) => {
+            MultiRaftActorCommand::SegmentCaughtUp(ack) => {
                 self.handle_catch_up_ack(ack);
             }
         }
@@ -427,7 +427,7 @@ impl MultiRaft {
         }
     }
 
-    fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
+    fn handle_assignment_ack(&mut self, ack: SegmentReplicaAssigned) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;
         };
@@ -576,7 +576,7 @@ impl MultiRaft {
 
     /// Feed a survivor's durable extent into the subsystem; if it completes a
     /// gather, execute the resulting seal.
-    fn handle_seal_boundary_report(&mut self, report: SealBoundaryReport) {
+    fn handle_seal_boundary_report(&mut self, report: DurableSegmentEndReported) {
         match self
             .seal_recovery
             .record(report.segment_key, report.from, report.durable_end)
@@ -593,7 +593,7 @@ impl MultiRaft {
 
     /// Route a catch-up confirmation to the owning group's `Raft`, which clears the
     /// member and prunes the repair once all confirm. Mirrors `handle_assignment_ack`.
-    fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+    fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;
         };
@@ -669,7 +669,7 @@ impl MultiRaft {
         }
         let cmd = DataTransportCommand::send_to_targets(
             targets.to_vec(),
-            SealBoundaryQuery {
+            RequestDurableSegmentEnd {
                 segment_key,
                 coordinator: self.node_id.clone(),
             },
@@ -1859,9 +1859,9 @@ mod tests {
         store.flush(); // commit + persist + apply (single-node)
     }
 
-    /// Targets a `SealBoundaryQuery` for `seg` was fanned out to (sorted).
+    /// Targets a `RequestDurableSegmentEnd` for `seg` was fanned out to (sorted).
     fn seal_boundary_query_targets(events: &[RaftEvent], seg: SegmentKey) -> Vec<NodeId> {
-        use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+        use crate::data_plane::messages::command::DataPlanePeerMessage;
         let mut out = Vec::new();
         for e in events {
             let RaftEvent::SealBoundaryQueries(cmds) = e else {
@@ -1869,7 +1869,7 @@ mod tests {
             };
             for cmd in cmds {
                 if let DataTransportCommand::SendToTargets(s) = cmd
-                    && let DataPlaneInterNodeCommand::SealBoundaryQuery(q) = &s.message
+                    && let DataPlanePeerMessage::RequestDurableSegmentEnd(q) = &s.message
                     && q.segment_key == seg
                 {
                     out.extend(s.targets.iter().cloned());
@@ -1924,12 +1924,12 @@ mod tests {
         let before = proposals_after_become_leader(&store).len();
 
         // Survivors report durable extents; the second completes the gather.
-        store.handle_seal_boundary_report(SealBoundaryReport {
+        store.handle_seal_boundary_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("y"),
             durable_end: Some(EntryId(50)),
         });
-        store.handle_seal_boundary_report(SealBoundaryReport {
+        store.handle_seal_boundary_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("z"),
             durable_end: Some(EntryId(40)),

@@ -17,7 +17,9 @@ use crate::control_plane::metadata::{
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{CatchUpAck, SegmentAssignment, SegmentAssignmentAck};
+use crate::data_plane::messages::command::{
+    AssignSegmentReplica, SegmentCaughtUp, SegmentReplicaAssigned,
+};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -126,7 +128,7 @@ pub struct Raft {
     election_epoch: u64,
     election_jitter: ElectionJitter,
     /// Segments whose data-leader has acked its
-    /// `SegmentAssignment`, mapped to the acking node. The heartbeat sweep skips
+    /// `AssignSegmentReplica`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
     confirmed_assignment: HashMap<SegmentKey, NodeId>,
     /// In-flight sealed-segment repairs. Seeded at `ReassignSegment` apply; the
@@ -230,7 +232,7 @@ impl Raft {
 
     /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
     /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
-    /// turns these into `SegmentAssignment` re-drives for unconfirmed segments.
+    /// turns these into `AssignSegmentReplica` re-drives for unconfirmed segments.
     pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         self.state_machine.active_segment_assignments()
     }
@@ -1213,7 +1215,7 @@ impl Raft {
 
             redrives.push(DataTransportCommand::send_to_targets(
                 vec![target.clone()],
-                SegmentAssignment {
+                AssignSegmentReplica {
                     segment_key,
                     shard_group_id: self.shard_group_id,
                     replica_set,
@@ -1226,7 +1228,7 @@ impl Raft {
         }
     }
 
-    pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
+    pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentReplicaAssigned) {
         self.confirmed_assignment.insert(ack.segment_key, ack.from);
     }
 
@@ -1241,7 +1243,7 @@ impl Raft {
 
     /// A member confirmed it holds a reassigned sealed segment; routed here from
     /// `MultiRaft`.
-    pub(crate) fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+    pub(crate) fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
         self.catch_up.confirm(ack.segment_key, ack.from);
     }
 
@@ -1934,7 +1936,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_plane::messages::command::CatchUpAssignment;
+    use crate::data_plane::messages::command::AssignSegmentCatchUp;
 
     impl Raft {
         pub(crate) fn propose_noop(&mut self) -> Result<u64, ProposalError> {
@@ -4120,8 +4122,8 @@ mod tests {
     }
 
     /// Run the catch-up re-drive sweep and collect (target, assignment) pairs.
-    fn drain_catch_up_redrives(raft: &mut Raft) -> Vec<(NodeId, CatchUpAssignment)> {
-        use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+    fn drain_catch_up_redrives(raft: &mut Raft) -> Vec<(NodeId, AssignSegmentCatchUp)> {
+        use crate::data_plane::messages::command::DataPlanePeerMessage;
         raft.maybe_redrive_catch_ups();
         let mut out = Vec::new();
         for event in raft.take_events() {
@@ -4131,7 +4133,7 @@ mod tests {
             for cmd in cmds {
                 if let DataTransportCommand::SendToTargets(s) = cmd {
                     let target = s.targets[0].clone();
-                    if let DataPlaneInterNodeCommand::CatchUpAssignment(a) = s.message {
+                    if let DataPlanePeerMessage::AssignSegmentCatchUp(a) = s.message {
                         out.push((target, a));
                     }
                 }

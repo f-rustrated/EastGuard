@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
+use crate::data_plane::messages::command::{DataPlaneCommand, DataPlanePeerMessage};
 use crate::net::OwnedReadHalf;
 
 const NODE_ID_FRAME_MAX: usize = 1024;
@@ -33,11 +33,11 @@ impl DataReader {
     ) {
         loop {
             match self
-                .read_frame::<DataPlaneInterNodeCommand>(DATA_FRAME_MAX)
+                .read_frame::<DataPlanePeerMessage>(DATA_FRAME_MAX)
                 .await
             {
                 Ok(msg) => {
-                    let _ = data_plane_tx.send(DataPlaneCommand::DataPlaneInterNodeCommand(msg));
+                    let _ = data_plane_tx.send(DataPlaneCommand::DataPlanePeerMessage(msg));
                 }
                 Err(e) => {
                     tracing::debug!("DataReader connection closed: {e}");
