@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
-    control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId},
+    control_plane::metadata::{EntryId, SegmentId},
     data_plane::states::segment::cache::CachedEntry,
     data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
@@ -127,8 +127,8 @@ pub struct InstallConsumerOffsetSnapshot {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RequestConsumerOffsetSnapshot {
-    pub topic_id: TopicId,
-    pub range_id: RangeId,
+    pub segment_key: SegmentKey,
+    pub replicas: Replicas,
     pub requester: NodeId,
 }
 

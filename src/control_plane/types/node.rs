@@ -166,4 +166,8 @@ impl Replicas {
         // [A,B,C] -> [C,A,B]
         self.0[0..=pos].rotate_right(1);
     }
+
+    pub fn except_for(&self, node: &NodeId) -> Vec<NodeId> {
+        self.0.iter().filter(|n| *n != node).cloned().collect()
+    }
 }

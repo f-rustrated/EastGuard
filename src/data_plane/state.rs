@@ -480,10 +480,10 @@ impl<W: WalStorage> DataPlane<W> {
                 self.install_consumer_offset_snapshot(&from, cmd)
             }
             C::RequestConsumerOffsetSnapshot(cmd) => {
-                self.handle_bootstrap_consumer_offset_request(cmd)
+                self.request_consumer_offset_snapshot(&from, cmd)
             }
             C::ConsumerOffsetSnapshotInstalled(cmd) => {
-                self.handle_consumer_offset_bootstrap_ack(cmd)
+                self.handle_consumer_offset_snapshot_installed(cmd)
             }
             C::AdvanceReplicaCommit(cmd) => self.handle_commit_advance(cmd),
             C::SegmentRollCommitted(message) => self.handle_segment_roll_committed(message),
@@ -987,15 +987,19 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         if cmd.update.generation > sealed_generation {
-            self.out
-                .store_transport_cmd(DataTransportCommand::send_to_targets(
-                    vec![leader],
+            let targets = cmd.replica_set.except_for(&self.node_id);
+            if !targets.is_empty() {
+                let transport = DataTransportCommand::send_to_targets(
+                    targets,
                     RequestConsumerOffsetSnapshot {
-                        topic_id: cmd.update.key.topic_id,
-                        range_id: cmd.update.key.range_id,
+                        segment_key: cmd.segment_key,
+                        replicas: cmd.replica_set.clone(),
                         requester: self.node_id.clone(),
                     },
-                ));
+                );
+                self.out.store_transport_cmd(transport)
+            }
+
             self.consumer_offsets
                 .future_entry(cmd.update.key.clone())
                 .push(FutureOffsetCommit::Replica(cmd));
@@ -1016,13 +1020,13 @@ impl<W: WalStorage> DataPlane<W> {
         from: &NodeId,
         cmd: InstallConsumerOffsetSnapshot,
     ) {
-        if !self.is_follower_of(&cmd.replica_set) {
+        if !cmd.replica_set.contains(&self.node_id) || !cmd.replica_set.contains(from) {
             return;
         }
         let Some(leader) = cmd.replica_set.leader() else {
             return;
         };
-        if leader != from {
+        if leader != from && leader != &self.node_id {
             return;
         };
 
@@ -1034,14 +1038,39 @@ impl<W: WalStorage> DataPlane<W> {
         self.needs_flush = true;
     }
 
-    fn handle_bootstrap_consumer_offset_request(&mut self, cmd: RequestConsumerOffsetSnapshot) {
-        if let Some(bootstrap) = self.consumer_offsets.bootstrap_for_request(&cmd) {
+    fn request_consumer_offset_snapshot(
+        &mut self,
+        from: &NodeId,
+        cmd: RequestConsumerOffsetSnapshot,
+    ) {
+        if &cmd.requester != from || !cmd.replicas.contains(&self.node_id) {
+            return;
+        }
+        if !cmd.replicas.contains(&cmd.requester) {
+            return;
+        }
+
+        if let Some(bootstrap) = self
+            .consumer_offsets
+            .create_offset_snapshot(cmd, &self.node_id)
+        {
             self.out.store_transport_cmd(bootstrap);
         }
     }
 
-    fn handle_consumer_offset_bootstrap_ack(&mut self, cmd: ConsumerOffsetSnapshotInstalled) {
+    fn handle_consumer_offset_snapshot_installed(&mut self, cmd: ConsumerOffsetSnapshotInstalled) {
+        if self.node_id != cmd.leader {
+            return;
+        }
+
         self.consumer_offsets.handle_bootstrap_ack(&cmd);
+
+        if let Some(bootstrap) = self
+            .consumer_offsets
+            .create_offset_snapshot_for_unready_replicas(cmd.segment_key)
+        {
+            self.out.store_transport_cmd(bootstrap);
+        }
         self.ack_ready_offset_placements();
     }
 
@@ -1065,7 +1094,7 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
-        for transport in self.consumer_offsets.install_leader_placement(
+        if let Some(transport) = self.consumer_offsets.install_leader_placement(
             cmd.segment_key,
             cmd.shard_group_id,
             cmd.replica_set.clone(),
@@ -1092,7 +1121,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// have successfully bootstrapped and are up-to-date)
     /// If then sends [`SegmentPlaced`](self::SegmentPlaced) to coordinator responsible for the shard
     fn ack_ready_offset_placements(&mut self) {
-        for ack in self.consumer_offsets.ready_placement_acks(&self.node_id) {
+        for ack in self.consumer_offsets.drain_ready_placements(&self.node_id) {
             self.out
                 .store_transport_cmd(DataTransportSendToCoordinator {
                     shard_group_id: ack.shard_group_id,
@@ -2032,6 +2061,7 @@ mod tests {
         dp.process_peer(DataPlanePeerMessage::ReplicateConsumerOffset(
             ReplicateConsumerOffset {
                 seq: 9,
+                segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader, test_node_id()]),
                 update: ConsumerOffsetUpdate {
                     key: consumer_offset_key(),
@@ -2125,6 +2155,7 @@ mod tests {
         dp.process_peer(DataPlanePeerMessage::ReplicateConsumerOffset(
             ReplicateConsumerOffset {
                 seq: 10,
+                segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
                 update: update.clone(),
             },
