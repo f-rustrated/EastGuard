@@ -87,11 +87,7 @@ pub(crate) struct OffsetPlacement {
 }
 
 impl OffsetPlacement {
-    pub(crate) fn compare(
-        &self,
-        other_key: &SegmentKey,
-        other: &Replicas,
-    ) -> Option<FollowerPlacementObservation> {
+    pub(crate) fn compare(&self, other_key: &SegmentKey, other: &Replicas) -> PlacementObservation {
         if self.segment_key == *other_key {
             if &self.replicas != other {
                 tracing::warn!(
@@ -102,22 +98,22 @@ impl OffsetPlacement {
                 );
             }
 
-            return Some(if &self.replicas == other {
+            return if &self.replicas == other {
                 // No need to place again - idempotency
-                FollowerPlacementObservation::Unchanged
+                PlacementObservation::Unchanged
             } else {
-                FollowerPlacementObservation::Conflict
-            });
+                PlacementObservation::Conflict
+            };
         }
         if self.segment_key.segment_id >= other_key.segment_id {
-            return Some(FollowerPlacementObservation::Stale);
+            return PlacementObservation::Stale;
         }
-        None
+        PlacementObservation::Accepted
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FollowerPlacementObservation {
+pub(crate) enum PlacementObservation {
     Accepted,
     Unchanged,
     Stale,
