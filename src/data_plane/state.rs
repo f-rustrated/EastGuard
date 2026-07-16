@@ -1111,8 +1111,9 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         if matches!(
-            self.consumer_offsets.observe_follower_placement(
+            self.consumer_offsets.observe_placement(
                 cmd.segment_key,
+                ShardGroupId(0),
                 &cmd.replicas,
                 &self.node_id
             ),
