@@ -8,7 +8,7 @@ use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicSt
 use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
 
 use super::command::{
-    CoordinatorSealRequest, EnsureGroup, InboundRaftRpc, MetadataProposal, RaftProtocolMessage,
+    EnsureGroup, InboundRaftRpc, MetadataProposal, ProposeSegmentRoll, RaftProtocolMessage,
     RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
@@ -51,8 +51,8 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
-    /// Data plane SealRequest forwarded to coordinator for Raft proposal.
-    Coordinator(CoordinatorSealRequest),
+    /// Data-plane request forwarded to the metadata coordinator for proposal.
+    ProposeSegmentRoll(ProposeSegmentRoll),
     /// Data-leader confirmation that it received a `SegmentAssignment`. Marks the
     /// segment confirmed so the leader's heartbeat sweep stops re-driving it.
     AssignmentAck(SegmentAssignmentAck),

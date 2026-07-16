@@ -553,7 +553,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         }
 
         // The segment ages past `max_segment_age_secs`; the leader enqueues a
-        // SealRequest, the coordinator commits a RollSegment, and the active
+        // RequestSegmentRoll, the coordinator commits a RollSegment, and the active
         // segment rolls. Poll DescribeTopic until the successor's start_offset
         // advances past 0 (the known-end seal landed).
         let mut rolled_start = None;

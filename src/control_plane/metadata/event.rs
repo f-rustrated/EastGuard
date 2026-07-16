@@ -6,8 +6,8 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
-    CatchUpAssignment, DataPlaneInterNodeCommand, DeleteSegments, SealResponse, SegmentAssignment,
-    SegmentSealed,
+    CatchUpAssignment, DataPlaneInterNodeCommand, DeleteSegments, SegmentAssignment,
+    SegmentRollCommitted, SegmentSealed,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
@@ -59,7 +59,7 @@ impl SegmentRolled {
         if let Some(ctx) = ctx {
             v.push(DataTransportCommand::send_to_targets(
                 vec![ctx.requester],
-                SealResponse {
+                SegmentRollCommitted {
                     old_segment_key: ctx.segment_key,
                     new_segment_id: self.new_segment_key.segment_id,
                     new_replica_set: self.new_replica_set,

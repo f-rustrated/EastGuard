@@ -140,7 +140,7 @@ pub struct CommitAdvance {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealRequest {
+pub struct RequestSegmentRoll {
     pub from: NodeId,
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
@@ -148,7 +148,7 @@ pub struct SealRequest {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealResponse {
+pub struct SegmentRollCommitted {
     pub old_segment_key: SegmentKey,
     pub new_segment_id: SegmentId,
     pub new_replica_set: Replicas,
@@ -282,8 +282,8 @@ pub enum DataPlaneInterNodeCommand {
     BootstrapConsumerOffsetRequest(BootstrapConsumerOffsetRequest),
     BootstrapConsumerOffsetAck(BootstrapConsumerOffsetAck),
     CommitAdvance(CommitAdvance),
-    SealRequest(SealRequest),
-    SealResponse(SealResponse),
+    RequestSegmentRoll(RequestSegmentRoll),
+    SegmentRollCommitted(SegmentRollCommitted),
     SegmentSealed(SegmentSealed),
     CatchUpAssignment(CatchUpAssignment),
     CatchUpRequest(CatchUpRequest),
@@ -308,8 +308,8 @@ impl_from_variant!(
     BootstrapConsumerOffsetRequest,
     BootstrapConsumerOffsetAck,
     CommitAdvance,
-    SealRequest,
-    SealResponse,
+    RequestSegmentRoll,
+    SegmentRollCommitted,
     SegmentSealed,
     CatchUpAssignment,
     CatchUpRequest,

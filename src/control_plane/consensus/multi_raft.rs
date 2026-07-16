@@ -1,8 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    CoordinatorSealRequest, DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc,
-    LogMutation, MetadataProposal, MultiRaftActorCommand, RaftEvent, RaftProtocolMessage,
-    RaftTimeoutCallback,
+    DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
+    MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{LeaderlessSegments, Raft, TimerSeqs};
@@ -104,7 +103,7 @@ impl PendingSealTracker {
     /// Drop every pending seal context for `group_id`. Called when a leader
     /// steps down — any not-yet-committed proposals will either be truncated
     /// by the new leader or commit there, but this replica will no longer be
-    /// the one to dispatch the SealResponse.
+    /// the one to dispatch `SegmentRollCommitted`.
     fn drop_group(&mut self, group_id: ShardGroupId) {
         if let Some(stale_group) = self.by_group.remove(&group_id) {
             for seal in stale_group.into_values() {
@@ -265,8 +264,8 @@ impl MultiRaft {
                         },
                     ));
             }
-            MultiRaftActorCommand::Coordinator(req) => {
-                self.handle_seal_request(req);
+            MultiRaftActorCommand::ProposeSegmentRoll(cmd) => {
+                self.propose_segment_roll(cmd);
             }
             MultiRaftActorCommand::AssignmentAck(ack) => {
                 self.handle_assignment_ack(ack);
@@ -512,7 +511,7 @@ impl MultiRaft {
         }
     }
 
-    fn handle_seal_request(&mut self, req: CoordinatorSealRequest) {
+    fn propose_segment_roll(&mut self, req: ProposeSegmentRoll) {
         let seal = &req.request;
         if self.pending_seals.contains(&seal.segment_key) {
             return;
@@ -520,7 +519,7 @@ impl MultiRaft {
 
         let Some(group_id) = self.find_group_for_topic(&seal.segment_key.topic_id) else {
             tracing::warn!(
-                "SealRequest for unknown topic {:?}",
+                "segment roll requested for unknown topic {:?}",
                 seal.segment_key.topic_id
             );
             return;
@@ -530,7 +529,10 @@ impl MultiRaft {
         };
 
         let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
-            tracing::warn!("SealRequest for unknown segment {:?}", seal.segment_key);
+            tracing::warn!(
+                "segment roll requested for unknown segment {:?}",
+                seal.segment_key
+            );
             return;
         };
 
@@ -559,7 +561,7 @@ impl MultiRaft {
                 self.dirty.insert(group_id);
             }
             Err(e) => {
-                tracing::debug!("SealRequest proposal rejected: {:?}", e);
+                tracing::debug!("segment roll proposal rejected: {:?}", e);
             }
         }
     }
@@ -805,7 +807,7 @@ impl MultiRaft {
             // that would otherwise prune is leader-gated and stops firing). A new
             // leader re-derives: re-proposes the seal / re-polls the survivors.
             if !raft.is_leader() {
-                // pending_seals: its SealResponse won't come from here.
+                // pending_seals: its committed roll notification won't come from here.
                 self.pending_seals.drop_group(*id);
                 // seal-end gathers: we can't propose their recovery roll.
                 self.seal_recovery.drop_group(*id);
@@ -832,7 +834,7 @@ impl MultiRaft {
             }
 
             if let RaftEvent::MetadataCommitted(committed) = &mut event {
-                // For leader to send a SealResponse back to the right client.
+                // For the leader to send the committed roll back to the requester.
                 committed.seal_context =
                     self.pending_seals.pop_seal_context(id, committed.log_index);
             }

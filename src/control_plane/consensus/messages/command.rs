@@ -3,7 +3,7 @@ use crate::control_plane::consensus::messages::rpc::{OutboundRaftPacket, RaftRpc
 use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::command::MetadataCommand;
-use crate::data_plane::messages::command::SealRequest;
+use crate::data_plane::messages::command::RequestSegmentRoll;
 use crate::impl_from_variant;
 
 pub struct InboundRaftRpc {
@@ -50,6 +50,6 @@ pub enum RaftTransportCommand {
 }
 
 #[derive(Debug)]
-pub struct CoordinatorSealRequest {
-    pub request: SealRequest,
+pub struct ProposeSegmentRoll {
+    pub request: RequestSegmentRoll,
 }
