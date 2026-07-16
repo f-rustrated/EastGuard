@@ -81,7 +81,7 @@ pub struct SegmentPlaced {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct AppendReplicaEntries {
+pub struct ReplicateSegmentEntries {
     pub segment_key: SegmentKey,
     pub replicas: Replicas,
     pub data: EntryPayload,
@@ -274,7 +274,7 @@ pub struct DeleteSegments {
 pub enum DataPlanePeerMessage {
     PlaceSegment(PlaceSegment),
     SegmentPlaced(SegmentPlaced),
-    AppendReplicaEntries(AppendReplicaEntries),
+    ReplicateSegmentEntries(ReplicateSegmentEntries),
     ReplicaEntriesAppended(ReplicaEntriesAppended),
     ReplicateConsumerOffset(ReplicateConsumerOffset),
     ConsumerOffsetReplicated(ConsumerOffsetReplicated),
@@ -300,7 +300,7 @@ impl_from_variant!(
     DataPlanePeerMessage,
     PlaceSegment,
     SegmentPlaced,
-    AppendReplicaEntries,
+    ReplicateSegmentEntries,
     ReplicaEntriesAppended,
     ReplicateConsumerOffset,
     ConsumerOffsetReplicated,

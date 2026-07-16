@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{AppendReplicaEntries, ProduceAck};
+use crate::data_plane::messages::command::{ProduceAck, ReplicateSegmentEntries};
 use crate::data_plane::states::segment::cache::CachedEntry;
 
 #[derive(Default)]
@@ -37,9 +37,9 @@ pub(crate) struct PendingReplicationBatch {
 }
 
 impl PendingReplicationBatch {
-    pub(crate) fn into_replica_append(self) -> (Vec<NodeId>, AppendReplicaEntries) {
+    pub(crate) fn into_replica_append(self) -> (Vec<NodeId>, ReplicateSegmentEntries) {
         let targets = self.followers;
-        let message = AppendReplicaEntries {
+        let message = ReplicateSegmentEntries {
             segment_key: self.segment_key,
             replicas: self.replica_set,
             data: self.entry.data.clone(),
