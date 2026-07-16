@@ -123,7 +123,7 @@ impl TopicMeta {
 
     /// Every active segment with its replica set and current start offset, for
     /// the leader's periodic assignment re-drive. Returns `(key, replica_set,
-    /// start_offset)` so a re-driven `AssignSegmentReplica` can recreate a segment
+    /// start_offset)` so a re-driven `PlaceSegment` can recreate a segment
     /// that missed its one-shot delivery with the correct starting offset.
     pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         if self.state != TopicState::Active {

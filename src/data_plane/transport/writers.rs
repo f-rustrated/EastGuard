@@ -69,7 +69,7 @@ impl TransportState {
         disconnect_tx: &mpsc::Sender<NodeId>,
     ) {
         for target in targets {
-            // Self-delivery: a node can be its own target (e.g. a AssignSegmentReplica
+            // Self-delivery: a node can be its own target (e.g. a PlaceSegment
             // to `replica_set[0]`
             if *target == self.node_id {
                 let _ = data_plane_tx.send(DataPlaneCommand::DataPlanePeerMessage(msg.clone()));

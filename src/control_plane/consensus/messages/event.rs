@@ -48,7 +48,7 @@ pub enum RaftEvent {
     DisconnectPeer(NodeId),
     MetadataCommitted(MetadataCommitted),
     /// Idempotent re-delivery of assignment messages each heartbeat, so a lost
-    /// fire-and-forget send self-heals: active-segment `AssignSegmentReplica`s and
+    /// fire-and-forget send self-heals: active-segment `PlaceSegment`s and
     /// sealed-segment `AssignSegmentCatchUp`s. The actor forwards them to the data
     /// transport.
     RedriveAssignments(Vec<DataTransportCommand>),

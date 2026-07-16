@@ -6,7 +6,7 @@ use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
-    DurableSegmentEndReported, SegmentCaughtUp, SegmentReplicaAssigned,
+    DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
 
 use super::command::{
@@ -55,9 +55,9 @@ pub enum MultiRaftActorCommand {
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data-plane request forwarded to the metadata coordinator for proposal.
     ProposeSegmentRoll(ProposeSegmentRoll),
-    /// Data-leader confirmation that it received a `AssignSegmentReplica`. Marks the
+    /// Data-leader confirmation that it received a `PlaceSegment`. Marks the
     /// segment confirmed so the leader's heartbeat sweep stops re-driving it.
-    AssignmentAck(SegmentReplicaAssigned),
+    AssignmentAck(SegmentPlaced),
     /// A survivor's reply to a leader-crash `RequestDurableSegmentEnd` — its durable extent
     /// for the segment, gathered to recover the committed seal end.
     DurableSegmentEndReported(DurableSegmentEndReported),

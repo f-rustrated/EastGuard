@@ -107,7 +107,7 @@ impl SegmentStore {
 
     /// Insert an active tracker AND its `active_by_range` index entry.
     /// Idempotent — if the key already exists the new tracker is dropped, so
-    /// callers can blindly retry a AssignSegmentReplica without checking first.
+    /// callers can blindly retry a PlaceSegment without checking first.
     /// The active index keys by `tracker.start_entry_id()` (invariant 2).
     ///
     /// Refuses to resurrect an already-sealed segment. A sealed segment is

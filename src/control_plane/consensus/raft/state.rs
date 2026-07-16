@@ -17,9 +17,7 @@ use crate::control_plane::metadata::{
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::messages::command::{
-    AssignSegmentReplica, SegmentCaughtUp, SegmentReplicaAssigned,
-};
+use crate::data_plane::messages::command::{PlaceSegment, SegmentCaughtUp, SegmentPlaced};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
@@ -128,9 +126,9 @@ pub struct Raft {
     election_epoch: u64,
     election_jitter: ElectionJitter,
     /// Segments whose data-leader has acked its
-    /// `AssignSegmentReplica`, mapped to the acking node. The heartbeat sweep skips
+    /// `PlaceSegment`, mapped to the acking node. The heartbeat sweep skips
     /// re-driving a segment whose confirmed node still matches `replica_set[0]`
-    confirmed_assignment: HashMap<SegmentKey, NodeId>,
+    confirmed_placement: HashMap<SegmentKey, NodeId>,
     /// In-flight sealed-segment repairs. Seeded at `ReassignSegment` apply; the
     /// heartbeat sweep re-drives until acked. Leader-volatile — cleared on step-down.
     catch_up: CatchUpRepairs,
@@ -189,7 +187,7 @@ impl Raft {
             election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
             election_epoch: 0,
-            confirmed_assignment: HashMap::new(),
+            confirmed_placement: HashMap::new(),
             catch_up: CatchUpRepairs::default(),
             ring_observation_streak: None,
         };
@@ -232,7 +230,7 @@ impl Raft {
 
     /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
     /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
-    /// turns these into `AssignSegmentReplica` re-drives for unconfirmed segments.
+    /// turns these into `PlaceSegment` re-drives for unconfirmed segments.
     pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
         self.state_machine.active_segment_assignments()
     }
@@ -1171,7 +1169,7 @@ impl Raft {
         self.current_leader = None;
         self.peer_states.clear();
         self.learner_states.clear();
-        self.confirmed_assignment.clear();
+        self.confirmed_placement.clear();
         self.catch_up.clear();
     }
 
@@ -1199,7 +1197,7 @@ impl Raft {
         // rederive Metadata <> Datanode segment assignment
         let active = self.active_segment_assignments();
         let active_keys: HashSet<SegmentKey> = active.iter().map(|(k, _, _)| *k).collect();
-        self.confirmed_assignment
+        self.confirmed_placement
             .retain(|k, _| active_keys.contains(k));
 
         let mut redrives = Vec::new();
@@ -1208,14 +1206,14 @@ impl Raft {
                 continue;
             };
 
-            // * If data leader acks assignment, it would have been added to confirmed_assignment through Raft::handle_assignment_ack
-            if self.confirmed_assignment.get(&segment_key) == Some(target) {
+            // * If data leader acks assignment, it would have been added to confirmed_placement through Raft::handle_segment_placed
+            if self.confirmed_placement.get(&segment_key) == Some(target) {
                 continue;
             }
 
             redrives.push(DataTransportCommand::send_to_targets(
                 vec![target.clone()],
-                AssignSegmentReplica {
+                PlaceSegment {
                     segment_key,
                     shard_group_id: self.shard_group_id,
                     replica_set,
@@ -1228,8 +1226,8 @@ impl Raft {
         }
     }
 
-    pub(crate) fn handle_assignment_ack(&mut self, ack: SegmentReplicaAssigned) {
-        self.confirmed_assignment.insert(ack.segment_key, ack.from);
+    pub(crate) fn handle_segment_placed(&mut self, ack: SegmentPlaced) {
+        self.confirmed_placement.insert(ack.segment_key, ack.from);
     }
 
     /// Re-drive the catch-up sweep — the sealed-segment analogue of

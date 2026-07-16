@@ -1533,7 +1533,7 @@ async fn metadata_leader(topic: &str, nodes: &[(&str, u16)]) -> Option<(ShardGro
 // ── produce/fetch e2e helpers ──────────────────────────────────────────────
 
 /// Wait until every node sees `expected` alive members. Topic creation emits the
-/// initial `AssignSegmentReplica` exactly once (fire-and-forget, no retry); if it's
+/// initial `PlaceSegment` exactly once (fire-and-forget, no retry); if it's
 /// sent before SWIM has converged, the data-leader's address isn't yet resolvable
 /// on the metadata leader and the assignment is dropped permanently. Gating
 /// creation on convergence keeps the produce path off that drop window.
@@ -1622,7 +1622,7 @@ async fn produce_until_acked<'a>(
     nodes: &'a [(&'a str, u16)],
 ) -> Option<(&'a str, u16)> {
     // Generous budget: the data plane, replication, and checkpoint run on real
-    // OS threads (outside turmoil's deterministic runtime), so AssignSegmentReplica
+    // OS threads (outside turmoil's deterministic runtime), so PlaceSegment
     // delivery + first commit can take a while on a slow interleaving.
     for _ in 0..80 {
         for &(host, port) in nodes {

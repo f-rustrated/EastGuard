@@ -15,7 +15,7 @@ use crate::control_plane::metadata::{
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentReplicaAssigned,
+    DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentPlaced,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -268,7 +268,7 @@ impl MultiRaft {
                 self.propose_segment_roll(cmd);
             }
             MultiRaftActorCommand::AssignmentAck(ack) => {
-                self.handle_assignment_ack(ack);
+                self.handle_segment_placed(ack);
             }
             MultiRaftActorCommand::DurableSegmentEndReported(report) => {
                 self.handle_seal_boundary_report(report);
@@ -427,11 +427,11 @@ impl MultiRaft {
         }
     }
 
-    fn handle_assignment_ack(&mut self, ack: SegmentReplicaAssigned) {
+    fn handle_segment_placed(&mut self, ack: SegmentPlaced) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;
         };
-        raft.handle_assignment_ack(ack);
+        raft.handle_segment_placed(ack);
     }
 
     fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
@@ -592,7 +592,7 @@ impl MultiRaft {
     }
 
     /// Route a catch-up confirmation to the owning group's `Raft`, which clears the
-    /// member and prunes the repair once all confirm. Mirrors `handle_assignment_ack`.
+    /// member and prunes the repair once all confirm. Mirrors `handle_segment_placed`.
     fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;

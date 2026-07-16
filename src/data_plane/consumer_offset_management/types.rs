@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetUpdate, OffsetRecord};
+use crate::data_plane::consumer_offset_management::ledger::{
+    ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
+};
 use crate::data_plane::messages::command::{
     CommitConsumerOffset, ConsumerOffsetCommitAck, ConsumerOffsetSnapshotInstalled,
 };
@@ -25,6 +27,20 @@ impl PendingOffsetMutation {
             record: record.into(),
             completion: completion.into(),
         }
+    }
+}
+
+impl From<ReplicateConsumerOffset> for PendingOffsetMutation {
+    fn from(cmd: ReplicateConsumerOffset) -> Self {
+        Self::new(OffsetRecord::OffsetCommit(cmd.update.clone()), cmd)
+    }
+}
+impl From<EpochSeal> for PendingOffsetMutation {
+    fn from(cmd: EpochSeal) -> Self {
+        PendingOffsetMutation::new(
+            OffsetRecord::EpochSeal(cmd.clone()),
+            OffsetMutationCompletion::EpochSeal,
+        )
     }
 }
 
@@ -67,5 +83,5 @@ pub(crate) struct OffsetPlacement {
     pub(crate) replicas: Replicas,
     pub(crate) ready_replicas: HashSet<NodeId>,
     pub(crate) bootstrap_acked: HashSet<NodeId>,
-    pub(crate) assignment_ack_sent: bool,
+    pub(crate) placement_ack_sent: bool,
 }

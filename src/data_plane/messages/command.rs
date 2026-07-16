@@ -66,7 +66,7 @@ pub enum ConsumerOffsetCommitAck {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct AssignSegmentReplica {
+pub struct PlaceSegment {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub replica_set: Replicas,
@@ -74,7 +74,7 @@ pub struct AssignSegmentReplica {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SegmentReplicaAssigned {
+pub struct SegmentPlaced {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub from: NodeId,
@@ -272,8 +272,8 @@ pub struct DeleteSegments {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum DataPlanePeerMessage {
-    AssignSegmentReplica(AssignSegmentReplica),
-    SegmentReplicaAssigned(SegmentReplicaAssigned),
+    PlaceSegment(PlaceSegment),
+    SegmentPlaced(SegmentPlaced),
     AppendReplicaEntries(AppendReplicaEntries),
     ReplicaEntriesAppended(ReplicaEntriesAppended),
     ReplicateConsumerOffset(ReplicateConsumerOffset),
@@ -298,8 +298,8 @@ pub enum DataPlanePeerMessage {
 
 impl_from_variant!(
     DataPlanePeerMessage,
-    AssignSegmentReplica,
-    SegmentReplicaAssigned,
+    PlaceSegment,
+    SegmentPlaced,
     AppendReplicaEntries,
     ReplicaEntriesAppended,
     ReplicateConsumerOffset,
