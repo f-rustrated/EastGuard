@@ -85,3 +85,41 @@ pub(crate) struct OffsetPlacement {
     pub(crate) bootstrap_acked: HashSet<NodeId>,
     pub(crate) placement_ack_sent: bool,
 }
+
+impl OffsetPlacement {
+    pub(crate) fn compare(
+        &self,
+        other_key: &SegmentKey,
+        other: &Replicas,
+    ) -> Option<FollowerPlacementObservation> {
+        if self.segment_key == *other_key {
+            if &self.replicas != other {
+                tracing::warn!(
+                    ?other_key,
+                    current_replicas = ?self.replicas,
+                    observed_replicas = ?other,
+                    "ignored conflicting replica set for an existing segment"
+                );
+            }
+
+            return Some(if &self.replicas == other {
+                // No need to place again - idempotency
+                FollowerPlacementObservation::Unchanged
+            } else {
+                FollowerPlacementObservation::Conflict
+            });
+        }
+        if self.segment_key.segment_id >= other_key.segment_id {
+            return Some(FollowerPlacementObservation::Stale);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FollowerPlacementObservation {
+    Accepted,
+    Unchanged,
+    Stale,
+    Conflict,
+}
