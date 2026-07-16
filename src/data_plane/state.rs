@@ -156,7 +156,7 @@ impl<W: WalStorage> DataPlane<W> {
                 self.handle_catch_up_read_complete(cmd);
             }
             DataPlaneCommand::OrphanGcCheck(check) => self.handle_orphan_gc_check(check),
-            DataPlaneCommand::CommitConsumerOffset(cmd) => self.handle_commit_consumer_offset(cmd),
+            DataPlaneCommand::CommitConsumerOffset(cmd) => self.commit_consumer_offset(cmd),
         }
 
         #[cfg(any(test, debug_assertions))]
@@ -563,7 +563,7 @@ impl<W: WalStorage> DataPlane<W> {
         for parked in parked_commits {
             match parked {
                 FutureOffsetCommit::Client(pending) => {
-                    self.handle_commit_consumer_offset(pending);
+                    self.commit_consumer_offset(pending);
                 }
                 FutureOffsetCommit::Replica(pending) => {
                     self.replicate_consumer_offset(pending);
@@ -954,10 +954,10 @@ impl<W: WalStorage> DataPlane<W> {
         self.check_pending_seal(cmd.segment_key);
     }
 
-    fn handle_commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
+    fn commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
         self.needs_flush |= self
             .consumer_offsets
-            .handle_consumer_offset_commit(cmd, &self.node_id);
+            .commit_consumer_offset(cmd, &self.node_id);
     }
 
     fn replicate_consumer_offset(&mut self, cmd: ReplicateConsumerOffset) {
