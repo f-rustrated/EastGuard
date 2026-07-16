@@ -1116,7 +1116,7 @@ impl<W: WalStorage> DataPlane<W> {
                 &cmd.replicas,
                 &self.node_id
             ),
-            FollowerPlacementObservation::Stale | FollowerPlacementObservation::Conflict
+            PlacementObservation::Stale | PlacementObservation::Conflict
         ) {
             return;
         };
