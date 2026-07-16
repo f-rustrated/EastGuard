@@ -1061,6 +1061,10 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn place_segment(&mut self, cmd: PlaceSegment) {
+        if !self.is_leader_of(&cmd.replica_set) {
+            return;
+        }
+
         for transport in self.consumer_offsets.install_leader_placement(
             cmd.segment_key,
             cmd.shard_group_id,
@@ -1141,6 +1145,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.needs_flush = true;
     }
 
+    // TODO refactor
     fn handle_segment_roll_committed(&mut self, cmd: SegmentRollCommitted) {
         self.pending_seal_requests.clear(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
@@ -1611,6 +1616,10 @@ impl<W: WalStorage> DataPlane<W> {
 
     fn is_follower_of(&self, replicas: &Replicas) -> bool {
         replicas.contains(&self.node_id) && replicas.leader() != Some(&self.node_id)
+    }
+
+    fn is_leader_of(&self, replicas: &Replicas) -> bool {
+        replicas.contains(&self.node_id) && replicas.leader() == Some(&self.node_id)
     }
 }
 
@@ -2425,7 +2434,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![NodeId::new("test")]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
@@ -2441,7 +2450,7 @@ mod tests {
     fn volume_trigger_flushes_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![NodeId::new("test")]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2459,7 +2468,7 @@ mod tests {
     fn volume_trigger_flush_leaves_stale_timer_harmless() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![NodeId::new("test")]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2480,7 +2489,7 @@ mod tests {
     fn cache_pressure_checkpoint_disabled_when_budget_zero() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![NodeId::new("test")]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2505,10 +2514,10 @@ mod tests {
 
         let small = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
         let large = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
-        let replica_set = vec![NodeId::new("1")];
-        let replica_set2 = vec![NodeId::new("3")];
-        dp.handle_command(assign_segment(small, replica_set));
-        dp.handle_command(assign_segment(large, replica_set2));
+        let replica_set = vec![NodeId::new(dp.node_id.to_string())];
+
+        dp.handle_command(assign_segment(small, replica_set.clone()));
+        dp.handle_command(assign_segment(large, replica_set));
 
         dp.handle_command(Produce {
             segment_key: small,
@@ -2565,7 +2574,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.config.hot_cache_budget_bytes = 10;
         dp.config.hot_cache_pressure_watermark = 0.5;
-        dp.handle_command(assign_segment(test_key(), vec![NodeId::new("test")]));
+        dp.handle_command(assign_segment(
+            test_key(),
+            vec![NodeId::new(dp.node_id.to_string())],
+        ));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
