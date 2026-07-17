@@ -2,9 +2,10 @@
 Ownership boundaries for one Raft group's state.
 
 [`LogState`] owns the in-memory Raft logs and its persistence bookkeeping:
-[`current_term`], [`voted_for`], the in-memory [`LogState::log`],
+[`current_term`], [`voted_for`], the in-memory [`LogState::entries`],
 and the local durability watermark [`stabled_index`].
 Its [`last_index`] is derived from the final in-memory Raft log entry; it is not a data-plane WAL position.
+
 
 [`TransientState`] owns knowledge that may be reconstructed after restart:
 the current role, leader identity, replication progress, and [`commit_index`].
@@ -31,7 +32,8 @@ boundaries describe the control-plane Raft metadata log.
 [`LogState`]: self::log_state::LogState
 [`current_term`]: self::log_state::LogState::current_term
 [`voted_for`]: self::log_state::LogState::voted_for
-[`LogState::log`]: self::log_state::LogState::log
+[`LogState::entries`]: self::log_state::LogState::entries
+[`LogState::unflushed_mutations`]: self::log_state::LogState::unflushed_mutations
 [`stabled_index`]: self::log_state::LogState::stabled_index
 [`last_index`]: self::log_state::LogState::last_index
 [`TransientState`]: self::transient_state::TransientState
