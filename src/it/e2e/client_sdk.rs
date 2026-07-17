@@ -21,6 +21,7 @@ use crate::config::Environment;
 use crate::connections::protocol::ClientResponse;
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
 use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
@@ -301,6 +302,61 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
             client.cached_write_leader("stale", b"k"),
             Some(real),
             "re-resolved back to the real write leader"
+        );
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Consumer-offset reads use the same redirect correction as produce and evict a
+/// stale topic route after following the current leader's hint.
+#[test]
+#[serial_test::serial]
+fn consumer_offset_read_corrects_stale_write_leader() -> turmoil::Result {
+    let mut sim = build_sim(90);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Client::connect(client_seeds()).expect("client connects");
+        client
+            .create_topic("stale-offset", policy())
+            .await
+            .expect("create");
+        let detail = client
+            .resolve_topic("stale-offset")
+            .await
+            .expect("describe seeds the routing cache");
+        let range_id = detail.ranges[0].range_id;
+        let real = client
+            .cached_write_leader("stale-offset", b"k")
+            .expect("write leader cached after describe");
+        let wrong_addr = client_seeds()
+            .into_iter()
+            .find(|addr| *addr != real.client_addr())
+            .expect("another node");
+        let wrong = NodeAddressInfo::new(
+            NodeId::new("wrong"),
+            NodeAddress::test(wrong_addr, wrong_addr),
+        );
+        client.poison_cache("stale-offset", wrong);
+
+        let offsets = client
+            .fetch_consumer_offsets(
+                "stale-offset",
+                vec![ConsumerOffsetKey {
+                    topic_id: detail.topic_id,
+                    range_id,
+                    group_id: "group".to_string(),
+                }]
+                .into_boxed_slice(),
+            )
+            .await
+            .expect("offset read follows the leader redirect");
+        assert!(offsets.is_empty(), "the group has no committed offset");
+        assert!(
+            client.cached_write_leader("stale-offset", b"k").is_none(),
+            "redirect invalidates the stale topic route"
         );
         Ok(())
     });
