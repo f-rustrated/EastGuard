@@ -5,7 +5,7 @@ use crate::control_plane::consensus::messages::{
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
-use crate::control_plane::consensus::raft::states::transient_state::LeaderlessSegments;
+use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::consensus::seal_recovery::{SealEndRecovery, SealEndStep};

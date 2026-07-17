@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::raft::states::transient_state::LeaderlessSegments;
+use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;

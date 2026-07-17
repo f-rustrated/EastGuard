@@ -1,3 +1,4 @@
+use crate::control_plane::metadata::SegmentMeta;
 use crate::control_plane::metadata::command::*;
 use crate::control_plane::metadata::event::*;
 
@@ -41,6 +42,12 @@ impl MetadataState {
         self.topic_name_index
             .get(name)
             .and_then(|id| self.topics.get(id))
+    }
+
+    pub(crate) fn get_segment(&self, key: &SegmentKey) -> Option<&SegmentMeta> {
+        let topic = self.get_topic(&key.topic_id)?;
+        let range = topic.ranges.get(&key.range_id)?;
+        range.segments.get(&key.segment_id)
     }
 
     pub(crate) fn get_consumer_group_assignment(
