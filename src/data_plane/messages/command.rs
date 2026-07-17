@@ -1,5 +1,5 @@
 use crate::control_plane::Replicas;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetSnapshot;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
@@ -119,10 +119,10 @@ pub struct ConsumerOffsetReplicated {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct InstallConsumerOffsetSnapshot {
+pub struct ConsumerOffsetSnapshot {
     pub segment_key: SegmentKey,
     pub replica_set: Replicas,
-    pub entries: Box<[ConsumerOffsetSnapshot]>,
+    pub entries: Box<[ConsumerOffsetEntry]>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -284,7 +284,7 @@ pub enum DataPlanePeerMessage {
     ReplicaEntriesAppended(ReplicaEntriesAppended),
     ReplicateConsumerOffset(ReplicateConsumerOffset),
     ConsumerOffsetReplicated(ConsumerOffsetReplicated),
-    InstallConsumerOffsetSnapshot(InstallConsumerOffsetSnapshot),
+    InstallConsumerOffsetSnapshot(ConsumerOffsetSnapshot),
     RequestConsumerOffsetSnapshot(RequestConsumerOffsetSnapshot),
     ConsumerOffsetSnapshotInstalled(ConsumerOffsetSnapshotInstalled),
     AdvanceReplicaCommit(AdvanceReplicaCommit),
@@ -310,7 +310,7 @@ impl_from_variant!(
     ReplicaEntriesAppended,
     ReplicateConsumerOffset,
     ConsumerOffsetReplicated,
-    InstallConsumerOffsetSnapshot,
+    InstallConsumerOffsetSnapshot(ConsumerOffsetSnapshot),
     RequestConsumerOffsetSnapshot,
     ConsumerOffsetSnapshotInstalled,
     AdvanceReplicaCommit,

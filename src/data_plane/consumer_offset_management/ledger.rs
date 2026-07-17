@@ -63,7 +63,7 @@ pub struct ConsumerOffsetUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct ConsumerOffsetSnapshot {
+pub struct ConsumerOffsetEntry {
     pub key: ConsumerOffsetKey,
     pub generation: GenerationId,
     pub position: Option<ConsumerOffsetPosition>,
@@ -73,7 +73,7 @@ pub struct ConsumerOffsetSnapshot {
 pub(crate) enum OffsetRecord {
     EpochSeal(EpochSeal),
     OffsetCommit(ConsumerOffsetUpdate),
-    BootstrapEntry(ConsumerOffsetSnapshot),
+    BootstrapEntry(ConsumerOffsetEntry),
     PlacementInstalled(SegmentKey),
 }
 
@@ -190,11 +190,11 @@ impl OffsetLedger {
         &self,
         topic_id: TopicId,
         range_id: RangeId,
-    ) -> Box<[ConsumerOffsetSnapshot]> {
+    ) -> Box<[ConsumerOffsetEntry]> {
         self.epochs
             .iter()
             .filter(|(key, _)| key.topic_id == topic_id && key.range_id == range_id)
-            .map(|(key, generation)| ConsumerOffsetSnapshot {
+            .map(|(key, generation)| ConsumerOffsetEntry {
                 key: key.clone(),
                 generation: *generation,
                 position: self.offsets.get(key).copied(),

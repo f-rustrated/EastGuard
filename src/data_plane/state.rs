@@ -1015,11 +1015,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.ack_ready_offset_placements();
     }
 
-    fn install_consumer_offset_snapshot(
-        &mut self,
-        from: &NodeId,
-        cmd: InstallConsumerOffsetSnapshot,
-    ) {
+    fn install_consumer_offset_snapshot(&mut self, from: &NodeId, cmd: ConsumerOffsetSnapshot) {
         if !cmd.replica_set.contains(&self.node_id) || !cmd.replica_set.contains(from) {
             return;
         }
@@ -2103,11 +2099,11 @@ mod tests {
         };
 
         dp.process_peer(DataPlanePeerMessage::InstallConsumerOffsetSnapshot(
-            InstallConsumerOffsetSnapshot {
+            ConsumerOffsetSnapshot {
                 segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
                 entries: vec![
-                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetSnapshot {
+                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
                         key: consumer_offset_key(),
                         generation: 3.into(),
                         position: Some(position),
@@ -2169,11 +2165,11 @@ mod tests {
         )));
 
         dp.process_peer(DataPlanePeerMessage::InstallConsumerOffsetSnapshot(
-            InstallConsumerOffsetSnapshot {
+            ConsumerOffsetSnapshot {
                 segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
                 entries: vec![
-                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetSnapshot {
+                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
                         key: consumer_offset_key(),
                         generation: 2.into(),
                         position: None,
