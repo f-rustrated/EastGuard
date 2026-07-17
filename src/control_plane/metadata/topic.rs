@@ -336,7 +336,7 @@ impl TopicMeta {
             .collect()
     }
 
-    pub(crate) fn find_mergeable_pair(&self, now: u64) -> Option<MetadataCommand> {
+    pub(crate) fn find_mergeable_range_pair(&self, now: u64) -> Option<MetadataCommand> {
         if !self.is_merge_eligible() {
             return None;
         }
