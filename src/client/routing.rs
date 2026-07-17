@@ -174,7 +174,13 @@ impl RoutingCache {
                     range_id: r.range_id,
                     keyspace_start: r.keyspace_start.clone(),
                     write_leader: r.write_leader.as_ref().map(|_| wrong.clone()),
-                    replica_addrs: r.replica_addrs.clone(),
+                    replica_addrs: if r.replica_addrs.is_empty() {
+                        Box::new([])
+                    } else {
+                        std::iter::once(wrong.clone())
+                            .chain(r.replica_addrs.iter().skip(1).cloned())
+                            .collect()
+                    },
                 })
                 .collect();
 

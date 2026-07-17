@@ -186,6 +186,9 @@ impl Client {
         let request_generation = req.generation;
 
         let served = self.call(leader.client_addr(), req).await?;
+        if served.redirected {
+            self.cache.invalidate(topic_name);
+        }
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffsetCommitted) => Ok(()),
             ClientResponse::DataPlane(DataPlaneResponse::StaleConsumerGroupEpoch(stale)) => {
@@ -215,6 +218,9 @@ impl Client {
                 let served = self
                     .call(leader.client_addr(), FetchConsumerOffsetRequest(offset))
                     .await?;
+                if served.redirected {
+                    self.cache.invalidate(topic_name);
+                }
                 match served.response {
                     ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffset(position)) => {
                         Ok(position.map(|p| (range_id, p)))
@@ -336,14 +342,19 @@ impl Client {
         };
 
         let served = self.call(start, request).await?;
-        // A redirect -> the cached leader was stale; drop it so the next produce re-describes.
-        if served.redirected {
+        // A redirect or stale range means the cached route is stale; drop it so
+        // the next produce re-describes.
+        if served.redirected
+            || matches!(
+                &served.response,
+                ClientResponse::DataPlane(DataPlaneResponse::StaleRange)
+            )
+        {
             self.cache.invalidate(topic);
         }
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
             ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
-                self.cache.invalidate(topic);
                 Err(ClientError::StaleRange)
             }
             _ => Err(ClientError::UnexpectedResponse),
