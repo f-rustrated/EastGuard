@@ -520,7 +520,7 @@ impl Raft {
     /// `DeleteSegments`. Topics with no retention policy contribute nothing.
     fn reconcile_retention_deletes(&mut self) -> bool {
         let now = now_ms();
-        let targets = self.m_stat.expired_segment_prefixes(now);
+        let targets = self.m_stat.expipred_segments(now);
 
         let mut changed = false;
         for (topic_id, range_id, segment_ids) in targets {
