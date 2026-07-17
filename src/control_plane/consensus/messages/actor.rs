@@ -5,10 +5,12 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
-use crate::data_plane::messages::command::{CatchUpAck, SealBoundaryReport, SegmentAssignmentAck};
+use crate::data_plane::messages::command::{
+    DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
+};
 
 use super::command::{
-    CoordinatorSealRequest, EnsureGroup, InboundRaftRpc, MetadataProposal, RaftProtocolMessage,
+    EnsureGroup, InboundRaftRpc, MetadataProposal, ProposeSegmentRoll, RaftProtocolMessage,
     RemoveGroup,
 };
 use super::timer::RaftTimeoutCallback;
@@ -51,18 +53,18 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
-    /// Data plane SealRequest forwarded to coordinator for Raft proposal.
-    Coordinator(CoordinatorSealRequest),
-    /// Data-leader confirmation that it received a `SegmentAssignment`. Marks the
+    /// Data-plane request forwarded to the metadata coordinator for proposal.
+    ProposeSegmentRoll(ProposeSegmentRoll),
+    /// Data-leader confirmation that it received a `PlaceSegment`. Marks the
     /// segment confirmed so the leader's heartbeat sweep stops re-driving it.
-    AssignmentAck(SegmentAssignmentAck),
-    /// A survivor's reply to a leader-crash `SealBoundaryQuery` — its durable extent
+    AssignmentAck(SegmentPlaced),
+    /// A survivor's reply to a leader-crash `RequestDurableSegmentEnd` — its durable extent
     /// for the segment, gathered to recover the committed seal end.
-    SealBoundaryReport(SealBoundaryReport),
+    DurableSegmentEndReported(DurableSegmentEndReported),
     /// A replica's confirmation that it holds a reassigned sealed segment through
     /// `sealed_end`. Clears the member from the coordinator's catch-up re-drive so
     /// the heartbeat sweep stops re-announcing the assignment.
-    CatchUpAck(CatchUpAck),
+    SegmentCaughtUp(SegmentCaughtUp),
 }
 
 pub struct GetConsumerGroupAssignment {

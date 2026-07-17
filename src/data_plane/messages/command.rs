@@ -1,7 +1,9 @@
+use crate::control_plane::Replicas;
+use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
 use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
-use crate::data_plane::consumer_offset_management::types::ReplicaOffsetCommit;
+use crate::data_plane::consumer_offset_management::types::ReplicateConsumerOffset;
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -22,12 +24,18 @@ pub enum DataPlaneCommand {
     SegmentCheckpointComplete(SegmentCheckpointComplete),
     OffsetCheckpointComplete(OffsetCheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
-    DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
+    ReceivePeerMessage(ReceivePeerMessage),
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
-    /// source read. The worker turns it into `CatchUpChunk`s on the transport.
+    /// source read. The worker turns it into `CatchUpEntries`s on the transport.
     CatchUpReadComplete(CatchUpReadComplete),
     OrphanGcCheck(OrphanGcCheck),
     CommitConsumerOffset(CommitConsumerOffset),
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ReceivePeerMessage {
+    pub from: NodeId,
+    pub message: Box<DataPlanePeerMessage>,
 }
 
 /// What the orphan-GC handler replies to the ticker: keep ticking while strays remain, or
@@ -64,60 +72,81 @@ pub enum ConsumerOffsetCommitAck {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SegmentAssignment {
+pub struct PlaceSegment {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
     pub start_entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SegmentAssignmentAck {
+pub struct SegmentPlaced {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub from: NodeId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaAppend {
+pub struct ReplicateSegmentEntries {
     pub segment_key: SegmentKey,
-    pub replica_set: Vec<NodeId>,
+    pub replicas: Replicas,
     pub data: EntryPayload,
     pub record_count: u32,
     pub entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaAck {
+pub struct ReplicaEntriesAppended {
     pub segment_key: SegmentKey,
     pub entry_id: EntryId,
     pub from: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum ReplicaOffsetAckResult {
+pub enum ConsumerOffsetReplicationResult {
     Committed,
     StaleEpoch(StaleEpoch),
 }
 
-// impl_from_variant!(ReplicaOffsetAckResult, StaleEpoch);
+// impl_from_variant!(ConsumerOffsetReplicationResult, StaleEpoch);
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaOffsetAck {
+pub struct ConsumerOffsetReplicated {
     pub seq: u64,
     pub update: ConsumerOffsetUpdate,
     pub from: NodeId,
-    pub result: ReplicaOffsetAckResult,
+    pub result: ConsumerOffsetReplicationResult,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CommitAdvance {
+pub struct ConsumerOffsetSnapshot {
+    pub segment_key: SegmentKey,
+    pub replica_set: Replicas,
+    pub entries: Box<[ConsumerOffsetEntry]>,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct RequestConsumerOffsetSnapshot {
+    pub segment_key: SegmentKey,
+    pub replicas: Replicas,
+    pub requester: NodeId,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct ConsumerOffsetSnapshotInstalled {
+    pub segment_key: SegmentKey,
+    pub from: NodeId,
+    pub leader: NodeId,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct AdvanceReplicaCommit {
     pub segment_key: SegmentKey,
     pub committed_entry_id: EntryId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealRequest {
+pub struct RequestSegmentRoll {
     pub from: NodeId,
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
@@ -125,10 +154,10 @@ pub struct SealRequest {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealResponse {
+pub struct SegmentRollCommitted {
     pub old_segment_key: SegmentKey,
     pub new_segment_id: SegmentId,
-    pub new_replica_set: Vec<NodeId>,
+    pub new_replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -140,31 +169,31 @@ pub struct SegmentSealed {
 // Catch-up: re-replicate a sealed segment to a newly assigned replica.
 //
 // A node assigned a sealed segment it doesn't fully hold fetches the missing
-// suffix from a healthy peer. Messages on the `DataPlaneInterNodeCommand` wire:
+// suffix from a healthy peer. Messages on the `DataPlanePeerMessage` wire:
 //
-//   coordinator ─CatchUpAssignment─▶ each replica  "own `key` [start, sealed_end]"
-//   replacement ─CatchUpRequest────▶ a peer         "I have through `local_end`; send the rest"
-//   source      ─CatchUpChunk(s)───▶ replacement   batches of entries
-//   source      ─CatchUpStreamEnd──▶ replacement   end of stream
-//   replacement ─CatchUpAck────────▶ coordinator   "have it through `sealed_end`"
+//   coordinator ─AssignSegmentCatchUp───▶ each replica  "own `key` [start, sealed_end]"
+//   replacement ─RequestCatchUpEntries──▶ source replica "send after `local_end`"
+//   source      ─CatchUpEntries─────────▶ replacement    batches of entries
+//   source      ─CatchUpEntriesSent─────▶ replacement    end of stream
+//   replacement ─SegmentCaughtUp────────▶ coordinator    "have it through `sealed_end`"
 //
-// `CatchUpAssignment`/`CatchUpAck` are the coordinator↔replica pair; the rest is
+// `AssignSegmentCatchUp`/`SegmentCaughtUp` are the coordinator↔replica pair; the rest is
 // the replacement↔source transfer. The ack lets the coordinator stop re-driving.
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CatchUpAssignment {
+pub struct AssignSegmentCatchUp {
     pub segment_key: SegmentKey,
-    /// Echoed into the `CatchUpAck` so the reply reaches this group's coordinator.
+    /// Echoed into the `SegmentCaughtUp` so the reply reaches this group's coordinator.
     pub shard_group_id: ShardGroupId,
     pub start_entry_id: EntryId,
     pub sealed_end_entry_id: EntryId,
-    pub replica_set: Vec<NodeId>,
+    pub replica_set: Replicas,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CatchUpRequest {
+pub struct RequestCatchUpEntries {
     pub segment_key: SegmentKey,
-    /// The requesting node — the source streams its `CatchUpChunk`s back here.
+    /// The requesting node — the source streams `CatchUpEntries` back here.
     pub from: NodeId,
     /// Highest entry id the requester already holds locally; the source streams
     /// `(local_end, sealed_end]`. `None` means nothing is held.
@@ -172,7 +201,7 @@ pub struct CatchUpRequest {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CatchUpChunk {
+pub struct CatchUpEntries {
     pub segment_key: SegmentKey,
     /// Contiguous entries in ascending `entry_id` order.
     pub entries: Box<[CatchUpEntry]>,
@@ -195,7 +224,7 @@ impl CatchUpEntry {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CatchUpStreamEnd {
+pub struct CatchUpEntriesSent {
     pub segment_key: SegmentKey,
 }
 
@@ -203,7 +232,7 @@ pub struct CatchUpStreamEnd {
 /// coordinator stop re-driving. Sent after a transfer verifies, and on a
 /// zero-transfer full match so a re-drive re-confirms.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct CatchUpAck {
+pub struct SegmentCaughtUp {
     pub segment_key: SegmentKey,
     pub shard_group_id: ShardGroupId,
     pub from: NodeId,
@@ -215,22 +244,22 @@ pub struct CatchUpAck {
 // committed end (the leader was the one tracking it). The coordinator gathers
 // each survivor's durable (fsync'd) extent and seals at their `min` — the
 // highest offset present on every survivor, hence committed (commit requires
-// all-replica ack). Two messages on the `DataPlaneInterNodeCommand` wire:
+// all-replica ack). Two messages on the `DataPlanePeerMessage` wire:
 //
-//   coordinator ─SealBoundaryQuery──▶ each survivor  "what's your durable extent for `key`?"
-//   survivor    ─SealBoundaryReport─▶ coordinator    durable end (or `None` if it holds nothing)
+//   coordinator ─RequestDurableSegmentEnd──▶ each survivor  "what's your durable extent for `key`?"
+//   survivor    ─DurableSegmentEndReported─▶ coordinator    durable end (or `None` if it holds nothing)
 //
 // The originating coordinator rides the query so every report returns to the
 // same gather even while shard-leader caches disagree during an election.
 // See `docs/data-plane/leader_crash_seal_boundary.md`.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealBoundaryQuery {
+pub struct RequestDurableSegmentEnd {
     pub segment_key: SegmentKey,
     pub coordinator: NodeId,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SealBoundaryReport {
+pub struct DurableSegmentEndReported {
     pub segment_key: SegmentKey,
     pub from: NodeId,
     pub durable_end: Option<EntryId>,
@@ -248,49 +277,55 @@ pub struct DeleteSegments {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub enum DataPlaneInterNodeCommand {
-    SegmentAssignment(SegmentAssignment),
-    SegmentAssignmentAck(SegmentAssignmentAck),
-    ReplicaAppend(ReplicaAppend),
-    ReplicaAck(ReplicaAck),
-    ReplicaOffsetCommit(ReplicaOffsetCommit),
-    ReplicaOffsetAck(ReplicaOffsetAck),
-    CommitAdvance(CommitAdvance),
-    SealRequest(SealRequest),
-    SealResponse(SealResponse),
+pub enum DataPlanePeerMessage {
+    PlaceSegment(PlaceSegment),
+    SegmentPlaced(SegmentPlaced),
+    ReplicateSegmentEntries(ReplicateSegmentEntries),
+    ReplicaEntriesAppended(ReplicaEntriesAppended),
+    ReplicateConsumerOffset(ReplicateConsumerOffset),
+    ConsumerOffsetReplicated(ConsumerOffsetReplicated),
+    InstallConsumerOffsetSnapshot(ConsumerOffsetSnapshot),
+    RequestConsumerOffsetSnapshot(RequestConsumerOffsetSnapshot),
+    ConsumerOffsetSnapshotInstalled(ConsumerOffsetSnapshotInstalled),
+    AdvanceReplicaCommit(AdvanceReplicaCommit),
+    RequestSegmentRoll(RequestSegmentRoll),
+    SegmentRollCommitted(SegmentRollCommitted),
     SegmentSealed(SegmentSealed),
-    CatchUpAssignment(CatchUpAssignment),
-    CatchUpRequest(CatchUpRequest),
-    CatchUpChunk(CatchUpChunk),
-    CatchUpStreamEnd(CatchUpStreamEnd),
-    CatchUpAck(CatchUpAck),
-    SealBoundaryQuery(SealBoundaryQuery),
-    SealBoundaryReport(SealBoundaryReport),
+    AssignSegmentCatchUp(AssignSegmentCatchUp),
+    RequestCatchUpEntries(RequestCatchUpEntries),
+    CatchUpEntries(CatchUpEntries),
+    CatchUpEntriesSent(CatchUpEntriesSent),
+    SegmentCaughtUp(SegmentCaughtUp),
+    RequestDurableSegmentEnd(RequestDurableSegmentEnd),
+    DurableSegmentEndReported(DurableSegmentEndReported),
     DeleteSegments(DeleteSegments),
-    ConsumerGroupEpochSeal(EpochSeal),
+    ConsumerGroupEpochSealed(EpochSeal),
 }
 
 impl_from_variant!(
-    DataPlaneInterNodeCommand,
-    SegmentAssignment,
-    SegmentAssignmentAck,
-    ReplicaAppend,
-    ReplicaAck,
-    ReplicaOffsetCommit,
-    ReplicaOffsetAck,
-    CommitAdvance,
-    SealRequest,
-    SealResponse,
+    DataPlanePeerMessage,
+    PlaceSegment,
+    SegmentPlaced,
+    ReplicateSegmentEntries,
+    ReplicaEntriesAppended,
+    ReplicateConsumerOffset,
+    ConsumerOffsetReplicated,
+    InstallConsumerOffsetSnapshot(ConsumerOffsetSnapshot),
+    RequestConsumerOffsetSnapshot,
+    ConsumerOffsetSnapshotInstalled,
+    AdvanceReplicaCommit,
+    RequestSegmentRoll,
+    SegmentRollCommitted,
     SegmentSealed,
-    CatchUpAssignment,
-    CatchUpRequest,
-    CatchUpChunk,
-    CatchUpStreamEnd,
-    CatchUpAck,
-    SealBoundaryQuery,
-    SealBoundaryReport,
+    AssignSegmentCatchUp,
+    RequestCatchUpEntries,
+    CatchUpEntries,
+    CatchUpEntriesSent,
+    SegmentCaughtUp,
+    RequestDurableSegmentEnd,
+    DurableSegmentEndReported,
     DeleteSegments,
-    ConsumerGroupEpochSeal(EpochSeal),
+    ConsumerGroupEpochSealed(EpochSeal),
 );
 
 #[derive(Debug)]
@@ -334,7 +369,7 @@ impl_from_variant!(
     OrphanGcCheck,
     CommitConsumerOffset,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
-    DataPlaneInterNodeCommand(DataPlaneInterNodeCommand),
+    ReceivePeerMessage,
 );
 
 use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};

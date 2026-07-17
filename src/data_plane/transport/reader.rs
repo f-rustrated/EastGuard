@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
+use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
 use crate::net::OwnedReadHalf;
 
 const NODE_ID_FRAME_MAX: usize = 1024;
@@ -32,12 +32,17 @@ impl DataReader {
         disconnect_tx: mpsc::Sender<NodeId>,
     ) {
         loop {
-            match self
-                .read_frame::<DataPlaneInterNodeCommand>(DATA_FRAME_MAX)
-                .await
-            {
-                Ok(msg) => {
-                    let _ = data_plane_tx.send(DataPlaneCommand::DataPlaneInterNodeCommand(msg));
+            match self.read_frame::<ReceivePeerMessage>(DATA_FRAME_MAX).await {
+                Ok(message) => {
+                    if message.from != peer {
+                        tracing::warn!(
+                            transport_peer = ?peer,
+                            claimed_sender = ?message.from,
+                            "rejected peer message whose sender differs from the connection peer"
+                        );
+                        return;
+                    }
+                    let _ = data_plane_tx.send(DataPlaneCommand::ReceivePeerMessage(message));
                 }
                 Err(e) => {
                     tracing::debug!("DataReader connection closed: {e}");

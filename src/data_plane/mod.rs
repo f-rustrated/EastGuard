@@ -48,6 +48,10 @@ impl SegmentKey {
         }
     }
 
+    pub(crate) fn placement_key(&self) -> (TopicId, RangeId) {
+        (self.topic_id, self.range_id)
+    }
+
     /// Path to this segment's file. The filename encodes the segment's
     /// `start_entry` (its first entry id) so the file is self-describing for
     /// crash recovery — discovery derives the base entry id from the name

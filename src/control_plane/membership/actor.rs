@@ -226,10 +226,10 @@ impl SwimSender {
         let Some(group) = self.resolve_shard_group(key).await? else {
             return Ok(ShardRouting::Redirect(None));
         };
-        if group.members.contains(node_id) {
+        if group.replicas.contains(node_id) {
             return Ok(ShardRouting::Local(group));
         }
-        let member = self.resolve_any(&group.members).await?;
+        let member = self.resolve_any(&group.replicas).await?;
         Ok(ShardRouting::Redirect(member))
     }
 

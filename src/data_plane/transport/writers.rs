@@ -8,7 +8,9 @@ use tokio::time::Instant;
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{DataPlaneCommand, DataPlaneInterNodeCommand};
+use crate::data_plane::messages::command::{
+    DataPlaneCommand, DataPlanePeerMessage, ReceivePeerMessage,
+};
 use crate::net::{OwnedWriteHalf, TcpStream};
 
 use super::reader::DataReader;
@@ -63,17 +65,20 @@ impl TransportState {
     pub async fn send(
         &mut self,
         targets: &[NodeId],
-        msg: &DataPlaneInterNodeCommand,
+        msg: &DataPlanePeerMessage,
         swim_tx: &SwimSender,
         data_plane_tx: &DataPlaneSender,
         disconnect_tx: &mpsc::Sender<NodeId>,
     ) {
         for target in targets {
-            // Self-delivery: a node can be its own target (e.g. a SegmentAssignment
+            // Self-delivery: a node can be its own target (e.g. a PlaceSegment
             // to `replica_set[0]`
             if *target == self.node_id {
                 let _ =
-                    data_plane_tx.send(DataPlaneCommand::DataPlaneInterNodeCommand(msg.clone()));
+                    data_plane_tx.send(DataPlaneCommand::ReceivePeerMessage(ReceivePeerMessage {
+                        from: self.node_id.clone(),
+                        message: Box::new(msg.clone()),
+                    }));
                 continue;
             }
 
@@ -117,7 +122,7 @@ impl TransportState {
     async fn connect_and_send(
         &mut self,
         target_id: NodeId,
-        msg: &DataPlaneInterNodeCommand,
+        msg: &DataPlanePeerMessage,
         swim_tx: &SwimSender,
     ) -> anyhow::Result<DataReader> {
         let node_addr = swim_tx
@@ -174,13 +179,16 @@ impl TransportState {
     async fn write_message(
         &mut self,
         target: &NodeId,
-        msg: &DataPlaneInterNodeCommand,
+        msg: &DataPlanePeerMessage,
     ) -> anyhow::Result<()> {
         let writer = self
             .writers
             .get_mut(target)
             .context("no writer for target")?;
-        let bytes = borsh::to_vec(msg)?;
+        let bytes = borsh::to_vec(&ReceivePeerMessage {
+            from: self.node_id.clone(),
+            message: Box::new(msg.clone()),
+        })?;
         let len = bytes.len() as u32;
         let mut buf = Vec::with_capacity(4 + bytes.len());
         buf.extend_from_slice(&len.to_be_bytes());

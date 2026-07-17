@@ -553,7 +553,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         }
 
         // The segment ages past `max_segment_age_secs`; the leader enqueues a
-        // SealRequest, the coordinator commits a RollSegment, and the active
+        // RequestSegmentRoll, the coordinator commits a RollSegment, and the active
         // segment rolls. Poll DescribeTopic until the successor's start_offset
         // advances past 0 (the known-end seal landed).
         let mut rolled_start = None;
@@ -585,7 +585,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
 /// End-to-end sealed-segment repair. Produce + age-seal a segment, kill one of its
 /// replicas, and confirm the coordinator reassigns the segment to the spare node,
 /// which catches up and serves the old data on a cold fetch. Exercises the whole
-/// loop: SWIM death → reconcile → `ReassignSegment` → `CatchUpAssignment` →
+/// loop: SWIM death → reconcile → `ReassignSegment` → `AssignSegmentCatchUp` →
 /// catch-up → cold-serve, across the control/data-plane seam.
 #[test]
 #[serial_test::serial]
@@ -1137,7 +1137,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
 /// End-to-end catch-up redrive under message loss. Seal a segment, then **partition
 /// the spare from the coordinator** before killing one of the segment's replicas (a
 /// *non-coordinator* one, so the coordinator survives to drive the repair). With the
-/// link down, the coordinator's `CatchUpAssignment` to the spare — and every heartbeat
+/// link down, the coordinator's `AssignSegmentCatchUp` to the spare — and every heartbeat
 /// redrive of it — are dropped. After a window we heal the link; the next redrive
 /// delivers, the spare pulls the segment from a surviving source (never partitioned),
 /// and serves the old data. Guards the redrive hardening (`raft-actor.md` #9): a lost
@@ -1533,7 +1533,7 @@ async fn metadata_leader(topic: &str, nodes: &[(&str, u16)]) -> Option<(ShardGro
 // ── produce/fetch e2e helpers ──────────────────────────────────────────────
 
 /// Wait until every node sees `expected` alive members. Topic creation emits the
-/// initial `SegmentAssignment` exactly once (fire-and-forget, no retry); if it's
+/// initial `PlaceSegment` exactly once (fire-and-forget, no retry); if it's
 /// sent before SWIM has converged, the data-leader's address isn't yet resolvable
 /// on the metadata leader and the assignment is dropped permanently. Gating
 /// creation on convergence keeps the produce path off that drop window.
@@ -1622,7 +1622,7 @@ async fn produce_until_acked<'a>(
     nodes: &'a [(&'a str, u16)],
 ) -> Option<(&'a str, u16)> {
     // Generous budget: the data plane, replication, and checkpoint run on real
-    // OS threads (outside turmoil's deterministic runtime), so SegmentAssignment
+    // OS threads (outside turmoil's deterministic runtime), so PlaceSegment
     // delivery + first commit can take a while on a slow interleaving.
     for _ in 0..80 {
         for &(host, port) in nodes {

@@ -2,7 +2,7 @@ use super::SegmentKey;
 use super::actor::DataPlaneSender;
 use super::cold_read::{CatchUpReadReply, ColdReadReply, ColdReadRequest};
 use super::messages::DataPlaneMessage;
-use super::messages::command::DataPlaneInterNodeCommand;
+use super::messages::command::DataPlanePeerMessage;
 use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{
@@ -15,20 +15,21 @@ use super::segment_writer::SegmentAppender;
 
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
-use super::states::seal_request::PendingSealRequests;
+use super::states::seal_request::PendingSegmentRollRequests;
 use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
 use crate::config::DataNodeConfig;
-use crate::control_plane::NodeId;
-use crate::control_plane::consensus::messages::{CoordinatorSealRequest, MultiRaftActorCommand};
+use crate::control_plane::consensus::messages::{MultiRaftActorCommand, ProposeSegmentRoll};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
+use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::EntryPayload;
 use crate::data_plane::consumer_offset_management::ConsumerOffsetManager;
 use crate::data_plane::consumer_offset_management::ledger::{EpochSeal, StaleEpoch};
+
 use crate::data_plane::consumer_offset_management::types::*;
 use crate::data_plane::messages::query::ReadConsumerOffset;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
@@ -41,7 +42,7 @@ use crate::schedulers::ticker_message::TimerCommand;
 use crate::test_traits::TAssertInvariant;
 use std::collections::{BTreeSet, HashMap};
 
-/// Same rational as the Raft transport's 4MiB cap, Per-`CatchUpChunk` read cap.
+/// Same rational as the Raft transport's 4MiB cap, Per-`CatchUpEntries` read cap.
 /// A large segment streams as several chunks via the read-complete re-arm loop.
 const CATCH_UP_CHUNK_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -71,7 +72,7 @@ pub struct DataPlane<W: WalStorage> {
 
     replication: ReplicationState,
 
-    pending_seal_requests: PendingSealRequests,
+    pending_seal_requests: PendingSegmentRollRequests,
     /// In-progress catch-up receives (replacement side), keyed by segment.
     pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
 
@@ -116,7 +117,7 @@ impl<W: WalStorage> DataPlane<W> {
             buffer_byte_count: 0,
             needs_flush: false,
             replication: ReplicationState::default(),
-            pending_seal_requests: PendingSealRequests::default(),
+            pending_seal_requests: PendingSegmentRollRequests::default(),
             pending_catch_ups: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
@@ -148,14 +149,14 @@ impl<W: WalStorage> DataPlane<W> {
             DataPlaneCommand::DataPlaneTimeoutCallback(callback) => {
                 self.handle_timeout(callback);
             }
-            DataPlaneCommand::DataPlaneInterNodeCommand(inter) => {
-                self.process_inter_node(inter);
+            DataPlaneCommand::ReceivePeerMessage(received) => {
+                self.receive_peer_message(received);
             }
             DataPlaneCommand::CatchUpReadComplete(cmd) => {
                 self.handle_catch_up_read_complete(cmd);
             }
             DataPlaneCommand::OrphanGcCheck(check) => self.handle_orphan_gc_check(check),
-            DataPlaneCommand::CommitConsumerOffset(cmd) => self.handle_commit_consumer_offset(cmd),
+            DataPlaneCommand::CommitConsumerOffset(cmd) => self.commit_consumer_offset(cmd),
         }
 
         #[cfg(any(test, debug_assertions))]
@@ -199,7 +200,8 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         self.buffer_byte_count += cmd.data.len();
-        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count);
+        let entry_id = tracker.next_staged_entry_id();
+        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count, entry_id);
         self.dirty_segments.insert(cmd.segment_key);
 
         self.out
@@ -391,7 +393,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.wal.delete_below(watermark);
         }
 
-        if self.consumer_offsets.offset_checkpoint_in_flight {
+        if self.consumer_offsets.offset_checkpoint_in_flight() {
             return;
         }
         let Some(reclaimable_lsn) = self.wal.reclaimable_lsn() else {
@@ -464,57 +466,68 @@ impl<W: WalStorage> DataPlane<W> {
         let _ = check.reply.try_send(signal);
     }
 
-    fn process_inter_node(&mut self, cmd: DataPlaneInterNodeCommand) {
-        use DataPlaneInterNodeCommand as C;
-        match cmd {
-            C::SegmentAssignment(cmd) => self.handle_segment_assignment(cmd),
-            C::ReplicaAppend(cmd) => self.process_replica_append(cmd),
-            C::ReplicaAck(cmd) => self.handle_replica_ack(cmd),
-            C::ReplicaOffsetCommit(cmd) => self.handle_replica_offset_commit(cmd),
-            C::ReplicaOffsetAck(cmd) => self.consumer_offsets.handle_replica_offset_ack(cmd),
-            C::CommitAdvance(cmd) => self.handle_commit_advance(cmd),
-            C::SealResponse(cmd) => self.handle_seal_response(cmd),
+    fn receive_peer_message(&mut self, received: ReceivePeerMessage) {
+        use DataPlanePeerMessage as C;
+        let ReceivePeerMessage { from, message } = received;
+
+        match *message {
+            C::PlaceSegment(cmd) => self.place_segment(cmd),
+            C::ReplicateSegmentEntries(cmd) => self.replicate_segment_entries(&from, cmd),
+            C::ReplicaEntriesAppended(cmd) => self.handle_replica_ack(cmd),
+            C::ReplicateConsumerOffset(cmd) => self.replicate_consumer_offset(cmd),
+            C::ConsumerOffsetReplicated(cmd) => self.handle_replica_offset_ack(cmd),
+            C::InstallConsumerOffsetSnapshot(cmd) => {
+                self.install_consumer_offset_snapshot(&from, cmd)
+            }
+            C::RequestConsumerOffsetSnapshot(cmd) => {
+                self.request_consumer_offset_snapshot(&from, cmd)
+            }
+            C::ConsumerOffsetSnapshotInstalled(cmd) => {
+                self.handle_consumer_offset_snapshot_installed(cmd)
+            }
+            C::AdvanceReplicaCommit(cmd) => self.handle_commit_advance(cmd),
+            C::SegmentRollCommitted(message) => self.handle_segment_roll_committed(message),
             C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd),
 
-            // Pass-through to MultiRaftActor — SealRequest is a control plane
+            // Pass-through to MultiRaftActor — RequestSegmentRoll is a control plane
             // message that shares the data transport wire format. The
             // coordinator loads its own live-nodes view from the shared
             // topology snapshot, so the data plane just forwards the request.
-            C::SealRequest(cmd) => {
+            C::RequestSegmentRoll(cmd) => {
                 self.out
-                    .store_coordinator_cmd(MultiRaftActorCommand::Coordinator(
-                        CoordinatorSealRequest { request: cmd },
+                    .store_coordinator_cmd(MultiRaftActorCommand::ProposeSegmentRoll(
+                        ProposeSegmentRoll { request: cmd },
                     ));
             }
 
             // Assignment confirmation from a data-leader — forward to the local
             // MultiRaftActor (we are this shard's coordinator), which marks the
             // segment confirmed so the heartbeat sweep stops re-driving it.
-            C::SegmentAssignmentAck(cmd) => {
+            C::SegmentPlaced(cmd) => {
                 self.out
                     .store_coordinator_cmd(MultiRaftActorCommand::AssignmentAck(cmd));
             }
 
             // Catch-ups: re-replicate a sealed segment to a newly assigned replica.
-            C::CatchUpAssignment(cmd) => self.handle_catch_up_assignment(cmd),
-            C::CatchUpRequest(cmd) => self.handle_catch_up_request(cmd),
-            C::CatchUpChunk(cmd) => self.handle_catch_up_chunk(cmd),
-            C::CatchUpStreamEnd(cmd) => self.handle_catch_up_stream_end(cmd),
+            C::AssignSegmentCatchUp(cmd) => self.handle_catch_up_assignment(cmd),
+            C::RequestCatchUpEntries(cmd) => self.handle_catch_up_request(cmd),
+            C::CatchUpEntries(cmd) => self.handle_catch_up_chunk(cmd),
+            C::CatchUpEntriesSent(cmd) => self.handle_catch_up_stream_end(cmd),
             // Pass-through to the local MultiRaftActor (we coordinate this group):
             // a replica's confirmation that it finished catching up.
-            C::CatchUpAck(cmd) => {
+            C::SegmentCaughtUp(cmd) => {
                 self.out
-                    .store_coordinator_cmd(MultiRaftActorCommand::CatchUpAck(cmd));
+                    .store_coordinator_cmd(MultiRaftActorCommand::SegmentCaughtUp(cmd));
             }
 
-            C::SealBoundaryQuery(cmd) => self.handle_seal_boundary_query(cmd),
+            C::RequestDurableSegmentEnd(cmd) => self.handle_seal_boundary_query(cmd),
             // Pass-through to the local MultiRaftActor
-            C::SealBoundaryReport(cmd) => {
+            C::DurableSegmentEndReported(cmd) => {
                 self.out
-                    .store_coordinator_cmd(MultiRaftActorCommand::SealBoundaryReport(cmd));
+                    .store_coordinator_cmd(MultiRaftActorCommand::DurableSegmentEndReported(cmd));
             }
             C::DeleteSegments(cmd) => self.handle_delete_segments(cmd),
-            C::ConsumerGroupEpochSeal(cmd) => self.handle_consumer_group_epoch_seal(cmd),
+            C::ConsumerGroupEpochSealed(cmd) => self.handle_consumer_group_epoch_seal(cmd),
         }
     }
 
@@ -543,22 +556,28 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         self.needs_flush = true;
+        self.resume_future_offset_commits(parked_commits);
+    }
+
+    fn resume_future_offset_commits(&mut self, parked_commits: Vec<FutureOffsetCommit>) {
         for parked in parked_commits {
             match parked {
                 FutureOffsetCommit::Client(pending) => {
-                    self.handle_commit_consumer_offset(pending);
+                    self.commit_consumer_offset(pending);
                 }
-                FutureOffsetCommit::Replica(pending) => self.handle_replica_offset_commit(pending),
+                FutureOffsetCommit::Replica(pending) => {
+                    self.replicate_consumer_offset(pending);
+                }
             }
         }
     }
 
-    fn handle_seal_boundary_query(&mut self, cmd: SealBoundaryQuery) {
+    fn handle_seal_boundary_query(&mut self, cmd: RequestDurableSegmentEnd) {
         let durable_end = self.durable_end(&cmd.segment_key);
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
                 vec![cmd.coordinator],
-                SealBoundaryReport {
+                DurableSegmentEndReported {
                     segment_key: cmd.segment_key,
                     from: self.node_id.clone(),
                     durable_end,
@@ -573,7 +592,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// - already hold it through `sealed_end` → register if needed, transfer nothing;
     /// - already reconciling → no-op while progressing, resume if stalled;
     /// - else fetch `(local, sealed_end]` from a peer — a delta or a full copy.
-    fn handle_catch_up_assignment(&mut self, cmd: CatchUpAssignment) {
+    fn handle_catch_up_assignment(&mut self, cmd: AssignSegmentCatchUp) {
         if let Some(pending) = self.pending_catch_ups.get_mut(&cmd.segment_key) {
             // A receive is already in flight: no-op while it appends; once stalled
             // (no append across `CATCH_UP_IDLE_REDRIVES` re-drives) re-request the
@@ -590,7 +609,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     vec![source],
-                    CatchUpRequest {
+                    RequestCatchUpEntries {
                         segment_key: cmd.segment_key,
                         from: self.node_id.clone(),
                         local_end,
@@ -646,7 +665,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
                 vec![source],
-                CatchUpRequest {
+                RequestCatchUpEntries {
                     segment_key: cmd.segment_key,
                     from: self.node_id.clone(),
                     local_end: local,
@@ -666,7 +685,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// Highest durable (fsync'd) entry id this node holds for `key`, across every
     /// place a copy can live: a live tracker (the active segment a survivor is
     /// still following), the sealed store, or the recovered inventory. `None` if
-    /// we hold nothing. Reported in a `SealBoundaryReport` so the coordinator can seal
+    /// we hold nothing. Reported in a `DurableSegmentEndReported` so the coordinator can seal
     /// a leader-crashed segment at the `min` of survivors' durable extents.
     fn durable_end(&self, key: &SegmentKey) -> Option<EntryId> {
         let live = self
@@ -711,7 +730,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// Append a streamed batch to the in-progress receive, building sparse-index
     /// anchors as we go (same predicate the checkpoint/recovery paths use).
     /// A write failure aborts the receive — the source/coordinator re-drive.
-    fn handle_catch_up_chunk(&mut self, cmd: CatchUpChunk) {
+    fn handle_catch_up_chunk(&mut self, cmd: CatchUpEntries) {
         let Some(pending) = self.pending_catch_ups.get_mut(&cmd.segment_key) else {
             tracing::debug!(
                 "catch-up chunk for an unknown receive {:?}; dropping",
@@ -756,7 +775,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     /// End of stream. Fsync, re-scan to verify it reaches `sealed_end`, then on
     /// success index the anchors, register the segment, and ack the coordinator.
-    fn handle_catch_up_stream_end(&mut self, cmd: CatchUpStreamEnd) {
+    fn handle_catch_up_stream_end(&mut self, cmd: CatchUpEntriesSent) {
         let Some(mut pending) = self.pending_catch_ups.remove(&cmd.segment_key) else {
             tracing::debug!(
                 "catch-up done for an unknown receive {:?}; dropping",
@@ -807,12 +826,12 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     /// Tell the coordinator we hold this segment, so its sweep stops re-announcing.
-    /// Routed via `SendToCoordinator`, mirroring `SegmentAssignmentAck`.
+    /// Routed via `SendToCoordinator`, mirroring `SegmentPlaced`.
     fn send_catch_up_ack(&mut self, shard_group_id: ShardGroupId, segment_key: SegmentKey) {
         self.out
             .store_transport_cmd(DataTransportSendToCoordinator {
                 shard_group_id,
-                message: CatchUpAck {
+                message: SegmentCaughtUp {
                     segment_key,
                     shard_group_id,
                     from: self.node_id.clone(),
@@ -822,7 +841,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     /// Source side: a peer wants `cmd.segment_key` brought up to its local end.
-    fn handle_catch_up_request(&mut self, cmd: CatchUpRequest) {
+    fn handle_catch_up_request(&mut self, cmd: RequestCatchUpEntries) {
         let Some((start_offset, sealed_end)) = self.segments.sealed_bounds(&cmd.segment_key) else {
             tracing::warn!(
                 "catch-up source has no sealed segment {:?}; dropping request",
@@ -870,8 +889,8 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     /// The cold-read pool finished one batch for a catch-up source read. Emit it
-    /// as a `CatchUpChunk` to the requester, then re-arm the next read until the
-    /// sealed end is reached, at which point send `CatchUpStreamEnd`.
+    /// as a `CatchUpEntries` to the requester, then re-arm the next read until the
+    /// sealed end is reached, at which point send `CatchUpEntriesSent`.
     fn handle_catch_up_read_complete(&mut self, cmd: CatchUpReadComplete) {
         let has_entries = !cmd.entries.is_empty();
         if has_entries {
@@ -883,7 +902,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     vec![cmd.requester.clone()],
-                    CatchUpChunk {
+                    CatchUpEntries {
                         segment_key: cmd.segment_key,
                         entries,
                     },
@@ -909,11 +928,11 @@ impl<W: WalStorage> DataPlane<W> {
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
                 vec![requester],
-                CatchUpStreamEnd { segment_key },
+                CatchUpEntriesSent { segment_key },
             ));
     }
 
-    fn handle_replica_ack(&mut self, cmd: ReplicaAck) {
+    fn handle_replica_ack(&mut self, cmd: ReplicaEntriesAppended) {
         let Some(committed) = self.replication.process_ack(&cmd.segment_key, &cmd.from) else {
             return;
         };
@@ -935,47 +954,152 @@ impl<W: WalStorage> DataPlane<W> {
         self.check_pending_seal(cmd.segment_key);
     }
 
-    fn handle_commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
+    fn commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
         self.needs_flush |= self
             .consumer_offsets
-            .handle_consumer_offset_commit(cmd, &self.node_id);
+            .commit_consumer_offset(cmd, &self.node_id);
     }
-    fn handle_replica_offset_commit(&mut self, cmd: ReplicaOffsetCommit) {
-        if !cmd.replica_set.contains(&self.node_id) {
+
+    fn replicate_consumer_offset(&mut self, cmd: ReplicateConsumerOffset) {
+        if !self.is_follower_of(&cmd.replica_set) {
             return;
         }
 
         let Some(leader) = cmd.replica_set.leader().cloned() else {
             return;
         };
-        if leader == self.node_id {
-            tracing::debug!("leader received replica offset commit message");
-            return;
-        }
 
         let sealed_generation = self.consumer_offsets.latest_generation(&cmd.update.key);
         if cmd.update.generation < sealed_generation {
             let transport = DataTransportCommand::send_to_targets(
                 vec![leader],
-                ReplicaOffsetAck {
+                ConsumerOffsetReplicated {
                     seq: cmd.seq,
                     update: cmd.update,
                     from: self.node_id.clone(),
-                    result: ReplicaOffsetAckResult::StaleEpoch(StaleEpoch(sealed_generation)),
+                    result: ConsumerOffsetReplicationResult::StaleEpoch(StaleEpoch(
+                        sealed_generation,
+                    )),
                 },
             );
             self.out.store_transport_cmd(transport);
             return;
         }
 
-        self.needs_flush |= self
-            .consumer_offsets
-            .handle_replica_offset_commit(cmd, sealed_generation);
+        if cmd.update.generation > sealed_generation {
+            let targets = cmd.replica_set.except_for(&self.node_id);
+            if !targets.is_empty() {
+                let transport = DataTransportCommand::send_to_targets(
+                    targets,
+                    RequestConsumerOffsetSnapshot {
+                        segment_key: cmd.segment_key,
+                        replicas: cmd.replica_set.clone(),
+                        requester: self.node_id.clone(),
+                    },
+                );
+                self.out.store_transport_cmd(transport)
+            }
+
+            self.consumer_offsets
+                .future_entry(cmd.update.key.clone())
+                .push(FutureOffsetCommit::Replica(cmd));
+            return;
+        }
+
+        self.consumer_offsets.push_pending_offset_mutation(cmd);
+        self.needs_flush = true;
     }
 
-    fn handle_segment_assignment(&mut self, cmd: SegmentAssignment) {
-        self.consumer_offsets
-            .add_placement(&cmd.segment_key, cmd.replica_set.clone());
+    fn handle_replica_offset_ack(&mut self, cmd: ConsumerOffsetReplicated) {
+        // ! Hot PATH without the following condition,
+        // every consumer-offset replica acknowledgement currently will trigger a full placement scan
+        if self.consumer_offsets.handle_replica_offset_ack(cmd) {
+            self.ack_ready_offset_placements();
+        }
+    }
+
+    fn install_consumer_offset_snapshot(&mut self, from: &NodeId, cmd: ConsumerOffsetSnapshot) {
+        if !cmd.replica_set.contains(&self.node_id) || !cmd.replica_set.contains(from) {
+            return;
+        }
+        let Some(leader) = cmd.replica_set.leader() else {
+            return;
+        };
+        if leader != from && leader != &self.node_id {
+            return;
+        };
+
+        let parked = self
+            .consumer_offsets
+            .install_consumer_offsets(cmd, &self.node_id);
+        self.resume_future_offset_commits(parked);
+
+        self.needs_flush = true;
+    }
+
+    fn request_consumer_offset_snapshot(
+        &mut self,
+        from: &NodeId,
+        cmd: RequestConsumerOffsetSnapshot,
+    ) {
+        if &cmd.requester != from || !cmd.replicas.contains(&self.node_id) {
+            return;
+        }
+        if !cmd.replicas.contains(&cmd.requester) {
+            return;
+        }
+
+        if let Some(bootstrap) = self
+            .consumer_offsets
+            .create_offset_snapshot(cmd, &self.node_id)
+        {
+            self.out.store_transport_cmd(bootstrap);
+        }
+    }
+
+    fn handle_consumer_offset_snapshot_installed(&mut self, cmd: ConsumerOffsetSnapshotInstalled) {
+        if self.node_id != cmd.leader {
+            return;
+        }
+
+        self.consumer_offsets.handle_snapshot_installed_ack(&cmd);
+
+        if let Some(bootstrap) = self
+            .consumer_offsets
+            .create_offset_snapshot_for_unready_replicas(cmd.segment_key)
+        {
+            self.out.store_transport_cmd(bootstrap);
+        }
+        self.ack_ready_offset_placements();
+    }
+
+    fn handle_commit_advance(&mut self, cmd: AdvanceReplicaCommit) {
+        let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
+            return;
+        };
+
+        if tracker.role() != SegmentRole::Follower {
+            tracing::warn!(
+                "AdvanceReplicaCommit received by non-follower: {:?}",
+                cmd.segment_key
+            );
+            return;
+        }
+        tracker.commit_entry(cmd.committed_entry_id);
+    }
+
+    fn place_segment(&mut self, cmd: PlaceSegment) {
+        if !self.is_leader_of(&cmd.replica_set) {
+            return;
+        }
+
+        if let Some(transport) = self.consumer_offsets.install_leader_placement(
+            cmd.segment_key,
+            cmd.shard_group_id,
+            cmd.replica_set.clone(),
+        ) {
+            self.out.store_transport_cmd(transport);
+        }
 
         if !self.segments.contains_key(&cmd.segment_key) {
             let tracker = SegmentTracker::new_with_start_entry_id(
@@ -989,83 +1113,69 @@ impl<W: WalStorage> DataPlane<W> {
             self.segments.insert_active(cmd.segment_key, tracker);
         }
 
-        self.out
-            .store_transport_cmd(DataTransportSendToCoordinator {
-                shard_group_id: cmd.shard_group_id,
-                message: SegmentAssignmentAck {
-                    segment_key: cmd.segment_key,
-                    shard_group_id: cmd.shard_group_id,
-                    from: self.node_id.clone(),
-                }
-                .into(),
-            });
+        self.ack_ready_offset_placements();
     }
 
-    fn process_replica_append(&mut self, cmd: ReplicaAppend) {
-        if cmd.replica_set.is_empty() {
+    /// Checks if there are any consumer offset placements that have reached full readiness (all replicas in the set
+    /// have successfully bootstrapped and are up-to-date)
+    /// If then sends [`SegmentPlaced`](self::SegmentPlaced) to coordinator responsible for the shard
+    fn ack_ready_offset_placements(&mut self) {
+        for ack in self.consumer_offsets.drain_ready_placements(&self.node_id) {
+            self.out
+                .store_transport_cmd(DataTransportSendToCoordinator {
+                    shard_group_id: ack.shard_group_id,
+                    message: ack.into(),
+                });
+        }
+    }
+
+    fn replicate_segment_entries(&mut self, from: &NodeId, cmd: ReplicateSegmentEntries) {
+        if cmd.replicas.leader() != Some(from) {
+            return;
+        }
+        if !self.is_follower_of(&cmd.replicas) {
+            tracing::warn!("{} is not follower for {:?}", self.node_id, cmd.segment_key);
             return;
         }
 
-        let replica_set = cmd.replica_set.clone();
-        if !self.segments.contains_key(&cmd.segment_key) {
-            if !cmd.replica_set.contains(&self.node_id) {
-                tracing::warn!(
-                    "ReplicaAppend for segment I'm not in: {:?}",
-                    cmd.segment_key
-                );
-                return;
-            }
-            if cmd.replica_set.first() == Some(&self.node_id) {
-                tracing::warn!("ReplicaAppend from self as leader: {:?}", cmd.segment_key);
-                return;
-            }
+        if matches!(
+            self.consumer_offsets.observe_placement(
+                cmd.segment_key,
+                ShardGroupId(0),
+                &cmd.replicas,
+                &self.node_id
+            ),
+            PlacementObservation::Stale | PlacementObservation::Conflict
+        ) {
+            return;
+        };
 
+        // If it sees this segment for the first time
+        if !self.segments.contains_key(&cmd.segment_key) {
             self.segments.insert_active(
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
                     cmd.segment_key
                         .file_path(&self.config.data_dir, cmd.entry_id),
                     SegmentRole::Follower,
-                    cmd.replica_set,
+                    cmd.replicas,
                     ShardGroupId(0),
                     cmd.entry_id,
                 ),
             );
         }
-
-        self.consumer_offsets
-            .add_placement(&cmd.segment_key, replica_set);
-
         let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
             return;
         };
 
-        tracker.stage_entry_from_replica(cmd.segment_key, cmd.data, cmd.record_count, cmd.entry_id);
+        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count, cmd.entry_id);
         self.dirty_segments.insert(cmd.segment_key);
 
         self.needs_flush = true;
     }
 
-    fn handle_commit_advance(&mut self, cmd: CommitAdvance) {
-        let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
-            return;
-        };
-
-        if tracker.role() != SegmentRole::Follower {
-            tracing::warn!(
-                "CommitAdvance received by non-follower: {:?}",
-                cmd.segment_key
-            );
-            return;
-        }
-        tracker.commit_entry(cmd.committed_entry_id);
-    }
-
-    fn handle_seal_response(&mut self, cmd: SealResponse) {
-        if cmd.new_replica_set.is_empty() {
-            return;
-        }
-
+    // TODO refactor
+    fn handle_segment_roll_committed(&mut self, cmd: SegmentRollCommitted) {
         self.pending_seal_requests.clear(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
@@ -1093,9 +1203,6 @@ impl<W: WalStorage> DataPlane<W> {
                 ));
         }
 
-        self.consumer_offsets
-            .add_placement(&cmd.old_segment_key, cmd.new_replica_set.clone());
-
         self.replication.segment_handoff(
             cmd.old_segment_key,
             cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
@@ -1103,7 +1210,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.retire_old_segment(cmd.old_segment_key);
 
         // The successor may already exist: on a roll the coordinator co-dispatches a
-        // `SegmentAssignment` for the new active segment alongside this `SealResponse`,
+        // `PlaceSegment` for the new active segment alongside this committed result,
         // and it can win the race (creating the successor empty). Carry the tail onto
         // the existing tracker rather than a fresh one that `insert_active` would
         // silently refuse — which would drop the records (data loss) and strand the
@@ -1133,10 +1240,12 @@ impl<W: WalStorage> DataPlane<W> {
             .get_mut(&cmd.old_segment_key.with_segment_id(cmd.new_segment_id))
         {
             for (data, record_count) in uncommitted_entry {
+                let entry_id = successor.next_staged_entry_id();
                 successor.stage_entry(
                     cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
                     data,
                     record_count,
+                    entry_id,
                 );
             }
         }
@@ -1165,7 +1274,7 @@ impl<W: WalStorage> DataPlane<W> {
                     self.out
                         .store_transport_cmd(DataTransportSendToCoordinator {
                             shard_group_id: tracker.shard_group_id(),
-                            message: SealRequest {
+                            message: RequestSegmentRoll {
                                 from: self.node_id.clone(),
                                 segment_key: cmd.segment_key,
                                 failed_nodes: vec![],
@@ -1214,7 +1323,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.out
             .store_transport_cmd(DataTransportSendToCoordinator {
                 shard_group_id: tracker.shard_group_id(),
-                message: SealRequest {
+                message: RequestSegmentRoll {
                     from: self.node_id.clone(),
                     segment_key,
                     failed_nodes: vec![],
@@ -1254,7 +1363,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     followers,
-                    CommitAdvance {
+                    AdvanceReplicaCommit {
                         segment_key,
                         committed_entry_id: entry_id,
                     },
@@ -1297,7 +1406,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.out
             .store_transport_cmd(DataTransportSendToCoordinator {
                 shard_group_id: tracker.shard_group_id(),
-                message: SealRequest {
+                message: RequestSegmentRoll {
                     from: self.node_id.clone(),
                     segment_key,
                     failed_nodes: failed_nodes.clone(),
@@ -1322,7 +1431,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.out
             .store_transport_cmd(DataTransportSendToCoordinator {
                 shard_group_id: tracker.shard_group_id(),
-                message: SealRequest {
+                message: RequestSegmentRoll {
                     from: self.node_id.clone(),
                     segment_key,
                     failed_nodes: vec![],
@@ -1411,7 +1520,7 @@ impl<W: WalStorage> DataPlane<W> {
                         self.out
                             .store_transport_cmd(DataTransportCommand::send_to_targets(
                                 vec![tracker.leader_node()],
-                                ReplicaAck {
+                                ReplicaEntriesAppended {
                                     segment_key: key,
                                     entry_id: entry.entry_id,
                                     from: self.node_id.clone(),
@@ -1523,7 +1632,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.out
                 .store_transport_cmd(DataTransportSendToCoordinator {
                     shard_group_id: tracker.shard_group_id(),
-                    message: SealRequest {
+                    message: RequestSegmentRoll {
                         from: self.node_id.clone(),
                         segment_key,
                         failed_nodes,
@@ -1532,6 +1641,14 @@ impl<W: WalStorage> DataPlane<W> {
                     .into(),
                 });
         }
+    }
+
+    fn is_follower_of(&self, replicas: &Replicas) -> bool {
+        replicas.contains(&self.node_id) && replicas.leader() != Some(&self.node_id)
+    }
+
+    fn is_leader_of(&self, replicas: &Replicas) -> bool {
+        replicas.contains(&self.node_id) && replicas.leader() == Some(&self.node_id)
     }
 }
 
@@ -1593,10 +1710,61 @@ mod tests {
         fn has_buffered_data(&self) -> bool {
             self.buffer_byte_count > 0
         }
+
+        fn process_peer(&mut self, message: impl Into<DataPlanePeerMessage>) {
+            self.handle_command(receive_peer_message(message.into()));
+        }
     }
 
     fn test_key() -> SegmentKey {
         SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
+    }
+
+    fn receive_peer_message(message: DataPlanePeerMessage) -> DataPlaneCommand {
+        let from = match &message {
+            DataPlanePeerMessage::ReplicateSegmentEntries(command) => {
+                command.replicas.leader().cloned().unwrap()
+            }
+            DataPlanePeerMessage::SegmentPlaced(event) => event.from.clone(),
+            DataPlanePeerMessage::ReplicaEntriesAppended(event) => event.from.clone(),
+            DataPlanePeerMessage::ReplicateConsumerOffset(command) => {
+                command.replica_set.leader().cloned().unwrap()
+            }
+            DataPlanePeerMessage::ConsumerOffsetReplicated(event) => event.from.clone(),
+            DataPlanePeerMessage::InstallConsumerOffsetSnapshot(command) => {
+                command.replica_set.leader().cloned().unwrap()
+            }
+            DataPlanePeerMessage::RequestConsumerOffsetSnapshot(request) => {
+                request.requester.clone()
+            }
+            DataPlanePeerMessage::ConsumerOffsetSnapshotInstalled(event) => event.from.clone(),
+            DataPlanePeerMessage::RequestSegmentRoll(request) => request.from.clone(),
+            DataPlanePeerMessage::RequestCatchUpEntries(request) => request.from.clone(),
+            DataPlanePeerMessage::SegmentCaughtUp(event) => event.from.clone(),
+            DataPlanePeerMessage::RequestDurableSegmentEnd(request) => request.coordinator.clone(),
+            DataPlanePeerMessage::DurableSegmentEndReported(event) => event.from.clone(),
+            DataPlanePeerMessage::PlaceSegment(_)
+            | DataPlanePeerMessage::AdvanceReplicaCommit(_)
+            | DataPlanePeerMessage::SegmentRollCommitted(_)
+            | DataPlanePeerMessage::SegmentSealed(_)
+            | DataPlanePeerMessage::AssignSegmentCatchUp(_)
+            | DataPlanePeerMessage::CatchUpEntries(_)
+            | DataPlanePeerMessage::CatchUpEntriesSent(_)
+            | DataPlanePeerMessage::DeleteSegments(_)
+            | DataPlanePeerMessage::ConsumerGroupEpochSealed(_) => NodeId::new("test-peer"),
+        };
+        receive_peer_message_from(from, message)
+    }
+
+    fn receive_peer_message_from(
+        from: NodeId,
+        message: impl Into<DataPlanePeerMessage>,
+    ) -> DataPlaneCommand {
+        ReceivePeerMessage {
+            from,
+            message: Box::new(message.into()),
+        }
+        .into()
     }
 
     fn consumer_offset_key() -> ConsumerOffsetKey {
@@ -1631,16 +1799,14 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
 
-        dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
-            EpochSeal {
-                generation: 2.into(),
-                key: ConsumerOffsetKey {
-                    topic_id: TopicId(1),
-                    range_id: RangeId(0),
-                    group_id: "group".into(),
-                },
+        dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
+            generation: 2.into(),
+            key: ConsumerOffsetKey {
+                topic_id: TopicId(1),
+                range_id: RangeId(0),
+                group_id: "group".into(),
             },
-        ));
+        }));
         assert!(matches!(
             response.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -1656,7 +1822,7 @@ mod tests {
         );
         assert_eq!(
             dp.consumer_offsets
-                .uncheckpointed_offset_lsns
+                .uncheckpointed_offset_lsns()
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
@@ -1711,8 +1877,8 @@ mod tests {
         dp.handle_command(OffsetCheckpointComplete {
             checkpointed_lsn: 2,
         });
-        assert!(dp.consumer_offsets.uncheckpointed_offset_lsns.is_empty());
-        assert_eq!(dp.consumer_offsets.offset_checkpoint_lsn, 2);
+        assert!(dp.consumer_offsets.uncheckpointed_offset_lsns().is_empty());
+        assert_eq!(dp.consumer_offsets.offset_checkpoint_lsn(), 2);
         assert_eq!(dp.wal.reclaimable_lsn(), None);
     }
 
@@ -1721,16 +1887,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.process(assign_segment(test_key(), vec![test_node_id()]));
-        dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
-            EpochSeal {
-                generation: 4.into(),
-                key: ConsumerOffsetKey {
-                    topic_id: TopicId(1),
-                    range_id: RangeId(0),
-                    group_id: "group".into(),
-                },
+        dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
+            generation: 4.into(),
+            key: ConsumerOffsetKey {
+                topic_id: TopicId(1),
+                range_id: RangeId(0),
+                group_id: "group".into(),
             },
-        ));
+        }));
         let (reply, mut response) = oneshot::channel();
         dp.process(CommitConsumerOffset {
             update: ConsumerOffsetUpdate {
@@ -1755,7 +1919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.process(assign_segment(test_key(), vec![test_node_id()]));
-        dp.process(DataPlaneInterNodeCommand::SegmentSealed(SegmentSealed {
+        dp.process_peer(DataPlanePeerMessage::SegmentSealed(SegmentSealed {
             segment_key: test_key(),
             committed_entry_id: None,
         }));
@@ -1797,12 +1961,19 @@ mod tests {
             test_key(),
             vec![test_node_id(), follower_1.clone(), follower_2.clone()],
         ));
-        dp.process(DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(
-            EpochSeal {
-                generation: 1.into(),
-                key: consumer_offset_key(),
-            },
-        ));
+        for follower in [&follower_1, &follower_2] {
+            dp.process_peer(DataPlanePeerMessage::ConsumerOffsetSnapshotInstalled(
+                ConsumerOffsetSnapshotInstalled {
+                    segment_key: test_key(),
+                    from: follower.clone(),
+                    leader: test_node_id(),
+                },
+            ));
+        }
+        dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
+            generation: 1.into(),
+            key: consumer_offset_key(),
+        }));
         dp.flush_batch();
         dp.out.transport_cmds.clear();
 
@@ -1832,25 +2003,28 @@ mod tests {
             .iter()
             .find_map(|command| match command {
                 DataTransportCommand::SendToTargets(send) => match &send.message {
-                    DataPlaneInterNodeCommand::ReplicaOffsetCommit(commit) => Some(commit.clone()),
-                    DataPlaneInterNodeCommand::SegmentAssignment(_)
-                    | DataPlaneInterNodeCommand::SegmentAssignmentAck(_)
-                    | DataPlaneInterNodeCommand::ReplicaAppend(_)
-                    | DataPlaneInterNodeCommand::ReplicaAck(_)
-                    | DataPlaneInterNodeCommand::ReplicaOffsetAck(_)
-                    | DataPlaneInterNodeCommand::CommitAdvance(_)
-                    | DataPlaneInterNodeCommand::SealRequest(_)
-                    | DataPlaneInterNodeCommand::SealResponse(_)
-                    | DataPlaneInterNodeCommand::SegmentSealed(_)
-                    | DataPlaneInterNodeCommand::CatchUpAssignment(_)
-                    | DataPlaneInterNodeCommand::CatchUpRequest(_)
-                    | DataPlaneInterNodeCommand::CatchUpChunk(_)
-                    | DataPlaneInterNodeCommand::CatchUpStreamEnd(_)
-                    | DataPlaneInterNodeCommand::CatchUpAck(_)
-                    | DataPlaneInterNodeCommand::SealBoundaryQuery(_)
-                    | DataPlaneInterNodeCommand::SealBoundaryReport(_)
-                    | DataPlaneInterNodeCommand::DeleteSegments(_)
-                    | DataPlaneInterNodeCommand::ConsumerGroupEpochSeal(_) => None,
+                    DataPlanePeerMessage::ReplicateConsumerOffset(commit) => Some(commit.clone()),
+                    DataPlanePeerMessage::PlaceSegment(_)
+                    | DataPlanePeerMessage::SegmentPlaced(_)
+                    | DataPlanePeerMessage::ReplicateSegmentEntries(_)
+                    | DataPlanePeerMessage::ReplicaEntriesAppended(_)
+                    | DataPlanePeerMessage::ConsumerOffsetReplicated(_)
+                    | DataPlanePeerMessage::InstallConsumerOffsetSnapshot(_)
+                    | DataPlanePeerMessage::RequestConsumerOffsetSnapshot(_)
+                    | DataPlanePeerMessage::ConsumerOffsetSnapshotInstalled(_)
+                    | DataPlanePeerMessage::AdvanceReplicaCommit(_)
+                    | DataPlanePeerMessage::RequestSegmentRoll(_)
+                    | DataPlanePeerMessage::SegmentRollCommitted(_)
+                    | DataPlanePeerMessage::SegmentSealed(_)
+                    | DataPlanePeerMessage::AssignSegmentCatchUp(_)
+                    | DataPlanePeerMessage::RequestCatchUpEntries(_)
+                    | DataPlanePeerMessage::CatchUpEntries(_)
+                    | DataPlanePeerMessage::CatchUpEntriesSent(_)
+                    | DataPlanePeerMessage::SegmentCaughtUp(_)
+                    | DataPlanePeerMessage::RequestDurableSegmentEnd(_)
+                    | DataPlanePeerMessage::DurableSegmentEndReported(_)
+                    | DataPlanePeerMessage::DeleteSegments(_)
+                    | DataPlanePeerMessage::ConsumerGroupEpochSealed(_) => None,
                 },
                 DataTransportCommand::SendToCoordinator(_)
                 | DataTransportCommand::DisconnectPeer(_) => None,
@@ -1858,12 +2032,12 @@ mod tests {
             .expect("leader must replicate the offset commit");
 
         for follower in [follower_1, follower_2] {
-            dp.process(DataPlaneInterNodeCommand::ReplicaOffsetAck(
-                ReplicaOffsetAck {
+            dp.process_peer(DataPlanePeerMessage::ConsumerOffsetReplicated(
+                ConsumerOffsetReplicated {
                     seq: replicated.seq,
                     update: replicated.update.clone(),
                     from: follower,
-                    result: ReplicaOffsetAckResult::Committed,
+                    result: ConsumerOffsetReplicationResult::Committed,
                 },
             ));
         }
@@ -1883,9 +2057,10 @@ mod tests {
             batch_offset: 1,
             absolute_offset: 6,
         };
-        dp.process(DataPlaneInterNodeCommand::ReplicaOffsetCommit(
-            ReplicaOffsetCommit {
+        dp.process_peer(DataPlanePeerMessage::ReplicateConsumerOffset(
+            ReplicateConsumerOffset {
                 seq: 9,
+                segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader, test_node_id()]),
                 update: ConsumerOffsetUpdate {
                     key: consumer_offset_key(),
@@ -1906,11 +2081,119 @@ mod tests {
             DataTransportCommand::SendToTargets(send)
                 if matches!(
                     &send.message,
-                    DataPlaneInterNodeCommand::ReplicaOffsetAck(ReplicaOffsetAck {
+                    DataPlanePeerMessage::ConsumerOffsetReplicated(ConsumerOffsetReplicated {
                         seq: 9,
-                        result: ReplicaOffsetAckResult::Committed,
+                        result: ConsumerOffsetReplicationResult::Committed,
                         ..
                     })
+                )
+        )));
+    }
+
+    #[test]
+    fn consumer_offset_bootstrap_acks_only_after_wal_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let leader = NodeId::new("leader");
+        let position = ConsumerOffsetPosition {
+            entry_id: EntryId(8),
+            batch_offset: 2,
+            absolute_offset: 11,
+        };
+
+        dp.process_peer(DataPlanePeerMessage::InstallConsumerOffsetSnapshot(
+            ConsumerOffsetSnapshot {
+                segment_key: test_key(),
+                replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
+                entries: vec![
+                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
+                        key: consumer_offset_key(),
+                        generation: 3.into(),
+                        position: Some(position),
+                    },
+                ]
+                .into_boxed_slice(),
+            },
+        ));
+
+        assert!(dp.out.transport_cmds.iter().all(|cmd| !matches!(
+            cmd,
+            DataTransportCommand::SendToTargets(send)
+                if matches!(send.message, DataPlanePeerMessage::ConsumerOffsetSnapshotInstalled(_))
+        )));
+
+        dp.flush_batch();
+
+        assert_eq!(
+            dp.consumer_offsets.offset(&consumer_offset_key()),
+            Some(position)
+        );
+        assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
+            cmd,
+            DataTransportCommand::SendToTargets(send)
+                if send.targets.as_ref() == [leader.clone()]
+                    && matches!(send.message, DataPlanePeerMessage::ConsumerOffsetSnapshotInstalled(_))
+        )));
+    }
+
+    #[test]
+    fn consumer_offset_bootstrap_releases_a_parked_newer_epoch_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let leader = NodeId::new("leader");
+        let position = ConsumerOffsetPosition {
+            entry_id: EntryId(9),
+            batch_offset: 0,
+            absolute_offset: 12,
+        };
+        let update = ConsumerOffsetUpdate {
+            key: consumer_offset_key(),
+            generation: 2.into(),
+            position,
+        };
+        dp.process_peer(DataPlanePeerMessage::ReplicateConsumerOffset(
+            ReplicateConsumerOffset {
+                seq: 10,
+                segment_key: test_key(),
+                replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
+                update: update.clone(),
+            },
+        ));
+        assert!(!dp.consumer_offsets.has_pending_offsets());
+        assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
+            cmd,
+            DataTransportCommand::SendToTargets(send)
+                if send.targets.as_ref() == [leader.clone()]
+                    && matches!(send.message, DataPlanePeerMessage::RequestConsumerOffsetSnapshot(_))
+        )));
+
+        dp.process_peer(DataPlanePeerMessage::InstallConsumerOffsetSnapshot(
+            ConsumerOffsetSnapshot {
+                segment_key: test_key(),
+                replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
+                entries: vec![
+                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
+                        key: consumer_offset_key(),
+                        generation: 2.into(),
+                        position: None,
+                    },
+                ]
+                .into_boxed_slice(),
+            },
+        ));
+        dp.flush_batch();
+
+        assert_eq!(
+            dp.consumer_offsets.offset(&consumer_offset_key()),
+            Some(position)
+        );
+        assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
+            cmd,
+            DataTransportCommand::SendToTargets(send)
+                if matches!(
+                    &send.message,
+                    DataPlanePeerMessage::ConsumerOffsetReplicated(ack)
+                        if ack.seq == 10 && ack.update == update
                 )
         )));
     }
@@ -2005,11 +2288,11 @@ mod tests {
     }
 
     fn assign_segment(key: SegmentKey, replica_set: Vec<NodeId>) -> DataPlaneCommand {
-        DataPlaneCommand::DataPlaneInterNodeCommand(
-            SegmentAssignment {
+        receive_peer_message(
+            PlaceSegment {
                 segment_key: key,
                 shard_group_id: ShardGroupId(1),
-                replica_set,
+                replica_set: Replicas::new(replica_set),
                 start_entry_id: EntryId(0),
             }
             .into(),
@@ -2032,11 +2315,11 @@ mod tests {
         new_segment_id: SegmentId,
         new_replica_set: Vec<NodeId>,
     ) -> DataPlaneCommand {
-        DataPlaneCommand::DataPlaneInterNodeCommand(
-            SealResponse {
+        receive_peer_message(
+            SegmentRollCommitted {
                 old_segment_key: old,
                 new_segment_id,
-                new_replica_set,
+                new_replica_set: Replicas::new(new_replica_set),
             }
             .into(),
         )
@@ -2093,7 +2376,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (tx, _) = oneshot::channel();
         dp.handle_command(Produce {
@@ -2112,7 +2395,7 @@ mod tests {
     fn segment_assignment_creates_tracker() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
         assert!(dp.segments.contains_key(&test_key()));
     }
 
@@ -2121,7 +2404,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
@@ -2146,7 +2429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
@@ -2164,7 +2447,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
@@ -2182,7 +2465,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         let (cmd, _) = produce(test_key());
         dp.handle_command(cmd);
@@ -2198,7 +2481,7 @@ mod tests {
     fn volume_trigger_flushes_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2216,7 +2499,7 @@ mod tests {
     fn volume_trigger_flush_leaves_stale_timer_harmless() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2237,7 +2520,7 @@ mod tests {
     fn cache_pressure_checkpoint_disabled_when_budget_zero() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2262,8 +2545,10 @@ mod tests {
 
         let small = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
         let large = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
-        dp.handle_command(assign_segment(small, vec![]));
-        dp.handle_command(assign_segment(large, vec![]));
+        let replica_set = vec![NodeId::new(dp.node_id.to_string())];
+
+        dp.handle_command(assign_segment(small, replica_set.clone()));
+        dp.handle_command(assign_segment(large, replica_set));
 
         dp.handle_command(Produce {
             segment_key: small,
@@ -2320,7 +2605,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.config.hot_cache_budget_bytes = 10;
         dp.config.hot_cache_pressure_watermark = 0.5;
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(
+            test_key(),
+            vec![NodeId::new(dp.node_id.to_string())],
+        ));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2377,8 +2665,8 @@ mod tests {
         assert!(dp.has_buffered_data());
     }
 
-    /// On a roll the coordinator co-dispatches a `SegmentAssignment` for the new
-    /// active segment alongside the `SealResponse`. If the assignment wins the race
+    /// On a roll the coordinator co-dispatches a `PlaceSegment` for the new
+    /// active segment alongside `SegmentRollCommitted`. If the assignment wins the race
     /// (creating the successor empty first), the seal handoff must still carry the
     /// old segment's staged tail onto that existing successor — not build a fresh
     /// tracker that `insert_active` refuses, dropping the records (data loss) and
@@ -2394,11 +2682,11 @@ mod tests {
         dp.handle_command(cmd);
         assert!(dp.has_buffered_data());
 
-        // The successor's SegmentAssignment wins the race: seg1 is created empty.
+        // The successor's PlaceSegment wins the race: seg1 is created empty.
         let successor = test_key().with_segment_id(SegmentId(1));
         dp.handle_command(assign_segment(successor, vec![test_node_id()]));
 
-        // The SealResponse handoff arrives second. Pre-fix `insert_active` refuses
+        // The committed roll handoff arrives second. Pre-fix `insert_active` refuses
         // (seg1 already active) → the staged produce is dropped and `buffer_byte_count`
         // strands, tripping `assert_invariants` after the command.
         dp.handle_command(seal_response(
@@ -2419,8 +2707,8 @@ mod tests {
         let key1 = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
         let key2 = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
 
-        dp.handle_command(assign_segment(key1, vec![]));
-        dp.handle_command(assign_segment(key2, vec![]));
+        dp.handle_command(assign_segment(key1, vec![test_node_id()]));
+        dp.handle_command(assign_segment(key2, vec![test_node_id()]));
 
         let wal_file_count =
             || -> usize { std::fs::read_dir(dir.path().join("wal")).unwrap().count() };
@@ -2451,8 +2739,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         assert_eq!(dp.segments.len(), 1);
     }
@@ -2462,7 +2750,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd1, _rx1) = produce(test_key());
         let (cmd2, _rx2) = produce(test_key());
@@ -2519,7 +2807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
@@ -2592,10 +2880,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![leader, test_node_id()],
+                replicas: Replicas::new(vec![leader, test_node_id()]),
                 data: b"setup".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2617,10 +2905,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![leader.clone(), test_node_id()],
+                replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2636,14 +2924,38 @@ mod tests {
     }
 
     #[test]
+    fn segment_replication_rejects_a_non_leader_transport_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let leader = NodeId::new("leader-node");
+
+        dp.handle_command(receive_peer_message_from(
+            NodeId::new("other-peer"),
+            ReplicateSegmentEntries {
+                segment_key: test_key(),
+                replicas: Replicas::new(vec![leader, test_node_id()]),
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                entry_id: EntryId(0),
+            },
+        ));
+
+        assert!(!dp.segments.contains_key(&test_key()));
+        assert!(!dp.needs_flush);
+    }
+
+    #[test]
     fn replica_append_rejected_if_not_in_replica_set() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![NodeId::new("other-leader"), NodeId::new("other-follower")],
+                replicas: Replicas::new(vec![
+                    NodeId::new("other-leader"),
+                    NodeId::new("other-follower"),
+                ]),
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2660,10 +2972,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![leader.clone(), test_node_id()],
+                replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2672,8 +2984,8 @@ mod tests {
         ));
         dp.flush_batch();
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CommitAdvance {
+        dp.handle_command(receive_peer_message(
+            AdvanceReplicaCommit {
                 segment_key: test_key(),
                 committed_entry_id: EntryId(0),
             }
@@ -2779,10 +3091,10 @@ mod tests {
 
         assert!(!dp.needs_flush);
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![leader, test_node_id()],
+                replicas: Replicas::new(vec![leader, test_node_id()]),
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2794,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_response_no_uncommitted_skips_wal_write() {
+    fn segment_roll_committed_without_uncommitted_data_skips_wal_write() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower");
@@ -2812,11 +3124,11 @@ mod tests {
             .unwrap()
             .commit_entry(EntryId(0));
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            SealResponse {
+        dp.handle_command(receive_peer_message(
+            SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
-                new_replica_set: vec![test_node_id(), NodeId::new("new-follower")],
+                new_replica_set: Replicas::new(vec![test_node_id(), NodeId::new("new-follower")]),
             }
             .into(),
         ));
@@ -2857,8 +3169,8 @@ mod tests {
         dp.enqueue_seal_request(test_key());
         dp.enqueue_seal_request(test_key());
 
-        // Count only seal requests — `handle_segment_assignment` also emits a
-        // SegmentAssignmentAck via SendToCoordinator, which is not a seal.
+        // Count only seal requests — `handle_place_segment` also emits a
+        // SegmentPlaced via SendToCoordinator, which is not a seal.
         assert_eq!(
             dp.out
                 .transport_cmds
@@ -2866,7 +3178,7 @@ mod tests {
                 .filter(|c| matches!(
                     c,
                     DataTransportCommand::SendToCoordinator(s)
-                        if matches!(s.message, DataPlaneInterNodeCommand::SealRequest(_))
+                        if matches!(s.message, DataPlanePeerMessage::RequestSegmentRoll(_))
                 ))
                 .count(),
             1
@@ -2879,10 +3191,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            ReplicaAppend {
+        dp.handle_command(receive_peer_message(
+            ReplicateSegmentEntries {
                 segment_key: test_key(),
-                replica_set: vec![leader, test_node_id()],
+                replicas: Replicas::new(vec![leader, test_node_id()]),
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
@@ -2909,7 +3221,7 @@ mod tests {
     // ── D4 integration tests ──────────────────────────────────────────
     //
     // These exercise the resolver end-to-end via `DataPlane` commands —
-    // SegmentAssignment routes through `handle_segment_assignment`, seal
+    // PlaceSegment routes through `handle_place_segment`, seal
     // routes through `handle_seal_response`, etc. The unit-level tests for
     // the index itself live in `states/segment_store.rs`.
 
@@ -2919,7 +3231,7 @@ mod tests {
     fn segment_assignment_indexes_for_resolver() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let resolved = dp
             .segments
@@ -2928,19 +3240,19 @@ mod tests {
         assert!(matches!(resolved, SegmentReadState::Active(k) if k == test_key()));
     }
 
-    /// Verifies the leader-side seal path: after `SealResponse`, the old
+    /// Verifies the leader-side seal path: after `SegmentRollCommitted`, the old
     /// segment migrates to the sealed table with `end_entry_id` set from
     /// the tracker's `committed_entry_id`, and the new segment becomes the
     /// active index entry for the range.
     #[test]
-    fn seal_response_routes_old_offsets_through_sealed_table() {
+    fn segment_roll_committed_routes_old_offsets_through_sealed_table() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
         // Single-replica produce auto-commits on flush, so entry 0 is
         // committed at the time we issue the seal. After seal: end=0 on the
         // sealed entry, new segment starts at offset 1.
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
         let (cmd, _rx) = produce(test_key());
         dp.handle_command(cmd);
         process_and_flush(
@@ -2950,11 +3262,11 @@ mod tests {
             ),
         );
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            SealResponse {
+        dp.handle_command(receive_peer_message(
+            SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
-                new_replica_set: vec![test_node_id()],
+                new_replica_set: Replicas::new(vec![test_node_id()]),
             }
             .into(),
         ));
@@ -3014,11 +3326,11 @@ mod tests {
         );
 
         // Replication-timeout failover seals the never-committed segment.
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            SealResponse {
+        dp.handle_command(receive_peer_message(
+            SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
-                new_replica_set: vec![test_node_id()],
+                new_replica_set: Replicas::new(vec![test_node_id()]),
             }
             .into(),
         ));
@@ -3088,7 +3400,7 @@ mod tests {
         );
 
         // Assign + produce 3 records (single replica → commit inline on flush).
-        dp.handle_command(assign_segment(test_key(), vec![]));
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
         let records: [(&[u8], u32); 3] = [(b"alpha", 2), (b"bravo", 5), (b"charlie", 1)];
         for (payload, record_count) in records {
             let (tx, _rx) = oneshot::channel();
@@ -3127,7 +3439,7 @@ mod tests {
             .unwrap();
         sparse.put_batch(index_entries).unwrap();
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+        dp.handle_command(receive_peer_message(
             SegmentSealed {
                 segment_key: test_key(),
                 committed_entry_id: None,
@@ -3201,7 +3513,7 @@ mod tests {
         let mut tracker = SegmentTracker::new_with_start_entry_id(
             dir.path().to_path_buf(),
             SegmentRole::Leader,
-            vec![],
+            Replicas::new(vec![test_node_id()]),
             ShardGroupId(1),
             EntryId(0),
         );
@@ -3220,8 +3532,8 @@ mod tests {
         let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
 
         let requester = NodeId::new("replacement");
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpRequest {
+        dp.handle_command(receive_peer_message(
+            RequestCatchUpEntries {
                 segment_key: test_key(),
                 from: requester.clone(),
                 local_end: Some(EntryId(4)),
@@ -3239,7 +3551,7 @@ mod tests {
     }
 
     /// A requester already at (or past) the source's committed end gets an
-    /// immediate `CatchUpStreamEnd` and no read is dispatched — the source short-
+    /// immediate `CatchUpEntriesSent` and no read is dispatched — the source short-
     /// circuits on its OWN `sealed_end`, not on anything the requester relayed.
     #[test]
     fn catch_up_request_already_caught_up_sends_done_without_reading() {
@@ -3247,8 +3559,8 @@ mod tests {
         let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
 
         let requester = NodeId::new("replacement");
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpRequest {
+        dp.handle_command(receive_peer_message(
+            RequestCatchUpEntries {
                 segment_key: test_key(),
                 from: requester.clone(),
                 local_end: Some(EntryId(10)), // == the source's sealed end
@@ -3258,7 +3570,7 @@ mod tests {
 
         // Nothing handed to the pool...
         assert!(cold_read_rx.try_recv().is_err());
-        // ...and a CatchUpStreamEnd went straight back to the requester.
+        // ...and a CatchUpEntriesSent went straight back to the requester.
         assert_eq!(dp.out.transport_cmds.len(), 1);
         let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("expected SendToTargets");
@@ -3266,12 +3578,12 @@ mod tests {
         assert_eq!(s.targets[0], requester);
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpStreamEnd(d) if d.segment_key == test_key()
+            DataPlanePeerMessage::CatchUpEntriesSent(d) if d.segment_key == test_key()
         ));
     }
 
-    /// A batch whose `next_offset` is past the sealed end emits one `CatchUpChunk`
-    /// (entries intact, with `record_count`) followed by `CatchUpStreamEnd` — no re-arm.
+    /// A batch whose `next_offset` is past the sealed end emits one `CatchUpEntries`
+    /// (entries intact, with `record_count`) followed by `CatchUpEntriesSent` — no re-arm.
     #[test]
     fn catch_up_read_complete_emits_chunk_then_done() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -3316,8 +3628,8 @@ mod tests {
             panic!("expected chunk SendToTargets");
         };
         assert_eq!(chunk.targets[0], requester);
-        let DataPlaneInterNodeCommand::CatchUpChunk(c) = &chunk.message else {
-            panic!("expected CatchUpChunk");
+        let DataPlanePeerMessage::CatchUpEntries(c) = &chunk.message else {
+            panic!("expected CatchUpEntries");
         };
         assert_eq!(c.segment_key, test_key());
         let got: Vec<(u64, u32, Vec<u8>)> = c
@@ -3339,12 +3651,12 @@ mod tests {
         };
         assert!(matches!(
             &done.message,
-            DataPlaneInterNodeCommand::CatchUpStreamEnd(_)
+            DataPlanePeerMessage::CatchUpEntriesSent(_)
         ));
     }
 
     /// A batch that ends below the sealed end emits its chunk and re-arms the next
-    /// read against the pool, resuming at `next_offset` — no `CatchUpStreamEnd` yet.
+    /// read against the pool, resuming at `next_offset` — no `CatchUpEntriesSent` yet.
     #[test]
     fn catch_up_read_complete_re_arms_until_sealed_end() {
         use crate::data_plane::states::segment::cache::CachedEntry;
@@ -3391,7 +3703,7 @@ mod tests {
         };
         assert!(matches!(
             &chunk.message,
-            DataPlaneInterNodeCommand::CatchUpChunk(_)
+            DataPlanePeerMessage::CatchUpEntries(_)
         ));
 
         // The next read was re-armed against the pool, resuming at next_offset.
@@ -3418,13 +3730,13 @@ mod tests {
         let source = NodeId::new("source");
 
         // Coordinator assigns this node the sealed segment [0, 2].
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(2),
-                replica_set: vec![test_node_id(), source.clone()],
+                replica_set: Replicas::new(vec![test_node_id(), source.clone()]),
             }
             .into(),
         ));
@@ -3437,13 +3749,13 @@ mod tests {
         assert_eq!(s.targets[0], source);
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpRequest(r)
+            DataPlanePeerMessage::RequestCatchUpEntries(r)
                 if r.segment_key == test_key() && r.local_end.is_none()
         ));
 
         // Source streams the three entries, then signals end of stream.
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpChunk {
+        dp.handle_command(receive_peer_message(
+            CatchUpEntries {
                 segment_key: test_key(),
                 entries: vec![
                     CatchUpEntry {
@@ -3466,8 +3778,8 @@ mod tests {
             }
             .into(),
         ));
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpStreamEnd {
+        dp.handle_command(receive_peer_message(
+            CatchUpEntriesSent {
                 segment_key: test_key(),
             }
             .into(),
@@ -3488,11 +3800,11 @@ mod tests {
                 matches!(t, CheckpointTask::PutAnchors(anchors) if !anchors.is_empty())
             })
         );
-        // ...and a CatchUpAck confirmed completion back to the coordinator.
+        // ...and a SegmentCaughtUp confirmed completion back to the coordinator.
         assert!(dp.out.transport_cmds.iter().any(|c| matches!(
             c,
             DataTransportCommand::SendToCoordinator(coord)
-                if matches!(&coord.message, DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key())
+                if matches!(&coord.message, DataPlanePeerMessage::SegmentCaughtUp(a) if a.segment_key == test_key())
         )));
     }
 
@@ -3505,19 +3817,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(5), // need through 5...
-                replica_set: vec![test_node_id(), NodeId::new("source")],
+                replica_set: Replicas::new(vec![test_node_id(), NodeId::new("source")]),
             }
             .into(),
         ));
         // ...but only 0..=2 arrive.
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpChunk {
+        dp.handle_command(receive_peer_message(
+            CatchUpEntries {
                 segment_key: test_key(),
                 entries: vec![
                     CatchUpEntry {
@@ -3540,8 +3852,8 @@ mod tests {
             }
             .into(),
         ));
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpStreamEnd {
+        dp.handle_command(receive_peer_message(
+            CatchUpEntriesSent {
                 segment_key: test_key(),
             }
             .into(),
@@ -3555,11 +3867,11 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, CheckpointTask::PutAnchors(_)))
         );
-        // ...and NO CatchUpAck — an unverified receive must not confirm completion.
+        // ...and NO SegmentCaughtUp — an unverified receive must not confirm completion.
         assert!(!dp.out.transport_cmds.iter().any(|c| matches!(
             c,
             DataTransportCommand::SendToCoordinator(s)
-                if matches!(&s.message, DataPlaneInterNodeCommand::CatchUpAck(_))
+                if matches!(&s.message, DataPlanePeerMessage::SegmentCaughtUp(_))
         )));
     }
 
@@ -3572,18 +3884,18 @@ mod tests {
         // Recovered from disk through entry 5 — past the sealed end of 2.
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 5));
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(2),
-                replica_set: vec![test_node_id(), NodeId::new("peer")],
+                replica_set: Replicas::new(vec![test_node_id(), NodeId::new("peer")]),
             }
             .into(),
         ));
 
-        // Zero transfer — no CatchUpRequest dispatched, only a CatchUpAck back to
+        // Zero transfer — no RequestCatchUpEntries dispatched, only a SegmentCaughtUp back to
         // the coordinator so its re-drive stops re-announcing the assignment.
         assert_eq!(dp.out.transport_cmds.len(), 1);
         let DataTransportCommand::SendToCoordinator(s) = &dp.out.transport_cmds[0] else {
@@ -3591,7 +3903,7 @@ mod tests {
         };
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpAck(a) if a.segment_key == test_key()
+            DataPlanePeerMessage::SegmentCaughtUp(a) if a.segment_key == test_key()
         ));
         // ...and the segment is now registered cold-readable at the sealed bounds.
         assert_eq!(
@@ -3662,13 +3974,13 @@ mod tests {
         write_seg_file(&path, &[(b"a", 1), (b"b", 1)]);
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(4),
-                replica_set: vec![test_node_id(), NodeId::new("source")],
+                replica_set: Replicas::new(vec![test_node_id(), NodeId::new("source")]),
             }
             .into(),
         ));
@@ -3713,7 +4025,7 @@ mod tests {
             .insert_sealed_from_catch_up(key, EntryId(0), EntryId(0));
         assert!(dp.segments.sealed_bounds(&key).is_some());
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+        dp.handle_command(receive_peer_message(
             DeleteSegments {
                 segment_keys: Box::new([key]),
             }
@@ -3742,7 +4054,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
+        dp.handle_command(receive_peer_message(
             DeleteSegments {
                 segment_keys: Box::new([test_key()]),
             }
@@ -3770,13 +4082,13 @@ mod tests {
         );
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(4),
-                replica_set: vec![test_node_id(), NodeId::new("source")],
+                replica_set: Replicas::new(vec![test_node_id(), NodeId::new("source")]),
             }
             .into(),
         ));
@@ -3788,7 +4100,7 @@ mod tests {
 
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpRequest(r) if r.local_end == Some(EntryId(1))
+            DataPlanePeerMessage::RequestCatchUpEntries(r) if r.local_end == Some(EntryId(1))
         ));
     }
 
@@ -3801,14 +4113,14 @@ mod tests {
         let leader = NodeId::new("leader");
         let follower = NodeId::new("follower");
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        dp.handle_command(receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(2),
                 // self (test-node) is a follower here; `leader` is replica_set[0].
-                replica_set: vec![leader.clone(), test_node_id(), follower.clone()],
+                replica_set: Replicas::new(vec![leader.clone(), test_node_id(), follower.clone()]),
             }
             .into(),
         ));
@@ -3825,21 +4137,21 @@ mod tests {
     // ── Re-drive rescues a stalled in-flight receive ───────────────────────
 
     fn catch_up_assignment_to(source: &NodeId, sealed_end: u64) -> DataPlaneCommand {
-        DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpAssignment {
+        receive_peer_message(
+            AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(sealed_end),
-                replica_set: vec![test_node_id(), source.clone()],
+                replica_set: Replicas::new(vec![test_node_id(), source.clone()]),
             }
             .into(),
         )
     }
 
     fn catch_up_chunk_of(ids: &[u64]) -> DataPlaneCommand {
-        DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpChunk {
+        receive_peer_message(
+            CatchUpEntries {
                 segment_key: test_key(),
                 entries: ids
                     .iter()
@@ -3883,7 +4195,7 @@ mod tests {
         assert_eq!(s.targets[0], source);
         assert!(matches!(
             &s.message,
-            DataPlaneInterNodeCommand::CatchUpRequest(r)
+            DataPlanePeerMessage::RequestCatchUpEntries(r)
                 if r.segment_key == test_key() && r.local_end.is_none()
         ));
     }
@@ -3926,8 +4238,8 @@ mod tests {
         dp.handle_command(catch_up_chunk_of(&[0, 1, 2]));
         // Overlap: 1,2 are duplicates (skipped), 3,4 are new (appended).
         dp.handle_command(catch_up_chunk_of(&[1, 2, 3, 4]));
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            CatchUpStreamEnd {
+        dp.handle_command(receive_peer_message(
+            CatchUpEntriesSent {
                 segment_key: test_key(),
             }
             .into(),
@@ -3945,7 +4257,7 @@ mod tests {
     // --- Leader-crash boundary recovery: durable extent + query handler -----
 
     /// A follower publishes (fsyncs) entries on flush but isn't told of the
-    /// commit until a `CommitAdvance` — so `durable_end` (the fsync'd extent)
+    /// commit until a `AdvanceReplicaCommit` — so `durable_end` (the fsync'd extent)
     /// runs ahead of `committed_entry_id`. Boundary recovery reads the former.
     #[test]
     fn durable_end_reports_published_extent_not_commit_cursor() {
@@ -3954,10 +4266,10 @@ mod tests {
         let leader = NodeId::new("leader-node");
 
         for entry_id in 0..3 {
-            dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-                ReplicaAppend {
+            dp.handle_command(receive_peer_message(
+                ReplicateSegmentEntries {
                     segment_key: test_key(),
-                    replica_set: vec![leader.clone(), test_node_id()],
+                    replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
                     data: b"x".to_vec().into(),
                     record_count: 1,
                     entry_id: EntryId(entry_id),
@@ -3965,7 +4277,7 @@ mod tests {
                 .into(),
             ));
         }
-        dp.flush_batch(); // publishes 0,1,2 past the WAL fsync; no CommitAdvance yet
+        dp.flush_batch(); // publishes 0,1,2 past the WAL fsync; no AdvanceReplicaCommit yet
 
         assert_eq!(
             dp.segments.get(&test_key()).unwrap().committed_entry_id(),
@@ -3999,15 +4311,15 @@ mod tests {
         assert_eq!(empty_dp.durable_end(&test_key()), None);
     }
 
-    /// A `SealBoundaryQuery` is answered with our durable extent, addressed back to
+    /// A `RequestDurableSegmentEnd` is answered with our durable extent, addressed back to
     /// the coordinator that owns this gather.
     #[test]
     fn seal_boundary_query_replies_with_durable_end() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 4));
 
-        dp.handle_command(DataPlaneCommand::DataPlaneInterNodeCommand(
-            SealBoundaryQuery {
+        dp.handle_command(receive_peer_message(
+            RequestDurableSegmentEnd {
                 segment_key: test_key(),
                 coordinator: NodeId::new("coordinator"),
             }
@@ -4019,8 +4331,8 @@ mod tests {
             panic!("boundary report must route to the coordinator");
         };
         assert_eq!(s.targets.as_ref(), &[NodeId::new("coordinator")]);
-        let DataPlaneInterNodeCommand::SealBoundaryReport(report) = &s.message else {
-            panic!("expected a SealBoundaryReport");
+        let DataPlanePeerMessage::DurableSegmentEndReported(report) = &s.message else {
+            panic!("expected a DurableSegmentEndReported");
         };
         assert_eq!(report.segment_key, test_key());
         assert_eq!(report.from, test_node_id());

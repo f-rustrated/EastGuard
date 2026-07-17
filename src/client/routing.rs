@@ -24,7 +24,7 @@ struct RangeRoute {
     /// `replica_set[0]` of the active segment, the produce target. `None` when the
     /// range has no active segment (sealed/deleting) or its replica set is empty.
     write_leader: Option<NodeAddressInfo>,
-    replicas: Box<[NodeAddressInfo]>,
+    replica_addrs: Box<[NodeAddressInfo]>,
 }
 
 // Active segment only — correct for produce (the write head) and a tailing consumer.
@@ -48,7 +48,7 @@ impl From<&RangeDetail> for RangeRoute {
                 .active_segment
                 .as_ref()
                 .and_then(|_| replicas.first().cloned()),
-            replicas,
+            replica_addrs: replicas,
         }
     }
 }
@@ -77,14 +77,14 @@ impl TopicRouting {
         self.ranges
             .iter()
             .find(|r| r.range_id == range_id)
-            .map(|r| r.replicas.as_ref())
+            .map(|r| r.replica_addrs.as_ref())
     }
 
     pub(crate) fn write_leader_for_range(&self, range_id: RangeId) -> Option<NodeAddressInfo> {
         self.ranges
             .iter()
             .find(|range| range.range_id == range_id)
-            .and_then(|range| range.replicas.first().cloned())
+            .and_then(|range| range.replica_addrs.first().cloned())
     }
 }
 
@@ -174,7 +174,7 @@ impl RoutingCache {
                     range_id: r.range_id,
                     keyspace_start: r.keyspace_start.clone(),
                     write_leader: r.write_leader.as_ref().map(|_| wrong.clone()),
-                    replicas: r.replicas.clone(),
+                    replica_addrs: r.replica_addrs.clone(),
                 })
                 .collect();
 

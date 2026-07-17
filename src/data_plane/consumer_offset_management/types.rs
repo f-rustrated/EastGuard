@@ -1,6 +1,13 @@
+use std::collections::HashSet;
+
 use crate::control_plane::{NodeId, Replicas};
-use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetUpdate, OffsetRecord};
-use crate::data_plane::messages::command::{CommitConsumerOffset, ConsumerOffsetCommitAck};
+use crate::data_plane::SegmentKey;
+use crate::data_plane::consumer_offset_management::ledger::{
+    ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
+};
+use crate::data_plane::messages::command::{
+    CommitConsumerOffset, ConsumerOffsetCommitAck, ConsumerOffsetSnapshotInstalled,
+};
 use crate::impl_from_variant;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -22,36 +29,57 @@ impl PendingOffsetMutation {
     }
 }
 
+impl From<ReplicateConsumerOffset> for PendingOffsetMutation {
+    fn from(cmd: ReplicateConsumerOffset) -> Self {
+        Self::new(OffsetRecord::OffsetCommit(cmd.update.clone()), cmd)
+    }
+}
+impl From<EpochSeal> for PendingOffsetMutation {
+    fn from(cmd: EpochSeal) -> Self {
+        PendingOffsetMutation::new(
+            OffsetRecord::EpochSeal(cmd.clone()),
+            OffsetMutationCompletion::EpochSeal,
+        )
+    }
+}
+
 pub(crate) struct LeaderOffsetCommitApplied {
     pub(crate) replica_set: Replicas,
+    pub(crate) required_followers: HashSet<NodeId>,
     pub(crate) reply: oneshot::Sender<ConsumerOffsetCommitAck>,
 }
 
 pub(crate) enum OffsetMutationCompletion {
     EpochSeal,
     LeaderCommit(LeaderOffsetCommitApplied),
-    ReplicaCommit(ReplicaOffsetCommit),
+    ReplicaCommit(ReplicateConsumerOffset),
+    Bootstrap(ConsumerOffsetSnapshotInstalled),
 }
 
 impl_from_variant!(
     OffsetMutationCompletion,
     LeaderCommit(LeaderOffsetCommitApplied),
-    ReplicaCommit(ReplicaOffsetCommit)
+    ReplicaCommit(ReplicateConsumerOffset),
+    Bootstrap(ConsumerOffsetSnapshotInstalled)
 );
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct ReplicaOffsetCommit {
+pub struct ReplicateConsumerOffset {
     pub seq: u64,
+    pub segment_key: SegmentKey,
     pub replica_set: Replicas,
     pub update: ConsumerOffsetUpdate,
 }
 
 pub(crate) enum FutureOffsetCommit {
     Client(CommitConsumerOffset),
-    Replica(ReplicaOffsetCommit),
+    Replica(ReplicateConsumerOffset),
 }
 
-pub(crate) struct OffsetPlacement {
-    pub(crate) leader: NodeId,
-    pub(crate) replicas: Replicas,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementObservation {
+    Accepted,
+    Unchanged,
+    Stale,
+    Conflict,
 }

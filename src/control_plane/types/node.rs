@@ -139,13 +139,13 @@ impl std::borrow::Borrow<str> for NodeId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
-pub struct Replicas(Vec<NodeId>);
-crate::smart_pointer!(Replicas, Vec<NodeId>);
+pub struct Replicas(pub Box<[NodeId]>);
+crate::impl_new_struct_wrapper!(Replicas, Box<[NodeId]>);
 
 impl Replicas {
     pub fn new(nodes: Vec<NodeId>) -> Self {
         assert!(!nodes.is_empty(), "Replica set cannot be empty");
-        Self(nodes)
+        Self(nodes.into_boxed_slice())
     }
 
     pub fn leader(&self) -> Option<&NodeId> {
@@ -154,5 +154,20 @@ impl Replicas {
 
     pub fn followers(&self) -> impl Iterator<Item = &NodeId> {
         self.iter().skip(1)
+    }
+
+    pub fn extend(&mut self, nodes: &[NodeId]) {
+        let new_nodes = [&*self.0, nodes].concat();
+        self.0 = new_nodes.into_boxed_slice();
+    }
+
+    pub fn change_leader(&mut self, pos: usize) {
+        // Take until pos and rotate to right so
+        // [A,B,C] -> [C,A,B]
+        self.0[0..=pos].rotate_right(1);
+    }
+
+    pub fn except_for(&self, node: &NodeId) -> Vec<NodeId> {
+        self.0.iter().filter(|n| *n != node).cloned().collect()
     }
 }

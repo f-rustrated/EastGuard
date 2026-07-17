@@ -741,6 +741,119 @@ fn consumer_group_rebalance_survives_broker_restart_without_offset_replay() {
 }
 
 #[test]
+#[serial_test::serial]
+fn restarted_offset_replica_bootstraps_missed_epoch_before_commit_ack() {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(10))
+        .simulation_duration(Duration::from_secs(75))
+        .rng_seed(187)
+        .build();
+
+    host_cluster(&mut sim, NODES, |env| {
+        env.node_id_suffix = Some("sim-187".to_string());
+        env.vnodes_per_node = 16;
+    });
+
+    // 0 = setup, 1 = crash replica, 2 = replica down, 3 = replica restarted.
+    let phase = Arc::new(AtomicU8::new(0));
+    let client_phase = phase.clone();
+    sim.client("client", async move {
+        let client_addr: std::net::SocketAddr =
+            format!("{}:9091", turmoil::lookup("n1")).parse().unwrap();
+        let admin = Arc::new(Client::connect([client_addr]).unwrap());
+        let producer_client = Arc::new(Client::connect([client_addr]).unwrap());
+        let first_client = Arc::new(Client::connect([client_addr]).unwrap());
+        let second_client = Arc::new(Client::connect([client_addr]).unwrap());
+        let topic = "rebalance_restart_offsets";
+        create_group_test_topics(&admin, topic).await;
+        let producer = Producer::new(
+            producer_client,
+            topic.to_string(),
+            ProducerConfig::default(),
+        );
+        let group_id = "offset-replica-epoch-bootstrap-group".to_string();
+        let first = Consumer::new(
+            first_client,
+            topic.to_string(),
+            KeyInterest::AllKeys,
+            group_config(group_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        producer.send(b"before", b"before".to_vec()).await.unwrap();
+        let before = tokio::time::timeout(Duration::from_secs(8), first.next_record())
+            .await
+            .expect("initial consume timed out")
+            .expect("initial consume failed")
+            .expect("initial consumer closed");
+        first.ack(&before).unwrap();
+        first.commit().await.unwrap();
+
+        client_phase.store(1, Ordering::SeqCst);
+        while client_phase.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // This membership change advances the group generation while n2 is down,
+        // so n2 misses the epoch seal but remains in the unchanged data placement.
+        let second = Consumer::new(
+            second_client,
+            topic.to_string(),
+            KeyInterest::AllKeys,
+            group_config(group_id),
+        )
+        .await
+        .unwrap();
+
+        while client_phase.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        producer.send(b"after", b"after".to_vec()).await.unwrap();
+        tokio::select! {
+            result = first.next_record() => {
+                let record = result.unwrap().expect("first consumer closed");
+                assert_eq!(record.value, b"after");
+                first.ack(&record).unwrap();
+                first.commit().await.unwrap();
+            }
+            result = second.next_record() => {
+                let record = result.unwrap().expect("second consumer closed");
+                assert_eq!(record.value, b"after");
+                second.ack(&record).unwrap();
+                second.commit().await.unwrap();
+            }
+            _ = tokio::time::sleep(Duration::from_secs(12)) => {
+                panic!("post-restart record was not delivered");
+            }
+        }
+        Ok(())
+    });
+
+    while phase.load(Ordering::SeqCst) < 1 {
+        assert!(
+            sim.elapsed() < Duration::from_secs(35),
+            "client never reached the replica-crash phase"
+        );
+        sim.step().unwrap();
+    }
+    sim.crash("n2");
+    phase.store(2, Ordering::SeqCst);
+    let restart_at = sim.elapsed() + Duration::from_secs(6);
+    while sim.elapsed() < restart_at {
+        sim.step().unwrap();
+    }
+    sim.bounce("n2");
+    let recovered_at = sim.elapsed() + Duration::from_secs(6);
+    while sim.elapsed() < recovered_at {
+        sim.step().unwrap();
+    }
+    phase.store(3, Ordering::SeqCst);
+    sim.run().unwrap();
+}
+
+#[test]
 fn consumer_group_split_rebalance() {
     use crate::control_plane::metadata::RangeId;
     let mut sim = Builder::new()

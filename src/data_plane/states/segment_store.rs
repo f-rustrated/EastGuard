@@ -107,7 +107,7 @@ impl SegmentStore {
 
     /// Insert an active tracker AND its `active_by_range` index entry.
     /// Idempotent — if the key already exists the new tracker is dropped, so
-    /// callers can blindly retry a SegmentAssignment without checking first.
+    /// callers can blindly retry a PlaceSegment without checking first.
     /// The active index keys by `tracker.start_entry_id()` (invariant 2).
     ///
     /// Refuses to resurrect an already-sealed segment. A sealed segment is
@@ -331,6 +331,7 @@ impl SegmentStore {
 mod tests {
     use super::*;
     use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::{NodeId, Replicas};
     use crate::data_plane::states::segment::tracker::SegmentRole;
     use std::path::PathBuf;
 
@@ -342,7 +343,7 @@ mod tests {
         SegmentTracker::new_with_start_entry_id(
             PathBuf::from("/tmp"),
             SegmentRole::Leader,
-            vec![],
+            Replicas::new(vec![NodeId::new("tracker")]),
             ShardGroupId(1),
             EntryId(start),
         )

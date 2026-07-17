@@ -1,18 +1,18 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::membership::ShardGroupId;
-use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+use crate::data_plane::messages::command::DataPlanePeerMessage;
 use crate::impl_from_variant;
 
 #[derive(Debug)]
 pub(crate) struct DataTransportSendToTargets {
     pub targets: Box<[NodeId]>,
-    pub message: DataPlaneInterNodeCommand,
+    pub message: DataPlanePeerMessage,
 }
 
 #[derive(Debug)]
 pub(crate) struct DataTransportSendToCoordinator {
     pub shard_group_id: ShardGroupId,
-    pub message: DataPlaneInterNodeCommand,
+    pub message: DataPlanePeerMessage,
 }
 
 #[derive(Debug)]
@@ -31,11 +31,11 @@ impl_from_variant!(
 
 impl DataTransportCommand {
     pub(crate) fn send_to_targets(
-        targets: Vec<NodeId>,
-        message: impl Into<DataPlaneInterNodeCommand>,
+        targets: impl Into<Box<[NodeId]>>,
+        message: impl Into<DataPlanePeerMessage>,
     ) -> Self {
         Self::SendToTargets(DataTransportSendToTargets {
-            targets: targets.into_boxed_slice(),
+            targets: targets.into(),
             message: message.into(),
         })
     }

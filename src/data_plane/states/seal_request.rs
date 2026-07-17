@@ -1,7 +1,7 @@
-//! Pending seal requests — the leader→coordinator `SealRequest` retry tracker.
+//! Pending segment-roll requests from the write leader to the coordinator.
 //!
-//! A leader that can't replicate sends a `SealRequest` and tracks it here until a
-//! `SealResponse` clears it; the data plane re-sends ones that time out. Owns the
+//! A leader that can't replicate sends `RequestSegmentRoll` and tracks it until
+//! `SegmentRollCommitted` clears it; the data plane re-sends timed-out requests. Owns the
 //! dedup + timing bookkeeping; building/sending the request stays in the data
 //! plane (it reads the live tracker's committed end).
 
@@ -16,18 +16,18 @@ use tokio::time::Instant;
 use crate::control_plane::NodeId;
 use crate::data_plane::SegmentKey;
 
-struct PendingSealRequest {
+struct PendingSegmentRollRequest {
     sent_at: Instant,
     failed_nodes: Vec<NodeId>,
 }
 
-/// Seal requests awaiting a `SealResponse`, keyed by segment.
+/// Segment-roll requests awaiting `SegmentRollCommitted`, keyed by segment.
 #[derive(Default)]
-pub(crate) struct PendingSealRequests {
-    requests: HashMap<SegmentKey, PendingSealRequest>,
+pub(crate) struct PendingSegmentRollRequests {
+    requests: HashMap<SegmentKey, PendingSegmentRollRequest>,
 }
 
-impl PendingSealRequests {
+impl PendingSegmentRollRequests {
     /// Whether a request for `key` is already in flight (the dedup guard).
     pub(crate) fn is_tracked(&self, key: &SegmentKey) -> bool {
         self.requests.contains_key(key)
@@ -37,14 +37,14 @@ impl PendingSealRequests {
     pub(crate) fn track(&mut self, key: SegmentKey, failed_nodes: Vec<NodeId>, now: Instant) {
         self.requests.insert(
             key,
-            PendingSealRequest {
+            PendingSegmentRollRequest {
                 sent_at: now,
                 failed_nodes,
             },
         );
     }
 
-    /// Drop a request once its `SealResponse` lands.
+    /// Drop a request once its committed result lands.
     pub(crate) fn clear(&mut self, key: &SegmentKey) {
         self.requests.remove(key);
     }
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn track_then_clear() {
-        let mut p = PendingSealRequests::default();
+        let mut p = PendingSegmentRollRequests::default();
         assert!(!p.is_tracked(&seg()));
         p.track(seg(), vec![], Instant::now());
         assert!(p.is_tracked(&seg()));
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn take_due_returns_only_timed_out_then_refreshes() {
-        let mut p = PendingSealRequests::default();
+        let mut p = PendingSegmentRollRequests::default();
         let t0 = Instant::now();
         let timeout = Duration::from_secs(5);
         p.track(seg(), vec![NodeId::new("d")], t0);

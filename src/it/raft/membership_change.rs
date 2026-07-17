@@ -14,7 +14,7 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, Topology};
-use crate::control_plane::{NodeId, SwimNodeState};
+use crate::control_plane::{NodeId, Replicas, SwimNodeState};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
@@ -196,11 +196,11 @@ fn node_death_triggers_remove_peer() -> turmoil::Result {
     let group_id = ShardGroupId(99);
     let group = ShardGroup {
         id: group_id,
-        members: vec![
+        replicas: Replicas::new(vec![
             NodeId::new("node-1"),
             NodeId::new("node-2"),
             NodeId::new("node-3"),
-        ],
+        ]),
     };
 
     for (name, port, peers) in [
@@ -275,11 +275,11 @@ fn node_death_removes_dead_voter_unreachable_spare_stays_non_voting() -> turmoil
     let group_id = ShardGroupId(101);
     let initial_group = ShardGroup {
         id: group_id,
-        members: vec![
+        replicas: Replicas::new(vec![
             NodeId::new("node-1"),
             NodeId::new("node-2"),
             NodeId::new("node-3"),
-        ],
+        ]),
     };
 
     // peer_names threaded into start_raft_node seed the stub topology — all

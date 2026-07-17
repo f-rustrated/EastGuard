@@ -1,5 +1,5 @@
 use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
-use crate::control_plane::{NodeAddressInfo, NodeId, SwimNodeState};
+use crate::control_plane::{NodeAddressInfo, NodeId, Replicas, SwimNodeState};
 use crate::impl_new_struct_wrapper;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -31,7 +31,7 @@ impl_new_struct_wrapper!(ShardGroupId, u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardGroup {
     pub id: ShardGroupId,
-    pub members: Vec<NodeId>,
+    pub replicas: Replicas,
 }
 
 /// Position on the consistent hash ring. Sorted by `(hash, pnode_id, replica_index)`.
@@ -109,11 +109,8 @@ impl TopologyReader {
     /// Ring membership of `group_id` in the current snapshot, regardless of
     /// whether the local node is among the members. `None` when the group is
     /// not in the snapshot at all.
-    pub(crate) fn group_ring_members(&self, group_id: ShardGroupId) -> Option<Box<[NodeId]>> {
-        self.0
-            .load()
-            .group(group_id)
-            .map(|g| g.members.clone().into_boxed_slice())
+    pub(crate) fn group_ring_members(&self, group_id: ShardGroupId) -> Option<Replicas> {
+        self.0.load().group(group_id).map(|g| g.replicas.clone())
     }
 
     /// The cluster's configured replication factor — the target replica-set size a
@@ -245,7 +242,7 @@ impl Topology {
             .chain(self.vnodes.range(..&start))
     }
 
-    fn token_owners_at(&self, hash: u32, n: usize) -> Vec<&NodeId> {
+    fn token_owners_at(&self, hash: u32, n: usize) -> Vec<NodeId> {
         if self.vnodes.is_empty() || n == 0 {
             return Vec::new();
         }
@@ -257,16 +254,16 @@ impl Topology {
         hash: u32,
         n: usize,
         excluded: &HashSet<NodeId>,
-    ) -> Vec<&NodeId> {
-        let mut result: Vec<&NodeId> = Vec::with_capacity(n);
+    ) -> Vec<NodeId> {
+        let mut result: Vec<NodeId> = Vec::with_capacity(n);
         for token in self.walk_clockwise_from(hash) {
             if excluded.contains(&token.pnode_id) {
                 continue;
             }
-            if result.iter().any(|o| **o == token.pnode_id) {
+            if result.contains(&token.pnode_id) {
                 continue;
             }
-            result.push(&token.pnode_id);
+            result.push(token.pnode_id.clone());
             if result.len() == n {
                 break;
             }
@@ -304,20 +301,21 @@ impl Topology {
             if !seen.insert(id) {
                 continue;
             }
-            let owners = self.token_owners_at(token.hash, self.config.replication_factor);
-            let members: Vec<NodeId> = owners.into_iter().cloned().collect();
-            for member in &members {
+            let replicas =
+                Replicas::new(self.token_owners_at(token.hash, self.config.replication_factor));
+
+            for member in &replicas.0 {
                 self.node_group_ids
                     .entry(member.clone())
                     .or_default()
                     .push(id);
             }
-            self.groups.insert(id, ShardGroup { id, members });
+            self.groups.insert(id, ShardGroup { id, replicas });
         }
     }
 
     #[cfg(test)]
-    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<&NodeId> {
+    fn token_owners_for(&self, key: &[u8], n: usize) -> Vec<NodeId> {
         let hash = hash_stable(key);
         self.token_owners_at(hash, n)
     }
@@ -376,7 +374,6 @@ impl Topology {
         let anchor = group_id.0 as u32;
         self.collect_distinct_owners_excluding(anchor, count, excluded)
             .into_iter()
-            .cloned()
             .collect()
     }
 
@@ -451,7 +448,7 @@ pub mod props {
                         .get(gid)
                         .expect("node_group_ids references missing group");
                     assert!(
-                        group.members.contains(node_id),
+                        group.replicas.contains(node_id),
                         "node {:?} in reverse index for group {:?} but not in group members",
                         node_id,
                         gid
@@ -463,7 +460,7 @@ pub mod props {
         fn assert_groups_consistent(&self) {
             use std::collections::HashSet;
             for (gid, group) in &self.groups {
-                for member in &group.members {
+                for member in &group.replicas.0 {
                     let ids = self
                         .node_group_ids
                         .get(member)
@@ -475,10 +472,10 @@ pub mod props {
                         member
                     );
                 }
-                let unique: HashSet<&NodeId> = group.members.iter().collect();
+                let unique: HashSet<&NodeId> = group.replicas.iter().collect();
                 assert_eq!(
                     unique.len(),
-                    group.members.len(),
+                    group.replicas.len(),
                     "group {:?} has duplicate members",
                     gid
                 );
@@ -634,7 +631,7 @@ mod tests {
 
         let multiple_owner = topology.token_owners_for(b"hello", 3);
         assert_eq!(multiple_owner.len(), 3);
-        let physical_node_ids: HashSet<&NodeId> = multiple_owner.into_iter().collect();
+        let physical_node_ids: HashSet<NodeId> = multiple_owner.into_iter().collect();
         assert_eq!(physical_node_ids.len(), 3);
     }
 
@@ -672,7 +669,7 @@ mod tests {
 
         let new_owners = topology.token_owners_for(key, 1);
         assert_eq!(new_owners.len(), 1);
-        assert_eq!(*new_owners[0], successor_id);
+        assert_eq!(new_owners[0], successor_id);
     }
 
     // --- ShardGroup tests ---
@@ -688,9 +685,9 @@ mod tests {
         );
 
         let group = topology.shard_group_for(b"topic-blue").unwrap();
-        assert_eq!(group.members.len(), 3);
+        assert_eq!(group.replicas.len(), 3);
 
-        let unique: HashSet<_> = group.members.iter().collect();
+        let unique: HashSet<_> = group.replicas.iter().collect();
         assert_eq!(unique.len(), 3);
     }
 
@@ -737,7 +734,7 @@ mod tests {
         );
 
         let group = topology.shard_group_for(b"any-key").unwrap();
-        assert_eq!(group.members.len(), 2);
+        assert_eq!(group.replicas.len(), 2);
     }
 
     #[test]
@@ -752,14 +749,14 @@ mod tests {
 
         let key = b"test-key";
         let before = topology.shard_group_for(key).unwrap().clone();
-        assert_eq!(before.members.len(), 3);
+        assert_eq!(before.replicas.len(), 3);
 
-        let removed = before.members[0].clone();
+        let removed = before.replicas[0].clone();
         topology.remove_node(&removed);
 
         let after = topology.shard_group_for(key).unwrap();
-        assert_eq!(after.members.len(), 2);
-        assert!(!after.members.contains(&removed));
+        assert_eq!(after.replicas.len(), 2);
+        assert!(!after.replicas.contains(&removed));
     }
 
     #[test]
@@ -790,8 +787,8 @@ mod tests {
         let groups = topology.shard_groups_for_node(&NodeId::new("node-0"));
         assert!(!groups.is_empty());
         for group in &groups {
-            assert!(group.members.contains(&NodeId::new("node-0")));
-            assert_eq!(group.members.len(), 3);
+            assert!(group.replicas.contains(&NodeId::new("node-0")));
+            assert_eq!(group.replicas.len(), 3);
         }
     }
 
@@ -913,7 +910,7 @@ mod tests {
     fn ring_replacements_returns_node_not_in_excluded() {
         let topology = five_node_topology();
         let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
-        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let current: HashSet<NodeId> = group.replicas.iter().cloned().collect();
 
         let picks = topology.ring_replacements_for(group.id, &current, 1);
 
@@ -931,7 +928,7 @@ mod tests {
         let topology = five_node_topology();
         let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
         // Exclude four of five nodes: every member plus one extra outsider.
-        let mut excluded: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let mut excluded: HashSet<NodeId> = group.replicas.iter().cloned().collect();
         let outsider = topology
             .live_nodes()
             .into_iter()
@@ -959,7 +956,7 @@ mod tests {
     fn ring_replacements_returns_fewer_than_count_when_pool_depleted() {
         let topology = five_node_topology();
         let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
-        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let current: HashSet<NodeId> = group.replicas.iter().cloned().collect();
 
         // 5 total, 3 excluded → 2 eligible. Ask for 5; expect 2.
         let picks = topology.ring_replacements_for(group.id, &current, 5);
@@ -1002,7 +999,7 @@ mod tests {
     fn ring_replacements_deterministic_across_calls() {
         let topology = five_node_topology();
         let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
-        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let current: HashSet<NodeId> = group.replicas.iter().cloned().collect();
 
         let a = topology.ring_replacements_for(group.id, &current, 2);
         let b = topology.ring_replacements_for(group.id, &current, 2);
@@ -1031,7 +1028,7 @@ mod tests {
         let g2 = t2.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(g1.id, g2.id, "group id must be deterministic");
 
-        let excluded: HashSet<NodeId> = g1.members.iter().cloned().collect();
+        let excluded: HashSet<NodeId> = g1.replicas.iter().cloned().collect();
         let p1 = t1.ring_replacements_for(g1.id, &excluded, 2);
         let p2 = t2.ring_replacements_for(g2.id, &excluded, 2);
         assert_eq!(p1, p2);
@@ -1044,19 +1041,16 @@ mod tests {
         // Verifies we're picking the ring's natural successors, not arbitrary nodes.
         let topology = five_node_topology();
         let group = topology.shard_group_for(b"topic-blue").unwrap().clone();
-        assert_eq!(group.members.len(), 3);
+        assert_eq!(group.replicas.len(), 3);
 
         // Owners at RF=5 are: the 3 current members, then the 2 ring successors.
-        let owners_5: Vec<NodeId> = topology
-            .token_owners_at(group.id.0 as u32, 5)
-            .into_iter()
-            .cloned()
-            .collect();
+        let owners_5 = topology.token_owners_at(group.id.0 as u32, 5);
+
         assert_eq!(owners_5.len(), 5);
-        assert_eq!(&owners_5[..3], group.members.as_slice());
+        assert_eq!(&owners_5[..3], &group.replicas[..3]);
         let expected_successors = &owners_5[3..];
 
-        let current: HashSet<NodeId> = group.members.iter().cloned().collect();
+        let current: HashSet<NodeId> = group.replicas.iter().cloned().collect();
         let picks = topology.ring_replacements_for(group.id, &current, 2);
         assert_eq!(&*picks, expected_successors);
     }
@@ -1291,6 +1285,6 @@ mod tests {
         let g1 = t1.shard_group_for(b"topic-blue").unwrap();
         let g2 = t2.shard_group_for(b"topic-blue").unwrap();
         assert_eq!(g1.id, g2.id);
-        assert_eq!(g1.members, g2.members);
+        assert_eq!(g1.replicas, g2.replicas);
     }
 }

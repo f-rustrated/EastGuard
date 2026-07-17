@@ -1,8 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::{
-    CoordinatorSealRequest, DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc,
-    LogMutation, MetadataProposal, MultiRaftActorCommand, RaftEvent, RaftProtocolMessage,
-    RaftTimeoutCallback,
+    DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
+    MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{LeaderlessSegments, Raft, TimerSeqs};
@@ -16,7 +15,7 @@ use crate::control_plane::metadata::{
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
-    CatchUpAck, SealBoundaryQuery, SealBoundaryReport, SegmentAssignmentAck,
+    DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentPlaced,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -104,7 +103,7 @@ impl PendingSealTracker {
     /// Drop every pending seal context for `group_id`. Called when a leader
     /// steps down — any not-yet-committed proposals will either be truncated
     /// by the new leader or commit there, but this replica will no longer be
-    /// the one to dispatch the SealResponse.
+    /// the one to dispatch `SegmentRollCommitted`.
     fn drop_group(&mut self, group_id: ShardGroupId) {
         if let Some(stale_group) = self.by_group.remove(&group_id) {
             for seal in stale_group.into_values() {
@@ -147,7 +146,7 @@ impl MultiRaft {
     pub(crate) fn reconcile_on_leadership_change(&mut self, shard_group_id: ShardGroupId) {
         let target_members = self.topology.group_ring_members(shard_group_id);
 
-        self.reconcile_membership(shard_group_id, target_members);
+        self.reconcile_membership(shard_group_id, target_members.map(|e| e.0));
 
         // Takeover backstop: the catch-up tracker is leader-volatile, so a repair
         // in flight when leadership changed left it empty here. Re-seed it; the
@@ -265,16 +264,16 @@ impl MultiRaft {
                         },
                     ));
             }
-            MultiRaftActorCommand::Coordinator(req) => {
-                self.handle_seal_request(req);
+            MultiRaftActorCommand::ProposeSegmentRoll(cmd) => {
+                self.propose_segment_roll(cmd);
             }
             MultiRaftActorCommand::AssignmentAck(ack) => {
-                self.handle_assignment_ack(ack);
+                self.handle_segment_placed(ack);
             }
-            MultiRaftActorCommand::SealBoundaryReport(report) => {
+            MultiRaftActorCommand::DurableSegmentEndReported(report) => {
                 self.handle_seal_boundary_report(report);
             }
-            MultiRaftActorCommand::CatchUpAck(ack) => {
+            MultiRaftActorCommand::SegmentCaughtUp(ack) => {
                 self.handle_catch_up_ack(ack);
             }
         }
@@ -323,12 +322,12 @@ impl MultiRaft {
         if self.groups.contains_key(&group.id) {
             return;
         }
-        if !group.members.contains(&self.node_id) {
+        if !group.replicas.contains(&self.node_id) {
             return;
         }
 
         let peers: HashSet<NodeId> = group
-            .members
+            .replicas
             .iter()
             .filter(|id| *id != &self.node_id)
             .cloned()
@@ -428,11 +427,11 @@ impl MultiRaft {
         }
     }
 
-    fn handle_assignment_ack(&mut self, ack: SegmentAssignmentAck) {
+    fn handle_segment_placed(&mut self, ack: SegmentPlaced) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;
         };
-        raft.handle_assignment_ack(ack);
+        raft.handle_segment_placed(ack);
     }
 
     fn get_leader(&self, group_id: ShardGroupId) -> Option<NodeId> {
@@ -512,7 +511,7 @@ impl MultiRaft {
         }
     }
 
-    fn handle_seal_request(&mut self, req: CoordinatorSealRequest) {
+    fn propose_segment_roll(&mut self, req: ProposeSegmentRoll) {
         let seal = &req.request;
         if self.pending_seals.contains(&seal.segment_key) {
             return;
@@ -520,7 +519,7 @@ impl MultiRaft {
 
         let Some(group_id) = self.find_group_for_topic(&seal.segment_key.topic_id) else {
             tracing::warn!(
-                "SealRequest for unknown topic {:?}",
+                "segment roll requested for unknown topic {:?}",
                 seal.segment_key.topic_id
             );
             return;
@@ -530,7 +529,10 @@ impl MultiRaft {
         };
 
         let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
-            tracing::warn!("SealRequest for unknown segment {:?}", seal.segment_key);
+            tracing::warn!(
+                "segment roll requested for unknown segment {:?}",
+                seal.segment_key
+            );
             return;
         };
 
@@ -559,7 +561,7 @@ impl MultiRaft {
                 self.dirty.insert(group_id);
             }
             Err(e) => {
-                tracing::debug!("SealRequest proposal rejected: {:?}", e);
+                tracing::debug!("segment roll proposal rejected: {:?}", e);
             }
         }
     }
@@ -574,7 +576,7 @@ impl MultiRaft {
 
     /// Feed a survivor's durable extent into the subsystem; if it completes a
     /// gather, execute the resulting seal.
-    fn handle_seal_boundary_report(&mut self, report: SealBoundaryReport) {
+    fn handle_seal_boundary_report(&mut self, report: DurableSegmentEndReported) {
         match self
             .seal_recovery
             .record(report.segment_key, report.from, report.durable_end)
@@ -590,8 +592,8 @@ impl MultiRaft {
     }
 
     /// Route a catch-up confirmation to the owning group's `Raft`, which clears the
-    /// member and prunes the repair once all confirm. Mirrors `handle_assignment_ack`.
-    fn handle_catch_up_ack(&mut self, ack: CatchUpAck) {
+    /// member and prunes the repair once all confirm. Mirrors `handle_segment_placed`.
+    fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
         let Some(raft) = self.groups.get_mut(&ack.shard_group_id) else {
             return;
         };
@@ -644,8 +646,7 @@ impl MultiRaft {
         if let Some(leader) = recency_leader
             && let Some(pos) = new_replica_set.iter().position(|n| *n == leader)
         {
-            let node = new_replica_set.remove(pos);
-            new_replica_set.insert(0, node);
+            new_replica_set.change_leader(pos);
         }
 
         let cmd = RollSegment {
@@ -668,7 +669,7 @@ impl MultiRaft {
         }
         let cmd = DataTransportCommand::send_to_targets(
             targets.to_vec(),
-            SealBoundaryQuery {
+            RequestDurableSegmentEnd {
                 segment_key,
                 coordinator: self.node_id.clone(),
             },
@@ -806,7 +807,7 @@ impl MultiRaft {
             // that would otherwise prune is leader-gated and stops firing). A new
             // leader re-derives: re-proposes the seal / re-polls the survivors.
             if !raft.is_leader() {
-                // pending_seals: its SealResponse won't come from here.
+                // pending_seals: its committed roll notification won't come from here.
                 self.pending_seals.drop_group(*id);
                 // seal-end gathers: we can't propose their recovery roll.
                 self.seal_recovery.drop_group(*id);
@@ -833,7 +834,7 @@ impl MultiRaft {
             }
 
             if let RaftEvent::MetadataCommitted(committed) = &mut event {
-                // For leader to send a SealResponse back to the right client.
+                // For the leader to send the committed roll back to the requester.
                 committed.seal_context =
                     self.pending_seals.pop_seal_context(id, committed.log_index);
             }
@@ -931,6 +932,7 @@ impl MultiRaft {
 mod tests {
     use super::*;
 
+    use crate::control_plane::Replicas;
     use crate::control_plane::consensus::raft::storage::RaftPersistentState;
     use crate::control_plane::consensus::seal_recovery;
     use crate::impls::metadata_storage::MetadataStorage;
@@ -944,7 +946,7 @@ mod tests {
     fn shard(id: u64, members: Vec<NodeId>) -> ShardGroup {
         ShardGroup {
             id: ShardGroupId(id),
-            members,
+            replicas: Replicas::new(members),
         }
     }
 
@@ -1386,7 +1388,7 @@ mod tests {
                 replication_factor: 3,
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
-            replica_set: vec![node("n1"), node("n2"), node("n3")],
+            replica_set: Replicas::new(vec![node("n1"), node("n2"), node("n3")]),
             created_at: 1000,
         });
 
@@ -1458,7 +1460,7 @@ mod tests {
                     replication_factor: 3,
                     partition_strategy: PartitionStrategy::AutoSplit,
                 },
-                replica_set: vec![node("n1"), node("n2"), node("n3")],
+                replica_set: Replicas::new(vec![node("n1"), node("n2"), node("n3")]),
                 created_at: 1000,
             })
         };
@@ -1716,7 +1718,7 @@ mod tests {
             .find(|id| {
                 new_topology
                     .group(*id)
-                    .is_some_and(|g| g.members.contains(&node("n4")))
+                    .is_some_and(|g| g.replicas.contains(&node("n4")))
             })
             .expect("some group of n1 must gain n4 after the join");
 
@@ -1775,7 +1777,7 @@ mod tests {
             .topology
             .shard_groups_for_node(&n1)
             .iter()
-            .find(|g| !g.members.contains(&node("n9")))
+            .find(|g| !g.replicas.contains(&node("n9")))
             .map(|g| g.id)
             .expect("some group of n1 must exclude n9");
 
@@ -1849,7 +1851,7 @@ mod tests {
                         replication_factor: rf,
                         partition_strategy: PartitionStrategy::AutoSplit,
                     },
-                    replica_set,
+                    replica_set: Replicas::new(replica_set),
                     created_at: 1000,
                 }),
             })
@@ -1857,9 +1859,9 @@ mod tests {
         store.flush(); // commit + persist + apply (single-node)
     }
 
-    /// Targets a `SealBoundaryQuery` for `seg` was fanned out to (sorted).
+    /// Targets a `RequestDurableSegmentEnd` for `seg` was fanned out to (sorted).
     fn seal_boundary_query_targets(events: &[RaftEvent], seg: SegmentKey) -> Vec<NodeId> {
-        use crate::data_plane::messages::command::DataPlaneInterNodeCommand;
+        use crate::data_plane::messages::command::DataPlanePeerMessage;
         let mut out = Vec::new();
         for e in events {
             let RaftEvent::SealBoundaryQueries(cmds) = e else {
@@ -1867,7 +1869,7 @@ mod tests {
             };
             for cmd in cmds {
                 if let DataTransportCommand::SendToTargets(s) = cmd
-                    && let DataPlaneInterNodeCommand::SealBoundaryQuery(q) = &s.message
+                    && let DataPlanePeerMessage::RequestDurableSegmentEnd(q) = &s.message
                     && q.segment_key == seg
                 {
                     out.extend(s.targets.iter().cloned());
@@ -1922,12 +1924,12 @@ mod tests {
         let before = proposals_after_become_leader(&store).len();
 
         // Survivors report durable extents; the second completes the gather.
-        store.handle_seal_boundary_report(SealBoundaryReport {
+        store.handle_seal_boundary_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("y"),
             durable_end: Some(EntryId(50)),
         });
-        store.handle_seal_boundary_report(SealBoundaryReport {
+        store.handle_seal_boundary_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("z"),
             durable_end: Some(EntryId(40)),
