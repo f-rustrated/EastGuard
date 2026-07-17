@@ -25,7 +25,7 @@ use super::types::*;
 pub(crate) struct ConsumerOffsetManager {
     offset_ledger: OffsetLedger, // durable offsets, epochs, and local placement readiness
     coordination: ConsumerOffsetCoordination, // live placements, pending mutations, parked commits, and replication tracking
-    checkpoint: OffsetCheckpointState,        // WAL reclamation and checkpoint progresss
+    checkpoint: OffsetCheckpointState,        // WAL reclamation and checkpoint progress
 }
 
 #[derive(Default)]
@@ -365,7 +365,7 @@ impl ConsumerOffsetManager {
         self.coordination.placements.get(placement_key)
     }
 
-    fn get_placement_followers(&mut self, cmd: &CommitConsumerOffset) -> HashSet<NodeId> {
+    fn get_placement_followers(&self, cmd: &CommitConsumerOffset) -> HashSet<NodeId> {
         self.get_placement(&cmd.update.key.placement_key())
             .map(|placement| {
                 placement

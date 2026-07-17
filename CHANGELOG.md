@@ -33,6 +33,7 @@ All notable changes to this project will be documented in this file.
 - **[PR #81]** Add data models for state machine
 
 ### Data Plane & Storage
+- Graduate consumer-offset replicas through durable range snapshots before they can serve reads, while allowing joining replicas to receive live commits without delaying client acknowledgement.
 - **[PR #136]** feat: 135
 - **[PR #132]** feat: d4 - cold path
 - **[PR #126]** feat: d3 - node membership reconcilation

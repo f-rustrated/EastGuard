@@ -304,15 +304,25 @@ These are the strict goals we are aiming for:
 
 ---
 
-## Implementation Plan
+## Implementation and Verification Status
 
-1. Build the logic to let a node enumerate its current range-ledger state and safely merge
-   incoming data.
-2. Create the messages for transfer, acknowledgement, and the disk completion marker.
-3. Track the "joining" and "ready" states.
-4. Trigger the transfer whenever a roll adds a new node.
-5. Build reconciliation for lost messages, metadata leadership changes, and replacement
-   rolls after data-leader failure.
-6. Block un-ready nodes from serving reads or acting as sources.
-7. Write tests for disk saving, duplicates, out-of-order messages, and recovery.
-8. Write a full system test that proves an idle checkpoint survives a replica replacement.
+The graduation path is implemented. Range-ledger snapshots, placement completion, and ordinary
+offset commits share the data-plane WAL, so one successful flush durably orders the imported
+state before its acknowledgement. Placement announcements are declarative and re-driven until
+all members graduate, while segment identity fences acknowledgements from older rolls.
+
+Current automated coverage verifies:
+
+- placement ordering, conflicting announcements, and durable readiness recovery;
+- source eligibility, including rejection after an intervening placement;
+- snapshot durability before acknowledgement and monotonic import;
+- commits concurrent with bootstrap, including the acknowledgement drain before graduation;
+- fail-closed behavior for an unready leader;
+- recovery when a restarted replica missed a consumer-group epoch while it was offline; and
+- deterministic end-to-end consumer-group operation across that restart.
+
+The remaining coverage gap is a deterministic full-system test that forces a roll onto a changed
+replica set and then reads an idle group's previously committed checkpoint from the replacement.
+The manager-level tests exercise that placement transition and preserve the idle ledger entry, but
+the end-to-end suite currently covers the related restart/missed-epoch path rather than forcing the
+complete replacement topology.
