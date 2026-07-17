@@ -74,7 +74,7 @@ pub(crate) enum OffsetRecord {
     EpochSeal(EpochSeal),
     OffsetCommit(ConsumerOffsetUpdate),
     BootstrapEntry(ConsumerOffsetSnapshot),
-    PlacementReady(SegmentKey),
+    PlacementInstalled(SegmentKey),
 }
 
 /// "Durable" consumer-group state. Live mutations are persisted by the shared
@@ -84,7 +84,7 @@ pub(crate) enum OffsetRecord {
 pub(crate) struct OffsetLedger {
     epochs: HashMap<ConsumerOffsetKey, GenerationId>,
     offsets: HashMap<ConsumerOffsetKey, ConsumerOffsetPosition>,
-    ready_placements: HashMap<(TopicId, RangeId), SegmentKey>,
+    installed_placements: HashMap<(TopicId, RangeId), SegmentKey>,
 }
 
 impl OffsetLedger {
@@ -153,8 +153,8 @@ impl OffsetLedger {
                         .or_insert(position);
                 }
             }
-            OffsetRecord::PlacementReady(segment_key) => {
-                self.ready_placements
+            OffsetRecord::PlacementInstalled(segment_key) => {
+                self.installed_placements
                     .entry((segment_key.topic_id, segment_key.range_id))
                     .and_modify(|current| {
                         if segment_key.segment_id > current.segment_id {
@@ -170,20 +170,20 @@ impl OffsetLedger {
         self.offsets.get(key).copied()
     }
 
-    pub(crate) fn is_placement_ready(&self, segment_key: &SegmentKey) -> bool {
-        self.ready_placements.get(&segment_key.placement_key()) == Some(segment_key)
+    pub(crate) fn has_installed_placement(&self, segment_key: &SegmentKey) -> bool {
+        self.installed_placements.get(&segment_key.placement_key()) == Some(segment_key)
     }
 
     pub(crate) fn can_graduate_to(&self, segment_key: &SegmentKey) -> bool {
-        let Some(ready) = self.ready_placements.get(&segment_key.placement_key()) else {
+        let Some(installed) = self.installed_placements.get(&segment_key.placement_key()) else {
             return false;
         };
 
-        ready.segment_id.0.checked_add(1) == Some(segment_key.segment_id.0)
+        installed.segment_id.checked_add(1) == Some(segment_key.segment_id.0)
     }
 
     pub(crate) fn can_source_snapshot_for(&self, segment_key: &SegmentKey) -> bool {
-        self.is_placement_ready(segment_key) || self.can_graduate_to(segment_key)
+        self.has_installed_placement(segment_key) || self.can_graduate_to(segment_key)
     }
 
     pub(crate) fn snapshot_range(
@@ -223,9 +223,9 @@ mod tests {
     fn placement_readiness_and_graduation_are_distinct() {
         let current = SegmentKey::new(TopicId(1), RangeId(2), SegmentId(4));
         let mut ledger = OffsetLedger::default();
-        ledger.apply(OffsetRecord::PlacementReady(current));
+        ledger.apply(OffsetRecord::PlacementInstalled(current));
 
-        assert!(ledger.is_placement_ready(&current));
+        assert!(ledger.has_installed_placement(&current));
         assert!(!ledger.can_graduate_to(&current));
         assert!(ledger.can_graduate_to(&current.with_segment_id(SegmentId(5))));
         assert!(!ledger.can_graduate_to(&current.with_segment_id(SegmentId(6))));
