@@ -5,6 +5,7 @@ pub(crate) mod command;
 pub(crate) mod errors;
 pub(crate) mod log;
 pub(crate) mod state;
+pub(crate) mod states;
 pub(crate) mod storage;
 
 pub(crate) fn now_ms() -> u64 {
