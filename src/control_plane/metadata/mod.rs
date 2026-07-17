@@ -6,7 +6,6 @@ pub mod error;
 pub(crate) mod event;
 pub(crate) mod range;
 
-pub(crate) mod state_machine;
 pub mod strategy;
 pub(crate) mod topic;
 
