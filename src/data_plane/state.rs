@@ -1011,8 +1011,11 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_replica_offset_ack(&mut self, cmd: ConsumerOffsetReplicated) {
-        self.consumer_offsets.handle_replica_offset_ack(cmd);
-        self.ack_ready_offset_placements();
+        // ! Hot PATH without the following condition,
+        // every consumer-offset replica acknowledgement currently will trigger a full placement scan
+        if self.consumer_offsets.handle_replica_offset_ack(cmd) {
+            self.ack_ready_offset_placements();
+        }
     }
 
     fn install_consumer_offset_snapshot(&mut self, from: &NodeId, cmd: ConsumerOffsetSnapshot) {
@@ -1059,7 +1062,7 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
-        self.consumer_offsets.handle_bootstrap_ack(&cmd);
+        self.consumer_offsets.handle_snapshot_installed_ack(&cmd);
 
         if let Some(bootstrap) = self
             .consumer_offsets

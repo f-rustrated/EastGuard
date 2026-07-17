@@ -11,8 +11,7 @@ use crate::data_plane::consumer_offset_management::replication::OffsetReplicatio
 
 use crate::data_plane::messages::command::{
     CommitConsumerOffset, ConsumerOffsetCommitAck, ConsumerOffsetReplicated,
-    ConsumerOffsetReplicationResult, ConsumerOffsetSnapshotInstalled,
-    InstallConsumerOffsetSnapshot,
+    ConsumerOffsetReplicationResult, ConsumerOffsetSnapshot, ConsumerOffsetSnapshotInstalled,
 };
 use crate::data_plane::messages::{RequestConsumerOffsetSnapshot, SegmentPlaced};
 
@@ -35,6 +34,76 @@ struct ConsumerOffsetCoordination {
     pending_offset_mutations: Vec<PendingOffsetMutation>,
     future_offset_commits: HashMap<ConsumerOffsetKey, Vec<FutureOffsetCommit>>,
     offset_replication: OffsetReplicationState,
+}
+
+struct OffsetPlacement {
+    segment_key: SegmentKey,
+    shard_group_id: ShardGroupId,
+    // Desired data replicas for this placement. This also preserves their
+    // ordering, including which replica is the leader.
+    replicas: Replicas,
+    // Consumer-offset readiness for every member of `replicas`.
+    replica_states: HashMap<NodeId, OffsetReplicaState>,
+    placement_ack_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetReplicaState {
+    Joining,
+    SnapshotInstalled,
+    Ready,
+}
+
+impl OffsetPlacement {
+    fn leader(&self) -> &NodeId {
+        self.replicas
+            .leader()
+            .expect("an offset placement must have a leader")
+    }
+
+    fn can_bootstrap_replicas(&self, segment_key: &SegmentKey) -> bool {
+        self.segment_key == *segment_key && self.is_replica_ready(self.leader())
+    }
+
+    fn is_replica_ready(&self, node: &NodeId) -> bool {
+        self.replica_states.get(node) == Some(&OffsetReplicaState::Ready)
+    }
+
+    fn all_replicas_ready(&self) -> bool {
+        self.replica_states
+            .values()
+            .all(|state| *state == OffsetReplicaState::Ready)
+    }
+
+    fn compare(&self, other_key: &SegmentKey, other: &Replicas) -> PlacementObservation {
+        if self.segment_key == *other_key {
+            if &self.replicas != other {
+                tracing::warn!(
+                    ?other_key,
+                    current_replicas = ?self.replicas,
+                    observed_replicas = ?other,
+                    "ignored conflicting replica set for an existing segment"
+                );
+            }
+            return if &self.replicas == other {
+                PlacementObservation::Unchanged
+            } else {
+                PlacementObservation::Conflict
+            };
+        }
+        if self.segment_key.segment_id >= other_key.segment_id {
+            return PlacementObservation::Stale;
+        }
+        PlacementObservation::Accepted
+    }
+
+    fn unready_followers(&self) -> Box<[NodeId]> {
+        self.replicas
+            .followers()
+            .filter(|node| !self.is_replica_ready(node))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -168,21 +237,26 @@ impl ConsumerOffsetManager {
         }
 
         // need to place!
-        let leader = replicas.leader().cloned().unwrap();
-        let ready_replicas = if self.offset_ledger.is_placement_ready(&segment_key) {
-            HashSet::from([node_id.clone()])
-        } else {
-            HashSet::new()
-        };
+        let local_placement_installed = self.offset_ledger.has_installed_placement(&segment_key);
+        let replica_states = replicas
+            .iter()
+            .cloned()
+            .map(|node| {
+                let state = if node == *node_id && local_placement_installed {
+                    OffsetReplicaState::Ready
+                } else {
+                    OffsetReplicaState::Joining
+                };
+                (node, state)
+            })
+            .collect();
         self.coordination.placements.insert(
             segment_key.placement_key(),
             OffsetPlacement {
                 segment_key,
                 shard_group_id,
-                leader,
                 replicas: replicas.clone(),
-                ready_replicas,
-                bootstrap_acked: HashSet::new(),
+                replica_states,
                 placement_ack_sent: false,
             },
         );
@@ -213,28 +287,26 @@ impl ConsumerOffsetManager {
         let leader = replicas.leader().cloned()?;
 
         let placement_key = segment_key.placement_key();
-        let ready_replicas =
+        let replica_states =
             self.derive_offset_commit_replicas(segment_key, &replicas, placement_key);
 
         match self.observe_placement(segment_key, shard_group_id, &replicas, &leader) {
+            PlacementObservation::Stale | PlacementObservation::Conflict => return None,
             PlacementObservation::Accepted => {
-                self.get_placement_mut(&placement_key)
-                    .unwrap()
-                    .ready_replicas = ready_replicas;
+                let placement = self.get_placement_mut(&placement_key).unwrap();
+                placement.replica_states = replica_states;
             }
             PlacementObservation::Unchanged => {
-                if let Some(placement) = self.get_placement_mut(&placement_key) {
-                    placement.placement_ack_sent = false;
-                }
+                let placement = self.get_placement_mut(&placement_key).unwrap();
+                placement.placement_ack_sent = false;
             }
-            PlacementObservation::Stale | PlacementObservation::Conflict => return None,
         }
 
         let placement = self
             .get_placement(&placement_key)
             .expect("accepted or unchanged placement must exist");
 
-        if !placement.is_ready(&leader) {
+        if !placement.is_replica_ready(&leader) {
             let targets: Box<[_]> = placement.replicas.followers().cloned().collect();
             if targets.is_empty() {
                 return None;
@@ -264,29 +336,29 @@ impl ConsumerOffsetManager {
         segment_key: SegmentKey,
         replicas: &Replicas,
         placement_key: (TopicId, RangeId),
-    ) -> HashSet<NodeId> {
+    ) -> HashMap<NodeId, OffsetReplicaState> {
         let leader = replicas.leader().unwrap();
-        let retained_replicas: HashSet<_> = replicas.iter().cloned().collect();
-
-        // Only replicas already eligible for offset commits retain that
-        // eligibility across placement graduation.
-        let mut ready_replicas: HashSet<NodeId> = self
-            .get_placement(&placement_key)
-            .map(|placement| {
-                placement
-                    .ready_replicas
-                    .intersection(&retained_replicas)
-                    .cloned()
-                    .collect()
+        let current = self.get_placement(&placement_key);
+        let mut replica_states: HashMap<_, _> = replicas
+            .iter()
+            .cloned()
+            .map(|replica| {
+                let state = if current.is_some_and(|placement| placement.is_replica_ready(&replica))
+                {
+                    OffsetReplicaState::Ready
+                } else {
+                    OffsetReplicaState::Joining
+                };
+                (replica, state)
             })
-            .unwrap_or_default();
+            .collect();
 
         if segment_key.segment_id == SegmentId(0)
-            || self.offset_ledger.is_placement_ready(&segment_key)
+            || self.offset_ledger.has_installed_placement(&segment_key)
         {
-            ready_replicas.insert(leader.clone());
+            replica_states.insert(leader.clone(), OffsetReplicaState::Ready);
         }
-        ready_replicas
+        replica_states
     }
 
     fn get_placement(&self, placement_key: &(TopicId, RangeId)) -> Option<&OffsetPlacement> {
@@ -296,9 +368,12 @@ impl ConsumerOffsetManager {
     fn get_placement_followers(&mut self, cmd: &CommitConsumerOffset) -> HashSet<NodeId> {
         self.get_placement(&cmd.update.key.placement_key())
             .map(|placement| {
-                let mut followers = placement.ready_replicas.clone();
-                followers.remove(&placement.leader);
-                followers
+                placement
+                    .replica_states
+                    .keys()
+                    .filter(|n| placement.is_replica_ready(n) && *n != placement.leader())
+                    .cloned()
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -312,7 +387,7 @@ impl ConsumerOffsetManager {
 
     pub(crate) fn install_consumer_offsets(
         &mut self,
-        cmd: InstallConsumerOffsetSnapshot,
+        cmd: ConsumerOffsetSnapshot,
         node_id: &NodeId,
     ) -> Vec<FutureOffsetCommit> {
         let leader = cmd.replica_set.leader().cloned().unwrap();
@@ -329,7 +404,7 @@ impl ConsumerOffsetManager {
         self.coordination
             .pending_offset_mutations
             .push(PendingOffsetMutation::new(
-                OffsetRecord::PlacementReady(cmd.segment_key),
+                OffsetRecord::PlacementInstalled(cmd.segment_key),
                 ConsumerOffsetSnapshotInstalled {
                     segment_key: cmd.segment_key,
                     from: node_id.clone(),
@@ -350,7 +425,8 @@ impl ConsumerOffsetManager {
         let live_ready = self
             .get_placement(&request.segment_key.placement_key())
             .is_some_and(|placement| {
-                placement.segment_key == request.segment_key && placement.is_ready(source_node_id)
+                placement.segment_key == request.segment_key
+                    && placement.is_replica_ready(source_node_id)
             });
 
         // Reject only when the source is neither live-ready nor durably eligible.
@@ -371,8 +447,8 @@ impl ConsumerOffsetManager {
         &self,
         segment_key: SegmentKey,
         replica_set: Replicas,
-    ) -> InstallConsumerOffsetSnapshot {
-        InstallConsumerOffsetSnapshot {
+    ) -> ConsumerOffsetSnapshot {
+        ConsumerOffsetSnapshot {
             entries: self
                 .offset_ledger
                 .snapshot_range(segment_key.topic_id, segment_key.range_id),
@@ -402,54 +478,54 @@ impl ConsumerOffsetManager {
         ))
     }
 
-    pub(crate) fn handle_bootstrap_ack(&mut self, ack: &ConsumerOffsetSnapshotInstalled) {
+    pub(crate) fn handle_snapshot_installed_ack(&mut self, ack: &ConsumerOffsetSnapshotInstalled) {
         let Some(placement) = self.get_placement_mut(&ack.segment_key.placement_key()) else {
             return;
         };
         if placement.segment_key != ack.segment_key || !placement.replicas.contains(&ack.from) {
             return;
         }
-        placement.bootstrap_acked.insert(ack.from.clone());
-        self.promote_drained_replicas();
+        placement
+            .replica_states
+            .insert(ack.from.clone(), OffsetReplicaState::SnapshotInstalled);
+        self.mark_offset_replica_ready_if_caught_up(&ack.from);
     }
 
-    fn promote_drained_replicas(&mut self) {
-        let promotable: Vec<(TopicId, RangeId, NodeId)> = self
-            .coordination
-            .placements
-            .iter()
-            .flat_map(|(&(topic_id, range_id), placement)| {
-                placement
-                    .bootstrap_acked
-                    .iter()
-                    .filter(|node| !self.coordination.offset_replication.has_pending_for(node))
-                    .cloned()
-                    .map(move |node| (topic_id, range_id, node))
-            })
-            .collect();
-        for (topic_id, range_id, node) in promotable {
-            if let Some(placement) = self.coordination.placements.get_mut(&(topic_id, range_id)) {
-                placement.ready_replicas.insert(node);
-            }
+    fn mark_offset_replica_ready_if_caught_up(&mut self, node: &NodeId) -> bool {
+        if self.coordination.offset_replication.has_pending_for(node) {
+            return false;
         }
-    }
-
-    pub(crate) fn ready_placement_acks(&mut self, from: &NodeId) -> Vec<SegmentPlaced> {
-        let mut acks = Vec::new();
+        let mut readiness_changed = false;
         for placement in self.coordination.placements.values_mut() {
-            if !placement.placement_ack_sent
-                && placement.leader == *from
-                && placement.ready_replicas.len() == placement.replicas.len()
-            {
-                placement.placement_ack_sent = true;
-                acks.push(SegmentPlaced {
-                    segment_key: placement.segment_key,
-                    shard_group_id: placement.shard_group_id,
-                    from: from.clone(),
-                });
+            if placement.replica_states.get(node) == Some(&OffsetReplicaState::SnapshotInstalled) {
+                placement
+                    .replica_states
+                    .insert(node.clone(), OffsetReplicaState::Ready);
+                readiness_changed = true;
             }
         }
-        acks
+        readiness_changed
+    }
+
+    pub(crate) fn drain_ready_placements(&mut self, from: &NodeId) -> Vec<SegmentPlaced> {
+        self.coordination
+            .placements
+            .values_mut()
+            .filter_map(|placement| {
+                if !placement.placement_ack_sent
+                    && placement.leader() == from
+                    && placement.all_replicas_ready()
+                {
+                    placement.placement_ack_sent = true;
+                    return Some(SegmentPlaced {
+                        segment_key: placement.segment_key,
+                        shard_group_id: placement.shard_group_id,
+                        from: from.clone(),
+                    });
+                }
+                None
+            })
+            .collect()
     }
 
     pub(crate) fn get_replica_set_if_leader(
@@ -460,10 +536,10 @@ impl ConsumerOffsetManager {
         let Some(placement) = self.get_placement(&key.placement_key()) else {
             return Err(None);
         };
-        if placement.leader != *node_id {
-            return Err(Some(placement.leader.clone()));
+        if placement.leader() != node_id {
+            return Err(Some(placement.leader().clone()));
         }
-        if !placement.ready_replicas.contains(node_id) {
+        if !placement.is_replica_ready(node_id) {
             return Err(None);
         }
         Ok(placement.replicas.clone())
@@ -477,9 +553,10 @@ impl ConsumerOffsetManager {
         self.coordination.pending_offset_mutations.push(cmd.into());
     }
 
-    pub(crate) fn handle_replica_offset_ack(&mut self, ack: ConsumerOffsetReplicated) {
+    pub(crate) fn handle_replica_offset_ack(&mut self, ack: ConsumerOffsetReplicated) -> bool {
+        let from = ack.from.clone();
         self.coordination.offset_replication.process_ack(ack);
-        self.promote_drained_replicas();
+        self.mark_offset_replica_ready_if_caught_up(&from)
     }
 
     pub(crate) fn handle_consumer_group_epoch_seal(
@@ -696,7 +773,7 @@ mod tests {
         let local = NodeId::new("b");
         let current = segment(2);
         let mut ledger = OffsetLedger::default();
-        ledger.apply(OffsetRecord::PlacementReady(current));
+        ledger.apply(OffsetRecord::PlacementInstalled(current));
         let mut manager = ConsumerOffsetManager::new(ledger);
 
         let replicas = Replicas::new(vec![NodeId::new("a"), local.clone(), NodeId::new("c")]);
@@ -707,7 +784,7 @@ mod tests {
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
-        assert_eq!(placement.ready_replicas, HashSet::from([local]));
+        assert!(placement.is_replica_ready(&local));
     }
 
     #[test]
@@ -723,7 +800,9 @@ mod tests {
             .placements
             .get_mut(&(current.topic_id, current.range_id))
             .unwrap();
-        live_placement.bootstrap_acked.insert(local.clone());
+        live_placement
+            .replica_states
+            .insert(local.clone(), OffsetReplicaState::SnapshotInstalled);
         live_placement.placement_ack_sent = true;
 
         manager.observe_placement(current, ShardGroupId(0), &replicas, &local);
@@ -733,7 +812,10 @@ mod tests {
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
-        assert_eq!(placement.bootstrap_acked, HashSet::from([local]));
+        assert_eq!(
+            placement.replica_states.get(&local),
+            Some(&OffsetReplicaState::SnapshotInstalled)
+        );
         assert!(placement.placement_ack_sent);
     }
 
@@ -810,8 +892,8 @@ mod tests {
         manager
             .get_placement_mut(&segment(1).placement_key())
             .unwrap()
-            .ready_replicas
-            .insert(retained.clone());
+            .replica_states
+            .insert(retained.clone(), OffsetReplicaState::Ready);
 
         let snapshots = manager.install_leader_placement(
             segment(2),
@@ -829,7 +911,8 @@ mod tests {
                     )
         )));
         let placement = manager.get_placement(&segment(2).placement_key()).unwrap();
-        assert_eq!(placement.ready_replicas, HashSet::from([retained]));
+        assert!(placement.is_replica_ready(&retained));
+        assert!(!placement.is_replica_ready(&new_leader));
 
         let (reply, mut response) = oneshot::channel();
         assert!(!manager.commit_consumer_offset(
@@ -870,7 +953,7 @@ mod tests {
         );
 
         let mut ledger = OffsetLedger::default();
-        ledger.apply(OffsetRecord::PlacementReady(old_segment));
+        ledger.apply(OffsetRecord::PlacementInstalled(old_segment));
         ledger.apply(OffsetRecord::EpochSeal(EpochSeal {
             key: key(),
             generation: GenerationId(1),
@@ -931,10 +1014,12 @@ mod tests {
             OffsetPlacement {
                 segment_key: segment(1),
                 shard_group_id: ShardGroupId(7),
-                leader: leader.clone(),
                 replicas: Replicas::new(vec![leader.clone(), retained.clone(), removed.clone()]),
-                ready_replicas: HashSet::from([leader.clone(), retained.clone(), removed]),
-                bootstrap_acked: HashSet::new(),
+                replica_states: HashMap::from([
+                    (leader.clone(), OffsetReplicaState::Ready),
+                    (retained.clone(), OffsetReplicaState::Ready),
+                    (removed, OffsetReplicaState::Ready),
+                ]),
                 placement_ack_sent: true,
             },
         );
@@ -977,12 +1062,12 @@ mod tests {
             .unwrap();
         assert!(response.try_recv().is_err());
 
-        manager.handle_bootstrap_ack(&ConsumerOffsetSnapshotInstalled {
+        manager.handle_snapshot_installed_ack(&ConsumerOffsetSnapshotInstalled {
             segment_key: segment(2),
             from: joining.clone(),
             leader: leader.clone(),
         });
-        assert!(manager.ready_placement_acks(&leader).is_empty());
+        assert!(manager.drain_ready_placements(&leader).is_empty());
 
         manager.handle_replica_offset_ack(ConsumerOffsetReplicated {
             seq: replicated.seq,
@@ -994,7 +1079,7 @@ mod tests {
             response.try_recv().unwrap(),
             ConsumerOffsetCommitAck::Committed
         );
-        assert!(manager.ready_placement_acks(&leader).is_empty());
+        assert!(manager.drain_ready_placements(&leader).is_empty());
 
         manager.handle_replica_offset_ack(ConsumerOffsetReplicated {
             seq: replicated.seq,
@@ -1002,7 +1087,7 @@ mod tests {
             from: joining,
             result: ConsumerOffsetReplicationResult::Committed,
         });
-        assert_eq!(manager.ready_placement_acks(&leader).len(), 1);
+        assert_eq!(manager.drain_ready_placements(&leader).len(), 1);
     }
 
     #[test]
