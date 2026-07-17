@@ -1,19 +1,22 @@
 #![allow(dead_code)]
 
 use crate::control_plane::consensus::messages::*;
-use crate::control_plane::consensus::raft::catch_up::CatchUpRepairs;
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::{EvictionError, ProposalError};
 use crate::control_plane::consensus::raft::log::LogEntry;
+use crate::control_plane::consensus::raft::states::log_state::LogState;
+use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
+use crate::control_plane::consensus::raft::states::transient_state::{
+    PeerState, Role, TransientState,
+};
 use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::DeleteSegments;
 use crate::control_plane::metadata::event::ApplyResult;
-use crate::control_plane::metadata::state_machine::MetadataStateMachine;
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, ConsumerMemberId, EntryId, MetadataCommand, RangeId, ReassignSegment,
-    RollSegment, SegmentId, TopicId, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
+    TopicId, TopicMeta, TopicStats,
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
@@ -22,10 +25,7 @@ use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-
-const ELECTION_JITTER_RANGE: u32 = 20;
+use std::collections::{BTreeSet, HashSet};
 
 /// #135: The number of consecutive, identical ring observations needed
 /// before we can safely evict a live ex-owner.
@@ -37,35 +37,6 @@ const ELECTION_JITTER_RANGE: u32 = 20;
 /// during a rebalance.
 pub(crate) const RING_STABLE_OBSERVATIONS: u32 = 3;
 
-/// Segments whose write leader crashed (sole death),
-pub(crate) type LeaderlessSegments = Vec<(SegmentKey, Vec<NodeId>)>;
-
-struct ElectionJitter {
-    seed: u64,
-    counter: u64,
-}
-
-impl ElectionJitter {
-    fn new(seed: u64) -> Self {
-        Self { seed, counter: 0 }
-    }
-
-    fn next(&mut self) -> u32 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.seed.hash(&mut hasher);
-        self.counter.hash(&mut hasher);
-        self.counter += 1;
-        (hasher.finish() % ELECTION_JITTER_RANGE as u64) as u32
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Role {
-    Follower,
-    Candidate { votes_received: u32 },
-    Leader,
-}
-
 // Peer tracking (LEADER-ONLY)
 // - next_index: Index of the next log entry to send to this peer.
 // - match_index: Highest log index known to be replicated on this peer.
@@ -73,12 +44,6 @@ pub enum Role {
 // - When a node becomes a leader: it sets next_index = last_log_index +1 and match_index = 0, so initially next_index could be 10 while match_index being 0.
 // - After rejection: when a follower rejects AppendEntries, the leader decrements next_index to retry with earlier entries - but match_index stays the same until the peer confirms.
 // So, `next_index` is the leader's guess and `match_index` is confirmed truth
-#[derive(Debug, Clone)]
-struct PeerState {
-    next_index: u64,
-    match_index: u64,
-}
-
 // ---------------------------------------------------------------------------
 // Raft state machine — pure sync, no I/O
 // ---------------------------------------------------------------------------
@@ -89,63 +54,15 @@ struct PeerState {
 /// All outbound packets and timer commands are buffered and drained by the
 /// caller (the actor layer).
 pub struct Raft {
-    // Identity
     pub node_id: NodeId,
     pub shard_group_id: ShardGroupId,
 
-    // -- LOG STATE
-    current_term: u64,
-    voted_for: Option<NodeId>,
-    log: Vec<LogEntry>,
-    stabled_index: u64, // flushed to disk
+    l_stat: LogState,
+    t_stat: TransientState,
+    m_stat: MetadataState,
 
-    // -- APPLICATION STATE
-    state_machine: MetadataStateMachine,
-    last_applied_index: u64, // applied to state machine
-
-    // Transient State (Volatile Consensus & Coordinator Metadata)
-    commit_index: u64, // majority voted
-    role: Role,
-    /// Tracks who the current leader is — set when this node becomes leader
-    /// or when a valid `AppendEntries` is received from a leader.
-    current_leader: Option<NodeId>,
     peers: HashSet<NodeId>,
-    // LEADER-ONLY volatile state
-    peer_states: HashMap<NodeId, PeerState>,
-    /// LEADER-ONLY: non-voting members the leader is catching up before promotion.
-    /// Replicated to (like peers) but **excluded from the commit quorum** — a node
-    /// that can't yet participate (e.g. a freshly ring-assigned host without a local
-    /// instance) is staged here and never counted, so it can't freeze the group. It is
-    /// promoted to a voting peer via a committed `AddPeer` only once caught up
-    /// (`maybe_promote_learner`). Re-derived on takeover (leader-volatile). Disjoint
-    /// from `peers`; empty on followers.
-    learner_states: HashMap<NodeId, PeerState>,
-    /// Election-timer generation. Bumped whenever the election timer is
-    /// (re)armed or cancelled; a fired `ElectionTimeout` carrying an older
-    /// epoch raced its own cancellation in flight and must be ignored
-    election_epoch: u64,
-    election_jitter: ElectionJitter,
-    /// Segments whose data-leader has acked its
-    /// `PlaceSegment`, mapped to the acking node. The heartbeat sweep skips
-    /// re-driving a segment whose confirmed node still matches `replica_set[0]`
-    confirmed_placement: HashMap<SegmentKey, NodeId>,
-    /// In-flight sealed-segment repairs. Seeded at `ReassignSegment` apply; the
-    /// heartbeat sweep re-drives until acked. Leader-volatile — cleared on step-down.
-    catch_up: CatchUpRepairs,
-    pending_proposals: Vec<MetadataCommand>,
-    leaderless_segments: LeaderlessSegments,
-    /// Tracks the ring membership seen during the last check, along with a count
-    /// of how many times we've seen this exact membership in a row (#135).
-    ///
-    /// This state is "leader-volatile," meaning it gets wiped clean whenever a
-    /// new leader takes over. This guarantees that a new leader must observe a
-    /// stable ring over time to "re-earn confidence" before it is allowed to
-    /// evict anyone.
-    ring_observation_streak: Option<(BTreeSet<NodeId>, u32)>,
-
-    pending_log_mutations: Vec<LogMutation>, // must persist
-    events: Vec<RaftEvent>,                  // volatile side effects
-
+    events: Vec<RaftEvent>,
     timer_seqs: TimerSeqs,
 }
 
@@ -169,46 +86,26 @@ impl Raft {
             node_id,
             shard_group_id,
             peers,
-            stabled_index: persistent.stabled_index(),
-            current_term: persistent.term,
-            voted_for: persistent.voted_for,
-            log: persistent.log,
-            pending_log_mutations: Vec::new(),
+            l_stat: LogState::from_persistent(persistent),
+            m_stat: MetadataState::new(shard_group_id),
+            t_stat: TransientState::new(election_jitter_seed),
             events: Vec::new(),
-            commit_index: 0,
-            last_applied_index: 0,
-            role: Role::Follower,
-            current_leader: None,
-            state_machine: MetadataStateMachine::new(shard_group_id),
-            pending_proposals: Vec::new(),
-            leaderless_segments: Vec::new(),
-            peer_states: HashMap::new(),
-            learner_states: HashMap::new(),
-            election_jitter: ElectionJitter::new(election_jitter_seed),
             timer_seqs,
-            election_epoch: 0,
-            confirmed_placement: HashMap::new(),
-            catch_up: CatchUpRepairs::default(),
-            ring_observation_streak: None,
         };
         raft.reset_election_timer();
         raft
     }
 
-    pub(crate) fn heartbeat_seq(&self) -> u64 {
-        self.timer_seqs.rpc
-    }
-
     pub(crate) fn topic_names(&self) -> Box<[String]> {
-        self.state_machine.topic_names()
+        self.m_stat.topic_names()
     }
 
     pub(crate) fn topic_stats(&self) -> Box<[TopicStats]> {
-        self.state_machine.topic_stats()
+        self.m_stat.topic_stats()
     }
 
     pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
-        self.state_machine.get_topic_by_name(name)
+        self.m_stat.get_topic_by_name(name)
     }
 
     pub(crate) fn get_consumer_group_assignment(
@@ -217,7 +114,7 @@ impl Raft {
         group_id: &str,
         member_id: ConsumerMemberId,
     ) -> Option<ConsumerGroupAssignment> {
-        self.state_machine
+        self.m_stat
             .get_consumer_group_assignment(topic_name, group_id, member_id)
     }
 
@@ -225,14 +122,7 @@ impl Raft {
         &self,
         node_id: &NodeId,
     ) -> Box<[(SegmentKey, Replicas)]> {
-        self.state_machine.active_segments_for_node(node_id)
-    }
-
-    /// Every active segment's assignment tuple `(key, replica_set, start_offset)`.
-    /// The leader's confirmation-gated assignment sweep (`MultiRaft::build_redrive_cmds`)
-    /// turns these into `PlaceSegment` re-drives for unconfirmed segments.
-    pub(crate) fn active_segment_assignments(&self) -> Box<[(SegmentKey, Replicas, EntryId)]> {
-        self.state_machine.active_segment_assignments()
+        self.m_stat.active_segments_for_node(node_id)
     }
 
     /// Full reconciliation against the current topology: assert the ring-assigned
@@ -345,7 +235,7 @@ impl Raft {
     /// for this group: live ex-owners present, or more voters than the ring
     /// names. Catching the ratchet in the wild precedes curing it.
     pub(crate) fn log_ring_drift(&self, topology_reader: &TopologyReader, live: &HashSet<NodeId>) {
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return;
         }
         let Some(ring_members) = topology_reader.group_ring_members(self.shard_group_id) else {
@@ -375,9 +265,9 @@ impl Raft {
     /// is proposed during a check, any `RemovePeer` proposed later in that
     /// same check is delayed until the add successfully commits.
     fn has_uncommitted_membership_change(&self) -> bool {
-        (self.commit_index + 1..=self.log_last_index()).any(|i| {
+        (self.t_stat.commit_index + 1..=self.log_last_index()).any(|i| {
             matches!(
-                self.log_get(i).map(|e| &e.command),
+                self.l_stat.get(i).map(|e| &e.command),
                 Some(RaftCommand::AddPeer(_) | RaftCommand::RemovePeer(_))
             )
         })
@@ -409,12 +299,12 @@ impl Raft {
         topology_reader: &TopologyReader,
         live: &HashSet<NodeId>,
     ) -> Result<(), EvictionError> {
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return Err(EvictionError::NotLeader);
         }
 
         let Some(ring_members) = topology_reader.group_ring_members(self.shard_group_id) else {
-            self.ring_observation_streak = None;
+            self.t_stat.ring_observation_streak = None;
             return Err(EvictionError::GroupNotFound);
         };
         let ring: BTreeSet<NodeId> = ring_members.iter().cloned().collect();
@@ -457,10 +347,7 @@ impl Raft {
             }
 
             // It checks if a specific node has a complete, up-to-date copy of all permanently saved data.
-            let in_sync = self
-                .peer_states
-                .get(member)
-                .is_some_and(|ps| ps.match_index >= self.commit_index);
+            let in_sync = self.t_stat.is_peer_caught_up(member);
             if !in_sync {
                 return Err(EvictionError::FollowersLagging);
             }
@@ -487,12 +374,7 @@ impl Raft {
 
     #[inline(always)]
     fn record_ring_observation(&mut self, ring: &BTreeSet<NodeId>) -> u32 {
-        let observations = match self.ring_observation_streak.take() {
-            Some((prev, n)) if prev == *ring => n.saturating_add(1),
-            _ => 1,
-        };
-        self.ring_observation_streak = Some((ring.clone(), observations));
-        observations
+        self.t_stat.record_ring_observation(ring)
     }
 
     /// Repair this group's segments whose replica set still names a dead node:
@@ -503,21 +385,25 @@ impl Raft {
     /// Runs per-death (`handle_node_death`) and as the takeover backfill sweep.
     pub(crate) fn reconcile_segments(&mut self, live_set: &HashSet<NodeId>) -> bool {
         let mut to_roll: Vec<(SegmentKey, Replicas)> = Vec::new();
-        for (key, rs) in self.active_segments_with_dead_members(live_set).into_vec() {
+        for (key, rs) in self
+            .m_stat
+            .active_segments_with_dead_members(live_set)
+            .into_vec()
+        {
             if Self::only_replica_dead(&rs, live_set) {
                 let survivors = rs
                     .iter()
                     .filter(|n| live_set.contains(*n))
                     .cloned()
                     .collect();
-                self.leaderless_segments.push((key, survivors));
+                self.t_stat.leaderless_segments.push((key, survivors));
             } else {
                 to_roll.push((key, rs));
             }
         }
 
         let mut leaderless_segments = vec![];
-        for (key, rs) in self.boundary_unknown_segments() {
+        for (key, rs) in self.m_stat.boundary_unknown_segments() {
             let survivors = rs
                 .iter()
                 .filter(|n| live_set.contains(*n))
@@ -525,9 +411,9 @@ impl Raft {
                 .collect();
             leaderless_segments.push((key, survivors));
         }
-        self.leaderless_segments.extend(leaderless_segments);
+        self.t_stat.leaderless_segments.extend(leaderless_segments);
 
-        let sealed = self.sealed_segments_with_dead_members(live_set);
+        let sealed = self.m_stat.sealed_segments_with_dead_members(live_set);
         let mut changed = false;
 
         // Roll the others: seal + reopen with a healthy set. `end_entry_id = None`
@@ -593,12 +479,9 @@ impl Raft {
 
     /// Re-fill known-end sealed segments left under-replicated by an earlier death
     fn refill_under_replicated_segments(&mut self, topology: &TopologyReader) -> bool {
-        let targets: Box<[(SegmentKey, Replicas)]> = self
-            .state_machine
-            .topics
-            .values()
-            .flat_map(|t| t.under_replicated_sealed_segments(topology.replication_factor()))
-            .collect();
+        let targets = self
+            .m_stat
+            .under_replicated_sealed_segments(topology.replication_factor());
 
         let mut changed = false;
         for (segment_key, mut replica_set) in targets {
@@ -637,17 +520,7 @@ impl Raft {
     /// `DeleteSegments`. Topics with no retention policy contribute nothing.
     fn reconcile_retention_deletes(&mut self) -> bool {
         let now = now_ms();
-        let targets: Vec<(TopicId, RangeId, Box<[SegmentId]>)> = self
-            .state_machine
-            .topics
-            .values()
-            .flat_map(|t| {
-                let topic_id = t.id;
-                t.expired_segment_prefixes(now)
-                    .into_iter()
-                    .map(move |(range_id, ids)| (topic_id, range_id, ids))
-            })
-            .collect();
+        let targets = self.m_stat.expired_segment_prefixes(now);
 
         let mut changed = false;
         for (topic_id, range_id, segment_ids) in targets {
@@ -707,41 +580,6 @@ impl Raft {
         self.peers_iter().filter(|p| !live.contains(*p))
     }
 
-    /// Active segments across all topics whose `replica_set` contains at
-    /// least one non-live member.
-    pub(crate) fn active_segments_with_dead_members(
-        &self,
-        live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, Replicas)]> {
-        self.state_machine
-            .topics
-            .values()
-            .flat_map(|t| t.active_segments_with_dead_members(live))
-            .collect()
-    }
-
-    /// Sealed (known-end) segments across all topics whose `replica_set` names a
-    /// non-live member — D5 sealed-segment repair candidates.
-    pub(crate) fn sealed_segments_with_dead_members(
-        &self,
-        live: &HashSet<NodeId>,
-    ) -> Box<[(SegmentKey, Replicas)]> {
-        self.state_machine
-            .topics
-            .values()
-            .flat_map(|t| t.sealed_segments_with_dead_members(live))
-            .collect()
-    }
-
-    pub(crate) fn boundary_unknown_segments(
-        &self,
-    ) -> impl Iterator<Item = (SegmentKey, Vec<NodeId>)> {
-        self.state_machine
-            .topics
-            .values()
-            .flat_map(|t| t.boundary_unknown_segments())
-    }
-
     /// A single missing replica is recoverable: the remaining replicas can
     /// report the all-ack committed minimum before the successor is opened.
     fn only_replica_dead(replica_set: &[NodeId], live: &HashSet<NodeId>) -> bool {
@@ -749,11 +587,11 @@ impl Raft {
     }
 
     pub(crate) fn has_topic(&self, topic_id: &TopicId) -> bool {
-        self.state_machine.get_topic(topic_id).is_some()
+        self.m_stat.get_topic(topic_id).is_some()
     }
 
     pub(crate) fn get_replica_set(&self, key: &SegmentKey) -> Option<Replicas> {
-        let topic = self.state_machine.get_topic(&key.topic_id)?;
+        let topic = self.m_stat.get_topic(&key.topic_id)?;
         let range = topic.ranges.get(&key.range_id)?;
         let seg = range.segments.get(&key.segment_id)?;
         Some(seg.replica_set.clone())
@@ -763,79 +601,30 @@ impl Raft {
         std::mem::take(&mut self.events)
     }
 
+    fn raise(&mut self, event: impl Into<RaftEvent>) {
+        self.events.push(event.into());
+    }
+
     pub fn take_log_mutations(&mut self) -> Vec<LogMutation> {
-        std::mem::take(&mut self.pending_log_mutations)
+        self.l_stat.take_mutations()
     }
 
     pub(crate) fn take_pending_proposals(&mut self) -> Vec<MetadataCommand> {
-        std::mem::take(&mut self.pending_proposals)
+        std::mem::take(&mut self.t_stat.pending_proposals)
     }
 
     /// Drain the leaderless segments found by `reconcile_segments` — the actor
     /// drives seal-end recovery (poll survivors, seal at the recovered end).
     pub(crate) fn take_leaderless_segments(&mut self) -> Vec<(SegmentKey, Vec<NodeId>)> {
-        std::mem::take(&mut self.leaderless_segments)
+        std::mem::take(&mut self.t_stat.leaderless_segments)
     }
 
     pub(crate) fn last_applied_index(&self) -> u64 {
-        self.last_applied_index
+        self.m_stat.last_applied_index
     }
 
     pub(crate) fn log_last_index(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.index)
-    }
-
-    fn log_last_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
-    }
-
-    fn log_term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            return 0;
-        }
-        self.log.get((index - 1) as usize).map_or(0, |e| e.term)
-    }
-
-    fn log_get(&self, index: u64) -> Option<&LogEntry> {
-        if index == 0 {
-            return None;
-        }
-        self.log.get((index - 1) as usize)
-    }
-
-    fn log_entries_from(&self, start_index: u64) -> Box<[LogEntry]> {
-        let last = self.log_last_index();
-        if start_index == 0 || start_index > last {
-            return Box::new([]);
-        }
-        self.log[(start_index - 1) as usize..].into()
-    }
-
-    fn log_append(&mut self, entry: LogEntry) {
-        debug_assert_eq!(
-            entry.index,
-            self.log_last_index() + 1,
-            "log entry index must be contiguous"
-        );
-        self.pending_log_mutations
-            .push(LogMutation::Append(entry.clone()));
-        self.log.push(entry);
-    }
-
-    fn log_truncate_from(&mut self, from_index: u64) {
-        if from_index == 0 || from_index > self.log_last_index() + 1 {
-            return;
-        }
-        self.pending_log_mutations
-            .push(LogMutation::TruncateFrom(from_index));
-        self.log.truncate((from_index - 1) as usize);
-    }
-
-    fn push_hard_state(&mut self) {
-        self.pending_log_mutations.push(LogMutation::HardState {
-            term: self.current_term,
-            voted_for: self.voted_for.clone(),
-        });
+        self.l_stat.last_index()
     }
 
     pub fn peers_count(&self) -> usize {
@@ -847,11 +636,11 @@ impl Raft {
     }
 
     pub fn current_leader(&self) -> Option<&NodeId> {
-        self.current_leader.as_ref()
+        self.t_stat.current_leader.as_ref()
     }
 
     pub fn is_leader(&self) -> bool {
-        self.role == Role::Leader
+        self.t_stat.role == Role::Leader
     }
 
     pub fn has_peer(&self, node_id: &NodeId) -> bool {
@@ -861,12 +650,12 @@ impl Raft {
     /// A node the leader is catching up as a non-voting learner (not yet a voter).
     #[cfg(test)]
     pub(crate) fn is_learner(&self, node_id: &NodeId) -> bool {
-        self.learner_states.contains_key(node_id)
+        self.t_stat.learner_states.contains_key(node_id)
     }
 
     #[cfg(test)]
     pub(crate) fn learner_count(&self) -> usize {
-        self.learner_states.len()
+        self.t_stat.learner_states.len()
     }
 
     /// Minimum number of nodes needed for a majority (strict majority).
@@ -877,7 +666,7 @@ impl Raft {
     }
 
     pub(crate) fn stabled_index(&self) -> u64 {
-        self.stabled_index
+        self.l_stat.stabled_index()
     }
 
     // -------------------------------------------------------------------
@@ -891,7 +680,7 @@ impl Raft {
                 // u64::MAX bypasses the staleness check for direct
                 // invocations in tests; real timers carry the epoch they
                 // were armed with.
-                if epoch == self.election_epoch || epoch == u64::MAX {
+                if epoch == self.t_stat.election_epoch || epoch == u64::MAX {
                     self.start_election();
                     return;
                 }
@@ -899,7 +688,7 @@ impl Raft {
                     node = %self.node_id,
                     group = self.shard_group_id.0,
                     stale_epoch = epoch,
-                    epoch = self.election_epoch,
+                    epoch = self.t_stat.election_epoch,
                     "election: dropped stale election timeout"
                 );
             }
@@ -935,12 +724,10 @@ impl Raft {
 
     fn start_election(&mut self) {
         // Leaders don't run election timers — they send heartbeats instead.
-        if self.role == Role::Leader {
+        if self.t_stat.role == Role::Leader {
             return;
         }
-        self.current_term += 1;
-        self.voted_for = Some(self.node_id.clone());
-        self.push_hard_state();
+        let term = self.l_stat.begin_election(&self.node_id);
 
         if self.peers.is_empty() {
             // Single-node cluster: elect self immediately.
@@ -948,20 +735,20 @@ impl Raft {
             return;
         }
 
-        self.role = Role::Candidate { votes_received: 1 }; // vote for self
+        self.t_stat.begin_campaign();
         self.reset_election_timer();
         tracing::trace!(
             node = %self.node_id,
             group = self.shard_group_id.0,
-            term = self.current_term,
+            term,
             "election: became candidate, broadcasting RequestVote"
         );
 
         let req = RequestVote {
-            term: self.current_term,
+            term,
             candidate_id: self.node_id.clone(),
             last_log_index: self.log_last_index(),
-            last_log_term: self.log_last_term(),
+            last_log_term: self.l_stat.last_term(),
         };
         for peer_id in self.peers.iter() {
             self.events.push(
@@ -974,11 +761,11 @@ impl Raft {
     // ! Followers grant or deny - All roles must respond
     fn handle_request_vote(&mut self, from: NodeId, req: RequestVote) {
         // If the request term is newer, step down.
-        if req.term > self.current_term {
+        if req.term > self.l_stat.current_term() {
             self.step_down(req.term);
         }
 
-        let term_ok = req.term == self.current_term;
+        let term_ok = req.term == self.l_stat.current_term();
         let vote_ok = self.vote_available_for(&req.candidate_id);
         let log_ok = self.log_is_up_to_date(req.last_log_index, req.last_log_term);
         let vote_granted = term_ok && vote_ok && log_ok;
@@ -987,7 +774,7 @@ impl Raft {
             group = self.shard_group_id.0,
             from = %req.candidate_id,
             req_term = req.term,
-            term = self.current_term,
+            term = self.l_stat.current_term(),
             granted = vote_granted,
             term_ok,
             vote_ok,
@@ -996,23 +783,19 @@ impl Raft {
         );
 
         if vote_granted {
-            self.voted_for = Some(req.candidate_id);
-            self.push_hard_state();
+            self.l_stat.grant_vote(req.candidate_id);
             self.reset_election_timer();
         }
 
-        self.events.push(
-            OutboundRaftPacket::new(
-                self.shard_group_id,
-                from,
-                RequestVoteResponse {
-                    term: self.current_term,
-                    node_id: self.node_id.clone(),
-                    vote_granted,
-                },
-            )
-            .into(),
-        );
+        self.raise(OutboundRaftPacket::new(
+            self.shard_group_id,
+            from,
+            RequestVoteResponse {
+                term: self.l_stat.current_term(),
+                node_id: self.node_id.clone(),
+                vote_granted,
+            },
+        ));
     }
 
     fn handle_request_vote_response(&mut self, resp: RequestVoteResponse) {
@@ -1021,11 +804,11 @@ impl Raft {
             group = self.shard_group_id.0,
             from = %resp.node_id,
             resp_term = resp.term,
-            term = self.current_term,
+            term = self.l_stat.current_term(),
             granted = resp.vote_granted,
             "election: RequestVoteResponse received"
         );
-        if resp.term > self.current_term {
+        if resp.term > self.l_stat.current_term() {
             self.step_down(resp.term);
             return;
         }
@@ -1033,29 +816,22 @@ impl Raft {
     }
 
     fn count_vote_if_eligible(&mut self, resp: RequestVoteResponse) {
-        let Role::Candidate { votes_received } = &mut self.role else {
-            return;
-        };
-        if resp.term != self.current_term || !resp.vote_granted {
+        if resp.term != self.l_stat.current_term() || !resp.vote_granted {
             return;
         }
-        *votes_received += 1;
-        if *votes_received >= self.quorum() {
+        if self.t_stat.record_vote(self.quorum()) {
             self.become_leader();
         }
     }
 
     fn vote_available_for(&self, candidate_id: &NodeId) -> bool {
-        match &self.voted_for {
-            None => true,
-            Some(id) => id == candidate_id,
-        }
+        self.l_stat.vote_available_for(candidate_id)
     }
 
     /// §5.4.1: A candidate's log is "at least as up-to-date" if its last
     /// entry has a higher term, or the same term with a >= index.
     fn log_is_up_to_date(&self, last_log_index: u64, last_log_term: u64) -> bool {
-        let my_last_term = self.log_last_term();
+        let my_last_term = self.l_stat.last_term();
         let my_last_index = self.log_last_index();
 
         if last_log_term != my_last_term {
@@ -1069,49 +845,27 @@ impl Raft {
     // -------------------------------------------------------------------
 
     fn become_leader(&mut self) {
-        self.role = Role::Leader;
-        self.current_leader = Some(self.node_id.clone());
+        let next = self.log_last_index() + 1;
+        self.t_stat
+            .initialize_leader(&self.node_id, &self.peers, next);
         tracing::debug!(
             node = %self.node_id,
             group = self.shard_group_id.0,
-            term = self.current_term,
+            term = self.l_stat.current_term(),
             "election: became leader"
         );
 
-        self.events.push(
-            LeaderChange {
-                shard_group_id: self.shard_group_id,
-                leader_node_id: self.node_id.clone(),
-                term: self.current_term,
-            }
-            .into(),
-        );
+        self.raise(LeaderChange {
+            shard_group_id: self.shard_group_id,
+            leader_node_id: self.node_id.clone(),
+            term: self.l_stat.current_term(),
+        });
 
         // Cancel election timer, start heartbeat + merge/ring check timers.
         self.cancel_all_timers();
         self.schedule_rpc_timer();
         self.schedule_merge_check_timer();
         self.schedule_ring_check_timer();
-
-        // next_index is set *before* the noop is appended, so it points
-        // at the noop's index — causing the first AppendEntries to carry it.
-        let next = self.log_last_index() + 1;
-
-        // Peer state tracker needs to be re-initialized on every leadership transition
-        self.peer_states.clear();
-        // Learners are leader-volatile catch-up state; reconcile re-stages them.
-        self.learner_states.clear();
-        // #135: ring confidence is leader-volatile — re-earn it.
-        self.ring_observation_streak = None;
-        for peer_id in self.peers.iter() {
-            self.peer_states.insert(
-                peer_id.clone(),
-                PeerState {
-                    next_index: next,
-                    match_index: 0,
-                },
-            );
-        }
 
         // Append a Noop entry at the new term so that all
         // preceding entries from earlier terms can be committed.
@@ -1128,10 +882,10 @@ impl Raft {
 
     fn step_down(&mut self, new_term: u64) {
         debug_assert!(
-            new_term >= self.current_term,
+            new_term >= self.l_stat.current_term(),
             "step_down must never regress the term"
         );
-        let was_leader = self.role == Role::Leader;
+        let was_leader = self.t_stat.role == Role::Leader;
 
         tracing::debug!(
             node = %self.node_id,
@@ -1147,15 +901,9 @@ impl Raft {
         // rule `recognize_leader`'s demotion branch follows. All production
         // callers pass strictly newer terms (guarded `>` at every call
         // site); tests use equal-term step_down to depose a leader in place.
-        if new_term > self.current_term {
-            self.current_term = new_term;
-            self.voted_for = None;
-            self.push_hard_state();
-        }
+        self.l_stat.advance_term(new_term);
 
         self.cancel_leader_timers();
-        // #135: a deposed leader's ring observations die with its term.
-        self.ring_observation_streak = None;
         if was_leader {
             // The election timer resets only on a vote grant or
             // on AppendEntries from the current leader — never on a mere
@@ -1165,12 +913,7 @@ impl Raft {
             // runs no election timer, arms a fresh one.
             self.reset_election_timer();
         }
-        self.role = Role::Follower;
-        self.current_leader = None;
-        self.peer_states.clear();
-        self.learner_states.clear();
-        self.confirmed_placement.clear();
-        self.catch_up.clear();
+        self.t_stat.reset_for_follower();
     }
 
     // -------------------------------------------------------------------
@@ -1178,7 +921,7 @@ impl Raft {
     // -------------------------------------------------------------------
 
     fn send_heartbeats(&mut self) {
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return;
         }
 
@@ -1195,9 +938,10 @@ impl Raft {
 
     fn maybe_redrive_segment_assignments(&mut self) {
         // rederive Metadata <> Datanode segment assignment
-        let active = self.active_segment_assignments();
+        let active = self.m_stat.active_segment_assignments();
         let active_keys: HashSet<SegmentKey> = active.iter().map(|(k, _, _)| *k).collect();
-        self.confirmed_placement
+        self.t_stat
+            .confirmed_data_leaders
             .retain(|k, _| active_keys.contains(k));
 
         let mut redrives = Vec::new();
@@ -1207,7 +951,7 @@ impl Raft {
             };
 
             // * If data leader acks assignment, it would have been added to confirmed_placement through Raft::handle_segment_placed
-            if self.confirmed_placement.get(&segment_key) == Some(target) {
+            if self.t_stat.confirmed_data_leaders.get(&segment_key) == Some(target) {
                 continue;
             }
 
@@ -1222,27 +966,29 @@ impl Raft {
             ));
         }
         if !redrives.is_empty() {
-            self.events.push(RaftEvent::RedriveAssignments(redrives));
+            self.raise(RaftEvent::RedriveAssignments(redrives));
         }
     }
 
     pub(crate) fn handle_segment_placed(&mut self, ack: SegmentPlaced) {
-        self.confirmed_placement.insert(ack.segment_key, ack.from);
+        self.t_stat
+            .confirmed_data_leaders
+            .insert(ack.segment_key, ack.from);
     }
 
     /// Re-drive the catch-up sweep — the sealed-segment analogue of
     /// `maybe_redrive_segment_assignments`. See `.claude/rules/raft-actor.md` #9.
     fn maybe_redrive_catch_ups(&mut self) {
-        let redrives = self.catch_up.redrives(self.shard_group_id);
+        let redrives = self.t_stat.catch_up.redrives(self.shard_group_id);
         if !redrives.is_empty() {
-            self.events.push(RaftEvent::RedriveAssignments(redrives));
+            self.raise(RaftEvent::RedriveAssignments(redrives));
         }
     }
 
     /// A member confirmed it holds a reassigned sealed segment; routed here from
     /// `MultiRaft`.
     pub(crate) fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
-        self.catch_up.confirm(ack.segment_key, ack.from);
+        self.t_stat.catch_up.confirm(ack.segment_key, ack.from);
     }
 
     /// Takeover backstop: re-seed catch-up for every known-end sealed segment this
@@ -1251,14 +997,10 @@ impl Raft {
     /// heartbeat sweep re-drives the re-seeded set (already-complete members
     /// full-match-ack cheaply). See `.claude/rules/raft-actor.md` #9.
     pub(crate) fn reseed_catch_up(&mut self) {
-        let sealed: Vec<_> = self
-            .state_machine
-            .topics
-            .values()
-            .flat_map(|t| t.known_end_sealed_segments())
-            .collect();
+        let sealed = self.m_stat.known_end_sealed_segments();
         for (segment_key, start, end, replica_set) in sealed {
-            self.catch_up
+            self.t_stat
+                .catch_up
                 .track_sealed(segment_key, start, end, replica_set);
         }
     }
@@ -1271,16 +1013,17 @@ impl Raft {
             RaftEvent::ShardLeaderRefresh(LeaderChange {
                 shard_group_id: self.shard_group_id,
                 leader_node_id: self.node_id.clone(),
-                term: self.current_term,
+                term: self.l_stat.current_term(),
             })
         })
     }
 
     /// Everyone the leader replicates to: voting peers plus catching-up learners.
     fn replication_targets(&self) -> Vec<NodeId> {
-        self.peer_states
+        self.t_stat
+            .peer_states
             .keys()
-            .chain(self.learner_states.keys())
+            .chain(self.t_stat.learner_states.keys())
             .cloned()
             .collect()
     }
@@ -1291,14 +1034,14 @@ impl Raft {
     /// that never participates (e.g. a freshly ring-assigned host with no local group
     /// instance yet) can never freeze the group. Leader-only.
     pub(crate) fn stage_learner(&mut self, node: NodeId) -> bool {
-        if self.role != Role::Leader
+        if !self.is_leader()
             || node == self.node_id
             || self.peers.contains(&node)
-            || self.learner_states.contains_key(&node)
+            || self.t_stat.learner_states.contains_key(&node)
         {
             return false;
         }
-        self.learner_states.insert(
+        self.t_stat.learner_states.insert(
             node.clone(),
             PeerState {
                 next_index: self.log_last_index() + 1,
@@ -1317,43 +1060,38 @@ impl Raft {
         if self.has_uncommitted_membership_change() {
             return;
         }
-        let Some(ls) = self.learner_states.get(node) else {
-            return;
-        };
-        if self.commit_index > 0 && ls.match_index >= self.commit_index {
+        if self.t_stat.is_learner_ready_for_promotion(node) {
             let _ = self.propose(RaftCommand::AddPeer(node.clone()));
         }
     }
 
     fn send_append_entries(&mut self, peer_id: NodeId) {
         let peer_state = match self
+            .t_stat
             .peer_states
             .get(&peer_id)
-            .or_else(|| self.learner_states.get(&peer_id))
+            .or_else(|| self.t_stat.learner_states.get(&peer_id))
         {
             Some(ps) => ps,
             None => return,
         };
 
         let prev_log_index = peer_state.next_index.saturating_sub(1);
-        let prev_log_term = self.log_term_at(prev_log_index);
-        let entries = self.log_entries_from(peer_state.next_index);
+        let prev_log_term = self.l_stat.term_at(prev_log_index);
+        let entries = self.l_stat.entries_from(peer_state.next_index);
 
-        self.events.push(
-            OutboundRaftPacket::new(
-                self.shard_group_id,
-                peer_id,
-                AppendEntries {
-                    term: self.current_term,
-                    leader_id: self.node_id.clone(),
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    leader_commit: self.commit_index,
-                },
-            )
-            .into(),
-        );
+        self.raise(OutboundRaftPacket::new(
+            self.shard_group_id,
+            peer_id,
+            AppendEntries {
+                term: self.l_stat.current_term(),
+                leader_id: self.node_id.clone(),
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.t_stat.commit_index,
+            },
+        ));
     }
 
     // ! SAFETY:
@@ -1361,7 +1099,7 @@ impl Raft {
     // ! - Candidates step down on same term : because receiving entries while being a candidate means another node already won.
     // ! - Followers process normally. All roles must respond.
     fn handle_append_entries(&mut self, from: NodeId, req: AppendEntries) {
-        if req.term < self.current_term {
+        if req.term < self.l_stat.current_term() {
             self.reject_append_entries(from);
             return;
         }
@@ -1380,19 +1118,19 @@ impl Raft {
     }
 
     fn recognize_leader(&mut self, req: &AppendEntries) {
-        if req.term > self.current_term {
+        if req.term > self.l_stat.current_term() {
             self.step_down(req.term);
-        } else if self.role != Role::Follower {
-            self.role = Role::Follower;
-            self.peer_states.clear();
-            self.learner_states.clear();
+        } else if self.t_stat.role != Role::Follower {
+            self.t_stat.role = Role::Follower;
+            self.t_stat.peer_states.clear();
+            self.t_stat.learner_states.clear();
         }
-        self.current_leader = Some(req.leader_id.clone());
+        self.t_stat.current_leader = Some(req.leader_id.clone());
         self.reset_election_timer();
         tracing::debug!(
             node = %self.node_id,
             group = self.shard_group_id.0,
-            term = self.current_term,
+            term = self.l_stat.current_term(),
             leader = %req.leader_id,
             "election: leader recognized"
         );
@@ -1402,25 +1140,25 @@ impl Raft {
         if prev_log_index == 0 {
             return true;
         }
-        let local_term = self.log_term_at(prev_log_index);
+        let local_term = self.l_stat.term_at(prev_log_index);
         local_term != 0 && local_term == prev_log_term
     }
 
     fn replicate_entries(&mut self, entries: Box<[LogEntry]>) {
         for entry in entries {
-            let existing_term = self.log_term_at(entry.index);
+            let existing_term = self.l_stat.term_at(entry.index);
             if existing_term != 0 && existing_term != entry.term {
-                self.log_truncate_from(entry.index);
+                self.l_stat.truncate_from(entry.index);
             }
             if entry.index > self.log_last_index() {
-                self.log_append(entry);
+                self.l_stat.append(entry);
             }
         }
     }
 
     fn advance_follower_commit(&mut self, leader_commit: u64) {
-        if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(self.log_last_index());
+        if leader_commit > self.t_stat.commit_index {
+            self.t_stat.commit_index = leader_commit.min(self.log_last_index());
             self.apply_committed_entries();
         }
     }
@@ -1429,22 +1167,22 @@ impl Raft {
     // ! - term guard
     // ! - only leaders track peer state
     fn handle_append_entries_response(&mut self, resp: AppendEntriesResponse) {
-        if resp.term > self.current_term {
+        if resp.term > self.l_stat.current_term() {
             self.step_down(resp.term);
             return;
         }
 
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return;
         }
 
         // The responder may be a voting peer or a catching-up learner.
         let node_id = resp.node_id.clone();
-        let is_voter = self.peer_states.contains_key(&node_id);
+        let is_voter = self.t_stat.peer_states.contains_key(&node_id);
         let peer_state = if is_voter {
-            self.peer_states.get_mut(&node_id)
+            self.t_stat.peer_states.get_mut(&node_id)
         } else {
-            self.learner_states.get_mut(&node_id)
+            self.t_stat.learner_states.get_mut(&node_id)
         };
         if let Some(peer_state) = peer_state {
             if resp.success {
@@ -1472,19 +1210,16 @@ impl Raft {
     }
 
     fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
-        self.events.push(
-            OutboundRaftPacket::new(
-                self.shard_group_id,
-                target,
-                AppendEntriesResponse {
-                    term: self.current_term,
-                    node_id: self.node_id.clone(),
-                    success,
-                    last_log_index: self.log_last_index(),
-                },
-            )
-            .into(),
-        );
+        self.raise(OutboundRaftPacket::new(
+            self.shard_group_id,
+            target,
+            AppendEntriesResponse {
+                term: self.l_stat.current_term(),
+                node_id: self.node_id.clone(),
+                success,
+                last_log_index: self.log_last_index(),
+            },
+        ));
     }
 
     // A log entry is committed once it is replicated on a
@@ -1509,19 +1244,14 @@ impl Raft {
 
         // Scan top-down: the highest current-term entry with quorum
         // implicitly commits everything below it (log matching property).
-        for n in (self.commit_index + 1..=last).rev() {
-            if self.log_term_at(n) != self.current_term {
+        for n in (self.t_stat.commit_index + 1..=last).rev() {
+            if self.l_stat.term_at(n) != self.l_stat.current_term() {
                 continue;
             }
-            let replication_count = self
-                .peer_states
-                .values()
-                .filter(|ps| ps.match_index >= n)
-                .count() as u32
-                + 1; // +1 for self
+            let replication_count = self.t_stat.replicated_voter_count(n);
 
             if replication_count >= quorum {
-                self.commit_index = n;
+                self.t_stat.commit_index = n;
                 self.apply_committed_entries();
                 return;
             }
@@ -1529,7 +1259,7 @@ impl Raft {
     }
 
     pub(crate) fn advance_stabled_index(&mut self, value: u64) {
-        self.stabled_index = self.stabled_index.max(value);
+        self.l_stat.advance_stabled_index(value);
         self.apply_committed_entries();
 
         #[cfg(any(test, debug_assertions))]
@@ -1538,17 +1268,19 @@ impl Raft {
 
     #[tracing::instrument(level = "debug", skip_all, fields(
         group = self.shard_group_id.0,
-        from = self.last_applied_index + 1,
-        to = self.commit_index.min(self.stabled_index),
+        from = self.m_stat.last_applied_index + 1,
+        to = self.t_stat.commit_index.min(self.l_stat.stabled_index()),
     ))]
     fn apply_committed_entries(&mut self) {
-        while self.last_applied_index < self.commit_index.min(self.stabled_index) {
-            self.last_applied_index += 1;
-            let Some(entry) = self.log_get(self.last_applied_index).cloned() else {
+        while self.m_stat.last_applied_index
+            < self.t_stat.commit_index.min(self.l_stat.stabled_index())
+        {
+            self.m_stat.last_applied_index += 1;
+            let Some(entry) = self.l_stat.get(self.m_stat.last_applied_index).cloned() else {
                 tracing::error!(
                     "[{}] committed entry at index {} missing from log",
                     self.node_id,
-                    self.last_applied_index
+                    self.m_stat.last_applied_index
                 );
                 break;
             };
@@ -1564,7 +1296,7 @@ impl Raft {
     }
 
     fn apply_metadata_entry(&mut self, cmd: MetadataCommand, index: u64) {
-        match self.state_machine.apply(cmd) {
+        match self.m_stat.apply(cmd) {
             Ok(result) => {
                 tracing::debug!(
                     "[{}] Applied metadata at index {}: {:?}",
@@ -1576,17 +1308,14 @@ impl Raft {
                 if self.is_leader()
                     && let ApplyResult::SegmentReassigned(r) = &result
                 {
-                    self.catch_up.track(r);
+                    self.t_stat.catch_up.track(r);
                 }
-                self.events.push(
-                    MetadataCommitted {
-                        shard_group_id: self.shard_group_id,
-                        result,
-                        log_index: index,
-                        seal_context: None,
-                    }
-                    .into(),
-                );
+                self.raise(MetadataCommitted {
+                    shard_group_id: self.shard_group_id,
+                    result,
+                    log_index: index,
+                    seal_context: None,
+                });
             }
             Err(e) => tracing::error!(
                 "[{}] Metadata apply error at index {}: {:?}",
@@ -1595,9 +1324,10 @@ impl Raft {
                 e
             ),
         }
-        if self.role == Role::Leader {
-            self.pending_proposals
-                .extend(self.state_machine.take_pending_proposals());
+        if self.t_stat.role == Role::Leader {
+            self.t_stat
+                .pending_proposals
+                .extend(self.m_stat.take_pending_proposals());
         }
     }
 
@@ -1610,13 +1340,13 @@ impl Raft {
         }
         // Promotion: a learner graduating to a voter carries its catch-up progress, so
         // the new voter isn't reset to match_index 0 (which would stall commits anew).
-        let carried = self.learner_states.remove(&node_id);
-        if self.peers.insert(node_id.clone()) && self.role == Role::Leader {
+        let carried = self.t_stat.learner_states.remove(&node_id);
+        if self.peers.insert(node_id.clone()) && self.t_stat.role == Role::Leader {
             let state = carried.unwrap_or(PeerState {
                 next_index: self.log_last_index() + 1,
                 match_index: 0,
             });
-            self.peer_states.insert(node_id, state);
+            self.t_stat.peer_states.insert(node_id, state);
         }
     }
 
@@ -1624,20 +1354,20 @@ impl Raft {
     /// `RemovePeer` log entry commits. Never call directly — the peer set is part
     /// of the replicated state machine and must only mutate through the log.
     fn apply_remove_peer(&mut self, node_id: NodeId) {
-        self.learner_states.remove(&node_id);
+        self.t_stat.learner_states.remove(&node_id);
         if self.peers.remove(&node_id) {
-            self.peer_states.remove(&node_id);
-            self.events.push(RaftEvent::DisconnectPeer(node_id));
+            self.t_stat.peer_states.remove(&node_id);
+            self.raise(RaftEvent::DisconnectPeer(node_id));
         }
     }
 
     fn add_new_entry(&mut self, command: RaftCommand) {
         let entry = LogEntry {
-            term: self.current_term,
+            term: self.l_stat.current_term(),
             index: self.log_last_index() + 1,
             command,
         };
-        self.log_append(entry);
+        self.l_stat.append(entry);
     }
 
     /// Propose a command to the Raft log. Only the leader can accept proposals.
@@ -1648,12 +1378,12 @@ impl Raft {
     // -> Appended to leader's log
     // -> Replicated to shard #45's followers
     // -> Majority ack -> committed
-    // -> Applied to MetadataStateMachine → topic blue exists
+    // -> Applied to MetadataState → topic blue exists
     /// Returns the log index at which the command was appended on success.
     #[tracing::instrument(level = "trace", skip_all, fields(group = self.shard_group_id.0, command = ?command))]
     pub fn propose(&mut self, command: RaftCommand) -> Result<u64, ProposalError> {
-        if self.role != Role::Leader {
-            return Err(ProposalError::NotLeader(self.current_leader.clone()));
+        if !self.is_leader() {
+            return Err(ProposalError::NotLeader(self.t_stat.current_leader.clone()));
         }
 
         self.add_new_entry(command);
@@ -1717,48 +1447,45 @@ impl Raft {
     }
 
     fn reset_election_timer(&mut self) {
-        self.election_epoch = self.election_epoch.wrapping_add(1);
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.election,
-            }));
-        let jitter = self.election_jitter.next();
+        let election_epoch = self.t_stat.advance_election_epoch();
+
+        let jitter = self.t_stat.election_jitter.next();
         tracing::trace!(
             node = %self.node_id,
             group = self.shard_group_id.0,
-            epoch = self.election_epoch,
+            epoch = election_epoch,
             jitter_ticks = jitter,
             "election: timer armed"
         );
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.timer_seqs.election,
-                timer: RaftTimer::election(jitter, self.shard_group_id, self.election_epoch),
-            }));
+
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.election,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::SetSchedule {
+            seq: self.timer_seqs.election,
+            timer: RaftTimer::election(jitter, self.shard_group_id, election_epoch),
+        }));
     }
 
     fn schedule_rpc_timer(&mut self) {
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.timer_seqs.rpc,
-                timer: RaftTimer::rpc(self.shard_group_id),
-            }));
+        self.raise(RaftEvent::Timer(TimerCommand::SetSchedule {
+            seq: self.timer_seqs.rpc,
+            timer: RaftTimer::rpc(self.shard_group_id),
+        }));
     }
 
     fn schedule_merge_check_timer(&mut self) {
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.timer_seqs.merge_check,
-                timer: RaftTimer::merge_check(self.shard_group_id),
-            }));
+        self.raise(RaftEvent::Timer(TimerCommand::SetSchedule {
+            seq: self.timer_seqs.merge_check,
+            timer: RaftTimer::merge_check(self.shard_group_id),
+        }));
     }
 
     fn schedule_ring_check_timer(&mut self) {
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::SetSchedule {
-                seq: self.timer_seqs.ring_check,
-                timer: RaftTimer::ring_check(self.shard_group_id),
-            }));
+        self.raise(RaftEvent::Timer(TimerCommand::SetSchedule {
+            seq: self.timer_seqs.ring_check,
+            timer: RaftTimer::ring_check(self.shard_group_id),
+        }));
     }
 
     /// Re-arm the periodic ring check (#135 trigger gap). The ring diff
@@ -1767,20 +1494,20 @@ impl Raft {
     /// the timer lifecycle, leader-gated like `evaluate_merges`: a deposed
     /// leader lets the timer die (it is re-armed on the next become_leader).
     pub(crate) fn reschedule_ring_check(&mut self) {
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return;
         }
         self.schedule_ring_check_timer();
     }
 
     pub(crate) fn evaluate_merges(&mut self, now: u64) {
-        if self.role != Role::Leader {
+        if !self.is_leader() {
             return;
         }
 
-        let merge_proposals = self.state_machine.evaluate_merges(now);
+        let merge_proposals = self.m_stat.evaluate_merges(now);
         for cmd in merge_proposals {
-            self.pending_proposals.push(cmd);
+            self.t_stat.pending_proposals.push(cmd);
         }
 
         self.schedule_merge_check_timer();
@@ -1791,38 +1518,31 @@ impl Raft {
     /// follower or candidate keeps its currently armed election deadline
     /// (#133).
     fn cancel_leader_timers(&mut self) {
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.rpc,
-            }));
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.merge_check,
-            }));
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.ring_check,
-            }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.rpc,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.merge_check,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.ring_check,
+        }));
     }
 
     pub(crate) fn cancel_all_timers(&mut self) {
-        self.election_epoch = self.election_epoch.wrapping_add(1);
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.election,
-            }));
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.rpc,
-            }));
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.merge_check,
-            }));
-        self.events
-            .push(RaftEvent::Timer(TimerCommand::CancelSchedule {
-                seq: self.timer_seqs.ring_check,
-            }));
+        self.t_stat.advance_election_epoch();
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.election,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.rpc,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.merge_check,
+        }));
+        self.raise(RaftEvent::Timer(TimerCommand::CancelSchedule {
+            seq: self.timer_seqs.ring_check,
+        }));
     }
 }
 
@@ -1830,26 +1550,26 @@ impl Raft {
 impl crate::test_traits::TAssertInvariant for Raft {
     fn assert_invariants(&self) {
         assert!(
-            self.last_applied_index <= self.commit_index,
+            self.m_stat.last_applied_index <= self.t_stat.commit_index,
             "last_applied ({}) > commit_index ({})",
-            self.last_applied_index,
-            self.commit_index,
+            self.m_stat.last_applied_index,
+            self.t_stat.commit_index,
         );
         assert!(
-            self.last_applied_index <= self.stabled_index,
+            self.m_stat.last_applied_index <= self.l_stat.stabled_index(),
             "last_applied ({}) > stabled_index ({}) — applied a non-durable entry",
-            self.last_applied_index,
-            self.stabled_index,
+            self.m_stat.last_applied_index,
+            self.l_stat.stabled_index(),
         );
         assert!(
-            self.commit_index <= self.log_last_index(),
+            self.t_stat.commit_index <= self.log_last_index(),
             "commit_index ({}) > log_last_index ({})",
-            self.commit_index,
+            self.t_stat.commit_index,
             self.log_last_index(),
         );
 
         // Log indices are contiguous and 1-based
-        for (i, entry) in self.log.iter().enumerate() {
+        for (i, entry) in self.l_stat.entries().iter().enumerate() {
             assert_eq!(
                 entry.index,
                 (i + 1) as u64,
@@ -1857,36 +1577,36 @@ impl crate::test_traits::TAssertInvariant for Raft {
                 entry.index,
             );
             assert!(
-                entry.term <= self.current_term,
+                entry.term <= self.l_stat.current_term(),
                 "log entry at index {} has term {} > current_term {}",
                 entry.index,
                 entry.term,
-                self.current_term,
+                self.l_stat.current_term(),
             );
         }
 
         // Invariant: peer_states exists only on the leader (and matches the peer
         // set when leader). Followers/candidates carry an empty peer_states.
-        match self.role {
+        match self.t_stat.role {
             Role::Leader => {
                 for peer in &self.peers {
                     assert!(
-                        self.peer_states.contains_key(peer),
+                        self.t_stat.peer_states.contains_key(peer),
                         "leader missing peer_state for {:?}",
                         peer,
                     );
                 }
                 assert_eq!(
-                    self.peer_states.len(),
+                    self.t_stat.peer_states.len(),
                     self.peers.len(),
                     "leader peer_states size ({}) != peers size ({})",
-                    self.peer_states.len(),
+                    self.t_stat.peer_states.len(),
                     self.peers.len(),
                 );
                 // Invariant: learners are non-voting and disjoint from voters — a node
                 // is never both — and self is never a learner. Learners are replicated
                 // to but excluded from the commit quorum until promoted via `AddPeer`.
-                for learner in self.learner_states.keys() {
+                for learner in self.t_stat.learner_states.keys() {
                     assert!(
                         !self.peers.contains(learner),
                         "node {:?} is both a voter and a learner",
@@ -1898,23 +1618,23 @@ impl crate::test_traits::TAssertInvariant for Raft {
                 // the local fragment of this: a leader must have voted for itself this
                 // term (and is therefore the only node that could have won this term).
                 assert_eq!(
-                    self.voted_for.as_ref(),
+                    self.l_stat.voted_for(),
                     Some(&self.node_id),
                     "leader has voted_for {:?}, expected self ({:?})",
-                    self.voted_for,
+                    self.l_stat.voted_for(),
                     self.node_id,
                 );
             }
             Role::Follower | Role::Candidate { .. } => {
                 assert!(
-                    self.peer_states.is_empty(),
+                    self.t_stat.peer_states.is_empty(),
                     "non-leader carries peer_states ({} entries)",
-                    self.peer_states.len(),
+                    self.t_stat.peer_states.len(),
                 );
                 assert!(
-                    self.learner_states.is_empty(),
+                    self.t_stat.learner_states.is_empty(),
                     "non-leader carries learner_states ({} entries)",
-                    self.learner_states.len(),
+                    self.t_stat.learner_states.len(),
                 );
             }
         }
@@ -1947,11 +1667,11 @@ mod tests {
         }
 
         pub(crate) fn current_term(&self) -> u64 {
-            self.current_term
+            self.l_stat.current_term()
         }
 
         pub(crate) fn voted_for(&self) -> Option<NodeId> {
-            self.voted_for.clone()
+            self.l_stat.voted_for().cloned()
         }
 
         pub(crate) fn simulate_flush_and_apply(&mut self) {
@@ -1959,8 +1679,8 @@ mod tests {
             self.apply_committed_entries();
         }
 
-        pub(crate) fn state_machine(&self) -> &MetadataStateMachine {
-            &self.state_machine
+        pub(crate) fn state_machine(&self) -> &MetadataState {
+            &self.m_stat
         }
     }
     fn node(id: &str) -> NodeId {
@@ -2033,16 +1753,19 @@ mod tests {
     #[test]
     fn single_node_elects_self_on_timeout() {
         let mut raft = single_node_raft();
-        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(raft.t_stat.role, Role::Follower);
 
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
             epoch: u64::MAX,
         });
 
-        assert_eq!(raft.role, Role::Leader);
-        assert_eq!(raft.current_term, 1);
-        assert_eq!(raft.voted_for, Some(NodeId::new("node-1")));
+        assert_eq!(raft.t_stat.role, Role::Leader);
+        assert_eq!(raft.l_stat.current_term(), 1);
+        assert_eq!(
+            raft.l_stat.voted_for().cloned(),
+            Some(NodeId::new("node-1"))
+        );
     }
 
     #[test]
@@ -2052,7 +1775,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
             epoch: u64::MAX,
         });
-        assert_eq!(raft.current_term, 1);
+        assert_eq!(raft.l_stat.current_term(), 1);
 
         // Step down and trigger another election
         raft.step_down(1);
@@ -2060,7 +1783,7 @@ mod tests {
             shard_group_id: TEST_SHARD,
             epoch: u64::MAX,
         });
-        assert_eq!(raft.current_term, 2);
+        assert_eq!(raft.l_stat.current_term(), 2);
     }
 
     // -------------------------------------------------------------------
@@ -2076,8 +1799,11 @@ mod tests {
             epoch: u64::MAX,
         });
 
-        assert!(matches!(raft.role, Role::Candidate { votes_received: 1 }));
-        assert_eq!(raft.current_term, 1);
+        assert!(matches!(
+            raft.t_stat.role,
+            Role::Candidate { votes_received: 1 }
+        ));
+        assert_eq!(raft.l_stat.current_term(), 1);
 
         let out = packets(&mut raft);
         assert_eq!(out.len(), 2); // one per peer
@@ -2107,7 +1833,10 @@ mod tests {
             }
             _ => panic!("expected RequestVoteResponse"),
         }
-        assert_eq!(raft.voted_for, Some(NodeId::new("node-1")));
+        assert_eq!(
+            raft.l_stat.voted_for().cloned(),
+            Some(NodeId::new("node-1"))
+        );
     }
 
     #[test]
@@ -2159,7 +1888,7 @@ mod tests {
         };
         raft.handle_rpc(node("node-2"), resp);
 
-        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.t_stat.role, Role::Leader);
     }
 
     #[test]
@@ -2178,8 +1907,8 @@ mod tests {
         };
         raft.handle_rpc(node("node-2"), resp);
 
-        assert_eq!(raft.role, Role::Follower);
-        assert_eq!(raft.current_term, 5);
+        assert_eq!(raft.t_stat.role, Role::Follower);
+        assert_eq!(raft.l_stat.current_term(), 5);
     }
 
     // -------------------------------------------------------------------
@@ -2190,7 +1919,7 @@ mod tests {
     fn rejects_vote_if_candidate_log_is_stale() {
         let mut raft = three_node_raft("node-2");
         // Give node-2 a log entry at term 2
-        raft.log_append(LogEntry {
+        raft.l_stat.append(LogEntry {
             term: 2,
             index: 1,
             command: RaftCommand::Noop,
@@ -2309,7 +2038,7 @@ mod tests {
     #[test]
     fn follower_rejects_append_entries_with_stale_term() {
         let mut raft = three_node_raft("node-2");
-        raft.current_term = 5;
+        raft.l_stat.advance_term(5);
 
         let ae = AppendEntries {
             term: 3,
@@ -2383,7 +2112,7 @@ mod tests {
         raft.propose_noop().unwrap();
         drain(&mut raft);
         assert_eq!(raft.log_last_index(), 2);
-        assert_eq!(raft.commit_index, 0);
+        assert_eq!(raft.t_stat.commit_index, 0);
 
         // node-2 acknowledges both entries (noop + proposal)
         let resp = AppendEntriesResponse {
@@ -2395,7 +2124,7 @@ mod tests {
         raft.handle_rpc(node("node-2"), resp);
 
         // Majority achieved (self + node-2 = 2 out of 3)
-        assert_eq!(raft.commit_index, 2);
+        assert_eq!(raft.t_stat.commit_index, 2);
     }
 
     #[test]
@@ -2454,7 +2183,7 @@ mod tests {
         raft.handle_rpc(node("node-1"), ae);
         drain(&mut raft);
 
-        assert_eq!(raft.commit_index, 1);
+        assert_eq!(raft.t_stat.commit_index, 1);
     }
 
     // -------------------------------------------------------------------
@@ -2523,7 +2252,7 @@ mod tests {
             }),
         );
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.t_stat.role, Role::Leader);
 
         // Receive AppendEntries from a leader with higher term
         let ae = AppendEntries {
@@ -2536,8 +2265,8 @@ mod tests {
         };
         raft.handle_rpc(node("node-3"), ae);
 
-        assert_eq!(raft.role, Role::Follower);
-        assert_eq!(raft.current_term, 3);
+        assert_eq!(raft.t_stat.role, Role::Follower);
+        assert_eq!(raft.l_stat.current_term(), 3);
     }
 
     // -------------------------------------------------------------------
@@ -2563,8 +2292,8 @@ mod tests {
             }),
         );
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader);
-        assert_eq!(raft.current_term, 1);
+        assert_eq!(raft.t_stat.role, Role::Leader);
+        assert_eq!(raft.l_stat.current_term(), 1);
 
         // Stale election timeout arrives — should be ignored
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
@@ -2573,17 +2302,17 @@ mod tests {
         });
 
         assert_eq!(
-            raft.role,
+            raft.t_stat.role,
             Role::Leader,
             "leader must not start a new election"
         );
-        assert_eq!(raft.current_term, 1, "term must not increment");
+        assert_eq!(raft.l_stat.current_term(), 1, "term must not increment");
     }
 
     #[test]
     fn follower_ignores_rpc_timeout() {
         let mut raft = three_node_raft("node-1");
-        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(raft.t_stat.role, Role::Follower);
 
         raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
@@ -2601,7 +2330,7 @@ mod tests {
             epoch: u64::MAX,
         });
         drain(&mut raft);
-        assert!(matches!(raft.role, Role::Candidate { .. }));
+        assert!(matches!(raft.t_stat.role, Role::Candidate { .. }));
 
         raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
             shard_group_id: TEST_SHARD,
@@ -2640,7 +2369,7 @@ mod tests {
         );
         drain(&mut raft);
 
-        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.t_stat.role, Role::Leader);
         assert_eq!(raft.current_leader(), Some(&node("node-1")));
     }
 
@@ -2930,7 +2659,7 @@ mod tests {
         let result = raft.propose(cmd.into());
         assert!(result.is_ok());
         raft.simulate_flush();
-        assert!(raft.last_applied_index > 0);
+        assert!(raft.m_stat.last_applied_index > 0);
     }
 
     // -------------------------------------------------------------------
@@ -3039,7 +2768,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 3 — MetadataStateMachine apply
+    // Phase 3 — MetadataState apply
     // -------------------------------------------------------------------
 
     use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
@@ -3158,7 +2887,7 @@ mod tests {
         drain(&mut raft);
         raft.simulate_flush();
         assert_eq!(raft.log_last_index(), 1);
-        assert_eq!(raft.commit_index, 0);
+        assert_eq!(raft.t_stat.commit_index, 0);
 
         // node-1 wins election at term 2
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
@@ -3175,12 +2904,12 @@ mod tests {
             }),
         );
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader);
-        assert_eq!(raft.current_term, 2);
+        assert_eq!(raft.t_stat.role, Role::Leader);
+        assert_eq!(raft.l_stat.current_term(), 2);
         // become_leader appends a Noop at term 2 (index 2)
         assert_eq!(raft.log_last_index(), 2);
-        assert_eq!(raft.log_term_at(1), 1);
-        assert_eq!(raft.log_term_at(2), 2);
+        assert_eq!(raft.l_stat.term_at(1), 1);
+        assert_eq!(raft.l_stat.term_at(2), 2);
 
         // node-3 acks only the old term-1 entry (index 1) but not the term-2 entry
         raft.handle_rpc(
@@ -3194,7 +2923,7 @@ mod tests {
         );
         // commit_index must NOT advance — the replicated entry is term 1, not current term
         assert_eq!(
-            raft.commit_index, 0,
+            raft.t_stat.commit_index, 0,
             "term-1 entry must not be directly committed even with majority"
         );
 
@@ -3210,7 +2939,7 @@ mod tests {
         );
         // Now both entries committed (term-2 entry at index 2 has quorum,
         // implicitly committing the term-1 entry at index 1)
-        assert_eq!(raft.commit_index, 2);
+        assert_eq!(raft.t_stat.commit_index, 2);
     }
 
     #[test]
@@ -3369,7 +3098,7 @@ mod tests {
             .next()
             .expect("three_node_raft must have peers")
             .clone();
-        let term = raft.current_term;
+        let term = raft.l_stat.current_term();
         raft.handle_rpc(
             peer.clone(),
             RaftRpc::RequestVoteResponse(RequestVoteResponse {
@@ -3379,7 +3108,11 @@ mod tests {
             }),
         );
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader, "must be leader after election");
+        assert_eq!(
+            raft.t_stat.role,
+            Role::Leader,
+            "must be leader after election"
+        );
         raft
     }
 
@@ -3393,14 +3126,14 @@ mod tests {
             epoch: u64::MAX,
         });
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.t_stat.role, Role::Leader);
         raft
     }
 
     /// Proposals in the log after the become_leader noop (index 1).
     fn proposals_after_become_leader(raft: &Raft) -> Vec<RaftCommand> {
         (2..=raft.log_last_index())
-            .filter_map(|i| raft.log_get(i).map(|e| e.command.clone()))
+            .filter_map(|i| raft.l_stat.get(i).map(|e| e.command.clone()))
             .collect()
     }
 
@@ -3552,7 +3285,11 @@ mod tests {
             );
         }
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader, "must be leader after election");
+        assert_eq!(
+            raft.t_stat.role,
+            Role::Leader,
+            "must be leader after election"
+        );
 
         let members = group.replicas.clone();
         (raft, reader, members)
@@ -3952,7 +3689,7 @@ mod tests {
             epoch: u64::MAX,
         });
         drain(&mut raft);
-        assert_eq!(raft.role, Role::Leader);
+        assert_eq!(raft.t_stat.role, Role::Leader);
         raft
     }
 
@@ -4167,8 +3904,8 @@ mod tests {
     fn catch_up_repairs_dropped_on_step_down() {
         let (mut raft, _) = raft_with_seeded_catch_up(vec![node("node-1"), node("y")]);
         // A higher term deposes the leader → leader-volatile tracker is cleared.
-        raft.step_down(raft.current_term + 1);
-        assert!(raft.catch_up.is_empty());
+        raft.step_down(raft.l_stat.current_term() + 1);
+        assert!(raft.t_stat.catch_up.is_empty());
         assert!(drain_catch_up_redrives(&mut raft).is_empty());
     }
 
@@ -4179,7 +3916,7 @@ mod tests {
 
         // Simulate the takeover gap: the leader-volatile tracker is empty, but the
         // sealed segment is still under-replicated in the state machine.
-        raft.catch_up.clear();
+        raft.t_stat.catch_up.clear();
         assert!(drain_catch_up_redrives(&mut raft).is_empty());
 
         raft.reseed_catch_up();
