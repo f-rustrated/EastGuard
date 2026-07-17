@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{
@@ -75,64 +74,6 @@ pub struct ReplicateConsumerOffset {
 pub(crate) enum FutureOffsetCommit {
     Client(CommitConsumerOffset),
     Replica(ReplicateConsumerOffset),
-}
-
-pub(crate) struct OffsetPlacement {
-    pub(crate) segment_key: SegmentKey,
-    pub(crate) shard_group_id: ShardGroupId, // needed for delayed coordinator routing
-    pub(crate) leader: NodeId,
-    pub(crate) replicas: Replicas,
-    pub(crate) ready_replicas: HashSet<NodeId>,
-    pub(crate) bootstrap_acked: HashSet<NodeId>,
-    pub(crate) placement_ack_sent: bool,
-}
-
-impl OffsetPlacement {
-    // Ensure the requested segment is the current placement &&
-    // The configured leader is offset-ready.
-    pub(crate) fn can_bootstrap_replicas(&self, segment_key: &SegmentKey) -> bool {
-        self.segment_key == *segment_key && self.is_ready(&self.leader)
-    }
-
-    pub(crate) fn is_ready(&self, n: &NodeId) -> bool {
-        self.ready_replicas.contains(n)
-    }
-
-    pub(crate) fn is_fully_ready(&self) -> bool {
-        self.ready_replicas.len() == self.replicas.len()
-    }
-
-    pub(crate) fn compare(&self, other_key: &SegmentKey, other: &Replicas) -> PlacementObservation {
-        if self.segment_key == *other_key {
-            if &self.replicas != other {
-                tracing::warn!(
-                    ?other_key,
-                    current_replicas = ?self.replicas,
-                    observed_replicas = ?other,
-                    "ignored conflicting replica set for an existing segment"
-                );
-            }
-
-            return if &self.replicas == other {
-                // No need to place again - idempotency
-                PlacementObservation::Unchanged
-            } else {
-                PlacementObservation::Conflict
-            };
-        }
-        if self.segment_key.segment_id >= other_key.segment_id {
-            return PlacementObservation::Stale;
-        }
-        PlacementObservation::Accepted
-    }
-
-    pub(crate) fn unready_followers(&self) -> Box<[NodeId]> {
-        self.replicas
-            .followers()
-            .filter(|node| !self.ready_replicas.contains(*node))
-            .cloned()
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
