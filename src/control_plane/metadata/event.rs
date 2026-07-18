@@ -1,5 +1,5 @@
 use crate::control_plane::Replicas;
-use crate::control_plane::consensus::multi_raft::SealContext;
+use crate::control_plane::consensus::multi_raft::RollRequestContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
@@ -42,7 +42,7 @@ pub struct SegmentRolled {
 impl SegmentRolled {
     pub fn into_command(
         self,
-        ctx: Option<SealContext>,
+        ctx: Option<RollRequestContext>,
         shard_group_id: ShardGroupId,
     ) -> Vec<DataTransportCommand> {
         let start = self.end_entry_id.map_or(EntryId::MIN, |id| id + 1);
@@ -251,13 +251,13 @@ impl SegmentsDeleted {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentSealCorrected {
+pub struct SegmentBoundaryCorrected {
     pub segment_key: SegmentKey,
     pub replica_set: Replicas,
     pub committed_entry_id: Option<EntryId>,
 }
 
-impl SegmentSealCorrected {
+impl SegmentBoundaryCorrected {
     pub fn into_commands(self) -> Vec<DataTransportCommand> {
         if self.replica_set.is_empty() {
             vec![]
@@ -281,7 +281,7 @@ pub enum ApplyResult {
     RangeMerged(RangeMerged),
     SegmentReassigned(SegmentReassigned),
     SegmentsDeleted(SegmentsDeleted),
-    SegmentSealCorrected(SegmentSealCorrected),
+    SegmentBoundaryCorrected(SegmentBoundaryCorrected),
     ConsumerGroupChanged(ConsumerGroupEpochSnapshot),
     TopicDeleted(TopicDeleted),
     Noop,
@@ -295,7 +295,7 @@ impl_from_variant!(
     RangeMerged,
     SegmentReassigned,
     SegmentsDeleted,
-    SegmentSealCorrected,
+    SegmentBoundaryCorrected,
     ConsumerGroupChanged(ConsumerGroupEpochSnapshot),
     TopicDeleted
 );

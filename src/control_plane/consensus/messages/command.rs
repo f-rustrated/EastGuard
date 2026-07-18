@@ -4,7 +4,7 @@ use crate::control_plane::consensus::messages::timer::RaftTimeoutCallback;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::command::MetadataCommand;
 use crate::data_plane::messages::command::RequestSegmentRoll;
-use crate::impl_from_variant;
+use crate::{impl_from_variant, impl_new_struct_wrapper};
 
 pub struct InboundRaftRpc {
     pub shard_group_id: ShardGroupId,
@@ -50,6 +50,5 @@ pub enum RaftTransportCommand {
 }
 
 #[derive(Debug)]
-pub struct ProposeSegmentRoll {
-    pub request: RequestSegmentRoll,
-}
+pub struct ProposeSegmentRoll(pub RequestSegmentRoll);
+impl_new_struct_wrapper!(ProposeSegmentRoll, RequestSegmentRoll);

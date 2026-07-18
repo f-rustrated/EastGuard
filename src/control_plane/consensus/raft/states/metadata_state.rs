@@ -216,17 +216,23 @@ impl MetadataState {
                 return Ok(ApplyResult::Noop);
             };
 
-            return Ok(ApplyResult::SegmentSealCorrected(SegmentSealCorrected {
-                segment_key: cmd.segment_key,
-                replica_set,
-                committed_entry_id: cmd.end_entry_id,
-            }));
+            return Ok(ApplyResult::SegmentBoundaryCorrected(
+                SegmentBoundaryCorrected {
+                    segment_key: cmd.segment_key,
+                    replica_set,
+                    committed_entry_id: cmd.end_entry_id,
+                },
+            ));
+        }
+
+        if cmd.intent == SegmentRollIntent::BoundaryCorrection {
+            return Ok(ApplyResult::Noop);
         }
 
         // If Active, Roll
         let new_segment_id = range.roll_segment(cmd.clone())?;
-        let split_proposal = (range.should_split(cmd.sealed_at) && can_split)
-            .then(|| range.build_split_proposal(&cmd));
+        let split_proposal =
+            (range.should_split() && can_split).then(|| range.build_split_proposal(&cmd));
 
         // For segment roll, unless data nodes got changed, consumer
         // TODO For now, it loops over EVERY consumger groups and take epoch snapshot for every topic.
@@ -237,6 +243,10 @@ impl MetadataState {
             .filter_map(|group_id| topic.consumer_group_epoch(group_id))
             .collect();
         tracing::debug!("Consumer groups: {:?}", consumer_group_epochs);
+
+        let merge_proposal = (cmd.intent == SegmentRollIntent::IdleMaintenance)
+            .then(|| topic.find_mergeable_range_pair(cmd.sealed_at))
+            .flatten();
 
         if let Some(proposal) = split_proposal {
             match proposal {
@@ -249,6 +259,9 @@ impl MetadataState {
                     error
                 ),
             }
+        }
+        if let Some(proposal) = merge_proposal {
+            self.pending_proposals.push(proposal);
         }
         Ok(SegmentRolled {
             new_segment_key: cmd.segment_key.with_segment_id(new_segment_id),
@@ -482,8 +495,6 @@ mod tests {
             strategy::{PartitionStrategy, StoragePolicy},
         },
     };
-    use std::collections::VecDeque;
-
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
             retention_ms: Some(3_600_000),
@@ -570,11 +581,30 @@ mod tests {
         segment_id: SegmentId,
         sealed_at: u64,
     ) {
+        roll_segment_with_intent(
+            sm,
+            topic_id,
+            range_id,
+            segment_id,
+            sealed_at,
+            SegmentRollIntent::DataPressure,
+        );
+    }
+
+    fn roll_segment_with_intent(
+        sm: &mut MetadataState,
+        topic_id: TopicId,
+        range_id: RangeId,
+        segment_id: SegmentId,
+        sealed_at: u64,
+        intent: SegmentRollIntent,
+    ) {
         let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
             segment_key: SegmentKey::new(topic_id, range_id, segment_id),
             sealed_at,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent,
         }));
         assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
     }
@@ -596,6 +626,7 @@ mod tests {
             sealed_at,
             new_replica_set: replica_set(),
             end_entry_id: Some(EntryId(end_entry_id)),
+            intent: SegmentRollIntent::Recovery,
         }));
         assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
     }
@@ -966,6 +997,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent: SegmentRollIntent::Recovery,
         }));
         assert_eq!(result, Err(TopicNotFound(TopicId(99))));
     }
@@ -980,6 +1012,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent: SegmentRollIntent::Recovery,
         }));
         assert_eq!(result, Err(RangeNotFound));
     }
@@ -994,6 +1027,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent: SegmentRollIntent::Recovery,
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
 
@@ -1130,6 +1164,7 @@ mod tests {
         assert_eq!(merged.keyspace_start, KEYSPACE_MIN);
         assert_eq!(merged.keyspace_end, KEYSPACE_MAX);
         assert_eq!(merged.state, RangeState::Active);
+        assert_eq!(merged.load_state, RangeLoadState::Unclassified);
     }
 
     #[test]
@@ -1281,6 +1316,7 @@ mod tests {
             sealed_at: 3000,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent: SegmentRollIntent::DataPressure,
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
 
@@ -1289,90 +1325,93 @@ mod tests {
         assert_eq!(range.segments.len(), 2);
     }
 
+    #[test]
+    fn boundary_correction_cannot_roll_active_segment() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+
+        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
+            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+            sealed_at: 2000,
+            new_replica_set: replica_set(),
+            end_entry_id: Some(EntryId(10)),
+            intent: SegmentRollIntent::BoundaryCorrection,
+        }));
+
+        assert_eq!(result, Ok(ApplyResult::Noop));
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.active_segment, Some(SegmentId(0)));
+        assert_eq!(range.load_state, RangeLoadState::Unclassified);
+    }
+
     // --- Hot Range Detection ---
 
     #[test]
-    fn seal_history_records_timestamps() {
+    fn pressure_rolls_advance_consecutive_streak() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), 3000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.seal_history.seal_count(), 3);
+        assert_eq!(
+            range.load_state,
+            RangeLoadState::Pressure(RangePressure {
+                consecutive_rolls: 2
+            })
+        );
     }
 
     #[test]
-    fn seal_history_prunes_old_entries() {
+    fn idle_roll_resets_pressure() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
-        // Jump far beyond the window — both old entries pruned
-        let far_future = 2000 + MEASUREMENT_WINDOW_MS + 1;
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), far_future);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(1),
+            2000,
+            SegmentRollIntent::IdleMaintenance,
+        );
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.seal_history.seal_count(), 1);
+        assert_eq!(range.load_state, RangeLoadState::Idle);
     }
 
     #[test]
-    fn seal_history_orders_delayed_proposal_timestamps() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(2000);
-        history.record_seal(1000);
-        history.record_seal(1500);
+    fn neutral_rolls_do_not_change_load_state() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
 
-        assert_eq!(history.seal_timestamps, VecDeque::from([1000, 1500, 2000]));
-    }
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(1),
+            1000,
+            SegmentRollIntent::Recovery,
+        );
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(2),
+            500,
+            SegmentRollIntent::ReplicationFailure,
+        );
 
-    #[test]
-    fn delayed_old_seal_is_pruned_against_newest_timestamp() {
-        let mut history = RangeSealHistory::default();
-        let newest = MEASUREMENT_WINDOW_MS + 2000;
-        history.record_seal(newest);
-        history.record_seal(1000);
-
-        assert_eq!(history.seal_timestamps, VecDeque::from([newest]));
-    }
-
-    #[test]
-    fn should_split_threshold_met() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(1000);
-        history.record_seal(2000);
-        history.record_seal(3000);
-
-        assert!(history.should_split(3000));
-    }
-
-    #[test]
-    fn should_split_below_threshold() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(1000);
-        history.record_seal(2000);
-
-        assert!(!history.should_split(2000));
-    }
-
-    #[test]
-    fn should_split_cooldown_blocks() {
-        let mut history = RangeSealHistory {
-            seal_timestamps: VecDeque::new(),
-            created_by_split_at: Some(1000),
-        };
-        history.record_seal(1100);
-        history.record_seal(1200);
-        history.record_seal(1300);
-
-        // Within cooldown — blocked
-        assert!(!history.should_split(1300));
-
-        // After cooldown — allowed
-        assert!(history.should_split(1000 + SPLIT_COOLDOWN_MS));
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(
+            range.load_state,
+            RangeLoadState::Pressure(RangePressure {
+                consecutive_rolls: 1
+            })
+        );
     }
 
     #[test]
@@ -1446,12 +1485,57 @@ mod tests {
     fn evaluate_merges_cold_adjacent() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
-        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        let (left, right) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            left,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            right,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
 
-        // Both children are cold (no seals)
-        let proposals = sm.evaluate_merges(2000 + SPLIT_COOLDOWN_MS + 1);
+        let proposals = sm.evaluate_merges(3000);
         assert_eq!(proposals.len(), 1);
         assert!(matches!(proposals[0], MetadataCommand::MergeRange(_)));
+        assert!(matches!(
+            sm.take_pending_proposals().last(),
+            Some(MetadataCommand::MergeRange(_))
+        ));
+    }
+
+    #[test]
+    fn split_children_do_not_merge_without_idle_signals() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+
+        assert!(sm.evaluate_merges(3000).is_empty());
+    }
+
+    #[test]
+    fn one_idle_child_does_not_merge() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+        let (left, _right) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            left,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
+
+        assert!(sm.evaluate_merges(3000).is_empty());
     }
 
     #[test]
@@ -1469,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn split_clears_seal_history() {
+    fn split_children_start_unclassified() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
@@ -1477,25 +1561,8 @@ mod tests {
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
-        assert!(topic.ranges[&c1].seal_history.seal_timestamps.is_empty());
-        assert!(topic.ranges[&c2].seal_history.seal_timestamps.is_empty());
-    }
-
-    #[test]
-    fn split_sets_cooldown() {
-        let mut sm = MetadataState::new(ShardGroupId(0));
-        let tid = create_topic(&mut sm, "blue");
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-        assert_eq!(
-            topic.ranges[&c1].seal_history.created_by_split_at,
-            Some(2000)
-        );
-        assert_eq!(
-            topic.ranges[&c2].seal_history.created_by_split_at,
-            Some(2000)
-        );
+        assert_eq!(topic.ranges[&c1].load_state, RangeLoadState::Unclassified);
+        assert_eq!(topic.ranges[&c2].load_state, RangeLoadState::Unclassified);
     }
 
     // --- D3: active_segments_for_node ---
@@ -1546,6 +1613,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: Some(EntryId(42000)),
+            intent: SegmentRollIntent::DataPressure,
         }));
 
         let result = result.unwrap();
@@ -1577,6 +1645,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: None,
+            intent: SegmentRollIntent::Recovery,
         }));
 
         assert_eq!(
@@ -1590,6 +1659,7 @@ mod tests {
             sealed_at: 2500,
             new_replica_set: replica_set(),
             end_entry_id: Some(EntryId(42000)),
+            intent: SegmentRollIntent::Recovery,
         }));
         assert!(result.is_ok());
 
@@ -1612,6 +1682,7 @@ mod tests {
             sealed_at: 2000,
             new_replica_set: replica_set(),
             end_entry_id: Some(EntryId(1000)),
+            intent: SegmentRollIntent::DataPressure,
         }));
 
         // Duplicate roll is rejected (end_offset already set)
@@ -1620,6 +1691,7 @@ mod tests {
             sealed_at: 2500,
             new_replica_set: replica_set(),
             end_entry_id: Some(EntryId(42000)),
+            intent: SegmentRollIntent::DataPressure,
         }));
         assert_eq!(result, Ok(ApplyResult::Noop));
     }

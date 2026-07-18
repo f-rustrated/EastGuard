@@ -194,7 +194,7 @@ impl TopicMeta {
         out.into_boxed_slice()
     }
 
-    /// Boundary-unknown sealed segments. These remain seal-end recovery
+    /// Boundary-unknown sealed segments. These remain boundary recovery
     /// candidates until a recovered boundary is committed to metadata, even if
     /// the crashed replica has rejoined by the next reconciliation pass.
     pub(crate) fn boundary_unknown_segments(&self) -> Box<[(SegmentKey, Vec<NodeId>)]> {
@@ -349,7 +349,7 @@ impl TopicMeta {
         if r1.state != RangeState::Active || r2.state != RangeState::Active {
             return None;
         }
-        if !r1.mergeable_with(r2, now) {
+        if !r1.mergeable_with(r2) {
             return None;
         }
         let replica_set = r1
@@ -505,8 +505,6 @@ pub mod props {
             self.assert_delete_cascade();
             for range in self.ranges.values() {
                 range.assert_invariants();
-
-                self.assert_split_children_cooldown(range);
             }
             for group in self.consumer_groups.values() {
                 group.assert_assignments(&self.active_ranges);
@@ -573,24 +571,6 @@ pub mod props {
                         seg.state,
                     );
                 }
-            }
-        }
-
-        fn assert_split_children_cooldown(&self, range: &RangeMeta) {
-            let Some([left, right]) = range.split_into else {
-                return;
-            };
-            if let Some(left_range) = self.ranges.get(&left) {
-                assert!(
-                    left_range.seal_history.created_by_split_at.is_some(),
-                    "split child missing created_by_split_at"
-                );
-            }
-            if let Some(right_range) = self.ranges.get(&right) {
-                assert!(
-                    right_range.seal_history.created_by_split_at.is_some(),
-                    "split child missing created_by_split_at"
-                );
             }
         }
 

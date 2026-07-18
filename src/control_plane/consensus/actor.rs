@@ -173,7 +173,7 @@ impl MultiRaftActor {
             RaftEvent::RedriveAssignments(cmds) => {
                 self.data_transport_cmds.extend(cmds);
             }
-            RaftEvent::SealBoundaryQueries(cmds) => {
+            RaftEvent::DurableEndQueries(cmds) => {
                 self.data_transport_cmds.extend(cmds);
             }
         }
