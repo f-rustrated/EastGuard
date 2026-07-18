@@ -32,7 +32,7 @@ pub(crate) struct SegmentTracker {
     /// pin BTreeMap keys to a per-segment identity that survives writes.
     start_entry_id: EntryId,
     staged_entries: Vec<StagedEntry>,
-    created_at: std::time::Instant,
+    last_activity_at: tokio::time::Instant,
 }
 
 impl SegmentTracker {
@@ -54,7 +54,7 @@ impl SegmentTracker {
             next_entry_id: EntryId::MIN,
             start_entry_id: EntryId::MIN,
             staged_entries: Vec::new(),
-            created_at: std::time::Instant::now(),
+            last_activity_at: tokio::time::Instant::now(),
         }
     }
 
@@ -208,6 +208,7 @@ impl SegmentTracker {
         }
         self.cache.advance_read_cursor(commit + 1);
         self.committed_entry_id = entry_id;
+        self.last_activity_at = tokio::time::Instant::now();
     }
 
     pub(crate) fn advance_checkpoint(
@@ -285,8 +286,8 @@ impl SegmentTracker {
         self.shard_group_id
     }
 
-    pub(crate) fn age_limit_reached(&self, max_age: Duration) -> bool {
-        self.created_at.elapsed() >= max_age
+    pub(crate) fn idle_timeout_reached(&self, idle_timeout: Duration) -> bool {
+        self.last_activity_at.elapsed() >= idle_timeout
     }
 
     pub(crate) fn size_limit_reached(&self, limit: u64) -> bool {
@@ -509,14 +510,27 @@ pub mod tests {
     }
 
     #[test]
-    fn age_limit_not_reached_immediately() {
+    fn idle_timeout_not_reached_immediately() {
         let t = make_tracker(SegmentRole::Leader);
-        assert!(!t.age_limit_reached(Duration::from_secs(60)));
+        assert!(!t.idle_timeout_reached(Duration::from_secs(60)));
     }
 
     #[test]
-    fn age_limit_reached_with_zero_duration() {
+    fn idle_timeout_reached_with_zero_duration() {
         let t = make_tracker(SegmentRole::Leader);
-        assert!(t.age_limit_reached(Duration::ZERO));
+        assert!(t.idle_timeout_reached(Duration::ZERO));
+    }
+
+    #[test]
+    fn committed_progress_refreshes_last_activity() {
+        let mut t = make_tracker(SegmentRole::Leader);
+        t.last_activity_at = tokio::time::Instant::now() - Duration::from_secs(60);
+        assert!(t.idle_timeout_reached(Duration::from_secs(30)));
+
+        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(0));
+        t.publish_staged(1);
+        t.commit_entry(EntryId(0));
+
+        assert!(!t.idle_timeout_reached(Duration::from_secs(30)));
     }
 }

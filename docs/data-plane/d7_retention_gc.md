@@ -219,8 +219,7 @@ The clock is the only difficulty, and it's confined to one injectable input:
 - **File reclamation is synchronous.** The data-plane delete (file + cache + index) is
   covered by the synchronous data-plane state tests.
 - **No flaky age-based e2e.** A real-time retention e2e would race the virtual clock;
-  it's deliberately avoided (the same call already made for age-based seal). Coverage
-  comes from the decision/apply/reclamation units above, not a wall-clock sim run.
+  it's deliberately avoided. Coverage comes from the decision/apply/reclamation units above, not a wall-clock sim run.
 
 ---
 

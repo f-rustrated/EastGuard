@@ -511,7 +511,7 @@ fn produce_then_fetch_hot() -> turmoil::Result {
 /// for repair to reassign, so this gates the repair e2e.
 #[test]
 #[serial_test::serial]
-fn age_seal_rolls_the_active_segment() -> turmoil::Result {
+fn idle_segment_automatically_rolls() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
         .simulation_duration(Duration::from_secs(180))
@@ -523,14 +523,14 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         .try_init();
 
     host_cluster(&mut sim, &NODES_3, |env| {
-        // Force a fast age-based seal.
-        env.max_segment_age_secs = 5;
-        env.segment_age_check_interval_secs = 1;
+        // Force a fast inactivity-based roll.
+        env.segment_idle_timeout_secs = 5;
+        env.segment_idle_check_interval_secs = 1;
     });
 
     sim.client("test-client", async {
         const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
-        const TOPIC: &str = "age-seal";
+        const TOPIC: &str = "idle-roll";
 
         wait_for_cluster(&NODES, 3).await;
         create_topic_anywhere(TOPIC, &NODES, 3).await;
@@ -552,7 +552,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
             assert!(acked, "produce {i} not acked by {leader:?}");
         }
 
-        // The segment ages past `max_segment_age_secs`; the leader enqueues a
+        // The segment remains inactive past `segment_idle_timeout_secs`; the leader enqueues a
         // RequestSegmentRoll, the coordinator commits a RollSegment, and the active
         // segment rolls. Poll DescribeTopic until the successor's start_offset
         // advances past 0 (the known-end seal landed).
@@ -604,7 +604,7 @@ fn pressure_rolls_automatically_split_the_range() -> turmoil::Result {
         env.node_id_suffix = Some("sim".to_string());
         env.vnodes_per_node = 16;
         env.segment_size_limit_bytes = 2048;
-        env.max_segment_age_secs = 3600;
+        env.segment_idle_timeout_secs = 3600;
     });
 
     sim.client("test-client", async {
@@ -643,8 +643,8 @@ fn idle_split_children_automatically_merge() -> turmoil::Result {
         env.node_id_suffix = Some("sim".to_string());
         env.vnodes_per_node = 16;
         env.segment_size_limit_bytes = 2048;
-        env.max_segment_age_secs = 0;
-        env.segment_age_check_interval_secs = 300;
+        env.segment_idle_timeout_secs = 0;
+        env.segment_idle_check_interval_secs = 300;
     });
 
     sim.client("test-client", async {

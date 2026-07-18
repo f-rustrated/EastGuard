@@ -424,8 +424,8 @@ impl<W: WalStorage> DataPlane<W> {
             DataPlaneTimeoutCallback::ReplicationTimeout { seq, segment_key } => {
                 self.handle_replication_timeout(segment_key, seq);
             }
-            DataPlaneTimeoutCallback::SegmentAgeCheck => {
-                self.enqueue_seal_for_aged_segments(self.config.max_segment_age);
+            DataPlaneTimeoutCallback::SegmentIdleCheck => {
+                self.enqueue_roll_for_idle_segments(self.config.segment_idle_timeout);
             }
         }
     }
@@ -1382,19 +1382,19 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    pub(crate) fn enqueue_seal_for_aged_segments(&mut self, max_age: std::time::Duration) {
-        let aged: Box<[SegmentKey]> = self
+    pub(crate) fn enqueue_roll_for_idle_segments(&mut self, idle_timeout: std::time::Duration) {
+        let idle: Box<[SegmentKey]> = self
             .segments
             .iter()
             .filter(|(_, tracker)| {
                 tracker.role() == SegmentRole::Leader
-                    && tracker.age_limit_reached(max_age)
+                    && tracker.idle_timeout_reached(idle_timeout)
                     && !tracker.size_limit_reached(self.config.segment_size_limit)
             })
             .map(|(&k, _)| k)
             .collect();
 
-        for key in aged {
+        for key in idle {
             self.enqueue_roll_request(key, SegmentRollIntent::IdleMaintenance);
         }
     }
@@ -2236,8 +2236,8 @@ mod tests {
 
     fn test_config(dir: PathBuf) -> DataNodeConfig {
         DataNodeConfig {
-            max_segment_age: std::time::Duration::from_secs(3600),
-            age_check_interval: std::time::Duration::from_secs(60),
+            segment_idle_timeout: std::time::Duration::from_secs(3600),
+            idle_check_interval: std::time::Duration::from_secs(60),
             segment_size_limit: 1024 * 1024 * 1024,
             batch_max_bytes: TEST_BATCH_MAX_BYTES,
             hot_cache_budget_bytes: 0,
@@ -3199,12 +3199,12 @@ mod tests {
     }
 
     #[test]
-    fn age_limit_requests_idle_maintenance_roll() {
+    fn idle_timeout_requests_idle_maintenance_roll() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
-        dp.enqueue_seal_for_aged_segments(std::time::Duration::ZERO);
+        dp.enqueue_roll_for_idle_segments(std::time::Duration::ZERO);
 
         assert_eq!(
             requested_roll_intents(&dp),
@@ -3213,13 +3213,13 @@ mod tests {
     }
 
     #[test]
-    fn size_limit_takes_precedence_over_age_limit() {
+    fn size_limit_takes_precedence_over_idle_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.config.segment_size_limit = 0;
         dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
-        dp.enqueue_seal_for_aged_segments(std::time::Duration::ZERO);
+        dp.enqueue_roll_for_idle_segments(std::time::Duration::ZERO);
 
         assert!(requested_roll_intents(&dp).is_empty());
     }

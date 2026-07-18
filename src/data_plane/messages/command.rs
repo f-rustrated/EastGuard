@@ -374,12 +374,12 @@ impl_from_variant!(
     ReceivePeerMessage,
 );
 
-use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};
+use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentIdleCallback};
 
 impl_from_variant_via!(
     DataPlaneCommand,
     DataPlaneTimeoutCallback,
     BatchFlushCallback,
     ReplicationCallback,
-    SegmentAgeCallback
+    SegmentIdleCallback
 );

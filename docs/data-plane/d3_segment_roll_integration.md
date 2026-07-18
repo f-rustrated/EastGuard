@@ -1,6 +1,6 @@
 # Phase D3: Segment Lifecycle Integration
 
-**Goal:** Connect data plane storage to metadata consensus. Three classes of integration: (1) seal triggers — size, age, replication failure, node death — all converging on a single segment-roll committed through the coordinator, (2) lifecycle event propagation — topic creation, segment roll, range split, and range merge commits turn into segment assignments delivered to the data plane, (3) coordinator routing — the segment leader resolves and reaches the coordinator.
+**Goal:** Connect data plane storage to metadata consensus. Three classes of integration: (1) seal triggers — size, inactivity, replication failure, node death — all converging on a single segment-roll committed through the coordinator, (2) lifecycle event propagation — topic creation, segment roll, range split, and range merge commits turn into segment assignments delivered to the data plane, (3) coordinator routing — the segment leader resolves and reaches the coordinator.
 
 **Depends on:** Phase D2 (segment replication), metadata control plane (shard leader gossip via SWIM).
 
@@ -37,7 +37,7 @@ Four triggers, one response: seal the current segment and open a new one via a s
 |---|---|---|---|
 | Replication failure | Follower timeout | Sub-second (replication timeout) | Segment leader sends a seal request |
 | Segment size | ~1GB threshold | On each flush | Segment leader sends a seal request |
-| Segment age | Configurable max age | Periodic ticker (~60s) | Segment leader sends a seal request |
+| Segment inactivity | Configurable idle timeout | Periodic ticker (~60s) | Segment leader sends a seal request |
 | Node death | SWIM protocol | ~6-7s | Coordinator proposes the roll directly |
 
 ### Trigger 1: Replication Failure (D2)
@@ -61,21 +61,21 @@ flush completes
 
 The reported end entry id is the segment's last committed entry, which may lag the write cursor by in-flight entries — those are replayed into the new segment when the seal response arrives. This replay relies on the coordinator keeping the seal requester as the new segment's primary: the requester is alive (it just sent the request) and holds the uncommitted tail. The size check runs after every flush, not on a timer.
 
-### Trigger 3: Segment Age
+### Trigger 3: Segment Inactivity
 
-When a segment has been active longer than the configured max age (e.g., 24 hours), the segment leader sends a seal request. This bounds segment lifetime for low-traffic topics — it prevents stale long-lived segments and simplifies retention and WAL management.
+When a segment has received no newly committed data for the configured idle timeout, the segment leader sends a seal request. This turns inactivity into a committed load signal: a quiet range can later merge with an equally quiet sibling, while occasional committed traffic keeps it active.
 
 ```
-periodic age ticker fires (~60s)
+periodic idle ticker fires (~60s)
     │
     ├── for each active segment this node leads:
-    │       age beyond configured max?
+    │       time since last committed data beyond idle timeout?
     │           └── yes → seal request (failed nodes = none,
     │                                    end entry id = last committed entry)
     └── no → continue
 ```
 
-Unlike the size and replication triggers, the age check is driven by a periodic ticker, not by writes. It is the only trigger that fires without a write — necessary for idle segments.
+Unlike the size and replication triggers, the inactivity check is driven by a periodic ticker. Successful committed progress refreshes the activity timestamp; stale or duplicate commit notifications do not. The ticker can therefore roll a truly idle segment even when no new write arrives to run a check.
 
 ### Trigger 4: SWIM Node Death
 
@@ -341,6 +341,6 @@ Broker D (segment leader)       Coordinator A        Raft [A,B,C]
 
 7. **Node-death seals carry no end entry id.** The coordinator doesn't know the actual offset. It is corrected later — by a seal request from the segment leader (if alive) or by D5 sealed-segment repair. This temporarily violates the metadata state machine's offset-continuity invariant (offset continuity within a range), which holds again after correction.
 
-8. **Size- and age-based seals reuse the failure path.** Same flow, with no failed nodes and the replica set preserved.
+8. **Size- and inactivity-based seals reuse the failure path.** Same flow, with no failed nodes and the replica set preserved.
 
 9. **Followers need no segment assignment.** They self-authorize from the leader's first replication append (D2).
