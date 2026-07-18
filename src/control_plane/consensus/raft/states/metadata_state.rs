@@ -1357,9 +1357,9 @@ mod tests {
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(
             range.load_state,
-            RangeLoadState::Pressure(RangePressure {
+            RangeLoadState::Pressure {
                 consecutive_rolls: 2
-            })
+            }
         );
     }
 
@@ -1408,9 +1408,9 @@ mod tests {
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(
             range.load_state,
-            RangeLoadState::Pressure(RangePressure {
+            RangeLoadState::Pressure {
                 consecutive_rolls: 1
-            })
+            }
         );
     }
 

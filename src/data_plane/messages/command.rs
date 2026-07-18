@@ -163,7 +163,7 @@ pub struct SegmentRollCommitted {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SegmentSealed {
+pub struct SegmentMetaSealed {
     pub segment_key: SegmentKey,
     pub committed_entry_id: Option<EntryId>,
 }
@@ -292,7 +292,7 @@ pub enum DataPlanePeerMessage {
     AdvanceReplicaCommit(AdvanceReplicaCommit),
     RequestSegmentRoll(RequestSegmentRoll),
     SegmentRollCommitted(SegmentRollCommitted),
-    SegmentSealed(SegmentSealed),
+    SegmentMetaSealed(SegmentMetaSealed),
     AssignSegmentCatchUp(AssignSegmentCatchUp),
     RequestCatchUpEntries(RequestCatchUpEntries),
     CatchUpEntries(CatchUpEntries),
@@ -318,7 +318,7 @@ impl_from_variant!(
     AdvanceReplicaCommit,
     RequestSegmentRoll,
     SegmentRollCommitted,
-    SegmentSealed,
+    SegmentMetaSealed,
     AssignSegmentCatchUp,
     RequestCatchUpEntries,
     CatchUpEntries,

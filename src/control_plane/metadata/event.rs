@@ -6,8 +6,8 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
-    AssignSegmentCatchUp, DataPlanePeerMessage, DeleteSegments, PlaceSegment, SegmentRollCommitted,
-    SegmentSealed,
+    AssignSegmentCatchUp, DataPlanePeerMessage, DeleteSegments, PlaceSegment, SegmentMetaSealed,
+    SegmentRollCommitted,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
@@ -140,7 +140,7 @@ impl RangeSplit {
         {
             cmds.push(DataTransportCommand::send_to_targets(
                 parent_replica_set.0,
-                SegmentSealed {
+                SegmentMetaSealed {
                     segment_key: parent_key,
                     committed_entry_id: None,
                 },
@@ -264,7 +264,7 @@ impl SegmentBoundaryCorrected {
         } else {
             vec![DataTransportCommand::send_to_targets(
                 self.replica_set.0,
-                SegmentSealed {
+                SegmentMetaSealed {
                     segment_key: self.segment_key,
                     committed_entry_id: self.committed_entry_id,
                 },
