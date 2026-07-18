@@ -221,7 +221,7 @@ A segment assignment carries: the segment identity, the shard group id (routing 
 
 ### Commit Event
 
-Applying a committed metadata entry emits a "metadata committed" event carrying the shard group, the apply result, and the log position. **All replicas emit it** (apply is deterministic), but **only the leader dispatches** the resulting notifications — followers apply the entry and drop the event.
+Applying a committed metadata entry can raise zero or more metadata events, each carrying the shard group and log position when it leaves the Raft state machine. **All replicas produce the same events** (apply is deterministic), but **only the leader dispatches** the resulting notifications — followers apply the entry and drop them.
 
 ### Dispatch (leader only)
 
@@ -239,7 +239,7 @@ range split / range merged:
     segment assignment → each new segment's primary
 ```
 
-The apply result is produced on all replicas; only the leader dispatches. For a rolled segment the assignment is always sent (the result carries full context); the seal response is sent only when pending context still exists on this leader.
+The event stream is produced on all replicas; only the leader dispatches it. For a rolled segment the assignment is always sent (the event carries full context); the roll response is sent only when pending context still exists on this leader. A single entry may also raise independent segment-seal or consumer-group events, so those effects are not hidden inside the roll, split, or merge event.
 
 ### Active-Segment Lookup
 

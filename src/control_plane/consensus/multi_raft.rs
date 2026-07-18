@@ -13,6 +13,7 @@ use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
+use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
@@ -842,9 +843,12 @@ impl MultiRaft {
             }
 
             if let RaftEvent::MetadataCommitted(committed) = &mut event {
-                // For the leader to send the committed roll back to the requester.
-                committed.roll_context =
-                    self.pending_rolls.pop_roll_context(id, committed.log_index);
+                // Only the roll event answers the requester. Other metadata events
+                // from the same log entry must not consume its pending context.
+                if matches!(committed.event, MetadataEvent::SegmentRolled(_)) {
+                    committed.roll_context =
+                        self.pending_rolls.pop_roll_context(id, committed.log_index);
+                }
             }
             self.pending_events.push(event);
         }

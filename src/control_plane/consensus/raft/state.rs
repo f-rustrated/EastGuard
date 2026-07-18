@@ -10,7 +10,7 @@ use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::DeleteSegments;
-use crate::control_plane::metadata::event::ApplyResult;
+use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
     SegmentRollIntent, TopicId, TopicMeta, TopicStats,
@@ -1273,32 +1273,32 @@ impl Raft {
 
     fn apply_metadata_entry(&mut self, cmd: MetadataCommand, index: u64) {
         match self.metadata.apply(cmd) {
-            Ok(result) => {
-                tracing::debug!(
-                    "[{}] Applied metadata at index {}: {:?}",
-                    self.node_id,
-                    index,
-                    result
-                );
-
-                if self.is_leader()
-                    && let ApplyResult::SegmentReassigned(r) = &result
-                {
-                    self.consensus.track_catch_up(r);
-                }
-                self.raise(MetadataCommitted {
-                    shard_group_id: self.shard_group_id,
-                    result,
-                    log_index: index,
-                    roll_context: None,
-                });
-            }
+            Ok(()) => {}
             Err(e) => tracing::error!(
                 "[{}] Metadata apply error at index {}: {:?}",
                 self.node_id,
                 index,
                 e
             ),
+        }
+        for event in self.metadata.take_pending_events() {
+            tracing::debug!(
+                "[{}] Applied metadata event at index {}: {:?}",
+                self.node_id,
+                index,
+                event
+            );
+            if self.is_leader()
+                && let MetadataEvent::SegmentReassigned(reassigned) = &event
+            {
+                self.consensus.track_catch_up(reassigned);
+            }
+            self.raise(MetadataCommitted {
+                shard_group_id: self.shard_group_id,
+                event,
+                log_index: index,
+                roll_context: None,
+            });
         }
         if self.consensus.is_leader() {
             self.consensus
