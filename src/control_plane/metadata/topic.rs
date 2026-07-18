@@ -289,6 +289,26 @@ impl TopicMeta {
         Some(seg)
     }
 
+    pub(crate) fn active_segment_key_and_replicas(
+        &self,
+        range_id: RangeId,
+    ) -> Result<(SegmentKey, Replicas), MetadataError> {
+        let range = self
+            .ranges
+            .get(&range_id)
+            .ok_or(MetadataError::RangeNotFound)?;
+
+        let segment_id = range.validate_active()?;
+        let segment = range
+            .segments
+            .get(&segment_id)
+            .ok_or(MetadataError::SegmentNotFound)?;
+        Ok((
+            SegmentKey::new(self.id, range_id, segment_id),
+            segment.replica_set.clone(),
+        ))
+    }
+
     pub(crate) fn get_mut(
         &mut self,
         segment_key: SegmentKey,
