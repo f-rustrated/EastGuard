@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - **[PR #6]** feat: peer discovery + swim protocol
 
 ### Control Plane & Metadata
+- **[PR #198]** feat: event-driven range load classification for deterministic split/merge
 - **[PR #131]** feat: peer/segment reconciliation on missing membership change
 - **[PR #98]** feat: hot range detection + auto-split/merge (Phase 6)
 - **[PR #94]** Fix: Size `shard_leader_buffer` based on topology configuration
