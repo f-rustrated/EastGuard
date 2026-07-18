@@ -15,7 +15,7 @@ use super::segment_writer::SegmentAppender;
 
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
-use super::states::seal_request::PendingSegmentRollRequests;
+use super::states::roll_request::PendingSegmentRollRequests;
 use super::states::segment_store::SegmentStore;
 use super::timer::DataPlaneTimeoutCallback;
 use super::transport::command::DataTransportCommand;
@@ -25,6 +25,7 @@ use crate::config::DataNodeConfig;
 use crate::control_plane::consensus::messages::{MultiRaftActorCommand, ProposeSegmentRoll};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
+use crate::control_plane::metadata::command::SegmentRollIntent;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::EntryPayload;
 use crate::data_plane::consumer_offset_management::ConsumerOffsetManager;
@@ -72,7 +73,7 @@ pub struct DataPlane<W: WalStorage> {
 
     replication: ReplicationState,
 
-    pending_seal_requests: PendingSegmentRollRequests,
+    pending_roll_requests: PendingSegmentRollRequests,
     /// In-progress catch-up receives (replacement side), keyed by segment.
     pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
 
@@ -88,7 +89,7 @@ pub struct DataPlane<W: WalStorage> {
     /// Consulted on a catch-up assignment to decide full-match / delta /
     /// full-copy and to skip transfer when we already hold the segment.
     recovered: LocalInventory,
-    pending_seals: std::collections::HashSet<SegmentKey>,
+    pending_boundary_corrections: std::collections::HashSet<SegmentKey>,
     pressure_checkpoints_in_flight: BTreeSet<SegmentKey>,
     consumer_offsets: ConsumerOffsetManager,
 }
@@ -117,13 +118,13 @@ impl<W: WalStorage> DataPlane<W> {
             buffer_byte_count: 0,
             needs_flush: false,
             replication: ReplicationState::default(),
-            pending_seal_requests: PendingSegmentRollRequests::default(),
             pending_catch_ups: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
             out,
             recovered,
-            pending_seals: std::collections::HashSet::new(),
+            pending_roll_requests: PendingSegmentRollRequests::default(),
+            pending_boundary_corrections: std::collections::HashSet::new(),
             pressure_checkpoints_in_flight: BTreeSet::new(),
             consumer_offsets: ConsumerOffsetManager::new(offset_ledger),
         }
@@ -175,7 +176,7 @@ impl<W: WalStorage> DataPlane<W> {
         if self.should_flush() {
             self.flush_batch();
         }
-        self.enqueue_timed_out_seal_retries();
+        self.enqueue_timed_out_roll_retries();
         self.out.flush().await;
 
         #[cfg(any(test, debug_assertions))]
@@ -487,7 +488,7 @@ impl<W: WalStorage> DataPlane<W> {
             }
             C::AdvanceReplicaCommit(cmd) => self.handle_commit_advance(cmd),
             C::SegmentRollCommitted(message) => self.handle_segment_roll_committed(message),
-            C::SegmentSealed(cmd) => self.handle_segment_sealed(cmd),
+            C::SegmentMetaSealed(cmd) => self.handle_segment_meta_sealed(cmd),
 
             // Pass-through to MultiRaftActor — RequestSegmentRoll is a control plane
             // message that shares the data transport wire format. The
@@ -496,7 +497,7 @@ impl<W: WalStorage> DataPlane<W> {
             C::RequestSegmentRoll(cmd) => {
                 self.out
                     .store_coordinator_cmd(MultiRaftActorCommand::ProposeSegmentRoll(
-                        ProposeSegmentRoll { request: cmd },
+                        ProposeSegmentRoll(cmd),
                     ));
             }
 
@@ -520,7 +521,7 @@ impl<W: WalStorage> DataPlane<W> {
                     .store_coordinator_cmd(MultiRaftActorCommand::SegmentCaughtUp(cmd));
             }
 
-            C::RequestDurableSegmentEnd(cmd) => self.handle_seal_boundary_query(cmd),
+            C::RequestDurableSegmentEnd(cmd) => self.handle_durable_end_query(cmd),
             // Pass-through to the local MultiRaftActor
             C::DurableSegmentEndReported(cmd) => {
                 self.out
@@ -572,7 +573,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    fn handle_seal_boundary_query(&mut self, cmd: RequestDurableSegmentEnd) {
+    fn handle_durable_end_query(&mut self, cmd: RequestDurableSegmentEnd) {
         let durable_end = self.durable_end(&cmd.segment_key);
         self.out
             .store_transport_cmd(DataTransportCommand::send_to_targets(
@@ -951,7 +952,7 @@ impl<W: WalStorage> DataPlane<W> {
                 .push((seq, ReplicationTimer::timeout(cmd.segment_key)));
         }
 
-        self.check_pending_seal(cmd.segment_key);
+        self.check_pending_boundary_correction(cmd.segment_key);
     }
 
     fn commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
@@ -1176,7 +1177,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     // TODO refactor
     fn handle_segment_roll_committed(&mut self, cmd: SegmentRollCommitted) {
-        self.pending_seal_requests.clear(&cmd.old_segment_key);
+        self.pending_roll_requests.remove(&cmd.old_segment_key);
         let Some(old_tracker) = self.segments.get(&cmd.old_segment_key) else {
             return;
         };
@@ -1196,7 +1197,7 @@ impl<W: WalStorage> DataPlane<W> {
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     old_tracker.followers().to_vec(),
-                    SegmentSealed {
+                    SegmentMetaSealed {
                         segment_key: cmd.old_segment_key,
                         committed_entry_id,
                     },
@@ -1255,7 +1256,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.needs_flush = true;
     }
 
-    fn handle_segment_sealed(&mut self, cmd: SegmentSealed) {
+    fn handle_segment_meta_sealed(&mut self, cmd: SegmentMetaSealed) {
         match cmd.committed_entry_id {
             // Determine the end offset and notify the coordinator
             None => {
@@ -1263,7 +1264,7 @@ impl<W: WalStorage> DataPlane<W> {
                     && tracker.role() == SegmentRole::Leader
                 {
                     if !tracker.is_fully_committed() {
-                        self.pending_seals.insert(cmd.segment_key);
+                        self.pending_boundary_corrections.insert(cmd.segment_key);
                         return; // Defer and exit early
                     }
 
@@ -1279,6 +1280,7 @@ impl<W: WalStorage> DataPlane<W> {
                                 segment_key: cmd.segment_key,
                                 failed_nodes: vec![],
                                 end_entry_id,
+                                intent: SegmentRollIntent::BoundaryCorrection,
                             }
                             .into(),
                         });
@@ -1303,8 +1305,8 @@ impl<W: WalStorage> DataPlane<W> {
         self.retire_old_segment(cmd.segment_key);
     }
 
-    fn check_pending_seal(&mut self, segment_key: SegmentKey) {
-        if !self.pending_seals.contains(&segment_key) {
+    fn check_pending_boundary_correction(&mut self, segment_key: SegmentKey) {
+        if !self.pending_boundary_corrections.contains(&segment_key) {
             return;
         }
 
@@ -1328,12 +1330,13 @@ impl<W: WalStorage> DataPlane<W> {
                     segment_key,
                     failed_nodes: vec![],
                     end_entry_id: actual_end_offset,
+                    intent: SegmentRollIntent::BoundaryCorrection,
                 }
                 .into(),
             });
 
         self.retire_old_segment(segment_key);
-        self.pending_seals.remove(&segment_key);
+        self.pending_boundary_corrections.remove(&segment_key);
     }
 
     // Drop the sealed segment's live tracker and checkpoint its committed
@@ -1375,7 +1378,7 @@ impl<W: WalStorage> DataPlane<W> {
             && tracker.is_fully_committed()
         {
             self.out.store_checkpoint(tracker.checkpoint(segment_key));
-            self.enqueue_seal_request(segment_key);
+            self.enqueue_roll_request(segment_key, SegmentRollIntent::DataPressure);
         }
     }
 
@@ -1383,12 +1386,16 @@ impl<W: WalStorage> DataPlane<W> {
         let aged: Box<[SegmentKey]> = self
             .segments
             .iter()
-            .filter(|(_, t)| t.role() == SegmentRole::Leader && t.age_limit_reached(max_age))
+            .filter(|(_, tracker)| {
+                tracker.role() == SegmentRole::Leader
+                    && tracker.age_limit_reached(max_age)
+                    && !tracker.size_limit_reached(self.config.segment_size_limit)
+            })
             .map(|(&k, _)| k)
             .collect();
 
         for key in aged {
-            self.enqueue_seal_request(key);
+            self.enqueue_roll_request(key, SegmentRollIntent::IdleMaintenance);
         }
     }
 
@@ -1411,15 +1418,20 @@ impl<W: WalStorage> DataPlane<W> {
                     segment_key,
                     failed_nodes: failed_nodes.clone(),
                     end_entry_id: tracker.committed_entry_id(),
+                    intent: SegmentRollIntent::ReplicationFailure,
                 }
                 .into(),
             });
-        self.pending_seal_requests
-            .track(segment_key, failed_nodes, tokio::time::Instant::now());
+        self.pending_roll_requests.track(
+            segment_key,
+            failed_nodes,
+            SegmentRollIntent::ReplicationFailure,
+            tokio::time::Instant::now(),
+        );
     }
 
-    fn enqueue_seal_request(&mut self, segment_key: SegmentKey) {
-        if self.pending_seal_requests.is_tracked(&segment_key) {
+    fn enqueue_roll_request(&mut self, segment_key: SegmentKey, intent: SegmentRollIntent) {
+        if self.pending_roll_requests.is_tracked(&segment_key) {
             return;
         }
         let Some(tracker) = self.segments.get(&segment_key) else {
@@ -1436,11 +1448,12 @@ impl<W: WalStorage> DataPlane<W> {
                     segment_key,
                     failed_nodes: vec![],
                     end_entry_id: tracker.committed_entry_id(),
+                    intent,
                 }
                 .into(),
             });
-        self.pending_seal_requests
-            .track(segment_key, vec![], tokio::time::Instant::now());
+        self.pending_roll_requests
+            .track(segment_key, vec![], intent, tokio::time::Instant::now());
     }
 
     // Fast Path should_flush check
@@ -1535,10 +1548,10 @@ impl<W: WalStorage> DataPlane<W> {
                 && tracker.is_fully_committed()
             {
                 self.out.store_checkpoint(tracker.checkpoint(key));
-                self.enqueue_seal_request(key);
+                self.enqueue_roll_request(key, SegmentRollIntent::DataPressure);
             }
 
-            self.check_pending_seal(key);
+            self.check_pending_boundary_correction(key);
         }
 
         for pending_repl in segment_batches {
@@ -1617,12 +1630,12 @@ impl<W: WalStorage> DataPlane<W> {
         }
     }
 
-    fn enqueue_timed_out_seal_retries(&mut self) {
-        let due = self.pending_seal_requests.take_due(
+    fn enqueue_timed_out_roll_retries(&mut self) {
+        let due = self.pending_roll_requests.take_due(
             tokio::time::Instant::now(),
-            self.config.seal_request_timeout,
+            self.config.segment_roll_request_timeout,
         );
-        for (segment_key, failed_nodes) in due {
+        for (segment_key, failed_nodes, intent) in due {
             let Some(tracker) = self.segments.get(&segment_key) else {
                 continue;
             };
@@ -1637,6 +1650,7 @@ impl<W: WalStorage> DataPlane<W> {
                         segment_key,
                         failed_nodes,
                         end_entry_id: tracker.committed_entry_id(),
+                        intent,
                     }
                     .into(),
                 });
@@ -1720,6 +1734,22 @@ mod tests {
         SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0))
     }
 
+    fn requested_roll_intents<W: WalStorage>(dp: &DataPlane<W>) -> Vec<SegmentRollIntent> {
+        dp.out
+            .transport_cmds
+            .iter()
+            .filter_map(|command| {
+                let DataTransportCommand::SendToCoordinator(send) = command else {
+                    return None;
+                };
+                let DataPlanePeerMessage::RequestSegmentRoll(request) = &send.message else {
+                    return None;
+                };
+                Some(request.intent)
+            })
+            .collect()
+    }
+
     fn receive_peer_message(message: DataPlanePeerMessage) -> DataPlaneCommand {
         let from = match &message {
             DataPlanePeerMessage::ReplicateSegmentEntries(command) => {
@@ -1746,7 +1776,7 @@ mod tests {
             DataPlanePeerMessage::PlaceSegment(_)
             | DataPlanePeerMessage::AdvanceReplicaCommit(_)
             | DataPlanePeerMessage::SegmentRollCommitted(_)
-            | DataPlanePeerMessage::SegmentSealed(_)
+            | DataPlanePeerMessage::SegmentMetaSealed(_)
             | DataPlanePeerMessage::AssignSegmentCatchUp(_)
             | DataPlanePeerMessage::CatchUpEntries(_)
             | DataPlanePeerMessage::CatchUpEntriesSent(_)
@@ -1919,7 +1949,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.process(assign_segment(test_key(), vec![test_node_id()]));
-        dp.process_peer(DataPlanePeerMessage::SegmentSealed(SegmentSealed {
+        dp.process_peer(DataPlanePeerMessage::SegmentMetaSealed(SegmentMetaSealed {
             segment_key: test_key(),
             committed_entry_id: None,
         }));
@@ -2015,7 +2045,7 @@ mod tests {
                     | DataPlanePeerMessage::AdvanceReplicaCommit(_)
                     | DataPlanePeerMessage::RequestSegmentRoll(_)
                     | DataPlanePeerMessage::SegmentRollCommitted(_)
-                    | DataPlanePeerMessage::SegmentSealed(_)
+                    | DataPlanePeerMessage::SegmentMetaSealed(_)
                     | DataPlanePeerMessage::AssignSegmentCatchUp(_)
                     | DataPlanePeerMessage::RequestCatchUpEntries(_)
                     | DataPlanePeerMessage::CatchUpEntries(_)
@@ -2212,7 +2242,7 @@ mod tests {
             batch_max_bytes: TEST_BATCH_MAX_BYTES,
             hot_cache_budget_bytes: 0,
             hot_cache_pressure_watermark: 0.9,
-            seal_request_timeout: std::time::Duration::from_secs(5),
+            segment_roll_request_timeout: std::time::Duration::from_secs(5),
             orphan_gc_interval: std::time::Duration::from_secs(300),
             data_dir: dir,
         }
@@ -2998,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_timeout_generates_seal_request() {
+    fn replication_timeout_generates_roll_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
@@ -3030,6 +3060,10 @@ mod tests {
                 .transport_cmds
                 .iter()
                 .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
+        );
+        assert_eq!(
+            requested_roll_intents(&dp),
+            vec![SegmentRollIntent::ReplicationFailure]
         );
     }
 
@@ -3079,7 +3113,7 @@ mod tests {
         let seq = dp.out.repl_schedules[0].0;
         dp.handle_replication_timeout(test_key(), seq);
 
-        let failed = dp.pending_seal_requests.failed_nodes(&test_key()).unwrap();
+        let failed = dp.pending_roll_requests.failed_nodes(&test_key()).unwrap();
         assert!(failed.contains(&follower));
     }
 
@@ -3144,12 +3178,12 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_seal_request_sends_to_coordinator() {
+    fn enqueue_roll_request_sends_to_coordinator() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
-        dp.enqueue_seal_request(test_key());
+        dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
 
         assert!(
             dp.out
@@ -3157,19 +3191,49 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, DataTransportCommand::SendToCoordinator(..)))
         );
-        assert!(dp.pending_seal_requests.is_tracked(&test_key()));
+        assert!(dp.pending_roll_requests.is_tracked(&test_key()));
+        assert_eq!(
+            requested_roll_intents(&dp),
+            vec![SegmentRollIntent::DataPressure]
+        );
     }
 
     #[test]
-    fn enqueue_seal_request_deduplicates() {
+    fn age_limit_requests_idle_maintenance_roll() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
 
-        dp.enqueue_seal_request(test_key());
-        dp.enqueue_seal_request(test_key());
+        dp.enqueue_seal_for_aged_segments(std::time::Duration::ZERO);
 
-        // Count only seal requests — `handle_place_segment` also emits a
+        assert_eq!(
+            requested_roll_intents(&dp),
+            vec![SegmentRollIntent::IdleMaintenance]
+        );
+    }
+
+    #[test]
+    fn size_limit_takes_precedence_over_age_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.config.segment_size_limit = 0;
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+
+        dp.enqueue_seal_for_aged_segments(std::time::Duration::ZERO);
+
+        assert!(requested_roll_intents(&dp).is_empty());
+    }
+
+    #[test]
+    fn enqueue_roll_request_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+
+        dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
+        dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
+
+        // Count only roll requests — `handle_place_segment` also emits a
         // SegmentPlaced via SendToCoordinator, which is not a seal.
         assert_eq!(
             dp.out
@@ -3186,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_seal_request_skips_follower() {
+    fn enqueue_roll_request_skips_follower() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
@@ -3202,18 +3266,18 @@ mod tests {
             .into(),
         ));
 
-        dp.enqueue_seal_request(test_key());
+        dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
 
         assert!(dp.out.transport_cmds.is_empty());
-        assert!(!dp.pending_seal_requests.is_tracked(&test_key()));
+        assert!(!dp.pending_roll_requests.is_tracked(&test_key()));
     }
 
     #[test]
-    fn enqueue_seal_request_skips_unknown_segment() {
+    fn enqueue_roll_request_skips_unknown_segment() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.enqueue_seal_request(test_key());
+        dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
 
         assert!(dp.out.transport_cmds.is_empty());
     }
@@ -3440,7 +3504,7 @@ mod tests {
         sparse.put_batch(index_entries).unwrap();
 
         dp.handle_command(receive_peer_message(
-            SegmentSealed {
+            SegmentMetaSealed {
                 segment_key: test_key(),
                 committed_entry_id: None,
             }
@@ -4314,7 +4378,7 @@ mod tests {
     /// A `RequestDurableSegmentEnd` is answered with our durable extent, addressed back to
     /// the coordinator that owns this gather.
     #[test]
-    fn seal_boundary_query_replies_with_durable_end() {
+    fn durable_end_query_replies_with_durable_end() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 4));
 
