@@ -100,6 +100,8 @@ Commit-completion tracking lives in the consensus actor: when a proposal is acce
 
 **Decision logic.** Each range tracks its recent seal timestamps within a sliding window. When the seal count exceeds the split threshold (and the range isn't in a cooldown window from a recent split), the leader proposes a split at the keyspace midpoint. Adjacent buddy ranges — children of the same parent split — with no recent seals can merge back together. Hysteresis between split and merge thresholds prevents oscillation.
 
+**Planned replacement.** Issue #192 replaces proposal-time timestamp history with committed, event-driven roll causes. Size-limit rolls advance pressure, age-limit rolls provide explicit idle evidence, and failure/recovery rolls remain neutral. Range-level split/merge seals stay outside load classification. See [Event-Driven Range Load Classification](event-driven-range-load.md).
+
 **Anti-recursion.** The apply path never proposes. Auto-proposals are buffered during apply and drained at the start of the next flush cycle, so a split apply can't recursively trigger another split. Stale auto-proposals (e.g., a merge proposed but the range was already split) are rejected by apply-time precondition checks.
 
 Midpoint splitting is good enough for now. Percentile-based split points are in the backlog.
