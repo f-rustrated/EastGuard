@@ -21,6 +21,15 @@ pub struct CreateTopic {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum SegmentRollIntent {
+    DataPressure,
+    IdleMaintenance,
+    ReplicationFailure,
+    Recovery,
+    BoundaryCorrection,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct RollSegment {
     pub segment_key: SegmentKey,
@@ -30,6 +39,7 @@ pub struct RollSegment {
     /// the actual committed offset. Corrected later via `correct_end_offset`
     /// or D5 sealed segment repair.
     pub end_entry_id: Option<EntryId>,
+    pub intent: SegmentRollIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
