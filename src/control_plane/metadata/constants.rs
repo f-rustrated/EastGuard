@@ -5,7 +5,4 @@ pub const KEYSPACE_MIN: &[u8] = &[];
 pub const KEYSPACE_MAX: &[u8] = &[0xFF];
 
 // --- Hot Range Detection Constants ---
-pub const SPLIT_SEAL_THRESHOLD: usize = 3;
-pub const MEASUREMENT_WINDOW_MS: u64 = 300_000; // 5 min sliding window
-pub const SPLIT_COOLDOWN_MS: u64 = 300_000; // 5 min cooldown after a split
-pub const MERGE_SEAL_THRESHOLD: usize = 0; // both ranges must be fully idle
+pub const SPLIT_SEAL_THRESHOLD: u8 = 3;
