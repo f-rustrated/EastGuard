@@ -14,11 +14,13 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::command::SegmentRollIntent;
 use crate::data_plane::SegmentKey;
 
 struct PendingSegmentRollRequest {
     sent_at: Instant,
     failed_nodes: Vec<NodeId>,
+    intent: SegmentRollIntent,
 }
 
 /// Segment-roll requests awaiting `SegmentRollCommitted`, keyed by segment.
@@ -34,33 +36,40 @@ impl PendingSegmentRollRequests {
     }
 
     /// Record a just-sent request.
-    pub(crate) fn track(&mut self, key: SegmentKey, failed_nodes: Vec<NodeId>, now: Instant) {
+    pub(crate) fn track(
+        &mut self,
+        key: SegmentKey,
+        failed_nodes: Vec<NodeId>,
+        intent: SegmentRollIntent,
+        sent_at: Instant,
+    ) {
         self.requests.insert(
             key,
             PendingSegmentRollRequest {
-                sent_at: now,
+                sent_at,
                 failed_nodes,
+                intent,
             },
         );
     }
 
     /// Drop a request once its committed result lands.
-    pub(crate) fn clear(&mut self, key: &SegmentKey) {
+    pub(crate) fn remove(&mut self, key: &SegmentKey) {
         self.requests.remove(key);
     }
 
-    /// Timed-out requests to re-send — `(key, failed_nodes)` — refreshing their
+    /// Timed-out requests to re-send — refreshing their
     /// clock so each fires at most once per `timeout`.
     pub(crate) fn take_due(
         &mut self,
         now: Instant,
         timeout: Duration,
-    ) -> Vec<(SegmentKey, Vec<NodeId>)> {
+    ) -> Vec<(SegmentKey, Vec<NodeId>, SegmentRollIntent)> {
         let mut due = Vec::new();
         for (key, req) in &mut self.requests {
             if now.duration_since(req.sent_at) >= timeout {
                 req.sent_at = now;
-                due.push((*key, req.failed_nodes.clone()));
+                due.push((*key, req.failed_nodes.clone(), req.intent));
             }
         }
         due
@@ -85,9 +94,14 @@ mod tests {
     fn track_then_clear() {
         let mut p = PendingSegmentRollRequests::default();
         assert!(!p.is_tracked(&seg()));
-        p.track(seg(), vec![], Instant::now());
+        p.track(
+            seg(),
+            vec![],
+            SegmentRollIntent::DataPressure,
+            Instant::now(),
+        );
         assert!(p.is_tracked(&seg()));
-        p.clear(&seg());
+        p.remove(&seg());
         assert!(!p.is_tracked(&seg()));
     }
 
@@ -96,11 +110,23 @@ mod tests {
         let mut p = PendingSegmentRollRequests::default();
         let t0 = Instant::now();
         let timeout = Duration::from_secs(5);
-        p.track(seg(), vec![NodeId::new("d")], t0);
+        p.track(
+            seg(),
+            vec![NodeId::new("d")],
+            SegmentRollIntent::ReplicationFailure,
+            t0,
+        );
 
         assert!(p.take_due(t0, timeout).is_empty(), "not yet due");
         let due = p.take_due(t0 + timeout, timeout);
-        assert_eq!(due, vec![(seg(), vec![NodeId::new("d")])]);
+        assert_eq!(
+            due,
+            vec![(
+                seg(),
+                vec![NodeId::new("d")],
+                SegmentRollIntent::ReplicationFailure,
+            )]
+        );
         // Refreshed → not due again at the same instant.
         assert!(p.take_due(t0 + timeout, timeout).is_empty());
     }

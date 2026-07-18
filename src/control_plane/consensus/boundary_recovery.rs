@@ -1,12 +1,12 @@
-//! Leader-crash seal-end recovery — a Raft-independent tracker.
+//! Leader-crash segment-boundary recovery — a Raft-independent tracker.
 //!
 //! When a segment's write leader crashes, the coordinator must recover the
 //! committed end before sealing it (see `docs/data-plane/leader_crash_seal_boundary.md`).
-//! This module owns that bookkeeping as a pure state machine: one [`SealEndGather`]
+//! This module owns that bookkeeping as a pure state machine: one [`BoundaryRecoveryRound`]
 //! per leader-crashed segment, polling the survivors for their durable extents
 //! and sealing at their `min`. It holds no Raft/transport/topology state — it
 //! consumes the current leaderless set plus survivor reports, and emits
-//! [`SealEndStep`]s for the owner (`MultiRaft`) to execute.
+//! [`BoundaryRecoveryAction`]s for the owner (`MultiRaft`) to execute.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,16 +32,16 @@ pub(crate) enum DurableSegmentEndReportedError {
 pub(crate) const GATHER_ATTEMPTS: u32 = 3;
 
 /// A side effect for the owner to carry out after driving recovery.
-pub(crate) enum SealEndStep {
+pub(crate) enum BoundaryRecoveryAction {
     /// (Re)send a boundary query to these survivors.
-    Query {
+    QueryDurableEnds {
         segment_key: SegmentKey,
         targets: Vec<NodeId>,
     },
     /// Propose the recovery roll: seal `segment_key` at `end`, led by `leader`.
     /// `end = None` is the unknown-end fallback (timeout, or a survivor holds
     /// nothing).
-    Seal {
+    ProposeRoll {
         shard_group_id: ShardGroupId,
         segment_key: SegmentKey,
         end: Option<EntryId>,
@@ -49,9 +49,9 @@ pub(crate) enum SealEndStep {
     },
 }
 
-/// One in-flight seal-end recovery: poll the survivors for their durable
+/// One in-flight boundary recovery: poll the survivors for their durable
 /// extents, seal at the `min` (the committed end), let the most-recent lead.
-struct SealEndGather {
+struct BoundaryRecoveryRound {
     shard_group_id: ShardGroupId,
     /// Survivors we await, in replica-set order.
     nodes: Vec<NodeId>,
@@ -64,7 +64,7 @@ struct SealEndGather {
     proposed: bool,
 }
 
-impl SealEndGather {
+impl BoundaryRecoveryRound {
     fn new(shard_group_id: ShardGroupId, nodes: Vec<NodeId>) -> Self {
         Self {
             shard_group_id,
@@ -84,7 +84,7 @@ impl SealEndGather {
         segment_key: SegmentKey,
         from: NodeId,
         durable_end: Option<EntryId>,
-    ) -> Result<Option<SealEndStep>, DurableSegmentEndReportedError> {
+    ) -> Result<Option<BoundaryRecoveryAction>, DurableSegmentEndReportedError> {
         if self.proposed {
             return Ok(None);
         }
@@ -106,7 +106,7 @@ impl SealEndGather {
             return Ok(None);
         }
         self.proposed = true;
-        Ok(Some(self.seal(segment_key)))
+        Ok(Some(self.propose_roll(segment_key)))
     }
 
     fn is_complete(&self) -> bool {
@@ -151,9 +151,9 @@ impl SealEndGather {
         ranked.first().map(|(_, node)| (*node).clone())
     }
 
-    /// The seal step for a completed gather.
-    fn seal(&self, segment_key: SegmentKey) -> SealEndStep {
-        SealEndStep::Seal {
+    /// The roll proposal for a completed gather.
+    fn propose_roll(&self, segment_key: SegmentKey) -> BoundaryRecoveryAction {
+        BoundaryRecoveryAction::ProposeRoll {
             shard_group_id: self.shard_group_id,
             segment_key,
             end: self.recovered_end(),
@@ -162,15 +162,15 @@ impl SealEndGather {
     }
 }
 
-/// Tracks every in-flight seal-end recovery (one per leader-crashed segment).
-/// Pure: it decides the next [`SealEndStep`]s and the owner executes them,
+/// Tracks every in-flight boundary recovery (one per leader-crashed segment).
+/// Pure: it decides the next [`BoundaryRecoveryAction`]s and the owner executes them,
 /// feeding back survivor reports and the current leaderless set.
 #[derive(Default)]
-pub(crate) struct SealEndRecovery {
-    gathers: HashMap<SegmentKey, SealEndGather>,
+pub(crate) struct SegmentBoundaryRecovery {
+    gathers: HashMap<SegmentKey, BoundaryRecoveryRound>,
 }
 
-impl SealEndRecovery {
+impl SegmentBoundaryRecovery {
     /// Start / re-query / expire gathers for `group`'s current leaderless
     /// `segments`. Returns the queries to send and rolls to propose. Callers
     /// prune stale gathers (segment no longer leaderless) *before* this — see
@@ -179,13 +179,15 @@ impl SealEndRecovery {
         &mut self,
         group: ShardGroupId,
         segments: LeaderlessSegments,
-    ) -> Vec<SealEndStep> {
+    ) -> Vec<BoundaryRecoveryAction> {
         let mut steps = Vec::with_capacity(segments.len());
         for (segment_key, survivors) in segments {
             let Some(g) = self.gathers.get_mut(&segment_key) else {
-                self.gathers
-                    .insert(segment_key, SealEndGather::new(group, survivors.clone()));
-                steps.push(SealEndStep::Query {
+                self.gathers.insert(
+                    segment_key,
+                    BoundaryRecoveryRound::new(group, survivors.clone()),
+                );
+                steps.push(BoundaryRecoveryAction::QueryDurableEnds {
                     segment_key,
                     targets: survivors,
                 });
@@ -198,7 +200,7 @@ impl SealEndRecovery {
             // applied, reconciliation no longer includes it and prunes us.
             if g.proposed {
                 if g.is_complete() {
-                    steps.push(g.seal(segment_key));
+                    steps.push(g.propose_roll(segment_key));
                 } else {
                     // The unknown-end fallback was proposed after an incomplete
                     // gather. It may have applied while a replica was down, but
@@ -207,7 +209,7 @@ impl SealEndRecovery {
                     g.proposed = false;
                     g.reports.clear();
                     g.attempts_left = GATHER_ATTEMPTS;
-                    steps.push(SealEndStep::Query {
+                    steps.push(BoundaryRecoveryAction::QueryDurableEnds {
                         segment_key,
                         targets: g.nodes.clone(),
                     });
@@ -218,10 +220,10 @@ impl SealEndRecovery {
             if g.attempts_left == 0 {
                 g.proposed = true;
                 tracing::warn!(
-                    "seal-end recovery timed out for {:?}; sealing with unknown end",
+                    "boundary recovery timed out for {:?}; proposing a roll with an unknown end",
                     segment_key
                 );
-                steps.push(SealEndStep::Seal {
+                steps.push(BoundaryRecoveryAction::ProposeRoll {
                     shard_group_id: group,
                     segment_key,
                     end: None,
@@ -231,7 +233,7 @@ impl SealEndRecovery {
             }
 
             g.attempts_left -= 1;
-            steps.push(SealEndStep::Query {
+            steps.push(BoundaryRecoveryAction::QueryDurableEnds {
                 segment_key,
                 targets: g.pending(),
             });
@@ -247,7 +249,7 @@ impl SealEndRecovery {
         segment_key: SegmentKey,
         from: NodeId,
         durable_end: Option<EntryId>,
-    ) -> Result<Option<SealEndStep>, DurableSegmentEndReportedError> {
+    ) -> Result<Option<BoundaryRecoveryAction>, DurableSegmentEndReportedError> {
         self.gathers
             .get_mut(&segment_key)
             .ok_or(DurableSegmentEndReportedError::UnknownRecovery)?
@@ -308,9 +310,9 @@ mod tests {
         NodeId::new(id)
     }
 
-    fn gather_with(reports: &[(&str, Option<u64>)]) -> SealEndGather {
+    fn gather_with(reports: &[(&str, Option<u64>)]) -> BoundaryRecoveryRound {
         let nodes = reports.iter().map(|(n, _)| node(n)).collect();
-        let mut g = SealEndGather::new(ShardGroupId(0), nodes);
+        let mut g = BoundaryRecoveryRound::new(ShardGroupId(0), nodes);
         let key = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
         for (n, end) in reports {
             let _ = g.record(key, node(n), end.map(EntryId)).unwrap();
@@ -354,14 +356,14 @@ mod tests {
     #[test]
     fn advance_starts_then_expires_with_unknown_end() {
         let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
-        let mut recovery = SealEndRecovery::default();
+        let mut recovery = SegmentBoundaryRecovery::default();
         let segments = || vec![(seg, vec![node("y"), node("z")])];
 
         // First pass starts the gather and queries both survivors.
         let steps = recovery.advance(ShardGroupId(1), segments());
         assert!(matches!(
             steps.as_slice(),
-            [SealEndStep::Query { targets, .. }] if targets == &[node("y"), node("z")]
+            [BoundaryRecoveryAction::QueryDurableEnds { targets, .. }] if targets == &[node("y"), node("z")]
         ));
         assert!(recovery.contains(&seg));
 
@@ -369,23 +371,23 @@ mod tests {
         for _ in 0..GATHER_ATTEMPTS {
             assert!(matches!(
                 recovery.advance(ShardGroupId(1), segments()).as_slice(),
-                [SealEndStep::Query { .. }]
+                [BoundaryRecoveryAction::QueryDurableEnds { .. }]
             ));
         }
         assert!(matches!(
             recovery.advance(ShardGroupId(1), segments()).as_slice(),
-            [SealEndStep::Seal { end: None, .. }]
+            [BoundaryRecoveryAction::ProposeRoll { end: None, .. }]
         ));
         assert!(matches!(
             recovery.advance(ShardGroupId(1), segments()).as_slice(),
-            [SealEndStep::Query { targets, .. }] if targets == &[node("y"), node("z")]
+            [BoundaryRecoveryAction::QueryDurableEnds { targets, .. }] if targets == &[node("y"), node("z")]
         ));
     }
 
     #[test]
-    fn record_seals_at_min_with_recency_leader_once() {
+    fn record_proposes_roll_at_min_with_recency_leader_once() {
         let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
-        let mut recovery = SealEndRecovery::default();
+        let mut recovery = SegmentBoundaryRecovery::default();
         recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])]);
 
         assert!(matches!(
@@ -398,7 +400,7 @@ mod tests {
             .expect("completes");
         assert!(matches!(
             step,
-            SealEndStep::Seal { end: Some(EntryId(40)), leader: Some(l), .. } if l == node("y")
+            BoundaryRecoveryAction::ProposeRoll { end: Some(EntryId(40)), leader: Some(l), .. } if l == node("y")
         ));
         // A late/duplicate report after the roll is proposed is ignored.
         assert!(matches!(
@@ -412,7 +414,7 @@ mod tests {
             recovery
                 .advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])])
                 .as_slice(),
-            [SealEndStep::Seal {
+            [BoundaryRecoveryAction::ProposeRoll {
                 end: Some(EntryId(40)),
                 ..
             }]
@@ -422,7 +424,7 @@ mod tests {
     #[test]
     fn conflicting_and_unexpected_reports_are_rejected() {
         let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
-        let mut recovery = SealEndRecovery::default();
+        let mut recovery = SegmentBoundaryRecovery::default();
         recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y"), node("z")])]);
 
         assert!(matches!(
@@ -447,7 +449,7 @@ mod tests {
     #[test]
     fn drop_stale_reconciled_drops_segments_no_longer_leaderless() {
         let seg = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
-        let mut recovery = SealEndRecovery::default();
+        let mut recovery = SegmentBoundaryRecovery::default();
         recovery.advance(ShardGroupId(1), vec![(seg, vec![node("y")])]);
         assert!(recovery.contains(&seg));
 

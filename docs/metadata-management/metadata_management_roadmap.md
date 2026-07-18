@@ -96,9 +96,9 @@ Commit-completion tracking lives in the consensus actor: when a proposal is acce
 
 **Goal.** The system detects ranges with disproportionate load and rebalances them through splits and merges, without external metrics infrastructure.
 
-**Core insight.** Segment seals are already in the Raft log. A range whose segments seal frequently is a hot range. Counting seal frequency gives a load signal for free — no probe protocol, no data plane → metadata reporting pipeline, no key histograms.
+**Core insight.** Segment rolls are already in the Raft log. Carrying their cause turns existing lifecycle traffic into an ordered load signal: size means pressure, age means idle, and failure/recovery say nothing about demand. No metrics pipeline, probe protocol, or key histogram is required.
 
-**Decision logic.** Each range tracks its recent seal timestamps within a sliding window. When the seal count exceeds the split threshold (and the range isn't in a cooldown window from a recent split), the leader proposes a split at the keyspace midpoint. Adjacent buddy ranges — children of the same parent split — with no recent seals can merge back together. Hysteresis between split and merge thresholds prevents oscillation.
+**Decision logic.** Each committed active-segment roll carries its cause. Size-limit rolls advance a consecutive pressure streak; age-limit rolls reset pressure and mark the range idle; failure and recovery rolls are neutral. At the pressure threshold the leader proposes a split at the keyspace midpoint. Committing the second idle signal for adjacent ranges queues a merge immediately; a periodic scan remains as a recovery fallback. New split children and merged ranges start unclassified, so absence of observations cannot trigger a merge. Range-level split/merge seals and their boundary-correction plumbing stay outside load classification. See [Event-Driven Range Load Classification](event-driven-range-load.md).
 
 **Anti-recursion.** The apply path never proposes. Auto-proposals are buffered during apply and drained at the start of the next flush cycle, so a split apply can't recursively trigger another split. Stale auto-proposals (e.g., a merge proposed but the range was already split) are rejected by apply-time precondition checks.
 
@@ -180,7 +180,7 @@ The two layers should share one replacement-selection policy. Otherwise the same
 
 7. **Segment offsets enable consumer position tracking.** Each sealed segment knows where it ended; consumers know they are done with a range when their position reaches the last segment's end. On split or merge, children start at offset 0 — a clean break from the parent's offset space.
 
-8. **Seal frequency is the hot-range signal.** Already in the log, costs nothing additional, accurate enough for midpoint splitting.
+8. **Committed segment-roll causes are the range-load signal.** Size and age rolls already pass through the log, so explicit causes distinguish pressure from idle without a metrics pipeline; failure and recovery remain policy-neutral.
 
 9. **Membership changes go through the log, never via direct mutation.** Detailed in Phase 3d and `mental-model.md`.
 
@@ -194,7 +194,7 @@ The two layers should share one replacement-selection policy. Otherwise the same
 | Hash ring divergence between client and server | Server resolves routing from SWIM (fast convergence). Leader forwarding handles misrouted proposals. |
 | Log entry format changes on payload variants | A version byte on log entries when bincode-incompatible changes are needed. |
 | Midpoint split does not balance skewed workloads | Acceptable for now; percentile-based split is in the backlog. |
-| Seal tracker grows unbounded on long-lived ranges | Sliding window keeps it bounded; cleaned up on range seal or delete. |
+| Pressure streak grows unbounded on long-lived ranges | The committed streak saturates at the split threshold. |
 | Two leaders coexisting briefly with divergent peer sets | Membership goes through the Raft log — quorum size advances deterministically with the log index. Split-brain commit is structurally impossible. See Phase 3d. |
 | New leader inherits dead peers because the predecessor died before converting the event | Reference-back step on becoming leader (Phase 3d; detailed in `mental-model.md`). |
 | Reconciliation shrinks the group's failure budget | Pair every removal with an addition — at both the Raft-peer and segment-replica-set layers. Not yet built. |

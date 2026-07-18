@@ -98,26 +98,26 @@ impl TTimer for ReplicationTimer {
 // --- Segment age timer (periodic age check via protocol period) ---
 
 #[derive(Debug)]
-pub struct SegmentAgeTimer {
+pub struct SegmentIdleTimer {
     ticks_remaining: u32,
 }
 
 #[derive(Debug, Default)]
-pub enum SegmentAgeCallback {
+pub enum SegmentIdleCallback {
     #[default]
     Check,
 }
 
-impl TTimer for SegmentAgeTimer {
-    type Callback = SegmentAgeCallback;
+impl TTimer for SegmentIdleTimer {
+    type Callback = SegmentIdleCallback;
 
     fn tick(&mut self) -> u32 {
         self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
         self.ticks_remaining
     }
 
-    fn to_timeout_callback(self, _seq: u64, _now: u64) -> SegmentAgeCallback {
-        SegmentAgeCallback::Check
+    fn to_timeout_callback(self, _seq: u64, _now: u64) -> SegmentIdleCallback {
+        SegmentIdleCallback::Check
     }
 
     #[cfg(test)]
@@ -132,7 +132,7 @@ impl TTimer for SegmentAgeTimer {
 pub enum DataPlaneTimeoutCallback {
     BatchFlushDeadline,
     ReplicationTimeout { seq: u64, segment_key: SegmentKey },
-    SegmentAgeCheck,
+    SegmentIdleCheck,
 }
 
 impl From<BatchFlushCallback> for DataPlaneTimeoutCallback {
@@ -152,9 +152,9 @@ impl From<ReplicationCallback> for DataPlaneTimeoutCallback {
     }
 }
 
-impl From<SegmentAgeCallback> for DataPlaneTimeoutCallback {
-    fn from(_: SegmentAgeCallback) -> Self {
-        DataPlaneTimeoutCallback::SegmentAgeCheck
+impl From<SegmentIdleCallback> for DataPlaneTimeoutCallback {
+    fn from(_: SegmentIdleCallback) -> Self {
+        DataPlaneTimeoutCallback::SegmentIdleCheck
     }
 }
 
@@ -165,7 +165,7 @@ impl fmt::Display for DataPlaneTimeoutCallback {
             DataPlaneTimeoutCallback::ReplicationTimeout { seq, segment_key } => {
                 write!(f, "ReplicationTimeout(seq={seq}, {segment_key:?})")
             }
-            DataPlaneTimeoutCallback::SegmentAgeCheck => write!(f, "SegmentAgeCheck"),
+            DataPlaneTimeoutCallback::SegmentIdleCheck => write!(f, "SegmentIdleCheck"),
         }
     }
 }

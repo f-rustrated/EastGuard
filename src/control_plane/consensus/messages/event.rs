@@ -1,10 +1,10 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::rpc::OutboundRaftPacket;
 use crate::control_plane::consensus::messages::timer::RaftTimer;
-use crate::control_plane::consensus::multi_raft::SealContext;
+use crate::control_plane::consensus::multi_raft::RollRequestContext;
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::event::ApplyResult;
+use crate::control_plane::metadata::event::MetadataEvent;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impl_from_variant;
 use crate::schedulers::ticker_message::TimerCommand;
@@ -19,9 +19,9 @@ pub struct LeaderChange {
 #[derive(Debug)]
 pub struct MetadataCommitted {
     pub shard_group_id: ShardGroupId,
-    pub result: ApplyResult,
+    pub event: MetadataEvent,
     pub log_index: u64,
-    pub seal_context: Option<SealContext>,
+    pub roll_context: Option<RollRequestContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,25 +55,24 @@ pub enum RaftEvent {
     /// Leader-crash `RequestDurableSegmentEnd` fan-out to a segment's survivors.
     /// A coordinator-initiated data-plane send not tied to a committed entry.
     /// The actor just forwards these to the data transport.
-    SealBoundaryQueries(Vec<DataTransportCommand>),
+    DurableEndQueries(Vec<DataTransportCommand>),
 }
 
 impl MetadataCommitted {
     pub fn into_data_transport_cmds(self) -> Vec<DataTransportCommand> {
         let sgid = self.shard_group_id;
-        match self.result {
-            ApplyResult::TopicCreated(tc) => {
+        match self.event {
+            MetadataEvent::TopicCreated(tc) => {
                 vec![tc.into_command(sgid)]
             }
-            ApplyResult::SegmentRolled(sr) => sr.into_command(self.seal_context, sgid),
-            ApplyResult::RangeSplit(rs) => rs.into_command(sgid),
-            ApplyResult::RangeMerged(rm) => rm.into_commands(sgid),
-            ApplyResult::TopicDeleted(deleted) => deleted.into_commands(),
-            ApplyResult::Noop => vec![],
-            ApplyResult::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
-            ApplyResult::SegmentsDeleted(d) => d.into_commands(),
-            ApplyResult::SegmentSealCorrected(ssc) => ssc.into_commands(),
-            ApplyResult::ConsumerGroupChanged(epoch) => epoch.into_commands(),
+            MetadataEvent::SegmentRolled(sr) => sr.into_command(self.roll_context, sgid),
+            MetadataEvent::RangeSplit(rs) => rs.into_command(sgid),
+            MetadataEvent::RangeMerged(rm) => rm.into_commands(sgid),
+            MetadataEvent::SegmentSealCommitted(sealed) => sealed.into_commands(),
+            MetadataEvent::SegmentReassigned(r) => r.into_catch_up_commands(sgid),
+            MetadataEvent::SegmentsDeleted(d) => d.into_commands(),
+            MetadataEvent::SegmentBoundaryCorrected(ssc) => ssc.into_commands(),
+            MetadataEvent::ConsumerGroupChanged(epoch) => epoch.into_commands(),
         }
     }
 }

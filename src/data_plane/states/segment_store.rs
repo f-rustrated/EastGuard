@@ -15,7 +15,7 @@
 //!   file are on disk; the stored location carries the `end_entry_id` so the
 //!   resolver knows where the segment ends.
 //!
-//! The store does **not** own the seal-handshake state (`pending_seal_requests`)
+//! The store does **not** own the seal-handshake state (`pending_roll_requests`)
 //! or replication bookkeeping — those are about coordinator + peer protocols,
 //! not about where bytes live. It is intentionally a passive registry: it
 //! never originates a side effect, never talks to the network, never emits

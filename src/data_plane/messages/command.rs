@@ -1,4 +1,5 @@
 use crate::control_plane::Replicas;
+use crate::control_plane::metadata::SegmentRollIntent;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry;
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
@@ -151,6 +152,7 @@ pub struct RequestSegmentRoll {
     pub segment_key: SegmentKey,
     pub failed_nodes: Vec<NodeId>,
     pub end_entry_id: EntryId,
+    pub intent: SegmentRollIntent,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -161,7 +163,7 @@ pub struct SegmentRollCommitted {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct SegmentSealed {
+pub struct SegmentMetaSealed {
     pub segment_key: SegmentKey,
     pub committed_entry_id: Option<EntryId>,
 }
@@ -290,7 +292,7 @@ pub enum DataPlanePeerMessage {
     AdvanceReplicaCommit(AdvanceReplicaCommit),
     RequestSegmentRoll(RequestSegmentRoll),
     SegmentRollCommitted(SegmentRollCommitted),
-    SegmentSealed(SegmentSealed),
+    SegmentMetaSealed(SegmentMetaSealed),
     AssignSegmentCatchUp(AssignSegmentCatchUp),
     RequestCatchUpEntries(RequestCatchUpEntries),
     CatchUpEntries(CatchUpEntries),
@@ -316,7 +318,7 @@ impl_from_variant!(
     AdvanceReplicaCommit,
     RequestSegmentRoll,
     SegmentRollCommitted,
-    SegmentSealed,
+    SegmentMetaSealed,
     AssignSegmentCatchUp,
     RequestCatchUpEntries,
     CatchUpEntries,
@@ -372,12 +374,12 @@ impl_from_variant!(
     ReceivePeerMessage,
 );
 
-use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentAgeCallback};
+use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentIdleCallback};
 
 impl_from_variant_via!(
     DataPlaneCommand,
     DataPlaneTimeoutCallback,
     BatchFlushCallback,
     ReplicationCallback,
-    SegmentAgeCallback
+    SegmentIdleCallback
 );

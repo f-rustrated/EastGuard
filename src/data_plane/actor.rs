@@ -4,7 +4,7 @@ use super::messages::pending::DataPlaneOutputs;
 use super::recovery::inventory::RecoveryOutput;
 use super::sparse_index::SparseIndex;
 use super::state::DataPlane;
-use super::timer::SegmentAgeTimer;
+use super::timer::SegmentIdleTimer;
 use super::wal::WalWriter;
 use crate::channels::BatchSender;
 use crate::config::DataNodeConfig;
@@ -26,7 +26,7 @@ pub struct DataPlaneActor;
 
 impl DataPlaneActor {
     /// Spawn the data-plane worker thread together with its three schedulers (batch-flush,
-    /// replication, segment-age) and the bridge that forwards scheduler callbacks (tokio
+    /// replication, segment-idle) and the bridge that forwards scheduler callbacks (tokio
     /// mpsc) into the worker's flume mailbox, plus a self-contained orphan-GC ticker.
     pub fn spawn(
         node_id: NodeId,
@@ -48,11 +48,11 @@ impl DataPlaneActor {
         let repl_scheduler_tx =
             spawn_scheduling_actor(timer_tx.clone(), 64, TICK_PERIOD_10_MS, None);
 
-        let _age_scheduler_tx = spawn_scheduling_actor::<SegmentAgeTimer, DataPlaneCommand>(
+        let _idle_scheduler_tx = spawn_scheduling_actor::<SegmentIdleTimer, DataPlaneCommand>(
             timer_tx,
             64,
             TICK_PERIOD_100_MS,
-            Some(config.age_check_ticks()),
+            Some(config.idle_check_ticks()),
         );
 
         let (tx, mailbox) = flume::bounded::<DataPlaneMessage>(4096);

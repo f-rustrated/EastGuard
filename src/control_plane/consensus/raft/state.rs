@@ -10,10 +10,10 @@ use crate::control_plane::consensus::raft::storage::RaftPersistentState;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::DeleteSegments;
-use crate::control_plane::metadata::event::ApplyResult;
+use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
-    TopicId, TopicMeta, TopicStats,
+    SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
@@ -373,7 +373,7 @@ impl Raft {
     }
 
     /// Repair this group's segments whose replica set still names a dead node:
-    ///   - active, one replica died → stash for seal-end recovery (rolled later)
+    ///   - active, one replica died → stash for boundary recovery (rolled later)
     ///   - active, multiple replicas died → roll now with an unknown end (`RollSegment`)
     ///   - sealed (known end) → swap the replica set (`ReassignSegment`); catch-up refills
     ///
@@ -423,6 +423,7 @@ impl Raft {
                     sealed_at: now_ms(),
                     new_replica_set,
                     end_entry_id: None,
+                    intent: SegmentRollIntent::Recovery,
                 }
                 .into()
             },
@@ -607,7 +608,7 @@ impl Raft {
     }
 
     /// Drain the leaderless segments found by `reconcile_segments` — the actor
-    /// drives seal-end recovery (poll survivors, seal at the recovered end).
+    /// drives boundary recovery (poll survivors, seal at the recovered end).
     pub(crate) fn take_leaderless_segments(&mut self) -> Vec<(SegmentKey, Vec<NodeId>)> {
         self.consensus.take_leaderless_segments()
     }
@@ -1272,32 +1273,32 @@ impl Raft {
 
     fn apply_metadata_entry(&mut self, cmd: MetadataCommand, index: u64) {
         match self.metadata.apply(cmd) {
-            Ok(result) => {
-                tracing::debug!(
-                    "[{}] Applied metadata at index {}: {:?}",
-                    self.node_id,
-                    index,
-                    result
-                );
-
-                if self.is_leader()
-                    && let ApplyResult::SegmentReassigned(r) = &result
-                {
-                    self.consensus.track_catch_up(r);
-                }
-                self.raise(MetadataCommitted {
-                    shard_group_id: self.shard_group_id,
-                    result,
-                    log_index: index,
-                    seal_context: None,
-                });
-            }
+            Ok(()) => {}
             Err(e) => tracing::error!(
                 "[{}] Metadata apply error at index {}: {:?}",
                 self.node_id,
                 index,
                 e
             ),
+        }
+        for event in self.metadata.take_pending_events() {
+            tracing::debug!(
+                "[{}] Applied metadata event at index {}: {:?}",
+                self.node_id,
+                index,
+                event
+            );
+            if self.is_leader()
+                && let MetadataEvent::SegmentReassigned(reassigned) = &event
+            {
+                self.consensus.track_catch_up(reassigned);
+            }
+            self.raise(MetadataCommitted {
+                shard_group_id: self.shard_group_id,
+                event,
+                log_index: index,
+                roll_context: None,
+            });
         }
         if self.consensus.is_leader() {
             self.consensus
@@ -3553,6 +3554,7 @@ mod tests {
                 sealed_at: 2000,
                 new_replica_set: Replicas::new(vec![node("node-1")]),
                 end_entry_id: Some(100.into()),
+                intent: SegmentRollIntent::DataPressure,
             })
             .into(),
         )
@@ -3619,6 +3621,7 @@ mod tests {
                     spare.clone(),
                 ]),
                 end_entry_id: Some(100.into()),
+                intent: SegmentRollIntent::DataPressure,
             })
             .into(),
         )
@@ -3687,6 +3690,7 @@ mod tests {
                 sealed_at: 2000,
                 new_replica_set: Replicas::new(sealed_set),
                 end_entry_id: Some(100.into()),
+                intent: SegmentRollIntent::DataPressure,
             })
             .into(),
         )
@@ -3816,6 +3820,7 @@ mod tests {
                 sealed_at: 2000,
                 new_replica_set: Replicas::new(vec![node("node-1")]),
                 end_entry_id: Some(100.into()),
+                intent: SegmentRollIntent::DataPressure,
             })
             .into(),
         )
@@ -3914,7 +3919,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_redrives_seal_recovery_for_unknown_end() {
+    fn reconcile_redrives_boundary_recovery_for_unknown_end() {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
         // Same shape, but seal with end_entry_id = None — a SWIM-death-style seal
@@ -3928,6 +3933,7 @@ mod tests {
                 sealed_at: 2000,
                 new_replica_set: Replicas::new(vec![node("y"), node("z"), node("node-1")]),
                 end_entry_id: None,
+                intent: SegmentRollIntent::Recovery,
             })
             .into(),
         )
@@ -3996,7 +4002,7 @@ mod tests {
         let live = live_set(&["node-1", "y", "z"]); // leader x crashed
         raft.reconcile_segments(&live);
 
-        // No immediate roll — the segment is stashed for seal-end recovery.
+        // No immediate roll — the segment is stashed for boundary recovery.
         let after = proposals_after_become_leader(&raft);
         let rolls = after[before..]
             .iter()

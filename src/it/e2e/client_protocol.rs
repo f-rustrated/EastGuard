@@ -511,7 +511,7 @@ fn produce_then_fetch_hot() -> turmoil::Result {
 /// for repair to reassign, so this gates the repair e2e.
 #[test]
 #[serial_test::serial]
-fn age_seal_rolls_the_active_segment() -> turmoil::Result {
+fn idle_segment_automatically_rolls() -> turmoil::Result {
     let mut sim = Builder::new()
         .tick_duration(Duration::from_millis(100))
         .simulation_duration(Duration::from_secs(180))
@@ -523,14 +523,14 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         .try_init();
 
     host_cluster(&mut sim, &NODES_3, |env| {
-        // Force a fast age-based seal.
-        env.max_segment_age_secs = 5;
-        env.segment_age_check_interval_secs = 1;
+        // Force a fast inactivity-based roll.
+        env.segment_idle_timeout_secs = 5;
+        env.segment_idle_check_interval_secs = 1;
     });
 
     sim.client("test-client", async {
         const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
-        const TOPIC: &str = "age-seal";
+        const TOPIC: &str = "idle-roll";
 
         wait_for_cluster(&NODES, 3).await;
         create_topic_anywhere(TOPIC, &NODES, 3).await;
@@ -552,7 +552,7 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
             assert!(acked, "produce {i} not acked by {leader:?}");
         }
 
-        // The segment ages past `max_segment_age_secs`; the leader enqueues a
+        // The segment remains inactive past `segment_idle_timeout_secs`; the leader enqueues a
         // RequestSegmentRoll, the coordinator commits a RollSegment, and the active
         // segment rolls. Poll DescribeTopic until the successor's start_offset
         // advances past 0 (the known-end seal landed).
@@ -577,6 +577,121 @@ fn age_seal_rolls_the_active_segment() -> turmoil::Result {
         );
 
         Ok(())
+    });
+
+    sim.run()
+}
+
+/// Three committed size-driven rolls classify the range as pressured and cause
+/// the metadata leader to split it through Raft. The simulation pins every
+/// placement/scheduling input and disables age interference, so only data
+/// pressure can produce the split signal.
+#[test]
+#[serial_test::serial]
+fn pressure_rolls_automatically_split_the_range() -> turmoil::Result {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(240))
+        .tcp_capacity(4096)
+        .rng_seed(192)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    host_cluster(&mut sim, &NODES_3, |env| {
+        env.node_id_suffix = Some("sim".to_string());
+        env.vnodes_per_node = 16;
+        env.segment_size_limit_bytes = 2048;
+        env.segment_idle_timeout_secs = 3600;
+    });
+
+    sim.client("test-client", async {
+        const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        const TOPIC: &str = "pressure-auto-split";
+
+        wait_for_cluster(&NODES, 3).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+        produce_until_topic_splits(TOPIC, &NODES).await;
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// After the pressure-driven split, both children independently age-roll and
+/// become idle. Applying the second idle signal queues and commits a `MergeRange`;
+/// the periodic scan remains only a recovery fallback. Age zero avoids `std::time`
+/// dependence, while the first age check is delayed until after the pressure rolls.
+#[test]
+#[serial_test::serial]
+fn idle_split_children_automatically_merge() -> turmoil::Result {
+    let mut sim = Builder::new()
+        .tick_duration(Duration::from_millis(100))
+        .simulation_duration(Duration::from_secs(420))
+        .tcp_capacity(4096)
+        .rng_seed(193)
+        .build();
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    host_cluster(&mut sim, &NODES_3, |env| {
+        env.node_id_suffix = Some("sim".to_string());
+        env.vnodes_per_node = 16;
+        env.segment_size_limit_bytes = 2048;
+        env.segment_idle_timeout_secs = 0;
+        env.segment_idle_check_interval_secs = 300;
+    });
+
+    sim.client("test-client", async {
+        const NODES: [(&str, u16); 3] = [("node-1", 8081), ("node-2", 8082), ("node-3", 8083)];
+        const TOPIC: &str = "idle-auto-merge";
+
+        wait_for_cluster(&NODES, 3).await;
+        create_topic_anywhere(TOPIC, &NODES, 3).await;
+        produce_until_topic_splits(TOPIC, &NODES).await;
+
+        // Pressure production completes well before the first age check. Cross
+        // that single virtual deadline only after observing the split, then poll
+        // briefly for the event-driven merge commit.
+        tokio::time::sleep(Duration::from_secs(310)).await;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(detail) = describe_topic(TOPIC, &NODES).await else {
+                continue;
+            };
+            let active_count = detail
+                .ranges
+                .iter()
+                .filter(|range| range.state == RangeState::Active)
+                .count();
+            let merged_range = detail
+                .ranges
+                .iter()
+                .find(|range| range.state == RangeState::Active && range.merged_from.is_some());
+            let source_boundaries_are_known = merged_range
+                .and_then(|range| range.merged_from)
+                .is_some_and(|(left, right)| {
+                    [left, right].into_iter().all(|source_id| {
+                        detail
+                            .ranges
+                            .iter()
+                            .find(|range| range.range_id == source_id)
+                            .and_then(|range| range.sealed_segments.last())
+                            // having end_entry_id means previous segments got sealed and boundary recovery was made successfully.
+                            .is_some_and(|segment| segment.end_entry_id.is_some())
+                    })
+                });
+            if active_count == 1 && source_boundaries_are_known {
+                return Ok(());
+            }
+        }
+
+        panic!("idle children did not merge with known source-segment boundaries");
     });
 
     sim.run()
@@ -1644,6 +1759,32 @@ async fn produce_until_acked<'a>(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     None
+}
+
+async fn produce_until_topic_splits(topic: &str, nodes: &[(&str, u16)]) {
+    for record in 0..16 {
+        let mut payload = format!("pressure-{record}").into_bytes();
+        payload.resize(1024, b'-');
+        produce_until_acked(topic, &payload, nodes)
+            .await
+            .unwrap_or_else(|| panic!("pressure record {record} never acked"));
+
+        for _ in 0..10 {
+            if let Some(detail) = describe_topic(topic, nodes).await
+                && detail
+                    .ranges
+                    .iter()
+                    .filter(|range| range.state == RangeState::Active)
+                    .count()
+                    == 2
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    panic!("three committed pressure rolls never split topic {topic}");
 }
 
 enum ProduceOutcome {

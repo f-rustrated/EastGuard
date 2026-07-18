@@ -21,6 +21,7 @@ pub struct MetadataState {
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
     pending_proposals: Vec<MetadataCommand>,
+    pending_events: Vec<MetadataEvent>,
 }
 
 impl MetadataState {
@@ -31,6 +32,7 @@ impl MetadataState {
             topic_name_index: HashMap::new(),
             next_topic_id: shard_group_id.0 << 32,
             pending_proposals: Vec::new(),
+            pending_events: Vec::new(),
         }
     }
 
@@ -74,6 +76,14 @@ impl MetadataState {
 
     pub(crate) fn take_pending_proposals(&mut self) -> Box<[MetadataCommand]> {
         std::mem::take(&mut self.pending_proposals).into_boxed_slice()
+    }
+
+    pub(crate) fn take_pending_events(&mut self) -> Vec<MetadataEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    fn raise_event(&mut self, event: impl Into<MetadataEvent>) {
+        self.pending_events.push(event.into());
     }
 
     pub(crate) fn active_segments_for_node(
@@ -156,27 +166,24 @@ impl MetadataState {
             .collect()
     }
 
-    pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<ApplyResult, MetadataError> {
+    pub(crate) fn apply(&mut self, command: MetadataCommand) -> Result<(), MetadataError> {
         use MetadataCommand::*;
-        let result = match command {
-            CreateTopic(cmd) => self.create_topic(cmd)?.into(),
+        match command {
+            CreateTopic(cmd) => self.create_topic(cmd)?,
             RollSegment(cmd) => self.roll_segment(cmd)?,
-            SplitRange(cmd) => self.split_range(cmd)?.into(),
-            MergeRange(cmd) => self.merge_range(cmd)?.into(),
-            DeleteTopic(cmd) => self.delete_topic(cmd)?.into(),
+            SplitRange(cmd) => self.split_range(cmd)?,
+            MergeRange(cmd) => self.merge_range(cmd)?,
+            DeleteTopic(cmd) => self.delete_topic(cmd)?,
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
             DeleteSegments(cmd) => self.delete_segments(cmd)?,
-            SyncConsumerGroup(cmd) => self
-                .sync_consumer_group(cmd)?
-                .map(ApplyResult::ConsumerGroupChanged)
-                .unwrap_or(ApplyResult::Noop),
-        };
+            SyncConsumerGroup(cmd) => self.sync_consumer_group(cmd)?,
+        }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
-        Ok(result)
+        Ok(())
     }
 
-    fn create_topic(&mut self, cmd: CreateTopic) -> Result<TopicCreated, MetadataError> {
+    fn create_topic(&mut self, cmd: CreateTopic) -> Result<(), MetadataError> {
         if self.topic_name_index.contains_key(&cmd.name) {
             return Err(TopicNameAlreadyExists(cmd.name));
         }
@@ -192,13 +199,14 @@ impl MetadataState {
         self.topic_name_index.insert(topic.name.clone(), topic_id);
         self.topics.insert(topic.id, topic);
         self.next_topic_id += 1;
-        Ok(TopicCreated {
+        self.raise_event(TopicCreated {
             segment_key: SegmentKey::new(topic_id, RangeId(0), SegmentId(0)),
             replica_set,
-        })
+        });
+        Ok(())
     }
 
-    fn roll_segment(&mut self, cmd: RollSegment) -> Result<ApplyResult, MetadataError> {
+    fn roll_segment(&mut self, cmd: RollSegment) -> Result<(), MetadataError> {
         let topic = self.get_active_topic_mut(cmd.segment_key.topic_id)?;
         let can_split = topic.can_split();
         let range = topic.get_range_mut(&cmd.segment_key.range_id)?;
@@ -208,35 +216,44 @@ impl MetadataState {
         // If Inactive, correction path
         if !is_active {
             let Some(end_entry_id) = cmd.end_entry_id else {
-                return Ok(ApplyResult::Noop);
+                return Ok(());
             };
             let Some(replica_set) =
                 range.correct_end_offset(cmd.segment_key.segment_id, end_entry_id)
             else {
-                return Ok(ApplyResult::Noop);
+                return Ok(());
             };
 
-            return Ok(ApplyResult::SegmentSealCorrected(SegmentSealCorrected {
+            self.raise_event(SegmentBoundaryCorrected {
                 segment_key: cmd.segment_key,
                 replica_set,
                 committed_entry_id: cmd.end_entry_id,
-            }));
+            });
+            return Ok(());
+        }
+
+        if cmd.intent == SegmentRollIntent::BoundaryCorrection {
+            return Ok(());
         }
 
         // If Active, Roll
         let new_segment_id = range.roll_segment(cmd.clone())?;
-        let split_proposal = (range.should_split(cmd.sealed_at) && can_split)
-            .then(|| range.build_split_proposal(&cmd));
+        let split_proposal =
+            (range.should_split() && can_split).then(|| range.build_split_proposal(&cmd));
 
         // For segment roll, unless data nodes got changed, consumer
         // TODO For now, it loops over EVERY consumger groups and take epoch snapshot for every topic.
         // TODO To reduce the load, it should specifically target groups that are affected by the possible range split
-        let consumer_group_epochs = topic
+        let consumer_group_epochs: Box<[ConsumerGroupEpochSnapshot]> = topic
             .consumer_groups
             .keys()
             .filter_map(|group_id| topic.consumer_group_epoch(group_id))
             .collect();
         tracing::debug!("Consumer groups: {:?}", consumer_group_epochs);
+
+        let merge_proposal = (cmd.intent == SegmentRollIntent::IdleMaintenance)
+            .then(|| topic.find_mergeable_range_pair(cmd.sealed_at))
+            .flatten();
 
         if let Some(proposal) = split_proposal {
             match proposal {
@@ -250,19 +267,25 @@ impl MetadataState {
                 ),
             }
         }
-        Ok(SegmentRolled {
+        if let Some(proposal) = merge_proposal {
+            self.pending_proposals.push(proposal);
+        }
+        self.raise_event(SegmentRolled {
             new_segment_key: cmd.segment_key.with_segment_id(new_segment_id),
             new_replica_set: cmd.new_replica_set,
             end_entry_id: cmd.end_entry_id,
-            consumer_group_epochs,
+        });
+
+        for epoch in consumer_group_epochs {
+            self.raise_event(epoch);
         }
-        .into())
+        Ok(())
     }
 
     /// Re-points a sealed segment's replica set.
     /// `Noop` when the set is unchanged, otherwise `SegmentReassigned`.
     /// The segment must be sealed; an active/deleting/unknown one is rejected.
-    fn reassign_segment(&mut self, cmd: ReassignSegment) -> Result<ApplyResult, MetadataError> {
+    fn reassign_segment(&mut self, cmd: ReassignSegment) -> Result<(), MetadataError> {
         let segment = self
             .topics
             .get_mut(&cmd.segment_key.topic_id)
@@ -271,17 +294,18 @@ impl MetadataState {
 
         // The dispatch announces the desired replica set; receivers reconcile, so
         // we only carry the sealed bounds (the catch-up target) alongside it.
-        if segment.reassign(cmd.replica_set.clone())? {
-            Ok(SegmentReassigned {
+        let event = segment
+            .reassign(cmd.replica_set.clone())?
+            .then_some(SegmentReassigned {
                 segment_key: cmd.segment_key,
                 start_entry_id: segment.start_entry_id,
                 sealed_end: segment.end_entry_id,
                 new_replica_set: cmd.replica_set,
-            }
-            .into())
-        } else {
-            Ok(ApplyResult::Noop)
+            });
+        if let Some(event) = event {
+            self.raise_event(event);
         }
+        Ok(())
     }
 
     /// Retention: mark an oldest-first prefix of a range's sealed segments `Deleting`.
@@ -289,7 +313,7 @@ impl MetadataState {
     /// `SegmentsDeleted` carrying the deleted segments grouped by `replica_set` for
     /// batched dispatch. Uses plain `get_mut` (not `validate_active`) so a command
     /// applied after the topic is being deleted is a harmless no-op (already `Deleting`).
-    fn delete_segments(&mut self, cmd: DeleteSegments) -> Result<ApplyResult, MetadataError> {
+    fn delete_segments(&mut self, cmd: DeleteSegments) -> Result<(), MetadataError> {
         let range = self
             .topics
             .get_mut(&cmd.topic_id)
@@ -298,7 +322,7 @@ impl MetadataState {
 
         let deleted_ids = range.delete_segments(&cmd.segment_ids);
         if deleted_ids.is_empty() {
-            return Ok(ApplyResult::Noop);
+            return Ok(());
         }
         // Group the deleted segments by replica_set here.
         let mut groups: Vec<(Replicas, Vec<SegmentKey>)> = Vec::new();
@@ -312,7 +336,8 @@ impl MetadataState {
                 None => groups.push((seg.replica_set.clone(), vec![key])),
             }
         }
-        Ok(SegmentsDeleted { groups }.into())
+        self.raise_event(SegmentsDeleted { groups });
+        Ok(())
     }
 
     fn get_active_topic_mut(&mut self, id: TopicId) -> Result<&mut TopicMeta, MetadataError> {
@@ -321,7 +346,7 @@ impl MetadataState {
         Ok(topic)
     }
 
-    fn split_range(&mut self, cmd: SplitRange) -> Result<RangeSplit, MetadataError> {
+    fn split_range(&mut self, cmd: SplitRange) -> Result<(), MetadataError> {
         let topic = self
             .topics
             .get_mut(&cmd.topic_id)
@@ -348,18 +373,26 @@ impl MetadataState {
 
         let consumer_group_epochs = topic.rebalance_consumer_groups();
 
-        Ok(RangeSplit {
+        self.raise_event(RangeSplit {
             topic_id: cmd.topic_id,
             children: [
                 (left_id, SegmentId(0), cmd.left_replica_set),
                 (right_id, SegmentId(0), cmd.right_replica_set),
             ],
-            parent_active_segment,
-            consumer_group_epochs,
-        })
+        });
+        if let Some((segment_key, replica_set)) = parent_active_segment {
+            self.raise_event(SegmentSealCommitted {
+                segment_key,
+                replica_set,
+            });
+        }
+        for epoch in consumer_group_epochs {
+            self.raise_event(epoch);
+        }
+        Ok(())
     }
 
-    fn merge_range(&mut self, cmd: MergeRange) -> Result<RangeMerged, MetadataError> {
+    fn merge_range(&mut self, cmd: MergeRange) -> Result<(), MetadataError> {
         let topic_id = cmd.topic_id;
         let replica_set = cmd.merged_replica_set.clone();
         let topic = self
@@ -367,20 +400,32 @@ impl MetadataState {
             .get_mut(&topic_id)
             .ok_or(TopicNotFound(topic_id))?;
         topic.validate_active()?;
+
+        let sealed_source_segments = [
+            topic.active_segment_key_and_replicas(cmd.range_id_1)?,
+            topic.active_segment_key_and_replicas(cmd.range_id_2)?,
+        ];
+
         let merged_id = topic.execute_merge(cmd)?;
         let consumer_group_epochs = topic.rebalance_consumer_groups();
 
-        Ok(RangeMerged {
+        self.raise_event(RangeMerged {
             segment_key: SegmentKey::new(topic_id, merged_id, SegmentId(0)),
             replica_set,
-            consumer_group_epochs,
-        })
+        });
+        for (segment_key, source_replica_set) in sealed_source_segments {
+            self.raise_event(SegmentSealCommitted {
+                segment_key,
+                replica_set: source_replica_set,
+            });
+        }
+        for epoch in consumer_group_epochs {
+            self.raise_event(epoch);
+        }
+        Ok(())
     }
 
-    fn sync_consumer_group(
-        &mut self,
-        cmd: SyncConsumerGroup,
-    ) -> Result<Option<ConsumerGroupEpochSnapshot>, MetadataError> {
+    fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> Result<(), MetadataError> {
         let group_id = cmd.group_id.clone();
 
         let topic = self
@@ -390,9 +435,14 @@ impl MetadataState {
             .ok_or_else(|| TopicNameNotFound(cmd.topic_name.clone()))?;
         topic.validate_active()?;
         if !topic.sync_consumer_group(cmd) {
-            return Ok(None);
+            return Ok(());
         }
-        Ok(topic.consumer_group_epoch(&group_id))
+
+        let event = topic.consumer_group_epoch(&group_id);
+        if let Some(event) = event {
+            self.raise_event(event);
+        }
+        Ok(())
     }
 
     // ! SAFETY: When the loop evaluates the [1, 2] pair and decides it is mergeable,
@@ -412,7 +462,7 @@ impl MetadataState {
             .collect()
     }
 
-    fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<TopicDeleted, MetadataError> {
+    fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
         let topic_id = self
             .topic_name_index
             .get(&cmd.name)
@@ -428,9 +478,10 @@ impl MetadataState {
 
         self.topic_name_index.remove(&cmd.name);
 
-        Ok(TopicDeleted {
-            consumer_group_epochs,
-        })
+        for epoch in consumer_group_epochs {
+            self.raise_event(epoch);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -482,8 +533,6 @@ mod tests {
             strategy::{PartitionStrategy, StoragePolicy},
         },
     };
-    use std::collections::VecDeque;
-
     fn default_policy() -> StoragePolicy {
         StoragePolicy {
             retention_ms: Some(3_600_000),
@@ -508,15 +557,26 @@ mod tests {
         ])
     }
 
+    fn apply_command(
+        sm: &mut MetadataState,
+        command: MetadataCommand,
+    ) -> Result<Vec<MetadataEvent>, MetadataError> {
+        sm.apply(command)?;
+        Ok(sm.take_pending_events())
+    }
+
     fn create_topic(sm: &mut MetadataState, name: &str) -> TopicId {
-        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
-            name: name.to_string(),
-            storage_policy: default_policy(),
-            replica_set: replica_set(),
-            created_at: 1000,
-        }));
-        match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
+        let result = apply_command(
+            sm,
+            MetadataCommand::CreateTopic(CreateTopic {
+                name: name.to_string(),
+                storage_policy: default_policy(),
+                replica_set: replica_set(),
+                created_at: 1000,
+            }),
+        );
+        match result.unwrap().into_iter().next().unwrap() {
+            MetadataEvent::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         }
     }
@@ -537,8 +597,8 @@ mod tests {
             session_timeout_ms: 10_000,
         };
 
-        let ApplyResult::ConsumerGroupChanged(epoch) = sm.apply(command.clone().into()).unwrap()
-        else {
+        let events = apply_command(&mut sm, command.clone().into()).unwrap();
+        let [MetadataEvent::ConsumerGroupChanged(epoch)] = events.as_slice() else {
             panic!("first member must create a committed generation");
         };
         assert_eq!(*epoch.generation, 1);
@@ -551,10 +611,7 @@ mod tests {
 
         let mut heartbeat = command;
         heartbeat.observed_at = 200;
-        assert!(matches!(
-            sm.apply(heartbeat.into()).unwrap(),
-            ApplyResult::Noop
-        ));
+        assert!(apply_command(&mut sm, heartbeat.into()).unwrap().is_empty());
         assert_eq!(
             *sm.get_consumer_group_assignment("orders", "workers", member)
                 .unwrap()
@@ -570,13 +627,38 @@ mod tests {
         segment_id: SegmentId,
         sealed_at: u64,
     ) {
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(topic_id, range_id, segment_id),
+        roll_segment_with_intent(
+            sm,
+            topic_id,
+            range_id,
+            segment_id,
             sealed_at,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
-        assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
+            SegmentRollIntent::DataPressure,
+        );
+    }
+
+    fn roll_segment_with_intent(
+        sm: &mut MetadataState,
+        topic_id: TopicId,
+        range_id: RangeId,
+        segment_id: SegmentId,
+        sealed_at: u64,
+        intent: SegmentRollIntent,
+    ) {
+        let result = apply_command(
+            sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(topic_id, range_id, segment_id),
+                sealed_at,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent,
+            }),
+        );
+        assert!(matches!(
+            result.unwrap().into_iter().next().unwrap(),
+            MetadataEvent::SegmentRolled(_)
+        ));
     }
 
     // ── D7 retention ───────────────────────────────────────────────────────
@@ -591,13 +673,20 @@ mod tests {
         end_entry_id: u64,
         sealed_at: u64,
     ) {
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(topic_id, RangeId(0), segment_id),
-            sealed_at,
-            new_replica_set: replica_set(),
-            end_entry_id: Some(EntryId(end_entry_id)),
-        }));
-        assert!(matches!(result.unwrap(), ApplyResult::SegmentRolled(_)));
+        let result = apply_command(
+            sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(topic_id, RangeId(0), segment_id),
+                sealed_at,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(end_entry_id)),
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
+        assert!(matches!(
+            result.unwrap().into_iter().next().unwrap(),
+            MetadataEvent::SegmentRolled(_)
+        ));
     }
 
     fn seg_state(sm: &MetadataState, topic_id: TopicId, segment_id: SegmentId) -> SegmentMetaState {
@@ -620,12 +709,15 @@ mod tests {
         sm: &mut MetadataState,
         topic_id: TopicId,
         ids: &[u64],
-    ) -> Result<ApplyResult, MetadataError> {
-        sm.apply(MetadataCommand::DeleteSegments(DeleteSegments {
-            topic_id,
-            range_id: RangeId(0),
-            segment_ids: ids.iter().map(|&i| SegmentId(i)).collect(),
-        }))
+    ) -> Result<Vec<MetadataEvent>, MetadataError> {
+        apply_command(
+            sm,
+            MetadataCommand::DeleteSegments(DeleteSegments {
+                topic_id,
+                range_id: RangeId(0),
+                segment_ids: ids.iter().map(|&i| SegmentId(i)).collect(),
+            }),
+        )
     }
 
     #[test]
@@ -633,8 +725,12 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
 
-        let result = delete_segments(&mut sm, t, &[0, 1]).unwrap();
-        let ApplyResult::SegmentsDeleted(d) = result else {
+        let result = delete_segments(&mut sm, t, &[0, 1])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let MetadataEvent::SegmentsDeleted(d) = result else {
             panic!("expected SegmentsDeleted, got {result:?}");
         };
         // All three sealed segments share one replica_set → a single group of 2 keys.
@@ -652,8 +748,8 @@ mod tests {
         let t = topic_with_three_sealed(&mut sm);
         // Naming the active head (seg 3) alongside the sealed prefix: only the sealed
         // ones transition; the write head is skipped, never deleted.
-        let ApplyResult::SegmentsDeleted(d) = delete_segments(&mut sm, t, &[0, 1, 2, 3]).unwrap()
-        else {
+        let events = delete_segments(&mut sm, t, &[0, 1, 2, 3]).unwrap();
+        let [MetadataEvent::SegmentsDeleted(d)] = events.as_slice() else {
             panic!("expected SegmentsDeleted");
         };
         let total_keys: usize = d.groups.iter().map(|(_, keys)| keys.len()).sum();
@@ -676,14 +772,11 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let t = topic_with_three_sealed(&mut sm);
         assert!(matches!(
-            delete_segments(&mut sm, t, &[0]).unwrap(),
-            ApplyResult::SegmentsDeleted(_)
+            delete_segments(&mut sm, t, &[0]).unwrap().as_slice(),
+            [MetadataEvent::SegmentsDeleted(_)]
         ));
         // Re-applying for an already-Deleting segment is a no-op.
-        assert!(matches!(
-            delete_segments(&mut sm, t, &[0]).unwrap(),
-            ApplyResult::Noop
-        ));
+        assert!(delete_segments(&mut sm, t, &[0]).unwrap().is_empty());
     }
 
     #[test]
@@ -704,8 +797,9 @@ mod tests {
     #[test]
     fn expired_prefix_empty_without_retention() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let t = sm
-            .apply(MetadataCommand::CreateTopic(CreateTopic {
+        let t = apply_command(
+            &mut sm,
+            MetadataCommand::CreateTopic(CreateTopic {
                 name: "no-retention".into(),
                 storage_policy: StoragePolicy {
                     retention_ms: None,
@@ -714,12 +808,13 @@ mod tests {
                 },
                 replica_set: replica_set(),
                 created_at: 1000,
-            }))
-            .map(|r| match r {
-                ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
-                other => panic!("{other:?}"),
-            })
-            .unwrap();
+            }),
+        )
+        .map(|r| match r.into_iter().next().unwrap() {
+            MetadataEvent::TopicCreated(tc) => tc.segment_key.topic_id,
+            other => panic!("{other:?}"),
+        })
+        .unwrap();
         roll_with_end(&mut sm, t, SegmentId(0), 9, 100);
         // Far past any window, but no policy → nothing expires.
         assert!(
@@ -737,16 +832,27 @@ mod tests {
         split_point: Vec<u8>,
         created_at: u64,
     ) -> (RangeId, RangeId) {
-        let result = sm.apply(MetadataCommand::SplitRange(SplitRange {
-            topic_id,
-            range_id,
-            split_point,
-            created_at,
-            left_replica_set: replica_set(),
-            right_replica_set: replica_set(),
-        }));
-        match result.unwrap() {
-            ApplyResult::RangeSplit(rs) => (rs.children[0].0, rs.children[1].0),
+        let result = apply_command(
+            sm,
+            MetadataCommand::SplitRange(SplitRange {
+                topic_id,
+                range_id,
+                split_point,
+                created_at,
+                left_replica_set: replica_set(),
+                right_replica_set: replica_set(),
+            }),
+        );
+        let events = result.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, MetadataEvent::SegmentSealCommitted(_)))
+                .count(),
+            1
+        );
+        match events.into_iter().next().unwrap() {
+            MetadataEvent::RangeSplit(split) => (split.children[0].0, split.children[1].0),
             other => panic!("expected RangeSplit, got {:?}", other),
         }
     }
@@ -758,15 +864,26 @@ mod tests {
         range_id_2: RangeId,
         created_at: u64,
     ) -> RangeId {
-        let result = sm.apply(MetadataCommand::MergeRange(MergeRange {
-            topic_id,
-            range_id_1,
-            range_id_2,
-            created_at,
-            merged_replica_set: replica_set(),
-        }));
-        match result.unwrap() {
-            ApplyResult::RangeMerged(rm) => rm.segment_key.range_id,
+        let result = apply_command(
+            sm,
+            MetadataCommand::MergeRange(MergeRange {
+                topic_id,
+                range_id_1,
+                range_id_2,
+                created_at,
+                merged_replica_set: replica_set(),
+            }),
+        );
+        let events = result.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, MetadataEvent::SegmentSealCommitted(_)))
+                .count(),
+            2
+        );
+        match events.into_iter().next().unwrap() {
+            MetadataEvent::RangeMerged(merged) => merged.segment_key.range_id,
             other => panic!("expected RangeMerged, got {:?}", other),
         }
     }
@@ -791,15 +908,17 @@ mod tests {
         roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
         let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
 
-        let result = sm
-            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: sealed,
                 replica_set: replacement_set(),
-            }))
-            .unwrap();
+            }),
+        )
+        .unwrap();
 
-        match result {
-            ApplyResult::SegmentReassigned(r) => {
+        match result.into_iter().next().unwrap() {
+            MetadataEvent::SegmentReassigned(r) => {
                 assert_eq!(r.segment_key, sealed);
                 assert_eq!(r.new_replica_set, replacement_set());
             }
@@ -818,21 +937,26 @@ mod tests {
         roll_segment(&mut sm, topic_id, RangeId(0), SegmentId(0), 2000);
         let sealed = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
 
-        sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
-            segment_key: sealed,
-            replica_set: replacement_set(),
-        }))
+        apply_command(
+            &mut sm,
+            MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: sealed,
+                replica_set: replacement_set(),
+            }),
+        )
         .unwrap();
 
         // Re-applying the identical set (duplicate death detection / re-proposal)
         // changes nothing.
-        let again = sm
-            .apply(MetadataCommand::ReassignSegment(ReassignSegment {
+        let again = apply_command(
+            &mut sm,
+            MetadataCommand::ReassignSegment(ReassignSegment {
                 segment_key: sealed,
                 replica_set: replacement_set(),
-            }))
-            .unwrap();
-        assert_eq!(again, ApplyResult::Noop);
+            }),
+        )
+        .unwrap();
+        assert!(again.is_empty());
     }
 
     #[test]
@@ -842,10 +966,13 @@ mod tests {
         // SegmentId(0) is the active write head — no roll yet.
         let active = SegmentKey::new(topic_id, RangeId(0), SegmentId(0));
 
-        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
-            segment_key: active,
-            replica_set: replacement_set(),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: active,
+                replica_set: replacement_set(),
+            }),
+        );
         assert!(matches!(result, Err(MetadataError::SegmentNotSealed)));
     }
 
@@ -855,10 +982,13 @@ mod tests {
         let topic_id = create_topic(&mut sm, "blue");
         let unknown = SegmentKey::new(topic_id, RangeId(0), SegmentId(99));
 
-        let result = sm.apply(MetadataCommand::ReassignSegment(ReassignSegment {
-            segment_key: unknown,
-            replica_set: replacement_set(),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::ReassignSegment(ReassignSegment {
+                segment_key: unknown,
+                replica_set: replacement_set(),
+            }),
+        );
         assert!(matches!(result, Err(MetadataError::SegmentNotFound)));
     }
 
@@ -886,12 +1016,15 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
-            name: "blue".to_string(),
-            storage_policy: default_policy(),
-            replica_set: replica_set(),
-            created_at: 2000,
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::CreateTopic(CreateTopic {
+                name: "blue".to_string(),
+                storage_policy: default_policy(),
+                replica_set: replica_set(),
+                created_at: 2000,
+            }),
+        );
         assert_eq!(result, Err(TopicNameAlreadyExists("blue".to_string())));
     }
 
@@ -961,12 +1094,16 @@ mod tests {
     #[test]
     fn roll_segment_bad_topic() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(TopicId(99), RangeId(0), SegmentId(0)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(TopicId(99), RangeId(0), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
         assert_eq!(result, Err(TopicNotFound(TopicId(99))));
     }
 
@@ -975,12 +1112,16 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(99), SegmentId(0)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(99), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
         assert_eq!(result, Err(RangeNotFound));
     }
 
@@ -989,13 +1130,17 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(99)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
-        assert_eq!(result, Ok(ApplyResult::Noop));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(99)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
+        assert_eq!(result, Ok(vec![]));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(0)));
@@ -1051,25 +1196,31 @@ mod tests {
     #[test]
     fn split_range_fixed_rejected() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
-            name: "ordered".to_string(),
-            storage_policy: fixed_policy(),
-            replica_set: replica_set(),
-            created_at: 1000,
-        }));
-        let tid = match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::CreateTopic(CreateTopic {
+                name: "ordered".to_string(),
+                storage_policy: fixed_policy(),
+                replica_set: replica_set(),
+                created_at: 1000,
+            }),
+        );
+        let tid = match result.unwrap().into_iter().next().unwrap() {
+            MetadataEvent::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         };
 
-        let split_result = sm.apply(MetadataCommand::SplitRange(SplitRange {
-            topic_id: tid,
-            range_id: RangeId(0),
-            split_point: vec![0x80],
-            created_at: 2000,
-            left_replica_set: replica_set(),
-            right_replica_set: replica_set(),
-        }));
+        let split_result = apply_command(
+            &mut sm,
+            MetadataCommand::SplitRange(SplitRange {
+                topic_id: tid,
+                range_id: RangeId(0),
+                split_point: vec![0x80],
+                created_at: 2000,
+                left_replica_set: replica_set(),
+                right_replica_set: replica_set(),
+            }),
+        );
         assert_eq!(split_result, Err(SplitNotAllowed(tid)));
     }
 
@@ -1078,24 +1229,30 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
-        let upper_bound = sm.apply(MetadataCommand::SplitRange(SplitRange {
-            topic_id: tid,
-            range_id: RangeId(0),
-            split_point: vec![0xFF],
-            created_at: 2000,
-            left_replica_set: replica_set(),
-            right_replica_set: replica_set(),
-        }));
+        let upper_bound = apply_command(
+            &mut sm,
+            MetadataCommand::SplitRange(SplitRange {
+                topic_id: tid,
+                range_id: RangeId(0),
+                split_point: vec![0xFF],
+                created_at: 2000,
+                left_replica_set: replica_set(),
+                right_replica_set: replica_set(),
+            }),
+        );
         assert_eq!(upper_bound, Err(InvalidSplitPoint));
 
-        let lower_bound = sm.apply(MetadataCommand::SplitRange(SplitRange {
-            topic_id: tid,
-            range_id: RangeId(0),
-            split_point: vec![],
-            created_at: 2000,
-            left_replica_set: replica_set(),
-            right_replica_set: replica_set(),
-        }));
+        let lower_bound = apply_command(
+            &mut sm,
+            MetadataCommand::SplitRange(SplitRange {
+                topic_id: tid,
+                range_id: RangeId(0),
+                split_point: vec![],
+                created_at: 2000,
+                left_replica_set: replica_set(),
+                right_replica_set: replica_set(),
+            }),
+        );
         assert_eq!(lower_bound, Err(InvalidSplitPoint));
     }
 
@@ -1130,6 +1287,7 @@ mod tests {
         assert_eq!(merged.keyspace_start, KEYSPACE_MIN);
         assert_eq!(merged.keyspace_end, KEYSPACE_MAX);
         assert_eq!(merged.state, RangeState::Active);
+        assert_eq!(merged.load_state, RangeLoadState::Unclassified);
     }
 
     #[test]
@@ -1165,13 +1323,16 @@ mod tests {
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
         let (c1a, _c1b) = split_range(&mut sm, tid, c1, vec![0x40], 3000);
 
-        let result = sm.apply(MetadataCommand::MergeRange(MergeRange {
-            topic_id: tid,
-            range_id_1: c1a,
-            range_id_2: c2,
-            created_at: 4000,
-            merged_replica_set: replica_set(),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::MergeRange(MergeRange {
+                topic_id: tid,
+                range_id_1: c1a,
+                range_id_2: c2,
+                created_at: 4000,
+                merged_replica_set: replica_set(),
+            }),
+        );
         assert_eq!(result, Err(RangesNotAdjacent));
     }
 
@@ -1182,9 +1343,12 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
-        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
-            name: "blue".into(),
-        }))
+        apply_command(
+            &mut sm,
+            MetadataCommand::DeleteTopic(DeleteTopic {
+                name: "blue".into(),
+            }),
+        )
         .unwrap();
 
         let topic = sm.get_topic(&tid).unwrap();
@@ -1204,9 +1368,12 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let _tid = create_topic(&mut sm, "blue");
 
-        sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
-            name: "blue".into(),
-        }))
+        apply_command(
+            &mut sm,
+            MetadataCommand::DeleteTopic(DeleteTopic {
+                name: "blue".into(),
+            }),
+        )
         .unwrap();
 
         assert!(sm.get_topic_by_name("blue").is_none());
@@ -1215,9 +1382,12 @@ mod tests {
     #[test]
     fn delete_topic_nonexistent() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let result = sm.apply(MetadataCommand::DeleteTopic(DeleteTopic {
-            name: "nope".into(),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::DeleteTopic(DeleteTopic {
+                name: "nope".into(),
+            }),
+        );
         assert_eq!(result, Err(MetadataError::TopicNameNotFound("nope".into())));
     }
 
@@ -1276,103 +1446,113 @@ mod tests {
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
 
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 3000,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
-        assert_eq!(result, Ok(ApplyResult::Noop));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 3000,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent: SegmentRollIntent::DataPressure,
+            }),
+        );
+        assert_eq!(result, Ok(vec![]));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
         assert_eq!(range.active_segment, Some(SegmentId(1)));
         assert_eq!(range.segments.len(), 2);
     }
 
+    #[test]
+    fn boundary_correction_cannot_roll_active_segment() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(10)),
+                intent: SegmentRollIntent::BoundaryCorrection,
+            }),
+        );
+
+        assert_eq!(result, Ok(vec![]));
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(range.active_segment, Some(SegmentId(0)));
+        assert_eq!(range.load_state, RangeLoadState::Unclassified);
+    }
+
     // --- Hot Range Detection ---
 
     #[test]
-    fn seal_history_records_timestamps() {
+    fn pressure_rolls_advance_consecutive_streak() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), 3000);
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.seal_history.seal_count(), 3);
+        assert_eq!(
+            range.load_state,
+            RangeLoadState::Pressure {
+                consecutive_rolls: 2
+            }
+        );
     }
 
     #[test]
-    fn seal_history_prunes_old_entries() {
+    fn idle_roll_resets_pressure() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
         roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 1000);
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(1), 2000);
-        // Jump far beyond the window — both old entries pruned
-        let far_future = 2000 + MEASUREMENT_WINDOW_MS + 1;
-        roll_segment(&mut sm, tid, RangeId(0), SegmentId(2), far_future);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(1),
+            2000,
+            SegmentRollIntent::IdleMaintenance,
+        );
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
-        assert_eq!(range.seal_history.seal_count(), 1);
+        assert_eq!(range.load_state, RangeLoadState::Idle);
     }
 
     #[test]
-    fn seal_history_orders_delayed_proposal_timestamps() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(2000);
-        history.record_seal(1000);
-        history.record_seal(1500);
+    fn neutral_rolls_do_not_change_load_state() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
 
-        assert_eq!(history.seal_timestamps, VecDeque::from([1000, 1500, 2000]));
-    }
+        roll_segment(&mut sm, tid, RangeId(0), SegmentId(0), 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(1),
+            1000,
+            SegmentRollIntent::Recovery,
+        );
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            RangeId(0),
+            SegmentId(2),
+            500,
+            SegmentRollIntent::ReplicationFailure,
+        );
 
-    #[test]
-    fn delayed_old_seal_is_pruned_against_newest_timestamp() {
-        let mut history = RangeSealHistory::default();
-        let newest = MEASUREMENT_WINDOW_MS + 2000;
-        history.record_seal(newest);
-        history.record_seal(1000);
-
-        assert_eq!(history.seal_timestamps, VecDeque::from([newest]));
-    }
-
-    #[test]
-    fn should_split_threshold_met() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(1000);
-        history.record_seal(2000);
-        history.record_seal(3000);
-
-        assert!(history.should_split(3000));
-    }
-
-    #[test]
-    fn should_split_below_threshold() {
-        let mut history = RangeSealHistory::default();
-        history.record_seal(1000);
-        history.record_seal(2000);
-
-        assert!(!history.should_split(2000));
-    }
-
-    #[test]
-    fn should_split_cooldown_blocks() {
-        let mut history = RangeSealHistory {
-            seal_timestamps: VecDeque::new(),
-            created_by_split_at: Some(1000),
-        };
-        history.record_seal(1100);
-        history.record_seal(1200);
-        history.record_seal(1300);
-
-        // Within cooldown — blocked
-        assert!(!history.should_split(1300));
-
-        // After cooldown — allowed
-        assert!(history.should_split(1000 + SPLIT_COOLDOWN_MS));
+        let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
+        assert_eq!(
+            range.load_state,
+            RangeLoadState::Pressure {
+                consecutive_rolls: 1
+            }
+        );
     }
 
     #[test]
@@ -1417,14 +1597,17 @@ mod tests {
     #[test]
     fn no_auto_proposal_for_fixed_strategy() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let result = sm.apply(MetadataCommand::CreateTopic(CreateTopic {
-            name: "ordered".to_string(),
-            storage_policy: fixed_policy(),
-            replica_set: replica_set(),
-            created_at: 1000,
-        }));
-        let tid = match result.unwrap() {
-            ApplyResult::TopicCreated(tc) => tc.segment_key.topic_id,
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::CreateTopic(CreateTopic {
+                name: "ordered".to_string(),
+                storage_policy: fixed_policy(),
+                replica_set: replica_set(),
+                created_at: 1000,
+            }),
+        );
+        let tid = match result.unwrap().into_iter().next().unwrap() {
+            MetadataEvent::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         };
 
@@ -1446,12 +1629,57 @@ mod tests {
     fn evaluate_merges_cold_adjacent() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
-        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        let (left, right) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            left,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            right,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
 
-        // Both children are cold (no seals)
-        let proposals = sm.evaluate_merges(2000 + SPLIT_COOLDOWN_MS + 1);
+        let proposals = sm.evaluate_merges(3000);
         assert_eq!(proposals.len(), 1);
         assert!(matches!(proposals[0], MetadataCommand::MergeRange(_)));
+        assert!(matches!(
+            sm.take_pending_proposals().last(),
+            Some(MetadataCommand::MergeRange(_))
+        ));
+    }
+
+    #[test]
+    fn split_children_do_not_merge_without_idle_signals() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+        split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+
+        assert!(sm.evaluate_merges(3000).is_empty());
+    }
+
+    #[test]
+    fn one_idle_child_does_not_merge() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let tid = create_topic(&mut sm, "blue");
+        let (left, _right) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
+        roll_segment_with_intent(
+            &mut sm,
+            tid,
+            left,
+            SegmentId(0),
+            3000,
+            SegmentRollIntent::IdleMaintenance,
+        );
+
+        assert!(sm.evaluate_merges(3000).is_empty());
     }
 
     #[test]
@@ -1469,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn split_clears_seal_history() {
+    fn split_children_start_unclassified() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
@@ -1477,25 +1705,8 @@ mod tests {
         let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 3000);
 
         let topic = sm.get_topic(&tid).unwrap();
-        assert!(topic.ranges[&c1].seal_history.seal_timestamps.is_empty());
-        assert!(topic.ranges[&c2].seal_history.seal_timestamps.is_empty());
-    }
-
-    #[test]
-    fn split_sets_cooldown() {
-        let mut sm = MetadataState::new(ShardGroupId(0));
-        let tid = create_topic(&mut sm, "blue");
-        let (c1, c2) = split_range(&mut sm, tid, RangeId(0), vec![0x80], 2000);
-
-        let topic = sm.get_topic(&tid).unwrap();
-        assert_eq!(
-            topic.ranges[&c1].seal_history.created_by_split_at,
-            Some(2000)
-        );
-        assert_eq!(
-            topic.ranges[&c2].seal_history.created_by_split_at,
-            Some(2000)
-        );
+        assert_eq!(topic.ranges[&c1].load_state, RangeLoadState::Unclassified);
+        assert_eq!(topic.ranges[&c2].load_state, RangeLoadState::Unclassified);
     }
 
     // --- D3: active_segments_for_node ---
@@ -1541,20 +1752,24 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
 
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: Some(EntryId(42000)),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(42000)),
+                intent: SegmentRollIntent::DataPressure,
+            }),
+        );
 
         let result = result.unwrap();
         assert!(matches!(
-            result,
-            ApplyResult::SegmentRolled(SegmentRolled {
+            result.as_slice(),
+            [MetadataEvent::SegmentRolled(SegmentRolled {
                 end_entry_id: Some(EntryId(42000)),
                 ..
-            })
+            })]
         ));
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
@@ -1572,12 +1787,16 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
 
         // Death-triggered roll with end_entry_id=0 (placeholder)
-        let _ = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: None,
-        }));
+        let _ = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: None,
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
 
         assert_eq!(
             sm.get_topic(&tid).unwrap().ranges[&RangeId(0)].segments[&SegmentId(0)].end_entry_id,
@@ -1585,12 +1804,16 @@ mod tests {
         );
 
         // Segment leader's RollSegment arrives with correct end_entry_id
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 2500,
-            new_replica_set: replica_set(),
-            end_entry_id: Some(EntryId(42000)),
-        }));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2500,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(42000)),
+                intent: SegmentRollIntent::Recovery,
+            }),
+        );
         assert!(result.is_ok());
 
         let range = &sm.get_topic(&tid).unwrap().ranges[&RangeId(0)];
@@ -1607,20 +1830,28 @@ mod tests {
         let tid = create_topic(&mut sm, "blue");
 
         // Normal roll with actual end_entry_id
-        let _ = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 2000,
-            new_replica_set: replica_set(),
-            end_entry_id: Some(EntryId(1000)),
-        }));
+        let _ = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2000,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(1000)),
+                intent: SegmentRollIntent::DataPressure,
+            }),
+        );
 
         // Duplicate roll is rejected (end_offset already set)
-        let result = sm.apply(MetadataCommand::RollSegment(RollSegment {
-            segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
-            sealed_at: 2500,
-            new_replica_set: replica_set(),
-            end_entry_id: Some(EntryId(42000)),
-        }));
-        assert_eq!(result, Ok(ApplyResult::Noop));
+        let result = apply_command(
+            &mut sm,
+            MetadataCommand::RollSegment(RollSegment {
+                segment_key: SegmentKey::new(tid, RangeId(0), SegmentId(0)),
+                sealed_at: 2500,
+                new_replica_set: replica_set(),
+                end_entry_id: Some(EntryId(42000)),
+                intent: SegmentRollIntent::DataPressure,
+            }),
+        );
+        assert_eq!(result, Ok(vec![]));
     }
 }

@@ -93,11 +93,11 @@ pub struct Environment {
     #[arg(long, env = "JOIN_MAX_ATTEMPTS", default_value_t = 5)]
     pub join_max_attempts: u32,
 
-    #[arg(long, env = "MAX_SEGMENT_AGE_SECS", default_value_t = 3600)]
-    pub max_segment_age_secs: u64,
+    #[arg(long, env = "SEGMENT_IDLE_TIMEOUT_SECS", default_value_t = 3600)]
+    pub segment_idle_timeout_secs: u64,
 
-    #[arg(long, env = "SEGMENT_AGE_CHECK_INTERVAL_SECS", default_value_t = 60)]
-    pub segment_age_check_interval_secs: u64,
+    #[arg(long, env = "SEGMENT_IDLE_CHECK_INTERVAL_SECS", default_value_t = 60)]
+    pub segment_idle_check_interval_secs: u64,
 
     #[arg(
         long,
@@ -129,8 +129,8 @@ pub struct Environment {
     #[arg(long, env = "HOT_CACHE_PRESSURE_WATERMARK", default_value_t = 0.9)]
     pub hot_cache_pressure_watermark: f64,
 
-    #[arg(long, env = "SEAL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
-    pub seal_request_timeout_secs: u64,
+    #[arg(long, env = "SEGMENT_ROLL_REQUEST_TIMEOUT_SECS", default_value_t = 5)]
+    pub segment_roll_request_timeout_secs: u64,
 
     /// Orphan-GC sweep interval, and the grace before a recovered segment is eligible for
     /// reclaim: a restarted node keeps its on-disk segments for this long so re-fill can
@@ -371,15 +371,17 @@ impl Environment {
 
     pub(crate) fn data_node_config(&self) -> DataNodeConfig {
         DataNodeConfig {
-            max_segment_age: std::time::Duration::from_secs(self.max_segment_age_secs),
-            age_check_interval: std::time::Duration::from_secs(
-                self.segment_age_check_interval_secs,
+            segment_idle_timeout: std::time::Duration::from_secs(self.segment_idle_timeout_secs),
+            idle_check_interval: std::time::Duration::from_secs(
+                self.segment_idle_check_interval_secs,
             ),
             segment_size_limit: self.segment_size_limit_bytes,
             batch_max_bytes: self.batch_max_bytes,
             hot_cache_budget_bytes: self.hot_cache_budget_bytes,
             hot_cache_pressure_watermark: self.hot_cache_pressure_watermark,
-            seal_request_timeout: std::time::Duration::from_secs(self.seal_request_timeout_secs),
+            segment_roll_request_timeout: std::time::Duration::from_secs(
+                self.segment_roll_request_timeout_secs,
+            ),
             orphan_gc_interval: std::time::Duration::from_secs(self.orphan_gc_interval_secs),
             data_dir: self.data_dir_path(),
         }
@@ -388,20 +390,20 @@ impl Environment {
 
 #[derive(Clone)]
 pub struct DataNodeConfig {
-    pub max_segment_age: std::time::Duration,
-    pub age_check_interval: std::time::Duration,
+    pub segment_idle_timeout: std::time::Duration,
+    pub idle_check_interval: std::time::Duration,
     pub segment_size_limit: u64,
     pub batch_max_bytes: usize,
     pub hot_cache_budget_bytes: u64,
     pub hot_cache_pressure_watermark: f64,
-    pub seal_request_timeout: std::time::Duration,
+    pub segment_roll_request_timeout: std::time::Duration,
     pub orphan_gc_interval: std::time::Duration,
     pub data_dir: PathBuf,
 }
 
 impl DataNodeConfig {
-    pub(crate) fn age_check_ticks(&self) -> u64 {
-        self.age_check_interval.as_millis() as u64 / TICK_PERIOD_100_MS
+    pub(crate) fn idle_check_ticks(&self) -> u64 {
+        self.idle_check_interval.as_millis() as u64 / TICK_PERIOD_100_MS
     }
 
     pub(crate) fn cache_pressure_threshold_bytes(&self) -> Option<u64> {
@@ -438,13 +440,13 @@ mod tests {
             join_interval_ms: 1000,
             join_multiplier: 2,
             join_max_attempts: 5,
-            max_segment_age_secs: 3600,
-            segment_age_check_interval_secs: 60,
+            segment_idle_timeout_secs: 3600,
+            segment_idle_check_interval_secs: 60,
             segment_size_limit_bytes: 1024 * 1024 * 1024,
             batch_max_bytes: 10 * 1024 * 1024,
             hot_cache_budget_bytes: 4 * 1024 * 1024 * 1024,
             hot_cache_pressure_watermark: 0.9,
-            seal_request_timeout_secs: 5,
+            segment_roll_request_timeout_secs: 5,
             orphan_gc_interval_secs: 300,
         }
     }

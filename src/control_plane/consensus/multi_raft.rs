@@ -1,4 +1,7 @@
 use crate::control_plane::NodeId;
+use crate::control_plane::consensus::boundary_recovery::{
+    BoundaryRecoveryAction, SegmentBoundaryRecovery,
+};
 use crate::control_plane::consensus::messages::{
     DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
     MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
@@ -8,11 +11,11 @@ use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::consensus::seal_recovery::{SealEndRecovery, SealEndStep};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
+use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, EntryId, TopicId, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
@@ -37,62 +40,66 @@ pub(crate) struct MultiRaft {
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
     pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposalError>>>,
 
-    pending_seals: PendingSealTracker,
-    /// Leader-crash seal-end recoveries (one per leader-crashed segment).
-    seal_recovery: SealEndRecovery,
+    pending_rolls: PendingRollTracker,
+    /// Leader-crash boundary recoveries (one per leader-crashed segment).
+    boundary_recovery: SegmentBoundaryRecovery,
 
     topology: TopologyReader,
 }
 
 #[derive(Debug)]
-pub(crate) struct SealContext {
+pub(crate) struct RollRequestContext {
     pub(crate) requester: NodeId,
     pub(crate) segment_key: SegmentKey,
 }
-// Bookkeeping for in-flight seal proposals.
+// Bookkeeping for in-flight roll proposals.
 #[derive(Default)]
-struct PendingSealTracker {
-    by_group: HashMap<ShardGroupId, BTreeMap<u64, SealContext>>,
+struct PendingRollTracker {
+    by_group: HashMap<ShardGroupId, BTreeMap<u64, RollRequestContext>>,
     by_key: HashSet<SegmentKey>,
 }
 
-impl PendingSealTracker {
+impl PendingRollTracker {
     fn contains(&self, key: &SegmentKey) -> bool {
         self.by_key.contains(key)
     }
 
-    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, seal: SealContext) {
-        self.by_key.insert(seal.segment_key);
+    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, roll: RollRequestContext) {
+        self.by_key.insert(roll.segment_key);
         self.by_group
             .entry(group_id)
             .or_default()
-            .insert(log_index, seal);
+            .insert(log_index, roll);
     }
-    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<SealContext> {
+    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<RollRequestContext> {
         let group_map = self.by_group.get_mut(&group_id)?;
-        let seal = group_map.remove(&log_index)?;
+        let roll = group_map.remove(&log_index)?;
 
         // Clean up the empty map to prevent memory leaks over time
         if group_map.is_empty() {
             self.by_group.remove(&group_id);
         }
 
-        self.by_key.remove(&seal.segment_key);
-        Some(seal)
+        self.by_key.remove(&roll.segment_key);
+        Some(roll)
     }
 
-    fn pop_seal_context(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<SealContext> {
+    fn pop_roll_context(
+        &mut self,
+        group_id: ShardGroupId,
+        log_index: u64,
+    ) -> Option<RollRequestContext> {
         self.remove(group_id, log_index)
     }
 
-    /// Drop pending seal contexts for `group_id` whose log indices were
+    /// Drop pending roll contexts for `group_id` whose log indices were
     /// truncated by a new leader. Prevents unbounded growth of `by_key` /
     /// `by_index` when proposals are rejected by truncation.
     fn drop_from(&mut self, group_id: ShardGroupId, from_index: u64) {
         if let Some(group_map) = self.by_group.get_mut(&group_id) {
             let stale = group_map.split_off(&from_index);
-            for seal in stale.into_values() {
-                self.by_key.remove(&seal.segment_key);
+            for roll in stale.into_values() {
+                self.by_key.remove(&roll.segment_key);
             }
 
             if group_map.is_empty() {
@@ -101,14 +108,14 @@ impl PendingSealTracker {
         }
     }
 
-    /// Drop every pending seal context for `group_id`. Called when a leader
+    /// Drop every pending roll context for `group_id`. Called when a leader
     /// steps down — any not-yet-committed proposals will either be truncated
     /// by the new leader or commit there, but this replica will no longer be
     /// the one to dispatch `SegmentRollCommitted`.
     fn drop_group(&mut self, group_id: ShardGroupId) {
         if let Some(stale_group) = self.by_group.remove(&group_id) {
-            for seal in stale_group.into_values() {
-                self.by_key.remove(&seal.segment_key);
+            for roll in stale_group.into_values() {
+                self.by_key.remove(&roll.segment_key);
             }
         }
     }
@@ -131,8 +138,8 @@ impl MultiRaft {
             pending_events: Vec::new(),
             deferred: Vec::new(),
             pending_proposes: BTreeMap::new(),
-            pending_seals: PendingSealTracker::default(),
-            seal_recovery: SealEndRecovery::default(),
+            pending_rolls: PendingRollTracker::default(),
+            boundary_recovery: SegmentBoundaryRecovery::default(),
             topology,
         }
     }
@@ -215,9 +222,9 @@ impl MultiRaft {
 
         let leaderless = raft.take_leaderless_segments();
 
-        self.seal_recovery
+        self.boundary_recovery
             .drop_stale_in_group(shard_group_id, &leaderless);
-        self.drive_seal_end_recovery(shard_group_id, leaderless);
+        self.drive_boundary_recovery(shard_group_id, leaderless);
     }
 
     pub(crate) fn process(&mut self, cmd: MultiRaftActorCommand) {
@@ -272,7 +279,7 @@ impl MultiRaft {
                 self.handle_segment_placed(ack);
             }
             MultiRaftActorCommand::DurableSegmentEndReported(report) => {
-                self.handle_seal_boundary_report(report);
+                self.handle_durable_end_report(report);
             }
             MultiRaftActorCommand::SegmentCaughtUp(ack) => {
                 self.handle_catch_up_ack(ack);
@@ -504,24 +511,23 @@ impl MultiRaft {
 
         // Across every group we just reconciled, drop gathers whose segment is no
         // longer leaderless — a group left with none drops all of its gathers.
-        self.seal_recovery.drop_stale_reconciled(&reconciled);
+        self.boundary_recovery.drop_stale_reconciled(&reconciled);
         for (shard_group_id, leaderless) in reconciled {
             if !leaderless.is_empty() {
-                self.drive_seal_end_recovery(shard_group_id, leaderless);
+                self.drive_boundary_recovery(shard_group_id, leaderless);
             }
         }
     }
 
     fn propose_segment_roll(&mut self, req: ProposeSegmentRoll) {
-        let seal = &req.request;
-        if self.pending_seals.contains(&seal.segment_key) {
+        if self.pending_rolls.contains(&req.segment_key) {
             return;
         }
 
-        let Some(group_id) = self.find_group_for_topic(&seal.segment_key.topic_id) else {
+        let Some(group_id) = self.find_group_for_topic(&req.segment_key.topic_id) else {
             tracing::warn!(
                 "segment roll requested for unknown topic {:?}",
-                seal.segment_key.topic_id
+                req.segment_key.topic_id
             );
             return;
         };
@@ -529,10 +535,10 @@ impl MultiRaft {
             return;
         };
 
-        let Some(old_replica_set) = raft.get_replica_set(&seal.segment_key) else {
+        let Some(old_replica_set) = raft.get_replica_set(&req.segment_key) else {
             tracing::warn!(
                 "segment roll requested for unknown segment {:?}",
-                seal.segment_key
+                req.segment_key
             );
             return;
         };
@@ -540,23 +546,24 @@ impl MultiRaft {
         let live_nodes = self.topology.live_nodes();
 
         let new_replica_set =
-            compute_replacement_replica_set(&old_replica_set, &seal.failed_nodes, &live_nodes);
+            compute_replacement_replica_set(&old_replica_set, &req.failed_nodes, &live_nodes);
 
         let cmd = RollSegment {
-            segment_key: seal.segment_key,
+            segment_key: req.segment_key,
             sealed_at: now_ms(),
             new_replica_set,
-            end_entry_id: Some(seal.end_entry_id),
+            end_entry_id: Some(req.end_entry_id),
+            intent: req.intent,
         };
 
         match raft.propose(cmd.into()) {
             Ok(log_index) => {
-                self.pending_seals.insert(
+                self.pending_rolls.insert(
                     group_id,
                     log_index,
-                    SealContext {
-                        requester: seal.from.clone(),
-                        segment_key: seal.segment_key,
+                    RollRequestContext {
+                        requester: req.from.clone(),
+                        segment_key: req.segment_key,
                     },
                 );
                 self.dirty.insert(group_id);
@@ -567,27 +574,27 @@ impl MultiRaft {
         }
     }
 
-    /// Drive the seal-end recovery subsystem for `group`'s leaderless `segments`
+    /// Drive boundary recovery for `group`'s leaderless `segments`
     /// (callers prune stale gathers first), executing the steps it returns.
-    fn drive_seal_end_recovery(&mut self, group: ShardGroupId, segments: LeaderlessSegments) {
-        for step in self.seal_recovery.advance(group, segments) {
-            self.execute_seal_step(step);
+    fn drive_boundary_recovery(&mut self, group: ShardGroupId, segments: LeaderlessSegments) {
+        for step in self.boundary_recovery.advance(group, segments) {
+            self.execute_boundary_recovery_action(step);
         }
     }
 
     /// Feed a survivor's durable extent into the subsystem; if it completes a
-    /// gather, execute the resulting seal.
-    fn handle_seal_boundary_report(&mut self, report: DurableSegmentEndReported) {
+    /// round, execute the resulting action.
+    fn handle_durable_end_report(&mut self, report: DurableSegmentEndReported) {
         match self
-            .seal_recovery
+            .boundary_recovery
             .record(report.segment_key, report.from, report.durable_end)
         {
-            Ok(Some(step)) => self.execute_seal_step(step),
+            Ok(Some(step)) => self.execute_boundary_recovery_action(step),
             Ok(None) => {}
             Err(error) => tracing::warn!(
                 segment = ?report.segment_key,
                 ?error,
-                "rejected seal-boundary report",
+                "rejected durable-end report",
             ),
         }
     }
@@ -601,13 +608,13 @@ impl MultiRaft {
         raft.handle_catch_up_ack(ack);
     }
 
-    fn execute_seal_step(&mut self, step: SealEndStep) {
+    fn execute_boundary_recovery_action(&mut self, step: BoundaryRecoveryAction) {
         match step {
-            SealEndStep::Query {
+            BoundaryRecoveryAction::QueryDurableEnds {
                 segment_key,
                 targets,
-            } => self.emit_seal_boundary_queries(segment_key, targets),
-            SealEndStep::Seal {
+            } => self.emit_durable_end_queries(segment_key, targets),
+            BoundaryRecoveryAction::ProposeRoll {
                 shard_group_id,
                 segment_key,
                 end,
@@ -655,6 +662,7 @@ impl MultiRaft {
             sealed_at: now_ms(),
             new_replica_set,
             end_entry_id: end,
+            intent: SegmentRollIntent::Recovery,
         };
         match raft.propose(cmd.into()) {
             Ok(_) => {
@@ -664,7 +672,7 @@ impl MultiRaft {
         }
     }
 
-    fn emit_seal_boundary_queries(&mut self, segment_key: SegmentKey, targets: Vec<NodeId>) {
+    fn emit_durable_end_queries(&mut self, segment_key: SegmentKey, targets: Vec<NodeId>) {
         if targets.is_empty() {
             return;
         }
@@ -676,7 +684,7 @@ impl MultiRaft {
             },
         );
         self.pending_events
-            .push(RaftEvent::SealBoundaryQueries(vec![cmd]));
+            .push(RaftEvent::DurableEndQueries(vec![cmd]));
     }
 
     fn find_group_for_topic(&self, topic_id: &TopicId) -> Option<ShardGroupId> {
@@ -793,13 +801,13 @@ impl MultiRaft {
                 if let LogMutation::TruncateFrom(from_index) = &log {
                     // Rare and destructive: a new leader is overwriting this
                     // replica's conflicting log suffix. Worth a trace — both
-                    // the data loss and the dropped seal contexts.
+                    // the data loss and the dropped roll contexts.
                     tracing::debug!(
                         group = id.0,
                         from = *from_index,
                         "log truncation: dropping conflicting suffix and its pending seals",
                     );
-                    self.pending_seals.drop_from(*id, *from_index);
+                    self.pending_rolls.drop_from(*id, *from_index);
                 }
                 mutations.push((*id, log));
             }
@@ -808,10 +816,10 @@ impl MultiRaft {
             // that would otherwise prune is leader-gated and stops firing). A new
             // leader re-derives: re-proposes the seal / re-polls the survivors.
             if !raft.is_leader() {
-                // pending_seals: its committed roll notification won't come from here.
-                self.pending_seals.drop_group(*id);
-                // seal-end gathers: we can't propose their recovery roll.
-                self.seal_recovery.drop_group(*id);
+                // pending_rolls: its committed roll notification won't come from here.
+                self.pending_rolls.drop_group(*id);
+                // boundary-recovery rounds: we can't propose their recovery roll.
+                self.boundary_recovery.drop_group(*id);
             }
             self.route_group_events(*id);
         }
@@ -820,7 +828,7 @@ impl MultiRaft {
 
     /// Drain a group's buffered events into `pending_events`. `MetadataCommitted`
     /// is dropped on non-leaders (only the current leader dispatches to the data
-    /// plane — see invariant 3); seal context is attached for the leader. Called
+    /// plane — see invariant 3); roll context is attached for the leader. Called
     /// both after step-driven apply (`collect_mutations`) and after the durability
     /// gate advances apply (`persist_and_advance`).
     fn route_group_events(&mut self, id: ShardGroupId) {
@@ -835,9 +843,12 @@ impl MultiRaft {
             }
 
             if let RaftEvent::MetadataCommitted(committed) = &mut event {
-                // For the leader to send the committed roll back to the requester.
-                committed.seal_context =
-                    self.pending_seals.pop_seal_context(id, committed.log_index);
+                // Only the roll event answers the requester. Other metadata events
+                // from the same log entry must not consume its pending context.
+                if matches!(committed.event, MetadataEvent::SegmentRolled(_)) {
+                    committed.roll_context =
+                        self.pending_rolls.pop_roll_context(id, committed.log_index);
+                }
             }
             self.pending_events.push(event);
         }
@@ -934,8 +945,8 @@ mod tests {
     use super::*;
 
     use crate::control_plane::Replicas;
+    use crate::control_plane::consensus::boundary_recovery;
     use crate::control_plane::consensus::raft::storage::RaftPersistentState;
-    use crate::control_plane::consensus::seal_recovery;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
     use std::collections::BTreeSet;
@@ -1836,7 +1847,7 @@ mod tests {
         );
     }
 
-    // --- Leader-crash seal-end recovery -----------------------------------
+    // --- Leader-crash boundary recovery -----------------------------------
 
     fn create_topic_via_store(store: &mut MultiRaft, name: &str, replica_set: Vec<NodeId>) {
         use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
@@ -1861,11 +1872,11 @@ mod tests {
     }
 
     /// Targets a `RequestDurableSegmentEnd` for `seg` was fanned out to (sorted).
-    fn seal_boundary_query_targets(events: &[RaftEvent], seg: SegmentKey) -> Vec<NodeId> {
+    fn durable_end_query_targets(events: &[RaftEvent], seg: SegmentKey) -> Vec<NodeId> {
         use crate::data_plane::messages::command::DataPlanePeerMessage;
         let mut out = Vec::new();
         for e in events {
-            let RaftEvent::SealBoundaryQueries(cmds) = e else {
+            let RaftEvent::DurableEndQueries(cmds) = e else {
                 continue;
             };
             for cmd in cmds {
@@ -1894,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_end_gather_seals_at_min_with_recency_leader() {
+    fn boundary_recovery_proposes_roll_at_min_with_recency_leader() {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
         // Coordinator n1 leads the shard group; the segment's data replicas are
@@ -1911,13 +1922,13 @@ mod tests {
         let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
 
         // x (the leader) crashed: the death drives reconcile, which finds the
-        // leaderless segment and starts a seal-end gather querying both
+        // leaderless segment and starts a boundary-recovery round querying both
         // survivors.
         store.handle_node_death(node("x"));
-        assert!(store.seal_recovery.contains(&seg0));
+        assert!(store.boundary_recovery.contains(&seg0));
         let events = store.flush();
         assert_eq!(
-            seal_boundary_query_targets(&events, seg0),
+            durable_end_query_targets(&events, seg0),
             vec![node("y"), node("z")],
             "query fans out to both survivors"
         );
@@ -1925,12 +1936,12 @@ mod tests {
         let before = proposals_after_become_leader(&store).len();
 
         // Survivors report durable extents; the second completes the gather.
-        store.handle_seal_boundary_report(DurableSegmentEndReported {
+        store.handle_durable_end_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("y"),
             durable_end: Some(EntryId(50)),
         });
-        store.handle_seal_boundary_report(DurableSegmentEndReported {
+        store.handle_durable_end_report(DurableSegmentEndReported {
             segment_key: seg0,
             from: node("z"),
             durable_end: Some(EntryId(40)),
@@ -1953,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_end_gather_expires_to_unknown_end() {
+    fn boundary_recovery_expires_to_unknown_end() {
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
         let (storage, _tmp) = temp_storage();
@@ -1970,7 +1981,7 @@ mod tests {
 
         // No reports ever arrive: each death-driven reconcile re-drives the
         // gather; after the attempt budget it falls back to an unknown-end roll.
-        for _ in 0..(seal_recovery::GATHER_ATTEMPTS + 2) {
+        for _ in 0..(boundary_recovery::GATHER_ATTEMPTS + 2) {
             store.handle_node_death(node("x"));
         }
         store.flush();
@@ -1985,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn seal_end_gather_dropped_on_step_down() {
+    fn boundary_recovery_dropped_on_step_down() {
         use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
@@ -2001,8 +2012,8 @@ mod tests {
         let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
         store.handle_node_death(node("x"));
         assert!(
-            store.seal_recovery.contains(&seg0),
-            "the leader started a seal-end gather"
+            store.boundary_recovery.contains(&seg0),
+            "the leader started a boundary-recovery round"
         );
 
         // A higher-term AppendEntries deposes n1. The drain-time `!is_leader`
@@ -2023,8 +2034,8 @@ mod tests {
         store.flush();
 
         assert!(
-            store.seal_recovery.is_empty(),
-            "a deposed leader drops its seal-end gathers"
+            store.boundary_recovery.is_empty(),
+            "a deposed leader drops its boundary-recovery rounds"
         );
     }
 }
