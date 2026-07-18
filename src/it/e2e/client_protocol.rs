@@ -669,16 +669,29 @@ fn idle_split_children_automatically_merge() -> turmoil::Result {
                 .iter()
                 .filter(|range| range.state == RangeState::Active)
                 .count();
-            let merged_range_is_active = detail
+            let merged_range = detail
                 .ranges
                 .iter()
-                .any(|range| range.state == RangeState::Active && range.merged_from.is_some());
-            if active_count == 1 && merged_range_is_active {
+                .find(|range| range.state == RangeState::Active && range.merged_from.is_some());
+            let source_boundaries_are_known = merged_range
+                .and_then(|range| range.merged_from)
+                .is_some_and(|(left, right)| {
+                    [left, right].into_iter().all(|source_id| {
+                        detail
+                            .ranges
+                            .iter()
+                            .find(|range| range.range_id == source_id)
+                            .and_then(|range| range.sealed_segments.last())
+                            // having end_entry_id means previous segments got sealed and boundary recovery was made successfully.
+                            .is_some_and(|segment| segment.end_entry_id.is_some())
+                    })
+                });
+            if active_count == 1 && source_boundaries_are_known {
                 return Ok(());
             }
         }
 
-        panic!("idle split children never merged through Raft");
+        panic!("idle children did not merge with known source-segment boundaries");
     });
 
     sim.run()
