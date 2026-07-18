@@ -1,12 +1,13 @@
 use super::constants::*;
 use borsh::{BorshDeserialize, BorshSerialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::control_plane::{
     Replicas,
     metadata::{
         EntryId, RangeId, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
-        command::RollSegment, error::MetadataError,
+        command::{RollSegment, SegmentRollIntent},
+        error::MetadataError,
     },
 };
 
@@ -30,7 +31,7 @@ pub struct RangeMeta {
     pub split_into: Option<[RangeId; 2]>,
     pub merged_into: Option<RangeId>,
     pub merged_from: Option<[RangeId; 2]>,
-    pub seal_history: RangeSealHistory,
+    pub load_state: RangeLoadState,
 }
 
 impl RangeMeta {
@@ -56,7 +57,7 @@ impl RangeMeta {
             split_into: None,
             merged_into: None,
             merged_from: None,
-            seal_history: RangeSealHistory::default(),
+            load_state: RangeLoadState::Unclassified,
         }
     }
 
@@ -79,8 +80,7 @@ impl RangeMeta {
             cmd.split_point.clone(),
             cmd.left_replica_set,
             cmd.created_at,
-        )
-        .with_split_origin(cmd.created_at);
+        );
 
         let right = RangeMeta::new(
             right_id,
@@ -88,19 +88,11 @@ impl RangeMeta {
             self.keyspace_end.clone(),
             cmd.right_replica_set,
             cmd.created_at,
-        )
-        .with_split_origin(cmd.created_at);
+        );
 
         Ok((left, right))
     }
 
-    fn with_split_origin(mut self, created_at: u64) -> Self {
-        self.seal_history = RangeSealHistory {
-            seal_timestamps: VecDeque::new(),
-            created_by_split_at: Some(created_at),
-        };
-        self
-    }
     pub(crate) fn validate_active(&self) -> Result<SegmentId, MetadataError> {
         if self.state != RangeState::Active {
             return Err(MetadataError::RangeNotActive);
@@ -108,8 +100,8 @@ impl RangeMeta {
         self.active_segment.ok_or(MetadataError::RangeNotActive)
     }
 
-    pub(crate) fn should_split(&self, sealed_at: u64) -> bool {
-        self.seal_history.should_split(sealed_at)
+    pub(crate) fn should_split(&self) -> bool {
+        self.load_state.should_split()
     }
 
     pub(crate) fn correct_end_offset(
@@ -178,7 +170,7 @@ impl RangeMeta {
 
         self.segments.insert(new_segment_id, new_segment);
         self.active_segment = Some(new_segment_id);
-        self.seal_history.record_seal(cmd.sealed_at);
+        self.load_state.apply(&cmd.intent);
         self.next_segment_id += 1;
         self.next_offset = start_offset;
 
@@ -352,54 +344,47 @@ impl RangeMeta {
         result
     }
 
-    pub(crate) fn mergeable_with(&self, r2: &RangeMeta, now: u64) -> bool {
-        let r1_recent = self.seal_history.recent_seal_count(now);
-        let r2_recent = r2.seal_history.recent_seal_count(now);
-
-        r1_recent == MERGE_SEAL_THRESHOLD && r2_recent == MERGE_SEAL_THRESHOLD
+    pub(crate) fn mergeable_with(&self, r2: &RangeMeta) -> bool {
+        self.load_state == RangeLoadState::Idle && r2.load_state == RangeLoadState::Idle
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct RangeSealHistory {
-    pub seal_timestamps: VecDeque<u64>,
-    pub created_by_split_at: Option<u64>,
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum RangeLoadState {
+    Unclassified,
+    Idle,
+    Pressure { consecutive_rolls: u8 },
 }
 
-impl RangeSealHistory {
-    pub fn record_seal(&mut self, sealed_at: u64) {
-        // Proposal timestamps are captured before Raft serialization, so a
-        // delayed proposal can commit after one with a newer wall-clock value.
-        // Preserve the event times while keeping the committed history ordered.
-        let position = self
-            .seal_timestamps
-            .partition_point(|timestamp| *timestamp <= sealed_at);
-        self.seal_timestamps.insert(position, sealed_at);
-
-        let newest = self.seal_timestamps.back().copied().unwrap_or(sealed_at);
-        let cutoff = newest.saturating_sub(MEASUREMENT_WINDOW_MS);
-        while self.seal_timestamps.front().is_some_and(|&t| t <= cutoff) {
-            self.seal_timestamps.pop_front();
+impl RangeLoadState {
+    pub fn apply(&mut self, intent: &SegmentRollIntent) {
+        match intent {
+            SegmentRollIntent::DataPressure => {
+                let consecutive_rolls = match self {
+                    Self::Pressure { consecutive_rolls } => *consecutive_rolls + 1,
+                    Self::Unclassified | Self::Idle => 1,
+                };
+                *self = Self::Pressure {
+                    consecutive_rolls: consecutive_rolls.min(SPLIT_SEAL_THRESHOLD),
+                };
+            }
+            SegmentRollIntent::IdleMaintenance => *self = Self::Idle,
+            SegmentRollIntent::ReplicationFailure | SegmentRollIntent::Recovery => {}
+            SegmentRollIntent::BoundaryCorrection => {
+                debug_assert!(
+                    false,
+                    "boundary correction applied as an active segment roll"
+                );
+            }
         }
     }
 
-    pub fn seal_count(&self) -> usize {
-        self.seal_timestamps.len()
-    }
-
-    pub fn should_split(&self, now: u64) -> bool {
-        if self.seal_count() < SPLIT_SEAL_THRESHOLD {
-            return false;
-        }
-        match self.created_by_split_at {
-            Some(split_at) => now.saturating_sub(split_at) >= SPLIT_COOLDOWN_MS,
-            None => true,
-        }
-    }
-
-    pub fn recent_seal_count(&self, now: u64) -> usize {
-        let cutoff = now.saturating_sub(MEASUREMENT_WINDOW_MS);
-        self.seal_timestamps.iter().filter(|&&t| t > cutoff).count()
+    pub fn should_split(&self) -> bool {
+        matches!(
+            self,
+            Self::Pressure{ consecutive_rolls }
+                if *consecutive_rolls >= SPLIT_SEAL_THRESHOLD
+        )
     }
 }
 
@@ -424,7 +409,7 @@ pub mod props {
                 self.split_into.is_none() || self.merged_into.is_none(),
                 "range both split and merged"
             );
-            self.assert_seal_history();
+            self.assert_load_state();
             self.assert_offset_chain();
             self.assert_retention_prefix();
         }
@@ -495,10 +480,12 @@ pub mod props {
                 }
             }
         }
-        fn assert_seal_history(&self) {
-            let ts = &self.seal_history.seal_timestamps;
-            for i in 1..ts.len() {
-                assert!(ts[i - 1] <= ts[i], "seal_history timestamps not sorted");
+        fn assert_load_state(&self) {
+            if let RangeLoadState::Pressure { consecutive_rolls } = &self.load_state {
+                assert!(
+                    *consecutive_rolls > 0 && *consecutive_rolls <= SPLIT_SEAL_THRESHOLD,
+                    "pressure streak outside its valid range",
+                );
             }
         }
 
