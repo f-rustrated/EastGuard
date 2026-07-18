@@ -124,9 +124,9 @@ Segment Leader (node D)           Coordinator (node A)           Raft [A, B, C]
 
 The flow moves three pieces of information, each scoped to where it is needed:
 
-- **Seal request** (segment leader → coordinator): the requester's identity, which segment to seal, which nodes failed (empty for size/age seals), and the last committed entry id. The requester identity is carried **explicitly** in the request — it is not inferred from the transport connection. Node-death-triggered rolls do not use a seal request at all and therefore have no requester.
+- **Seal request** (segment leader → coordinator): the requester's identity, which segment to seal, which nodes failed (empty for size/age seals), the last committed entry id, and the roll intent. The intent distinguishes size pressure, idle maintenance, replication failure, and post-range-seal boundary correction. The requester identity is carried **explicitly** in the request — it is not inferred from the transport connection. Node-death-triggered recovery rolls do not use a seal request at all and therefore have no requester.
 
-- **Roll command** (proposed through Raft): which segment, the seal timestamp, the new replica set, and an *optional* end entry id. The end entry id is present for segment-leader-initiated seals (it came from the seal request) and absent for node-death seals, where the coordinator does not know the actual committed offset.
+- **Roll command** (proposed through Raft): which segment, the seal timestamp, the new replica set, an *optional* end entry id, and the intent. The end entry id is present for segment-leader-initiated seals (it came from the seal request) and absent when recovery does not yet know the committed boundary. Only a successful roll of the active segment applies a load signal; boundary correction fills an already-sealed segment's end without creating a successor.
 
 - **Pending context** (held by the coordinator between propose and commit): the requester and the old segment identity, keyed by the proposal's log position. The coordinator also keeps a dedup set of in-flight seal keys so duplicate seal requests for the same segment are skipped.
 
@@ -162,10 +162,10 @@ On an inbound seal request from the data port, the data plane converts it to a c
 ### Coordinator: Seal-Request Handling
 
 ```
-on a seal request (requester, segment, failed nodes, end entry id):
+on a seal request (requester, segment, failed nodes, end entry id, intent):
     if this segment already has an in-flight seal → skip (dedup)
     compute new replica set = current replica set − failed nodes + healthy nodes
-    build the roll (segment, seal timestamp, new replica set, end entry id)
+    build the roll (segment, seal timestamp, new replica set, end entry id, intent)
     propose through Raft:
         accepted → record the in-flight seal key + pending context
         rejected (not leader) → no reply; the requester retries on timeout
@@ -175,7 +175,7 @@ on a seal request (requester, segment, failed nodes, end entry id):
 
 **Dispatch:** on a replication timeout, after a flush size check, and on the periodic age ticker, the data plane resolves the coordinator from the local topology view and sends a seal request to it over the data port.
 
-**Timeout (~5s):** when a seal request is sent, the data plane records it. If no seal response arrives before the timeout, it refreshes the coordinator from the topology and retries. For size- and age-triggered seals this is the only recovery path — the replication timeout won't fire, since replication is healthy.
+**Timeout (~5s):** when a seal request is sent, the data plane records its failed nodes and intent. If no seal response arrives before the timeout, it refreshes the coordinator from the topology and retries the same logical request with the same intent. For size- and age-triggered seals this is the only recovery path — the replication timeout won't fire, since replication is healthy.
 
 ### Applying a Roll
 

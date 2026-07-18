@@ -4,7 +4,7 @@
 
 **Depends on:** segment lifecycle coordination, Raft-backed metadata commands, automatic range split/merge, and segment retention.
 
-**Status:** Proposed by GitHub issue #192. The current implementation still classifies load from a wall-clock seal history; this document describes its replacement.
+**Status:** Implemented for GitHub issue #192.
 
 ---
 
@@ -154,7 +154,7 @@ Existing apply-time checks continue to protect against stale proposals. If the r
 
 ## Automated merge
 
-The existing leader-side merge timer remains, but its role becomes smaller: it prompts a scan of committed metadata. It does not calculate idleness and its wall-clock value does not affect eligibility.
+Applying an idle signal immediately checks the newly committed metadata and queues a merge when both adjacent ranges are idle. The existing leader-side merge timer remains as a recovery scan, but it does not calculate idleness and its wall-clock value does not affect eligibility.
 
 Two adjacent active ranges are merge-eligible only when both are explicitly idle:
 
@@ -269,6 +269,6 @@ Coverage must demonstrate:
 - segment retention remains based on physical seal time;
 - repeated deterministic turmoil scenarios cover size, age, failure, recovery, retry, split, merge, and boundary-correction paths.
 
-The persisted metadata and Raft command formats are serialized. Before implementation, compatibility expectations for existing stores must be decided: migrate old state to unclassified, or explicitly require a fresh store. Historical timestamps cannot reliably be converted into causes.
+This change is intentionally format-breaking for persisted metadata and Raft commands. Existing stores must be recreated; there is no timestamp-to-cause migration because historical timestamps cannot reliably distinguish pressure, maintenance, failure, or recovery.
 
 For the broader architecture, see [Metadata Management — Mental Model](mental-model.md). For the phase history, see [Metadata Management Roadmap](metadata_management_roadmap.md). Operational contracts live in `.agents/rules/metadata-state-machine.md`, `.agents/rules/raft-actor.md`, and `.agents/rules/ds-rsm.md`.
