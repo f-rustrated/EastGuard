@@ -1,6 +1,6 @@
 # Topology (Invariants)
 
-`Topology` — consistent hash ring mapping resource keys to shard groups, plus a tracker of current Raft leaders per shard group. Maintained locally on every node, updated via SWIM membership events. Pure synchronous data structure. For the conceptual picture, see `docs/metadata-management/mental-model.md` § "Topology — the hash ring".
+`Topology` — consistent hash ring mapping resource keys to shard groups, plus a tracker of current Raft leaders per shard group. Maintained locally on every node, updated via SWIM membership events. Pure synchronous data structure. For the conceptual picture, see `docs/metadata-management/d3_routing_proposals_and_completion.md`.
 
 ## Structure
 

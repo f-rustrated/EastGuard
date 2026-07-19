@@ -11,7 +11,7 @@ EastGuard not use monolithic metadata store or single controller quorum. Metadat
 - Single node participates in **many** Raft groups simultaneously (some leader, others follower).
 - Each `Raft` instance has own term, voted_for, log, commit_index — fully independent.
 - `MultiRaftActor` multiplexes all groups through `HashMap<ShardGroupId, Raft>`.
-- Log storage backed by shared RocksDB instance, keyed by `(shard_group_id, key_type, index)`. See `docs/metadata-management/mental-model.md` § "Storage layout" for the full key scheme.
+- Log storage backed by shared RocksDB instance, keyed by `(shard_group_id, key_type, index)`. See `docs/metadata-management/d2_replicated_apply_and_durability.md` § "Shared storage, isolated key ranges" for the design rationale.
 
 ## Architecture
 

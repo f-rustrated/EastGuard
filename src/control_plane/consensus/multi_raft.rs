@@ -492,7 +492,7 @@ impl MultiRaft {
     // Membership changes flow through the Raft log: only the leader proposes
     // `RemovePeer`, and followers apply on commit. Direct mutation would let
     // replicas disagree on quorum size during gossip convergence. See
-    // `docs/metadata-management/metadata_management_roadmap.md` Phase 3d.
+    // `docs/metadata-management/d4_membership_and_shard_reconciliation.md`.
     //
     // The live set is loaded fresh from the topology snapshot — drift between
     // event emission and processing is absorbed naturally, and there's one
