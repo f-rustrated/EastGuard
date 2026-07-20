@@ -132,6 +132,10 @@ impl ConsumerOffsetManager {
         self.offset_ledger.offset(key)
     }
 
+    pub(crate) fn durable_generation(&self, key: &ConsumerOffsetKey) -> GenerationId {
+        self.offset_ledger.generation(key)
+    }
+
     pub(crate) fn commit_consumer_offset(
         &mut self,
         cmd: CommitConsumerOffset,
