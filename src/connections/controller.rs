@@ -372,16 +372,23 @@ impl ClientController {
 
     async fn handle_fetch_consumer_offset(
         &self,
-        FetchConsumerOffsetRequest(key): FetchConsumerOffsetRequest,
+        req: FetchConsumerOffsetRequest,
     ) -> anyhow::Result<ClientResponse> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.data_plane_tx
-            .send_async(ReadConsumerOffset { key, reply })
+            .send_async(ReadConsumerOffset {
+                key: req.key,
+                generation: req.generation,
+                reply,
+            })
             .await?;
 
         Ok(match response.await? {
             ReadConsumerOffsetResult::Offset(offset) => {
                 DataPlaneResponse::ConsumerOffset(offset).into()
+            }
+            ReadConsumerOffsetResult::GenerationMismatch(mismatch) => {
+                DataPlaneResponse::ConsumerOffsetGenerationMismatch(mismatch).into()
             }
             ReadConsumerOffsetResult::NotLeader(leader) => DataPlaneResponse::NotWriteLeader {
                 leader_addr: self.resolve_id_to_addr(leader).await,
