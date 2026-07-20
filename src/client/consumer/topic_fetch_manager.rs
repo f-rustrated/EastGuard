@@ -274,19 +274,20 @@ impl TopicFetchManagerState {
             return;
         };
 
+        let metadata = ctx.metadata.load();
+        let checkpoint_ranges = metadata.checkpoint_lookup_ranges(&to_start);
+
         // An unavailable offsets topic is not evidence that this group has no committed offsets.
         // Leave the actor for this range unstarted so the next rebalance tick retries recovery.
         let Ok(Ok(saved_offsets)) = tokio::time::timeout(
             Duration::from_secs(2),
-            group.fetch_saved_offsets(ctx.all_ranges()),
+            group.fetch_saved_offsets(checkpoint_ranges),
         )
         .await
         else {
             tracing::warn!("failed to recover/time-out fetch_all_saved_offsets");
             return;
         };
-
-        let metadata = ctx.metadata.load();
 
         for range in to_start {
             let (resolved_entry_id, skip_below_offset, next_absolute_offset) = if let Some(pos) =
@@ -710,5 +711,60 @@ mod tests {
         };
         assert!(topic.lineage_depth(RangeId(0)) < topic.lineage_depth(RangeId(1)));
         assert!(topic.lineage_depth(RangeId(0)) < topic.lineage_depth(RangeId(2)));
+    }
+
+    #[test]
+    fn checkpoint_lookup_is_limited_to_starting_ranges_and_their_ancestors() {
+        let mut ranges = split_ranges().into_vec();
+        ranges.push(RangeDetail {
+            range_id: RangeId(3),
+            keyspace_start: Vec::new(),
+            keyspace_end: vec![64],
+            state: RangeState::Sealed,
+            active_segment: None,
+            sealed_segments: Box::new([]),
+            split_into: Some((RangeId(0), RangeId(4))),
+            merged_into: None,
+            merged_from: None,
+        });
+        ranges.push(RangeDetail {
+            range_id: RangeId(4),
+            keyspace_start: vec![64],
+            keyspace_end: vec![128],
+            state: RangeState::Active,
+            active_segment: None,
+            sealed_segments: Box::new([]),
+            split_into: None,
+            merged_into: None,
+            merged_from: None,
+        });
+        ranges.push(RangeDetail {
+            range_id: RangeId(99),
+            keyspace_start: vec![200],
+            keyspace_end: vec![255],
+            state: RangeState::Active,
+            active_segment: None,
+            sealed_segments: Box::new([]),
+            split_into: None,
+            merged_into: None,
+            merged_from: None,
+        });
+        let topic = TopicDetail {
+            topic_id: TopicId(0),
+            name: "test".to_string(),
+            state: TopicState::Active,
+            ranges: ranges.into_boxed_slice(),
+        };
+
+        let required = topic
+            .checkpoint_lookup_ranges(&[RangeId(1)])
+            .into_vec()
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            required,
+            HashSet::from([RangeId(1), RangeId(0), RangeId(3)])
+        );
     }
 }

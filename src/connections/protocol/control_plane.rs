@@ -192,6 +192,30 @@ impl TopicDetail {
             .max()
             .unwrap_or_default()
     }
+
+    /// Ranges whose durable checkpoints are needed to start `ranges` safely:
+    /// each requested range plus its complete predecessor lineage.
+    pub(crate) fn checkpoint_lookup_ranges(&self, ranges: &[RangeId]) -> Box<[RangeId]> {
+        let mut required = ranges.iter().copied().collect::<HashSet<_>>();
+        for range_id in ranges {
+            self.collect_checkpoint_ancestors(*range_id, &mut required);
+        }
+        required.into_iter().collect()
+    }
+
+    fn collect_checkpoint_ancestors(&self, range_id: RangeId, required: &mut HashSet<RangeId>) {
+        for parent in self.ranges.iter().filter(|candidate| {
+            // Either split or merge
+            candidate
+                .split_into
+                .is_some_and(|children| children.0 == range_id || children.1 == range_id)
+                || candidate.merged_into == Some(range_id)
+        }) {
+            if required.insert(parent.range_id) {
+                self.collect_checkpoint_ancestors(parent.range_id, required);
+            }
+        }
+    }
 }
 
 pub struct RebalancePlan {

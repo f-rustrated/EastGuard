@@ -243,7 +243,7 @@ impl ConsumerGroup {
 
     pub(crate) async fn fetch_saved_offsets(
         &self,
-        ranges: Vec<RangeId>,
+        ranges: Box<[RangeId]>,
     ) -> Result<std::collections::HashMap<RangeId, ConsumerOffsetPosition>, ClientError> {
         let consumer_offset_keys = ranges
             .into_iter()
