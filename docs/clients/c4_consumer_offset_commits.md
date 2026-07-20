@@ -189,7 +189,13 @@ revoked ranges have already been discarded and are not included in the retry.
 The client sends one commit to the range's data leader. Server-side replication, generation
 validation, shared-WAL durability, and leader redirects are described in D8.
 
-When an actor starts, it first reads the group's durable position for its range:
+When actors start after a rebalance, they read the group's durable positions at the assignment
+generation. Each range leader answers only after that generation's ownership seal is durable,
+and the client serializes the multi-range lookup with its own commits. The independently routed
+reads therefore share one logical transition boundary rather than observing a mixture of old-
+and new-generation progress.
+
+For each range:
 
 - If present, fetch begins at the containing entry and filters batch records through the
   committed record offset.

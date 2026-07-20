@@ -207,10 +207,19 @@ A normal rebalance is incremental:
 2. Refresh metadata only if the cache cannot describe an assigned range.
 3. Expand active assignment into effective lineage ownership.
 4. Stop revoked range actors.
-5. Load durable offsets and start newly owned or previously unprovisioned ranges.
+5. Load durable offsets at the assignment generation and start newly owned or previously
+   unprovisioned ranges.
 
 Unchanged actors continue running. Rebuilding every actor on each heartbeat would cause
 avoidable duplicate delivery and control-plane traffic.
+
+The assignment generation is also the distributed offset-read boundary. Range leaders answer
+only after that generation's epoch seal is durable locally. Although different ranges may be
+served by different leaders, every answer therefore includes all commits before the ownership
+transition and excludes commits by the new owner. The recovering member serializes its own
+commits with this lookup, so it cannot advance one requested range while the remaining range
+leaders are still answering. This gives the range set one logical snapshot without a
+cross-range transaction.
 
 A stale commit is a stronger signal. The client fences delivery, stops all range actors,
 rebuilds effective ownership from the latest generation, retries only positions still owned,
@@ -225,6 +234,7 @@ acknowledgements while the asynchronous actor stops are in flight.
 |---|---|
 | Client routes to follower | Redirect to current data leader |
 | Assignment arrives before epoch seal | Commit parks until the seal arrives |
+| Offset read arrives before epoch seal is durable | Read is rejected; rebalance retries |
 | Old owner commits after reassignment | Rejected by generation fence |
 | Leader WAL fsync fails | Commit fails; no replication acknowledgement |
 | Follower WAL fsync fails or connection disappears | Leader does not acknowledge the commit |
