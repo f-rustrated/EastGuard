@@ -150,15 +150,6 @@ impl ConsumerContext {
 
         RangeLookupResult::NeedRefresh
     }
-
-    pub(crate) fn all_ranges(&self) -> Vec<RangeId> {
-        self.metadata
-            .load()
-            .ranges
-            .iter()
-            .map(|r| r.range_id)
-            .collect::<Vec<_>>()
-    }
 }
 
 pub(crate) fn compute_progress_signal(

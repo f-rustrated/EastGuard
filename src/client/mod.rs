@@ -205,6 +205,7 @@ impl Client {
         &self,
         topic_name: &str,
         consumer_offset_keys: Box<[ConsumerOffsetKey]>,
+        generation: GenerationId,
     ) -> Result<HashMap<RangeId, ConsumerOffsetPosition>, ClientError> {
         let routing = self.resolve_topic_if_missing(topic_name).await?;
 
@@ -216,7 +217,13 @@ impl Client {
                     .write_leader_for_range(range_id)
                     .ok_or(ClientError::StaleRange)?;
                 let served = self
-                    .call(leader.client_addr(), FetchConsumerOffsetRequest(offset))
+                    .call(
+                        leader.client_addr(),
+                        FetchConsumerOffsetRequest {
+                            key: offset,
+                            generation,
+                        },
+                    )
                     .await?;
                 if served.redirected {
                     self.cache.invalidate(topic_name);
@@ -224,6 +231,14 @@ impl Client {
                 match served.response {
                     ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffset(position)) => {
                         Ok(position.map(|p| (range_id, p)))
+                    }
+                    ClientResponse::DataPlane(
+                        DataPlaneResponse::ConsumerOffsetGenerationMismatch(mismatch),
+                    ) if mismatch.observed_generation > generation => {
+                        Err(ClientError::StaleConsumerGroupEpoch {
+                            request_generation: generation,
+                            sealed_generation: mismatch.observed_generation,
+                        })
                     }
                     _ => Err(ClientError::UnexpectedResponse),
                 }
@@ -497,7 +512,8 @@ impl Client {
                 | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
                 DataPlaneResponse::ConsumerOffsetCommitted
                 | DataPlaneResponse::StaleConsumerGroupEpoch(_)
-                | DataPlaneResponse::ConsumerOffset(_) => Redirect::Done,
+                | DataPlaneResponse::ConsumerOffset(_)
+                | DataPlaneResponse::ConsumerOffsetGenerationMismatch(_) => Redirect::Done,
             },
             ClientResponse::Admin(_) => Redirect::Done,
             // The server's writer-loop sentinel; a client never legitimately reads it.

@@ -19,6 +19,7 @@ use crate::client::{
 };
 use crate::config::Environment;
 use crate::connections::protocol::ClientResponse;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
 use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
@@ -350,6 +351,7 @@ fn consumer_offset_read_corrects_stale_write_leader() -> turmoil::Result {
                     group_id: "group".to_string(),
                 }]
                 .into_boxed_slice(),
+                GenerationId(0),
             )
             .await
             .expect("offset read follows the leader redirect");

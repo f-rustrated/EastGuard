@@ -243,15 +243,20 @@ impl ConsumerGroup {
 
     pub(crate) async fn fetch_saved_offsets(
         &self,
-        ranges: Vec<RangeId>,
+        ranges: Box<[RangeId]>,
     ) -> Result<std::collections::HashMap<RangeId, ConsumerOffsetPosition>, ClientError> {
+        // A generation is the distributed snapshot boundary. Holding the same
+        // lock used by commits prevents this member from advancing any requested
+        // checkpoint while range leaders independently serve that boundary.
+        let _guard = self.commit_lock.lock().await;
+        let generation = GenerationId(self.generation.load(AtomicOrdering::Acquire));
         let consumer_offset_keys = ranges
             .into_iter()
             .map(|r| self.consumer_offset_key(r))
             .collect();
 
         self.client
-            .fetch_consumer_offsets(&self.topic, consumer_offset_keys)
+            .fetch_consumer_offsets(&self.topic, consumer_offset_keys, generation)
             .await
     }
 }

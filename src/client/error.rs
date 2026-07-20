@@ -46,6 +46,9 @@ pub enum ClientError {
         sealed_generation: GenerationId,
     },
 
+    #[error("consumer checkpoint lookup failed for ranges {ranges:?}: {reason}")]
+    ConsumerCheckpointLookupFailed { ranges: Box<[u64]>, reason: String },
+
     /// A consumer range-control command could not be delivered or acknowledged.
     #[error("consumer {operation} failed for range {range_id}: {reason}")]
     ConsumerControl {
@@ -81,5 +84,12 @@ impl ClientError {
         let reason = reason.into();
         tracing::warn!(reason, "consumer commit failed");
         ClientError::ConsumerCommit { reason }
+    }
+
+    pub(crate) fn on_checkpoint_lookup(ranges: &[RangeId], reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        let ranges = ranges.iter().map(|range| **range).collect();
+        tracing::warn!(?ranges, reason, "consumer offset recovery failed");
+        ClientError::ConsumerCheckpointLookupFailed { ranges, reason }
     }
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
 use turmoil::Builder;
@@ -62,25 +62,33 @@ fn three_node_sim(simulation_secs: u64, seed: u64) -> turmoil::Sim<'static> {
 fn spawn_node(sim: &mut turmoil::Sim<'static>, i: u8, total: u8, seed: u64) {
     let cp = client_port(i);
     let rp = cluster_port(i);
-    sim.host(node_name(i), move || async move {
-        let name = node_name(i);
-        let me = turmoil::lookup(name.as_str());
-        let seeds: Vec<String> = (1..=total)
-            .filter(|&j| j != i)
-            .map(|j| {
-                format!(
-                    "{}:{}",
-                    turmoil::lookup(node_name(j).as_str()),
-                    cluster_port(j)
-                )
-            })
-            .collect();
-        let mut env = default_env(i as u32, name.clone(), cp, rp);
-        env.advertise_host = Some(me.to_string());
-        env.join_seed_nodes = seeds;
-        env.vnodes_per_node = 3;
-        StartUp::with_env(env, seed).run().await?;
-        Ok(())
+    // Pin every identity input to the simulation seed. A per-host boot counter
+    // keeps restart identities distinct without reintroducing OS randomness.
+    let boot = Arc::new(AtomicU32::new(0));
+    sim.host(node_name(i), move || {
+        let boot = boot.clone();
+        async move {
+            let boot = boot.fetch_add(1, Ordering::SeqCst);
+            let name = node_name(i);
+            let me = turmoil::lookup(name.as_str());
+            let seeds: Vec<String> = (1..=total)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    format!(
+                        "{}:{}",
+                        turmoil::lookup(node_name(j).as_str()),
+                        cluster_port(j)
+                    )
+                })
+                .collect();
+            let mut env = default_env(i as u32, name.clone(), cp, rp);
+            env.node_id_suffix = Some(format!("sim-{seed}-{i}-{boot}"));
+            env.advertise_host = Some(me.to_string());
+            env.join_seed_nodes = seeds;
+            env.vnodes_per_node = 3;
+            StartUp::with_env(env, seed).run().await?;
+            Ok(())
+        }
     });
 }
 

@@ -99,7 +99,15 @@ pub struct CommitConsumerOffsetRequest(pub ConsumerOffsetUpdate);
 impl_new_struct_wrapper!(CommitConsumerOffsetRequest, ConsumerOffsetUpdate);
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct FetchConsumerOffsetRequest(pub ConsumerOffsetKey);
+pub struct FetchConsumerOffsetRequest {
+    pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
+}
+
+#[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]
+pub struct ConsumerOffsetGenerationMismatch {
+    pub observed_generation: GenerationId,
+}
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum DataPlaneResponse {
@@ -136,6 +144,7 @@ pub enum DataPlaneResponse {
     ConsumerOffsetCommitted,
     StaleConsumerGroupEpoch(GenerationId),
     ConsumerOffset(Option<ConsumerOffsetPosition>),
+    ConsumerOffsetGenerationMismatch(ConsumerOffsetGenerationMismatch),
     InternalError(String),
 }
 

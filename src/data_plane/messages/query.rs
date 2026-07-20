@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use crate::connections::protocol::RangeProgressSignal;
+use crate::connections::protocol::{ConsumerOffsetGenerationMismatch, RangeProgressSignal};
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
 use crate::data_plane::consumer_offset_management::ledger::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
@@ -85,10 +86,12 @@ pub enum ListOffsetsResult {
 
 pub struct ReadConsumerOffset {
     pub key: ConsumerOffsetKey,
+    pub generation: GenerationId,
     pub reply: oneshot::Sender<ReadConsumerOffsetResult>,
 }
 
 pub enum ReadConsumerOffsetResult {
     Offset(Option<ConsumerOffsetPosition>),
+    GenerationMismatch(ConsumerOffsetGenerationMismatch),
     NotLeader(Option<NodeId>),
 }
