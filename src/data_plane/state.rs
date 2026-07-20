@@ -22,6 +22,7 @@ use super::transport::command::DataTransportCommand;
 use super::wal::WalRecord;
 use super::wal::WalStorage;
 use crate::config::DataNodeConfig;
+use crate::connections::protocol::ConsumerOffsetGenerationMismatch;
 use crate::control_plane::consensus::messages::{MultiRaftActorCommand, ProposeSegmentRoll};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
@@ -360,7 +361,16 @@ impl<W: WalStorage> DataPlane<W> {
             .consumer_offsets
             .get_replica_set_if_leader(&query.key, &self.node_id)
         {
-            Ok(_) => ReadConsumerOffsetResult::Offset(self.consumer_offsets.offset(&query.key)),
+            Ok(_) => {
+                let observed_generation = self.consumer_offsets.durable_generation(&query.key);
+                if observed_generation == query.generation {
+                    ReadConsumerOffsetResult::Offset(self.consumer_offsets.offset(&query.key))
+                } else {
+                    ReadConsumerOffsetResult::GenerationMismatch(ConsumerOffsetGenerationMismatch {
+                        observed_generation,
+                    })
+                }
+            }
             Err(leader) => ReadConsumerOffsetResult::NotLeader(leader),
         };
         let _ = query.reply.send(result);
@@ -1704,6 +1714,7 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
 #[cfg(test)]
 mod tests {
     use crate::control_plane::Replicas;
+    use crate::control_plane::metadata::consumer_group::GenerationId;
     use crate::data_plane::consumer_offset_management::ledger::{
         ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetLedger,
     };
@@ -1803,6 +1814,44 @@ mod tests {
             range_id: RangeId(0),
             group_id: "group".into(),
         }
+    }
+
+    fn read_consumer_offset(
+        dp: &DataPlane<impl WalStorage>,
+        generation: GenerationId,
+    ) -> ReadConsumerOffsetResult {
+        let (reply, mut response) = oneshot::channel();
+        dp.read_consumer_offset(ReadConsumerOffset {
+            key: consumer_offset_key(),
+            generation,
+            reply,
+        });
+        response.try_recv().unwrap()
+    }
+
+    #[test]
+    fn consumer_offset_read_waits_for_durable_generation_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.process(assign_segment(test_key(), vec![test_node_id()]));
+        dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
+            generation: 2.into(),
+            key: consumer_offset_key(),
+        }));
+
+        assert!(matches!(
+            read_consumer_offset(&dp, 2.into()),
+            ReadConsumerOffsetResult::GenerationMismatch(ConsumerOffsetGenerationMismatch {
+                observed_generation: GenerationId(0)
+            })
+        ));
+
+        dp.flush_batch();
+
+        assert!(matches!(
+            read_consumer_offset(&dp, 2.into()),
+            ReadConsumerOffsetResult::Offset(None)
+        ));
     }
 
     #[test]
