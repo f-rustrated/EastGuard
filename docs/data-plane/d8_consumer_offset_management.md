@@ -239,7 +239,7 @@ acknowledgements while the asynchronous actor stops are in flight.
 | Leader WAL fsync fails | Commit fails; no replication acknowledgement |
 | Follower WAL fsync fails or connection disappears | Leader does not acknowledge the commit |
 | Offset snapshot fails | WAL remains pinned and recovery stays possible |
-| Durable-offset read is unavailable | New range actor remains unstarted; a later rebalance retries |
+| Durable-offset read is unavailable | New range actor remains unstarted; the client receives an error and a later rebalance retries |
 | Broker restarts | Snapshot plus shared-WAL replay reconstructs the ledger |
 
 ---

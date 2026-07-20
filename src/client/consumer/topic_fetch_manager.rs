@@ -166,9 +166,8 @@ impl TopicFetchManagerState {
 
         let plan = self.prepare_rebalance(&group, ctx).await?;
 
-        let commit_result = group.commit_owned(&plan.effective).await;
-        self.provision_range_actors(plan.to_start, ctx).await;
-        commit_result
+        group.commit_owned(&plan.effective).await?;
+        self.provision_range_actors(plan.to_start, ctx).await
     }
 
     // It stops all fetch actors deliberately because a stale epoch invalidates the manager’s entire ownership snapshot, not just one range.
@@ -221,7 +220,9 @@ impl TopicFetchManagerState {
             return;
         };
 
-        self.provision_range_actors(plan.to_start, ctx).await;
+        if let Err(error) = self.provision_range_actors(plan.to_start, ctx).await {
+            self.report_rebalance_error(error);
+        }
     }
 
     async fn prepare_rebalance(
@@ -265,28 +266,37 @@ impl TopicFetchManagerState {
         Ok(plan)
     }
 
-    async fn provision_range_actors(&mut self, to_start: Vec<RangeId>, ctx: &Arc<ConsumerContext>) {
+    async fn provision_range_actors(
+        &mut self,
+        to_start: Vec<RangeId>,
+        ctx: &Arc<ConsumerContext>,
+    ) -> Result<(), ClientError> {
         if to_start.is_empty() {
-            return;
+            return Ok(());
         }
 
         let Some(group) = self.consumer_group.clone() else {
-            return;
+            return Ok(());
         };
 
         let metadata = ctx.metadata.load();
         let checkpoint_ranges = metadata.checkpoint_lookup_ranges(&to_start);
 
         // An unavailable offsets topic is not evidence that this group has no committed offsets.
-        // Leave the actor for this range unstarted so the next rebalance tick retries recovery.
-        let Ok(Ok(saved_offsets)) = tokio::time::timeout(
+        // Leave the actor unstarted, surface the failure, and let the next rebalance retry.
+        let saved_offsets = match tokio::time::timeout(
             Duration::from_secs(2),
             group.fetch_saved_offsets(checkpoint_ranges),
         )
         .await
-        else {
-            tracing::warn!("failed to recover/time-out fetch_all_saved_offsets");
-            return;
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(ClientError::on_checkpoint_lookup(
+                    &to_start,
+                    "durable offset lookup timed out",
+                ));
+            }
         };
 
         for range in to_start {
@@ -332,6 +342,11 @@ impl TopicFetchManagerState {
                 );
             }
         }
+        Ok(())
+    }
+
+    fn report_rebalance_error(&self, error: ClientError) {
+        let _ = self.record_tx.send(Err(error));
     }
 
     /// Transfers a pending cursor into a live fetch actor.
@@ -603,6 +618,27 @@ mod tests {
             ConsumerConfig::new(StartPolicy::Earliest),
             record_tx,
         )
+    }
+
+    #[test]
+    fn rebalance_error_is_delivered_to_the_consumer() {
+        let (record_tx, record_rx) = flume::unbounded();
+        let state = TopicFetchManagerState::new(
+            PendingCursorStore::new(Vec::new()),
+            None,
+            ConsumerConfig::new(StartPolicy::Earliest),
+            record_tx,
+        );
+        state.report_rebalance_error(ClientError::on_checkpoint_lookup(
+            &[RangeId(4), RangeId(7)],
+            "lookup failed",
+        ));
+
+        assert!(matches!(
+            record_rx.recv().unwrap(),
+            Err(ClientError::ConsumerCheckpointLookupFailed { ranges, reason })
+                if *ranges == [4, 7] && reason == "lookup failed"
+        ));
     }
 
     fn split_ranges() -> Box<[RangeDetail]> {

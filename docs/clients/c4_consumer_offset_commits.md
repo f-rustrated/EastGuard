@@ -200,8 +200,10 @@ For each range:
 - If present, fetch begins at the containing entry and filters batch records through the
   committed record offset.
 - If absent, the configured earliest/latest start policy applies.
-- If the durable read is unavailable or times out, the actor does not start. A later rebalance
-  retries instead of assuming no offset exists.
+- If the durable read is unavailable or times out, the actor does not start. The failure is
+  returned through the consumer's record stream, and a later rebalance retries instead of
+  assuming no offset exists. When the lookup is part of explicit stale-commit recovery, the
+  failure is returned directly by the commit call.
 
 This fail-closed behavior prevents a temporary broker failure from replaying an entire range
 or skipping to its tail under the fallback start policy.
