@@ -117,15 +117,24 @@ this is; the codec tag says *how to read* it.
 
 ---
 
-## Idempotency hook (future)
+## Delivery contract and idempotency seam
 
-Today produce is **at-least-once**: a produce that times out after the leader
-committed but before the client saw the ack will be retried and stored twice. Exactly-
-once needs a producer session id + per-record sequence numbers carried on the produce,
-deduplicated at the segment leader — the server-side half is its own backlog item. C2
-should leave a clean seam for it (a place to stamp session/sequence on each produce)
-even before the server enforces it, so enabling exactly-once later doesn't reshape the
-producer API.
+Today produce is explicitly **at-least-once**: a produce that times out after the
+leader committed but before the client saw the acknowledgment can be retried and stored
+twice. The UUID and per-record counter currently allocated by the producer do not cross
+the wire and do not participate in a broker decision.
+
+The future protocol is specified in
+[D10: Idempotent Production](../data-plane/d10_idempotent_production.md). It assigns a
+sequence to each immutable broker batch, orders independently routed batches in lanes,
+uses metadata-backed incarnations for fencing, and retains range-scoped deduplication
+frontiers across rolls, failover, and lineage changes. A bounded recent-result window
+returns exact positions for normal retries without retaining one position forever per
+request. This is intentionally described as idempotent production rather than end-to-
+end exactly-once processing.
+
+Until D10 is implemented end to end, callers must not interpret construction with a
+stable producer UUID as a delivery guarantee.
 
 ---
 
@@ -142,8 +151,9 @@ producer API.
 5. **Compression** — optional client-side codec over the (batched) records, with a
    cleartext codec tag prefixing the compressed block so the consumer can decompress; the
    broker stays opaque and never decompresses.
-6. **Idempotency seam** — a no-op-today hook to stamp producer session + sequence,
-   ready for the server-side dedup work.
+6. **Idempotency seam** — a no-op-today identity allocation point. D10 will replace the
+   per-record counter with immutable batch identity and carry it through the broker
+   protocol.
 7. **Tests** — against the simulated cluster: produce to the right leader from a warm
    cache (one hop), correction after a roll/failover (`NotWriteLeader` follow),
    correction from a cold/stale cache (`ShardNotLocal` follow), `TopicNotFound`
@@ -156,4 +166,6 @@ producer API.
 - `d6_produce_consume_api.md` — the server's produce routing and redirect contract.
 - `d1_storage_engine.md` — the broker-opaque entry payload and end-to-end compression
   this stamps a codec into.
+- `../data-plane/d10_idempotent_production.md` — session fencing, ordered lanes,
+  durable range ledgers, topology handoff, and bounded retry guarantees.
 - `client_roadmap.md` — the idempotency / batching / compression backlog context.
