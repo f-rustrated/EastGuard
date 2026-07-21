@@ -12,9 +12,9 @@ All shard groups share a single RocksDB default column family. Each key is prefi
 |---|---|---|---|
 | LogEntry | 0x01 | u64 BE index | 17 bytes |
 | HardState | 0x02 | none | 9 bytes |
-| SnapMeta | 0x03 | none | 9 bytes (reserved) |
-| SnapData | 0x04 | none | 9 bytes (reserved) |
-| AppliedIndex | 0x05 | none | 9 bytes (reserved) |
+| SnapMeta | 0x03 | none | 9 bytes |
+| SnapData | 0x04 | none | 9 bytes |
+| AppliedIndex | 0x05 | none | 9 bytes |
 | Epoch | 0x06 | none | 9 bytes (reserved) |
 
 ## Invariants
@@ -32,3 +32,7 @@ All shard groups share a single RocksDB default column family. Each key is prefi
 6. **Truncation preserves non-log keys.** `TruncateFrom(index)` deletes log entries from `index` onward but never touches `HardState` or other metadata keys. Upper bound of the delete is `[group_id][0x02]`, exclusive. Losing hard state would break Raft's term/voted-for guarantees.
 
 7. **`stabled_index` advances only after a successful flush.** Set only after `persist_mutations()` returns successfully. Apply is bounded by `min(commit_index, stabled_index)` — entries cannot be applied before they are durable. Apply-before-durable would let a crash erase already-applied state.
+
+8. **Snapshot publication and prefix compaction are atomic.** Snapshot metadata, contents, applied index, and deletion of covered log entries share one synced `WriteBatch`. A crash exposes either the previous valid snapshot and log or the complete replacement; it cannot expose a compacted prefix without the snapshot that replaces it.
+
+9. **Snapshot contents are validated before restore.** Stored size, CRC32 checksum, and applied index must match the snapshot metadata. Corruption fails recovery explicitly rather than exposing partial metadata or silently replaying from an unavailable prefix.
