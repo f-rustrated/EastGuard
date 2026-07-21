@@ -45,6 +45,7 @@ pub(crate) struct MultiRaft {
     boundary_recovery: SegmentBoundaryRecovery,
 
     topology: TopologyReader,
+    snapshot_entry_threshold: u64,
 }
 
 #[derive(Debug)]
@@ -127,6 +128,7 @@ impl MultiRaft {
         election_jitter_seed: u64,
         storage: Box<dyn RaftStorage>,
         topology: TopologyReader,
+        snapshot_entry_threshold: u64,
     ) -> Self {
         Self {
             node_id,
@@ -141,6 +143,7 @@ impl MultiRaft {
             pending_rolls: PendingRollTracker::default(),
             boundary_recovery: SegmentBoundaryRecovery::default(),
             topology,
+            snapshot_entry_threshold,
         }
     }
 
@@ -343,7 +346,7 @@ impl MultiRaft {
 
         let election_jitter_seed = self.create_election_jitter_seed(group);
 
-        let persistent = self.storage.load_state(group.id.0);
+        let persistent = self.storage.load_state(*group.id);
 
         let timer_seqs = TimerSeqs {
             election: self.seq_counter.generate(),
@@ -765,6 +768,8 @@ impl MultiRaft {
         self.flush_auto_proposals(&dirty);
         let (mutations, last_indices) = self.collect_mutations(&dirty);
         self.persist_and_advance(mutations, last_indices);
+        self.apply_received_snapshots(&dirty);
+        self.create_eligible_snapshots(&dirty);
         self.resolve_pending_proposes(&dirty);
         std::mem::take(&mut self.pending_events)
     }
@@ -922,6 +927,38 @@ impl MultiRaft {
             self.route_group_events(id);
         }
     }
+
+    // Promotes the staged snapshot.
+    // Replaces local metadata and committed peers.
+    // Advances commit/application state.
+    // Sends the installation ACK.
+    fn apply_received_snapshots(&mut self, dirty: &[ShardGroupId]) {
+        for id in dirty {
+            if let Some(raft) = self.groups.get_mut(id) {
+                raft.publish_persisted_snapshot();
+            }
+            self.route_group_events(*id);
+        }
+    }
+
+    // Creates snapshot only when
+    // last_applied_index - last_included_index >= snapshot_entry_threshold
+    fn create_eligible_snapshots(&mut self, dirty: &[ShardGroupId]) {
+        for id in dirty {
+            let Some(raft) = self.groups.get_mut(id) else {
+                continue;
+            };
+
+            let Some(snapshot_mutations) =
+                raft.take_snapshot_mutations(self.snapshot_entry_threshold)
+            else {
+                continue;
+            };
+
+            self.storage.persist_mutations(snapshot_mutations);
+            raft.publish_local_snapshot();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -990,7 +1027,7 @@ mod tests {
             },
         );
         let (_pub_handle, reader) = topology_channel(topology);
-        MultiRaft::new(node_id, 0, storage, reader)
+        MultiRaft::new(node_id, 0, storage, reader, 10000)
     }
 
     #[test]
@@ -1149,6 +1186,41 @@ mod tests {
         let db = MetadataStorage::open(path);
         assert!(db.load_state(1) != Default::default());
         assert!(db.load_state(2) != Default::default());
+    }
+
+    #[test]
+    fn snapshot_compaction_and_restart_complete_end_to_end() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let me = node("n1");
+        {
+            let mut store = new_store(me.clone(), Box::new(MetadataStorage::open(path.clone())));
+            store.snapshot_entry_threshold = 1;
+            store.add_group(&shard(1, vec![me.clone()]));
+            store.handle_consensus(RaftProtocolMessage::Timeout(
+                RaftTimeoutCallback::ElectionTimeout {
+                    shard_group_id: ShardGroupId(1),
+                    epoch: u64::MAX,
+                },
+            ));
+            store.flush();
+        }
+
+        let persisted = MetadataStorage::open(path.clone()).load_state(1);
+        assert_eq!(
+            persisted
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.header.last_included_index),
+            Some(1)
+        );
+        assert!(persisted.log.is_empty());
+        drop(persisted);
+
+        let mut restarted = new_store(me.clone(), Box::new(MetadataStorage::open(path)));
+        restarted.add_group(&shard(1, vec![me]));
+        let raft = restarted.groups.get(&ShardGroupId(1)).unwrap();
+        assert_eq!(raft.last_applied_index(), 1);
+        assert_eq!(raft.log_last_index(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -1523,7 +1595,7 @@ mod tests {
             },
         );
         let (_pub_handle, reader) = topology_channel(topology);
-        MultiRaft::new(node_id, 0, storage, reader)
+        MultiRaft::new(node_id, 0, storage, reader, 10000)
     }
 
     /// `new_store_with_topology`, but the publisher half is kept so the test
@@ -1546,7 +1618,10 @@ mod tests {
             },
         );
         let (pub_handle, reader) = topology_channel(topology);
-        (MultiRaft::new(node_id, 0, storage, reader), pub_handle)
+        (
+            MultiRaft::new(node_id, 0, storage, reader, 10000),
+            pub_handle,
+        )
     }
 
     /// Drive `TEST_GROUP_ID` to elect this node as leader by simulating
