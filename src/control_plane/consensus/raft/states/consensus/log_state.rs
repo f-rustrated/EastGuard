@@ -303,7 +303,7 @@ mod tests {
             2,
             1,
             SnapshotData {
-                metadata: MetadataState::new(ShardGroupId(1)).snapshot(),
+                state: MetadataState::new(ShardGroupId(1)).snapshot(),
                 peers: Box::new([]),
             },
         );
@@ -332,7 +332,7 @@ mod tests {
             2,
             1,
             SnapshotData {
-                metadata: MetadataState::new(ShardGroupId(1)).snapshot(),
+                state: MetadataState::new(ShardGroupId(1)).snapshot(),
                 peers: Box::new([]),
             },
         );

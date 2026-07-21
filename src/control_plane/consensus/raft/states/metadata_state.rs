@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub(crate) struct MetadataSnapshot {
+pub(crate) struct MetadataStateSnapshot {
     topics: HashMap<TopicId, TopicMeta>,
     next_topic_id: u64,
 }
@@ -43,14 +43,14 @@ impl MetadataState {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> MetadataSnapshot {
-        MetadataSnapshot {
+    pub(crate) fn snapshot(&self) -> MetadataStateSnapshot {
+        MetadataStateSnapshot {
             topics: self.topics.clone(),
             next_topic_id: self.next_topic_id,
         }
     }
 
-    pub(crate) fn from_snapshot(snapshot: &MetadataSnapshot, last_applied_index: u64) -> Self {
+    pub(crate) fn from_snapshot(snapshot: &MetadataStateSnapshot, last_applied_index: u64) -> Self {
         let topics = snapshot.topics.clone();
         let topic_name_index = topics
             .values()
@@ -627,11 +627,11 @@ mod tests {
             1000,
             default_policy(),
         );
-        let a = MetadataSnapshot {
+        let a = MetadataStateSnapshot {
             topics: HashMap::from([(first.id, first.clone()), (second.id, second.clone())]),
             next_topic_id: 3,
         };
-        let b = MetadataSnapshot {
+        let b = MetadataStateSnapshot {
             topics: HashMap::from([(second.id, second), (first.id, first)]),
             next_topic_id: 3,
         };

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::LogMutation;
 use crate::control_plane::consensus::raft::log::LogEntry;
-use crate::control_plane::consensus::raft::states::metadata_state::MetadataSnapshot;
+use crate::control_plane::consensus::raft::states::metadata_state::MetadataStateSnapshot;
 use crate::control_plane::membership::ShardGroupId;
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -17,7 +17,7 @@ pub struct RaftSnapshotHeader {
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct SnapshotData {
-    pub(crate) metadata: MetadataSnapshot,
+    pub(crate) state: MetadataStateSnapshot,
     pub(crate) peers: Box<[NodeId]>,
 }
 

@@ -485,7 +485,7 @@ mod tests {
             2,
             1,
             SnapshotData {
-                metadata: MetadataState::new(group).snapshot(),
+                state: MetadataState::new(group).snapshot(),
                 peers: vec![NodeId::new("n1"), NodeId::new("n2")].into_boxed_slice(),
             },
         );
@@ -506,7 +506,7 @@ mod tests {
             1,
             1,
             SnapshotData {
-                metadata: MetadataState::new(group).snapshot(),
+                state: MetadataState::new(group).snapshot(),
                 peers: Box::new([]),
             },
         );
