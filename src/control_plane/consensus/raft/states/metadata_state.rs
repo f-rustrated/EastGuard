@@ -50,8 +50,8 @@ impl MetadataState {
         }
     }
 
-    pub(crate) fn from_snapshot(snapshot: &MetadataStateSnapshot, last_applied_index: u64) -> Self {
-        let topics = snapshot.topics.clone();
+    pub(crate) fn from_snapshot(snapshot: MetadataStateSnapshot, last_applied_index: u64) -> Self {
+        let topics = snapshot.topics;
         let topic_name_index = topics
             .values()
             .map(|topic| (topic.name.clone(), topic.id))

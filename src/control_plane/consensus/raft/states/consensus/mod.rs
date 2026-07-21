@@ -90,7 +90,7 @@ impl ConsensusState {
     pub(crate) fn take_snapshot_ack_target(&mut self) -> Option<NodeId> {
         self.transient.snapshot_ack_target.take()
     }
-    pub(crate) fn publish_snapshot(&mut self) -> Option<RaftSnapshot> {
+    pub(crate) fn apply_snapshot(&mut self) -> Option<RaftSnapshot> {
         self.log.publish_snapshot()
     }
     pub(crate) fn install_snapshot_chunk(
