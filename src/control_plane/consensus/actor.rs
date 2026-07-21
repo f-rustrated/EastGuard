@@ -52,9 +52,16 @@ impl MultiRaftActor {
         swim_tx: SwimSender,
         data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
         topology: TopologyReader,
+        snapshot_entry_threshold: u64,
     ) {
         tokio::spawn({
-            let store = MultiRaft::new(node_id, election_jitter_seed, storage, topology);
+            let store = MultiRaft::new(
+                node_id,
+                election_jitter_seed,
+                storage,
+                topology,
+                snapshot_entry_threshold,
+            );
 
             let mut actor = MultiRaftActor {
                 store,

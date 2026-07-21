@@ -115,7 +115,7 @@ pub struct Environment {
 
     /// Number of newly applied metadata entries between Raft snapshots.
     /// Put it another way, "how often snapshot publication process happens"
-    #[arg(long, env = "RAFT_SNAPSHOT_ENTRY_THRESHOLD", default_value_t = 10_000)]
+    #[arg(long, env = "RAFT_SNAPSHOT_ENTRY_THRESHOLD", default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub raft_snapshot_entry_threshold: u64,
 
     /// Node-wide hot cache budget for published segment entries. When resident

@@ -154,6 +154,7 @@ impl StartUp {
             swim_sender.clone(),
             data_transport_tx,
             topology_reader,
+            self.env.raft_snapshot_entry_threshold,
         );
 
         // Client handler
