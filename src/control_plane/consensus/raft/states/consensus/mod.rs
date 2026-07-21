@@ -2,7 +2,7 @@ mod log_state;
 mod transient_state;
 
 use crate::control_plane::Replicas;
-use crate::control_plane::consensus::messages::LogMutation;
+use crate::control_plane::consensus::messages::{InstallSnapshot, LogMutation};
 use crate::control_plane::consensus::raft::log::LogEntry;
 use crate::control_plane::consensus::raft::storage::{RaftPersistentState, RaftSnapshot};
 use crate::control_plane::membership::ShardGroupId;
@@ -19,10 +19,15 @@ use std::{
 
 use log_state::LogState;
 pub(crate) use log_state::SnapshotAlreadyStaged;
-use transient_state::TransientState;
-pub(crate) use transient_state::{
-    InTransitSnapshot, LeaderlessSegments, PeerState, Role, SNAPSHOT_CHUNK_BYTES,
-};
+use transient_state::{InTransitSnapshot, TransientState};
+pub(crate) use transient_state::{LeaderlessSegments, PeerState, Role, SNAPSHOT_CHUNK_BYTES};
+
+pub(crate) enum SnapshotInstallOutcome {
+    AlreadyInstalled,
+    ChunkAccepted { next_offset: u64 },
+    Staged,
+    ChunkRejected { retry_offset: u64 },
+}
 
 /// Owns Raft consensus state while preserving its durable/volatile boundary.
 pub(crate) struct ConsensusState {
@@ -82,18 +87,50 @@ impl ConsensusState {
     ) -> Result<(), SnapshotAlreadyStaged> {
         self.log.stage_snapshot(snapshot)
     }
-    pub(crate) fn set_snapshot_ack_target(&mut self, leader: NodeId) {
-        self.transient.snapshot_ack_target = Some(leader);
-    }
     pub(crate) fn take_snapshot_ack_target(&mut self) -> Option<NodeId> {
         self.transient.snapshot_ack_target.take()
     }
-    pub(crate) fn finish_snapshot(&mut self) -> Option<RaftSnapshot> {
-        self.log.finish_snapshot()
+    pub(crate) fn publish_snapshot(&mut self) -> Option<RaftSnapshot> {
+        self.log.publish_snapshot()
     }
-    pub(crate) fn in_transit_snapshot(&mut self) -> &mut Option<InTransitSnapshot> {
-        &mut self.transient.in_transit_snapshot
+    pub(crate) fn install_snapshot_chunk(
+        &mut self,
+        req: &InstallSnapshot,
+    ) -> SnapshotInstallOutcome {
+        if req.header.last_included_index <= self.last_included_index() {
+            return SnapshotInstallOutcome::AlreadyInstalled;
+        }
+        if req.offset == 0 {
+            self.transient.in_transit_snapshot = Some(InTransitSnapshot::new(req));
+        }
+        let Some(in_transit) = self.transient.in_transit_snapshot.as_mut() else {
+            return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
+        };
+
+        if !in_transit.is_next_chunk(req) {
+            return SnapshotInstallOutcome::ChunkRejected {
+                retry_offset: in_transit.retry_offset(req),
+            };
+        }
+
+        let next_offset = in_transit.append(&req.data);
+        if !req.done {
+            return SnapshotInstallOutcome::ChunkAccepted { next_offset };
+        }
+
+        let Some(completed) = self.transient.in_transit_snapshot.take() else {
+            return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
+        };
+        let Ok((leader, snapshot)) = completed.finish() else {
+            return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
+        };
+        if self.log.stage_snapshot(snapshot).is_err() {
+            return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
+        }
+        self.transient.snapshot_ack_target = Some(leader);
+        SnapshotInstallOutcome::Staged
     }
+
     /// Highest committed entry that is also locally durable and therefore safe to apply.
     pub(crate) fn ready_to_apply_index(&self) -> u64 {
         self.transient.commit_index.min(self.log.stabled_index())

@@ -3,7 +3,7 @@ use crate::control_plane::{
     consensus::messages::LogMutation,
     consensus::raft::{
         log::LogEntry,
-        storage::{RaftPersistentState, RaftSnapshot, RaftStorage, SnapshotMeta},
+        storage::{RaftPersistentState, RaftSnapshot, RaftSnapshotHeader, RaftStorage},
     },
     membership::ShardGroupId,
 };
@@ -89,11 +89,11 @@ impl DbOp {
             let applied_key = GroupKey::applied_index().encode_for(group_id);
             let compact_start = GroupKey::LogEntry(1).encode_for(group_id);
             let compact_end =
-                GroupKey::LogEntry(snapshot.meta.last_included_index + 1).encode_for(group_id);
+                GroupKey::LogEntry(snapshot.header.last_included_index + 1).encode_for(group_id);
             vec![
                 DbOp::Put {
                     key: meta_key,
-                    value: borsh::to_vec(&snapshot.meta).expect("encode SnapshotMeta failed"),
+                    value: borsh::to_vec(&snapshot.header).expect("encode SnapshotMeta failed"),
                 },
                 DbOp::Put {
                     key: data_key,
@@ -101,7 +101,7 @@ impl DbOp {
                 },
                 DbOp::Put {
                     key: applied_key,
-                    value: snapshot.meta.last_included_index.to_be_bytes().to_vec(),
+                    value: snapshot.header.last_included_index.to_be_bytes().to_vec(),
                 },
                 DbOp::DeleteRange {
                     start: compact_start,
@@ -187,7 +187,7 @@ impl MetadataStorage {
         let log = self.list_log_entires(group_id);
         let first_retained = snapshot
             .as_ref()
-            .map_or(1, |snapshot| snapshot.meta.last_included_index + 1);
+            .map_or(1, |snapshot| snapshot.header.last_included_index + 1);
 
         // ! Failing fast in corruption
         for (offset, entry) in log.iter().enumerate() {
@@ -226,7 +226,8 @@ impl MetadataStorage {
             (None, None, None) => return None,
             _ => panic!("incomplete durable snapshot"),
         };
-        let meta = borsh::from_slice::<SnapshotMeta>(&meta_bytes).expect("corrupt SnapshotMeta");
+        let meta =
+            borsh::from_slice::<RaftSnapshotHeader>(&meta_bytes).expect("corrupt SnapshotMeta");
         let applied_index = u64::from_be_bytes(
             applied_bytes
                 .as_slice()
@@ -509,7 +510,7 @@ mod tests {
                 peers: Box::new([]),
             },
         );
-        let snapshot_size = snapshot.meta.size_bytes as usize;
+        let snapshot_size = snapshot.header.size_bytes as usize;
         db.persist_mutations(Box::new([
             (
                 group,

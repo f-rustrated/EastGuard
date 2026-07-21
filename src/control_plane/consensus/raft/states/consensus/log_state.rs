@@ -98,17 +98,17 @@ impl LogState {
     pub(crate) fn last_included_index(&self) -> u64 {
         self.snapshot
             .active()
-            .map_or(0, |snapshot| snapshot.meta.last_included_index)
+            .map_or(0, |snapshot| snapshot.header.last_included_index)
     }
 
     fn last_included_term(&self) -> u64 {
         self.snapshot
             .active()
-            .map_or(0, |snapshot| snapshot.meta.last_included_term)
+            .map_or(0, |snapshot| snapshot.header.last_included_term)
     }
 
     pub(crate) fn overwrite_with(&mut self, snapshot: RaftSnapshot) {
-        let index = snapshot.meta.last_included_index;
+        let index = snapshot.header.last_included_index;
         if index <= self.last_included_index() {
             return;
         }
@@ -146,7 +146,7 @@ impl LogState {
         Ok(())
     }
 
-    pub(crate) fn finish_snapshot(&mut self) -> Option<RaftSnapshot> {
+    pub(crate) fn publish_snapshot(&mut self) -> Option<RaftSnapshot> {
         let SnapshotState::Staged { snapshot, .. } =
             std::mem::replace(&mut self.snapshot, SnapshotState::None)
         else {
