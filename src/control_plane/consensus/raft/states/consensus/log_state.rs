@@ -104,7 +104,7 @@ impl LogState {
             .map_or(0, |snapshot| snapshot.meta.last_included_term)
     }
 
-    pub(crate) fn compact_to(&mut self, snapshot: RaftSnapshot) {
+    pub(crate) fn overwrite_with(&mut self, snapshot: RaftSnapshot) {
         let index = snapshot.meta.last_included_index;
         if index <= self.last_included_index() {
             return;
@@ -132,7 +132,7 @@ impl LogState {
         else {
             return None;
         };
-        self.compact_to(snapshot.clone());
+        self.overwrite_with(snapshot.clone());
         Some(snapshot)
     }
 
