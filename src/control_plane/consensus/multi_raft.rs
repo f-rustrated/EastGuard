@@ -771,6 +771,15 @@ impl MultiRaft {
         self.apply_received_snapshots(&dirty);
         self.create_eligible_snapshots(&dirty);
         self.resolve_pending_proposes(&dirty);
+
+        #[cfg(any(test, debug_assertions))]
+        {
+            use crate::test_traits::TAssertInvariant;
+            for id in dirty {
+                let raft = self.groups.get(&id).unwrap();
+                raft.assert_invariants();
+            }
+        }
         std::mem::take(&mut self.pending_events)
     }
 
@@ -935,7 +944,7 @@ impl MultiRaft {
     fn apply_received_snapshots(&mut self, dirty: &[ShardGroupId]) {
         for id in dirty {
             if let Some(raft) = self.groups.get_mut(id) {
-                raft.publish_persisted_snapshot();
+                raft.publish_received_snapshot();
             }
             self.route_group_events(*id);
         }
@@ -950,7 +959,7 @@ impl MultiRaft {
             };
 
             let Some(snapshot_mutations) =
-                raft.take_snapshot_mutations(self.snapshot_entry_threshold)
+                raft.create_eligible_snapshots(self.snapshot_entry_threshold)
             else {
                 continue;
             };

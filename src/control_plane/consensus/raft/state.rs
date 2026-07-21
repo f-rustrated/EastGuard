@@ -4,9 +4,13 @@ use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::{EvictionError, ProposalError};
 use crate::control_plane::consensus::raft::log::LogEntry;
-use crate::control_plane::consensus::raft::states::consensus::{ConsensusState, PeerState, Role};
+use crate::control_plane::consensus::raft::states::consensus::{
+    ConsensusState, PeerState, Role, SNAPSHOT_CHUNK_BYTES, SnapshotInstallOutcome,
+};
 use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
-use crate::control_plane::consensus::raft::storage::RaftPersistentState;
+use crate::control_plane::consensus::raft::storage::{
+    RaftPersistentState, RaftSnapshot, SnapshotData,
+};
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::DeleteSegments;
@@ -78,17 +82,71 @@ impl Raft {
         shard_group_id: ShardGroupId,
         timer_seqs: TimerSeqs,
     ) -> Self {
+        let restored_snapshot = persistent.snapshot.clone();
+        let restored_peers = restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.peers(&node_id));
+        let metadata = restored_snapshot.map_or_else(
+            || MetadataState::new(shard_group_id),
+            |snapshot| {
+                MetadataState::from_snapshot(
+                    snapshot.data.state,
+                    snapshot.header.last_included_index,
+                )
+            },
+        );
         let mut raft = Self {
             node_id,
             shard_group_id,
-            peers,
-            consensus: ConsensusState::new(persistent, election_jitter_seed),
-            metadata: MetadataState::new(shard_group_id),
+            peers: restored_peers.unwrap_or(peers),
+            consensus: ConsensusState::from_persistent(persistent, election_jitter_seed),
+            metadata,
             events: Vec::new(),
             timer_seqs,
         };
         raft.reset_election_timer();
         raft
+    }
+
+    pub(crate) fn create_eligible_snapshots(
+        &mut self,
+        threshold: u64,
+    ) -> Option<Box<[(ShardGroupId, LogMutation)]>> {
+        let snapshot = self.snapshot_on_threshold(threshold)?;
+
+        if self.consensus.stage_snapshot(snapshot).is_err() {
+            return None;
+        }
+
+        Some(
+            self.take_log_mutations()
+                .into_iter()
+                .map(|mutation| (self.shard_group_id, mutation))
+                .collect(),
+        )
+    }
+
+    fn snapshot_on_threshold(&self, threshold: u64) -> Option<RaftSnapshot> {
+        let index = self.metadata.last_applied_index;
+        if index.saturating_sub(self.consensus.last_included_index()) < threshold {
+            return None;
+        }
+        let term = self.consensus.log_term_at(index);
+        let mut peers: Vec<NodeId> = self.peers.iter().cloned().collect();
+        peers.push(self.node_id.clone());
+        peers.sort();
+        Some(RaftSnapshot::new(
+            index,
+            term,
+            SnapshotData {
+                state: self.metadata.snapshot(),
+                peers: peers.into_boxed_slice(),
+            },
+        ))
+    }
+
+    pub(crate) fn publish_local_snapshot(&mut self) {
+        self.consensus.apply_snapshot();
     }
 
     pub(crate) fn topic_names(&self) -> Box<[String]> {
@@ -707,6 +765,8 @@ impl Raft {
             RaftRpc::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
             RaftRpc::AppendEntries(req) => self.handle_append_entries(from, req),
             RaftRpc::AppendEntriesResponse(resp) => self.handle_append_entries_response(resp),
+            RaftRpc::InstallSnapshot(req) => self.install_snapshot(from, req),
+            RaftRpc::InstallSnapshotResponse(resp) => self.handle_install_snapshot_response(resp),
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -1059,6 +1119,11 @@ impl Raft {
             None => return,
         };
 
+        if peer_state.next_index <= self.consensus.last_included_index() {
+            self.send_snapshot_chunk(peer_id, 0);
+            return;
+        }
+
         let prev_log_index = peer_state.next_index.saturating_sub(1);
         let prev_log_term = self.consensus.log_term_at(prev_log_index);
         let entries = self.consensus.log_entries_from(peer_state.next_index);
@@ -1075,6 +1140,148 @@ impl Raft {
                 leader_commit: self.consensus.commit_index(),
             },
         ));
+    }
+
+    // Leader-exclusive action.
+    fn send_snapshot_chunk(&mut self, peer_id: NodeId, byte_offset: u64) {
+        let Some(snapshot) = self.consensus.snapshot() else {
+            return;
+        };
+        let bytes = snapshot.encoded_data();
+        let start = (byte_offset as usize).min(bytes.len());
+        let end = (start + SNAPSHOT_CHUNK_BYTES).min(bytes.len());
+        self.raise(OutboundRaftPacket::new(
+            self.shard_group_id,
+            peer_id,
+            InstallSnapshot {
+                term: self.consensus.current_term(),
+                leader_id: self.node_id.clone(),
+                header: snapshot.header.clone(),
+                offset: byte_offset,
+                data: bytes[start..end].into(),
+                done: end == bytes.len(),
+            },
+        ));
+    }
+
+    // Run exclusively on the follower
+    fn install_snapshot(&mut self, from: NodeId, req: InstallSnapshot) {
+        if from != req.leader_id {
+            self.raise_snapshot_install_failed_event(from, req.header.last_included_index);
+            return;
+        }
+        if req.term < self.consensus.current_term() {
+            self.raise_snapshot_install_failed_event(from, req.header.last_included_index);
+            return;
+        }
+        if req.term > self.consensus.current_term() {
+            self.step_down(req.term);
+        }
+
+        self.consensus.recognize_leader(req.leader_id.clone());
+        self.reset_election_timer();
+
+        use SnapshotInstallOutcome as O;
+        match self.consensus.install_snapshot_chunk(&req) {
+            O::Staged => {}
+
+            O::AlreadyInstalled => {
+                self.raise_install_snapshot_response(from, req.header.last_included_index, 0, true);
+            }
+            O::ChunkAccepted { next_offset } => {
+                self.raise_install_snapshot_response(
+                    from,
+                    req.header.last_included_index,
+                    next_offset,
+                    true,
+                );
+            }
+            O::ChunkRejected { retry_offset } => {
+                self.raise_install_snapshot_response(
+                    from,
+                    req.header.last_included_index,
+                    retry_offset,
+                    false,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn publish_received_snapshot(&mut self) {
+        let Some(leader) = self.consensus.take_snapshot_ack_target() else {
+            return;
+        };
+
+        let Some(snapshot) = self.consensus.apply_snapshot() else {
+            tracing::debug!("snapshot awaiting durability must be staged");
+            return;
+        };
+
+        self.peers = snapshot.peers(&self.node_id);
+        self.metadata =
+            MetadataState::from_snapshot(snapshot.data.state, snapshot.header.last_included_index);
+
+        self.consensus
+            .set_commit_index(snapshot.header.last_included_index);
+        tracing::info!(
+            node = %self.node_id,
+            group = self.shard_group_id.0,
+            last_included_index = snapshot.header.last_included_index,
+            "metadata snapshot installed",
+        );
+        self.raise_install_snapshot_response(leader, snapshot.header.last_included_index, 0, true);
+
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
+    }
+
+    fn raise_install_snapshot_response(
+        &mut self,
+        target: NodeId,
+        last_included_index: u64,
+        next_offset: u64,
+        success: bool,
+    ) {
+        self.raise(OutboundRaftPacket::new(
+            self.shard_group_id,
+            target,
+            InstallSnapshotResponse {
+                term: self.consensus.current_term(),
+                node_id: self.node_id.clone(),
+                last_included_index,
+                next_byte_offset: next_offset,
+                success,
+            },
+        ));
+    }
+
+    fn raise_snapshot_install_failed_event(&mut self, target: NodeId, last_included_index: u64) {
+        self.raise_install_snapshot_response(target, last_included_index, 0, false);
+    }
+
+    // Leader receives ack from follower.
+    // If there is remaining snapshot chunk, send more, otherwise update peer state
+    fn handle_install_snapshot_response(&mut self, resp: InstallSnapshotResponse) {
+        if resp.term > self.consensus.current_term() {
+            self.step_down(resp.term);
+            return;
+        }
+        if !self.is_leader() {
+            return;
+        }
+
+        if !resp.success {
+            return;
+        }
+        if resp.next_byte_offset > 0 {
+            self.send_snapshot_chunk(resp.node_id, resp.next_byte_offset);
+            return;
+        }
+        if let Some(peer) = self.consensus.peer_state_mut(&resp.node_id) {
+            peer.match_index = resp.last_included_index;
+            peer.next_index = resp.last_included_index + 1;
+        }
+        self.send_append_entries(resp.node_id);
     }
 
     // ! SAFETY:
@@ -1545,11 +1752,18 @@ impl crate::test_traits::TAssertInvariant for Raft {
             self.log_last_index(),
         );
 
-        // Log indices are contiguous and 1-based
+        let last_included_index = self.consensus.last_included_index();
+        assert!(
+            last_included_index <= self.metadata.last_applied_index,
+            "last_included_index ({last_included_index}) > last_applied ({})",
+            self.metadata.last_applied_index,
+        );
+
+        // Retained log indices are contiguous immediately after the snapshot.
         for (i, entry) in self.consensus.log_entries().iter().enumerate() {
             assert_eq!(
                 entry.index,
-                (i + 1) as u64,
+                last_included_index + (i + 1) as u64,
                 "log entry at position {i} has non-contiguous index {}",
                 entry.index,
             );
@@ -1631,6 +1845,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::consensus::raft::storage::RaftSnapshotHeader;
     use crate::data_plane::messages::command::AssignSegmentCatchUp;
 
     impl Raft {
@@ -1721,6 +1936,60 @@ mod tests {
             TEST_SHARD,
             test_timer_seqs(),
         )
+    }
+
+    #[test]
+    fn installed_snapshot_becomes_visible_only_after_durable_finish() {
+        let mut raft = three_node_raft("node-3");
+        drain(&mut raft);
+        let snapshot = RaftSnapshot::new(
+            5,
+            1,
+            SnapshotData {
+                state: MetadataState::new(TEST_SHARD).snapshot(),
+                peers: vec![node("node-1"), node("node-3")].into_boxed_slice(),
+            },
+        );
+        let bytes = borsh::to_vec(&snapshot.data).unwrap();
+
+        raft.handle_rpc(
+            node("node-1"),
+            InstallSnapshot {
+                term: 1,
+                leader_id: node("node-1"),
+                header: RaftSnapshotHeader {
+                    last_included_index: 5,
+                    last_included_term: 1,
+                    checksum: snapshot.header.checksum,
+                    size_bytes: snapshot.header.size_bytes,
+                },
+                offset: 0,
+                data: bytes.into_boxed_slice(),
+                done: true,
+            },
+        );
+
+        assert_eq!(raft.consensus.last_included_index(), 0);
+        assert!(raft.has_peer(&node("node-2")));
+        assert!(matches!(
+            raft.take_log_mutations().as_slice(),
+            [LogMutation::HardState { .. }, LogMutation::Snapshot(_)]
+        ));
+
+        raft.publish_received_snapshot();
+
+        assert_eq!(raft.consensus.last_included_index(), 5);
+        assert_eq!(raft.last_applied_index(), 5);
+        assert!(!raft.has_peer(&node("node-2")));
+        assert!(raft.has_peer(&node("node-1")));
+        assert!(packets(&mut raft).iter().any(|packet| matches!(
+            packet.rpc,
+            RaftRpc::InstallSnapshotResponse(InstallSnapshotResponse {
+                success: true,
+                last_included_index: 5,
+                ..
+            })
+        )));
     }
 
     // -------------------------------------------------------------------
@@ -2204,6 +2473,38 @@ mod tests {
         let out = packets(&mut raft);
         assert!(!out.is_empty());
         assert!(matches!(out[0].rpc, RaftRpc::AppendEntries(_)));
+    }
+
+    #[test]
+    fn leader_does_not_immediately_retry_rejected_snapshot() {
+        let mut raft = three_node_raft("node-1");
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+        raft.handle_rpc(
+            node("node-2"),
+            RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                node_id: node("node-2"),
+                vote_granted: true,
+            }),
+        );
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("node-2"),
+            RaftRpc::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: 1,
+                node_id: node("node-2"),
+                last_included_index: 5,
+                next_byte_offset: 0,
+                success: false,
+            }),
+        );
+
+        assert!(packets(&mut raft).is_empty());
     }
 
     // -------------------------------------------------------------------
