@@ -6,7 +6,7 @@ Kafka's architecture was revolutionary in 2011. But its monolithic controller, s
 
 Inspired by LinkedIn's [Northguard](https://www.linkedin.com/blog/engineering/infrastructure/introducing-northguard-and-xinfra) architecture.
 
----
+
 
 ## Why EastGuard
 
@@ -14,16 +14,20 @@ Inspired by LinkedIn's [Northguard](https://www.linkedin.com/blog/engineering/in
 
 Kafka routes all metadata through a single controller (or KRaft quorum). Every partition reassignment, every leader election, every ISR change funnels through one bottleneck. At hundreds of thousands of partitions, controller failover takes minutes. Rebalancing requires external tooling. A slow broker degrades the entire ISR, and operators must manually intervene.
 
-### How EastGuard Fixes It
 
-| | Kafka | EastGuard |
-|---|---|---|
-| **Metadata** | Single controller / KRaft quorum | Dynamically-sharded Raft groups (DS-RSM) -- metadata throughput scales linearly with brokers |
-| **Partitioning** | Static partitions, manual reassignment | Dynamic ranges that split and merge automatically based on traffic load |
-| **Replication unit** | Entire partition (can be hundreds of GB) | ~1 GB segments dispersed across the cluster -- automatic load balancing, no rebalancing tools |
-| **Failure handling** | ISR shrink/expand + high watermark tracking | Seal the segment, open a new one with healthy replicas -- sealed data is immutable, recovery is just byte-copy |
-| **Failure detection** | Heartbeat-based, centralized | SWIM protocol -- decentralized, O(log N) convergence, no heartbeat storm |
-| **Consumer reads** | Leader-only (unless using follower fetching with lag) | Any replica -- every replica has all committed data |
+### Architectural Comparison: Kafka vs. Pulsar vs. EastGuard
+
+| Feature | Apache Kafka | Apache Pulsar | EastGuard |
+| :--- | :--- | :--- | :--- |
+| **Metadata Control Plane** | Centralized (Single Controller or KRaft Quorum). | Centralized (ZooKeeper). | **Decentralized (DS-RSM):** Dynamically-sharded Raft groups. Metadata throughput scales linearly as you add brokers. |
+| **Partitioning** | Static partitions. Requires manual reassignment to scale. | Static partitions at the broker level (backed by dynamic ledgers). | **Dynamic Ranges:** Ranges split and merge automatically based on traffic load without manual intervention. |
+| **Replication Unit** | The entire partition (can be hundreds of GBs). | BookKeeper Ledgers / Fragments (small & distributed). | **~1 GB Segments:** Log striping disperses segments across the cluster for automatic load balancing. |
+| **Replication Model** | ISR (In-Sync Replicas) shrink/expand + high watermark tracking. | Quorum-based (BookKeeper). Creates new fragments on failure. | **Seal-on-Failure:** If a replica fails, the segment is sealed and a new one opens. Recovery is a simple immutable byte-copy. |
+| **Failure Detection** | Centralized, heartbeat-based. | Centralized via ZooKeeper sessions. | **SWIM Protocol:** Decentralized, O(log N) gossip convergence. No central heartbeat storms. |
+| **Consumer Reads** | Leader-only (unless using follower fetching, which risks lag). | Routed through the stateless broker (caches data from Bookies). | **Any Replica:** Every replica has all committed data. Consumers read lock-free from the nearest node's cache. |
+| **Consumer Groups** | Centralized Group Coordinator broker manages rebalancing. | Managed by the broker owning the topic partition. | **Zero-Controller:** Decentralized deterministic hashing and system topic gossip. Consumers auto-converge on assignments. |
+| **Client Architecture** | Thread-heavy, often requires many TCP connections. | Multiplexed TCP connections per broker. | **Multiplexed Core:** Single multiplexed TCP connection per broker with thread-safe batched pipelining. |
+
 
 ---
 
