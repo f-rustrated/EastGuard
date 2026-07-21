@@ -12,8 +12,15 @@ use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use MetadataError::*;
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub(crate) struct MetadataSnapshot {
+    topics: HashMap<TopicId, TopicMeta>,
+    next_topic_id: u64,
+}
 
 pub struct MetadataState {
     pub(crate) topics: HashMap<TopicId, TopicMeta>,
@@ -31,6 +38,29 @@ impl MetadataState {
             last_applied_index: 0,
             topic_name_index: HashMap::new(),
             next_topic_id: shard_group_id.0 << 32,
+            pending_proposals: Vec::new(),
+            pending_events: Vec::new(),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> MetadataSnapshot {
+        MetadataSnapshot {
+            topics: self.topics.clone(),
+            next_topic_id: self.next_topic_id,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: &MetadataSnapshot, last_applied_index: u64) -> Self {
+        let topics = snapshot.topics.clone();
+        let topic_name_index = topics
+            .values()
+            .map(|topic| (topic.name.clone(), topic.id))
+            .collect();
+        Self {
+            topics,
+            last_applied_index,
+            topic_name_index,
+            next_topic_id: snapshot.next_topic_id,
             pending_proposals: Vec::new(),
             pending_events: Vec::new(),
         }
@@ -579,6 +609,34 @@ mod tests {
             MetadataEvent::TopicCreated(tc) => tc.segment_key.topic_id,
             other => panic!("expected TopicCreated, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn snapshot_encoding_is_independent_of_hashmap_insertion_order() {
+        let first = TopicMeta::new(
+            "first".into(),
+            TopicId(1),
+            replica_set(),
+            1000,
+            default_policy(),
+        );
+        let second = TopicMeta::new(
+            "second".into(),
+            TopicId(2),
+            replica_set(),
+            1000,
+            default_policy(),
+        );
+        let a = MetadataSnapshot {
+            topics: HashMap::from([(first.id, first.clone()), (second.id, second.clone())]),
+            next_topic_id: 3,
+        };
+        let b = MetadataSnapshot {
+            topics: HashMap::from([(second.id, second), (first.id, first)]),
+            next_topic_id: 3,
+        };
+
+        assert_eq!(borsh::to_vec(&a).unwrap(), borsh::to_vec(&b).unwrap());
     }
 
     #[test]
