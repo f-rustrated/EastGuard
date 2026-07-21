@@ -2,6 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::log::LogEntry;
+use crate::control_plane::consensus::raft::storage::RaftSnapshotHeader;
 use crate::control_plane::membership::ShardGroupId;
 use crate::impl_from_variant;
 
@@ -39,11 +40,32 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct InstallSnapshot {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub header: RaftSnapshotHeader,
+    pub offset: u64,
+    pub data: Box<[u8]>,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct InstallSnapshotResponse {
+    pub term: u64,
+    pub node_id: NodeId,
+    pub last_included_index: u64,
+    pub next_byte_offset: u64,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum RaftRpc {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 impl_from_variant!(
@@ -51,7 +73,9 @@ impl_from_variant!(
     RequestVote,
     RequestVoteResponse,
     AppendEntries,
-    AppendEntriesResponse
+    AppendEntriesResponse,
+    InstallSnapshot,
+    InstallSnapshotResponse
 );
 
 #[derive(Debug)]

@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub struct MultiRaftActor {
-    store: MultiRaft,
+    state: MultiRaft,
     transport_tx: BatchSender<RaftTransportCommand>,
     scheduler_tx: SchedulerSender<RaftTimer>,
     swim_tx: SwimSender,
@@ -52,12 +52,19 @@ impl MultiRaftActor {
         swim_tx: SwimSender,
         data_transport_tx: impl Into<BatchSender<DataTransportCommand>>,
         topology: TopologyReader,
+        snapshot_entry_threshold: u64,
     ) {
         tokio::spawn({
-            let store = MultiRaft::new(node_id, election_jitter_seed, storage, topology);
+            let store = MultiRaft::new(
+                node_id,
+                election_jitter_seed,
+                storage,
+                topology,
+                snapshot_entry_threshold,
+            );
 
             let mut actor = MultiRaftActor {
-                store,
+                state: store,
                 transport_tx: transport_tx.into(),
                 scheduler_tx,
                 swim_tx,
@@ -75,7 +82,7 @@ impl MultiRaftActor {
                         break;
                     }
                     for cmd in buf.drain(..) {
-                        actor.store.process(cmd);
+                        actor.state.process(cmd);
                     }
                     actor.flush().await;
                 }
@@ -92,7 +99,7 @@ impl MultiRaftActor {
         const MAX_FLUSH_ROUNDS: u32 = 8;
         let mut paused = false;
         for _ in 0..MAX_FLUSH_ROUNDS {
-            let events = self.store.flush();
+            let events = self.state.flush();
             if events.is_empty() {
                 paused = true;
                 break;
@@ -124,7 +131,7 @@ impl MultiRaftActor {
                 .send_batch(std::mem::take(&mut self.data_transport_cmds).into_boxed_slice()),
         );
 
-        self.store.fire_deferred();
+        self.state.fire_deferred();
     }
 
     async fn route_event(&mut self, event: RaftEvent) {
@@ -146,8 +153,8 @@ impl MultiRaftActor {
                 // On becoming leader, run both halves of takeover reconciliation:
                 // - replace any peer that SWIM no longer considers alive
                 // - roll any active segment whose replica set still names a non-live node
-                if lc.leader_node_id == *self.store.node_id() {
-                    self.store.reconcile_on_leadership_change(lc.shard_group_id);
+                if lc.leader_node_id == *self.state.node_id() {
+                    self.state.reconcile_on_leadership_change(lc.shard_group_id);
                 }
                 let _ = self
                     .swim_tx

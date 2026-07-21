@@ -15,13 +15,15 @@ A vote is not transient: forgetting [`voted_for`] after a crash could let one re
 
 Numeric progress watermarks are ordered as:
 ```text
-last_applied_index <= commit_index <= stabled_index <= last_index
+last_included_index <= last_applied_index <= commit_index <= stabled_index <= last_index
 ```
 
 Higher indices mean further progress. Expressed as entry sets, the same
 relationship is `applied ⊆ committed ⊆ stable ⊆ in-memory log`.
 
 - [`last_index`]: newest entry currently present in the in-memory Raft log.
+- `last_included_index`: newest entry represented by the durable snapshot. When
+  the retained suffix is empty, this is also the logical `last_index`.
 - [`stabled_index`]: newest Raft log entry successfully persisted to RocksDB.
 - [`commit_index`]: newest durable entry known to have quorum agreement.
 - [`last_applied_index`]: newest committed entry applied to metadata.

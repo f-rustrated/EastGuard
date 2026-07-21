@@ -97,6 +97,7 @@ async fn start_raft_node(
         swim_tx,
         data_tx,
         topology_reader,
+        10_000,
     );
 
     raft_tx.send(EnsureGroup { group }).await.unwrap();

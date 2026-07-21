@@ -131,6 +131,7 @@ async fn run_raft_node(
         swim_tx,
         data_tx,
         topology_reader,
+        10_000,
     );
 
     raft_tx

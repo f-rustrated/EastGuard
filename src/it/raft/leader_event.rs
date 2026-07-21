@@ -143,6 +143,7 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     swim_tx,
                     data_tx,
                     topology_reader,
+                    10_000,
                 );
 
                 raft_tx.send(EnsureGroup { group: g }).await.unwrap();
