@@ -2,7 +2,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::rpc::OutboundRaftPacket;
 use crate::control_plane::consensus::messages::timer::RaftTimer;
 use crate::control_plane::consensus::multi_raft::RollRequestContext;
-use crate::control_plane::consensus::raft::log::LogEntry;
+use crate::control_plane::consensus::raft::{log::LogEntry, storage::RaftSnapshot};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::data_plane::transport::command::DataTransportCommand;
@@ -33,6 +33,7 @@ pub enum LogMutation {
         term: u64,
         voted_for: Option<NodeId>,
     },
+    Snapshot(RaftSnapshot),
 }
 
 #[derive(Debug)]

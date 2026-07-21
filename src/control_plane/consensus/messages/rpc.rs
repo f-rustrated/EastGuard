@@ -39,11 +39,35 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct InstallSnapshot {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub checksum: u32,
+    pub size_bytes: u64,
+    pub offset: u64,
+    pub data: Box<[u8]>,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct InstallSnapshotResponse {
+    pub term: u64,
+    pub node_id: NodeId,
+    pub last_included_index: u64,
+    pub next_offset: u64,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum RaftRpc {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 impl_from_variant!(
@@ -51,7 +75,9 @@ impl_from_variant!(
     RequestVote,
     RequestVoteResponse,
     AppendEntries,
-    AppendEntriesResponse
+    AppendEntriesResponse,
+    InstallSnapshot,
+    InstallSnapshotResponse
 );
 
 #[derive(Debug)]

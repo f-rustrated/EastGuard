@@ -3,7 +3,7 @@ use crate::control_plane::{
     consensus::messages::LogMutation,
     consensus::raft::{
         log::LogEntry,
-        storage::{RaftPersistentState, RaftStorage},
+        storage::{RaftPersistentState, RaftSnapshot, RaftStorage, SnapshotMeta},
     },
     membership::ShardGroupId,
 };
@@ -22,15 +22,12 @@ impl GroupKey {
     fn hard_state() -> Self {
         Self::Fixed(0x02)
     }
-    #[allow(dead_code)]
     fn snap_meta() -> Self {
         Self::Fixed(0x03)
     }
-    #[allow(dead_code)]
     fn snap_data() -> Self {
         Self::Fixed(0x04)
     }
-    #[allow(dead_code)]
     fn applied_index() -> Self {
         Self::Fixed(0x05)
     }
@@ -67,7 +64,7 @@ enum DbOp {
     DeleteRange { start: Vec<u8>, end: Vec<u8> },
 }
 impl DbOp {
-    fn from_log(id: &ShardGroupId, log: LogMutation) -> Self {
+    fn from_log(id: &ShardGroupId, log: LogMutation) -> Vec<Self> {
         fn put_log_entry(group_id: u64, entry: &LogEntry) -> DbOp {
             let key = GroupKey::LogEntry(entry.index).encode_for(group_id);
             let value = borsh::to_vec(entry).expect("encode LogEntry failed");
@@ -86,10 +83,40 @@ impl DbOp {
             DbOp::DeleteRange { start, end }
         }
 
+        fn put_snapshot(group_id: u64, snapshot: RaftSnapshot) -> Vec<DbOp> {
+            let meta_key = GroupKey::snap_meta().encode_for(group_id);
+            let data_key = GroupKey::snap_data().encode_for(group_id);
+            let applied_key = GroupKey::applied_index().encode_for(group_id);
+            let compact_start = GroupKey::LogEntry(1).encode_for(group_id);
+            let compact_end =
+                GroupKey::LogEntry(snapshot.meta.last_included_index + 1).encode_for(group_id);
+            vec![
+                DbOp::Put {
+                    key: meta_key,
+                    value: borsh::to_vec(&snapshot.meta).expect("encode SnapshotMeta failed"),
+                },
+                DbOp::Put {
+                    key: data_key,
+                    value: snapshot.encoded_data().to_vec(),
+                },
+                DbOp::Put {
+                    key: applied_key,
+                    value: snapshot.meta.last_included_index.to_be_bytes().to_vec(),
+                },
+                DbOp::DeleteRange {
+                    start: compact_start,
+                    end: compact_end,
+                },
+            ]
+        }
+
         match log {
-            LogMutation::Append(entry) => put_log_entry(id.0, &entry),
-            LogMutation::TruncateFrom(index) => delete_from(id.0, index),
-            LogMutation::HardState { term, voted_for } => put_hard_state(id.0, term, voted_for),
+            LogMutation::Append(entry) => vec![put_log_entry(**id, &entry)],
+            LogMutation::TruncateFrom(index) => vec![delete_from(**id, index)],
+            LogMutation::HardState { term, voted_for } => {
+                vec![put_hard_state(**id, term, voted_for)]
+            }
+            LogMutation::Snapshot(snapshot) => put_snapshot(**id, snapshot),
         }
     }
 }
@@ -156,11 +183,64 @@ impl MetadataStorage {
         let (term, voted_for) =
             borsh::from_slice::<(u64, Option<NodeId>)>(&bytes).expect("corrupt HardState");
 
+        let snapshot = self.load_snapshot(group_id);
+        let log = self.list_log_entires(group_id);
+        let first_retained = snapshot
+            .as_ref()
+            .map_or(1, |snapshot| snapshot.meta.last_included_index + 1);
+
+        // ! Failing fast in corruption
+        for (offset, entry) in log.iter().enumerate() {
+            assert_eq!(
+                entry.index,
+                first_retained + offset as u64,
+                "non-contiguous retained Raft log"
+            );
+        }
         RaftPersistentState {
             term,
             voted_for,
-            log: self.list_log_entires(group_id),
+            log,
+            snapshot,
         }
+    }
+
+    fn load_snapshot(&self, group_id: u64) -> Option<RaftSnapshot> {
+        // ! Err means RocksDB read failure;
+        let meta_bytes = self
+            .db
+            .get(GroupKey::snap_meta().encode_for(group_id))
+            .expect("read SnapshotMeta failed");
+        let data_bytes = self
+            .db
+            .get(GroupKey::snap_data().encode_for(group_id))
+            .expect("read SnapshotData failed");
+        let applied_bytes = self
+            .db
+            .get(GroupKey::applied_index().encode_for(group_id))
+            .expect("read AppliedIndex failed");
+
+        let (meta_bytes, data_bytes, applied_bytes) = match (meta_bytes, data_bytes, applied_bytes)
+        {
+            (Some(meta), Some(data), Some(applied)) => (meta, data, applied),
+            (None, None, None) => return None,
+            _ => panic!("incomplete durable snapshot"),
+        };
+        let meta = borsh::from_slice::<SnapshotMeta>(&meta_bytes).expect("corrupt SnapshotMeta");
+        let applied_index = u64::from_be_bytes(
+            applied_bytes
+                .as_slice()
+                .try_into()
+                .expect("corrupt AppliedIndex"),
+        );
+        assert_eq!(
+            applied_index, meta.last_included_index,
+            "snapshot applied index mismatch"
+        );
+        Some(RaftSnapshot::from_encoded(
+            meta,
+            data_bytes.into_boxed_slice(),
+        ))
     }
 
     fn list_log_entires(&self, group_id: u64) -> Vec<LogEntry> {
@@ -194,7 +274,7 @@ impl RaftStorage for MetadataStorage {
     fn persist_mutations(&self, mutations: Box<[(ShardGroupId, LogMutation)]>) {
         let batch: Box<[DbOp]> = mutations
             .into_iter()
-            .map(|(id, log)| DbOp::from_log(&id, log))
+            .flat_map(|(id, log)| DbOp::from_log(&id, log))
             .collect();
         self.write_batch(&batch);
         #[cfg(any(test, debug_assertions))]
@@ -271,6 +351,8 @@ impl TAssertInvariant for MetadataStorage {
 mod tests {
     use super::*;
     use crate::control_plane::consensus::raft::command::RaftCommand;
+    use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
+    use crate::control_plane::consensus::raft::storage::SnapshotData;
 
     fn temp_db() -> (MetadataStorage, std::path::PathBuf) {
         let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -380,5 +462,69 @@ mod tests {
             Some(NodeId::new("n1")),
             "HardState voted_for must survive truncation"
         );
+    }
+
+    #[test]
+    fn snapshot_persistence_atomically_compacts_covered_prefix() {
+        let (db, _path) = temp_db();
+        let group = ShardGroupId(7);
+        db.persist_mutations(Box::new([
+            (group, LogMutation::Append(noop_entry(1, 1))),
+            (group, LogMutation::Append(noop_entry(2, 1))),
+            (group, LogMutation::Append(noop_entry(3, 2))),
+            (
+                group,
+                LogMutation::HardState {
+                    term: 2,
+                    voted_for: None,
+                },
+            ),
+        ]));
+        let snapshot = RaftSnapshot::new(
+            2,
+            1,
+            SnapshotData {
+                metadata: MetadataState::new(group).snapshot(),
+                peers: vec![NodeId::new("n1"), NodeId::new("n2")].into_boxed_slice(),
+            },
+        );
+        db.persist_mutations(Box::new([(group, LogMutation::Snapshot(snapshot.clone()))]));
+
+        let restored = db.load_state(group.0);
+        assert_eq!(restored.snapshot, Some(snapshot));
+        assert_eq!(restored.log, vec![noop_entry(3, 2)]);
+        assert_eq!(restored.stabled_index(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot checksum mismatch")]
+    fn corrupt_snapshot_fails_recovery_explicitly() {
+        let (db, _path) = temp_db();
+        let group = ShardGroupId(8);
+        let snapshot = RaftSnapshot::new(
+            1,
+            1,
+            SnapshotData {
+                metadata: MetadataState::new(group).snapshot(),
+                peers: Box::new([]),
+            },
+        );
+        let snapshot_size = snapshot.meta.size_bytes as usize;
+        db.persist_mutations(Box::new([
+            (
+                group,
+                LogMutation::HardState {
+                    term: 1,
+                    voted_for: None,
+                },
+            ),
+            (group, LogMutation::Snapshot(snapshot)),
+        ]));
+        db.write_batch(&[DbOp::Put {
+            key: GroupKey::snap_data().encode_for(group.0),
+            value: vec![0xff; snapshot_size],
+        }]);
+
+        let _ = db.load_state(group.0);
     }
 }

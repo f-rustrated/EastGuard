@@ -60,3 +60,4 @@ pub(super) fn stub_topology_channel(
 mod election;
 mod leader_event;
 mod membership_change;
+mod snapshot;
