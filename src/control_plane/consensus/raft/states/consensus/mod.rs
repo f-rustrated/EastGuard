@@ -4,7 +4,7 @@ mod transient_state;
 use crate::control_plane::Replicas;
 use crate::control_plane::consensus::messages::LogMutation;
 use crate::control_plane::consensus::raft::log::LogEntry;
-use crate::control_plane::consensus::raft::storage::RaftPersistentState;
+use crate::control_plane::consensus::raft::storage::{RaftPersistentState, RaftSnapshot};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::MetadataCommand;
 use crate::control_plane::metadata::event::SegmentReassigned;
@@ -18,8 +18,11 @@ use std::{
 };
 
 use log_state::LogState;
+pub(crate) use log_state::SnapshotAlreadyStaged;
 use transient_state::TransientState;
-pub(crate) use transient_state::{LeaderlessSegments, PeerState, Role};
+pub(crate) use transient_state::{
+    InTransitSnapshot, LeaderlessSegments, PeerState, Role, SNAPSHOT_CHUNK_BYTES,
+};
 
 /// Owns Raft consensus state while preserving its durable/volatile boundary.
 pub(crate) struct ConsensusState {
@@ -28,10 +31,15 @@ pub(crate) struct ConsensusState {
 }
 
 impl ConsensusState {
-    pub(crate) fn new(persistent: RaftPersistentState, election_jitter_seed: u64) -> Self {
+    pub(crate) fn from_persistent(
+        persistent: RaftPersistentState,
+        election_jitter_seed: u64,
+    ) -> Self {
+        let log = LogState::from_persistent(persistent);
+        let restored_commit_index = log.last_included_index();
         Self {
-            log: LogState::from_persistent(persistent),
-            transient: TransientState::new(election_jitter_seed),
+            log,
+            transient: TransientState::new(election_jitter_seed, restored_commit_index),
         }
     }
 
@@ -61,6 +69,30 @@ impl ConsensusState {
     }
     pub(crate) fn stabled_index(&self) -> u64 {
         self.log.stabled_index()
+    }
+    pub(crate) fn last_included_index(&self) -> u64 {
+        self.log.last_included_index()
+    }
+    pub(crate) fn snapshot(&self) -> Option<&RaftSnapshot> {
+        self.log.snapshot()
+    }
+    pub(crate) fn stage_snapshot(
+        &mut self,
+        snapshot: RaftSnapshot,
+    ) -> Result<(), SnapshotAlreadyStaged> {
+        self.log.stage_snapshot(snapshot)
+    }
+    pub(crate) fn set_snapshot_ack_target(&mut self, leader: NodeId) {
+        self.transient.snapshot_ack_target = Some(leader);
+    }
+    pub(crate) fn take_snapshot_ack_target(&mut self) -> Option<NodeId> {
+        self.transient.snapshot_ack_target.take()
+    }
+    pub(crate) fn finish_snapshot(&mut self) -> Option<RaftSnapshot> {
+        self.log.finish_snapshot()
+    }
+    pub(crate) fn in_transit_snapshot(&mut self) -> &mut Option<InTransitSnapshot> {
+        &mut self.transient.in_transit_snapshot
     }
     /// Highest committed entry that is also locally durable and therefore safe to apply.
     pub(crate) fn ready_to_apply_index(&self) -> u64 {

@@ -2,6 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::log::LogEntry;
+use crate::control_plane::consensus::raft::storage::SnapshotMeta;
 use crate::control_plane::membership::ShardGroupId;
 use crate::impl_from_variant;
 
@@ -42,10 +43,7 @@ pub struct AppendEntriesResponse {
 pub struct InstallSnapshot {
     pub term: u64,
     pub leader_id: NodeId,
-    pub last_included_index: u64,
-    pub last_included_term: u64,
-    pub checksum: u32,
-    pub size_bytes: u64,
+    pub meta: SnapshotMeta,
     pub offset: u64,
     pub data: Box<[u8]>,
     pub done: bool,
@@ -56,7 +54,7 @@ pub struct InstallSnapshotResponse {
     pub term: u64,
     pub node_id: NodeId,
     pub last_included_index: u64,
-    pub next_offset: u64,
+    pub next_byte_offset: u64,
     pub success: bool,
 }
 

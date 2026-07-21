@@ -12,6 +12,9 @@ pub(crate) struct LogState {
     unflushed_mutations: Vec<LogMutation>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SnapshotAlreadyStaged;
+
 enum SnapshotState {
     None,
     // Staged represents a transition between two durable states.
@@ -115,15 +118,32 @@ impl LogState {
         self.stabled_index = self.stabled_index.max(index);
     }
 
-    pub(crate) fn stage_snapshot(&mut self, snapshot: RaftSnapshot) {
-        self.unflushed_mutations
-            .push(LogMutation::Snapshot(snapshot.clone()));
+    pub(crate) fn stage_snapshot(
+        &mut self,
+        snapshot: RaftSnapshot,
+    ) -> Result<(), SnapshotAlreadyStaged> {
+        if let SnapshotState::Staged {
+            snapshot: staged, ..
+        } = &self.snapshot
+        {
+            return if staged == &snapshot {
+                Ok(())
+            } else {
+                Err(SnapshotAlreadyStaged)
+            };
+        }
         let active = match std::mem::replace(&mut self.snapshot, SnapshotState::None) {
             SnapshotState::None => None,
             SnapshotState::Active(active) => Some(active),
-            SnapshotState::Staged { .. } => panic!("snapshot already staged"),
+            staged @ SnapshotState::Staged { .. } => {
+                self.snapshot = staged;
+                return Err(SnapshotAlreadyStaged);
+            }
         };
+        self.unflushed_mutations
+            .push(LogMutation::Snapshot(snapshot.clone()));
         self.snapshot = SnapshotState::Staged { active, snapshot };
+        Ok(())
     }
 
     pub(crate) fn finish_snapshot(&mut self) -> Option<RaftSnapshot> {
@@ -304,5 +324,22 @@ mod tests {
         state.truncate_from(3);
         assert_eq!(state.last_index(), 2);
         assert_eq!(state.last_term(), 1);
+    }
+
+    #[test]
+    fn staging_the_same_snapshot_is_idempotent() {
+        let snapshot = RaftSnapshot::new(
+            2,
+            1,
+            SnapshotData {
+                metadata: MetadataState::new(ShardGroupId(1)).snapshot(),
+                peers: Box::new([]),
+            },
+        );
+        let mut state = LogState::from_persistent(RaftPersistentState::default());
+
+        assert!(state.stage_snapshot(snapshot.clone()).is_ok());
+        assert!(state.stage_snapshot(snapshot).is_ok());
+        assert_eq!(state.take_mutations().len(), 1);
     }
 }
