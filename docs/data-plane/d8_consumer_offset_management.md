@@ -168,11 +168,58 @@ offset commit fsync
 
 Snapshot creation is driven by reclamation pressure. Many commits therefore collapse into a
 single asynchronous snapshot. WAL deletion uses the minimum safe watermark across segment
-checkpoints and consumer-offset checkpoints; neither state family can delete recovery data
-still needed by the other.
+checkpoints and the auxiliary-state checkpoint, which contains only consumer offsets today;
+neither state family can delete recovery data still needed by the other.
 
 On restart, recovery loads the latest snapshot and replays later offset records from the
 shared WAL. Recovery then writes the consolidated snapshot before removing the replayed WAL.
+
+### Consolidation with producer frontier state
+
+The implemented snapshot currently contains consumer-offset state only. D10 adds another
+range-scoped, end-state ledger for producer retry frontiers. It must extend this checkpoint
+into one **range-auxiliary-state snapshot**, rather than introducing a second independently
+fsynced snapshot:
+
+```text
+shared WAL
+  ├── consumer offset records
+  └── produced entries carrying producer sequence identity
+              │ reclamation reaches uncovered state
+              ▼
+one auxiliary-state snapshot at one LSN boundary
+  ├── current consumer offsets + placement readiness
+  └── current producer frontiers + bounded recent results
+              │ durable rename completes
+              ▼
+advance one auxiliary checkpoint watermark
+```
+
+This follows the metadata log-to-snapshot model: replayable log records are authoritative
+until one complete current-state image safely replaces their covered prefix. The snapshot
+is asynchronous and reclamation-driven, so its single fsync is not part of offset-commit or
+produce latency. Segment payload checkpointing remains separate because segment files retain
+application data, whereas both auxiliary ledgers retain only their latest state.
+
+### Migration from the consumer-only checkpoint
+
+The D10 implementation should replace, rather than wrap, the current consumer-only snapshot
+pipeline:
+
+1. Replace the consumer-offset-only snapshot image with the typed auxiliary-state image.
+2. Replace its dedicated checkpoint job, completion signal, in-flight flag, and watermark
+   with one auxiliary-state checkpoint lifecycle.
+3. Keep offset commits and graduation imports in the shared WAL; their WAL fsync is still the
+   acknowledgement durability boundary.
+4. On upgrade, load the legacy consumer-offset snapshot when no consolidated snapshot exists,
+   combine it with producer frontier state recovered from WAL, and publish a durable
+   consolidated snapshot before reclaiming either the legacy file or covered WAL.
+5. Remove the legacy snapshot only after the consolidated snapshot's durable rename and
+   directory sync complete.
+
+This cleanup removes the independent consumer-snapshot fsync once D10 adds producer state. It
+does not remove the shared-WAL fsync required before acknowledging an offset commit, nor the
+single asynchronous fsync that makes a replacement snapshot safe for WAL truncation.
 
 ---
 

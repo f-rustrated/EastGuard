@@ -126,7 +126,7 @@ the wire and do not participate in a broker decision.
 
 The future protocol is specified in
 [D10: Idempotent Production](../data-plane/d10_idempotent_production.md). It assigns a
-sequence to each immutable broker batch, orders independently routed batches in lanes,
+sequence to each immutable per-range broker batch and orders each producer-range stream,
 uses metadata-backed incarnations for fencing, and retains range-scoped deduplication
 frontiers across rolls, failover, and lineage changes. A bounded recent-result window
 returns exact positions for normal retries without retaining one position forever per
@@ -166,6 +166,6 @@ stable producer UUID as a delivery guarantee.
 - `d6_produce_consume_api.md` — the server's produce routing and redirect contract.
 - `d1_storage_engine.md` — the broker-opaque entry payload and end-to-end compression
   this stamps a codec into.
-- `../data-plane/d10_idempotent_production.md` — session fencing, ordered lanes,
+- `../data-plane/d10_idempotent_production.md` — session fencing, ordered producer-range streams,
   durable range ledgers, topology handoff, and bounded retry guarantees.
 - `client_roadmap.md` — the idempotency / batching / compression backlog context.
