@@ -118,10 +118,10 @@ impl ConsensusState {
             return SnapshotInstallOutcome::ChunkAccepted { next_offset };
         }
 
-        let Some(completed) = self.transient.in_transit_snapshot.take() else {
+        let Some(in_transit_snapshot) = self.transient.in_transit_snapshot.take() else {
             return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
         };
-        let Ok((leader, snapshot)) = completed.finish() else {
+        let Ok((leader, snapshot)) = in_transit_snapshot.finish() else {
             return SnapshotInstallOutcome::ChunkRejected { retry_offset: 0 };
         };
         if self.log.stage_snapshot(snapshot).is_err() {

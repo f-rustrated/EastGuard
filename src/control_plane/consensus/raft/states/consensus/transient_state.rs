@@ -1,11 +1,17 @@
 use crate::control_plane::NodeId;
+use crate::control_plane::consensus::messages::InstallSnapshot;
 use crate::control_plane::consensus::raft::catch_up::CatchUpRepairs;
+use crate::control_plane::consensus::raft::storage::{
+    RaftSnapshot, RaftSnapshotHeader, SnapshotData,
+};
 use crate::control_plane::metadata::MetadataCommand;
 use crate::data_plane::SegmentKey;
+use borsh::BorshDeserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 const ELECTION_JITTER_RANGE: u32 = 20;
+pub(crate) const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Segments whose write leader crashed (sole death).
 pub(crate) type LeaderlessSegments = Vec<(SegmentKey, Vec<NodeId>)>;
@@ -44,6 +50,88 @@ pub(crate) struct PeerState {
     pub(crate) match_index: u64,
 }
 
+pub(crate) struct InTransitSnapshot {
+    term: u64,
+    leader_id: NodeId,
+    header: RaftSnapshotHeader,
+    bytes: Vec<u8>,
+}
+
+impl InTransitSnapshot {
+    pub(crate) fn new(req: &InstallSnapshot) -> Self {
+        Self {
+            term: req.term,
+            leader_id: req.leader_id.clone(),
+            header: req.header.clone(),
+            bytes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_next_chunk(&self, req: &InstallSnapshot) -> bool {
+        let next_offset = self.next_offset().saturating_add(req.data.len() as u64);
+        self.same_transfer(req)
+            && self.is_next_offset(req.offset)
+            && req.data.len() <= SNAPSHOT_CHUNK_BYTES
+            // Will appending this new chunk cause the total installed data to exceed the declared total
+            && next_offset <= self.header.size_bytes
+            && req.done == (next_offset == self.header.size_bytes)
+    }
+
+    //  Does this chunk start exactly where the last one left off?
+    fn is_next_offset(&self, byte_offset: u64) -> bool {
+        self.next_offset() == byte_offset
+    }
+
+    // Answer:  Does this chunk belong to the exact same snapshot we are currently in the middle of downloading?
+    fn same_transfer(&self, req: &InstallSnapshot) -> bool {
+        self.term == req.term && self.leader_id == req.leader_id && self.header == req.header
+    }
+
+    pub(crate) fn retry_offset(&self, req: &InstallSnapshot) -> u64 {
+        if self.same_transfer(req) {
+            self.next_offset()
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn append(&mut self, data: &[u8]) -> u64 {
+        self.bytes.extend_from_slice(data);
+        self.next_offset()
+    }
+
+    fn next_offset(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    pub(crate) fn finish(self) -> Result<(NodeId, RaftSnapshot), ()> {
+        if self.bytes.len() as u64 != self.header.size_bytes {
+            tracing::error!(
+                "Size Mismatch {} {}",
+                self.bytes.len(),
+                self.header.size_bytes
+            );
+
+            return Err(());
+        }
+        if crc32fast::hash(&self.bytes) != self.header.checksum {
+            tracing::error!("Data Corruption Detected - Checksum not match!");
+            return Err(());
+        }
+        let data = SnapshotData::try_from_slice(&self.bytes).map_err(|_| {
+            tracing::error!("Invalid Data");
+        })?;
+        Ok((
+            self.leader_id,
+            RaftSnapshot::new(
+                self.header.last_included_index,
+                self.header.last_included_term,
+                data,
+            ),
+        ))
+    }
+}
+
 pub(crate) struct TransientState {
     pub(crate) commit_index: u64,
     pub(crate) role: Role,
@@ -59,12 +147,14 @@ pub(crate) struct TransientState {
     pub(crate) pending_proposals: Vec<MetadataCommand>,
     pub(crate) leaderless_segments: LeaderlessSegments,
     pub(crate) ring_observation_streak: Option<(BTreeSet<NodeId>, u32)>,
+    pub(super) in_transit_snapshot: Option<InTransitSnapshot>,
+    pub(super) snapshot_ack_target: Option<NodeId>,
 }
 
 impl TransientState {
-    pub(crate) fn new(election_jitter_seed: u64) -> Self {
+    pub(crate) fn new(election_jitter_seed: u64, commit_index: u64) -> Self {
         Self {
-            commit_index: 0,
+            commit_index,
             role: Role::Follower,
             current_leader: None,
             peer_states: HashMap::new(),
@@ -76,6 +166,8 @@ impl TransientState {
             pending_proposals: Vec::new(),
             leaderless_segments: Vec::new(),
             ring_observation_streak: None,
+            in_transit_snapshot: None,
+            snapshot_ack_target: None,
         }
     }
 
@@ -121,6 +213,8 @@ impl TransientState {
         self.confirmed_data_leaders.clear();
         self.catch_up.clear();
         self.ring_observation_streak = None;
+        self.in_transit_snapshot = None;
+        self.snapshot_ack_target = None;
     }
 
     pub(crate) fn recognize_leader(&mut self, leader: NodeId) {
@@ -179,7 +273,7 @@ mod tests {
         let peer = NodeId::new("node-2");
         let mut peers = HashSet::new();
         peers.insert(peer.clone());
-        let mut state = TransientState::new(1);
+        let mut state = TransientState::new(1, 0);
 
         state.initialize_leader(&self_id, &peers, 7);
         assert_eq!(state.role, Role::Leader);
@@ -191,5 +285,33 @@ mod tests {
         assert!(state.current_leader.is_none());
         assert!(state.peer_states.is_empty());
         assert!(state.learner_states.is_empty());
+    }
+
+    #[test]
+    fn snapshot_chunk_is_bound_to_leader_term_and_offset() {
+        let request = InstallSnapshot {
+            term: 3,
+            leader_id: NodeId::new("node-1"),
+            header: RaftSnapshotHeader {
+                last_included_index: 5,
+                last_included_term: 2,
+                checksum: 0,
+                size_bytes: 2,
+            },
+            offset: 0,
+            data: vec![1].into_boxed_slice(),
+            done: false,
+        };
+        let mut chunk = InTransitSnapshot::new(&request);
+        assert!(chunk.is_next_chunk(&request));
+        assert_eq!(chunk.append(&request.data), 1);
+
+        let mut next = request.clone();
+        next.offset = 1;
+        next.done = true;
+        assert!(chunk.is_next_chunk(&next));
+        next.term += 1;
+        assert!(!chunk.is_next_chunk(&next));
+        assert_eq!(chunk.retry_offset(&next), 0);
     }
 }
