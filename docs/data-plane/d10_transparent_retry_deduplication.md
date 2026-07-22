@@ -265,9 +265,33 @@ Produce requests add producer id, incarnation, producer-range sequence, and dige
 Successful responses distinguish newly appended, duplicate with position, and duplicate
 without position.
 
-Keep a clearly named raw/at-least-once append only if internal callers need it. The public
-producer should default to idempotent sessions only after this protocol is implemented
-end to end. Until then EastGuard's public delivery contract remains at-least-once.
+The SDK `Producer` uses this protocol by default. Low-level `Client::produce` remains an
+explicit raw append and therefore remains at-least-once.
+
+The implemented delivery contract is:
+
+- Within a live producer lease, retrying the same producer-range sequence and payload
+  appends at most once and returns its original entry id while that result remains in the
+  16-entry recent window.
+- After the result leaves that window, the frontier still prevents another append, but
+  the broker returns `DuplicatePositionUnavailable` because the original entry id is no
+  longer retained.
+- Reusing a sequence with a different payload checksum, skipping a sequence, using an
+  expired session, or writing with a fenced incarnation is rejected without appending.
+- A restarted producer using the same producer id opens with a new session nonce. Metadata
+  advances its incarnation and fences the older process. Retrying the open itself is
+  idempotent.
+- Request identity is part of the replicated data entry and the shared WAL batch. There is
+  no producer-only WAL record or additional fsync. Consumer offsets and producer ledgers
+  share `auxiliary-state.snapshot`; startup migrates the legacy consumer-only snapshot.
+- A retry against a sealed split/merge parent is routed to the frozen parent ledger. A
+  committed request returns its old position; a proven next sequence returns stale range
+  so the SDK can repartition it to children.
+
+The remaining limits are deliberate. Exact historical positions are bounded by the recent
+window, payload conflict detection uses the stored checksum rather than retaining payload
+bytes, and a frozen parent lookup requires one of the parent's retained replicas to remain
+reachable. An expired request is never accepted merely because its ledger was collected.
 
 ---
 
@@ -308,7 +332,7 @@ the repository's data-plane test rules.
 
 ---
 
-## Implementation phases
+## Implementation shape
 
 1. **Storage and WAL framing.** Extend entry identity, generalize the consumer-only
    checkpoint into the typed D9 auxiliary-state snapshot, and support legacy snapshot
@@ -340,5 +364,5 @@ the repository's data-plane test rules.
 9. **Acknowledgment follows full data-replica durability.** Entry and request identity are
    fsynced together before success.
 
-These rules describe the proposed phase, not current behavior. Current production remains
-at-least-once until every layer is implemented and validated.
+These rules describe the SDK producer path. The low-level raw append path remains
+at-least-once by design.
