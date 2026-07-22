@@ -39,12 +39,21 @@ pub enum ControlPlaneRequest {
         name: String,
     },
     SyncConsumerGroup(SyncConsumerGroupRequest),
+    OpenProducerSession(OpenProducerSessionRequest),
 }
 
 impl_from_variant!(
     ControlPlaneRequest,
-    SyncConsumerGroup(SyncConsumerGroupRequest)
+    SyncConsumerGroup(SyncConsumerGroupRequest),
+    OpenProducerSession(OpenProducerSessionRequest)
 );
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct OpenProducerSessionRequest {
+    pub topic_name: String,
+    pub producer_id: uuid::Uuid,
+    pub session_nonce: uuid::Uuid,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum ConsumerGroupSyncAction {
@@ -77,8 +86,15 @@ pub enum ControlPlaneResponse {
     },
     ConsumerGroupAssignment(ConsumerGroupAssignmentResponse),
     ConsumerGroupLeft,
+    ProducerSessionOpened(ProducerSessionOpened),
     // All control plane operations
     InternalError(String),
+}
+
+#[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]
+pub struct ProducerSessionOpened {
+    pub incarnation: u32,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]

@@ -136,7 +136,7 @@ pub(crate) enum CheckpointTask {
     DeleteSegmentIndex(SegmentKey),
     /// Snapshot the consumer-offset cache after its corresponding shared-WAL
     /// batch is durable. This runs off the data-plane write path.
-    ConsumerOffsets(OffsetCheckpointJob),
+    ConsumerOffsets(Box<OffsetCheckpointJob>),
 }
 
 pub struct CheckpointJob {

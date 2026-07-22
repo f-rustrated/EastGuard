@@ -92,6 +92,21 @@ pub struct SyncConsumerGroup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct OpenProducerSession {
+    pub topic_name: String,
+    pub producer_id: Uuid,
+    pub session_nonce: Uuid,
+    pub observed_at: u64,
+    pub session_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ExpireProducerSessions {
+    pub topic_id: TopicId,
+    pub observed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SyncConsumerGroupRequest {
     pub topic_name: String,
     pub group_id: String,
@@ -110,10 +125,7 @@ impl Deref for SyncConsumerGroup {
 impl SyncConsumerGroup {
     pub(crate) fn new(req: SyncConsumerGroupRequest) -> Self {
         const SESSION_TIMEOUT_MS: u64 = 10_000;
-        let observed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let observed_at = crate::now_ms();
         SyncConsumerGroup {
             req,
             observed_at,
@@ -132,6 +144,8 @@ pub enum MetadataCommand {
     ReassignSegment(ReassignSegment),
     DeleteSegments(DeleteSegments),
     SyncConsumerGroup(SyncConsumerGroup),
+    OpenProducerSession(OpenProducerSession),
+    ExpireProducerSessions(ExpireProducerSessions),
 }
 
 impl_from_variant!(
@@ -143,5 +157,7 @@ impl_from_variant!(
     DeleteTopic,
     ReassignSegment,
     DeleteSegments,
-    SyncConsumerGroup
+    SyncConsumerGroup,
+    OpenProducerSession,
+    ExpireProducerSessions
 );

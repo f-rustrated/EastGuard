@@ -101,7 +101,7 @@ impl DataPlaneOutputs {
 
     pub(crate) fn store_offset_checkpoint(&mut self, job: OffsetCheckpointJob) {
         self.checkpoint_tasks
-            .push(CheckpointTask::ConsumerOffsets(job));
+            .push(CheckpointTask::ConsumerOffsets(Box::new(job)));
     }
 
     pub(crate) fn store_put_anchors(&mut self, anchors: Vec<SparseEntry>) {

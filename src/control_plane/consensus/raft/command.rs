@@ -3,8 +3,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::ReassignSegment;
 use crate::control_plane::metadata::command::{
-    CreateTopic, DeleteSegments, DeleteTopic, MergeRange, MetadataCommand, RollSegment, SplitRange,
-    SyncConsumerGroup,
+    CreateTopic, DeleteSegments, DeleteTopic, ExpireProducerSessions, MergeRange, MetadataCommand,
+    OpenProducerSession, RollSegment, SplitRange, SyncConsumerGroup,
 };
 use crate::{impl_from_variant, impl_from_variant_via};
 
@@ -31,5 +31,7 @@ impl_from_variant_via!(
     DeleteTopic,
     ReassignSegment,
     DeleteSegments,
-    SyncConsumerGroup
+    SyncConsumerGroup,
+    OpenProducerSession,
+    ExpireProducerSessions
 );

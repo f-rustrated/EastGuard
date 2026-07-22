@@ -17,6 +17,7 @@ use crate::{
         },
     },
     data_plane::{
+        ProduceError, ProducerAppendIdentity,
         consumer_offset_management::ledger::{
             ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
         },
@@ -60,6 +61,7 @@ pub struct ProduceRequest {
     /// The broker stamps an entry_id and stores/replicates this opaque payload as-is.
     pub data: Vec<u8>,
     pub record_count: u32,
+    pub producer_append_id: Option<ProducerAppendIdentity>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -115,6 +117,7 @@ pub enum DataPlaneResponse {
     Produced {
         entry_id: EntryId,
     },
+    ProduceRejected(ProduceError),
     // Fetch
     Fetched {
         entries: Box<[Entry]>,

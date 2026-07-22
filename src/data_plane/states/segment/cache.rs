@@ -7,7 +7,7 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 
 use crate::control_plane::metadata::EntryId;
-use crate::data_plane::EntryPayload;
+use crate::data_plane::{EntryPayload, ProducerAppendIdentity};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedEntry {
@@ -15,6 +15,7 @@ pub(crate) struct CachedEntry {
     pub(crate) record_count: u32,
     pub(crate) entry_id: EntryId,
     pub(crate) lsn: u64,
+    pub(crate) producer_append_id: Option<ProducerAppendIdentity>,
 }
 
 impl CachedEntry {
@@ -331,6 +332,7 @@ mod tests {
             record_count: 1,
             entry_id: EntryId(entry_id),
             lsn,
+            producer_append_id: None,
         })
     }
 

@@ -5,7 +5,6 @@ use crate::{client::error::ClientError, control_plane::metadata::EntryId};
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
 pub(crate) type Records = Box<[(Vec<u8>, Vec<u8>)]>;
 
@@ -49,10 +48,9 @@ impl RangeBuffer {
 }
 
 pub struct PendingRecord {
+    pub order: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
-    pub producer_id: Uuid,
-    pub sequence_number: u32,
     pub tx: oneshot::Sender<Result<EntryId, ClientError>>,
 }
 impl PendingRecord {
