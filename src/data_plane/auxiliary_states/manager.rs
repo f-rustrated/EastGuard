@@ -67,8 +67,10 @@ impl AuxiliaryStateManager {
         &mut self,
         segment_key: SegmentKey,
         producer: AuthorizedProducerIdentity,
+        received_at_ms: u64,
     ) -> Result<(), ProduceError> {
-        self.producer_tracker.verify(segment_key, producer)
+        self.producer_tracker
+            .verify(segment_key, producer, received_at_ms)
     }
 
     pub(crate) fn unstage_producer(&mut self, append_key: &AppendKey) {

@@ -154,17 +154,17 @@ fn run_orphan_gc(internal: Duration, tx: &Sender<DataPlaneMessage>) {
 pub(crate) struct DataPlaneSender(pub flume::Sender<DataPlaneMessage>);
 
 impl DataPlaneSender {
-    pub fn send(
-        &self,
-        msg: impl Into<DataPlaneMessage>,
-    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
-        self.0.send(msg.into())
+    pub fn send(&self, msg: impl Into<DataPlaneMessage>) -> Result<(), flume::SendError<()>> {
+        self.0.send(msg.into()).map_err(|_| flume::SendError(()))
     }
 
     pub async fn send_async(
         &self,
         msg: impl Into<DataPlaneMessage>,
-    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
-        self.0.send_async(msg.into()).await
+    ) -> Result<(), flume::SendError<()>> {
+        self.0
+            .send_async(msg.into())
+            .await
+            .map_err(|_| flume::SendError(()))
     }
 }

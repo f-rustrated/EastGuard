@@ -371,7 +371,7 @@ mod tests {
             output.producer,
         );
         assert_eq!(
-            ledger.verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
+            ledger.verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer), 1,),
             Err(ProduceError::Duplicate(EntryId(7)))
         );
 
@@ -382,8 +382,11 @@ mod tests {
                 restarted.producer,
             );
         assert_eq!(
-            restarted_tracker
-                .verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
+            restarted_tracker.verify_producer(
+                key,
+                AuthorizedProducerIdentity::ExistingOnly(producer),
+                1,
+            ),
             Err(ProduceError::Duplicate(EntryId(7))),
             "the auxiliary snapshot must recover producer sessions after WAL reclamation"
         );
