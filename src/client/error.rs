@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::client::RangeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
+use crate::data_plane::ProduceError;
 
 /// Errors a caller decides on. Redirect-following, reconnect, and retry-within-deadline
 /// are handled internally.
@@ -37,6 +38,9 @@ pub enum ClientError {
     /// Expected range has split or metadata is stale.
     #[error("stale range routing")]
     StaleRange,
+
+    #[error("produce rejected: {0}")]
+    ProduceRejected(ProduceError),
 
     #[error(
         "consumer group generation {request_generation:?} is stale; data layer sealed at {sealed_generation:?}"
