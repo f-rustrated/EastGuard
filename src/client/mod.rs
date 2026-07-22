@@ -45,9 +45,10 @@ use uuid::Uuid;
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, CommitConsumerOffsetRequest,
     ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneResponse, FetchConsumerOffsetRequest, ProduceRequest,
-    RangeOffsetRequest,
+    ControlPlaneResponse, DataPlaneResponse, FetchConsumerOffsetRequest,
+    OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened, RangeOffsetRequest,
 };
+use crate::data_plane::{ProduceError, ProducerAppendIdentity};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 pub use redirect::RetryPolicy;
@@ -311,20 +312,19 @@ impl Client {
         }
     }
 
-    pub(crate) async fn produce(
+    pub(crate) async fn open_producer_session(
         &self,
-        topic: &str,
-        routing_key: &[u8],
-        data: Vec<u8>,
-        record_count: u32,
-    ) -> Result<EntryId, ClientError> {
-        let routing = self.resolve_topic_if_missing(topic).await?;
-        let range_id = routing
-            .range_id(routing_key)
-            .ok_or(ClientError::TopicNotFound)?;
-
-        self.produce_to_range(topic, range_id, routing_key, data, record_count)
-            .await
+        req: OpenProducerSessionRequest,
+    ) -> Result<ProducerSessionOpened, ClientError> {
+        let served = self
+            .call(self.next_known_node(), ControlPlaneRequest::from(req))
+            .await?;
+        match served.response {
+            ClientResponse::ControlPlane(ControlPlaneResponse::ProducerSessionOpened(session)) => {
+                Ok(session)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Produce one entry under `routing_key`, returning the committed `entry_id`.
@@ -337,6 +337,7 @@ impl Client {
         routing_key: &[u8],
         data: Vec<u8>,
         record_count: u32,
+        producer: Option<ProducerAppendIdentity>,
     ) -> Result<EntryId, ClientError> {
         // Describe once to seed the cache (gives the first hop).
         let routing = self.resolve_topic_if_missing(topic).await?;
@@ -354,6 +355,7 @@ impl Client {
             routing_key: routing_key.to_vec(),
             data,
             record_count,
+            producer_append_id: producer,
         };
 
         let served = self.call(start, request).await?;
@@ -371,6 +373,9 @@ impl Client {
             ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
             ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
                 Err(ClientError::StaleRange)
+            }
+            ClientResponse::DataPlane(DataPlaneResponse::ProduceRejected(error)) => {
+                Err(ClientError::ProduceRejected(error))
             }
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -489,6 +494,7 @@ impl Client {
                 | ControlPlaneResponse::TopicDeleted
                 | ControlPlaneResponse::ConsumerGroupAssignment(_)
                 | ControlPlaneResponse::ConsumerGroupLeft
+                | ControlPlaneResponse::ProducerSessionOpened(_)
                 | ControlPlaneResponse::TopicList { .. }
                 | ControlPlaneResponse::TopicDetail(_) => Redirect::Done,
             },
@@ -506,6 +512,7 @@ impl Client {
                 DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 DataPlaneResponse::SegmentNotLocal
                 | DataPlaneResponse::Produced { .. }
+                | DataPlaneResponse::ProduceRejected(..)
                 | DataPlaneResponse::Fetched { .. }
                 | DataPlaneResponse::EntryIdOutOfRange
                 | DataPlaneResponse::KeyspaceBoundNarrowed
