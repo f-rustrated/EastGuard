@@ -1,7 +1,7 @@
 use super::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsets, EpochSeal, OffsetRecord, StaleEpoch,
 };
-use super::state::AuxiliarySnapshot;
+use super::snapshot::AuxiliarySnapshot;
 use crate::client::EntryId;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;

@@ -19,7 +19,7 @@ use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{ConsumerOffsets, OffsetRecord};
 use crate::data_plane::auxiliary_states::producer::ProducerTracker;
-use crate::data_plane::auxiliary_states::state::AuxiliarySnapshot;
+use crate::data_plane::auxiliary_states::snapshot::AuxiliarySnapshot;
 use crate::data_plane::sparse_index::SparseIndex;
 use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::WalRecordType;
