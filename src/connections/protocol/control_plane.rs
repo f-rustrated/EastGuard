@@ -83,6 +83,7 @@ pub enum ControlPlaneResponse {
     // DeleteTopic
     TopicDeleted,
     TopicNotFound,
+    StaleRange,
     /// This node does not own the topic's metadata shard. The hint is absent
     /// while membership or shard routing is still converging.
     ShardNotLocal(ShardNotLocal),

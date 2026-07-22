@@ -365,14 +365,14 @@ impl Client {
         if served.redirected
             || matches!(
                 &served.response,
-                ClientResponse::DataPlane(DataPlaneResponse::StaleRange)
+                ClientResponse::ControlPlane(ControlPlaneResponse::StaleRange)
             )
         {
             self.cache.invalidate(topic);
         }
         match served.response {
             ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
-            ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
+            ClientResponse::ControlPlane(ControlPlaneResponse::StaleRange) => {
                 Err(ClientError::StaleRange)
             }
             ClientResponse::DataPlane(DataPlaneResponse::ProduceRejected(error)) => {
@@ -496,6 +496,7 @@ impl Client {
                 },
                 ControlPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 ControlPlaneResponse::TopicCreated
+                | ControlPlaneResponse::StaleRange
                 | ControlPlaneResponse::AlreadyExists
                 | ControlPlaneResponse::TopicDeleted
                 | ControlPlaneResponse::ConsumerGroupAssignment(_)
@@ -509,7 +510,6 @@ impl Client {
                     Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
-                DataPlaneResponse::StaleRange => Redirect::Done,
                 DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 DataPlaneResponse::SegmentNotLocal
                 | DataPlaneResponse::Produced { .. }

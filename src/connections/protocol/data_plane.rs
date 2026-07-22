@@ -137,7 +137,6 @@ pub enum DataPlaneResponse {
     NotWriteLeader {
         leader_addr: Option<NodeAddressInfo>,
     },
-    StaleRange,
     SegmentNotLocal,
 
     ConsumerOffsetCommitted,
