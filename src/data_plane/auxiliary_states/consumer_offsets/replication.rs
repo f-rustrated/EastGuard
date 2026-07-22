@@ -1,5 +1,5 @@
+use super::state::ConsumerOffsetUpdate;
 use crate::control_plane::NodeId;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::messages::command::{
     ConsumerOffsetCommitAck, ConsumerOffsetReplicated, ConsumerOffsetReplicationResult,
 };
@@ -98,7 +98,7 @@ impl OffsetReplicationState {
         }
     }
 
-    pub(crate) fn has_pending_for(&self, node_id: &NodeId) -> bool {
+    pub(crate) fn has_pending_replication_for(&self, node_id: &NodeId) -> bool {
         self.pending
             .values()
             .any(|pending| pending.pending_acks.contains(node_id))

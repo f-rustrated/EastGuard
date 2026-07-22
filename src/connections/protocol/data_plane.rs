@@ -18,7 +18,7 @@ use crate::{
     },
     data_plane::{
         ProduceError, ProducerAppendIdentity,
-        consumer_offset_management::ledger::{
+        auxiliary_states::consumer_offsets::state::{
             ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
         },
         messages::query::{FetchResult, ListOffsetsResult},

@@ -14,7 +14,7 @@ use crate::connections::protocol::{
     RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
 
 pub mod config;
 pub use config::*;

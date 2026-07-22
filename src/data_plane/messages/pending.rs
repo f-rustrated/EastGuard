@@ -6,7 +6,7 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::MultiRaftActorCommand;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
-use crate::data_plane::checkpoint::{CheckpointJob, CheckpointTask, OffsetCheckpointJob};
+use crate::data_plane::checkpoint::{AuxiliaryCheckpointJob, CheckpointJob, CheckpointTask};
 use crate::data_plane::messages::command::ProduceAck;
 use crate::data_plane::sparse_index::SparseEntry;
 use crate::data_plane::timer::{BatchFlushTimer, ReplicationTimer};
@@ -99,9 +99,9 @@ impl DataPlaneOutputs {
         self.checkpoint_tasks.push(CheckpointTask::Checkpoint(job));
     }
 
-    pub(crate) fn store_offset_checkpoint(&mut self, job: OffsetCheckpointJob) {
+    pub(crate) fn store_auxiliary_checkpoint(&mut self, job: AuxiliaryCheckpointJob) {
         self.checkpoint_tasks
-            .push(CheckpointTask::ConsumerOffsets(Box::new(job)));
+            .push(CheckpointTask::AuxiliaryState(Box::new(job)));
     }
 
     pub(crate) fn store_put_anchors(&mut self, anchors: Vec<SparseEntry>) {

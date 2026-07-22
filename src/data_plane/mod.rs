@@ -7,9 +7,9 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::impl_new_struct_wrapper;
 
 pub(crate) mod actor;
+pub(crate) mod auxiliary_states;
 pub(crate) mod checkpoint;
 pub(crate) mod cold_read;
-pub(crate) mod consumer_offset_management;
 pub(crate) mod messages;
 pub(crate) mod producer_ledger;
 pub(crate) mod recovery;

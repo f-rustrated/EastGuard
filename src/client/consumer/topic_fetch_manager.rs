@@ -10,7 +10,7 @@ use crate::client::consumer::{
 use crate::client::{ClientError, CommitMode, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition, RebalancePlan};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
 use crate::impl_from_variant;
 
 #[cfg(any(test, debug_assertions))]

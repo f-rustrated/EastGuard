@@ -4,7 +4,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::consumer_offset_management::ledger::{ConsumerOffsetKey, EpochSeal};
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{ConsumerOffsetKey, EpochSeal};
 use crate::data_plane::messages::command::{
     AssignSegmentCatchUp, DataPlanePeerMessage, DeleteSegments, PlaceSegment, SegmentMetaSealed,
     SegmentRollCommitted,

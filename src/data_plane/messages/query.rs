@@ -13,7 +13,7 @@ use crate::connections::protocol::{ConsumerOffsetGenerationMismatch, RangeProgre
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, TopicId};
-use crate::data_plane::consumer_offset_management::ledger::{
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
 use crate::data_plane::states::segment::cache::CachedEntry;

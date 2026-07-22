@@ -29,7 +29,7 @@ use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
-use crate::data_plane::consumer_offset_management::ledger::{
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
 pub use codec::CompressionCodec;

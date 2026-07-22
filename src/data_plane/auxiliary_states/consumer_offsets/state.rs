@@ -9,10 +9,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use crate::client::RangeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, TopicId};
-use crate::data_plane::SegmentKey;
+use crate::data_plane::messages::command::AuthorizedProducerIdentity;
+use crate::data_plane::producer_ledger::{AppendKey, ProducerDecision, ProducerLedger};
+use crate::data_plane::{ProducerAppendIdentity, SegmentKey};
 
-const SNAPSHOT_FILE: &str = "consumer-offsets.snapshot";
-const SNAPSHOT_TEMP_FILE: &str = "consumer-offsets.snapshot.tmp";
+const SNAPSHOT_FILE: &str = "auxiliary-state.snapshot";
+const SNAPSHOT_TEMP_FILE: &str = "auxiliary-state.snapshot.tmp";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
 pub(crate) struct ConsumerOffsetKey {
@@ -81,20 +83,47 @@ pub(crate) enum OffsetRecord {
 /// data-plane WAL; this type is only the in-memory cache and its asynchronous
 /// WAL-reclamation snapshot.
 #[derive(Debug, Clone, Default, BorshSerialize, BorshDeserialize)]
-pub(crate) struct OffsetLedger {
+pub(crate) struct AuxiliaryState {
     epochs: HashMap<ConsumerOffsetKey, GenerationId>,
     offsets: HashMap<ConsumerOffsetKey, ConsumerOffsetPosition>,
     installed_placements: HashMap<(TopicId, RangeId), SegmentKey>,
+    producer_ledger: ProducerLedger,
 }
 
-impl OffsetLedger {
+impl AuxiliaryState {
+    pub(crate) fn verify_producer(
+        &mut self,
+        segment_key: SegmentKey,
+        producer: AuthorizedProducerIdentity,
+    ) -> ProducerDecision {
+        self.producer_ledger.verify(segment_key, producer)
+    }
+
+    pub(crate) fn unstage_producer(&mut self, append_key: &AppendKey) {
+        self.producer_ledger.unstage(append_key);
+    }
+
+    pub(crate) fn apply_producer(
+        &mut self,
+        segment_key: SegmentKey,
+        producer: ProducerAppendIdentity,
+        entry_id: EntryId,
+    ) {
+        self.producer_ledger.commit(segment_key, producer, entry_id);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn assert_producer_invariants(&self) {
+        crate::test_traits::TAssertInvariant::assert_invariants(&self.producer_ledger);
+    }
     pub(crate) fn load_snapshot(data_dir: &Path) -> io::Result<Self> {
         let path = data_dir.join(SNAPSHOT_FILE);
-        match fs::read(path) {
-            Ok(bytes) => Self::try_from_slice(&bytes).map_err(io::Error::other),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
-        }
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        Self::try_from_slice(&bytes).map_err(io::Error::other)
     }
 
     pub(crate) fn write_snapshot(&self, data_dir: &Path) -> io::Result<()> {
@@ -222,7 +251,7 @@ mod tests {
     #[test]
     fn placement_readiness_and_graduation_are_distinct() {
         let current = SegmentKey::new(TopicId(1), RangeId(2), SegmentId(4));
-        let mut ledger = OffsetLedger::default();
+        let mut ledger = AuxiliaryState::default();
         ledger.apply(OffsetRecord::PlacementInstalled(current));
 
         assert!(ledger.has_installed_placement(&current));
@@ -239,7 +268,7 @@ mod tests {
             batch_offset: 2,
             absolute_offset: 9,
         };
-        let mut ledger = OffsetLedger::default();
+        let mut ledger = AuxiliaryState::default();
         ledger.apply(OffsetRecord::EpochSeal(EpochSeal {
             key: key(),
             generation: GenerationId(3),
@@ -251,7 +280,7 @@ mod tests {
         }));
         ledger.write_snapshot(dir.path()).unwrap();
 
-        let recovered = OffsetLedger::load_snapshot(dir.path()).unwrap();
+        let recovered = AuxiliaryState::load_snapshot(dir.path()).unwrap();
         assert_eq!(*recovered.generation(&key()), 3);
         assert_eq!(recovered.offset(&key()), Some(position));
     }

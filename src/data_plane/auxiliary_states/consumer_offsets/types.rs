@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 
+use super::state::{ConsumerOffsetUpdate, EpochSeal, OffsetRecord};
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
-use crate::data_plane::consumer_offset_management::ledger::{
-    ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
-};
 use crate::data_plane::messages::command::{
     CommitConsumerOffset, ConsumerOffsetCommitAck, ConsumerOffsetSnapshotInstalled,
 };

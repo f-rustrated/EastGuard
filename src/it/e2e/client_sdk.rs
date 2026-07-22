@@ -22,7 +22,7 @@ use crate::connections::protocol::ClientResponse;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetKey;
 use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
