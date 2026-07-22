@@ -284,7 +284,7 @@ The implemented delivery contract is:
   idempotent.
 - Request identity is part of the replicated data entry and the shared WAL batch. There is
   no producer-only WAL record or additional fsync. Consumer offsets and producer ledgers
-  share `auxiliary-state.snapshot`; startup migrates the legacy consumer-only snapshot.
+  share `auxiliary-state.snapshot`.
 - A retry against a sealed split/merge parent is routed to the frozen parent ledger. A
   committed request returns its old position; a proven next sequence returns stale range
   so the SDK can repartition it to children.
@@ -319,7 +319,6 @@ reachable. An expired request is never accepted merely because its ledger was co
   successor returns the original position for the unresolved retry.
 - Restart all replicas and reconstruct the same frontier and recent window from the
   consolidated snapshot plus committed WAL suffix.
-- Migrate a legacy consumer-only snapshot before reclaiming covered WAL.
 
 ### Topology transitions
 
@@ -336,8 +335,7 @@ the repository's data-plane test rules.
 ## Implementation shape
 
 1. **Storage and WAL framing.** Extend entry identity, generalize the consumer-only
-   checkpoint into the typed D9 auxiliary-state snapshot, and support legacy snapshot
-   migration.
+   checkpoint into the typed D9 auxiliary-state snapshot.
 2. **Local deduplication.** Add the frontier plus recent-result ring and the range-leader
    verification pipeline; change client batching to assign immutable per-range sequences.
 3. **Session lifecycle and fencing.** Add Raft-backed open, recover, renew, expire, and

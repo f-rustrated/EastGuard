@@ -211,11 +211,8 @@ pipeline:
    with one auxiliary-state checkpoint lifecycle.
 3. Keep offset commits and graduation imports in the shared WAL; their WAL fsync is still the
    acknowledgement durability boundary.
-4. On upgrade, load the legacy consumer-offset snapshot when no consolidated snapshot exists,
-   combine it with producer frontier state recovered from WAL, and publish a durable
-   consolidated snapshot before reclaiming either the legacy file or covered WAL.
-5. Remove the legacy snapshot only after the consolidated snapshot's durable rename and
-   directory sync complete.
+4. Reclaim covered WAL only after the consolidated snapshot's durable rename and directory
+   sync complete.
 
 This cleanup removes the independent consumer-snapshot fsync once D10 adds producer state. It
 does not remove the shared-WAL fsync required before acknowledging an offset commit, nor the
