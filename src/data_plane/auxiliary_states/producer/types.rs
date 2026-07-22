@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     client::RangeId,
-    control_plane::metadata::TopicId,
+    control_plane::metadata::{EntryId, TopicId},
     data_plane::{SegmentKey, auxiliary_states::producer::state::ProducerKey},
 };
 
@@ -38,6 +38,8 @@ pub enum ProduceError {
     RequestInFlight,
     #[error("internal produce failure: {0}")]
     Internal(String),
+    #[error("duplicate sequence produce: {0:?}")]
+    Duplicate(EntryId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

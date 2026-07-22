@@ -22,8 +22,9 @@ use crate::data_plane::messages::command::{
 };
 use crate::data_plane::messages::{RequestConsumerOffsetSnapshot, SegmentPlaced};
 
+use crate::data_plane::ProduceError;
 use crate::data_plane::ProducerAppendIdentity;
-use crate::data_plane::auxiliary_states::producer::{ProducerDecision, ProducerTracker};
+use crate::data_plane::auxiliary_states::producer::ProducerTracker;
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -66,7 +67,7 @@ impl AuxiliaryStateManager {
         &mut self,
         segment_key: SegmentKey,
         producer: AuthorizedProducerIdentity,
-    ) -> ProducerDecision {
+    ) -> Result<(), ProduceError> {
         self.producer_tracker.verify(segment_key, producer)
     }
 

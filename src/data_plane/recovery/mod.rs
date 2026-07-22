@@ -195,10 +195,9 @@ mod tests {
     use crate::data_plane::auxiliary_states::consumer_offsets::state::{
         ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
     };
-    use crate::data_plane::auxiliary_states::producer::ProducerDecision;
     use crate::data_plane::messages::AuthorizedProducerIdentity;
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
-    use crate::data_plane::{ProducerAppendIdentity, SegmentKey};
+    use crate::data_plane::{ProduceError, ProducerAppendIdentity, SegmentKey};
 
     /// One bare-payload `(Data, BatchEnd)` batch — the segment-file framing the
     /// checkpoint worker writes (no routing header).
@@ -373,7 +372,7 @@ mod tests {
         );
         assert_eq!(
             ledger.verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
-            ProducerDecision::Duplicate(EntryId(7))
+            Err(ProduceError::Duplicate(EntryId(7)))
         );
 
         let restarted = run(data_dir, &db).unwrap();
@@ -385,7 +384,7 @@ mod tests {
         assert_eq!(
             restarted_tracker
                 .verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
-            ProducerDecision::Duplicate(EntryId(7)),
+            Err(ProduceError::Duplicate(EntryId(7))),
             "the auxiliary snapshot must recover producer sessions after WAL reclamation"
         );
     }
