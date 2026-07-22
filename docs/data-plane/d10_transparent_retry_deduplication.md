@@ -265,8 +265,9 @@ Produce requests add producer id, incarnation, producer-range sequence, and dige
 Successful responses distinguish newly appended, duplicate with position, and duplicate
 without position.
 
-The SDK `Producer` uses this protocol by default. Low-level `Client::produce` remains an
-explicit raw append and therefore remains at-least-once.
+The SDK `Producer` is the production write API and uses this protocol by default. Routing
+and topology tests can exercise the internal range-write path without producer identity;
+that path is not exposed as a production client API.
 
 The implemented delivery contract is:
 

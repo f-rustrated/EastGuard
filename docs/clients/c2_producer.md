@@ -117,15 +117,15 @@ this is; the codec tag says *how to read* it.
 
 ---
 
-## Delivery contract and idempotency seam
+## Delivery contract
 
-Today produce is explicitly **at-least-once**: a produce that times out after the
-leader committed but before the client saw the acknowledgment can be retried and stored
-twice. The UUID and per-record counter currently allocated by the producer do not cross
-the wire and do not participate in a broker decision.
+The SDK producer uses transparent retry deduplication. If an acknowledgment is lost after
+commit, retrying the same immutable batch returns its original position without storing it
+again. Producer identity, incarnation, sequence, and payload digest participate in the
+broker decision and are durable with the append.
 
-The future protocol is specified in
-[D10: Idempotent Production](../data-plane/d10_idempotent_production.md). It assigns a
+The protocol is specified in
+[D10: Transparent Retry Deduplication](../data-plane/d10_transparent_retry_deduplication.md). It assigns a
 sequence to each immutable per-range broker batch and orders each producer-range stream,
 uses metadata-backed incarnations for fencing, and retains range-scoped deduplication
 frontiers across rolls, failover, and lineage changes. A bounded recent-result window
@@ -166,6 +166,6 @@ stable producer UUID as a delivery guarantee.
 - `d6_produce_consume_api.md` — the server's produce routing and redirect contract.
 - `d1_storage_engine.md` — the broker-opaque entry payload and end-to-end compression
   this stamps a codec into.
-- `../data-plane/d10_idempotent_production.md` — session fencing, ordered producer-range streams,
+- `../data-plane/d10_transparent_retry_deduplication.md` — session fencing, ordered producer-range streams,
   durable range ledgers, topology handoff, and bounded retry guarantees.
 - `client_roadmap.md` — the idempotency / batching / compression backlog context.
