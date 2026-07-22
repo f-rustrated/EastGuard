@@ -21,8 +21,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
-    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
-    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
+    EntryId, OpenProducerSession, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta,
+    SegmentMetaState, SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -55,6 +55,20 @@ pub struct OpenProducerSessionRequest {
     pub session_nonce: uuid::Uuid,
 }
 
+impl OpenProducerSessionRequest {
+    pub fn into_command(self) -> OpenProducerSession {
+        const SESSION_TIMEOUT_MS: u64 = 60_000;
+        let observed_at = crate::now_ms();
+        OpenProducerSession {
+            topic_name: self.topic_name,
+            producer_id: self.producer_id,
+            session_nonce: self.session_nonce,
+            observed_at,
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum ConsumerGroupSyncAction {
     Heartbeat,
@@ -69,6 +83,9 @@ pub enum ControlPlaneResponse {
     // DeleteTopic
     TopicDeleted,
     TopicNotFound,
+    /// This node does not own the topic's metadata shard. The hint is absent
+    /// while membership or shard routing is still converging.
+    ShardNotLocal(ShardNotLocal),
     // ListHostedTopics
     TopicList {
         topics: Box<[TopicSummary]>,
@@ -89,6 +106,11 @@ pub enum ControlPlaneResponse {
     ProducerSessionOpened(ProducerSessionOpened),
     // All control plane operations
     InternalError(String),
+}
+
+#[derive(Debug, BorshSerialize, BorshDeserialize)]
+pub struct ShardNotLocal {
+    pub hint_node: Option<NodeAddressInfo>,
 }
 
 #[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]

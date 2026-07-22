@@ -47,6 +47,7 @@ use crate::connections::protocol::{
     ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
     ControlPlaneResponse, DataPlaneResponse, FetchConsumerOffsetRequest,
     OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened, RangeOffsetRequest,
+    ShardNotLocal,
 };
 use crate::data_plane::{ProduceError, ProducerAppendIdentity};
 
@@ -432,9 +433,9 @@ impl Client {
                             ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
                                 Redirect::Done
                             }
-                            ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
-                                hint_node: None,
-                            }) => Redirect::Done,
+                            ClientResponse::ControlPlane(ControlPlaneResponse::ShardNotLocal(
+                                ShardNotLocal { hint_node: None },
+                            )) => Redirect::Done,
                             _ => Self::redirect_target(&response),
                         }
                     } else {
@@ -488,6 +489,11 @@ impl Client {
                     None => Redirect::Reresolve,
                 },
                 ControlPlaneResponse::TopicNotFound => Redirect::NotFound,
+                ControlPlaneResponse::ShardNotLocal(ShardNotLocal { hint_node }) => match hint_node
+                {
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
+                    None => Redirect::Reresolve,
+                },
                 ControlPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 ControlPlaneResponse::TopicCreated
                 | ControlPlaneResponse::AlreadyExists
@@ -503,11 +509,6 @@ impl Client {
                     Some(addr) => Redirect::Follow(addr.client_addr()),
                     None => Redirect::Reresolve,
                 },
-                DataPlaneResponse::ShardNotLocal { hint_node } => match hint_node {
-                    Some(addr) => Redirect::Follow(addr.client_addr()),
-                    None => Redirect::Reresolve,
-                },
-                DataPlaneResponse::TopicNotFound => Redirect::NotFound,
                 DataPlaneResponse::StaleRange => Redirect::Done,
                 DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
                 DataPlaneResponse::SegmentNotLocal

@@ -94,10 +94,10 @@ impl Replaying {
                                 let (header, entry_data) =
                                     RoutingHeader::split_wal_payload(&record.payload)?;
                                 self.writer.replay(&header, entry_data)?;
-                                if let Some(producer) = header.producer {
+                                if let Some(producer_identity) = header.producer_identity {
                                     self.producer.advance(
                                         header.segment_key(),
-                                        producer,
+                                        producer_identity,
                                         header.entry_id,
                                     );
                                 }

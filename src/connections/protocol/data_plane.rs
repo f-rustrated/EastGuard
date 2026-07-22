@@ -137,11 +137,7 @@ pub enum DataPlaneResponse {
     NotWriteLeader {
         leader_addr: Option<NodeAddressInfo>,
     },
-    ShardNotLocal {
-        hint_node: Option<NodeAddressInfo>,
-    },
     StaleRange,
-    TopicNotFound,
     SegmentNotLocal,
 
     ConsumerOffsetCommitted,
@@ -155,9 +151,7 @@ impl DataPlaneResponse {
     pub fn is_routing_error(&self) -> bool {
         matches!(
             self,
-            DataPlaneResponse::SegmentNotLocal
-                | DataPlaneResponse::ShardNotLocal { .. }
-                | DataPlaneResponse::NotWriteLeader { .. }
+            DataPlaneResponse::SegmentNotLocal | DataPlaneResponse::NotWriteLeader { .. }
         )
     }
 

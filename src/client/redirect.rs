@@ -15,6 +15,7 @@ use crate::client::Client;
 use crate::client::error::ClientError;
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneResponse, DataPlaneResponse,
+    ShardNotLocal,
 };
 
 /// Consecutive hint-follows before forcing a backoff — breaks a redirect cycle
@@ -177,6 +178,12 @@ mod tests {
         );
         assert_eq!(
             classify(&ClientResponse::ControlPlane(
+                ControlPlaneResponse::ShardNotLocal(ShardNotLocal { hint_node: None })
+            )),
+            "reresolve"
+        );
+        assert_eq!(
+            classify(&ClientResponse::ControlPlane(
                 ControlPlaneResponse::TopicCreated
             )),
             "done"
@@ -192,16 +199,6 @@ mod tests {
                 }
             )),
             "follow"
-        );
-        assert_eq!(
-            classify(&ClientResponse::DataPlane(
-                DataPlaneResponse::ShardNotLocal { hint_node: None }
-            )),
-            "reresolve"
-        );
-        assert_eq!(
-            classify(&ClientResponse::DataPlane(DataPlaneResponse::TopicNotFound)),
-            "notfound"
         );
         assert_eq!(
             classify(&ClientResponse::DataPlane(

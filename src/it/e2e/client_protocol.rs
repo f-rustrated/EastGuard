@@ -7,7 +7,7 @@ use crate::StartUp;
 use crate::connections::protocol::{
     AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
     ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, FetchRequest,
-    NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
+    NodeState, ProduceRequest, RangeProgressSignal, ShardNotLocal, TopicDetail,
 };
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
@@ -1839,9 +1839,9 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
         ClientResponse::DataPlane(DataPlaneResponse::NotWriteLeader {
             leader_addr: Some(addr),
         }) => ProduceOutcome::Redirect(addr.client_addr()),
-        ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
+        ClientResponse::ControlPlane(ControlPlaneResponse::ShardNotLocal(ShardNotLocal {
             hint_node: Some(addr),
-        }) => ProduceOutcome::Redirect(addr.client_addr()),
+        })) => ProduceOutcome::Redirect(addr.client_addr()),
         _ => ProduceOutcome::Retry,
     }
 }

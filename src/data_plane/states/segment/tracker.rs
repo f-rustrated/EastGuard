@@ -108,7 +108,7 @@ impl SegmentTracker {
         for (i, staged) in self.staged_entries.iter().enumerate() {
             let entry_id = self.next_entry_id + i as u64;
             let header = RoutingHeader::new(staged.segment_key, entry_id, staged.record_count)
-                .with_producer(staged.producer);
+                .with_producer(staged.producer_identity);
             let _ = WalRecord::data(header.build_wal_payload(&staged.data), staged.record_count)
                 .encode_to(wal_buf);
         }
@@ -121,7 +121,7 @@ impl SegmentTracker {
     pub(crate) fn abort_staged(&mut self) -> Box<[crate::data_plane::ProducerAppendIdentity]> {
         self.staged_entries
             .drain(..)
-            .filter_map(|entry| entry.producer)
+            .filter_map(|entry| entry.producer_identity)
             .collect()
     }
 
@@ -136,7 +136,7 @@ impl SegmentTracker {
                     record_count: s.record_count,
                     entry_id,
                     lsn,
-                    producer_append_id: s.producer,
+                    producer_append_id: s.producer_identity,
                 });
                 self.cache.publish(entry.clone());
                 entry
@@ -170,7 +170,7 @@ impl SegmentTracker {
     ) -> impl Iterator<Item = (EntryPayload, u32, Option<ProducerAppendIdentity>)> + '_ {
         self.staged_entries
             .iter()
-            .map(|s| (s.data.clone(), s.record_count, s.producer))
+            .map(|s| (s.data.clone(), s.record_count, s.producer_identity))
     }
 
     // carrying over uncommitted data!
