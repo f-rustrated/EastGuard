@@ -120,11 +120,25 @@ fn client_produce_routes_to_write_leader() -> turmoil::Result {
 
         // The SDK absorbs the post-create segment-assignment lag inside produce.
         let first = client
-            .produce("produce-route", b"k", b"rec-0".to_vec(), 1)
+            .produce_to_range(
+                "produce-route",
+                RangeId(0),
+                b"k",
+                b"rec-0".to_vec(),
+                1,
+                None,
+            )
             .await
             .expect("first produce acked");
         let second = client
-            .produce("produce-route", b"k", b"rec-1".to_vec(), 1)
+            .produce_to_range(
+                "produce-route",
+                RangeId(0),
+                b"k",
+                b"rec-1".to_vec(),
+                1,
+                None,
+            )
             .await
             .expect("second produce acked");
         assert!(
@@ -150,16 +164,16 @@ fn client_multiplexes_concurrent_requests() -> turmoil::Result {
         client.create_topic("mux", policy()).await.expect("create");
         // Warm the cache + segment assignment so the burst below routes directly.
         let warm = client
-            .produce("mux", b"k", b"warm".to_vec(), 1)
+            .produce_to_range("mux", RangeId(0), b"k", b"warm".to_vec(), 1, None)
             .await
             .expect("warmup produce");
 
         // Four produces + two describes concurrently over the shared connection.
         let (a, b, c, d, e, f) = tokio::join!(
-            client.produce("mux", b"k", b"p1".to_vec(), 1),
-            client.produce("mux", b"k", b"p2".to_vec(), 1),
-            client.produce("mux", b"k", b"p3".to_vec(), 1),
-            client.produce("mux", b"k", b"p4".to_vec(), 1),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p1".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p2".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p3".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p4".to_vec(), 1, None),
             client.resolve_topic("mux"),
             client.resolve_topic("mux"),
         );
@@ -205,7 +219,7 @@ fn client_reconnects_after_node_crash() -> turmoil::Result {
             .await
             .expect("create");
         client
-            .produce("reconnect", b"k", b"rec-0".to_vec(), 1)
+            .produce_to_range("reconnect", RangeId(0), b"k", b"rec-0".to_vec(), 1, None)
             .await
             .expect("produce");
 
@@ -286,7 +300,7 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
 
         // Starts at `wrong`, gets NotWriteLeader{real}, follows once, commits.
         client
-            .produce("stale", b"k", b"rec-1".to_vec(), 1)
+            .produce_to_range("stale", RangeId(0), b"k", b"rec-1".to_vec(), 1, None)
             .await
             .expect("produce self-corrects through the redirect");
 
@@ -296,7 +310,7 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
             "stale entry dropped after the corrected produce"
         );
         client
-            .produce("stale", b"k", b"rec-2".to_vec(), 1)
+            .produce_to_range("stale", RangeId(0), b"k", b"rec-2".to_vec(), 1, None)
             .await
             .expect("produce after re-resolve");
         assert_eq!(
@@ -842,13 +856,15 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, |env| {
         sim_cluster(env);
-        // Force fast size-based rolls
-        env.segment_size_limit_bytes = 10;
+        // The five encoded records cross this once near the end. Rolling every
+        // individual record turns this consumer test into a topology-race test.
+        env.segment_size_limit_bytes = 80;
     });
 
     sim.client("test-client", async {
         let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
-        let custom_policy = policy();
+        let mut custom_policy = policy();
+        custom_policy.partition_strategy = PartitionStrategy::Fixed;
         client
             .create_topic("basic-consume", custom_policy)
             .await
@@ -880,7 +896,7 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             producer
                 .send(key.as_bytes(), val)
                 .await
-                .expect("produce record");
+                .unwrap_or_else(|error| panic!("produce record {i}: {error:?}"));
         }
 
         // Consume them with Earliest
@@ -1942,7 +1958,14 @@ fn producer_split_fence_retry() -> turmoil::Result {
 
         for i in 0..3 {
             client_admin
-                .produce(topic, b"k", b"longer_than_ten_bytes".to_vec(), 1)
+                .produce_to_range(
+                    topic,
+                    RangeId(0),
+                    b"k",
+                    b"longer_than_ten_bytes".to_vec(),
+                    1,
+                    None,
+                )
                 .await
                 .expect("produce trigger record");
             wait_for_segment_roll(&client_admin, topic, 0, (i + 1) as u64).await;

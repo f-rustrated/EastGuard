@@ -403,6 +403,7 @@ async fn produce_until_acked(
         routing_key: b"campaign-key".to_vec(),
         data: payload.to_vec(),
         record_count: 1,
+        producer: None,
     }));
     loop {
         for (host, port) in nodes {
