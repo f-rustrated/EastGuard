@@ -17,7 +17,9 @@ use self::inventory::{LocalInventory, RecoveryOutput};
 use self::replay::ReplayWriter;
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
-use crate::data_plane::consumer_offset_management::ledger::{OffsetLedger, OffsetRecord};
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{ConsumerOffsets, OffsetRecord};
+use crate::data_plane::auxiliary_states::producer::ProducerTracker;
+use crate::data_plane::auxiliary_states::state::AuxiliarySnapshot;
 use crate::data_plane::sparse_index::SparseIndex;
 use crate::data_plane::states::segment::record::RoutingHeader;
 use crate::data_plane::wal::WalRecordType;
@@ -56,7 +58,8 @@ struct Replaying {
     data_dir: PathBuf,
     writer: ReplayWriter,
     scanner: WalScanner,
-    offsets: OffsetLedger,
+    offsets: ConsumerOffsets,
+    producer: ProducerTracker,
 }
 
 impl Replaying {
@@ -64,12 +67,13 @@ impl Replaying {
         let recovered = RecoveredSegments::scan_data_dir(&data_dir)?;
         let writer = ReplayWriter::new(data_dir.clone(), recovered);
         let scanner = WalScanner::open(&data_dir)?;
-        let offsets = OffsetLedger::load_snapshot(&data_dir)?;
+        let snapshot = AuxiliarySnapshot::load(&data_dir)?;
         Ok(Self {
             data_dir,
             writer,
             scanner,
-            offsets,
+            offsets: snapshot.consumer_offsets,
+            producer: ProducerTracker::from_sessions(snapshot.producer_sessions),
         })
     }
 
@@ -90,6 +94,13 @@ impl Replaying {
                                 let (header, entry_data) =
                                     RoutingHeader::split_wal_payload(&record.payload)?;
                                 self.writer.replay(&header, entry_data)?;
+                                if let Some(producer) = header.producer {
+                                    self.producer.advance(
+                                        header.segment_key(),
+                                        producer,
+                                        header.entry_id,
+                                    );
+                                }
                             }
                             WalRecordType::ConsumerOffset => {
                                 let offset = OffsetRecord::try_from_slice(&record.payload)
@@ -124,6 +135,7 @@ impl Replaying {
             scanner: self.scanner,
             recovered,
             offsets: self.offsets,
+            producer: self.producer,
         })
     }
 }
@@ -132,7 +144,8 @@ struct Durable {
     data_dir: PathBuf,
     scanner: WalScanner,
     recovered: RecoveredSegments,
-    offsets: OffsetLedger,
+    offsets: ConsumerOffsets,
+    producer: ProducerTracker,
 }
 
 impl Durable {
@@ -154,12 +167,17 @@ impl Durable {
         }
 
         let inventory = LocalInventory::from_recovered(&self.recovered);
-        self.offsets.write_snapshot(&self.data_dir)?;
+        AuxiliarySnapshot {
+            consumer_offsets: self.offsets.clone(),
+            producer_sessions: self.producer.sessions(),
+        }
+        .write(&self.data_dir)?;
         self.scanner.delete_files()?;
         Ok(RecoveryOutput {
             inventory,
             data_dir: self.data_dir,
             offsets: self.offsets,
+            producer: self.producer,
         })
     }
 }
@@ -174,11 +192,13 @@ mod tests {
     use super::segment_scan::scan_segment_file;
     use super::*;
     use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
-    use crate::data_plane::SegmentKey;
-    use crate::data_plane::consumer_offset_management::ledger::{
+    use crate::data_plane::auxiliary_states::consumer_offsets::state::{
         ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetRecord,
     };
+    use crate::data_plane::auxiliary_states::producer::ProducerDecision;
+    use crate::data_plane::messages::AuthorizedProducerIdentity;
     use crate::data_plane::wal::{WalRecord, WalStorage, WalWriter};
+    use crate::data_plane::{ProducerAppendIdentity, SegmentKey};
 
     /// One bare-payload `(Data, BatchEnd)` batch — the segment-file framing the
     /// checkpoint worker writes (no routing header).
@@ -197,6 +217,17 @@ mod tests {
         let wal_payload = RoutingHeader::new(key, EntryId(entry_id), record_count)
             .build_wal_payload(payload.as_bytes());
         WalRecord::data(wal_payload, record_count)
+    }
+
+    fn wal_producer_data(
+        key: SegmentKey,
+        entry_id: u64,
+        producer: ProducerAppendIdentity,
+    ) -> WalRecord {
+        let wal_payload = RoutingHeader::new(key, EntryId(entry_id), 1)
+            .with_producer(Some(producer))
+            .build_wal_payload(b"data");
+        WalRecord::data(wal_payload, 1)
     }
 
     fn wal_offset(record: OffsetRecord) -> WalRecord {
@@ -314,6 +345,49 @@ mod tests {
         let restarted = run(data_dir, &db).unwrap();
         assert_eq!(*restarted.offsets.generation(&key), 4);
         assert_eq!(restarted.offsets.offset(&key), Some(position));
+    }
+
+    #[test]
+    fn recovers_producer_deduplication_from_the_shared_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let key = SegmentKey::new(TopicId(1), RangeId(2), SegmentId(0));
+        let producer = ProducerAppendIdentity {
+            producer_id: uuid::Uuid::new_v4(),
+            incarnation: 1,
+            expires_at: u64::MAX,
+            sequence: 0,
+            digest: 9,
+        };
+        write_wal(
+            &data_dir,
+            1,
+            &wal_batch(&[wal_producer_data(key, 7, producer)]),
+        );
+
+        let (_db_dir, db) = open_db();
+        let output = run(data_dir.clone(), &db).unwrap();
+        let mut ledger = crate::data_plane::auxiliary_states::AuxiliaryStateManager::from_recovery(
+            output.offsets,
+            output.producer,
+        );
+        assert_eq!(
+            ledger.verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
+            ProducerDecision::Duplicate(EntryId(7))
+        );
+
+        let restarted = run(data_dir, &db).unwrap();
+        let mut restarted_tracker =
+            crate::data_plane::auxiliary_states::AuxiliaryStateManager::from_recovery(
+                restarted.offsets,
+                restarted.producer,
+            );
+        assert_eq!(
+            restarted_tracker
+                .verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer)),
+            ProducerDecision::Duplicate(EntryId(7)),
+            "the auxiliary snapshot must recover producer sessions after WAL reclamation"
+        );
     }
 
     #[test]

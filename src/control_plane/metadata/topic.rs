@@ -8,6 +8,7 @@ use crate::{
         metadata::{
             error::MetadataError,
             event::ConsumerGroupEpochSnapshot,
+            producer_sessions::ProducerSessions,
             strategy::{PartitionStrategy, StoragePolicy},
         },
     },
@@ -32,7 +33,9 @@ pub struct TopicMeta {
     pub ranges: HashMap<RangeId, RangeMeta>,
     pub next_range_id: u64,
     pub(crate) consumer_groups: HashMap<String, ConsumerGroupMeta>,
+    pub(crate) producer_sessions: ProducerSessions,
 }
+
 impl TopicMeta {
     pub(crate) fn new(
         name: String,
@@ -59,6 +62,7 @@ impl TopicMeta {
             ranges: HashMap::from([(range_id, range)]),
             next_range_id: 1,
             consumer_groups: HashMap::new(),
+            producer_sessions: Default::default(),
         }
     }
 
@@ -495,6 +499,7 @@ impl TopicMeta {
     pub(crate) fn delete(&mut self) {
         self.state = TopicState::Deleted;
         self.active_ranges.clear();
+        self.producer_sessions.clear();
 
         for range in self.ranges.values_mut() {
             range.delete();
@@ -528,6 +533,12 @@ pub mod props {
             }
             for group in self.consumer_groups.values() {
                 group.assert_assignments(&self.active_ranges);
+            }
+            if self.state == TopicState::Deleted {
+                assert!(
+                    self.producer_sessions.is_empty(),
+                    "deleted topic retains producer sessions"
+                );
             }
         }
     }

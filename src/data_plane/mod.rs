@@ -1,7 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::impl_new_struct_wrapper;
@@ -11,7 +10,6 @@ pub(crate) mod auxiliary_states;
 pub(crate) mod checkpoint;
 pub(crate) mod cold_read;
 pub(crate) mod messages;
-pub(crate) mod producer_ledger;
 pub(crate) mod recovery;
 pub(crate) mod segment_writer;
 pub(crate) mod sparse_index;
@@ -30,38 +28,7 @@ pub struct SegmentKey {
     pub segment_id: SegmentId,
 }
 
-/// Stable identity of one producer append. The range is supplied by the
-/// enclosing `SegmentKey`, so it is deliberately not duplicated here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
-pub struct ProducerAppendIdentity {
-    pub producer_id: Uuid,
-    pub incarnation: u32,
-    pub expires_at: u64,
-    pub sequence: u64,
-    pub digest: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, thiserror::Error)]
-pub enum ProduceError {
-    #[error("not the write leader")]
-    NotLeader,
-    #[error("segment not found")]
-    SegmentNotFound,
-    #[error("producer incarnation was fenced")]
-    ProducerFenced,
-    #[error("producer session expired or is unknown")]
-    SessionExpired,
-    #[error("sequence was reused with a different payload")]
-    RequestIdentityConflict,
-    #[error("duplicate position is outside the retained result window")]
-    DuplicatePositionUnavailable,
-    #[error("sequence gap; expected {0}")]
-    SequenceGap(u64),
-    #[error("the same producer request is already in flight")]
-    RequestInFlight,
-    #[error("internal produce failure: {0}")]
-    Internal(String),
-}
+pub use auxiliary_states::producer::{ProduceError, ProducerAppendIdentity};
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct EntryPayload(Bytes);

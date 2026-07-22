@@ -1,6 +1,8 @@
 use super::consumer_offsets::state::{
-    AuxiliaryState, ConsumerOffsetKey, ConsumerOffsetPosition, EpochSeal, OffsetRecord, StaleEpoch,
+    ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsets, EpochSeal, OffsetRecord, StaleEpoch,
 };
+use super::state::AuxiliarySnapshot;
+use crate::client::EntryId;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
@@ -20,7 +22,7 @@ use crate::data_plane::messages::command::{
 use crate::data_plane::messages::{RequestConsumerOffsetSnapshot, SegmentPlaced};
 
 use crate::data_plane::ProducerAppendIdentity;
-use crate::data_plane::producer_ledger::{AppendKey, ProducerDecision};
+use crate::data_plane::auxiliary_states::producer::{AppendKey, ProducerDecision, ProducerTracker};
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -29,9 +31,10 @@ use super::consumer_offsets::types::*;
 
 #[derive(Default)]
 pub(crate) struct AuxiliaryStateManager {
-    durable: AuxiliaryState,
-    coordination: ConsumerOffsetCoordination, // live placements, pending mutations, parked commits, and replication tracking
-    checkpoint: AuxiliaryCheckpointState,     // WAL reclamation and checkpoint progress
+    offsets: ConsumerOffsets,
+    consumer_coord: ConsumerOffsetCoordination, // live placements, pending mutations, parked commits, and replication tracking
+    producer: ProducerTracker,
+    checkpoint: AuxiliaryCheckpointState, // WAL reclamation and checkpoint progress
 }
 
 #[derive(Default)]
@@ -42,9 +45,15 @@ struct AuxiliaryCheckpointState {
 }
 
 impl AuxiliaryStateManager {
-    pub(crate) fn new(durable: AuxiliaryState) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(offsets: ConsumerOffsets) -> Self {
+        Self::from_recovery(offsets, ProducerTracker::default())
+    }
+
+    pub(crate) fn from_recovery(offsets: ConsumerOffsets, producer: ProducerTracker) -> Self {
         Self {
-            durable,
+            offsets,
+            producer,
             ..Default::default()
         }
     }
@@ -54,34 +63,34 @@ impl AuxiliaryStateManager {
         segment_key: SegmentKey,
         producer: AuthorizedProducerIdentity,
     ) -> ProducerDecision {
-        self.durable.verify_producer(segment_key, producer)
+        self.producer.verify(segment_key, producer)
     }
 
     pub(crate) fn unstage_producer(&mut self, append_key: &AppendKey) {
-        self.durable.unstage_producer(append_key);
+        self.producer.unstage(append_key);
     }
 
-    pub(crate) fn commit_producer(
+    pub(crate) fn advance_producer(
         &mut self,
         segment_key: SegmentKey,
         producer: ProducerAppendIdentity,
-        entry_id: crate::control_plane::metadata::EntryId,
+        entry_id: EntryId,
         lsn: u64,
     ) {
-        self.durable.apply_producer(segment_key, producer, entry_id);
+        self.producer.advance(segment_key, producer, entry_id);
         self.mark_auxiliary_state_dirty(lsn);
     }
 
     pub(crate) fn push_future(&mut self, key: ConsumerOffsetKey, future: FutureOffsetCommit) {
-        self.coordination.future_entry(key).push(future);
+        self.consumer_coord.future_entry(key).push(future);
     }
 
     pub(crate) fn offset(&self, key: &ConsumerOffsetKey) -> Option<ConsumerOffsetPosition> {
-        self.durable.offset(key)
+        self.offsets.offset(key)
     }
 
     pub(crate) fn durable_generation(&self, key: &ConsumerOffsetKey) -> GenerationId {
-        self.durable.generation(key)
+        self.offsets.generation(key)
     }
 
     pub(crate) fn commit_consumer_offset(
@@ -172,14 +181,17 @@ impl AuxiliaryStateManager {
         self.checkpoint.in_flight = true;
         Some(AuxiliaryCheckpointJob {
             checkpointed_lsn: *self.latest_uncheckpointed_lsn()?,
-            offsets: self.durable.clone(),
+            snapshot: AuxiliarySnapshot {
+                consumer_offsets: self.offsets.clone(),
+                producer_sessions: self.producer.sessions(),
+            },
             data_dir,
         })
     }
 
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn assert_producer_invariants(&self) {
-        self.durable.assert_producer_invariants();
+        self.producer.assert_invariants();
     }
 
     pub(crate) fn auxiliary_checkpoint_in_flight(&self) -> bool {
@@ -199,7 +211,7 @@ impl AuxiliaryStateManager {
         }
 
         // need to place!
-        let local_placement_installed = self.durable.has_installed_placement(&segment_key);
+        let local_placement_installed = self.offsets.has_installed_placement(&segment_key);
         let replica_states = replicas
             .iter()
             .cloned()
@@ -212,7 +224,7 @@ impl AuxiliaryStateManager {
                 (node, state)
             })
             .collect();
-        self.coordination.placements.insert(
+        self.consumer_coord.placements.insert(
             segment_key.placement_key(),
             OffsetPlacement {
                 segment_key,
@@ -230,7 +242,7 @@ impl AuxiliaryStateManager {
         segment_key: &SegmentKey,
         replicas: &Replicas,
     ) -> PlacementObservation {
-        self.coordination
+        self.consumer_coord
             .placements
             .get(&(segment_key.topic_id, segment_key.range_id))
             .map(|placement| placement.compare(segment_key, replicas))
@@ -316,7 +328,7 @@ impl AuxiliaryStateManager {
             .collect();
 
         if segment_key.segment_id == SegmentId(0)
-            || self.durable.has_installed_placement(&segment_key)
+            || self.offsets.has_installed_placement(&segment_key)
         {
             replica_states.insert(leader.clone(), OffsetReplicaState::Ready);
         }
@@ -324,7 +336,7 @@ impl AuxiliaryStateManager {
     }
 
     fn get_placement(&self, placement_key: &(TopicId, RangeId)) -> Option<&OffsetPlacement> {
-        self.coordination.placements.get(placement_key)
+        self.consumer_coord.placements.get(placement_key)
     }
 
     fn get_placement_followers(&self, cmd: &CommitConsumerOffset) -> HashSet<NodeId> {
@@ -344,7 +356,7 @@ impl AuxiliaryStateManager {
         &mut self,
         placement_key: &(TopicId, RangeId),
     ) -> Option<&mut OffsetPlacement> {
-        self.coordination.placements.get_mut(placement_key)
+        self.consumer_coord.placements.get_mut(placement_key)
     }
 
     pub(crate) fn install_consumer_offsets(
@@ -356,12 +368,12 @@ impl AuxiliaryStateManager {
         let mut bootstrapped_keys = HashSet::new();
         for entry in cmd.entries {
             bootstrapped_keys.insert(entry.key.clone());
-            self.coordination.push_pending(PendingOffsetMutation::new(
+            self.consumer_coord.push_pending(PendingOffsetMutation::new(
                 OffsetRecord::BootstrapEntry(entry),
                 OffsetMutationCompletion::EpochSeal,
             ));
         }
-        self.coordination.push_pending(PendingOffsetMutation::new(
+        self.consumer_coord.push_pending(PendingOffsetMutation::new(
             OffsetRecord::PlacementInstalled(cmd.segment_key),
             ConsumerOffsetSnapshotInstalled {
                 segment_key: cmd.segment_key,
@@ -388,7 +400,7 @@ impl AuxiliaryStateManager {
             });
 
         // Reject only when the source is neither live-ready nor durably eligible.
-        if !live_ready && !self.durable.can_source_snapshot_for(&request.segment_key) {
+        if !live_ready && !self.offsets.can_source_snapshot_for(&request.segment_key) {
             return None;
         }
         Some(DataTransportCommand::send_to_targets(
@@ -404,7 +416,7 @@ impl AuxiliaryStateManager {
     ) -> ConsumerOffsetSnapshot {
         ConsumerOffsetSnapshot {
             entries: self
-                .durable
+                .offsets
                 .snapshot_range(segment_key.topic_id, segment_key.range_id),
             segment_key,
             replica_set,
@@ -446,11 +458,11 @@ impl AuxiliaryStateManager {
     }
 
     fn mark_offset_replica_ready_if_caught_up(&mut self, node: &NodeId) -> bool {
-        if self.coordination.has_pending_replication_for(node) {
+        if self.consumer_coord.has_pending_replication_for(node) {
             return false;
         }
         let mut readiness_changed = false;
-        for placement in self.coordination.placements.values_mut() {
+        for placement in self.consumer_coord.placements.values_mut() {
             if placement.replica_states.get(node) == Some(&OffsetReplicaState::SnapshotInstalled) {
                 placement
                     .replica_states
@@ -462,7 +474,7 @@ impl AuxiliaryStateManager {
     }
 
     pub(crate) fn drain_ready_placements(&mut self, from: &NodeId) -> Vec<SegmentPlaced> {
-        self.coordination
+        self.consumer_coord
             .placements
             .values_mut()
             .filter_map(|placement| {
@@ -500,16 +512,16 @@ impl AuxiliaryStateManager {
     }
 
     pub(crate) fn has_pending_offsets(&self) -> bool {
-        self.coordination.has_pending_offsets()
+        self.consumer_coord.has_pending_offsets()
     }
 
     pub(crate) fn push_pending_offset_mutation(&mut self, cmd: impl Into<PendingOffsetMutation>) {
-        self.coordination.push_pending(cmd.into());
+        self.consumer_coord.push_pending(cmd.into());
     }
 
     pub(crate) fn handle_replica_offset_ack(&mut self, ack: ConsumerOffsetReplicated) -> bool {
         let from = ack.from.clone();
-        self.coordination.ack_replication(ack);
+        self.consumer_coord.ack_replication(ack);
         self.mark_offset_replica_ready_if_caught_up(&from)
     }
 
@@ -527,22 +539,22 @@ impl AuxiliaryStateManager {
     }
 
     pub(crate) fn latest_generation(&self, key: &ConsumerOffsetKey) -> GenerationId {
-        self.coordination
+        self.consumer_coord
             .latest_generation(key)
             // No pending EpochSeals, fall back to the actual ledger's generation
-            .unwrap_or_else(|| self.durable.generation(key))
+            .unwrap_or_else(|| self.offsets.generation(key))
     }
 
     pub(crate) fn encode_offsets(&mut self) -> Result<Vec<Vec<u8>>, std::io::Error> {
-        self.coordination.encode_offsets()
+        self.consumer_coord.encode_offsets()
     }
 
     pub(crate) fn take_pending(&mut self) -> Vec<PendingOffsetMutation> {
-        self.coordination.take_pending()
+        self.consumer_coord.take_pending()
     }
 
     pub(crate) fn fail_inflight_coordination(&mut self, error: &str) {
-        self.coordination.fail_all(error);
+        self.consumer_coord.fail_all(error);
     }
 
     pub(crate) fn flush_batch(
@@ -557,7 +569,7 @@ impl AuxiliaryStateManager {
         }
 
         for PendingOffsetMutation { record, completion } in pending {
-            self.durable.apply(record.clone());
+            self.offsets.apply(record.clone());
             match completion {
                 OffsetMutationCompletion::EpochSeal => {}
                 OffsetMutationCompletion::LeaderCommit(commit) => {
@@ -572,7 +584,7 @@ impl AuxiliaryStateManager {
                         continue;
                     }
 
-                    let seq = self.coordination.begin_replication(
+                    let seq = self.consumer_coord.begin_replication(
                         followers.clone().into_iter().collect(),
                         commit.required_followers,
                         offset_commit.clone(),
@@ -621,7 +633,7 @@ impl AuxiliaryStateManager {
     }
 
     fn take_future_commits(&mut self, key: ConsumerOffsetKey) -> Vec<FutureOffsetCommit> {
-        self.coordination.take_future_commits(&key)
+        self.consumer_coord.take_future_commits(&key)
     }
 
     #[cfg(test)]
@@ -671,7 +683,7 @@ mod tests {
     fn observed_placement_restores_local_durable_readiness() {
         let local = NodeId::new("b");
         let current = segment(2);
-        let mut ledger = AuxiliaryState::default();
+        let mut ledger = ConsumerOffsets::default();
         ledger.apply(OffsetRecord::PlacementInstalled(current));
         let mut manager = AuxiliaryStateManager::new(ledger);
 
@@ -679,7 +691,7 @@ mod tests {
         manager.observe_placement(current, ShardGroupId(0), &replicas, &local);
 
         let placement = manager
-            .coordination
+            .consumer_coord
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
@@ -692,10 +704,10 @@ mod tests {
         let leader = NodeId::new("a");
         let replicas = Replicas::new(vec![leader, local.clone()]);
         let current = segment(2);
-        let mut manager = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let mut manager = AuxiliaryStateManager::new(ConsumerOffsets::default());
         manager.observe_placement(current, ShardGroupId(0), &replicas, &local);
         let live_placement = manager
-            .coordination
+            .consumer_coord
             .placements
             .get_mut(&(current.topic_id, current.range_id))
             .unwrap();
@@ -707,7 +719,7 @@ mod tests {
         manager.observe_placement(current, ShardGroupId(0), &replicas, &local);
 
         let placement = manager
-            .coordination
+            .consumer_coord
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
@@ -725,13 +737,13 @@ mod tests {
         let stale_replicas = Replicas::new(vec![NodeId::new("old"), local.clone()]);
         let current = segment(2);
         let stale = segment(1);
-        let mut manager = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let mut manager = AuxiliaryStateManager::new(ConsumerOffsets::default());
         manager.observe_placement(current, ShardGroupId(0), &current_replicas, &local);
 
         manager.observe_placement(stale, ShardGroupId(0), &stale_replicas, &local);
 
         let placement = manager
-            .coordination
+            .consumer_coord
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
@@ -745,7 +757,7 @@ mod tests {
         let follower = NodeId::new("b");
         let current = segment(2);
         let current_replicas = Replicas::new(vec![leader.clone(), follower]);
-        let mut manager = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let mut manager = AuxiliaryStateManager::new(ConsumerOffsets::default());
 
         manager.install_leader_placement(current, ShardGroupId(7), current_replicas.clone());
 
@@ -769,7 +781,7 @@ mod tests {
         );
 
         let placement = manager
-            .coordination
+            .consumer_coord
             .placements
             .get(&(current.topic_id, current.range_id))
             .unwrap();
@@ -782,7 +794,7 @@ mod tests {
         let old_leader = NodeId::new("a");
         let retained = NodeId::new("b");
         let new_leader = NodeId::new("d");
-        let mut manager = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let mut manager = AuxiliaryStateManager::new(ConsumerOffsets::default());
         manager.install_leader_placement(
             segment(1),
             ShardGroupId(7),
@@ -844,14 +856,14 @@ mod tests {
             requester: new_leader.clone(),
         };
 
-        let empty = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let empty = AuxiliaryStateManager::new(ConsumerOffsets::default());
         assert!(
             empty
                 .create_offset_snapshot(request.clone(), &NodeId::new("empty"))
                 .is_none()
         );
 
-        let mut ledger = AuxiliaryState::default();
+        let mut ledger = ConsumerOffsets::default();
         ledger.apply(OffsetRecord::PlacementInstalled(old_segment));
         ledger.apply(OffsetRecord::EpochSeal(EpochSeal {
             key: key(),
@@ -897,7 +909,7 @@ mod tests {
         let retained = NodeId::new("b");
         let removed = NodeId::new("c");
         let joining = NodeId::new("d");
-        let mut ledger = AuxiliaryState::default();
+        let mut ledger = ConsumerOffsets::default();
         ledger.apply(OffsetRecord::EpochSeal(EpochSeal {
             key: key(),
             generation: GenerationId(1),
@@ -908,7 +920,7 @@ mod tests {
             position: position(),
         }));
         let mut manager = AuxiliaryStateManager::new(ledger);
-        manager.coordination.placements.insert(
+        manager.consumer_coord.placements.insert(
             (TopicId(1), RangeId(2)),
             OffsetPlacement {
                 segment_key: segment(1),
@@ -991,10 +1003,10 @@ mod tests {
 
     #[test]
     fn fail_all_resolves_pending_in_flight_and_future_clients() {
-        let mut manager = AuxiliaryStateManager::new(AuxiliaryState::default());
+        let mut manager = AuxiliaryStateManager::new(ConsumerOffsets::default());
         let (pending_reply, mut pending_response) = oneshot::channel();
         manager
-            .coordination
+            .consumer_coord
             .push_pending(PendingOffsetMutation::new(
                 OffsetRecord::OffsetCommit(ConsumerOffsetUpdate {
                     key: key(),
@@ -1022,7 +1034,7 @@ mod tests {
         );
 
         let (replication_reply, mut replication_response) = oneshot::channel();
-        manager.coordination.begin_replication(
+        manager.consumer_coord.begin_replication(
             HashSet::from_iter([NodeId::new("follower")]),
             HashSet::from_iter([NodeId::new("follower")]),
             ConsumerOffsetUpdate {
@@ -1039,6 +1051,6 @@ mod tests {
         assert_eq!(pending_response.try_recv().unwrap(), expected);
         assert_eq!(future_response.try_recv().unwrap(), expected);
         assert_eq!(replication_response.try_recv().unwrap(), expected);
-        assert!(manager.coordination.is_empty());
+        assert!(manager.consumer_coord.is_empty());
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use flume::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::auxiliary_states::consumer_offsets::state::AuxiliaryState;
+use crate::data_plane::auxiliary_states::state::AuxiliarySnapshot;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 use crate::data_plane::wal::WalRecord;
 
@@ -70,8 +70,8 @@ impl CheckpointWorker {
 
                 // A snapshot is created only when WAL reclamation would cross an uncheckpointed offset record.
                 CheckpointTask::AuxiliaryState(job) => {
-                    if let Err(e) = job.offsets.write_snapshot(&job.data_dir) {
-                        tracing::error!("consumer offset checkpoint failed: {e}");
+                    if let Err(e) = job.snapshot.write(&job.data_dir) {
+                        tracing::error!("auxiliary state checkpoint failed: {e}");
                         continue;
                     }
                     let completion: DataPlaneCommand = AuxiliaryCheckpointComplete {
@@ -146,7 +146,7 @@ pub struct CheckpointJob {
 }
 
 pub struct AuxiliaryCheckpointJob {
-    pub offsets: AuxiliaryState,
+    pub snapshot: AuxiliarySnapshot,
     pub data_dir: PathBuf,
     pub checkpointed_lsn: u64,
 }
