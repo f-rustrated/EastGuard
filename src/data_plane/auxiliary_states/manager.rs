@@ -12,6 +12,7 @@ use crate::data_plane::SegmentKey;
 use crate::data_plane::auxiliary_states::consumer_offsets::{
     ConsumerOffsetCoordination, OffsetPlacement, OffsetReplicaState,
 };
+use crate::data_plane::auxiliary_states::producer::types::AppendKey;
 use crate::data_plane::checkpoint::AuxiliaryCheckpointJob;
 
 use crate::data_plane::messages::command::{
@@ -22,7 +23,7 @@ use crate::data_plane::messages::command::{
 use crate::data_plane::messages::{RequestConsumerOffsetSnapshot, SegmentPlaced};
 
 use crate::data_plane::ProducerAppendIdentity;
-use crate::data_plane::auxiliary_states::producer::{AppendKey, ProducerDecision, ProducerTracker};
+use crate::data_plane::auxiliary_states::producer::{ProducerDecision, ProducerTracker};
 use crate::data_plane::transport::command::DataTransportCommand;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ use super::consumer_offsets::types::*;
 pub(crate) struct AuxiliaryStateManager {
     offsets: ConsumerOffsets,
     consumer_coord: ConsumerOffsetCoordination, // live placements, pending mutations, parked commits, and replication tracking
-    producer: ProducerTracker,
+    producer_tracker: ProducerTracker,
     checkpoint: AuxiliaryCheckpointState, // WAL reclamation and checkpoint progress
 }
 
@@ -50,10 +51,13 @@ impl AuxiliaryStateManager {
         Self::from_recovery(offsets, ProducerTracker::default())
     }
 
-    pub(crate) fn from_recovery(offsets: ConsumerOffsets, producer: ProducerTracker) -> Self {
+    pub(crate) fn from_recovery(
+        offsets: ConsumerOffsets,
+        producer_tracker: ProducerTracker,
+    ) -> Self {
         Self {
             offsets,
-            producer,
+            producer_tracker,
             ..Default::default()
         }
     }
@@ -63,11 +67,11 @@ impl AuxiliaryStateManager {
         segment_key: SegmentKey,
         producer: AuthorizedProducerIdentity,
     ) -> ProducerDecision {
-        self.producer.verify(segment_key, producer)
+        self.producer_tracker.verify(segment_key, producer)
     }
 
     pub(crate) fn unstage_producer(&mut self, append_key: &AppendKey) {
-        self.producer.unstage(append_key);
+        self.producer_tracker.unstage(append_key);
     }
 
     pub(crate) fn advance_producer(
@@ -77,7 +81,8 @@ impl AuxiliaryStateManager {
         entry_id: EntryId,
         lsn: u64,
     ) {
-        self.producer.advance(segment_key, producer, entry_id);
+        self.producer_tracker
+            .advance(segment_key, producer, entry_id);
         self.mark_auxiliary_state_dirty(lsn);
     }
 
@@ -183,7 +188,7 @@ impl AuxiliaryStateManager {
             checkpointed_lsn: *self.latest_uncheckpointed_lsn()?,
             snapshot: AuxiliarySnapshot {
                 consumer_offsets: self.offsets.clone(),
-                producer_sessions: self.producer.sessions(),
+                producer_sessions: self.producer_tracker.sessions(),
             },
             data_dir,
         })
@@ -191,7 +196,7 @@ impl AuxiliaryStateManager {
 
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn assert_producer_invariants(&self) {
-        self.producer.assert_invariants();
+        self.producer_tracker.assert_invariants();
     }
 
     pub(crate) fn auxiliary_checkpoint_in_flight(&self) -> bool {
