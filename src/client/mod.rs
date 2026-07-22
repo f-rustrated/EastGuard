@@ -337,7 +337,7 @@ impl Client {
         routing_key: &[u8],
         data: Vec<u8>,
         record_count: u32,
-        producer: Option<ProducerAppendIdentity>,
+        producer_identity: Option<ProducerAppendIdentity>,
     ) -> Result<EntryId, ClientError> {
         // Describe once to seed the cache (gives the first hop).
         let routing = self.resolve_topic_if_missing(topic).await?;
@@ -355,7 +355,7 @@ impl Client {
             routing_key: routing_key.to_vec(),
             data,
             record_count,
-            producer_append_id: producer,
+            producer_identity,
         };
 
         let served = self.call(start, request).await?;

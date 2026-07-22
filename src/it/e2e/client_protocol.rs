@@ -1832,7 +1832,7 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
         routing_key: b"k".to_vec(),
         data: payload.to_vec(),
         record_count: 1,
-        producer_append_id: None,
+        producer_identity: None,
     }));
     match send_request(node.0, node.1, req).await {
         ClientResponse::DataPlane(DataPlaneResponse::Produced { .. }) => ProduceOutcome::Acked,

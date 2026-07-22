@@ -12,7 +12,10 @@ use crate::{
             strategy::{PartitionStrategy, StoragePolicy},
         },
     },
-    data_plane::SegmentKey,
+    data_plane::{
+        ProduceError, ProducerAppendIdentity, SegmentKey,
+        messages::command::AuthorizedProducerIdentity,
+    },
 };
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -504,6 +507,34 @@ impl TopicMeta {
         for range in self.ranges.values_mut() {
             range.delete();
         }
+    }
+
+    pub(crate) fn verify_producer_session(
+        &self,
+        q: ProducerAppendIdentity,
+        received_at_ms: u64,
+    ) -> Result<AuthorizedProducerIdentity, ProduceError> {
+        let Some(session) = self.producer_sessions.get(&q.producer_id) else {
+            // Data replica placement is independent from metadata-Raft placement.
+            // A restarted data leader can therefore serve before its local metadata
+            // view contains this session. The durable range ledger still enforces
+            // the lease, sequence, and incarnation; do not strand recovery on a
+            // non-authoritative local metadata miss.
+            return Ok(AuthorizedProducerIdentity::ExistingOnly(q));
+        };
+
+        if q.incarnation < session.incarnation {
+            return Err(ProduceError::ProducerFenced);
+        };
+
+        if q.incarnation == session.incarnation
+            && q.expires_at <= session.expires_at
+            && q.expires_at >= received_at_ms
+        {
+            return Ok(AuthorizedProducerIdentity::MetadataVerified(q));
+        }
+
+        Err(ProduceError::SessionExpired)
     }
 }
 

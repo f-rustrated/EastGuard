@@ -118,7 +118,7 @@ fn duplicate_unknown_and_fenced_sessions_are_end_to_end_visible() -> turmoil::Re
                 routing_key: b"k".to_vec(),
                 data: payload.clone(),
                 record_count: 1,
-                producer_append_id: Some(unknown),
+                producer_identity: Some(unknown),
             }));
         let mut rejected = false;
         for (host, port, _) in NODES {

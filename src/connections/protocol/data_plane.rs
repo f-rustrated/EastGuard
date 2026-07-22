@@ -61,7 +61,7 @@ pub struct ProduceRequest {
     /// The broker stamps an entry_id and stores/replicates this opaque payload as-is.
     pub data: Vec<u8>,
     pub record_count: u32,
-    pub producer_append_id: Option<ProducerAppendIdentity>,
+    pub producer_identity: Option<ProducerAppendIdentity>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
