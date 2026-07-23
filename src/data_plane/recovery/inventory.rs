@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use super::segment_scan::RecoveredSegments;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::SegmentKey;
-use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsets;
-use crate::data_plane::auxiliary_states::producer::ProducerTracker;
+use crate::data_plane::auxiliary_states::AuxiliaryStateManager;
 
 /// What recovery verified for one on-disk segment: its `start_offset` (the filename base,
 /// needed to locate the file) and `verified_end` (the highest entry id a CRC-complete batch
@@ -71,14 +70,18 @@ impl LocalInventory {
 pub(crate) struct RecoveryOutput {
     pub(crate) inventory: LocalInventory,
     pub(crate) data_dir: PathBuf,
-    pub(crate) offsets: ConsumerOffsets,
-    pub(crate) producer: ProducerTracker,
+    pub(crate) auxiliary_state: AuxiliaryStateManager,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+    use crate::{
+        control_plane::metadata::{RangeId, SegmentId, TopicId},
+        data_plane::auxiliary_states::{
+            consumer_offsets::state::ConsumerOffsets, producer::ProducerTracker,
+        },
+    };
 
     fn seg(topic: u64, segment: u64) -> SegmentKey {
         SegmentKey::new(TopicId(topic), RangeId(0), SegmentId(segment))
@@ -128,8 +131,10 @@ mod tests {
         let output = RecoveryOutput {
             inventory: inv,
             data_dir: PathBuf::from("/var/lib/eastguard/data"),
-            offsets: ConsumerOffsets::default(),
-            producer: ProducerTracker::default(),
+            auxiliary_state: AuxiliaryStateManager::from_recovery(
+                ConsumerOffsets::default(),
+                ProducerTracker::default(),
+            ),
         };
         assert_eq!(output.inventory.orphan_candidates().count(), 0);
         assert_eq!(output.data_dir, PathBuf::from("/var/lib/eastguard/data"));

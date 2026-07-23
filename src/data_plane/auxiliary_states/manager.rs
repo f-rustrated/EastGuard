@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 use super::consumer_offsets::types::*;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct AuxiliaryStateManager {
     offsets: ConsumerOffsets,
     consumer_coord: ConsumerOffsetCoordination, // live placements, pending mutations, parked commits, and replication tracking
@@ -39,7 +39,7 @@ pub(crate) struct AuxiliaryStateManager {
     checkpoint: AuxiliaryCheckpointState, // WAL reclamation and checkpoint progress
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct AuxiliaryCheckpointState {
     uncheckpointed_lsns: VecDeque<u64>,
     checkpoint_lsn: u64,

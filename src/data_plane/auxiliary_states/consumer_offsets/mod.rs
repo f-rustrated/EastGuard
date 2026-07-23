@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use tokio::sync::oneshot;
 use types::*;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ConsumerOffsetCoordination {
     pub(crate) placements: HashMap<(TopicId, RangeId), OffsetPlacement>,
     pending_offset_mutations: Vec<PendingOffsetMutation>,
@@ -137,6 +137,7 @@ impl ConsumerOffsetCoordination {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct OffsetPlacement {
     pub(crate) segment_key: SegmentKey,
     pub(crate) shard_group_id: ShardGroupId,

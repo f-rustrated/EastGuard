@@ -6,12 +6,13 @@ use crate::data_plane::messages::command::{
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct OffsetReplicationState {
     seq: u64,
     pending: HashMap<u64, PendingOffsetReplication>,
 }
 
+#[derive(Debug)]
 struct PendingOffsetReplication {
     update: ConsumerOffsetUpdate,
     pending_acks: HashSet<NodeId>,

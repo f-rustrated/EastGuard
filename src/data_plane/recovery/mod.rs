@@ -17,6 +17,7 @@ use self::inventory::{LocalInventory, RecoveryOutput};
 use self::replay::ReplayWriter;
 use self::segment_scan::RecoveredSegments;
 use self::wal_scan::{ScanError, WalScanner};
+use crate::data_plane::auxiliary_states::AuxiliaryStateManager;
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{ConsumerOffsets, OffsetRecord};
 use crate::data_plane::auxiliary_states::producer::ProducerTracker;
 use crate::data_plane::auxiliary_states::snapshot::AuxiliarySnapshot;
@@ -176,8 +177,7 @@ impl Durable {
         Ok(RecoveryOutput {
             inventory,
             data_dir: self.data_dir,
-            offsets: self.offsets,
-            producer: self.producer,
+            auxiliary_state: AuxiliaryStateManager::from_recovery(self.offsets, self.producer),
         })
     }
 }
@@ -338,12 +338,12 @@ mod tests {
 
         let (_db_dir, db) = open_db();
         let output = run(data_dir.clone(), &db).unwrap();
-        assert_eq!(*output.offsets.generation(&key), 4);
-        assert_eq!(output.offsets.offset(&key), Some(position));
+        assert_eq!(*output.auxiliary_state.durable_generation(&key), 4);
+        assert_eq!(output.auxiliary_state.offset(&key), Some(position));
 
         let restarted = run(data_dir, &db).unwrap();
-        assert_eq!(*restarted.offsets.generation(&key), 4);
-        assert_eq!(restarted.offsets.offset(&key), Some(position));
+        assert_eq!(*restarted.auxiliary_state.durable_generation(&key), 4);
+        assert_eq!(restarted.auxiliary_state.offset(&key), Some(position));
     }
 
     #[test]
@@ -366,21 +366,15 @@ mod tests {
 
         let (_db_dir, db) = open_db();
         let output = run(data_dir.clone(), &db).unwrap();
-        let mut ledger = crate::data_plane::auxiliary_states::AuxiliaryStateManager::from_recovery(
-            output.offsets,
-            output.producer,
-        );
+        let mut ledger = output.auxiliary_state;
         assert_eq!(
             ledger.verify_producer(key, AuthorizedProducerIdentity::ExistingOnly(producer), 1,),
             Err(ProduceError::Duplicate(EntryId(7)))
         );
 
         let restarted = run(data_dir, &db).unwrap();
-        let mut restarted_tracker =
-            crate::data_plane::auxiliary_states::AuxiliaryStateManager::from_recovery(
-                restarted.offsets,
-                restarted.producer,
-            );
+        let mut restarted_tracker = restarted.auxiliary_state;
+
         assert_eq!(
             restarted_tracker.verify_producer(
                 key,

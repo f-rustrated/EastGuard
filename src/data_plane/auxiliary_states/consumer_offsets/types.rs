@@ -11,6 +11,7 @@ use crate::impl_from_variant;
 use borsh::{BorshDeserialize, BorshSerialize};
 use tokio::sync::oneshot;
 
+#[derive(Debug)]
 pub(crate) struct PendingOffsetMutation {
     pub(crate) record: OffsetRecord,
     pub(crate) completion: OffsetMutationCompletion,
@@ -41,12 +42,14 @@ impl From<EpochSeal> for PendingOffsetMutation {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct LeaderOffsetCommitApplied {
     pub(crate) replica_set: Replicas,
     pub(crate) required_followers: HashSet<NodeId>,
     pub(crate) reply: oneshot::Sender<ConsumerOffsetCommitAck>,
 }
 
+#[derive(Debug)]
 pub(crate) enum OffsetMutationCompletion {
     EpochSeal,
     LeaderCommit(LeaderOffsetCommitApplied),
@@ -69,6 +72,7 @@ pub struct ReplicateConsumerOffset {
     pub update: ConsumerOffsetUpdate,
 }
 
+#[derive(Debug)]
 pub(crate) enum FutureOffsetCommit {
     Client(CommitConsumerOffset),
     Replica(ReplicateConsumerOffset),

@@ -88,6 +88,7 @@ impl AuthorizedProducerIdentity {
     }
 }
 
+#[derive(Debug)]
 pub struct CommitConsumerOffset {
     pub update: ConsumerOffsetUpdate,
     pub reply: oneshot::Sender<ConsumerOffsetCommitAck>,
