@@ -91,8 +91,8 @@ impl ConsumerOffsetCoordination {
             .begin(followers, required, update, reply)
     }
 
-    pub(crate) fn fail_all(&mut self, error: &str) {
-        self.offset_replication.fail_all(error);
+    pub(crate) fn drop_all(&mut self, error: &str) {
+        self.offset_replication.drop_all(error);
 
         for pending in self.take_pending() {
             if let OffsetMutationCompletion::LeaderCommit(commit) = pending.completion {

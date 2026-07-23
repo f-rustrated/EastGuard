@@ -105,7 +105,7 @@ impl OffsetReplicationState {
             .any(|pending| pending.pending_acks.contains(node_id))
     }
 
-    pub(crate) fn fail_all(&mut self, error: &str) {
+    pub(crate) fn drop_all(&mut self, error: &str) {
         for (_, mut pending) in self.pending.drain() {
             if let Some(reply) = pending.reply.take() {
                 let _ = reply.send(ConsumerOffsetCommitAck::InternalError(error.to_string()));

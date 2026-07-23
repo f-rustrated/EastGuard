@@ -100,7 +100,7 @@ impl SegmentStore {
     ) -> Option<EntryId> {
         let tracker = self.get_mut(&key)?;
         let entry_id = tracker.next_staged_entry_id();
-        tracker.stage_producer_entry(key, data, record_count, entry_id, producer_identity);
+        tracker.stage_entry(key, data, record_count, entry_id, producer_identity);
         Some(entry_id)
     }
 

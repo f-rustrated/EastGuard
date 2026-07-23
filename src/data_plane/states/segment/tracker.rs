@@ -272,7 +272,7 @@ impl SegmentTracker {
         self.last_committed_entry_id() == self.durable_end_entry_id()
     }
 
-    pub(crate) fn stage_producer_entry(
+    pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,
         data: PayloadBytes,
@@ -402,7 +402,7 @@ pub mod tests {
     #[test]
     fn stage_entry_tracks_size() {
         let mut t = make_tracker(SegmentRole::Leader);
-        t.stage_producer_entry(test_key(), Bytes::from("abcde").into(), 2, EntryId(0), None);
+        t.stage_entry(test_key(), Bytes::from("abcde").into(), 2, EntryId(0), None);
 
         assert_eq!(t.size_bytes, 5);
         assert!(t.has_staged());
@@ -418,7 +418,7 @@ pub mod tests {
             ShardGroupId(1),
             EntryId(5),
         );
-        t.stage_producer_entry(test_key(), Bytes::from("data").into(), 1, EntryId(5), None);
+        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(5), None);
         assert!(t.has_staged());
 
         // Publish to advance next_entry_id
@@ -427,7 +427,7 @@ pub mod tests {
         t.publish_staged(1);
 
         // Duplicate entry_id (5) should be skipped since next is now 6
-        t.stage_producer_entry(test_key(), Bytes::from("dup").into(), 1, EntryId(5), None);
+        t.stage_entry(test_key(), Bytes::from("dup").into(), 1, EntryId(5), None);
         assert!(!t.has_staged());
         assert_eq!(t.next_entry_id, EntryId(6));
         t.assert_invariants();
@@ -439,7 +439,7 @@ pub mod tests {
         let mut wal_buf = Vec::new();
 
         for i in 0..3u64 {
-            t.stage_producer_entry(
+            t.stage_entry(
                 test_key(),
                 Bytes::from(format!("entry-{i}")).into(),
                 1,
@@ -474,7 +474,7 @@ pub mod tests {
             ShardGroupId(1),
             EntryId(2),
         );
-        t.stage_producer_entry(
+        t.stage_entry(
             test_key(),
             Bytes::from("entry-2").into(),
             1,
@@ -493,7 +493,7 @@ pub mod tests {
     fn stage_then_publish_drains() {
         let mut t = make_tracker(SegmentRole::Leader);
         let mut wal_buf = Vec::new();
-        t.stage_producer_entry(
+        t.stage_entry(
             test_key(),
             Bytes::from("payload").into(),
             3,
@@ -559,7 +559,7 @@ pub mod tests {
         t.last_activity_at = tokio::time::Instant::now() - Duration::from_secs(60);
         assert!(t.idle_timeout_reached(Duration::from_secs(30)));
 
-        t.stage_producer_entry(test_key(), Bytes::from("data").into(), 1, EntryId(0), None);
+        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(0), None);
         t.publish_staged(1);
         t.commit_entry(EntryId(0));
 

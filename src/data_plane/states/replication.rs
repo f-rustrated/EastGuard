@@ -30,7 +30,7 @@ pub(crate) struct AckCommitted {
     pub entry_id: EntryId,
     pub replies: Vec<oneshot::Sender<ProduceAck>>,
     pub reset_timer_seq: Option<u64>,
-    pub producer_append_id: Option<ProducerAppendIdentity>,
+    pub producer_identity: Option<ProducerAppendIdentity>,
     pub lsn: u64,
 }
 
@@ -177,7 +177,7 @@ impl ReplicationState {
             entry_id: batch.entry_id,
             replies: batch.replies,
             reset_timer_seq,
-            producer_append_id: batch.producer_append_id,
+            producer_identity: batch.producer_append_id,
             lsn: batch.lsn,
         })
     }

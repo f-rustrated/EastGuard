@@ -533,7 +533,7 @@ impl AuxiliaryStateManager {
         self.mark_offset_replica_ready_if_caught_up(&from)
     }
 
-    pub(crate) fn handle_consumer_group_epoch_seal(
+    pub(crate) fn unpark_future_offset_commits(
         &mut self,
         cmd: EpochSeal,
     ) -> Option<Vec<FutureOffsetCommit>> {
@@ -561,8 +561,8 @@ impl AuxiliaryStateManager {
         self.consumer_coord.take_pending()
     }
 
-    pub(crate) fn fail_inflight_coordination(&mut self, error: &str) {
-        self.consumer_coord.fail_all(error);
+    pub(crate) fn drop_coordination(&mut self, error: &str) {
+        self.consumer_coord.drop_all(error);
     }
 
     pub(crate) fn flush_batch(
@@ -1053,7 +1053,7 @@ mod tests {
             replication_reply,
         );
 
-        manager.fail_inflight_coordination("WAL failed");
+        manager.drop_coordination("WAL failed");
 
         let expected = ConsumerOffsetCommitAck::InternalError("WAL failed".into());
         assert_eq!(pending_response.try_recv().unwrap(), expected);
