@@ -13,9 +13,9 @@ use turmoil::Builder;
 
 use super::host_cluster;
 use crate::client::{
-    BufferConfig, Client, ClientError, CompressionCodec, Consumer, ConsumerConfig, KeyInterest,
-    PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy, StoragePolicy,
-    TopicDetail,
+    BufferConfig, Client, ClientError, ClientSuccess, CompressionCodec, Consumer, ConsumerConfig,
+    KeyInterest, PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy,
+    StoragePolicy, TopicDetail,
 };
 use crate::config::Environment;
 use crate::connections::protocol::ClientResponse;
@@ -459,9 +459,7 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
 #[test]
 #[serial_test::serial]
 fn producer_compression_lz4_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{
-        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
-    };
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest};
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -524,9 +522,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
-            served.response
-        {
+        if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) = served.response {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
@@ -562,9 +558,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
 #[test]
 #[serial_test::serial]
 fn producer_compression_zstd_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{
-        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
-    };
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest};
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -621,9 +615,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
-            served.response
-        {
+        if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) = served.response {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
@@ -1908,7 +1900,7 @@ async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64
 #[test]
 #[serial_test::serial]
 fn producer_split_fence_retry() -> turmoil::Result {
-    let mut sim = build_sim(90);
+    let mut sim = build_sim(150);
     host_cluster(&mut sim, &NODES, |env| {
         sim_cluster(env);
         env.segment_size_limit_bytes = 10;
@@ -1979,8 +1971,10 @@ fn producer_split_fence_retry() -> turmoil::Result {
         );
 
         producer.flush().await;
-        assert!(left.await.expect("left sender completes").is_ok());
-        assert!(right.await.expect("right sender completes").is_ok());
+        let res_left = left.await.expect("left sender completes");
+        let res_right = right.await.expect("right sender completes");
+        assert!(res_left.is_ok(), "res_left failed: {:?}", res_left);
+        assert!(res_right.is_ok(), "res_right failed: {:?}", res_right);
 
         let refreshed = client1.resolve_topic(topic).await.expect("refresh routing");
         let left_range = refreshed

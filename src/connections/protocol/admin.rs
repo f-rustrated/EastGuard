@@ -17,24 +17,7 @@ pub enum AdminRequest {
     GetShardLeader { shard_group_id: ShardGroupId },
 }
 
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
-pub enum AdminResponse {
-    // DescribeCluster
-    ClusterInfo { nodes: Box<[NodeInfo]> },
-    // ListHostedTopicsWithStats
-    TopicStats { topics: Box<[TopicStats]> },
-    // SplitRange
-    RangeSplit,
-    InvalidSplitPoint,
-    // GetShardInfo
-    ShardInfo { detail: Option<ShardDetail> },
-    // GetShardLeader
-    ShardLeader { leader: Option<String> },
-    // All admin operations
-    InternalError(String),
-}
-
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ShardDetail {
     pub shard_group_id: ShardGroupId,
     pub leader_node_id: Option<String>,
@@ -42,21 +25,21 @@ pub struct ShardDetail {
     pub member_node_ids: Box<[String]>,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct NodeInfo {
     pub node_id: String,
     pub addr: SocketAddr,
     pub state: NodeState,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum NodeState {
     Alive,
     Suspect,
     Dead,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct TopicStats {
     pub name: String,
     pub range_count: u32,

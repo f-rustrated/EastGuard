@@ -7,8 +7,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::client::{Client, ClientError};
-use crate::connections::protocol::{ClientResponse, ConsumerGroupSyncAction, ControlPlaneResponse};
+use crate::client::{Client, ClientError, ClientSuccess};
+use crate::connections::protocol::{ClientResponse, ConsumerGroupSyncAction};
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SyncConsumerGroupRequest, TopicId};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{
@@ -201,9 +201,7 @@ impl ConsumerGroup {
             .await?
             .response
         {
-            ClientResponse::ControlPlane(ControlPlaneResponse::ConsumerGroupAssignment(
-                assignment,
-            )) => assignment,
+            ClientResponse::Ok(ClientSuccess::ConsumerGroupAssignment(assignment)) => assignment,
             _ => return Err(ClientError::UnexpectedResponse),
         };
 

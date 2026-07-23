@@ -14,8 +14,7 @@ use tokio::time::Instant;
 use crate::client::Client;
 use crate::client::error::ClientError;
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneResponse, DataPlaneResponse,
-    ShardNotLocal,
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, ClientSuccess, ServerError,
 };
 
 /// Consecutive hint-follows before forcing a backoff — breaks a redirect cycle
@@ -151,41 +150,35 @@ mod tests {
     #[test]
     fn control_plane_redirects_map_to_actions() {
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::TopicMetadataRedirect { owner: info(8081) }
-            )),
+            classify(&ClientResponse::Err(ServerError::TopicMetadataRedirect {
+                owner: info(8081)
+            })),
             "follow"
         );
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::NotRaftLeader {
-                    leader_addr: Some(info(8082))
-                }
-            )),
+            classify(&ClientResponse::Err(ServerError::NotRaftLeader {
+                leader_addr: Some(info(8082))
+            })),
             "follow"
         );
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::NotRaftLeader { leader_addr: None }
-            )),
+            classify(&ClientResponse::Err(ServerError::NotRaftLeader {
+                leader_addr: None
+            })),
             "reresolve"
         );
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::TopicNotFound
-            )),
+            classify(&ClientResponse::Err(ServerError::TopicNotFound)),
             "notfound"
         );
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::ShardNotLocal(ShardNotLocal { hint_node: None })
-            )),
+            classify(&ClientResponse::Err(ServerError::ShardNotLocal {
+                hint_node: None
+            })),
             "reresolve"
         );
         assert_eq!(
-            classify(&ClientResponse::ControlPlane(
-                ControlPlaneResponse::TopicCreated
-            )),
+            classify(&ClientResponse::Ok(ClientSuccess::TopicCreated)),
             "done"
         );
     }
@@ -193,21 +186,17 @@ mod tests {
     #[test]
     fn data_plane_redirects_map_to_actions() {
         assert_eq!(
-            classify(&ClientResponse::DataPlane(
-                DataPlaneResponse::NotWriteLeader {
-                    leader_addr: Some(info(8083))
-                }
-            )),
+            classify(&ClientResponse::Err(ServerError::NotWriteLeader {
+                leader_addr: Some(info(8083))
+            })),
             "follow"
         );
         assert_eq!(
-            classify(&ClientResponse::DataPlane(
-                DataPlaneResponse::SegmentNotLocal
-            )),
-            "done"
+            classify(&ClientResponse::Err(ServerError::SegmentNotLocal)),
+            "reresolve"
         );
         assert_eq!(
-            classify(&ClientResponse::DataPlane(DataPlaneResponse::Produced {
+            classify(&ClientResponse::Ok(ClientSuccess::Produced {
                 entry_id: 7.into()
             })),
             "done"

@@ -8,10 +8,10 @@ use turmoil::Builder;
 use uuid::Uuid;
 
 use super::{NODES, host_cluster};
-use crate::client::{Client, ClientError, PartitionStrategy, StoragePolicy};
+use crate::client::{Client, ClientError, PartitionStrategy, ServerError, StoragePolicy};
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientRequest, ClientResponse, DataPlaneResponse,
-    OpenProducerSessionRequest, ProduceRequest,
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, OpenProducerSessionRequest,
+    ProduceRequest,
 };
 use crate::data_plane::{ProduceError, ProducerAppendIdentity};
 use crate::it::helpers::send_request;
@@ -124,9 +124,7 @@ fn duplicate_unknown_and_fenced_sessions_are_end_to_end_visible() -> turmoil::Re
         for (host, port, _) in NODES {
             if matches!(
                 send_request(host, port, unknown_wire.clone()).await,
-                ClientResponse::DataPlane(DataPlaneResponse::ProduceRejected(
-                    ProduceError::SessionExpired
-                ))
+                ClientResponse::Err(ServerError::ProduceRejected(ProduceError::SessionExpired))
             ) {
                 rejected = true;
                 break;

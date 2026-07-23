@@ -10,8 +10,8 @@ use crate::client::consumer::topic_fetch_manager::{
 use crate::client::redirect::Served;
 use crate::client::{Client, ClientError};
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientResponse, DataPlaneResponse, FetchByIdRequest, RangeDetail,
-    RangeOffsetRequest, RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
+    ClientDataPlaneRequest, ClientResponse, FetchByIdRequest, RangeDetail, RangeOffsetRequest,
+    RangeProgressSignal, RangeTransition, SegmentDetail, TopicDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;

@@ -8,12 +8,12 @@ use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
 use turmoil::Builder;
 
-use crate::StartUp;
-use crate::impl_from_variant;
+use crate::{StartUp, client::ClientSuccess};
+use crate::{client::ServerError, impl_from_variant};
 
 use crate::connections::protocol::{
-    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, ProduceRequest, TopicDetail,
+    ClientDataPlaneRequest, ClientRequest, ClientResponse, ControlPlaneRequest, FetchByIdRequest,
+    ProduceRequest, TopicDetail,
 };
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
@@ -326,7 +326,7 @@ pub(super) async fn try_propose(
     host: &str,
     port: u16,
     req: &ClientRequest,
-) -> Option<ControlPlaneResponse> {
+) -> Option<ClientResponse> {
     let stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port)))
         .await
         .ok()
@@ -340,10 +340,7 @@ pub(super) async fn try_propose(
             .await
             .ok()
             .and_then(|r| r.ok())?;
-    match response {
-        ClientResponse::ControlPlane(cp) => Some(cp),
-        _ => None,
-    }
+    Some(response)
 }
 
 async fn send_request(
@@ -374,7 +371,7 @@ async fn describe_topic_anywhere(
     loop {
         for (host, port) in nodes {
             match send_request(host, *port, &request).await {
-                Ok(ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail))) => {
+                Ok(ClientResponse::Ok(ClientSuccess::TopicDetail(detail))) => {
                     return detail;
                 }
                 Ok(_) => {}
@@ -408,7 +405,7 @@ async fn produce_until_acked(
     loop {
         for (host, port) in nodes {
             match send_request(host, *port, &request).await {
-                Ok(ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id })) => {
+                Ok(ClientResponse::Ok(ClientSuccess::Produced { entry_id })) => {
                     return entry_id;
                 }
                 Ok(_) => {}
@@ -441,7 +438,7 @@ async fn assert_record_readable(
     loop {
         for (host, port) in nodes {
             match send_request(host, *port, &request).await {
-                Ok(ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }))
+                Ok(ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }))
                     if entries
                         .iter()
                         .any(|entry| entry.entry_id == entry_id && entry.data == expected) =>
@@ -555,10 +552,8 @@ pub fn run_for_scenario(scenario: &SimScenario) -> turmoil::Result {
                             try_propose(&node_name(node), client_port(node), &req).await;
                         if matches!(
                             response,
-                            Some(
-                                ControlPlaneResponse::TopicCreated
-                                    | ControlPlaneResponse::AlreadyExists
-                            )
+                            Some(ClientResponse::Ok(ClientSuccess::TopicCreated))
+                                | Some(ClientResponse::Err(ServerError::AlreadyExists))
                         ) {
                             break 'await_commit;
                         }
