@@ -49,7 +49,7 @@ use crate::connections::protocol::{
     FetchConsumerOffsetRequest, OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened,
     RangeOffsetRequest,
 };
-use crate::data_plane::{ProduceError, ProducerAppendIdentity};
+use crate::data_plane::{PayloadBytes, ProduceError, ProducerAppendIdentity};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 pub use redirect::RetryPolicy;
@@ -331,7 +331,7 @@ impl Client {
         topic: &str,
         range_id: RangeId,
         routing_key: &[u8],
-        data: Vec<u8>,
+        data: impl Into<PayloadBytes>,
         record_count: u32,
         producer_identity: Option<ProducerAppendIdentity>,
     ) -> Result<EntryId, ClientError> {
@@ -349,7 +349,7 @@ impl Client {
             topic_name: topic.to_string(),
             range_id,
             routing_key: routing_key.to_vec(),
-            data,
+            data: data.into(),
             record_count,
             producer_identity,
         };

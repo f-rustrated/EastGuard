@@ -398,7 +398,7 @@ async fn produce_until_acked(
         topic_name: topic.to_string(),
         range_id,
         routing_key: b"campaign-key".to_vec(),
-        data: payload.to_vec(),
+        data: payload.to_vec().into(),
         record_count: 1,
         producer_identity: None,
     }));

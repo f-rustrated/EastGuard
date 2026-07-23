@@ -13,7 +13,7 @@ use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, OpenProducerSessionRequest,
     ProduceRequest,
 };
-use crate::data_plane::{ProduceError, ProducerAppendIdentity};
+use crate::data_plane::{PayloadBytes, ProduceError, ProducerAppendIdentity};
 use crate::it::helpers::send_request;
 
 fn seeds() -> Vec<SocketAddr> {
@@ -23,13 +23,13 @@ fn seeds() -> Vec<SocketAddr> {
         .collect()
 }
 
-fn one_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+fn one_record(key: &[u8], value: &[u8]) -> PayloadBytes {
     let mut payload = vec![0]; // CompressionCodec::None
     payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
     payload.extend_from_slice(key);
     payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
     payload.extend_from_slice(value);
-    payload
+    payload.into()
 }
 
 #[test]

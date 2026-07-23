@@ -1,7 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::{
-    Replicas,
+    NodeId, Replicas,
     metadata::{EntryId, SegmentId, error::MetadataError},
 };
 
@@ -78,5 +78,9 @@ impl SegmentMeta {
         self.state == SegmentMetaState::Sealed
             && self.end_entry_id.is_some()
             && self.replica_set.len() < replication_factor
+    }
+
+    pub(crate) fn is_shard_leader(&self, node_id: &NodeId) -> bool {
+        self.replica_set.first() == Some(node_id)
     }
 }

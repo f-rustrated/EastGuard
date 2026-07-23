@@ -14,7 +14,7 @@ use crate::{
         EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
     },
     data_plane::{
-        ProducerAppendIdentity,
+        PayloadBytes, ProducerAppendIdentity,
         auxiliary_states::consumer_offsets::state::{ConsumerOffsetKey, ConsumerOffsetUpdate},
         messages::query::FetchedRecords,
     },
@@ -81,7 +81,7 @@ pub struct ProduceRequest {
     /// Pre-serialized blob produced by the client: a leading 1-byte cleartext
     /// codec tag (none/lz4/zstd) followed by the optionally-compressed records.
     /// The broker stamps an entry_id and stores/replicates this opaque payload as-is.
-    pub data: Vec<u8>,
+    pub data: PayloadBytes,
     pub record_count: u32,
     pub producer_identity: Option<ProducerAppendIdentity>,
 }

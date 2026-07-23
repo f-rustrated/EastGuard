@@ -2,12 +2,15 @@ use super::constants::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashMap;
 
-use crate::control_plane::{
-    Replicas,
-    metadata::{
-        EntryId, RangeId, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
-        command::{RollSegment, SegmentRollIntent},
-        error::MetadataError,
+use crate::{
+    client::ServerError,
+    control_plane::{
+        Replicas,
+        metadata::{
+            EntryId, RangeId, SegmentId, SegmentMeta, SegmentMetaState, SplitRange,
+            command::{RollSegment, SegmentRollIntent},
+            error::MetadataError,
+        },
     },
 };
 
@@ -91,6 +94,12 @@ impl RangeMeta {
         );
 
         Ok((left, right))
+    }
+
+    pub(crate) fn active_write_segment(&self) -> Result<&SegmentMeta, ServerError> {
+        self.active_segment
+            .map(|id| self.segments.get(&id).unwrap())
+            .ok_or(ServerError::StaleRange)
     }
 
     pub(crate) fn validate_active(&self) -> Result<SegmentId, MetadataError> {

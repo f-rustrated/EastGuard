@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::constants::*;
 use super::*;
 use crate::{
+    client::ServerError,
     control_plane::{
         NodeId, Replicas,
         metadata::{
@@ -89,6 +90,22 @@ impl TopicMeta {
         self.ranges
             .get(range_id)
             .ok_or(MetadataError::RangeNotFound)
+    }
+
+    /// Resolves the active target range for a write operation.
+    /// Returns `ServerError::StaleRange` if the range is sealed/split or not active for the key.
+    pub(crate) fn resolve_writable_range(
+        &self,
+        range_id: RangeId,
+        routing_key: &[u8],
+    ) -> Result<&RangeMeta, ServerError> {
+        let range = self
+            .route_active_range(routing_key)
+            .ok_or(ServerError::TopicNotFound)?;
+        if range.range_id != range_id {
+            return Err(ServerError::StaleRange);
+        }
+        Ok(range)
     }
 
     pub(crate) fn get_range_mut(

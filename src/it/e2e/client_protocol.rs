@@ -1819,7 +1819,7 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
         topic_name: topic.into(),
         range_id,
         routing_key: b"k".to_vec(),
-        data: payload.to_vec(),
+        data: payload.to_vec().into(),
         record_count: 1,
         producer_identity: None,
     }));
