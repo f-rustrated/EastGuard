@@ -381,14 +381,10 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .send(ProduceAck::Ok {
-                entry_id: EntryId(42),
-            });
+            .send(ProduceAck::Ok(EntryId(42)));
         assert!(matches!(
             rx.blocking_recv().unwrap(),
-            ProduceAck::Ok {
-                entry_id: EntryId(42)
-            }
+            ProduceAck::Ok(EntryId(42))
         ));
     }
 

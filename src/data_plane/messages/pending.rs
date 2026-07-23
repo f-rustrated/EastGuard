@@ -58,7 +58,7 @@ impl DataPlaneOutputs {
             let _ = self.coordinator_tx.send(cmd).await;
         }
         for (entry_id, reply) in self.produce_replies.drain(..) {
-            let _ = reply.send(ProduceAck::Ok { entry_id });
+            let _ = reply.send(ProduceAck::Ok(entry_id));
         }
 
         let checkpoint_tasks = std::mem::take(&mut self.checkpoint_tasks);

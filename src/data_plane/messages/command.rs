@@ -366,9 +366,7 @@ pub enum ProduceAck {
     /// `entry_id` is the committed offset for this produce. Exact for a producer
     /// with one request in flight at a time (the common case); under pipelining
     /// it is the segment's committed highwater at ack time (an upper bound).
-    Ok {
-        entry_id: EntryId,
-    },
+    Ok(EntryId),
     Err(ProduceError),
 }
 
