@@ -15,6 +15,7 @@ use crate::connections::protocol::{
 };
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState, TopicId};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
+use crate::data_plane::messages::query::RangeOffsets;
 
 pub mod config;
 pub use config::*;
@@ -85,10 +86,10 @@ impl Consumer {
 
         if matches!(config.start_policy, StartPolicy::Latest) {
             for cursor in cursors.iter_mut() {
-                let (_, tail_entry_id) = client
+                let RangeOffsets { next_entry_id, .. } = client
                     .fetch_range_entry_ids(&topic, cursor.range_id)
                     .await?;
-                cursor.next_entry_id = tail_entry_id;
+                cursor.next_entry_id = next_entry_id;
             }
         }
 

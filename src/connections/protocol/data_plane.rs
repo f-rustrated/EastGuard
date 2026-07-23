@@ -9,12 +9,14 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
+    client::ClientSuccess,
     control_plane::metadata::{
         EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
     },
     data_plane::{
         ProducerAppendIdentity,
         auxiliary_states::consumer_offsets::state::{ConsumerOffsetKey, ConsumerOffsetUpdate},
+        messages::query::FetchedRecords,
     },
     impl_from_variant, impl_new_struct_wrapper,
 };
@@ -24,6 +26,26 @@ pub struct EntryPayload {
     pub entry_id: EntryId,
     pub record_count: u32,
     pub data: Vec<u8>,
+}
+
+impl EntryPayload {
+    pub fn from_fetched_record(r: FetchedRecords) -> ClientSuccess {
+        let wire_entries = r
+            .entries
+            .into_iter()
+            .map(|cached| EntryPayload {
+                entry_id: cached.entry_id,
+                record_count: cached.record_count,
+                data: cached.data.to_vec(),
+            })
+            .collect();
+
+        ClientSuccess::Fetched {
+            entries: wire_entries,
+            next_entry_id: r.next_entry_id,
+            progress_signal: r.progress_signal,
+        }
+    }
 }
 
 /// Client → broker data-plane request. Every variant carries a `Client*Request`

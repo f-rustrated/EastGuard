@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use tokio::sync::oneshot;
 
 use crate::connections::protocol::{ConsumerOffsetGenerationMismatch, RangeProgressSignal};
@@ -31,6 +32,8 @@ impl_from_variant!(DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset);
 /// `topic_name → topic_id` and the range's current `progress_signal` via a
 /// metadata query before dispatching, so the data plane never reaches into the
 /// metadata RSM during its sync apply loop.
+use crate::client::ServerError;
+
 pub struct Fetch {
     pub topic_id: TopicId,
     pub range_id: RangeId,
@@ -41,30 +44,14 @@ pub struct Fetch {
     /// in-band on the fetch that delivers the range's final records (see
     /// d4_consumer_range_tracking.md §Range Transitions).
     pub progress_signal: RangeProgressSignal,
-    pub reply: oneshot::Sender<FetchResult>,
+    pub reply: oneshot::Sender<Result<FetchedRecords, ServerError>>,
 }
 
 #[derive(Debug)]
-pub enum FetchResult {
-    /// Records read from the segment (may be empty if the consumer is at the
-    /// tail). `next_entry_id` is what the consumer should request next.
-    ///
-    /// Carries `Arc<CachedEntry>`s straight from the tail cache — no
-    /// intermediate struct construction. The broker layer (wire translation)
-    /// does the single `Bytes → Vec<u8>` copy at serialization time; the
-    /// `lsn` field rides along through the channel but isn't on the wire.
-    Records {
-        entries: Vec<Arc<CachedEntry>>,
-        next_entry_id: EntryId,
-        progress_signal: RangeProgressSignal,
-    },
-    /// `entry_id` was past the last committed offset on this node (e.g. caller
-    /// asked for an offset that hasn't been produced/committed yet).
-    EntryIdOutOfRange,
-    /// This node does not host any segment of the requested `(topic, range)`.
-    /// The consumer should re-resolve via `DescribeTopic` and retry.
-    SegmentNotLocal,
-    InternalError(String),
+pub struct FetchedRecords {
+    pub(crate) entries: Vec<Arc<CachedEntry>>,
+    pub next_entry_id: EntryId,
+    pub progress_signal: RangeProgressSignal,
 }
 
 /// Offset-bounds query for a range. Returns the start and currently-committed
@@ -72,16 +59,13 @@ pub enum FetchResult {
 pub struct ListOffsets {
     pub topic_id: TopicId,
     pub range_id: RangeId,
-    pub reply: oneshot::Sender<ListOffsetsResult>,
+    pub reply: oneshot::Sender<Result<RangeOffsets, ServerError>>,
 }
 
-#[derive(Debug)]
-pub enum ListOffsetsResult {
-    RangeOffsets {
-        start_entry_id: EntryId,
-        next_entry_id: EntryId,
-    },
-    SegmentNotLocal,
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct RangeOffsets {
+    pub start_entry_id: EntryId,
+    pub next_entry_id: EntryId,
 }
 
 pub struct ReadConsumerOffset {

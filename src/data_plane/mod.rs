@@ -31,11 +31,11 @@ pub struct SegmentKey {
 pub use auxiliary_states::producer::{ProduceError, ProducerAppendIdentity};
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct EntryPayload(Bytes);
+pub struct PayloadBytes(Bytes);
 
-impl_new_struct_wrapper!(EntryPayload, Bytes);
+impl_new_struct_wrapper!(PayloadBytes, Bytes);
 
-impl From<Vec<u8>> for EntryPayload {
+impl From<Vec<u8>> for PayloadBytes {
     fn from(v: Vec<u8>) -> Self {
         Self(Bytes::from(v))
     }

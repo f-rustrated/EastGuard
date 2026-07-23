@@ -32,6 +32,7 @@ use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
+use crate::data_plane::messages::query::RangeOffsets;
 pub use codec::CompressionCodec;
 pub use consumer::{
     CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
@@ -121,7 +122,7 @@ impl Client {
         &self,
         topic: &str,
         range_id: RangeId,
-    ) -> Result<(EntryId, EntryId), ClientError> {
+    ) -> Result<RangeOffsets, ClientError> {
         let deadline = Instant::now() + self.retry.deadline;
         let mut backoff = self.retry.initial_backoff;
         let mut last_error = None;
@@ -156,10 +157,7 @@ impl Client {
             let served = self.call(addr, req).await?;
 
             match served.response {
-                ClientResponse::Ok(ClientSuccess::RangeOffset {
-                    start_entry_id,
-                    next_entry_id,
-                }) => return Ok((start_entry_id, next_entry_id)),
+                ClientResponse::Ok(ClientSuccess::RangeOffset(res)) => return Ok(res),
                 ClientResponse::Err(ServerError::SegmentNotLocal) => {
                     last_error = Some("range offsets segment not local".to_string());
                 }

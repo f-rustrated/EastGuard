@@ -15,7 +15,7 @@ use crate::{
     control_plane::membership::ShardGroupId,
     control_plane::metadata::{EntryId, SegmentId},
     data_plane::states::segment::cache::CachedEntry,
-    data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
+    data_plane::{PayloadBytes, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::borrow::Borrow;
@@ -56,7 +56,7 @@ pub struct OrphanGcCheck {
 
 pub struct Produce {
     pub segment_key: SegmentKey,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
     pub received_at_ms: u64,
     pub producer_identity: Option<AuthorizedProducerIdentity>,
@@ -120,7 +120,7 @@ pub struct SegmentPlaced {
 pub struct ReplicateSegmentEntries {
     pub segment_key: SegmentKey,
     pub replicas: Replicas,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
     pub entry_id: EntryId,
     pub producer_identity: Option<ProducerAppendIdentity>,
@@ -241,7 +241,7 @@ pub struct CatchUpEntries {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpEntry {
     pub entry_id: EntryId,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
 }
 impl CatchUpEntry {

@@ -3,7 +3,7 @@ use std::io;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
-use crate::data_plane::{EntryPayload, ProducerAppendIdentity, SegmentKey};
+use crate::data_plane::{PayloadBytes, ProducerAppendIdentity, SegmentKey};
 
 const ROUTING_HEADER_MAGIC: u32 = 0x4547_5032;
 const ROUTING_HEADER_SIZE: usize = 81;
@@ -157,7 +157,7 @@ impl RoutingHeader {
 }
 
 pub(crate) struct StagedEntry {
-    pub(crate) data: EntryPayload,
+    pub(crate) data: PayloadBytes,
     pub(crate) record_count: u32,
     pub(crate) segment_key: SegmentKey,
     pub(crate) producer_identity: Option<ProducerAppendIdentity>,
@@ -165,7 +165,7 @@ pub(crate) struct StagedEntry {
 
 impl StagedEntry {
     pub(crate) fn new(
-        data: EntryPayload,
+        data: PayloadBytes,
         record_count: u32,
         segment_key: SegmentKey,
         producer_identity: Option<ProducerAppendIdentity>,

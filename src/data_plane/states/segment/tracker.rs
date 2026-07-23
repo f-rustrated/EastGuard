@@ -4,7 +4,7 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::ProducerAppendIdentity;
-use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
+use crate::data_plane::{PayloadBytes, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
 
@@ -146,7 +146,7 @@ impl SegmentTracker {
 
     pub(crate) fn uncommitted_entries(
         &self,
-    ) -> impl Iterator<Item = (EntryPayload, u32, Option<ProducerAppendIdentity>)> + '_ {
+    ) -> impl Iterator<Item = (PayloadBytes, u32, Option<ProducerAppendIdentity>)> + '_ {
         let commit = self.cache.load_read_cursor();
         let tail = self.cache.load_write_cursor();
         (commit..tail).filter_map(|pos| {
@@ -167,7 +167,7 @@ impl SegmentTracker {
     /// re-count them.
     pub(crate) fn staged_for_replay(
         &self,
-    ) -> impl Iterator<Item = (EntryPayload, u32, Option<ProducerAppendIdentity>)> + '_ {
+    ) -> impl Iterator<Item = (PayloadBytes, u32, Option<ProducerAppendIdentity>)> + '_ {
         self.staged_entries
             .iter()
             .map(|s| (s.data.clone(), s.record_count, s.producer_identity))
@@ -275,7 +275,7 @@ impl SegmentTracker {
     pub(crate) fn stage_producer_entry(
         &mut self,
         segment_key: SegmentKey,
-        data: EntryPayload,
+        data: PayloadBytes,
         record_count: u32,
         entry_id: EntryId,
         producer_append_id: Option<ProducerAppendIdentity>,

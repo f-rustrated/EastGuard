@@ -11,6 +11,7 @@ use crate::client::{ClientError, CommitMode, ConsumerConfig};
 use crate::connections::protocol::{RangeDetail, RangeTransition, RebalancePlan};
 use crate::control_plane::metadata::{EntryId, RangeId, RangeState};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
+use crate::data_plane::messages::query::RangeOffsets;
 use crate::impl_from_variant;
 
 #[cfg(any(test, debug_assertions))]
@@ -380,8 +381,11 @@ impl TopicFetchManagerState {
     ) -> Result<EntryId, ClientError> {
         // 1. Fetch the latest boundary from the replica if the start policy is Latest.
         if self.config.start_policy == StartPolicy::Latest {
-            let (_, tail_entry_id) = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
-            return Ok(tail_entry_id);
+            let RangeOffsets {
+                start_entry_id: _,
+                next_entry_id,
+            } = ctx.client.fetch_range_entry_ids(&ctx.topic, range).await?;
+            return Ok(next_entry_id);
         }
 
         // 2. Fallback to the local cursor's next entry ID.

@@ -11,6 +11,7 @@ use crate::connections::protocol::{
 };
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
+use crate::data_plane::messages::query::RangeOffsets;
 
 const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
 
@@ -148,14 +149,14 @@ impl RangeFetchActor {
             }
             ClientResponse::Err(ServerError::EntryIdOutOfRange) => {
                 let prev_entry_id = self.cursor.next_entry_id;
-                let (start_id, _) = self
+                let RangeOffsets { start_entry_id, .. } = self
                     .ctx
                     .client
                     .fetch_range_entry_ids(&self.ctx.topic, self.cursor.range_id)
                     .await?;
 
-                if self.cursor.next_entry_id < start_id {
-                    self.cursor.next_entry_id = start_id;
+                if self.cursor.next_entry_id < start_entry_id {
+                    self.cursor.next_entry_id = start_entry_id;
                 }
                 if self.cursor.next_entry_id == prev_entry_id {
                     tokio::time::sleep(Duration::from_millis(50)).await;
