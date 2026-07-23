@@ -4,91 +4,111 @@
 //! cache only ever costs an extra hop, never a wrong target.
 use crate::connections::protocol::{RangeDetail, TopicDetail};
 use crate::control_plane::NodeAddressInfo;
-use crate::control_plane::metadata::{RangeId, TopicId};
+use crate::control_plane::metadata::{RangeId, RangeState, TopicId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Per-topic routing snapshot. Built once from a `DescribeTopic` response and
+/// Per-topic routing cache. Built once from a `DescribeTopic` response and
 /// replaced wholesale on refresh.
 pub(crate) struct TopicRouting {
     pub topic_id: TopicId,
-    ranges: Box<[RangeRoute]>,
+    range_placements: Box<[RangePlacement]>,
+    active_ranges: Box<[ActiveRangeRoute]>,
 }
 
-/// One active range's placement. Sealed/deleting ranges have no write leader.
-struct RangeRoute {
+/// Replica placement for active and historical ranges used by readers.
+struct RangePlacement {
     range_id: RangeId,
-    keyspace_start: Vec<u8>,
-    /// `replica_set[0]` of the active segment, the produce target. `None` when the
-    /// range has no active segment (sealed/deleting) or its replica set is empty.
-    write_leader: Option<NodeAddressInfo>,
     replica_addrs: Box<[NodeAddressInfo]>,
 }
-
-// Active segment only — correct for produce (the write head) and a tailing consumer.
-// Historical/cold reads live in *sealed* segments whose placement can differ, so they
-// need per-segment replicas; that's blocked on the DescribeTopic sealed-segment
-// extension (`RangeDetail` exposes only `active_segment` today) and is a C3 concern.
-// See c1_routing_and_connections.md / d4.
-impl From<&RangeDetail> for RangeRoute {
-    fn from(range: &RangeDetail) -> Self {
-        let placement = range
+impl RangePlacement {
+    fn from(r: &RangeDetail) -> Self {
+        let placement = r
             .active_segment
             .as_ref()
-            .or_else(|| range.sealed_segments.last());
-        let replicas: Box<[NodeAddressInfo]> = placement
-            .map(|seg| seg.replica_set.iter().cloned().collect())
-            .unwrap_or_default();
-        RangeRoute {
-            range_id: range.range_id,
-            keyspace_start: range.keyspace_start.clone(),
-            write_leader: range
-                .active_segment
-                .as_ref()
-                .and_then(|_| replicas.first().cloned()),
-            replica_addrs: replicas,
+            .or_else(|| r.sealed_segments.last());
+        RangePlacement {
+            range_id: r.range_id,
+            replica_addrs: placement
+                .map(|segment| segment.replica_set.iter().cloned().collect())
+                .unwrap_or_default(),
         }
     }
 }
 
+/// Active keyspace owner. Leader resolution is optional and independent of ownership.
+struct ActiveRangeRoute {
+    range_id: RangeId,
+    keyspace_start: Vec<u8>,
+    write_leader: Option<NodeAddressInfo>,
+}
+
+impl ActiveRangeRoute {
+    fn from(t: &TopicDetail) -> Vec<Self> {
+        t.ranges
+            .iter()
+            .filter(|range| range.state == RangeState::Active)
+            .map(|range| ActiveRangeRoute {
+                range_id: range.range_id,
+                keyspace_start: range.keyspace_start.clone(),
+                write_leader: range
+                    .active_segment
+                    .as_ref()
+                    .and_then(|segment| segment.replica_set.first().cloned()),
+            })
+            .collect()
+    }
+}
+
 impl TopicRouting {
+    fn from_detail(detail: &TopicDetail) -> Self {
+        let range_placements = detail.ranges.iter().map(RangePlacement::from).collect();
+        let mut active_ranges = ActiveRangeRoute::from(detail);
+        active_ranges.sort_unstable_by(|a, b| a.keyspace_start.cmp(&b.keyspace_start));
+
+        Self {
+            topic_id: detail.topic_id,
+            range_placements,
+            active_ranges: active_ranges.into_boxed_slice(),
+        }
+    }
+
+    fn active_range(&self, routing_key: &[u8]) -> Option<&ActiveRangeRoute> {
+        let insertion = self
+            .active_ranges
+            .partition_point(|range| range.keyspace_start.as_slice() <= routing_key);
+        self.active_ranges.get(insertion.checked_sub(1)?)
+    }
+
     /// The active range owning `routing_key` — mirrors the server's
     /// `route_active_range`: the active range with the greatest `keyspace_start ≤ key`.
-    /// Returns its write leader.
+    /// Returns its write leader when that address is currently resolved.
     pub(crate) fn write_leader(&self, routing_key: &[u8]) -> Option<NodeAddressInfo> {
-        self.ranges
-            .iter()
-            .rev()
-            .find(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
-            .and_then(|r| r.write_leader.clone())
+        self.active_range(routing_key)?.write_leader.clone()
     }
 
     pub(crate) fn range_id(&self, routing_key: &[u8]) -> Option<RangeId> {
-        self.ranges
-            .iter()
-            .rev()
-            .find(|r| r.write_leader.is_some() && r.keyspace_start.as_slice() <= routing_key)
-            .map(|r| r.range_id)
+        Some(self.active_range(routing_key)?.range_id)
     }
 
     pub(crate) fn replicas(&self, range_id: RangeId) -> Option<&[NodeAddressInfo]> {
-        self.ranges
+        self.range_placements
             .iter()
-            .find(|r| r.range_id == range_id)
-            .map(|r| r.replica_addrs.as_ref())
+            .find(|range| range.range_id == range_id)
+            .map(|range| range.replica_addrs.as_ref())
     }
 
     pub(crate) fn write_leader_for_range(&self, range_id: RangeId) -> Option<NodeAddressInfo> {
-        self.ranges
+        self.range_placements
             .iter()
             .find(|range| range.range_id == range_id)
             .and_then(|range| range.replica_addrs.first().cloned())
     }
 
     pub(crate) fn active_range_ids(&self) -> impl Iterator<Item = RangeId> + '_ {
-        self.ranges.iter().map(|r| r.range_id)
+        self.active_ranges.iter().map(|range| range.range_id)
     }
 }
 
@@ -114,16 +134,7 @@ impl RoutingCache {
     }
 
     pub(crate) fn insert(&self, detail: &TopicDetail) {
-        let mut ranges: Vec<RangeRoute> = detail.ranges.iter().map(RangeRoute::from).collect();
-        // Sort ranges by keyspace_start so that reverse-scan and binary search work
-        ranges.sort_unstable_by(|a, b| a.keyspace_start.cmp(&b.keyspace_start));
-
-        let topic_routing = TopicRouting {
-            topic_id: detail.topic_id,
-            ranges: ranges.into_boxed_slice(),
-        };
-
-        let routing = Arc::new(topic_routing);
+        let routing = Arc::new(TopicRouting::from_detail(detail));
         self.topics.rcu(|current_topics| {
             let mut next_topics = (**current_topics).clone();
             next_topics.insert(detail.name.clone(), routing.clone());
@@ -150,7 +161,7 @@ impl RoutingCache {
     }
 
     /// Cached *active-segment* replica addresses for a range (C3 tailing fetch).
-    /// Historical reads need the sealed-segment extension — see `RangeRoute`.
+    /// Historical reads need the sealed-segment extension — see `RangePlacement`.
     pub(crate) fn replicas(
         &self,
         topic: &str,
@@ -171,18 +182,16 @@ impl RoutingCache {
                 return current_topics.clone();
             };
 
-            let ranges = routing
-                .ranges
+            let range_placements = routing
+                .range_placements
                 .iter()
-                .map(|r| RangeRoute {
-                    range_id: r.range_id,
-                    keyspace_start: r.keyspace_start.clone(),
-                    write_leader: r.write_leader.as_ref().map(|_| wrong.clone()),
-                    replica_addrs: if r.replica_addrs.is_empty() {
+                .map(|range| RangePlacement {
+                    range_id: range.range_id,
+                    replica_addrs: if range.replica_addrs.is_empty() {
                         Box::new([])
                     } else {
                         std::iter::once(wrong.clone())
-                            .chain(r.replica_addrs.iter().skip(1).cloned())
+                            .chain(range.replica_addrs.iter().skip(1).cloned())
                             .collect()
                     },
                 })
@@ -190,12 +199,48 @@ impl RoutingCache {
 
             let poisoned = Arc::new(TopicRouting {
                 topic_id: routing.topic_id,
-                ranges,
+                range_placements,
+                active_ranges: routing
+                    .active_ranges
+                    .iter()
+                    .map(|range| ActiveRangeRoute {
+                        range_id: range.range_id,
+                        keyspace_start: range.keyspace_start.clone(),
+                        write_leader: range.write_leader.as_ref().map(|_| wrong.clone()),
+                    })
+                    .collect(),
             });
 
             let mut next_topics = (**current_topics).clone();
             next_topics.insert(topic.to_string(), poisoned);
             Arc::new(next_topics)
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::{NodeAddress, NodeId};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    fn leader(port: u16) -> NodeAddressInfo {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        NodeAddressInfo::new(
+            NodeId::new(format!("node-{port}")),
+            NodeAddress::test(addr, addr),
+        )
+    }
+
+    fn active_range(
+        range_id: u64,
+        keyspace_start: &[u8],
+        leader_resolved: bool,
+    ) -> ActiveRangeRoute {
+        ActiveRangeRoute {
+            range_id: RangeId(range_id),
+            keyspace_start: keyspace_start.to_vec(),
+            write_leader: leader_resolved.then(|| leader(range_id as u16 + 1)),
+        }
     }
 }
