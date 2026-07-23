@@ -54,7 +54,7 @@ impl ProducerSession {
         }
         if identity.incarnation > self.incarnation {
             if !allow_session_creation {
-                return Err(ProduceError::SessionExpired);
+                return Err(ProduceError::SessionNotInstalled);
             }
             // * frontier and dedup_entries must be reset rather than reserved because:
             // * dedup_entries stores entries indexed by sequence number and if old dedup were kept, sending seq=0 in new incarnation could match previous one,
@@ -159,7 +159,7 @@ impl ProducerTracker {
         let producer_key = append_key.producer_key();
 
         if !allow_session_creation && !self.sessions.contains_key(&producer_key) {
-            return Err(ProduceError::SessionExpired);
+            return Err(ProduceError::SessionNotInstalled);
         }
 
         let session = self.sessions.entry(producer_key).or_insert_with(|| {
@@ -353,7 +353,7 @@ mod tests {
         let mut coordination = ProducerTracker::default();
         assert_eq!(
             verify(&mut coordination, existing(request(id, 0, 0, 7))),
-            Err(ProduceError::SessionExpired)
+            Err(ProduceError::SessionNotInstalled)
         );
         assert_eq!(
             verify(&mut coordination, verified(request(id, 0, 0, 7))),

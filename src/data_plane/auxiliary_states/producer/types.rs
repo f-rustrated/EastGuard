@@ -28,6 +28,8 @@ pub enum ProduceError {
     ProducerFenced,
     #[error("producer session expired or is unknown")]
     SessionExpired,
+    #[error("producer session is not installed on this replica")]
+    SessionNotInstalled,
     #[error("sequence was reused with a different payload")]
     RequestIdentityConflict,
     #[error("duplicate position is outside the retained result window")]

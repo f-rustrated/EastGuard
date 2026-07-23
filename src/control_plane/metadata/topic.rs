@@ -537,6 +537,10 @@ impl TopicMeta {
         q: ProducerAppendIdentity,
         received_at_ms: u64,
     ) -> Result<AuthorizedProducerIdentity, ProduceError> {
+        if q.expires_at < received_at_ms {
+            return Err(ProduceError::SessionExpired);
+        }
+
         let Some(session) = self.producer_sessions.get(&q.producer_id) else {
             // Data replica placement is independent from metadata-Raft placement.
             // A restarted data leader can therefore serve before its local metadata
@@ -557,7 +561,7 @@ impl TopicMeta {
             return Ok(AuthorizedProducerIdentity::MetadataVerified(q));
         }
 
-        Err(ProduceError::SessionExpired)
+        Err(ProduceError::SessionNotInstalled)
     }
 }
 

@@ -86,6 +86,10 @@ impl TopicRouting {
             .find(|range| range.range_id == range_id)
             .and_then(|range| range.replica_addrs.first().cloned())
     }
+
+    pub(crate) fn active_range_ids(&self) -> impl Iterator<Item = RangeId> + '_ {
+        self.ranges.iter().map(|r| r.range_id)
+    }
 }
 
 /// Thread-safe, lock-free per-topic cache. Entries are replaced on refresh and

@@ -966,6 +966,63 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
     sim.run()
 }
 
+/// Producer Test: Session lease renewal, expiration, and resumption.
+/// Renews inside the safety margin without resetting the sequence stream, then
+/// idles past the renewed lease and verifies that a fresh producer resumes at zero.
+#[test]
+#[serial_test::serial]
+fn producer_resumes_cleanly_after_session_lease_expiration() -> turmoil::Result {
+    let mut sim = build_sim(160);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("session-expire-test", policy())
+            .await
+            .expect("create topic");
+
+        let producer = Producer::new(
+            client.clone(),
+            "session-expire-test".into(),
+            ProducerConfig::default(),
+        );
+
+        // 1. Send initial record
+        let entry1 = producer
+            .send(b"k1", b"v1".to_vec())
+            .await
+            .expect("first send");
+        assert_eq!(entry1, EntryId(0));
+
+        // Enter the one-second renewal margin of the 60-second lease. Renewal
+        // must reuse the nonce and preserve the existing range sequence stream.
+        tokio::time::sleep(Duration::from_millis(59_500)).await;
+
+        let entry2 = producer
+            .send(b"k2", b"v2".to_vec())
+            .await
+            .expect("send after proactive renewal");
+        assert_eq!(entry2, EntryId(1));
+
+        // Idle past the renewed lease. Reopening now uses a fresh producer
+        // identity and starts its range sequence stream at zero.
+        tokio::time::sleep(Duration::from_secs(61)).await;
+
+        let entry3 = producer
+            .send(b"k3", b"v3".to_vec())
+            .await
+            .expect("send after expiration");
+        assert_eq!(entry3, EntryId(2));
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
 /// E2E Consumer Test 1.5: Latest Skips History (Active Segment)
 /// StartPolicy::Latest should skip existing records in an active segment without needing a roll.
 #[test]

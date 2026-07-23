@@ -54,6 +54,12 @@ pub struct PendingRecord {
     pub tx: oneshot::Sender<Result<EntryId, ClientError>>,
 }
 impl PendingRecord {
+    pub fn complete_all(records: Vec<Self>, result: Result<EntryId, ClientError>) {
+        for pending in records {
+            let _ = pending.tx.send(result.clone());
+        }
+    }
+
     /// Serialize a slice of records into a byte buffer.
     pub fn serialize_batch(records: &[PendingRecord]) -> Vec<u8> {
         let mut buf = Vec::new();

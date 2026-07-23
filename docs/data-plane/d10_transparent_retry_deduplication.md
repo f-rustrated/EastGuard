@@ -114,8 +114,10 @@ batches per range.
 ```text
 request(session, incarnation, range, sequence, digest)
 │
-├── session unknown or expired
+├── lease timestamp expired
 │      └── SessionExpired
+├── unexpired session not installed on this replica
+│      └── SessionNotInstalled
 ├── incarnation older than installed fence
 │      └── ProducerFenced
 ├── dedup state or placement still recovering
@@ -279,6 +281,8 @@ The implemented delivery contract is:
   longer retained.
 - Reusing a sequence with a different payload checksum, skipping a sequence, using an
   expired session, or writing with a fenced incarnation is rejected without appending.
+  An unexpired session that has not reached the serving replica is distinguished from
+  expiration so the producer can retry the unchanged identity while metadata converges.
 - A restarted producer using the same producer id opens with a new session nonce. Metadata
   advances its incarnation and fences the older process. Retrying the open itself is
   idempotent.

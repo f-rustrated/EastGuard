@@ -124,7 +124,9 @@ fn duplicate_unknown_and_fenced_sessions_are_end_to_end_visible() -> turmoil::Re
         for (host, port, _) in NODES {
             if matches!(
                 send_request(host, port, unknown_wire.clone()).await,
-                ClientResponse::Err(ServerError::ProduceRejected(ProduceError::SessionExpired))
+                ClientResponse::Err(ServerError::ProduceRejected(
+                    ProduceError::SessionNotInstalled
+                ))
             ) {
                 rejected = true;
                 break;
