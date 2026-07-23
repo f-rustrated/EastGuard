@@ -70,3 +70,18 @@ impl ServerError {
         )
     }
 }
+
+impl From<crate::control_plane::metadata::error::MetadataError> for ServerError {
+    fn from(err: crate::control_plane::metadata::error::MetadataError) -> Self {
+        use crate::control_plane::metadata::error::MetadataError::*;
+
+        match err {
+            TopicNotFound(_) | TopicNameNotFound(_) => ServerError::TopicNotFound,
+            TopicNameAlreadyExists(_) => ServerError::AlreadyExists,
+            TopicNotActive(_) | RangeNotFound | RangeNotActive => ServerError::StaleRange,
+            SegmentNotFound | SegmentNotActive | SegmentNotSealed => ServerError::SegmentNotLocal,
+            InvalidSplitPoint => ServerError::InvalidSplitPoint,
+            SplitNotAllowed(_) | RangesNotAdjacent => ServerError::Internal(err.to_string()),
+        }
+    }
+}

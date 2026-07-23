@@ -85,6 +85,12 @@ impl TopicMeta {
         Ok(vec_ranges.try_into().unwrap())
     }
 
+    pub(crate) fn get_range(&self, range_id: &RangeId) -> Result<&RangeMeta, MetadataError> {
+        self.ranges
+            .get(range_id)
+            .ok_or(MetadataError::RangeNotFound)
+    }
+
     pub(crate) fn get_range_mut(
         &mut self,
         range_id: &RangeId,
