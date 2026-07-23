@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::channels::BatchSender;
+use crate::client::ServerError;
 use crate::control_plane::NodeAddress;
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::NodeId;
@@ -162,49 +163,61 @@ impl SwimSender {
     pub(crate) async fn resolve_shard_group(
         &self,
         resource_key: Vec<u8>,
-    ) -> anyhow::Result<Option<ShardGroup>> {
+    ) -> Result<Option<ShardGroup>, ServerError> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(QueryCommand::ResolveShardGroup {
             key: resource_key,
             reply: send,
         })
-        .await?;
-        Ok(recv.await?)
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+        recv.await
+            .map_err(|err| ServerError::Internal(err.to_string()))
     }
 
     pub(crate) async fn get_shard_info(
         &self,
         key: Vec<u8>,
-    ) -> anyhow::Result<Option<(ShardGroup, Option<ShardLeaderEntry>)>> {
+    ) -> Result<Option<(ShardGroup, Option<ShardLeaderEntry>)>, ServerError> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(QueryCommand::GetShardInfo { key, reply: send })
-            .await?;
-        Ok(recv.await?)
+            .await
+            .map_err(|err| ServerError::Internal(err.to_string()))?;
+        recv.await
+            .map_err(|err| ServerError::Internal(err.to_string()))
     }
 
-    pub(crate) async fn get_members(&self) -> anyhow::Result<Vec<SwimNode>> {
+    pub(crate) async fn get_members(&self) -> Result<Vec<SwimNode>, ServerError> {
         let (send, recv) = tokio::sync::oneshot::channel();
-        self.send(QueryCommand::GetMembers { reply: send }).await?;
-        Ok(recv.await?)
+        self.send(QueryCommand::GetMembers { reply: send })
+            .await
+            .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+        recv.await
+            .map_err(|err| ServerError::Internal(err.to_string()))
     }
 
     pub(crate) async fn resolve_address(
         &self,
         node_id: NodeId,
-    ) -> anyhow::Result<Option<NodeAddress>> {
+    ) -> Result<Option<NodeAddress>, ServerError> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.send(QueryCommand::ResolveAddress {
             node_id,
             reply: send,
         })
-        .await?;
-        Ok(recv.await?)
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+        recv.await
+            .map_err(|err| ServerError::Internal(err.to_string()))
     }
 
     pub(crate) async fn resolve_any(
         &self,
         members: &[NodeId],
-    ) -> anyhow::Result<Option<NodeAddressInfo>> {
+    ) -> Result<Option<NodeAddressInfo>, ServerError> {
         for member in members {
             if let Some(addr) = self.resolve_address(member.clone()).await? {
                 return Ok(Some(NodeAddressInfo {
@@ -222,7 +235,7 @@ impl SwimSender {
         &self,
         key: Vec<u8>,
         node_id: &NodeId,
-    ) -> anyhow::Result<ShardRouting> {
+    ) -> Result<ShardRouting, ServerError> {
         let Some(group) = self.resolve_shard_group(key).await? else {
             return Ok(ShardRouting::Redirect(None));
         };
@@ -235,7 +248,7 @@ impl SwimSender {
 
     pub(crate) async fn list_all_node_addresses(
         &self,
-    ) -> anyhow::Result<HashMap<NodeId, NodeAddress>> {
+    ) -> Result<HashMap<NodeId, NodeAddress>, ServerError> {
         Ok(self
             .get_members()
             .await?
