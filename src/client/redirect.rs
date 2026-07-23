@@ -196,9 +196,7 @@ mod tests {
             "reresolve"
         );
         assert_eq!(
-            classify(&ClientResponse::Ok(ClientSuccess::Produced {
-                entry_id: 7.into()
-            })),
+            classify(&ClientResponse::Ok(ClientSuccess::Produced(7.into()))),
             "done"
         );
     }

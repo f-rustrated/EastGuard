@@ -68,9 +68,7 @@ pub enum ClientSuccess {
     ProducerSessionOpened(ProducerSessionOpened),
 
     // Data Plane
-    Produced {
-        entry_id: EntryId,
-    },
+    Produced(EntryId),
     Fetched {
         entries: Box<[EntryPayload]>,
         next_entry_id: EntryId,

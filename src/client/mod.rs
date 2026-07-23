@@ -366,7 +366,7 @@ impl Client {
             self.cache.invalidate(topic);
         }
         match served.response {
-            ClientResponse::Ok(ClientSuccess::Produced { entry_id }) => Ok(entry_id),
+            ClientResponse::Ok(ClientSuccess::Produced(entry_id)) => Ok(entry_id),
             ClientResponse::Err(ServerError::StaleRange) => Err(ClientError::StaleRange),
             ClientResponse::Err(ServerError::ProduceRejected(error)) => {
                 Err(ClientError::ProduceRejected(error))

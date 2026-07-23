@@ -405,7 +405,7 @@ async fn produce_until_acked(
     loop {
         for (host, port) in nodes {
             match send_request(host, *port, &request).await {
-                Ok(ClientResponse::Ok(ClientSuccess::Produced { entry_id })) => {
+                Ok(ClientResponse::Ok(ClientSuccess::Produced(entry_id))) => {
                     return entry_id;
                 }
                 Ok(_) => {}
