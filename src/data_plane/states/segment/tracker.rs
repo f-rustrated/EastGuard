@@ -136,7 +136,7 @@ impl SegmentTracker {
                     record_count: s.record_count,
                     entry_id,
                     lsn,
-                    producer_append_id: s.producer_identity,
+                    producer_identity: s.producer_identity,
                 });
                 self.cache.publish(entry.clone());
                 entry
@@ -154,7 +154,7 @@ impl SegmentTracker {
                 (
                     entry.data.clone(),
                     entry.record_count,
-                    entry.producer_append_id,
+                    entry.producer_identity,
                 )
             })
         })

@@ -253,7 +253,7 @@ impl ColdReadPool {
                         // lsn is a live-WAL concept; cold reads serve durable
                         // data, so it carries no meaningful LSN.
                         lsn: 0,
-                        producer_append_id: None,
+                        producer_identity: None,
                     }));
 
                     if bytes_read >= req.max_bytes {
