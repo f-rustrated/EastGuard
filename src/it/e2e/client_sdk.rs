@@ -837,6 +837,33 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
             .expect("Record 4");
         assert_ne!(id3, id4);
 
+        // Cancel the send that triggers a full batch. The batch is shared work:
+        // canceling this caller must not cancel the other record in the batch.
+        let first = {
+            let producer = producer.clone();
+            tokio::spawn(async move {
+                producer
+                    .send(b"cancel-key", b"survivor".to_vec())
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let mut trigger =
+            Box::pin(producer.send(b"cancel-key", b"canceled-caller".to_vec()));
+        tokio::select! {
+            biased;
+            result = &mut trigger => panic!("threshold send completed before cancellation: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(trigger);
+
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("surviving sender completes")
+            .expect("surviving sender task")
+            .expect("shared batch completes");
+
         Ok(())
     });
 

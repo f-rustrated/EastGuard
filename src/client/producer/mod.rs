@@ -111,6 +111,10 @@ impl Producer {
     }
 
     /// Produce a single record. Returns the committed entry ID once the batch flushes.
+    ///
+    /// Canceling before the record enters a batch prevents publication. Once buffered,
+    /// publication is shared work and may still complete; canceling only discards this
+    /// caller's acknowledgement.
     pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
         let _active_send = self.send_gate.read().await;
         if self.should_reject.load(Ordering::Acquire) {
@@ -134,8 +138,7 @@ impl Producer {
 
         match push_res {
             PushResult::Flush(records_to_flush) => {
-                let _flush = self.flush_gate.read().await;
-                self.flush_records(records_to_flush).await;
+                self.spawn_flush(records_to_flush);
             }
             PushResult::SpawnLinger(linger, seq) => {
                 let producer = self.clone();
@@ -148,6 +151,16 @@ impl Producer {
         }
 
         rx.await.map_err(|_| ClientError::UnexpectedResponse)?
+    }
+
+    // ! Dedicated spawning is required because otherwise when the client cancels the operation,
+    // ! It would accidantely cancel all other records in that shared batch.
+    fn spawn_flush(&self, records: Vec<PendingRecord>) {
+        let producer = self.clone();
+        tokio::spawn(async move {
+            let _flush = producer.flush_gate.read().await;
+            producer.flush_records(records).await;
+        });
     }
 
     /// Flush the buffered records for a specific range if they exist.
