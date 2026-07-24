@@ -162,7 +162,10 @@ impl Client {
                 ClientResponse::Err(ServerError::SegmentNotLocal) => {
                     last_error = Some("range offsets segment not local".to_string());
                 }
-                _ => return Err(ClientError::UnexpectedResponse),
+                ClientResponse::Err(error) => return Err(ClientError::Server(error)),
+                ClientResponse::Ok(_) | ClientResponse::Stop => {
+                    return Err(ClientError::UnexpectedResponse);
+                }
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -197,7 +200,8 @@ impl Client {
                     sealed_generation: stale,
                 })
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -240,7 +244,10 @@ impl Client {
                             sealed_generation: mismatch.observed_generation,
                         })
                     }
-                    _ => Err(ClientError::UnexpectedResponse),
+                    ClientResponse::Err(error) => Err(ClientError::Server(error)),
+                    ClientResponse::Ok(_) | ClientResponse::Stop => {
+                        Err(ClientError::UnexpectedResponse)
+                    }
                 }
             }
         });
@@ -262,7 +269,8 @@ impl Client {
         match served.response {
             ClientResponse::Ok(ClientSuccess::TopicCreated) => Ok(true),
             ClientResponse::Err(ServerError::AlreadyExists) => Ok(false),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -276,7 +284,8 @@ impl Client {
         self.cache.invalidate(name);
         match served.response {
             ClientResponse::Ok(ClientSuccess::TopicDeleted) => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -304,10 +313,8 @@ impl Client {
                 self.cache.insert(&detail);
                 Ok(detail)
             }
-            err => {
-                tracing::error!("{err:?}{}{}", file!(), line!());
-                Err(ClientError::UnexpectedResponse)
-            }
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -320,7 +327,8 @@ impl Client {
             .await?;
         match served.response {
             ClientResponse::Ok(ClientSuccess::ProducerSessionOpened(session)) => Ok(session),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -372,7 +380,8 @@ impl Client {
             ClientResponse::Err(ServerError::ProduceRejected(error)) => {
                 Err(ClientError::ProduceRejected(error))
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 

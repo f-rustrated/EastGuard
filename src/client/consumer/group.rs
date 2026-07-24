@@ -204,7 +204,10 @@ impl ConsumerGroup {
             .response
         {
             ClientResponse::Ok(ClientSuccess::ConsumerGroupAssignment(assignment)) => assignment,
-            _ => return Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => return Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => {
+                return Err(ClientError::UnexpectedResponse);
+            }
         };
 
         self.generation
@@ -231,7 +234,8 @@ impl ConsumerGroup {
                 self.quit.store(true, AtomicOrdering::Release);
                 Ok(())
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 

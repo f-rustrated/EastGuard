@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::client::RangeId;
+use crate::connections::protocol::ServerError;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::data_plane::ProduceError;
 
@@ -46,6 +47,9 @@ pub enum ClientError {
     /// Response didn't match the request — a wire/version mismatch, not routing.
     #[error("unexpected response for request")]
     UnexpectedResponse,
+
+    #[error(transparent)]
+    Server(ServerError),
 
     /// Expected range has split or metadata is stale.
     #[error("stale range routing")]

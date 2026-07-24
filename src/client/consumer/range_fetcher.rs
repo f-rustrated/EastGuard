@@ -179,7 +179,8 @@ impl RangeFetchActor {
                 self.ctx.refresh_metadata().await?;
                 Ok(true)
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
