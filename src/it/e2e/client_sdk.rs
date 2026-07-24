@@ -837,8 +837,48 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
             .expect("Record 4");
         assert_ne!(id3, id4);
 
-        // Cancel the send that triggers a full batch. The batch is shared work:
-        // canceling this caller must not cancel the other record in the batch.
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Exercises batch cancellation semantics:
+/// Canceling the threshold `send()` caller after the batch is buffered must not abort
+/// surviving senders sharing the batch.
+#[test]
+#[serial_test::serial]
+fn producer_shared_batch_cancellation_does_not_abort_surviving_senders() -> turmoil::Result {
+    let mut sim = build_sim(91);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("batch-cancel", policy())
+            .await
+            .expect("create topic");
+
+        client
+            .resolve_topic("batch-cancel")
+            .await
+            .expect("resolve");
+
+        let producer = Producer::new(
+            client.clone(),
+            "batch-cancel".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_millis(500),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 2,
+                },
+                codec: CompressionCodec::None,
+            },
+        )
+        .unwrap();
+
+        // 1) Submit first record (survivor) -> sits in buffer (records = 1).
         let first = {
             let producer = producer.clone();
             tokio::spawn(async move {
@@ -849,15 +889,18 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
         };
         tokio::task::yield_now().await;
 
-        let mut trigger =
-            Box::pin(producer.send(b"cancel-key", b"canceled-caller".to_vec()));
+        // 2) Submit threshold record (trigger) -> reaches max_batch_records: 2 -> triggers PushResult::Flush.
+        let mut trigger = Box::pin(producer.send(b"cancel-key", b"canceled-caller".to_vec()));
         tokio::select! {
             biased;
             result = &mut trigger => panic!("threshold send completed before cancellation: {result:?}"),
             _ = tokio::task::yield_now() => {}
         }
+
+        // 3) Cancel the threshold sender by dropping its future.
         drop(trigger);
 
+        // 4) Assert that the surviving sender in the shared batch completes successfully.
         tokio::time::timeout(Duration::from_secs(5), first)
             .await
             .expect("surviving sender completes")
