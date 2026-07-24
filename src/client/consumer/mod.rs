@@ -197,7 +197,8 @@ impl Consumer {
         }
     }
 
-    /// Stop fetching, commit acknowledged offsets, revoke ownership, and leave the group.
+    /// Stop fetching, discard prefetched records that were not delivered, commit
+    /// acknowledged offsets, revoke ownership, and leave the group.
     ///
     /// This affects every clone. Once the command reaches the fetch manager, shutdown
     /// continues even if this future is canceled; cancellation only loses the result.
@@ -207,7 +208,16 @@ impl Consumer {
             .send_async(CloseConsumer { reply }.into())
             .await
             .map_err(|_| ClientError::ConsumerClosed)?;
-        response.await.map_err(|_| ClientError::ConsumerClosed)?
+        let result = response.await.map_err(|_| ClientError::ConsumerClosed)?;
+
+        self.purge_prefetched_buffer();
+        result
+    }
+
+    // ! Discards prefetched, undelivered records after fetching stops and ownership is revoked
+    // ! This ensures all clones observe terminiation
+    fn purge_prefetched_buffer(&self) {
+        while self.consumer_rx.try_recv().is_ok() {}
     }
 
     pub fn ack(&self, record: &ConsumerRecord) -> Result<(), ClientError> {

@@ -100,7 +100,7 @@ pub struct Inner {
     codec: CompressionCodec,
     session_manager: ClientProducerSessionManager,
     send_gate: RwLock<()>,
-    flush_gate: RwLock<()>,
+    flush_gate: Arc<RwLock<()>>,
     should_reject: AtomicBool,
     next_record_order: AtomicU64,
 }
@@ -130,7 +130,7 @@ impl Producer {
             codec: config.codec,
             session_manager: ClientProducerSessionManager::new(producer_id),
             send_gate: RwLock::new(()),
-            flush_gate: RwLock::new(()),
+            flush_gate: Arc::new(RwLock::new(())),
             should_reject: AtomicBool::new(false),
             next_record_order: AtomicU64::new(0),
         })))
@@ -142,7 +142,7 @@ impl Producer {
     /// publication is shared work and may still complete; canceling only discards this
     /// caller's acknowledgement.
     pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
-        let _active_send = self.send_gate.read().await;
+        let send_guard = self.send_gate.read().await;
         if self.should_reject.load(Ordering::Acquire) {
             return Err(ClientError::ProducerClosed);
         }
@@ -164,7 +164,8 @@ impl Producer {
 
         match push_res {
             PushResult::Flush(records_to_flush) => {
-                self.spawn_flush(records_to_flush);
+                let flush = self.flush_gate.clone().read_owned().await;
+                self.flush_in_background(records_to_flush, flush);
             }
             PushResult::SpawnLinger(linger, seq) => {
                 let producer = self.clone();
@@ -175,16 +176,21 @@ impl Producer {
             }
             PushResult::Buffered => {}
         }
+        drop(send_guard);
 
         rx.await.map_err(|_| ClientError::UnexpectedResponse)?
     }
 
     // ! Dedicated spawning is required because otherwise when the client cancels the operation,
     // ! It would accidantely cancel all other records in that shared batch.
-    fn spawn_flush(&self, records: Vec<PendingRecord>) {
+    fn flush_in_background(
+        &self,
+        records: Vec<PendingRecord>,
+        flush: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) {
         let producer = self.clone();
         tokio::spawn(async move {
-            let _flush = producer.flush_gate.read().await;
+            let _flush = flush;
             producer.flush_records(records).await;
         });
     }

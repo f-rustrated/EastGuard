@@ -92,7 +92,7 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            group_config(group_id),
+            group_config(group_id.clone()),
         )
         .await
         .unwrap();
@@ -105,6 +105,17 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
         assert_eq!(replayed.value, b"first");
         c2.ack(&replayed).unwrap();
         c2.close().await.unwrap();
+
+        let c3 = Consumer::new(client, topic, KeyInterest::AllKeys, group_config(group_id))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), c3.next_record())
+                .await
+                .is_err(),
+            "final close commit prevents replay"
+        );
+        c3.close().await.unwrap();
 
         Ok(())
     });

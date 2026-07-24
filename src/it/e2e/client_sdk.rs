@@ -913,6 +913,62 @@ fn producer_shared_batch_cancellation_does_not_abort_surviving_senders() -> turm
     sim.run()
 }
 
+#[test]
+#[serial_test::serial]
+fn producer_close_drains_buffered_sends_and_fences_clones() -> turmoil::Result {
+    let mut sim = build_sim(60);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("producer-close", policy())
+            .await
+            .expect("create topic");
+        client
+            .resolve_topic("producer-close")
+            .await
+            .expect("warm routing");
+
+        let producer = Producer::new(
+            client,
+            "producer-close".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_secs(30),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 1000,
+                },
+                codec: CompressionCodec::None,
+            },
+        )
+        .unwrap();
+
+        let sending = {
+            let producer = producer.clone();
+            tokio::spawn(async move { producer.send(b"key", b"value".to_vec()).await })
+        };
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(5), producer.close())
+            .await
+            .expect("close drains without waiting for linger");
+        sending
+            .await
+            .expect("sender task")
+            .expect("buffered send is acknowledged");
+
+        assert!(matches!(
+            producer.send(b"later", b"rejected".to_vec()).await,
+            Err(ClientError::ProducerClosed)
+        ));
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
 /// E2E Consumer Test 1: Basic Consume.
 /// Produce 5 records, consume them with StartPolicy::Earliest and KeyInterest::AllKeys,
 /// and assert exact ordered delivery.
@@ -1042,6 +1098,22 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             .close()
             .await
             .expect("close latest consumer");
+        assert!(
+            consumer
+                .next_record()
+                .await
+                .expect("closed consumer")
+                .is_none(),
+            "close terminates the earliest consumer stream"
+        );
+        assert!(
+            consumer_latest
+                .next_record()
+                .await
+                .expect("closed latest consumer")
+                .is_none(),
+            "close terminates the latest consumer stream"
+        );
 
         Ok(())
     });
