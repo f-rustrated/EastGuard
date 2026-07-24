@@ -26,11 +26,16 @@ pub(crate) struct RetryCommitAfterEpochRefresh {
     pub(crate) reply: oneshot::Sender<Result<(), ClientError>>,
 }
 
+pub(crate) struct CloseConsumer {
+    pub(crate) reply: oneshot::Sender<Result<(), ClientError>>,
+}
+
 pub(crate) enum TopicFetchManagerCommand {
     PauseRange(PauseRange),
     ResumeRange(ResumeRange),
     SeekRange(SeekRange),
     RetryCommitAfterEpochRefresh(RetryCommitAfterEpochRefresh),
+    CloseConsumer(CloseConsumer),
 }
 
 impl_from_variant!(
@@ -39,6 +44,7 @@ impl_from_variant!(
     ResumeRange,
     SeekRange,
     RetryCommitAfterEpochRefresh,
+    CloseConsumer,
 );
 
 pub(crate) struct RangeDrained {

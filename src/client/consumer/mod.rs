@@ -165,6 +165,16 @@ impl Consumer {
         }
     }
 
+    /// Stop fetching, commit acknowledged offsets, revoke ownership, and leave the group.
+    pub async fn close(&self) -> Result<(), ClientError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send_async(CloseConsumer { reply }.into())
+            .await
+            .map_err(|_| ClientError::ConsumerClosed)?;
+        response.await.map_err(|_| ClientError::ConsumerClosed)?
+    }
+
     pub fn ack(&self, record: &ConsumerRecord) -> Result<(), ClientError> {
         let Some(group) = &self.group else {
             return Ok(());

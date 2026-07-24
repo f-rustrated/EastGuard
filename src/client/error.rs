@@ -54,6 +54,9 @@ pub enum ClientError {
     #[error("producer is closed")]
     ProducerClosed,
 
+    #[error("consumer is closed")]
+    ConsumerClosed,
+
     #[error("produce rejected: {0}")]
     ProduceRejected(ProduceError),
 

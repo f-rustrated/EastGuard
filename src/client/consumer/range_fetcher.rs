@@ -15,8 +15,12 @@ use crate::data_plane::messages::query::RangeOffsets;
 
 const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
 
+pub(crate) struct StopRangeFetch {
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 pub(crate) enum RangeFetchActorCommand {
-    Stop,
+    Stop(StopRangeFetch),
     Pause {
         reply: tokio::sync::oneshot::Sender<()>,
     },
@@ -63,7 +67,13 @@ impl RangeFetchActor {
             tokio::select! {
                 cmd = rx.recv_async() => {
                     match cmd {
-                        Ok(RangeFetchActorCommand::Stop) | Err(_) => {
+                        Ok(RangeFetchActorCommand::Stop(command)) => {
+                            if let Some(reply) = command.reply {
+                                let _ = reply.send(());
+                            }
+                            return;
+                        }
+                        Err(_) => {
                             return; // Graceful shutdown
                         }
                         Ok(RangeFetchActorCommand::Pause { reply }) => {

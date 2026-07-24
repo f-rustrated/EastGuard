@@ -85,7 +85,7 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
         assert_eq!(first.value, b"first");
 
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        drop(c1);
+        c1.close().await.unwrap();
         tokio::time::sleep(Duration::from_secs(4)).await;
 
         let c2 = Consumer::new(
@@ -104,6 +104,7 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
             .unwrap();
         assert_eq!(replayed.value, b"first");
         c2.ack(&replayed).unwrap();
+        c2.close().await.unwrap();
 
         Ok(())
     });

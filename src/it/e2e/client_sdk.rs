@@ -967,6 +967,12 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             "Latest consumer should not receive historical records"
         );
 
+        consumer.close().await.expect("close earliest consumer");
+        consumer_latest
+            .close()
+            .await
+            .expect("close latest consumer");
+
         Ok(())
     });
 
