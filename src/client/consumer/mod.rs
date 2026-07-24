@@ -62,6 +62,13 @@ impl Consumer {
         interest: KeyInterest,
         config: ConsumerConfig,
     ) -> Result<Self, ClientError> {
+        if topic.is_empty() {
+            return Err(ClientError::invalid_configuration(
+                "consumer.topic",
+                "must not be empty",
+            ));
+        }
+        config.validate()?;
         let detail = client.resolve_topic(&topic).await?;
         let mut cursors = PendingCursorStore::build_cursors(&detail, interest, config.start_policy);
 

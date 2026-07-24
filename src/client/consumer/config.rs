@@ -1,3 +1,5 @@
+use crate::client::ClientError;
+
 #[derive(Debug, Clone)]
 pub enum DeliverySemantic {
     AtLeastOnce,
@@ -30,6 +32,25 @@ impl ConsumerConfig {
             commit_mode: CommitMode::Auto,
         }
     }
+
+    pub(crate) fn validate(&self) -> Result<(), ClientError> {
+        if self.group_id.as_ref().is_some_and(|group| group.is_empty()) {
+            return Err(ClientError::invalid_configuration(
+                "consumer.group_id",
+                "must not be empty",
+            ));
+        }
+        if self.group_id.is_some()
+            && self.commit_mode == CommitMode::Auto
+            && self.auto_commit_interval_ms == 0
+        {
+            return Err(ClientError::invalid_configuration(
+                "consumer.auto_commit_interval_ms",
+                "must be greater than zero when group auto-commit is enabled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,5 +67,27 @@ impl std::str::FromStr for StartPolicy {
             "earliest" => Ok(StartPolicy::Earliest),
             _ => anyhow::bail!("Start policy must be 'earliest' or 'latest'"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_group_id() {
+        let mut config = ConsumerConfig::new(StartPolicy::Earliest);
+        config.group_id = Some(String::new());
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_group_auto_commit_interval() {
+        let mut config = ConsumerConfig::new(StartPolicy::Earliest);
+        config.group_id = Some("group".to_string());
+        config.auto_commit_interval_ms = 0;
+
+        assert!(config.validate().is_err());
     }
 }

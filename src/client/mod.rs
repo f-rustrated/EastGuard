@@ -38,7 +38,7 @@ pub use consumer::{
     CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
     StartPolicy,
 };
-pub use error::ClientError;
+pub use error::{ClientError, InvalidConfiguration};
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};
 use uuid::Uuid;
@@ -86,6 +86,7 @@ impl Client {
         if seeds.is_empty() {
             return Err(ClientError::NoSeeds);
         }
+        retry.validate()?;
         Ok(Self {
             pool: ConnectionPool::new(),
             cache: RoutingCache::new(),

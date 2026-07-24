@@ -42,6 +42,30 @@ impl Default for RetryPolicy {
     }
 }
 
+impl RetryPolicy {
+    pub(crate) fn validate(&self) -> Result<(), ClientError> {
+        if self.deadline.is_zero() {
+            return Err(ClientError::invalid_configuration(
+                "retry.deadline",
+                "must be non-zero",
+            ));
+        }
+        if self.initial_backoff.is_zero() {
+            return Err(ClientError::invalid_configuration(
+                "retry.initial_backoff",
+                "must be non-zero",
+            ));
+        }
+        if self.max_backoff < self.initial_backoff {
+            return Err(ClientError::invalid_configuration(
+                "retry.max_backoff",
+                "must be greater than or equal to retry.initial_backoff",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The response that served the call. `redirected` ⇒ the starting target was wrong
 /// (a follow/re-resolve happened), so the caller can refresh its cache.
 #[derive(Debug)]
@@ -199,5 +223,21 @@ mod tests {
             classify(&ClientResponse::Ok(ClientSuccess::Produced(7.into()))),
             "done"
         );
+    }
+
+    #[test]
+    fn retry_policy_rejects_zero_deadline_and_inverted_backoff() {
+        let zero_deadline = RetryPolicy {
+            deadline: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        assert!(zero_deadline.validate().is_err());
+
+        let inverted = RetryPolicy {
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(1),
+            ..RetryPolicy::default()
+        };
+        assert!(inverted.validate().is_err());
     }
 }

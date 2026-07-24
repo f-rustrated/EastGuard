@@ -134,7 +134,7 @@ async fn handle_publish(
     key: String,
     message: String,
 ) -> anyhow::Result<()> {
-    let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+    let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default())?;
     let entry_id = producer.send(key.as_bytes(), message.into_bytes()).await?;
 
     println!(

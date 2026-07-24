@@ -36,27 +36,31 @@ pub struct Inner {
 }
 
 impl Producer {
-    /// Create a new producer for the specified topic.
-    pub fn new(client: Arc<Client>, topic: String, config: ProducerConfig) -> Self {
-        // Generate a globally unique UUID for the producer session ID (idempotency seam)
-        let producer_id = Uuid::new_v4();
-
-        Self::new_with_producer_id(client, topic, config, producer_id)
-    }
-    pub fn new_with_producer_id(
+    /// Create a producer, returning a structured error for invalid configuration.
+    pub fn new(
         client: Arc<Client>,
         topic: String,
         config: ProducerConfig,
-        producer_id: Uuid,
-    ) -> Self {
-        Self(Arc::new(Inner {
+    ) -> Result<Self, ClientError> {
+        // Generate a globally unique UUID for the producer session ID (idempotency seam)
+        let producer_id = Uuid::new_v4();
+
+        if topic.is_empty() {
+            return Err(ClientError::invalid_configuration(
+                "producer.topic",
+                "must not be empty",
+            ));
+        }
+        config.validate()?;
+
+        Ok(Self(Arc::new(Inner {
             client,
             topic,
             buffers: ProducerBuffers::new(config.buffer.clone()),
             codec: config.codec,
             session_manager: ClientProducerSessionManager::new(producer_id),
             next_record_order: std::sync::atomic::AtomicU64::new(0),
-        }))
+        })))
     }
 
     /// Produce a single record. Returns the committed entry ID once the batch flushes.

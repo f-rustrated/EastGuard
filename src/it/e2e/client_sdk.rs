@@ -488,7 +488,8 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Lz4,
             },
-        );
+        )
+        .unwrap();
 
         // Send 2 records concurrently so they get batched and compressed
         let (res1, res2) = tokio::join!(
@@ -584,7 +585,8 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Zstd,
             },
-        );
+        )
+        .unwrap();
 
         // Send 2 records concurrently so they get batched and compressed
         let (res1, res2) = tokio::join!(
@@ -667,18 +669,21 @@ fn producer_concurrency_stress() -> turmoil::Result {
         // Warm the cache
         client.resolve_topic("prod-stress").await.expect("resolve");
 
-        let producer = Arc::new(Producer::new(
-            client.clone(),
-            "prod-stress".to_string(),
-            ProducerConfig {
-                buffer: BufferConfig {
-                    linger: Duration::from_millis(30),
-                    max_batch_bytes: 1024 * 1024,
-                    max_batch_records: 100,
+        let producer = Arc::new(
+            Producer::new(
+                client.clone(),
+                "prod-stress".to_string(),
+                ProducerConfig {
+                    buffer: BufferConfig {
+                        linger: Duration::from_millis(30),
+                        max_batch_bytes: 1024 * 1024,
+                        max_batch_records: 100,
+                    },
+                    codec: CompressionCodec::None,
                 },
-                codec: CompressionCodec::None,
-            },
-        ));
+            )
+            .unwrap(),
+        );
 
         const TASKS: usize = 50;
         const RECORDS_PER_TASK: usize = 10;
@@ -778,7 +783,8 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1) Send Record 1 -> spawns Linger 1 (100ms)
         let f1 = producer.send(b"key-1", b"val-1".to_vec());
@@ -880,7 +886,8 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         for i in 0..5 {
             let key = format!("key-{}", i);
@@ -988,7 +995,8 @@ fn producer_resumes_cleanly_after_session_lease_expiration() -> turmoil::Result 
             client.clone(),
             "session-expire-test".into(),
             ProducerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // 1. Send initial record
         let entry1 = producer
@@ -1058,7 +1066,8 @@ fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // Produce 5 records into the active segment (no roll)
         for i in 0..5 {
@@ -1147,7 +1156,8 @@ fn consumer_key_filtering_multi_range() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         for i in 0..3 {
             producer
@@ -1250,7 +1260,8 @@ fn consumer_range_split_consume() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1. Produce 3 records to parent range, waiting for segment rolls in between
         for i in 0..3 {
@@ -1362,7 +1373,8 @@ fn consumer_retention_recovery() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1. Produce record 1 (goes to segment 0, entry 0)
         producer
@@ -1451,7 +1463,8 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // Produce 3 records across 3 different segments by rolling them
         producer
@@ -1540,7 +1553,8 @@ fn consumer_pause_seek_resume_live_range() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         let (rec0, rec1, rec2) = tokio::join!(
             producer.send(b"k", b"rec-0".to_vec()),
@@ -1633,7 +1647,8 @@ fn consumer_seek_resume_after_sealed_segment_reassignment() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         let record = |idx: usize| {
             let mut value = format!("sealed-rec-{idx}").into_bytes();
@@ -1763,7 +1778,8 @@ fn consumer_linger_batching_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Lz4,
             },
-        );
+        )
+        .unwrap();
 
         // Send 3 records concurrently so they get batched together as Entry 0
         let (res1, res2, res3) = tokio::join!(
@@ -1981,18 +1997,21 @@ fn producer_split_fence_retry() -> turmoil::Result {
             .expect("resolve topic initial");
         assert_eq!(detail_initial.ranges.len(), 1, "Must start with 1 range");
 
-        let producer = Arc::new(Producer::new(
-            client1.clone(),
-            topic.to_string(),
-            ProducerConfig {
-                buffer: BufferConfig {
-                    linger: Duration::from_secs(60),
-                    max_batch_bytes: 1024 * 1024,
-                    max_batch_records: 1000,
+        let producer = Arc::new(
+            Producer::new(
+                client1.clone(),
+                topic.to_string(),
+                ProducerConfig {
+                    buffer: BufferConfig {
+                        linger: Duration::from_secs(60),
+                        max_batch_bytes: 1024 * 1024,
+                        max_batch_records: 1000,
+                    },
+                    codec: CompressionCodec::None,
                 },
-                codec: CompressionCodec::None,
-            },
-        ));
+            )
+            .unwrap(),
+        );
 
         // Both keys enter the parent batch before the range splits.
         let left = {
