@@ -46,6 +46,34 @@ impl ConsumerRecord {
     }
 }
 
+/// A topic consumer backed by one shared fetch manager.
+///
+/// Clones compete for records from the same stream; they do not each receive a copy.
+/// Closing any clone shuts down the shared manager and invalidates the other clones.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use east_guard::client::{
+///     Client, Consumer, ConsumerConfig, KeyInterest, StartPolicy,
+/// };
+/// use std::{net::SocketAddr, sync::Arc};
+///
+/// let seed: SocketAddr = "127.0.0.1:9091".parse()?;
+/// let client = Arc::new(Client::connect([seed])?);
+/// let mut config = ConsumerConfig::new(StartPolicy::Earliest);
+/// config.group_id = Some("billing".to_string());
+///
+/// let consumer =
+///     Consumer::new(client, "orders".to_string(), KeyInterest::AllKeys, config).await?;
+/// if let Some(record) = consumer.next_record().await? {
+///     consumer.ack(&record)?;
+/// }
+/// consumer.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Consumer {
     ctx: Arc<ConsumerContext>,
@@ -143,6 +171,10 @@ impl Consumer {
         ));
     }
 
+    /// Commit acknowledged positions for ranges currently owned by this consumer.
+    ///
+    /// A canceled commit may still complete on the server. Retrying is safe because
+    /// committed positions advance monotonically.
     pub async fn commit(&self) -> Result<(), ClientError> {
         let Some(group) = &self.group else {
             return Ok(());
@@ -166,6 +198,9 @@ impl Consumer {
     }
 
     /// Stop fetching, commit acknowledged offsets, revoke ownership, and leave the group.
+    ///
+    /// This affects every clone. Once the command reaches the fetch manager, shutdown
+    /// continues even if this future is canceled; cancellation only loses the result.
     pub async fn close(&self) -> Result<(), ClientError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.command_tx
@@ -249,6 +284,8 @@ impl Consumer {
     /// Returns `Ok(Some(record))` when a record is available, and `Ok(None)` when the topic has
     /// been fully consumed (i.e. all lineage paths have been drained to their ends and no active
     /// cursors remain).
+    ///
+    /// Canceling while waiting does not acknowledge or commit a record.
     pub async fn next_record(&self) -> Result<Option<ConsumerRecord>, ClientError> {
         loop {
             let Ok(res) = self.consumer_rx.recv_async().await else {

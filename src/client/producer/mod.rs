@@ -21,6 +21,32 @@ use uuid::Uuid;
 
 /// A thread-safe, internally synchronized producer for a single topic.
 /// Cheap to clone and share across tasks.
+///
+/// Every clone refers to the same buffers and shutdown state. Closing any clone
+/// closes the producer for all clones.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use east_guard::client::{Client, Producer, ProducerConfig};
+/// use std::{net::SocketAddr, sync::Arc};
+///
+/// let seed: SocketAddr = "127.0.0.1:9091".parse()?;
+/// let client = Arc::new(Client::connect([seed])?);
+/// let producer = Producer::new(client, "orders".to_string(), ProducerConfig::default())?;
+///
+/// let sender = producer.clone();
+/// let sent = tokio::spawn(async move {
+///     sender.send(b"customer-42", b"created".to_vec()).await
+/// });
+/// let committed_entry = sent.await??;
+///
+/// producer.close().await;
+/// # let _ = committed_entry;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Producer(Arc<Inner>);
 impl_new_struct_wrapper!(Producer, Arc<Inner>);
@@ -171,14 +197,23 @@ impl Producer {
         }
     }
 
-    /// Wait for active sends, then flush records left buffered by canceled send futures.
     pub async fn flush(&self) {
-        let _exclusive = self.send_gate.write().await;
-        let _flush = self.flush_gate.write().await;
-        self.flush_buffers().await;
+        let producer = self.clone();
+        let handle = tokio::spawn(async move {
+            let _exclusive = producer.send_gate.write().await;
+            let _flush = producer.flush_gate.write().await;
+            producer.flush_buffers().await;
+        });
+        // ! If the caller's timeout/cancellation fires, Tokio drops the flush() future—which "drops" handle.
+        // ! Dropping handle simply detaches the task, which is different than handle.abort();
+        // ! So, cancellation loses only the caller's knowledge of when the drain finished.
+        let _ = handle.await;
     }
 
-    /// This serves as the public SDK entry point for external applications to gracefully shut down a producer
+    /// Close every clone and wait for accepted records to finish.
+    ///
+    /// New sends fail with [`ClientError::ProducerClosed`]. Canceling this future keeps
+    /// the producer closed, while the producer-owned drain continues in the background.
     pub async fn close(&self) {
         self.should_reject.store(true, Ordering::Release);
         self.flush().await;

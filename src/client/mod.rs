@@ -5,6 +5,14 @@
 //! that keeps the cache honest. The server never proxies — it redirects, and this
 //! library follows. Producer (C2) and consumer (C3) layer on top of this core.
 //!
+//! # Cancellation
+//!
+//! Canceling a future stops waiting locally; it does not retract a request already
+//! written to a server. Mutating operations may therefore complete after their future
+//! is dropped. Producer batching has a stronger contract documented on
+//! [`Producer::send`]. Use [`Producer::close`] and [`Consumer::close`] for explicit
+//! graceful shutdown; dropping a handle performs only best-effort cleanup.
+//!
 //! `#![allow(dead_code)]` — C1 is the foundation; its tests and the later C2/C3 phases
 //! are the first non-test consumers (mirrors `consumer`).
 
