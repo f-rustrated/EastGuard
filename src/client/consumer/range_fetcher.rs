@@ -5,12 +5,13 @@ use super::{ConsumerContext, ConsumerRecord, RangeCursor};
 use crate::client::consumer::context::RangeLookupResult;
 use crate::client::consumer::messages::RangeDrained;
 use crate::client::redirect::Served;
-use crate::client::{ClientError, CompressionCodec};
+use crate::client::{ClientError, ClientSuccess, CompressionCodec, ServerError};
 use crate::connections::protocol::{
-    ClientResponse, DataPlaneResponse, RangeProgressSignal, RangeTransition, SegmentDetail,
+    ClientResponse, EntryPayload, RangeProgressSignal, RangeTransition, SegmentDetail,
 };
 use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetPosition;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition;
+use crate::data_plane::messages::query::RangeOffsets;
 
 const EMPTY_FETCHES_BEFORE_REFRESH: u8 = 20;
 
@@ -137,124 +138,25 @@ impl RangeFetchActor {
                 .await?
         };
 
-        let ClientResponse::DataPlane(dp_response) = served.response else {
-            return Err(ClientError::UnexpectedResponse);
-        };
-
-        self.handle_data_plane_response(dp_response).await
-    }
-
-    async fn handle_data_plane_response(
-        &mut self,
-        dp_response: DataPlaneResponse,
-    ) -> Result<bool, ClientError> {
-        match dp_response {
-            DataPlaneResponse::Fetched {
+        match served.response {
+            ClientResponse::Ok(ClientSuccess::Fetched {
                 entries,
                 next_entry_id,
                 progress_signal,
-            } => {
-                if entries.is_empty() {
-                    // ! short-polling backoff mechanism to prevent the consumer from unintentionally DDoS-ing the data plane server
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if self.group_fetch {
-                        self.consecutive_empty_fetches =
-                            self.consecutive_empty_fetches.saturating_add(1);
-                        if self.consecutive_empty_fetches >= EMPTY_FETCHES_BEFORE_REFRESH {
-                            self.ctx.refresh_metadata().await?;
-                            self.consecutive_empty_fetches = 0;
-                        }
-                    }
-                } else {
-                    self.consecutive_empty_fetches = 0;
-                }
-
-                for entry in entries.into_iter() {
-                    if self.should_skip_entry_by_absolute_offset(entry.record_count) {
-                        continue;
-                    }
-
-                    let records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
-                        .map_err(|e| {
-                            tracing::error!("Failed to decompress entry payload: {}", e);
-                            ClientError::UnexpectedResponse
-                        })?;
-
-                    let skip_batch_offsets_below = if entry.entry_id == self.cursor.next_entry_id {
-                        self.cursor.skip_batch_offsets_below.take()
-                    } else {
-                        None
-                    };
-
-                    for (i, (key, value)) in records.into_iter().enumerate() {
-                        if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
-                            continue;
-                        }
-
-                        let absolute_offset = self.cursor.next_absolute_offset;
-                        self.cursor.next_absolute_offset =
-                            self.cursor.next_absolute_offset.saturating_add(1);
-
-                        if self
-                            .cursor
-                            .skip_absolute_offsets_below
-                            .is_some_and(|target| absolute_offset < target)
-                        {
-                            continue;
-                        }
-                        self.cursor.skip_absolute_offsets_below = None;
-
-                        let consumer_rec = ConsumerRecord {
-                            topic: self.ctx.topic.clone(),
-                            range_id: self.cursor.range_id,
-                            position: ConsumerOffsetPosition {
-                                batch_offset: i as u64,
-                                entry_id: entry.entry_id,
-                                absolute_offset,
-                            },
-                            key,
-                            value,
-                        };
-
-                        if self.record_tx.send(Ok(consumer_rec)).is_err() {
-                            return Ok(false); // Disconnected
-                        }
-                    }
-                }
-
-                // Data plane returns Fetched response with progress_signal,
-                // If the range is permanently sealed, it attaches Sealed signal.
-                // end_entry_id suggest hard stop point.
-                //
-                // next_entry_id is offset of the next record the consumer needs to fetch.
-                // So the end_entry_id could be 999 while next_entry_id  is only  501, suggesting that you still have more to fetch in this range
-                if let RangeProgressSignal::Sealed {
-                    end_entry_id,
-                    transition,
-                } = progress_signal
-                    && next_entry_id > end_entry_id
-                {
-                    self.cursor.next_entry_id = next_entry_id;
-                    let _ = self.ctx.cursor_tx.send(RangeDrained {
-                        cursor: self.cursor.clone(),
-                        transition,
-                    });
-                    return Ok(false);
-                }
-
-                self.cursor.next_entry_id = next_entry_id;
-                Ok(true)
+            }) => {
+                self.handle_fetched(entries, next_entry_id, progress_signal)
+                    .await
             }
-            DataPlaneResponse::EntryIdOutOfRange => {
+            ClientResponse::Err(ServerError::EntryIdOutOfRange) => {
                 let prev_entry_id = self.cursor.next_entry_id;
-                let (start_id, _) = self
+                let RangeOffsets { start_entry_id, .. } = self
                     .ctx
                     .client
                     .fetch_range_entry_ids(&self.ctx.topic, self.cursor.range_id)
                     .await?;
 
-                if self.cursor.next_entry_id < start_id {
-                    self.cursor.next_entry_id = start_id;
+                if self.cursor.next_entry_id < start_entry_id {
+                    self.cursor.next_entry_id = start_entry_id;
                 }
                 if self.cursor.next_entry_id == prev_entry_id {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -262,14 +164,104 @@ impl RangeFetchActor {
                 }
                 Ok(true)
             }
-
-            dp if dp.is_routing_error() => {
+            ClientResponse::Err(err) if err.is_routing_error() => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 self.ctx.refresh_metadata().await?;
                 Ok(true)
             }
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    async fn handle_fetched(
+        &mut self,
+        entries: Box<[EntryPayload]>,
+        next_entry_id: EntryId,
+        progress_signal: RangeProgressSignal,
+    ) -> Result<bool, ClientError> {
+        if entries.is_empty() {
+            // ! short-polling backoff mechanism to prevent the consumer from unintentionally DDoS-ing the data plane server
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if self.group_fetch {
+                self.consecutive_empty_fetches = self.consecutive_empty_fetches.saturating_add(1);
+                if self.consecutive_empty_fetches >= EMPTY_FETCHES_BEFORE_REFRESH {
+                    self.ctx.refresh_metadata().await?;
+                    self.consecutive_empty_fetches = 0;
+                }
+            }
+        } else {
+            self.consecutive_empty_fetches = 0;
+        }
+
+        for entry in entries.into_vec() {
+            if self.should_skip_entry_by_absolute_offset(entry.record_count) {
+                continue;
+            }
+
+            let records = CompressionCodec::decode_payload(&entry.data, entry.record_count)
+                .map_err(|e| {
+                    tracing::error!("Failed to decompress entry payload: {}", e);
+                    ClientError::UnexpectedResponse
+                })?;
+
+            let skip_batch_offsets_below = if entry.entry_id == self.cursor.next_entry_id {
+                self.cursor.skip_batch_offsets_below.take()
+            } else {
+                None
+            };
+
+            for (i, (key, value)) in records.into_iter().enumerate() {
+                if skip_batch_offsets_below.is_some_and(|skip| i as u64 <= skip) {
+                    continue;
+                }
+
+                let absolute_offset = self.cursor.next_absolute_offset;
+                self.cursor.next_absolute_offset =
+                    self.cursor.next_absolute_offset.saturating_add(1);
+
+                if self
+                    .cursor
+                    .skip_absolute_offsets_below
+                    .is_some_and(|target| absolute_offset < target)
+                {
+                    continue;
+                }
+                self.cursor.skip_absolute_offsets_below = None;
+
+                let consumer_rec = ConsumerRecord {
+                    topic: self.ctx.topic.clone(),
+                    range_id: self.cursor.range_id,
+                    position: ConsumerOffsetPosition {
+                        batch_offset: i as u64,
+                        entry_id: entry.entry_id,
+                        absolute_offset,
+                    },
+                    key,
+                    value,
+                };
+
+                if self.record_tx.send(Ok(consumer_rec)).is_err() {
+                    return Ok(false); // Disconnected
+                }
+            }
+        }
+
+        if let RangeProgressSignal::Sealed {
+            end_entry_id,
+            transition,
+        } = progress_signal
+            && next_entry_id > end_entry_id
+        {
+            self.cursor.next_entry_id = next_entry_id;
+            let _ = self.ctx.cursor_tx.send(RangeDrained {
+                cursor: self.cursor.clone(),
+                transition,
+            });
+            return Ok(false);
+        }
+
+        self.cursor.next_entry_id = next_entry_id;
+        Ok(true)
     }
 
     fn should_skip_entry_by_absolute_offset(&mut self, record_count: u32) -> bool {

@@ -5,7 +5,8 @@ use std::time::Duration;
 use turmoil::Builder;
 
 use crate::StartUp;
-use crate::connections::protocol::ControlPlaneResponse;
+use crate::client::ClientSuccess;
+use crate::connections::protocol::ClientResponse;
 use crate::control_plane::membership::ShardGroupId;
 use crate::it::helpers::{check_alive_count, check_dead_or_not_exist, default_env};
 use crate::it::sim::invariants::{
@@ -113,7 +114,7 @@ fn metadata_visible() -> turmoil::Result {
         for _ in 0..30u32 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             for i in 1..=3u8 {
-                if let Some(ControlPlaneResponse::TopicCreated) =
+                if let Some(ClientResponse::Ok(ClientSuccess::TopicCreated)) =
                     try_propose(&node_name(i), client_port(i), &req).await
                 {
                     acked = true;
@@ -208,7 +209,7 @@ fn leader_elects_after_kill() -> turmoil::Result {
             }
             if !topic_acked {
                 for i in 1..=3u8 {
-                    if let Some(ControlPlaneResponse::TopicCreated) =
+                    if let Some(ClientResponse::Ok(ClientSuccess::TopicCreated)) =
                         try_propose(&node_name(i), client_port(i), &req).await
                     {
                         topic_acked = true;

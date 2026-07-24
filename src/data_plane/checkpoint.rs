@@ -4,7 +4,7 @@ use std::sync::Arc;
 use flume::Receiver;
 
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::consumer_offset_management::ledger::OffsetLedger;
+use crate::data_plane::auxiliary_states::snapshot::AuxiliarySnapshot;
 use crate::data_plane::states::segment::cache::SegmentRingBuffer;
 use crate::data_plane::wal::WalRecord;
 
@@ -69,12 +69,12 @@ impl CheckpointWorker {
                 }
 
                 // A snapshot is created only when WAL reclamation would cross an uncheckpointed offset record.
-                CheckpointTask::ConsumerOffsets(job) => {
-                    if let Err(e) = job.offsets.write_snapshot(&job.data_dir) {
-                        tracing::error!("consumer offset checkpoint failed: {e}");
+                CheckpointTask::AuxiliaryState(job) => {
+                    if let Err(e) = job.snapshot.write(&job.data_dir) {
+                        tracing::error!("auxiliary state checkpoint failed: {e}");
                         continue;
                     }
-                    let completion: DataPlaneCommand = OffsetCheckpointComplete {
+                    let completion: DataPlaneCommand = AuxiliaryCheckpointComplete {
                         checkpointed_lsn: job.checkpointed_lsn,
                     }
                     .into();
@@ -136,7 +136,7 @@ pub(crate) enum CheckpointTask {
     DeleteSegmentIndex(SegmentKey),
     /// Snapshot the consumer-offset cache after its corresponding shared-WAL
     /// batch is durable. This runs off the data-plane write path.
-    ConsumerOffsets(OffsetCheckpointJob),
+    AuxiliaryState(Box<AuxiliaryCheckpointJob>),
 }
 
 pub struct CheckpointJob {
@@ -145,8 +145,8 @@ pub struct CheckpointJob {
     pub segment_file_path: PathBuf,
 }
 
-pub struct OffsetCheckpointJob {
-    pub offsets: OffsetLedger,
+pub struct AuxiliaryCheckpointJob {
+    pub snapshot: AuxiliarySnapshot,
     pub data_dir: PathBuf,
     pub checkpointed_lsn: u64,
 }

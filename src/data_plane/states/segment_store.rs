@@ -21,11 +21,11 @@
 //! never originates a side effect, never talks to the network, never emits
 //! events. `DataPlane` keeps doing all of that.
 
-use super::segment::tracker::SegmentTracker;
+use super::segment::tracker::{SegmentRole, SegmentTracker};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
-use crate::data_plane::SegmentKey;
+use crate::data_plane::{PayloadBytes, ProduceError, ProducerAppendIdentity, SegmentKey};
 
 /// Where a segment's data currently lives once its tracker has been dropped.
 /// Returned from the resolver as part of a `Sealed` outcome so the cold-read
@@ -79,6 +79,29 @@ impl SegmentStore {
 
     pub(crate) fn get_mut(&mut self, key: &SegmentKey) -> Option<&mut SegmentTracker> {
         self.by_key.get_mut(key)
+    }
+
+    /// Validates that the target segment exists and this node is the write leader.
+    pub(crate) fn verify_write_leader(&self, key: &SegmentKey) -> Result<(), ProduceError> {
+        match self.get(key) {
+            Some(t) if t.role() == SegmentRole::Follower => Err(ProduceError::NotLeader),
+            None => Err(ProduceError::SegmentNotFound),
+            _ => Ok(()),
+        }
+    }
+
+    /// Stages a producer entry into the segment tracker, returning the assigned entry_id.
+    pub(crate) fn stage_producer_entry(
+        &mut self,
+        key: SegmentKey,
+        data: PayloadBytes,
+        record_count: u32,
+        producer_identity: Option<ProducerAppendIdentity>,
+    ) -> Option<EntryId> {
+        let tracker = self.get_mut(&key)?;
+        let entry_id = tracker.next_staged_entry_id();
+        tracker.stage_entry(key, data, record_count, entry_id, producer_identity);
+        Some(entry_id)
     }
 
     pub(crate) fn values(&self) -> impl Iterator<Item = &SegmentTracker> {

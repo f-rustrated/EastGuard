@@ -8,6 +8,7 @@ use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{ProduceAck, ReplicateSegmentEntries};
 use crate::data_plane::states::segment::cache::CachedEntry;
+use crate::data_plane::{ProduceError, ProducerAppendIdentity};
 
 #[derive(Default)]
 pub(crate) struct ReplicationState {
@@ -21,12 +22,16 @@ pub(crate) struct PendingBatch {
     pub(crate) replies: Vec<oneshot::Sender<ProduceAck>>,
     pub(crate) pending_acks: HashSet<NodeId>,
     pub(crate) entry_id: EntryId,
+    pub(crate) producer_append_id: Option<ProducerAppendIdentity>,
+    pub(crate) lsn: u64,
 }
 
 pub(crate) struct AckCommitted {
     pub entry_id: EntryId,
     pub replies: Vec<oneshot::Sender<ProduceAck>>,
     pub reset_timer_seq: Option<u64>,
+    pub producer_identity: Option<ProducerAppendIdentity>,
+    pub lsn: u64,
 }
 
 pub(crate) struct PendingReplicationBatch {
@@ -45,6 +50,7 @@ impl PendingReplicationBatch {
             data: self.entry.data.clone(),
             record_count: self.entry.record_count,
             entry_id: self.entry.entry_id,
+            producer_identity: self.entry.producer_identity,
         };
         (targets, message)
     }
@@ -93,13 +99,14 @@ impl ReplicationState {
     }
 
     pub(crate) fn fail_all(&mut self, err: String) {
+        self.timer_seqs.clear();
         for reply in self.drain_all_pending_replies() {
-            let _ = reply.send(ProduceAck::Err(err.clone()));
+            let _ = reply.send(ProduceAck::Err(ProduceError::Internal(err.clone())));
         }
 
         for batch in self.drain_all_in_flight() {
             for reply in batch.replies {
-                let _ = reply.send(ProduceAck::Err(err.clone()));
+                let _ = reply.send(ProduceAck::Err(ProduceError::Internal(err.clone())));
             }
         }
     }
@@ -119,6 +126,8 @@ impl ReplicationState {
                 replies,
                 pending_acks,
                 entry_id: pending_repl.entry.entry_id,
+                producer_append_id: pending_repl.entry.producer_identity,
+                lsn: pending_repl.entry.lsn,
             },
         );
         if is_first {
@@ -144,25 +153,32 @@ impl ReplicationState {
     ) -> Option<AckCommitted> {
         let deque = self.in_flight.get_mut(segment_key)?;
         let front = deque.front_mut()?;
+
         front.pending_acks.remove(from);
 
         if !front.pending_acks.is_empty() {
             return None;
         }
 
-        let batch = deque.pop_front().unwrap();
+        // All ACKs collected: commit the batch
+        let batch = deque.pop_front()?;
         self.timer_seqs.remove(segment_key);
 
-        let reset_timer_seq = (!deque.is_empty()).then_some({
+        let reset_timer_seq = if deque.is_empty() {
+            self.in_flight.remove(segment_key);
+            None
+        } else {
             let seq = self.alloc_timer_seq();
             self.set_timer_seq(*segment_key, seq);
-            seq
-        });
+            Some(seq)
+        };
 
         Some(AckCommitted {
             entry_id: batch.entry_id,
             replies: batch.replies,
             reset_timer_seq,
+            producer_identity: batch.producer_append_id,
+            lsn: batch.lsn,
         })
     }
 
@@ -191,6 +207,7 @@ impl ReplicationState {
     }
 
     pub(crate) fn segment_handoff(&mut self, old: SegmentKey, new: SegmentKey) {
+        self.timer_seqs.remove(&old);
         if let Some(replies) = self.pending_replies.remove(&old) {
             self.pending_replies.entry(new).or_default().extend(replies);
         }
@@ -205,6 +222,34 @@ impl ReplicationState {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+impl crate::test_traits::TAssertInvariant for ReplicationState {
+    fn assert_invariants(&self) {
+        for (key, replies) in &self.pending_replies {
+            assert!(!replies.is_empty(), "empty pending reply queue for {key:?}");
+        }
+        for (key, batches) in &self.in_flight {
+            assert!(!batches.is_empty(), "empty replication queue for {key:?}");
+            assert!(
+                self.timer_seqs.contains_key(key),
+                "in-flight replication has no active timer for {key:?}"
+            );
+            for batch in batches {
+                assert!(
+                    !batch.pending_acks.is_empty(),
+                    "in-flight replication batch has no pending acknowledgments"
+                );
+            }
+        }
+        for key in self.timer_seqs.keys() {
+            assert!(
+                self.in_flight.contains_key(key),
+                "replication timer exists without an in-flight batch for {key:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,7 +258,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
-    use crate::data_plane::EntryPayload;
+    use crate::data_plane::PayloadBytes;
     use crate::data_plane::states::segment::cache::CachedEntry;
 
     fn key(seg: u64) -> SegmentKey {
@@ -226,10 +271,11 @@ mod tests {
 
     fn cached_entry(entry_id: EntryId) -> Arc<CachedEntry> {
         Arc::new(CachedEntry {
-            data: EntryPayload::from(Bytes::from("data")),
+            data: PayloadBytes::from(Bytes::from("data")),
             record_count: 1,
             entry_id,
             lsn: 1,
+            producer_identity: None,
         })
     }
 
@@ -327,20 +373,18 @@ mod tests {
         assert!(committed.reset_timer_seq.is_none());
 
         assert!(!state.is_active_timer(&sk, 0));
+        assert!(!state.in_flight.contains_key(&sk));
+        crate::test_traits::TAssertInvariant::assert_invariants(&state);
 
         let _ = committed
             .replies
             .into_iter()
             .next()
             .unwrap()
-            .send(ProduceAck::Ok {
-                entry_id: EntryId(42),
-            });
+            .send(ProduceAck::Ok(EntryId(42)));
         assert!(matches!(
             rx.blocking_recv().unwrap(),
-            ProduceAck::Ok {
-                entry_id: EntryId(42)
-            }
+            ProduceAck::Ok(EntryId(42))
         ));
     }
 

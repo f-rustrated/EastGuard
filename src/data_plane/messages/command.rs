@@ -1,29 +1,31 @@
 use crate::control_plane::Replicas;
 use crate::control_plane::metadata::SegmentRollIntent;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
-use crate::data_plane::consumer_offset_management::ledger::EpochSeal;
-use crate::data_plane::consumer_offset_management::ledger::StaleEpoch;
-use crate::data_plane::consumer_offset_management::types::ReplicateConsumerOffset;
+use crate::data_plane::ProduceError;
+use crate::data_plane::ProducerAppendIdentity;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetEntry;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetUpdate;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::EpochSeal;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::StaleEpoch;
+use crate::data_plane::auxiliary_states::consumer_offsets::types::ReplicateConsumerOffset;
+use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentIdleCallback};
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
-use borsh::{BorshDeserialize, BorshSerialize};
-use std::borrow::Borrow;
-use std::sync::Arc;
-use tokio::sync::oneshot;
-
 use crate::{
     control_plane::NodeId,
     control_plane::membership::ShardGroupId,
     control_plane::metadata::{EntryId, SegmentId},
     data_plane::states::segment::cache::CachedEntry,
-    data_plane::{EntryPayload, SegmentKey, timer::DataPlaneTimeoutCallback},
+    data_plane::{PayloadBytes, SegmentKey, timer::DataPlaneTimeoutCallback},
 };
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::borrow::Borrow;
+use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub enum DataPlaneCommand {
     Produce(Produce),
     SegmentCheckpointComplete(SegmentCheckpointComplete),
-    OffsetCheckpointComplete(OffsetCheckpointComplete),
+    AuxiliaryCheckpointComplete(AuxiliaryCheckpointComplete),
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     ReceivePeerMessage(ReceivePeerMessage),
     /// Internal (not a wire message): the cold-read pool's reply for a catch-up
@@ -54,11 +56,39 @@ pub struct OrphanGcCheck {
 
 pub struct Produce {
     pub segment_key: SegmentKey,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
+    pub received_at_ms: u64,
+    pub producer_identity: Option<AuthorizedProducerIdentity>,
     pub reply: oneshot::Sender<ProduceAck>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AuthorizedProducerIdentity {
+    // Local metadata confirmed the session, so the producer tracker may register it.
+    MetadataVerified(ProducerAppendIdentity),
+    // Local metadata missed, so authority falls back to the tracker's recovered sessions.
+    //ONLY IF it already has an existing, non-expired session on disk for this producer.
+    //If the ledger doesn't know this session either, it is rejected.
+    ExistingOnly(ProducerAppendIdentity),
+}
+
+impl AuthorizedProducerIdentity {
+    pub(crate) fn request(self) -> ProducerAppendIdentity {
+        match self {
+            Self::MetadataVerified(request) | Self::ExistingOnly(request) => request,
+        }
+    }
+
+    pub(crate) fn destruct(self) -> (ProducerAppendIdentity, bool) {
+        match self {
+            AuthorizedProducerIdentity::MetadataVerified(req) => (req, true),
+            AuthorizedProducerIdentity::ExistingOnly(req) => (req, false),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct CommitConsumerOffset {
     pub update: ConsumerOffsetUpdate,
     pub reply: oneshot::Sender<ConsumerOffsetCommitAck>,
@@ -91,9 +121,10 @@ pub struct SegmentPlaced {
 pub struct ReplicateSegmentEntries {
     pub segment_key: SegmentKey,
     pub replicas: Replicas,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
     pub entry_id: EntryId,
+    pub producer_identity: Option<ProducerAppendIdentity>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -211,7 +242,7 @@ pub struct CatchUpEntries {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct CatchUpEntry {
     pub entry_id: EntryId,
-    pub data: EntryPayload,
+    pub data: PayloadBytes,
     pub record_count: u32,
 }
 impl CatchUpEntry {
@@ -335,10 +366,8 @@ pub enum ProduceAck {
     /// `entry_id` is the committed offset for this produce. Exact for a producer
     /// with one request in flight at a time (the common case); under pipelining
     /// it is the segment's committed highwater at ack time (an upper bound).
-    Ok {
-        entry_id: EntryId,
-    },
-    Err(String),
+    Ok(EntryId),
+    Err(ProduceError),
 }
 
 pub struct SegmentCheckpointComplete {
@@ -348,7 +377,7 @@ pub struct SegmentCheckpointComplete {
     pub checkpointed_bytes: u64,
 }
 
-pub struct OffsetCheckpointComplete {
+pub struct AuxiliaryCheckpointComplete {
     pub checkpointed_lsn: u64,
 }
 
@@ -366,15 +395,13 @@ impl_from_variant!(
     DataPlaneCommand,
     Produce,
     SegmentCheckpointComplete,
-    OffsetCheckpointComplete,
+    AuxiliaryCheckpointComplete,
     CatchUpReadComplete,
     OrphanGcCheck,
     CommitConsumerOffset,
     DataPlaneTimeoutCallback(DataPlaneTimeoutCallback),
     ReceivePeerMessage,
 );
-
-use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentIdleCallback};
 
 impl_from_variant_via!(
     DataPlaneCommand,

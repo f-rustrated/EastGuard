@@ -9,21 +9,44 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::{
-        NodeAddressInfo,
-        metadata::{
-            EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta,
-            consumer_group::GenerationId,
-        },
+    client::ClientSuccess,
+    control_plane::metadata::{
+        EntryId, RangeId, RangeMeta, RangeState, TopicId, TopicMeta, consumer_group::GenerationId,
     },
     data_plane::{
-        consumer_offset_management::ledger::{
-            ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
-        },
-        messages::query::{FetchResult, ListOffsetsResult},
+        PayloadBytes, ProducerAppendIdentity,
+        auxiliary_states::consumer_offsets::state::{ConsumerOffsetKey, ConsumerOffsetUpdate},
+        messages::query::FetchedRecords,
     },
     impl_from_variant, impl_new_struct_wrapper,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct EntryPayload {
+    pub entry_id: EntryId,
+    pub record_count: u32,
+    pub data: Vec<u8>,
+}
+
+impl EntryPayload {
+    pub fn from_fetched_record(r: FetchedRecords) -> ClientSuccess {
+        let wire_entries = r
+            .entries
+            .into_iter()
+            .map(|cached| EntryPayload {
+                entry_id: cached.entry_id,
+                record_count: cached.record_count,
+                data: cached.data.to_vec(),
+            })
+            .collect();
+
+        ClientSuccess::Fetched {
+            entries: wire_entries,
+            next_entry_id: r.next_entry_id,
+            progress_signal: r.progress_signal,
+        }
+    }
+}
 
 /// Client → broker data-plane request. Every variant carries a `Client*Request`
 /// struct so the carried fields are named in one place (consistent with the
@@ -58,8 +81,9 @@ pub struct ProduceRequest {
     /// Pre-serialized blob produced by the client: a leading 1-byte cleartext
     /// codec tag (none/lz4/zstd) followed by the optionally-compressed records.
     /// The broker stamps an entry_id and stores/replicates this opaque payload as-is.
-    pub data: Vec<u8>,
+    pub data: PayloadBytes,
     pub record_count: u32,
+    pub producer_identity: Option<ProducerAppendIdentity>,
 }
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -104,105 +128,9 @@ pub struct FetchConsumerOffsetRequest {
     pub generation: GenerationId,
 }
 
-#[derive(Debug, Clone, Copy, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ConsumerOffsetGenerationMismatch {
     pub observed_generation: GenerationId,
-}
-
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
-pub enum DataPlaneResponse {
-    // Produce
-    Produced {
-        entry_id: EntryId,
-    },
-    // Fetch
-    Fetched {
-        entries: Box<[Entry]>,
-        next_entry_id: EntryId,
-        progress_signal: RangeProgressSignal,
-    },
-    EntryIdOutOfRange,
-    // keyspace_bound was set but narrower than the target range's keyspace.
-    KeyspaceBoundNarrowed,
-
-    RangeOffset {
-        start_entry_id: EntryId,
-        next_entry_id: EntryId,
-    },
-    // `NotWriteLeader` is the segment's data-replica write leader (`replica_set[0]`),
-    // distinct from the metadata Raft leader (`ControlPlaneResponse::NotRaftLeader`).
-    NotWriteLeader {
-        leader_addr: Option<NodeAddressInfo>,
-    },
-    ShardNotLocal {
-        hint_node: Option<NodeAddressInfo>,
-    },
-    StaleRange,
-    TopicNotFound,
-    SegmentNotLocal,
-
-    ConsumerOffsetCommitted,
-    StaleConsumerGroupEpoch(GenerationId),
-    ConsumerOffset(Option<ConsumerOffsetPosition>),
-    ConsumerOffsetGenerationMismatch(ConsumerOffsetGenerationMismatch),
-    InternalError(String),
-}
-
-impl DataPlaneResponse {
-    pub fn is_routing_error(&self) -> bool {
-        matches!(
-            self,
-            DataPlaneResponse::SegmentNotLocal
-                | DataPlaneResponse::ShardNotLocal { .. }
-                | DataPlaneResponse::NotWriteLeader { .. }
-        )
-    }
-
-    pub(crate) fn from_list_offset_result(value: ListOffsetsResult) -> Self {
-        match value {
-            ListOffsetsResult::RangeOffsets {
-                start_entry_id,
-                next_entry_id,
-            } => DataPlaneResponse::RangeOffset {
-                start_entry_id,
-                next_entry_id,
-            },
-            ListOffsetsResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
-        }
-    }
-
-    pub(crate) fn from_fetch_result(result: FetchResult) -> Self {
-        match result {
-            FetchResult::Records {
-                entries,
-                next_entry_id,
-                progress_signal,
-            } => {
-                // Single Bytes → Vec<u8> copy per entry at the wire boundary
-                // — borsh's owned-byte encoding requires Vec<u8>. The
-                // intermediate `FetchedEntry` step that used to live in the
-                // data plane is gone; the Arc rides straight through the
-                // channel from the cache.
-                let wire_entries = entries
-                    .into_iter()
-                    .map(|cached| Entry {
-                        entry_id: cached.entry_id,
-                        // Auto-deref EntryPayload → Bytes → [u8], then to_vec.
-                        data: cached.data.to_vec(),
-                        record_count: cached.record_count,
-                    })
-                    .collect();
-                DataPlaneResponse::Fetched {
-                    entries: wire_entries,
-                    next_entry_id,
-                    progress_signal,
-                }
-            }
-            FetchResult::EntryIdOutOfRange => DataPlaneResponse::EntryIdOutOfRange,
-            FetchResult::SegmentNotLocal => DataPlaneResponse::SegmentNotLocal,
-            FetchResult::InternalError(s) => DataPlaneResponse::InternalError(s),
-        }
-    }
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -227,7 +155,7 @@ pub struct Entry {
 /// payload) — tells the consumer whether to keep fetching this range or drain
 /// to `end_offset` and follow the lineage transition to its successor(s).
 /// See (d4_consumer_range_tracking.md, "Range Transitions".)
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum RangeProgressSignal {
     Active,
     Sealed {
@@ -236,7 +164,7 @@ pub enum RangeProgressSignal {
     },
 }
 
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum RangeTransition {
     Split {
         left_range_id: RangeId,

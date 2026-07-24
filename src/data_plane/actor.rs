@@ -7,6 +7,7 @@ use super::state::DataPlane;
 use super::timer::SegmentIdleTimer;
 use super::wal::WalWriter;
 use crate::channels::BatchSender;
+use crate::client::ServerError;
 use crate::config::DataNodeConfig;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
@@ -154,17 +155,16 @@ fn run_orphan_gc(internal: Duration, tx: &Sender<DataPlaneMessage>) {
 pub(crate) struct DataPlaneSender(pub flume::Sender<DataPlaneMessage>);
 
 impl DataPlaneSender {
-    pub fn send(
-        &self,
-        msg: impl Into<DataPlaneMessage>,
-    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
-        self.0.send(msg.into())
+    pub fn send(&self, msg: impl Into<DataPlaneMessage>) -> Result<(), ServerError> {
+        self.0
+            .send(msg.into())
+            .map_err(|err| ServerError::Internal(format!("Channel dropped: {}", err)))
     }
 
-    pub async fn send_async(
-        &self,
-        msg: impl Into<DataPlaneMessage>,
-    ) -> Result<(), flume::SendError<DataPlaneMessage>> {
-        self.0.send_async(msg.into()).await
+    pub async fn send_async(&self, msg: impl Into<DataPlaneMessage>) -> Result<(), ServerError> {
+        self.0
+            .send_async(msg.into())
+            .await
+            .map_err(|err| ServerError::Internal(format!("Channel dropped: {}", err)))
     }
 }

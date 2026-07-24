@@ -110,6 +110,6 @@ pub(crate) enum DeferredReply {
     ),
     GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
     GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),
-    GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Option<TopicMeta>),
+    GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Box<Option<TopicMeta>>),
     GetConsumerGroupAssignment(DeferredConsumerGroupAssignment),
 }

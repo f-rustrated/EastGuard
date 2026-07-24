@@ -1,17 +1,18 @@
+use super::state::ConsumerOffsetUpdate;
 use crate::control_plane::NodeId;
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetUpdate;
 use crate::data_plane::messages::command::{
     ConsumerOffsetCommitAck, ConsumerOffsetReplicated, ConsumerOffsetReplicationResult,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct OffsetReplicationState {
     seq: u64,
     pending: HashMap<u64, PendingOffsetReplication>,
 }
 
+#[derive(Debug)]
 struct PendingOffsetReplication {
     update: ConsumerOffsetUpdate,
     pending_acks: HashSet<NodeId>,
@@ -98,13 +99,13 @@ impl OffsetReplicationState {
         }
     }
 
-    pub(crate) fn has_pending_for(&self, node_id: &NodeId) -> bool {
+    pub(crate) fn has_pending_replication_for(&self, node_id: &NodeId) -> bool {
         self.pending
             .values()
             .any(|pending| pending.pending_acks.contains(node_id))
     }
 
-    pub(crate) fn fail_all(&mut self, error: &str) {
+    pub(crate) fn drop_all(&mut self, error: &str) {
         for (_, mut pending) in self.pending.drain() {
             if let Some(reply) = pending.reply.take() {
                 let _ = reply.send(ConsumerOffsetCommitAck::InternalError(error.to_string()));

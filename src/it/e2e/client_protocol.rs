@@ -5,9 +5,9 @@ use turmoil::Builder;
 
 use crate::StartUp;
 use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientDataPlaneRequest, ClientRequest, ClientResponse,
-    ControlPlaneRequest, ControlPlaneResponse, DataPlaneResponse, FetchByIdRequest, FetchRequest,
-    NodeState, ProduceRequest, RangeProgressSignal, TopicDetail,
+    AdminRequest, ClientDataPlaneRequest, ClientRequest, ClientResponse, ClientSuccess,
+    ControlPlaneRequest, FetchByIdRequest, FetchRequest, NodeState, ProduceRequest,
+    RangeProgressSignal, ServerError, TopicDetail,
 };
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
@@ -62,11 +62,11 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
                 match send_request(host, port, req.clone()).await {
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated) => {
+                    ClientResponse::Ok(ClientSuccess::TopicCreated) => {
                         created = true;
                         break 'outer;
                     }
-                    ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => {
+                    ClientResponse::Err(ServerError::AlreadyExists) => {
                         created = true;
                         break 'outer;
                     }
@@ -85,7 +85,7 @@ fn create_topic_and_describe_cluster() -> turmoil::Result {
             )
             .await;
             match resp {
-                ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }) => {
+                ClientResponse::Ok(ClientSuccess::ClusterInfo { nodes }) => {
                     assert!(!nodes.is_empty(), "{host} returned empty node list");
                 }
                 other => panic!("{host}: unexpected DescribeCluster response: {other:?}"),
@@ -128,8 +128,8 @@ fn delete_topic() -> turmoil::Result {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
                 match send_request(host, port, create_req.clone()).await {
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                    | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => {
+                    ClientResponse::Ok(ClientSuccess::TopicCreated)
+                    | ClientResponse::Err(ServerError::AlreadyExists) => {
                         acked = Some((host, port));
                         break 'outer;
                     }
@@ -146,8 +146,7 @@ fn delete_topic() -> turmoil::Result {
             ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
         )
         .await;
-        let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) = list_resp
-        else {
+        let ClientResponse::Ok(ClientSuccess::TopicList { topics }) = list_resp else {
             panic!("expected TopicList, got {list_resp:?}");
         };
         assert!(
@@ -165,10 +164,7 @@ fn delete_topic() -> turmoil::Result {
         )
         .await;
         assert!(
-            matches!(
-                del_resp,
-                ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted)
-            ),
+            matches!(del_resp, ClientResponse::Ok(ClientSuccess::TopicDeleted)),
             "expected TopicDeleted, got {del_resp:?}"
         );
 
@@ -177,14 +173,13 @@ fn delete_topic() -> turmoil::Result {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut still_present = false;
             for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-                if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList {
-                    topics: listed,
-                }) = send_request(
-                    h,
-                    p,
-                    ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
-                )
-                .await
+                if let ClientResponse::Ok(ClientSuccess::TopicList { topics: listed }) =
+                    send_request(
+                        h,
+                        p,
+                        ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
+                    )
+                    .await
                     && listed.iter().any(|t| t.name == "del-test")
                 {
                     still_present = true;
@@ -196,9 +191,7 @@ fn delete_topic() -> turmoil::Result {
         }
 
         for (h, p) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-            if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicList {
-                topics: listed,
-            }) = send_request(
+            if let ClientResponse::Ok(ClientSuccess::TopicList { topics: listed }) = send_request(
                 h,
                 p,
                 ClientRequest::ControlPlane(ControlPlaneRequest::ListHostedTopics),
@@ -248,8 +241,8 @@ fn list_topic_stats_after_create() -> turmoil::Result {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
                 match send_request(host, port, create_req.clone()).await {
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                    | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => {
+                    ClientResponse::Ok(ClientSuccess::TopicCreated)
+                    | ClientResponse::Err(ServerError::AlreadyExists) => {
                         created = true;
                         break 'outer;
                     }
@@ -262,7 +255,7 @@ fn list_topic_stats_after_create() -> turmoil::Result {
         // At least one node must report stats for "stats-test".
         let mut found = false;
         for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
-            if let ClientResponse::Admin(AdminResponse::TopicStats { topics }) = send_request(
+            if let ClientResponse::Ok(ClientSuccess::TopicStats { topics }) = send_request(
                 host,
                 port,
                 ClientRequest::Admin(AdminRequest::ListHostedTopicsWithStats),
@@ -321,8 +314,8 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
             tokio::time::sleep(Duration::from_secs(2)).await;
             for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
                 match send_request(host, port, create_req.clone()).await {
-                    ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                    | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => {
+                    ClientResponse::Ok(ClientSuccess::TopicCreated)
+                    | ClientResponse::Err(ServerError::AlreadyExists) => {
                         created = true;
                         break 'outer;
                     }
@@ -342,13 +335,11 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
         for (host, port) in [("node-1", 8081u16), ("node-2", 8082), ("node-3", 8083)] {
             let resp = send_request(host, port, describe.clone()).await;
             match resp {
-                ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) => {
+                ClientResponse::Ok(ClientSuccess::TopicDetail(detail)) => {
                     found_detail = Some(detail);
                     break;
                 }
-                ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect {
-                    owner,
-                }) => {
+                ClientResponse::Err(ServerError::TopicMetadataRedirect { owner }) => {
                     // Follow the redirect — owner.client_addr is the SWIM-resolved
                     // address; for turmoil tests we use the well-known port map.
                     let owner_port = match &*owner.node_id {
@@ -359,9 +350,7 @@ fn describe_topic_returns_topic_metadata() -> turmoil::Result {
                     };
                     let owner_host = &*owner.node_id;
                     let resp2 = send_request(owner_host, owner_port, describe.clone()).await;
-                    if let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) =
-                        resp2
-                    {
+                    if let ClientResponse::Ok(ClientSuccess::TopicDetail(d)) = resp2 {
                         found_detail = Some(d);
                         break;
                     }
@@ -463,7 +452,7 @@ fn produce_then_fetch_hot() -> turmoil::Result {
                 max_bytes: 1 << 20,
                 keyspace_bound: None,
             }));
-            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched {
+            if let ClientResponse::Ok(ClientSuccess::Fetched {
                 entries: batch,
                 next_entry_id: next,
                 progress_signal: signal,
@@ -837,7 +826,7 @@ fn sealed_segment_repair_catches_up_the_spare() -> turmoil::Result {
                     entry_id: EntryId(0),
                     max_bytes: 1 << 20,
                 }));
-            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) =
                 send_request(spare.0, spare.1, fetch).await
                 && !entries.is_empty()
                 && entries[0].data[..] == rec(0)[..]
@@ -1020,7 +1009,7 @@ fn leader_crash_seals_active_segment_at_min_and_continues() -> turmoil::Result {
                         entry_id: EntryId(0),
                         max_bytes: 1 << 20,
                     }));
-                if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+                if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) =
                     send_request(host, port, fetch).await
                     && !entries.is_empty()
                     && entries[0].data[..] == rec0[..]
@@ -1215,7 +1204,7 @@ fn sealed_repair_survives_coordinator_crash() -> turmoil::Result {
                     entry_id: EntryId(0),
                     max_bytes: 1 << 20,
                 }));
-            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) =
                 send_request(spare.0, spare.1, fetch).await
                 && !entries.is_empty()
                 && entries[0].data[..] == rec(0)[..]
@@ -1380,7 +1369,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
         // partition didn't actually drop the assignment — the test would be vacuous.)
         tokio::time::sleep(Duration::from_secs(15)).await;
         for _ in 0..5 {
-            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) =
                 send_request(spare.0, spare.1, fetch.clone()).await
             {
                 assert!(
@@ -1397,7 +1386,7 @@ fn catch_up_redrive_recovers_dropped_assignment() -> turmoil::Result {
         let mut served = false;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
+            if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) =
                 send_request(spare.0, spare.1, fetch.clone()).await
                 && !entries.is_empty()
                 && entries[0].data[..] == rec(0)[..]
@@ -1573,7 +1562,7 @@ fn restarted_node_reuses_recovered_segment_on_reassignment() -> turmoil::Result 
         let mut served = false;
         for _ in 0..180 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. })) =
+            if let Some(ClientResponse::Ok(ClientSuccess::Fetched { entries, .. })) =
                 try_send_request(VICTIM.0, VICTIM.1, fetch.clone()).await
                 && !entries.is_empty()
                 && entries[0].data[..] == rec(0)[..]
@@ -1663,7 +1652,7 @@ async fn wait_for_cluster(nodes: &[(&str, u16)], expected: usize) {
             )
             .await
             {
-                ClientResponse::Admin(AdminResponse::ClusterInfo { nodes: members }) => members
+                ClientResponse::Ok(ClientSuccess::ClusterInfo { nodes: members }) => members
                     .iter()
                     .filter(|m| matches!(m.state, NodeState::Alive))
                     .count(),
@@ -1704,18 +1693,16 @@ async fn create_topic_anywhere(topic: &str, nodes: &[(&str, u16)], replication_f
         tokio::time::sleep(Duration::from_secs(2)).await;
         for &(host, port) in nodes {
             match send_request(host, port, req.clone()).await {
-                ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated)
-                | ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => return,
-                ClientResponse::ControlPlane(ControlPlaneResponse::NotRaftLeader {
+                ClientResponse::Ok(ClientSuccess::TopicCreated)
+                | ClientResponse::Err(ServerError::AlreadyExists) => return,
+                ClientResponse::Err(ServerError::NotRaftLeader {
                     leader_addr: Some(addr),
                 }) => {
                     if let Some((lh, lp)) = redirect_addr_to_node(addr.client_addr(), nodes)
                         && matches!(
                             send_request(lh, lp, req.clone()).await,
-                            ClientResponse::ControlPlane(
-                                ControlPlaneResponse::TopicCreated
-                                    | ControlPlaneResponse::AlreadyExists
-                            )
+                            ClientResponse::Ok(ClientSuccess::TopicCreated)
+                                | ClientResponse::Err(ServerError::AlreadyExists)
                         )
                     {
                         return;
@@ -1812,17 +1799,19 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
     )
     .await
     {
-        ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) => match d
-            .ranges
-            .iter()
-            .filter(|r| {
-                r.state == RangeState::Active && r.keyspace_start.as_slice() <= b"k".as_slice()
-            })
-            .max_by_key(|r| &r.keyspace_start)
-        {
-            Some(range) => range.range_id,
-            None => return ProduceOutcome::Retry,
-        },
+        ClientResponse::Ok(ClientSuccess::TopicDetail(d)) => {
+            match d
+                .ranges
+                .iter()
+                .filter(|r| {
+                    r.state == RangeState::Active && r.keyspace_start.as_slice() <= b"k".as_slice()
+                })
+                .max_by_key(|r| &r.keyspace_start)
+            {
+                Some(range) => range.range_id,
+                None => return ProduceOutcome::Retry,
+            }
+        }
         _ => return ProduceOutcome::Retry,
     };
 
@@ -1830,15 +1819,16 @@ async fn produce_once(topic: &str, payload: &[u8], node: (&str, u16)) -> Produce
         topic_name: topic.into(),
         range_id,
         routing_key: b"k".to_vec(),
-        data: payload.to_vec(),
+        data: payload.to_vec().into(),
         record_count: 1,
+        producer_identity: None,
     }));
     match send_request(node.0, node.1, req).await {
-        ClientResponse::DataPlane(DataPlaneResponse::Produced { .. }) => ProduceOutcome::Acked,
-        ClientResponse::DataPlane(DataPlaneResponse::NotWriteLeader {
+        ClientResponse::Ok(ClientSuccess::Produced { .. }) => ProduceOutcome::Acked,
+        ClientResponse::Err(ServerError::NotWriteLeader {
             leader_addr: Some(addr),
         }) => ProduceOutcome::Redirect(addr.client_addr()),
-        ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
+        ClientResponse::Err(ServerError::ShardNotLocal {
             hint_node: Some(addr),
         }) => ProduceOutcome::Redirect(addr.client_addr()),
         _ => ProduceOutcome::Retry,
@@ -1851,11 +1841,11 @@ async fn describe_topic(topic: &str, nodes: &[(&str, u16)]) -> Option<TopicDetai
         ClientRequest::ControlPlane(ControlPlaneRequest::DescribeTopic { name: topic.into() });
     for &(host, port) in nodes {
         match send_request(host, port, req.clone()).await {
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) => return Some(d),
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicMetadataRedirect { owner }) => {
+            ClientResponse::Ok(ClientSuccess::TopicDetail(d)) => return Some(d),
+            ClientResponse::Err(ServerError::TopicMetadataRedirect { owner }) => {
                 if let Some(&(owner_host, owner_port)) =
                     nodes.iter().find(|(n, _)| owner.node_id.starts_with(n))
-                    && let ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(d)) =
+                    && let ClientResponse::Ok(ClientSuccess::TopicDetail(d)) =
                         send_request(owner_host, owner_port, req.clone()).await
                 {
                     return Some(d);

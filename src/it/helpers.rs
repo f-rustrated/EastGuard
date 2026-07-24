@@ -1,7 +1,6 @@
+use crate::client::ClientSuccess;
 use crate::config::Environment;
-use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientRequest, ClientResponse, NodeState,
-};
+use crate::connections::protocol::{AdminRequest, ClientRequest, ClientResponse, NodeState};
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
 use crate::control_plane::{NodeAddress, SwimNode};
@@ -60,7 +59,7 @@ pub async fn get_members(host: &str, port: u16) -> turmoil::Result<Vec<SwimNode>
         .await?;
     let (_, response): (_, ClientResponse) = reader.read_request().await?;
     let nodes = match response {
-        ClientResponse::Admin(AdminResponse::ClusterInfo { nodes }) => nodes,
+        ClientResponse::Ok(ClientSuccess::ClusterInfo { nodes }) => nodes,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

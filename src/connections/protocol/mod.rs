@@ -20,15 +20,22 @@
 mod admin;
 mod control_plane;
 mod data_plane;
+mod error;
 
 pub use admin::*;
 pub use control_plane::*;
 pub use data_plane::*;
+pub use error::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::SyncConsumerGroupRequest, impl_from_variant, impl_from_variant_via,
+    control_plane::metadata::{EntryId, SyncConsumerGroupRequest},
+    data_plane::{
+        auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition,
+        messages::query::RangeOffsets,
+    },
+    impl_from_variant, impl_from_variant_via,
 };
 
 // ── Top-level dispatch ─────────────────────────────────────────────────────
@@ -42,10 +49,63 @@ pub enum ClientRequest {
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum ClientResponse {
-    ControlPlane(ControlPlaneResponse),
-    DataPlane(DataPlaneResponse),
-    Admin(AdminResponse),
+    Ok(ClientSuccess),
+    Err(ServerError),
     Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ClientSuccess {
+    // Control Plane
+    TopicCreated,
+    TopicDeleted,
+    TopicList {
+        topics: Box<[TopicSummary]>,
+    },
+    TopicDetail(TopicDetail),
+    ConsumerGroupAssignment(ConsumerGroupAssignmentResponse),
+    ConsumerGroupLeft,
+    ProducerSessionOpened(ProducerSessionOpened),
+
+    // Data Plane
+    Produced(EntryId),
+    Fetched {
+        entries: Box<[EntryPayload]>,
+        next_entry_id: EntryId,
+        progress_signal: RangeProgressSignal,
+    },
+    RangeOffset(RangeOffsets),
+    ConsumerOffsetCommitted,
+    ConsumerOffset(Option<ConsumerOffsetPosition>),
+
+    // Admin
+    ClusterInfo {
+        nodes: Box<[NodeInfo]>,
+    },
+    TopicStats {
+        topics: Box<[TopicStats]>,
+    },
+    ShardInfo {
+        detail: Option<ShardDetail>,
+    },
+    ShardLeader {
+        leader: Option<String>,
+    },
+}
+
+impl From<Result<ClientSuccess, ServerError>> for ClientResponse {
+    fn from(res: Result<ClientSuccess, ServerError>) -> Self {
+        match res {
+            Ok(ok) => ClientResponse::Ok(ok),
+            Err(err) => ClientResponse::Err(err),
+        }
+    }
+}
+
+impl From<ClientSuccess> for ClientResponse {
+    fn from(ok: ClientSuccess) -> Self {
+        ClientResponse::Ok(ok)
+    }
 }
 
 impl_from_variant!(
@@ -53,13 +113,6 @@ impl_from_variant!(
     ControlPlane(ControlPlaneRequest),
     DataPlane(ClientDataPlaneRequest),
     Admin(AdminRequest),
-);
-
-impl_from_variant!(
-    ClientResponse,
-    ControlPlane(ControlPlaneResponse),
-    DataPlane(DataPlaneResponse),
-    Admin(AdminResponse),
 );
 
 impl_from_variant_via!(

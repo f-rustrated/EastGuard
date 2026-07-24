@@ -13,16 +13,16 @@ use turmoil::Builder;
 
 use super::host_cluster;
 use crate::client::{
-    BufferConfig, Client, ClientError, CompressionCodec, Consumer, ConsumerConfig, KeyInterest,
-    PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy, StoragePolicy,
-    TopicDetail,
+    BufferConfig, Client, ClientError, ClientSuccess, CompressionCodec, Consumer, ConsumerConfig,
+    KeyInterest, PartitionStrategy, Producer, ProducerConfig, RetryPolicy, StartPolicy,
+    StoragePolicy, TopicDetail,
 };
 use crate::config::Environment;
 use crate::connections::protocol::ClientResponse;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
-use crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetKey;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetKey;
 use crate::it::e2e::{NODES, NODES_4};
 
 /// Per-test cluster tweaks for the SDK suite: pinned node-id suffix + low vnode
@@ -120,11 +120,25 @@ fn client_produce_routes_to_write_leader() -> turmoil::Result {
 
         // The SDK absorbs the post-create segment-assignment lag inside produce.
         let first = client
-            .produce("produce-route", b"k", b"rec-0".to_vec(), 1)
+            .produce_to_range(
+                "produce-route",
+                RangeId(0),
+                b"k",
+                b"rec-0".to_vec(),
+                1,
+                None,
+            )
             .await
             .expect("first produce acked");
         let second = client
-            .produce("produce-route", b"k", b"rec-1".to_vec(), 1)
+            .produce_to_range(
+                "produce-route",
+                RangeId(0),
+                b"k",
+                b"rec-1".to_vec(),
+                1,
+                None,
+            )
             .await
             .expect("second produce acked");
         assert!(
@@ -150,16 +164,16 @@ fn client_multiplexes_concurrent_requests() -> turmoil::Result {
         client.create_topic("mux", policy()).await.expect("create");
         // Warm the cache + segment assignment so the burst below routes directly.
         let warm = client
-            .produce("mux", b"k", b"warm".to_vec(), 1)
+            .produce_to_range("mux", RangeId(0), b"k", b"warm".to_vec(), 1, None)
             .await
             .expect("warmup produce");
 
         // Four produces + two describes concurrently over the shared connection.
         let (a, b, c, d, e, f) = tokio::join!(
-            client.produce("mux", b"k", b"p1".to_vec(), 1),
-            client.produce("mux", b"k", b"p2".to_vec(), 1),
-            client.produce("mux", b"k", b"p3".to_vec(), 1),
-            client.produce("mux", b"k", b"p4".to_vec(), 1),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p1".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p2".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p3".to_vec(), 1, None),
+            client.produce_to_range("mux", RangeId(0), b"k", b"p4".to_vec(), 1, None),
             client.resolve_topic("mux"),
             client.resolve_topic("mux"),
         );
@@ -205,7 +219,7 @@ fn client_reconnects_after_node_crash() -> turmoil::Result {
             .await
             .expect("create");
         client
-            .produce("reconnect", b"k", b"rec-0".to_vec(), 1)
+            .produce_to_range("reconnect", RangeId(0), b"k", b"rec-0".to_vec(), 1, None)
             .await
             .expect("produce");
 
@@ -286,7 +300,7 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
 
         // Starts at `wrong`, gets NotWriteLeader{real}, follows once, commits.
         client
-            .produce("stale", b"k", b"rec-1".to_vec(), 1)
+            .produce_to_range("stale", RangeId(0), b"k", b"rec-1".to_vec(), 1, None)
             .await
             .expect("produce self-corrects through the redirect");
 
@@ -296,7 +310,7 @@ fn client_corrects_stale_write_leader() -> turmoil::Result {
             "stale entry dropped after the corrected produce"
         );
         client
-            .produce("stale", b"k", b"rec-2".to_vec(), 1)
+            .produce_to_range("stale", RangeId(0), b"k", b"rec-2".to_vec(), 1, None)
             .await
             .expect("produce after re-resolve");
         assert_eq!(
@@ -445,9 +459,7 @@ fn client_discovers_nodes_beyond_the_seed() -> turmoil::Result {
 #[test]
 #[serial_test::serial]
 fn producer_compression_lz4_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{
-        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
-    };
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest};
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -510,9 +522,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
-            served.response
-        {
+        if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) = served.response {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
@@ -548,9 +558,7 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
 #[test]
 #[serial_test::serial]
 fn producer_compression_zstd_end_to_end() -> turmoil::Result {
-    use crate::connections::protocol::{
-        ClientDataPlaneRequest, DataPlaneResponse, FetchByIdRequest,
-    };
+    use crate::connections::protocol::{ClientDataPlaneRequest, FetchByIdRequest};
 
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, sim_cluster);
@@ -607,9 +615,7 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
             .call(leader_addr, ClientDataPlaneRequest::FetchById(fetch_req))
             .await
             .expect("fetch");
-        if let ClientResponse::DataPlane(DataPlaneResponse::Fetched { entries, .. }) =
-            served.response
-        {
+        if let ClientResponse::Ok(ClientSuccess::Fetched { entries, .. }) = served.response {
             assert_eq!(entries.len(), 1);
             let entry = &entries[0];
             assert_eq!(entry.entry_id, entry_id);
@@ -842,13 +848,15 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
     let mut sim = build_sim(90);
     host_cluster(&mut sim, &NODES, |env| {
         sim_cluster(env);
-        // Force fast size-based rolls
-        env.segment_size_limit_bytes = 10;
+        // The five encoded records cross this once near the end. Rolling every
+        // individual record turns this consumer test into a topology-race test.
+        env.segment_size_limit_bytes = 80;
     });
 
     sim.client("test-client", async {
         let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
-        let custom_policy = policy();
+        let mut custom_policy = policy();
+        custom_policy.partition_strategy = PartitionStrategy::Fixed;
         client
             .create_topic("basic-consume", custom_policy)
             .await
@@ -880,7 +888,7 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             producer
                 .send(key.as_bytes(), val)
                 .await
-                .expect("produce record");
+                .unwrap_or_else(|error| panic!("produce record {i}: {error:?}"));
         }
 
         // Consume them with Earliest
@@ -951,6 +959,63 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             timeout_res.is_err(),
             "Latest consumer should not receive historical records"
         );
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+/// Producer Test: Session lease renewal, expiration, and resumption.
+/// Renews inside the safety margin without resetting the sequence stream, then
+/// idles past the renewed lease and verifies that a fresh producer resumes at zero.
+#[test]
+#[serial_test::serial]
+fn producer_resumes_cleanly_after_session_lease_expiration() -> turmoil::Result {
+    let mut sim = build_sim(160);
+    host_cluster(&mut sim, &NODES, |env| {
+        sim_cluster(env);
+    });
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("session-expire-test", policy())
+            .await
+            .expect("create topic");
+
+        let producer = Producer::new(
+            client.clone(),
+            "session-expire-test".into(),
+            ProducerConfig::default(),
+        );
+
+        // 1. Send initial record
+        let entry1 = producer
+            .send(b"k1", b"v1".to_vec())
+            .await
+            .expect("first send");
+        assert_eq!(entry1, EntryId(0));
+
+        // Enter the one-second renewal margin of the 60-second lease. Renewal
+        // must reuse the nonce and preserve the existing range sequence stream.
+        tokio::time::sleep(Duration::from_millis(59_500)).await;
+
+        let entry2 = producer
+            .send(b"k2", b"v2".to_vec())
+            .await
+            .expect("send after proactive renewal");
+        assert_eq!(entry2, EntryId(1));
+
+        // Idle past the renewed lease. Reopening now uses a fresh producer
+        // identity and starts its range sequence stream at zero.
+        tokio::time::sleep(Duration::from_secs(61)).await;
+
+        let entry3 = producer
+            .send(b"k3", b"v3".to_vec())
+            .await
+            .expect("send after expiration");
+        assert_eq!(entry3, EntryId(2));
 
         Ok(())
     });
@@ -1892,7 +1957,7 @@ async fn wait_for_retention_deletion(client: &Client, topic: &str, range_id: u64
 #[test]
 #[serial_test::serial]
 fn producer_split_fence_retry() -> turmoil::Result {
-    let mut sim = build_sim(90);
+    let mut sim = build_sim(150);
     host_cluster(&mut sim, &NODES, |env| {
         sim_cluster(env);
         env.segment_size_limit_bytes = 10;
@@ -1942,7 +2007,14 @@ fn producer_split_fence_retry() -> turmoil::Result {
 
         for i in 0..3 {
             client_admin
-                .produce(topic, b"k", b"longer_than_ten_bytes".to_vec(), 1)
+                .produce_to_range(
+                    topic,
+                    RangeId(0),
+                    b"k",
+                    b"longer_than_ten_bytes".to_vec(),
+                    1,
+                    None,
+                )
                 .await
                 .expect("produce trigger record");
             wait_for_segment_roll(&client_admin, topic, 0, (i + 1) as u64).await;
@@ -1956,8 +2028,10 @@ fn producer_split_fence_retry() -> turmoil::Result {
         );
 
         producer.flush().await;
-        assert!(left.await.expect("left sender completes").is_ok());
-        assert!(right.await.expect("right sender completes").is_ok());
+        let res_left = left.await.expect("left sender completes");
+        let res_right = right.await.expect("right sender completes");
+        assert!(res_left.is_ok(), "res_left failed: {:?}", res_left);
+        assert!(res_right.is_ok(), "res_right failed: {:?}", res_right);
 
         let refreshed = client1.resolve_topic(topic).await.expect("refresh routing");
         let left_range = refreshed

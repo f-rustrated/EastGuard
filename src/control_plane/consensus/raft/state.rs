@@ -13,7 +13,7 @@ use crate::control_plane::consensus::raft::storage::{
 };
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
-use crate::control_plane::metadata::command::DeleteSegments;
+use crate::control_plane::metadata::command::{DeleteSegments, ExpireProducerSessions};
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
@@ -202,6 +202,7 @@ impl Raft {
         // Ring members to assert as peers (see doc above); `None` skips the add step.
         target_members: Option<Box<[NodeId]>>,
     ) -> bool {
+        let now = now_ms();
         let mut changed = false;
         let live_set: HashSet<NodeId> = topology.live_nodes().into_iter().collect();
         if let Some(members) = target_members {
@@ -221,7 +222,8 @@ impl Raft {
         changed |= self.reconcile_peers(topology, &live_set);
         changed |= self.reconcile_segments(&live_set);
         changed |= self.refill_under_replicated_segments(topology);
-        changed |= self.reconcile_retention_deletes();
+        changed |= self.reconcile_retention_deletes(now);
+        changed |= self.evict_expired_producer_sessions(now);
 
         // Record a ring observation every run, whether routine RingCheck or
         // leadership change. During a leadership change, evictions are paused
@@ -573,8 +575,7 @@ impl Raft {
     /// topic's `retention_ms` (against the wall clock, the one age-based decision —
     /// leader-only so cross-node skew can't diverge replicas), and propose
     /// `DeleteSegments`. Topics with no retention policy contribute nothing.
-    fn reconcile_retention_deletes(&mut self) -> bool {
-        let now = now_ms();
+    fn reconcile_retention_deletes(&mut self, now: u64) -> bool {
         let targets = self.metadata.expipred_segments(now);
 
         let mut changed = false;
@@ -592,6 +593,25 @@ impl Raft {
                     self.shard_group_id,
                     e
                 );
+                continue;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn evict_expired_producer_sessions(&mut self, now: u64) -> bool {
+        let topics = self.metadata.topics_with_expired_producer_sessions(now);
+        let mut changed = false;
+        for topic_id in topics {
+            if let Err(error) = self.propose(
+                ExpireProducerSessions {
+                    topic_id,
+                    observed_at: now,
+                }
+                .into(),
+            ) {
+                tracing::warn!(?topic_id, ?error, "producer session expiry rejected");
                 continue;
             }
             changed = true;
@@ -1839,6 +1859,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
             !self.peers.contains(&self.node_id),
             "self found in peers set",
         );
+        self.metadata.assert_invariants();
     }
 }
 

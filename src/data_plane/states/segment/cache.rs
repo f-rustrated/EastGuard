@@ -7,14 +7,15 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::Notify;
 
 use crate::control_plane::metadata::EntryId;
-use crate::data_plane::EntryPayload;
+use crate::data_plane::{PayloadBytes, ProducerAppendIdentity};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedEntry {
-    pub(crate) data: EntryPayload,
+    pub(crate) data: PayloadBytes,
     pub(crate) record_count: u32,
     pub(crate) entry_id: EntryId,
     pub(crate) lsn: u64,
+    pub(crate) producer_identity: Option<ProducerAppendIdentity>,
 }
 
 impl CachedEntry {
@@ -321,16 +322,17 @@ impl TAssertInvariant for SegmentRingBuffer {
 
 #[cfg(test)]
 mod tests {
-    use crate::data_plane::EntryPayload;
+    use crate::data_plane::PayloadBytes;
     use bytes::Bytes;
 
     use super::*;
     fn make_entry(entry_id: u64, lsn: u64) -> Arc<CachedEntry> {
         Arc::new(CachedEntry {
-            data: EntryPayload::from(Bytes::from("test")),
+            data: PayloadBytes::from(Bytes::from("test")),
             record_count: 1,
             entry_id: EntryId(entry_id),
             lsn,
+            producer_identity: None,
         })
     }
 

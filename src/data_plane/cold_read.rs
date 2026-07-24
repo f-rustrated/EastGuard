@@ -10,11 +10,12 @@ use super::actor::DataPlaneSender;
 use super::sparse_index::SparseIndex;
 use super::states::segment::cache::CachedEntry;
 use super::wal::{WalRecord, WalRecordType};
+use crate::client::ServerError;
 use crate::connections::protocol::RangeProgressSignal;
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::messages::command::CatchUpReadComplete;
-use crate::data_plane::messages::query::FetchResult;
+use crate::data_plane::messages::query::FetchedRecords;
 
 pub const DEFAULT_POOL_SIZE: usize = 4;
 
@@ -43,7 +44,7 @@ pub(crate) struct ColdReadRequest {
 /// Where a finished cold read is delivered.
 pub(crate) enum ColdReadReply {
     Consumer {
-        reply: oneshot::Sender<FetchResult>,
+        reply: oneshot::Sender<Result<FetchedRecords, ServerError>>,
         progress_signal: RangeProgressSignal,
     },
     CatchUp(CatchUpReadReply),
@@ -137,11 +138,11 @@ impl ColdReadPool {
                         reply,
                         progress_signal,
                     } => {
-                        let _ = reply.send(FetchResult::Records {
+                        let _ = reply.send(Ok(FetchedRecords {
                             entries: records.entries,
                             next_entry_id: records.next_offset,
                             progress_signal,
-                        });
+                        }));
                     }
                     ColdReadReply::CatchUp(cu) => {
                         let done = CatchUpReadComplete {
@@ -167,7 +168,7 @@ impl ColdReadPool {
                     ColdReadReply::Consumer { reply, .. } => {
                         tracing::warn!("cold read failed for {segment_key:?}: {e}");
                         let err_msg = format!("cold read failed: {e}");
-                        let _ = reply.send(FetchResult::InternalError(err_msg));
+                        let _ = reply.send(Err(ServerError::Internal(err_msg)));
                     }
                     ColdReadReply::CatchUp(_) => {
                         // Source-side read failed; nothing durable changed. The
@@ -252,6 +253,7 @@ impl ColdReadPool {
                         // lsn is a live-WAL concept; cold reads serve durable
                         // data, so it carries no meaningful LSN.
                         lsn: 0,
+                        producer_identity: None,
                     }));
 
                     if bytes_read >= req.max_bytes {

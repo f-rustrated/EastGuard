@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::{NodeId, Replicas};
-use crate::data_plane::{EntryPayload, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
+use crate::data_plane::ProducerAppendIdentity;
+use crate::data_plane::{PayloadBytes, SegmentKey, checkpoint::CheckpointJob, wal::WalRecord};
 
 use super::cache::CachedEntry;
 
@@ -106,7 +107,8 @@ impl SegmentTracker {
     pub(crate) fn stage_to_wal(&mut self, wal_buf: &mut Vec<u8>) {
         for (i, staged) in self.staged_entries.iter().enumerate() {
             let entry_id = self.next_entry_id + i as u64;
-            let header = RoutingHeader::new(staged.segment_key, entry_id, staged.record_count);
+            let header = RoutingHeader::new(staged.segment_key, entry_id, staged.record_count)
+                .with_producer(staged.producer_identity);
             let _ = WalRecord::data(header.build_wal_payload(&staged.data), staged.record_count)
                 .encode_to(wal_buf);
         }
@@ -116,8 +118,11 @@ impl SegmentTracker {
         !self.staged_entries.is_empty()
     }
 
-    pub(crate) fn abort_staged(&mut self) {
-        self.staged_entries.clear();
+    pub(crate) fn abort_staged(&mut self) -> Box<[crate::data_plane::ProducerAppendIdentity]> {
+        self.staged_entries
+            .drain(..)
+            .filter_map(|entry| entry.producer_identity)
+            .collect()
     }
 
     pub(crate) fn publish_staged(&mut self, lsn: u64) -> Box<[Arc<CachedEntry>]> {
@@ -131,6 +136,7 @@ impl SegmentTracker {
                     record_count: s.record_count,
                     entry_id,
                     lsn,
+                    producer_identity: s.producer_identity,
                 });
                 self.cache.publish(entry.clone());
                 entry
@@ -138,13 +144,19 @@ impl SegmentTracker {
             .collect()
     }
 
-    pub(crate) fn uncommitted_entries(&self) -> impl Iterator<Item = (EntryPayload, u32)> + '_ {
+    pub(crate) fn uncommitted_entries(
+        &self,
+    ) -> impl Iterator<Item = (PayloadBytes, u32, Option<ProducerAppendIdentity>)> + '_ {
         let commit = self.cache.load_read_cursor();
         let tail = self.cache.load_write_cursor();
         (commit..tail).filter_map(|pos| {
-            self.cache
-                .load_published(pos)
-                .map(|entry| (entry.data.clone(), entry.record_count))
+            self.cache.load_published(pos).map(|entry| {
+                (
+                    entry.data.clone(),
+                    entry.record_count,
+                    entry.producer_identity,
+                )
+            })
         })
     }
 
@@ -153,17 +165,19 @@ impl SegmentTracker {
     /// the WAL, so a seal must carry them forward too — and they are already
     /// counted in the data plane's `buffer_byte_count`, so the caller must not
     /// re-count them.
-    pub(crate) fn staged_for_replay(&self) -> impl Iterator<Item = (EntryPayload, u32)> + '_ {
+    pub(crate) fn staged_for_replay(
+        &self,
+    ) -> impl Iterator<Item = (PayloadBytes, u32, Option<ProducerAppendIdentity>)> + '_ {
         self.staged_entries
             .iter()
-            .map(|s| (s.data.clone(), s.record_count))
+            .map(|s| (s.data.clone(), s.record_count, s.producer_identity))
     }
 
     // carrying over uncommitted data!
     pub(crate) fn replayable_bytes(&self) -> usize {
         self.uncommitted_entries()
             .chain(self.staged_for_replay())
-            .map(|(data, _)| data.len())
+            .map(|(data, _, _)| data.len())
             .sum()
     }
 
@@ -261,9 +275,10 @@ impl SegmentTracker {
     pub(crate) fn stage_entry(
         &mut self,
         segment_key: SegmentKey,
-        data: EntryPayload,
+        data: PayloadBytes,
         record_count: u32,
         entry_id: EntryId,
+        producer_append_id: Option<ProducerAppendIdentity>,
     ) {
         let expected = self.next_staged_entry_id();
         if entry_id < expected {
@@ -274,8 +289,12 @@ impl SegmentTracker {
             "entry_id gap: expected {expected}, got {entry_id}",
         );
         self.size_bytes += data.len() as u64;
-        self.staged_entries
-            .push(StagedEntry::new(data, record_count, segment_key));
+        self.staged_entries.push(StagedEntry::new(
+            data,
+            record_count,
+            segment_key,
+            producer_append_id,
+        ));
     }
 
     pub(crate) fn next_staged_entry_id(&self) -> EntryId {
@@ -383,7 +402,7 @@ pub mod tests {
     #[test]
     fn stage_entry_tracks_size() {
         let mut t = make_tracker(SegmentRole::Leader);
-        t.stage_entry(test_key(), Bytes::from("abcde").into(), 2, EntryId(0));
+        t.stage_entry(test_key(), Bytes::from("abcde").into(), 2, EntryId(0), None);
 
         assert_eq!(t.size_bytes, 5);
         assert!(t.has_staged());
@@ -399,7 +418,7 @@ pub mod tests {
             ShardGroupId(1),
             EntryId(5),
         );
-        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(5));
+        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(5), None);
         assert!(t.has_staged());
 
         // Publish to advance next_entry_id
@@ -408,7 +427,7 @@ pub mod tests {
         t.publish_staged(1);
 
         // Duplicate entry_id (5) should be skipped since next is now 6
-        t.stage_entry(test_key(), Bytes::from("dup").into(), 1, EntryId(5));
+        t.stage_entry(test_key(), Bytes::from("dup").into(), 1, EntryId(5), None);
         assert!(!t.has_staged());
         assert_eq!(t.next_entry_id, EntryId(6));
         t.assert_invariants();
@@ -425,6 +444,7 @@ pub mod tests {
                 Bytes::from(format!("entry-{i}")).into(),
                 1,
                 EntryId(i),
+                None,
             );
             t.stage_to_wal(&mut wal_buf);
             t.publish_staged(i + 1);
@@ -454,7 +474,13 @@ pub mod tests {
             ShardGroupId(1),
             EntryId(2),
         );
-        t.stage_entry(test_key(), Bytes::from("entry-2").into(), 1, EntryId(2));
+        t.stage_entry(
+            test_key(),
+            Bytes::from("entry-2").into(),
+            1,
+            EntryId(2),
+            None,
+        );
         t.publish_staged(1);
 
         t.commit_entry(EntryId(1));
@@ -467,7 +493,13 @@ pub mod tests {
     fn stage_then_publish_drains() {
         let mut t = make_tracker(SegmentRole::Leader);
         let mut wal_buf = Vec::new();
-        t.stage_entry(test_key(), Bytes::from("payload").into(), 3, EntryId(0));
+        t.stage_entry(
+            test_key(),
+            Bytes::from("payload").into(),
+            3,
+            EntryId(0),
+            None,
+        );
         t.stage_to_wal(&mut wal_buf);
 
         assert!(!wal_buf.is_empty());
@@ -527,7 +559,7 @@ pub mod tests {
         t.last_activity_at = tokio::time::Instant::now() - Duration::from_secs(60);
         assert!(t.idle_timeout_reached(Duration::from_secs(30)));
 
-        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(0));
+        t.stage_entry(test_key(), Bytes::from("data").into(), 1, EntryId(0), None);
         t.publish_staged(1);
         t.commit_entry(EntryId(0));
 

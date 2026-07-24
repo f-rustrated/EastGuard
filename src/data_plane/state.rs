@@ -6,12 +6,13 @@ use super::messages::command::DataPlanePeerMessage;
 use super::messages::command::*;
 use super::messages::pending::DataPlaneOutputs;
 use super::messages::query::{
-    DataPlaneQuery, Fetch, FetchResult, ListOffsets, ListOffsetsResult, ReadConsumerOffsetResult,
+    DataPlaneQuery, Fetch, FetchedRecords, ListOffsets, RangeOffsets, ReadConsumerOffsetResult,
 };
 use super::recovery::inventory::{LocalInventory, RecoveryOutput};
 use super::recovery::orphan::OrphanCandidate;
 use super::recovery::segment_scan::scan_segment_file;
 use super::segment_writer::SegmentAppender;
+use crate::client::ServerError;
 
 use super::states::replication::PendingReplicationBatch;
 use super::states::replication::ReplicationState;
@@ -28,11 +29,12 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::EntryId;
 use crate::control_plane::metadata::command::SegmentRollIntent;
 use crate::control_plane::{NodeId, Replicas};
-use crate::data_plane::EntryPayload;
-use crate::data_plane::consumer_offset_management::ConsumerOffsetManager;
-use crate::data_plane::consumer_offset_management::ledger::{EpochSeal, StaleEpoch};
+use crate::data_plane::auxiliary_states::AuxiliaryStateManager;
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{EpochSeal, StaleEpoch};
+use crate::data_plane::auxiliary_states::producer::types::AppendKey;
+use crate::data_plane::{PayloadBytes, ProduceError, ProducerAppendIdentity};
 
-use crate::data_plane::consumer_offset_management::types::*;
+use crate::data_plane::auxiliary_states::consumer_offsets::types::*;
 use crate::data_plane::messages::query::ReadConsumerOffset;
 use crate::data_plane::states::segment::tracker::{SegmentRole, SegmentTracker};
 use crate::data_plane::states::segment_store::SegmentReadState;
@@ -92,7 +94,7 @@ pub struct DataPlane<W: WalStorage> {
     recovered: LocalInventory,
     pending_boundary_corrections: std::collections::HashSet<SegmentKey>,
     pressure_checkpoints_in_flight: BTreeSet<SegmentKey>,
-    consumer_offsets: ConsumerOffsetManager,
+    auxiliary_state: AuxiliaryStateManager,
 }
 
 impl<W: WalStorage> DataPlane<W> {
@@ -108,7 +110,7 @@ impl<W: WalStorage> DataPlane<W> {
         let RecoveryOutput {
             inventory: recovered,
             data_dir: _,
-            offsets: offset_ledger,
+            auxiliary_state,
         } = recovery;
         DataPlane {
             node_id,
@@ -127,7 +129,7 @@ impl<W: WalStorage> DataPlane<W> {
             pending_roll_requests: PendingSegmentRollRequests::default(),
             pending_boundary_corrections: std::collections::HashSet::new(),
             pressure_checkpoints_in_flight: BTreeSet::new(),
-            consumer_offsets: ConsumerOffsetManager::new(offset_ledger),
+            auxiliary_state,
         }
     }
 
@@ -145,8 +147,8 @@ impl<W: WalStorage> DataPlane<W> {
             DataPlaneCommand::SegmentCheckpointComplete(complete) => {
                 self.handle_checkpoint_complete(complete);
             }
-            DataPlaneCommand::OffsetCheckpointComplete(complete) => {
-                self.handle_offset_checkpoint_complete(complete);
+            DataPlaneCommand::AuxiliaryCheckpointComplete(complete) => {
+                self.handle_auxiliary_checkpoint_complete(complete);
             }
             DataPlaneCommand::DataPlaneTimeoutCallback(callback) => {
                 self.handle_timeout(callback);
@@ -185,26 +187,48 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_produce(&mut self, cmd: Produce) {
-        let reject = match self.segments.get(&cmd.segment_key) {
-            Some(t) if t.role() == SegmentRole::Follower => Some("not leader"),
-            None => Some("segment not found"),
-            _ => None,
-        };
-        if let Some(reason) = reject {
-            let _ = cmd.reply.send(ProduceAck::Err(reason.into()));
+        if let Some(identity) = cmd.producer_identity
+            && let Err(err) =
+                self.auxiliary_state
+                    .verify_producer(cmd.segment_key, identity, cmd.received_at_ms)
+        {
+            let ack = match err {
+                ProduceError::Duplicate(entry_id) => ProduceAck::Ok(entry_id),
+                err => ProduceAck::Err(err),
+            };
+            let _ = cmd.reply.send(ack);
+            return;
+        }
+
+        let producer_identity = cmd
+            .producer_identity
+            .map(AuthorizedProducerIdentity::request);
+
+        if let Err(reason) = self.segments.verify_write_leader(&cmd.segment_key) {
+            if let Some(p_id) = producer_identity {
+                let append_key = AppendKey::new(cmd.segment_key, &p_id);
+                self.auxiliary_state.unstage_producer(&append_key);
+            }
+            let _ = cmd.reply.send(ProduceAck::Err(reason));
             return;
         }
 
         self.replication.enqueue_reply(cmd.segment_key, cmd.reply);
 
-        let Some(tracker) = self.segments.get_mut(&cmd.segment_key) else {
-            return;
-        };
-
         self.buffer_byte_count += cmd.data.len();
-        let entry_id = tracker.next_staged_entry_id();
-        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count, entry_id);
-        self.dirty_segments.insert(cmd.segment_key);
+
+        if self
+            .segments
+            .stage_producer_entry(
+                cmd.segment_key,
+                cmd.data,
+                cmd.record_count,
+                producer_identity,
+            )
+            .is_some()
+        {
+            self.dirty_segments.insert(cmd.segment_key);
+        }
 
         self.out
             .store_batch_produce_timer(TimerCommand::SetSchedule {
@@ -226,7 +250,7 @@ impl<W: WalStorage> DataPlane<W> {
             .segments
             .resolve(cmd.topic_id, cmd.range_id, cmd.entry_id)
         else {
-            let _ = cmd.reply.send(FetchResult::SegmentNotLocal);
+            let _ = cmd.reply.send(Err(ServerError::SegmentNotLocal));
             return;
         };
 
@@ -244,7 +268,7 @@ impl<W: WalStorage> DataPlane<W> {
     fn handle_hot_fetch(&self, cmd: Fetch, key: SegmentKey) {
         let Some(tracker) = self.segments.get(&key) else {
             // Resolver and store invariants should keep these in sync(just a guard)
-            let _ = cmd.reply.send(FetchResult::SegmentNotLocal);
+            let _ = cmd.reply.send(Err(ServerError::SegmentNotLocal));
             return;
         };
 
@@ -260,11 +284,11 @@ impl<W: WalStorage> DataPlane<W> {
         // checking against the cache read cursor.
         if *cache_position >= read_cursor {
             // Past the tail — nothing to return.
-            let _ = cmd.reply.send(FetchResult::Records {
+            let _ = cmd.reply.send(Ok(FetchedRecords {
                 entries: Vec::new(),
                 next_entry_id: cmd.entry_id,
                 progress_signal: cmd.progress_signal,
-            });
+            }));
             return;
         }
 
@@ -290,11 +314,11 @@ impl<W: WalStorage> DataPlane<W> {
             }
         }
 
-        let _ = cmd.reply.send(FetchResult::Records {
+        let _ = cmd.reply.send(Ok(FetchedRecords {
             entries,
             next_entry_id,
             progress_signal: cmd.progress_signal,
-        });
+        }));
     }
 
     /// Hand a sealed-segment read off to the cold-read pool. The pool owns the
@@ -307,7 +331,7 @@ impl<W: WalStorage> DataPlane<W> {
         end_entry_id: EntryId,
     ) {
         if cmd.entry_id > end_entry_id {
-            let _ = cmd.reply.send(FetchResult::EntryIdOutOfRange);
+            let _ = cmd.reply.send(Err(ServerError::EntryIdOutOfRange));
             return;
         }
 
@@ -325,9 +349,9 @@ impl<W: WalStorage> DataPlane<W> {
         if let Err(flume::SendError(req)) = self.cold_read_handoff_sender.send(req)
             && let ColdReadReply::Consumer { reply, .. } = req.reply
         {
-            let _ = reply.send(FetchResult::InternalError(
+            let _ = reply.send(Err(ServerError::Internal(
                 "cold-read pool unavailable".into(),
-            ));
+            )));
         }
     }
 
@@ -342,29 +366,29 @@ impl<W: WalStorage> DataPlane<W> {
             self.segments
                 .resolve(cmd.topic_id, cmd.range_id, EntryId(u64::MAX))
         else {
-            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            let _ = cmd.reply.send(Err(ServerError::SegmentNotLocal));
             return;
         };
 
         let Some(tracker) = self.segments.get(&key) else {
-            let _ = cmd.reply.send(ListOffsetsResult::SegmentNotLocal);
+            let _ = cmd.reply.send(Err(ServerError::SegmentNotLocal));
             return;
         };
-        let _ = cmd.reply.send(ListOffsetsResult::RangeOffsets {
+        let _ = cmd.reply.send(Ok(RangeOffsets {
             start_entry_id: tracker.start_entry_id(),
             next_entry_id: tracker.successor_start_entry_id(),
-        });
+        }));
     }
 
     fn read_consumer_offset(&self, query: ReadConsumerOffset) {
         let result = match self
-            .consumer_offsets
+            .auxiliary_state
             .get_replica_set_if_leader(&query.key, &self.node_id)
         {
             Ok(_) => {
-                let observed_generation = self.consumer_offsets.durable_generation(&query.key);
+                let observed_generation = self.auxiliary_state.durable_generation(&query.key);
                 if observed_generation == query.generation {
-                    ReadConsumerOffsetResult::Offset(self.consumer_offsets.offset(&query.key))
+                    ReadConsumerOffsetResult::Offset(self.auxiliary_state.offset(&query.key))
                 } else {
                     ReadConsumerOffsetResult::GenerationMismatch(ConsumerOffsetGenerationMismatch {
                         observed_generation,
@@ -389,9 +413,9 @@ impl<W: WalStorage> DataPlane<W> {
         self.reclaim_checkpointed_wal();
     }
 
-    fn handle_offset_checkpoint_complete(&mut self, complete: OffsetCheckpointComplete) {
-        self.consumer_offsets
-            .handle_offset_checkpoint_complete(complete.checkpointed_lsn);
+    fn handle_auxiliary_checkpoint_complete(&mut self, complete: AuxiliaryCheckpointComplete) {
+        self.auxiliary_state
+            .handle_auxiliary_checkpoint_complete(complete.checkpointed_lsn);
         self.reclaim_checkpointed_wal();
     }
 
@@ -404,13 +428,13 @@ impl<W: WalStorage> DataPlane<W> {
             self.wal.delete_below(watermark);
         }
 
-        if self.consumer_offsets.offset_checkpoint_in_flight() {
+        if self.auxiliary_state.auxiliary_checkpoint_in_flight() {
             return;
         }
         let Some(reclaimable_lsn) = self.wal.reclaimable_lsn() else {
             return;
         };
-        let Some(oldest_offset_lsn) = self.consumer_offsets.oldest_uncheckpointed_lsn() else {
+        let Some(oldest_offset_lsn) = self.auxiliary_state.oldest_uncheckpointed_lsn() else {
             return;
         };
         if self.segments.reclamation_watermark(reclaimable_lsn) < *oldest_offset_lsn {
@@ -419,10 +443,10 @@ impl<W: WalStorage> DataPlane<W> {
 
         // At this point, lsn must exist in consumer_offset so the following is just safeguard.
         if let Some(job) = self
-            .consumer_offsets
-            .raise_offset_checkpoint_job(self.config.data_dir.clone())
+            .auxiliary_state
+            .raise_auxiliary_checkpoint_job(self.config.data_dir.clone())
         {
-            self.out.store_offset_checkpoint(job);
+            self.out.store_auxiliary_checkpoint(job);
         }
     }
 
@@ -561,8 +585,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn handle_consumer_group_epoch_seal(&mut self, cmd: EpochSeal) {
-        let Some(parked_commits) = self.consumer_offsets.handle_consumer_group_epoch_seal(cmd)
-        else {
+        let Some(parked_commits) = self.auxiliary_state.unpark_future_offset_commits(cmd) else {
             return;
         };
 
@@ -949,6 +972,14 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         self.commit_segment(cmd.segment_key, committed.entry_id);
+        if let Some(p_id) = committed.producer_identity {
+            self.auxiliary_state.advance_producer(
+                cmd.segment_key,
+                p_id,
+                committed.entry_id,
+                committed.lsn,
+            );
+        }
         self.out.produce_replies.extend(
             committed
                 .replies
@@ -967,7 +998,7 @@ impl<W: WalStorage> DataPlane<W> {
 
     fn commit_consumer_offset(&mut self, cmd: CommitConsumerOffset) {
         self.needs_flush |= self
-            .consumer_offsets
+            .auxiliary_state
             .commit_consumer_offset(cmd, &self.node_id);
     }
 
@@ -980,7 +1011,7 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         };
 
-        let sealed_generation = self.consumer_offsets.latest_generation(&cmd.update.key);
+        let sealed_generation = self.auxiliary_state.latest_generation(&cmd.update.key);
         if cmd.update.generation < sealed_generation {
             let transport = DataTransportCommand::send_to_targets(
                 vec![leader],
@@ -1011,20 +1042,19 @@ impl<W: WalStorage> DataPlane<W> {
                 self.out.store_transport_cmd(transport)
             }
 
-            self.consumer_offsets
-                .future_entry(cmd.update.key.clone())
-                .push(FutureOffsetCommit::Replica(cmd));
+            self.auxiliary_state
+                .push_future(cmd.update.key.clone(), FutureOffsetCommit::Replica(cmd));
             return;
         }
 
-        self.consumer_offsets.push_pending_offset_mutation(cmd);
+        self.auxiliary_state.push_pending_offset_mutation(cmd);
         self.needs_flush = true;
     }
 
     fn handle_replica_offset_ack(&mut self, cmd: ConsumerOffsetReplicated) {
         // ! Hot PATH without the following condition,
         // every consumer-offset replica acknowledgement currently will trigger a full placement scan
-        if self.consumer_offsets.handle_replica_offset_ack(cmd) {
+        if self.auxiliary_state.handle_replica_offset_ack(cmd) {
             self.ack_ready_offset_placements();
         }
     }
@@ -1041,7 +1071,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         let parked = self
-            .consumer_offsets
+            .auxiliary_state
             .install_consumer_offsets(cmd, &self.node_id);
         self.resume_future_offset_commits(parked);
 
@@ -1061,7 +1091,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         if let Some(bootstrap) = self
-            .consumer_offsets
+            .auxiliary_state
             .create_offset_snapshot(cmd, &self.node_id)
         {
             self.out.store_transport_cmd(bootstrap);
@@ -1073,10 +1103,10 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
-        self.consumer_offsets.handle_snapshot_installed_ack(&cmd);
+        self.auxiliary_state.handle_snapshot_installed_ack(&cmd);
 
         if let Some(bootstrap) = self
-            .consumer_offsets
+            .auxiliary_state
             .create_offset_snapshot_for_unready_replicas(cmd.segment_key)
         {
             self.out.store_transport_cmd(bootstrap);
@@ -1104,7 +1134,7 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
-        if let Some(transport) = self.consumer_offsets.install_leader_placement(
+        if let Some(transport) = self.auxiliary_state.install_leader_placement(
             cmd.segment_key,
             cmd.shard_group_id,
             cmd.replica_set.clone(),
@@ -1131,7 +1161,7 @@ impl<W: WalStorage> DataPlane<W> {
     /// have successfully bootstrapped and are up-to-date)
     /// If then sends [`SegmentPlaced`](self::SegmentPlaced) to coordinator responsible for the shard
     fn ack_ready_offset_placements(&mut self) {
-        for ack in self.consumer_offsets.drain_ready_placements(&self.node_id) {
+        for ack in self.auxiliary_state.drain_ready_placements(&self.node_id) {
             self.out
                 .store_transport_cmd(DataTransportSendToCoordinator {
                     shard_group_id: ack.shard_group_id,
@@ -1150,7 +1180,7 @@ impl<W: WalStorage> DataPlane<W> {
         }
 
         if matches!(
-            self.consumer_offsets.observe_placement(
+            self.auxiliary_state.observe_placement(
                 cmd.segment_key,
                 ShardGroupId(0),
                 &cmd.replicas,
@@ -1179,7 +1209,13 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         };
 
-        tracker.stage_entry(cmd.segment_key, cmd.data, cmd.record_count, cmd.entry_id);
+        tracker.stage_entry(
+            cmd.segment_key,
+            cmd.data,
+            cmd.record_count,
+            cmd.entry_id,
+            cmd.producer_identity,
+        );
         self.dirty_segments.insert(cmd.segment_key);
 
         self.needs_flush = true;
@@ -1201,7 +1237,7 @@ impl<W: WalStorage> DataPlane<W> {
         let uncommitted_entry = old_tracker
             .uncommitted_entries()
             .chain(old_tracker.staged_for_replay())
-            .collect::<Box<[(EntryPayload, u32)]>>();
+            .collect::<Box<[(PayloadBytes, u32, Option<ProducerAppendIdentity>)]>>();
 
         if !old_tracker.followers().is_empty() {
             self.out
@@ -1250,13 +1286,14 @@ impl<W: WalStorage> DataPlane<W> {
             .segments
             .get_mut(&cmd.old_segment_key.with_segment_id(cmd.new_segment_id))
         {
-            for (data, record_count) in uncommitted_entry {
+            for (data, record_count, producer) in uncommitted_entry {
                 let entry_id = successor.next_staged_entry_id();
                 successor.stage_entry(
                     cmd.old_segment_key.with_segment_id(cmd.new_segment_id),
                     data,
                     record_count,
                     entry_id,
+                    producer,
                 );
             }
         }
@@ -1264,6 +1301,15 @@ impl<W: WalStorage> DataPlane<W> {
         self.dirty_segments
             .insert(cmd.old_segment_key.with_segment_id(cmd.new_segment_id));
         self.needs_flush = true;
+
+        // ! Uncommitted entries are replayed into the successor segment, and self.needs_flush = true is flagged.
+        // ! If no BatchFlushTimer was scheduled for the ticker system, flush_batch() won't be triggered( when no subsequent client produce request arrived),
+        // ! leaving replayed records dirty and stranding the waiting producer client on reply_rx.await until timing out after 40s.
+        self.out
+            .store_batch_produce_timer(TimerCommand::SetSchedule {
+                seq: self.wal.next_lsn(),
+                timer: BatchFlushTimer::deadline(),
+            });
     }
 
     fn handle_segment_meta_sealed(&mut self, cmd: SegmentMetaSealed) {
@@ -1356,7 +1402,7 @@ impl<W: WalStorage> DataPlane<W> {
             if tracker.role() == SegmentRole::Leader {
                 let staged_bytes: usize = tracker
                     .staged_for_replay()
-                    .map(|(data, _)| data.len())
+                    .map(|(data, _, _)| data.len())
                     .sum();
                 self.buffer_byte_count -= staged_bytes;
             }
@@ -1472,7 +1518,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn has_staged_data(&self) -> bool {
-        self.consumer_offsets.has_pending_offsets()
+        self.auxiliary_state.has_pending_offsets()
             || self
                 .dirty_segments
                 .iter()
@@ -1480,7 +1526,7 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn flush_batch(&mut self) {
-        let Ok(encoded_offsets) = self.consumer_offsets.encode_offsets() else {
+        let Ok(encoded_offsets) = self.auxiliary_state.encode_offsets() else {
             self.needs_flush = !self.dirty_segments.is_empty();
             return;
         };
@@ -1509,7 +1555,7 @@ impl<W: WalStorage> DataPlane<W> {
             }
         };
 
-        for c in self.consumer_offsets.flush_batch(&self.node_id, lsn) {
+        for c in self.auxiliary_state.flush_batch(&self.node_id, lsn) {
             self.out.store_transport_cmd(c);
         }
 
@@ -1525,10 +1571,16 @@ impl<W: WalStorage> DataPlane<W> {
                         if tracker.followers().is_empty() {
                             // No followers → committed the moment it's durable.
                             tracker.commit_entry(entry.entry_id);
+                            if let Some(p_id) = entry.producer_identity {
+                                self.auxiliary_state.advance_producer(
+                                    key,
+                                    p_id,
+                                    entry.entry_id,
+                                    lsn,
+                                );
+                            }
                             if let Some(reply) = self.replication.pop_pending_reply(&key) {
-                                let _ = reply.send(ProduceAck::Ok {
-                                    entry_id: entry.entry_id,
-                                });
+                                let _ = reply.send(ProduceAck::Ok(entry.entry_id));
                             }
                         } else {
                             segment_batches.push(PendingReplicationBatch {
@@ -1540,6 +1592,10 @@ impl<W: WalStorage> DataPlane<W> {
                         }
                     }
                     SegmentRole::Follower => {
+                        if let Some(p_id) = entry.producer_identity {
+                            self.auxiliary_state
+                                .advance_producer(key, p_id, entry.entry_id, lsn);
+                        }
                         self.out
                             .store_transport_cmd(DataTransportCommand::send_to_targets(
                                 vec![tracker.leader_node()],
@@ -1587,12 +1643,15 @@ impl<W: WalStorage> DataPlane<W> {
 
         for key in std::mem::take(&mut self.dirty_segments) {
             if let Some(tracker) = self.segments.get_mut(&key) {
-                tracker.abort_staged();
+                for append_identity in tracker.abort_staged() {
+                    let append_key = AppendKey::new(key, &append_identity);
+                    self.auxiliary_state.unstage_producer(&append_key);
+                }
             }
         }
 
         self.replication.fail_all(e.to_string());
-        self.consumer_offsets.fail_all(&e.to_string());
+        self.auxiliary_state.drop_coordination(&e.to_string());
         self.needs_flush = false;
     }
 
@@ -1603,7 +1662,7 @@ impl<W: WalStorage> DataPlane<W> {
         };
 
         let segment_watermark = self.segments.reclamation_watermark(reclaimable_lsn);
-        let offset_watermark = self.consumer_offsets.reclamation_watermark(reclaimable_lsn);
+        let offset_watermark = self.auxiliary_state.reclamation_watermark(reclaimable_lsn);
 
         segment_watermark.min(offset_watermark)
     }
@@ -1708,25 +1767,27 @@ impl<T: WalStorage> TAssertInvariant for DataPlane<T> {
         );
 
         self.segments.assert_invariants();
+        self.replication.assert_invariants();
+        self.auxiliary_state.assert_producer_invariants();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::control_plane::Replicas;
     use crate::control_plane::metadata::consumer_group::GenerationId;
-    use crate::data_plane::consumer_offset_management::ledger::{
-        ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate, EpochSeal, OffsetLedger,
+    use crate::data_plane::auxiliary_states::consumer_offsets::state::{
+        ConsumerOffsetEntry, ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
     };
-    use std::path::PathBuf;
 
-    use super::*;
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
     use crate::data_plane::checkpoint::CheckpointTask;
     use crate::data_plane::cold_read::DEFAULT_POOL_SIZE;
     use crate::data_plane::recovery::segment_scan::RecoveredSegments;
     use crate::data_plane::wal::WalWriter;
+    use std::path::PathBuf;
     use tokio::sync::oneshot;
 
     use bytes::Bytes;
@@ -1896,11 +1957,11 @@ mod tests {
             ConsumerOffsetCommitAck::Committed
         );
         assert_eq!(
-            dp.consumer_offsets.offset(&consumer_offset_key()),
+            dp.auxiliary_state.offset(&consumer_offset_key()),
             Some(position)
         );
         assert_eq!(
-            dp.consumer_offsets
+            dp.auxiliary_state
                 .uncheckpointed_offset_lsns()
                 .iter()
                 .copied()
@@ -1950,14 +2011,14 @@ mod tests {
         dp.reclaim_checkpointed_wal();
         assert!(matches!(
             dp.out.checkpoint_tasks.as_slice(),
-            [CheckpointTask::ConsumerOffsets(job)] if job.checkpointed_lsn == 2
+            [CheckpointTask::AuxiliaryState(job)] if job.checkpointed_lsn == 2
         ));
 
-        dp.handle_command(OffsetCheckpointComplete {
+        dp.handle_command(AuxiliaryCheckpointComplete {
             checkpointed_lsn: 2,
         });
-        assert!(dp.consumer_offsets.uncheckpointed_offset_lsns().is_empty());
-        assert_eq!(dp.consumer_offsets.offset_checkpoint_lsn(), 2);
+        assert!(dp.auxiliary_state.uncheckpointed_offset_lsns().is_empty());
+        assert_eq!(dp.auxiliary_state.auxiliary_checkpoint_lsn(), 2);
         assert_eq!(dp.wal.reclaimable_lsn(), None);
     }
 
@@ -2025,7 +2086,7 @@ mod tests {
             ConsumerOffsetCommitAck::Committed
         );
         assert_eq!(
-            dp.consumer_offsets.offset(&consumer_offset_key()),
+            dp.auxiliary_state.offset(&consumer_offset_key()),
             Some(position)
         );
     }
@@ -2152,7 +2213,7 @@ mod tests {
 
         dp.flush_batch();
         assert_eq!(
-            dp.consumer_offsets.offset(&consumer_offset_key()),
+            dp.auxiliary_state.offset(&consumer_offset_key()),
             Some(position)
         );
         assert!(dp.out.transport_cmds.iter().any(|command| matches!(
@@ -2184,13 +2245,11 @@ mod tests {
             ConsumerOffsetSnapshot {
                 segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
-                entries: vec![
-                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
-                        key: consumer_offset_key(),
-                        generation: 3.into(),
-                        position: Some(position),
-                    },
-                ]
+                entries: vec![ConsumerOffsetEntry {
+                    key: consumer_offset_key(),
+                    generation: 3.into(),
+                    position: Some(position),
+                }]
                 .into_boxed_slice(),
             },
         ));
@@ -2204,7 +2263,7 @@ mod tests {
         dp.flush_batch();
 
         assert_eq!(
-            dp.consumer_offsets.offset(&consumer_offset_key()),
+            dp.auxiliary_state.offset(&consumer_offset_key()),
             Some(position)
         );
         assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
@@ -2238,7 +2297,7 @@ mod tests {
                 update: update.clone(),
             },
         ));
-        assert!(!dp.consumer_offsets.has_pending_offsets());
+        assert!(!dp.auxiliary_state.has_pending_offsets());
         assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
             cmd,
             DataTransportCommand::SendToTargets(send)
@@ -2250,20 +2309,18 @@ mod tests {
             ConsumerOffsetSnapshot {
                 segment_key: test_key(),
                 replica_set: Replicas::new(vec![leader.clone(), test_node_id()]),
-                entries: vec![
-                    crate::data_plane::consumer_offset_management::ledger::ConsumerOffsetEntry {
-                        key: consumer_offset_key(),
-                        generation: 2.into(),
-                        position: None,
-                    },
-                ]
+                entries: vec![ConsumerOffsetEntry {
+                    key: consumer_offset_key(),
+                    generation: 2.into(),
+                    position: None,
+                }]
                 .into_boxed_slice(),
             },
         ));
         dp.flush_batch();
 
         assert_eq!(
-            dp.consumer_offsets.offset(&consumer_offset_key()),
+            dp.auxiliary_state.offset(&consumer_offset_key()),
             Some(position)
         );
         assert!(dp.out.transport_cmds.iter().any(|cmd| matches!(
@@ -2329,7 +2386,10 @@ mod tests {
             RecoveryOutput {
                 inventory: recovered,
                 data_dir: dir.path().to_path_buf(),
-                offsets: OffsetLedger::default(),
+                auxiliary_state: AuxiliaryStateManager::from_recovery(
+                    Default::default(),
+                    Default::default(),
+                ),
             },
         )
     }
@@ -2384,6 +2444,8 @@ mod tests {
             segment_key: key,
             data: Bytes::from("data").into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: tx,
         };
         (cmd.into(), rx)
@@ -2462,12 +2524,133 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from("hello world!").into(),
             record_count: 2,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: tx,
         });
 
         let tracker = dp.segments.get(&test_key()).unwrap();
         assert_eq!(tracker.size_bytes(), 12);
         assert_eq!(tracker.next_entry_id(), EntryId(0));
+    }
+
+    #[test]
+    fn committed_producer_retry_returns_same_entry_without_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        let producer = ProducerAppendIdentity {
+            producer_id: uuid::Uuid::new_v4(),
+            incarnation: 0,
+            expires_at: u64::MAX,
+            sequence: 0,
+            digest: 7,
+        };
+
+        let send = |data_plane: &mut DataPlane<_>| {
+            let (reply, ack) = oneshot::channel();
+            data_plane.handle_command(Produce {
+                segment_key: test_key(),
+                data: Bytes::from_static(b"one").into(),
+                record_count: 1,
+                received_at_ms: 0,
+                producer_identity: Some(AuthorizedProducerIdentity::MetadataVerified(producer)),
+                reply,
+            });
+            data_plane.flush_batch();
+            ack.blocking_recv().unwrap()
+        };
+
+        assert!(matches!(send(&mut dp), ProduceAck::Ok(EntryId(0))));
+        assert!(matches!(send(&mut dp), ProduceAck::Ok(EntryId(0))));
+        assert_eq!(
+            dp.segments.get(&test_key()).unwrap().next_staged_entry_id(),
+            EntryId(1)
+        );
+    }
+
+    #[test]
+    fn committed_retry_survives_segment_removal_but_new_append_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        let producer_id = uuid::Uuid::new_v4();
+        let request = ProducerAppendIdentity {
+            producer_id,
+            incarnation: 0,
+            expires_at: u64::MAX,
+            sequence: 0,
+            digest: 7,
+        };
+        let (reply, ack) = oneshot::channel();
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from_static(b"one").into(),
+            record_count: 1,
+            received_at_ms: 0,
+            producer_identity: Some(AuthorizedProducerIdentity::MetadataVerified(request)),
+            reply,
+        });
+        dp.flush_batch();
+        assert!(matches!(
+            ack.blocking_recv().unwrap(),
+            ProduceAck::Ok { .. }
+        ));
+        dp.segments.take_active_and_seal(test_key());
+
+        let (duplicate_reply, duplicate) = oneshot::channel();
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from_static(b"one").into(),
+            record_count: 1,
+            received_at_ms: 0,
+            producer_identity: Some(AuthorizedProducerIdentity::ExistingOnly(request)),
+            reply: duplicate_reply,
+        });
+        assert!(matches!(
+            duplicate.blocking_recv().unwrap(),
+            ProduceAck::Ok(EntryId(0))
+        ));
+
+        let (not_committed_reply, not_committed) = oneshot::channel();
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from_static(b"two").into(),
+            record_count: 1,
+            received_at_ms: 0,
+            producer_identity: Some(AuthorizedProducerIdentity::ExistingOnly(
+                ProducerAppendIdentity {
+                    sequence: 1,
+                    digest: 8,
+                    ..request
+                },
+            )),
+            reply: not_committed_reply,
+        });
+        assert!(matches!(
+            not_committed.blocking_recv().unwrap(),
+            ProduceAck::Err(ProduceError::SegmentNotFound)
+        ));
+
+        let (retry_reply, retry) = oneshot::channel();
+        dp.handle_command(Produce {
+            segment_key: test_key(),
+            data: Bytes::from_static(b"two").into(),
+            record_count: 1,
+            received_at_ms: 0,
+            producer_identity: Some(AuthorizedProducerIdentity::ExistingOnly(
+                ProducerAppendIdentity {
+                    sequence: 1,
+                    digest: 8,
+                    ..request
+                },
+            )),
+            reply: retry_reply,
+        });
+        assert!(matches!(
+            retry.blocking_recv().unwrap(),
+            ProduceAck::Err(ProduceError::SegmentNotFound)
+        ));
     }
 
     #[test]
@@ -2566,6 +2749,8 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from(vec![0u8; TEST_BATCH_MAX_BYTES]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
 
@@ -2584,6 +2769,8 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from(vec![0u8; TEST_BATCH_MAX_BYTES]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         assert!(dp.buffer_byte_count >= TEST_BATCH_MAX_BYTES);
@@ -2605,6 +2792,8 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from(vec![0u8; 16]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         dp.flush_batch();
@@ -2633,12 +2822,16 @@ mod tests {
             segment_key: small,
             data: Bytes::from(vec![0u8; 10]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         dp.handle_command(Produce {
             segment_key: large,
             data: Bytes::from(vec![0u8; 45]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         dp.flush_batch();
@@ -2666,6 +2859,8 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from(vec![0u8; 8]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         dp.flush_batch();
@@ -2693,6 +2888,8 @@ mod tests {
             segment_key: test_key(),
             data: Bytes::from(vec![0u8; 8]).into(),
             record_count: 1,
+            received_at_ms: 0,
+            producer_identity: None,
             reply: oneshot::channel().0,
         });
         dp.flush_batch();
@@ -2966,6 +3163,7 @@ mod tests {
                 data: b"setup".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -2991,6 +3189,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -3016,6 +3215,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             },
         ));
 
@@ -3038,6 +3238,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -3058,6 +3259,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -3181,6 +3383,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -3311,6 +3514,7 @@ mod tests {
                 data: b"data".to_vec().into(),
                 record_count: 1,
                 entry_id: EntryId(0),
+                producer_identity: None,
             }
             .into(),
         ));
@@ -3508,7 +3712,7 @@ mod tests {
             RecoveryOutput {
                 inventory: empty_inventory(),
                 data_dir: dir.path().to_path_buf(),
-                offsets: OffsetLedger::default(),
+                auxiliary_state: AuxiliaryStateManager::default(),
             },
         );
 
@@ -3521,6 +3725,8 @@ mod tests {
                 segment_key: test_key(),
                 data: Bytes::copy_from_slice(payload).into(),
                 record_count,
+                received_at_ms: 0,
+                producer_identity: None,
                 reply: tx,
             });
         }
@@ -3574,14 +3780,11 @@ mod tests {
         let result = reply_rx
             .blocking_recv()
             .expect("cold-read pool dropped the reply");
-        let FetchResult::Records {
+        let FetchedRecords {
             entries,
             next_entry_id,
             ..
-        } = result
-        else {
-            panic!("expected Records from cold read, got {result:?}");
-        };
+        } = result.expect("expected Records from cold read");
         let got: Vec<(u64, u32, Vec<u8>)> = entries
             .iter()
             .map(|e| (*e.entry_id, e.record_count, e.data.to_vec()))
@@ -3620,7 +3823,7 @@ mod tests {
             RecoveryOutput {
                 inventory: empty_inventory(),
                 data_dir: dir.path().to_path_buf(),
-                offsets: OffsetLedger::default(),
+                auxiliary_state: AuxiliaryStateManager::default(),
             },
         );
         let mut tracker = SegmentTracker::new_with_start_entry_id(
@@ -3712,18 +3915,21 @@ mod tests {
                 record_count: 1,
                 entry_id: EntryId(0),
                 lsn: 0,
+                producer_identity: None,
             }),
             Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"bb").into(),
                 record_count: 2,
                 entry_id: EntryId(1),
                 lsn: 0,
+                producer_identity: None,
             }),
             Arc::new(CachedEntry {
                 data: Bytes::copy_from_slice(b"ccc").into(),
                 record_count: 3,
                 entry_id: EntryId(2),
                 lsn: 0,
+                producer_identity: None,
             }),
         ];
         dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
@@ -3790,7 +3996,7 @@ mod tests {
             RecoveryOutput {
                 inventory: empty_inventory(),
                 data_dir: dir.path().to_path_buf(),
-                offsets: OffsetLedger::default(),
+                auxiliary_state: AuxiliaryStateManager::default(),
             },
         );
         let requester = NodeId::new("replacement");
@@ -3805,6 +4011,7 @@ mod tests {
                 record_count: 1,
                 entry_id: EntryId(4),
                 lsn: 0,
+                producer_identity: None,
             })],
             next_offset: EntryId(5),
         }));
@@ -4386,6 +4593,7 @@ mod tests {
                     data: b"x".to_vec().into(),
                     record_count: 1,
                     entry_id: EntryId(entry_id),
+                    producer_identity: None,
                 }
                 .into(),
             ));

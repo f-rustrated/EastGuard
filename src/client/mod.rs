@@ -22,16 +22,17 @@ mod routing;
 use crate::client::nodes::KnownNodes;
 use crate::client::routing::TopicRouting;
 
-pub use crate::connections::protocol::{TopicDetail, TopicSummary};
+pub use crate::connections::protocol::{ClientSuccess, ServerError, TopicDetail, TopicSummary};
 #[cfg(test)]
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
-use crate::data_plane::consumer_offset_management::ledger::{
+use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
+use crate::data_plane::messages::query::RangeOffsets;
 pub use codec::CompressionCodec;
 pub use consumer::{
     CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
@@ -45,9 +46,10 @@ use uuid::Uuid;
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, CommitConsumerOffsetRequest,
     ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
-    ControlPlaneResponse, DataPlaneResponse, FetchConsumerOffsetRequest, ProduceRequest,
+    FetchConsumerOffsetRequest, OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened,
     RangeOffsetRequest,
 };
+use crate::data_plane::{PayloadBytes, ProduceError, ProducerAppendIdentity};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 pub use redirect::RetryPolicy;
@@ -120,7 +122,7 @@ impl Client {
         &self,
         topic: &str,
         range_id: RangeId,
-    ) -> Result<(EntryId, EntryId), ClientError> {
+    ) -> Result<RangeOffsets, ClientError> {
         let deadline = Instant::now() + self.retry.deadline;
         let mut backoff = self.retry.initial_backoff;
         let mut last_error = None;
@@ -155,11 +157,8 @@ impl Client {
             let served = self.call(addr, req).await?;
 
             match served.response {
-                ClientResponse::DataPlane(DataPlaneResponse::RangeOffset {
-                    start_entry_id,
-                    next_entry_id,
-                }) => return Ok((start_entry_id, next_entry_id)),
-                ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
+                ClientResponse::Ok(ClientSuccess::RangeOffset(res)) => return Ok(res),
+                ClientResponse::Err(ServerError::SegmentNotLocal) => {
                     last_error = Some("range offsets segment not local".to_string());
                 }
                 _ => return Err(ClientError::UnexpectedResponse),
@@ -190,8 +189,8 @@ impl Client {
             self.cache.invalidate(topic_name);
         }
         match served.response {
-            ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffsetCommitted) => Ok(()),
-            ClientResponse::DataPlane(DataPlaneResponse::StaleConsumerGroupEpoch(stale)) => {
+            ClientResponse::Ok(ClientSuccess::ConsumerOffsetCommitted) => Ok(()),
+            ClientResponse::Err(ServerError::StaleConsumerGroupEpoch(stale)) => {
                 Err(ClientError::StaleConsumerGroupEpoch {
                     request_generation,
                     sealed_generation: stale,
@@ -229,12 +228,12 @@ impl Client {
                     self.cache.invalidate(topic_name);
                 }
                 match served.response {
-                    ClientResponse::DataPlane(DataPlaneResponse::ConsumerOffset(position)) => {
+                    ClientResponse::Ok(ClientSuccess::ConsumerOffset(position)) => {
                         Ok(position.map(|p| (range_id, p)))
                     }
-                    ClientResponse::DataPlane(
-                        DataPlaneResponse::ConsumerOffsetGenerationMismatch(mismatch),
-                    ) if mismatch.observed_generation > generation => {
+                    ClientResponse::Err(ServerError::ConsumerOffsetGenerationMismatch(
+                        mismatch,
+                    )) if mismatch.observed_generation > generation => {
                         Err(ClientError::StaleConsumerGroupEpoch {
                             request_generation: generation,
                             sealed_generation: mismatch.observed_generation,
@@ -260,8 +259,8 @@ impl Client {
         };
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicCreated) => Ok(true),
-            ClientResponse::ControlPlane(ControlPlaneResponse::AlreadyExists) => Ok(false),
+            ClientResponse::Ok(ClientSuccess::TopicCreated) => Ok(true),
+            ClientResponse::Err(ServerError::AlreadyExists) => Ok(false),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -275,7 +274,7 @@ impl Client {
         // The redirect loop already turned a `TopicNotFound` response into an error.
         self.cache.invalidate(name);
         match served.response {
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDeleted) => Ok(()),
+            ClientResponse::Ok(ClientSuccess::TopicDeleted) => Ok(()),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -299,7 +298,7 @@ impl Client {
         };
         let served = self.call(self.next_known_node(), request).await?;
         match served.response {
-            ClientResponse::ControlPlane(ControlPlaneResponse::TopicDetail(detail)) => {
+            ClientResponse::Ok(ClientSuccess::TopicDetail(detail)) => {
                 self.remember_nodes(&detail);
                 self.cache.insert(&detail);
                 Ok(detail)
@@ -311,20 +310,17 @@ impl Client {
         }
     }
 
-    pub(crate) async fn produce(
+    pub(crate) async fn open_producer_session(
         &self,
-        topic: &str,
-        routing_key: &[u8],
-        data: Vec<u8>,
-        record_count: u32,
-    ) -> Result<EntryId, ClientError> {
-        let routing = self.resolve_topic_if_missing(topic).await?;
-        let range_id = routing
-            .range_id(routing_key)
-            .ok_or(ClientError::TopicNotFound)?;
-
-        self.produce_to_range(topic, range_id, routing_key, data, record_count)
-            .await
+        req: OpenProducerSessionRequest,
+    ) -> Result<ProducerSessionOpened, ClientError> {
+        let served = self
+            .call(self.next_known_node(), ControlPlaneRequest::from(req))
+            .await?;
+        match served.response {
+            ClientResponse::Ok(ClientSuccess::ProducerSessionOpened(session)) => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// Produce one entry under `routing_key`, returning the committed `entry_id`.
@@ -335,8 +331,9 @@ impl Client {
         topic: &str,
         range_id: RangeId,
         routing_key: &[u8],
-        data: Vec<u8>,
+        data: impl Into<PayloadBytes>,
         record_count: u32,
+        producer_identity: Option<ProducerAppendIdentity>,
     ) -> Result<EntryId, ClientError> {
         // Describe once to seed the cache (gives the first hop).
         let routing = self.resolve_topic_if_missing(topic).await?;
@@ -352,8 +349,9 @@ impl Client {
             topic_name: topic.to_string(),
             range_id,
             routing_key: routing_key.to_vec(),
-            data,
+            data: data.into(),
             record_count,
+            producer_identity,
         };
 
         let served = self.call(start, request).await?;
@@ -362,15 +360,16 @@ impl Client {
         if served.redirected
             || matches!(
                 &served.response,
-                ClientResponse::DataPlane(DataPlaneResponse::StaleRange)
+                ClientResponse::Err(ServerError::StaleRange)
             )
         {
             self.cache.invalidate(topic);
         }
         match served.response {
-            ClientResponse::DataPlane(DataPlaneResponse::Produced { entry_id }) => Ok(entry_id),
-            ClientResponse::DataPlane(DataPlaneResponse::StaleRange) => {
-                Err(ClientError::StaleRange)
+            ClientResponse::Ok(ClientSuccess::Produced(entry_id)) => Ok(entry_id),
+            ClientResponse::Err(ServerError::StaleRange) => Err(ClientError::StaleRange),
+            ClientResponse::Err(ServerError::ProduceRejected(error)) => {
+                Err(ClientError::ProduceRejected(error))
             }
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -424,12 +423,10 @@ impl Client {
 
                     let redirect = if is_direct_to_node {
                         match &response {
-                            ClientResponse::DataPlane(DataPlaneResponse::SegmentNotLocal) => {
+                            ClientResponse::Err(ServerError::SegmentNotLocal) => Redirect::Done,
+                            ClientResponse::Err(ServerError::ShardNotLocal { hint_node: None }) => {
                                 Redirect::Done
                             }
-                            ClientResponse::DataPlane(DataPlaneResponse::ShardNotLocal {
-                                hint_node: None,
-                            }) => Redirect::Done,
                             _ => Self::redirect_target(&response),
                         }
                     } else {
@@ -474,49 +471,31 @@ impl Client {
     /// won't compile until handled.
     pub(crate) fn redirect_target(response: &ClientResponse) -> Redirect {
         match response {
-            ClientResponse::ControlPlane(cp) => match cp {
-                ControlPlaneResponse::TopicMetadataRedirect { owner } => {
+            ClientResponse::Ok(_) => Redirect::Done,
+            ClientResponse::Err(err) => match err {
+                ServerError::ShardNotLocal { hint_node } => match hint_node {
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
+                    None => Redirect::Reresolve,
+                },
+                ServerError::NotRaftLeader { leader_addr }
+                | ServerError::NotWriteLeader { leader_addr } => match leader_addr {
+                    Some(addr) => Redirect::Follow(addr.client_addr()),
+                    None => Redirect::Reresolve,
+                },
+                ServerError::TopicMetadataRedirect { owner } => {
                     Redirect::Follow(owner.client_addr())
                 }
-                ControlPlaneResponse::NotRaftLeader { leader_addr } => match leader_addr {
-                    Some(addr) => Redirect::Follow(addr.client_addr()),
-                    None => Redirect::Reresolve,
-                },
-                ControlPlaneResponse::TopicNotFound => Redirect::NotFound,
-                ControlPlaneResponse::InternalError(_) => Redirect::Reresolve,
-                ControlPlaneResponse::TopicCreated
-                | ControlPlaneResponse::AlreadyExists
-                | ControlPlaneResponse::TopicDeleted
-                | ControlPlaneResponse::ConsumerGroupAssignment(_)
-                | ControlPlaneResponse::ConsumerGroupLeft
-                | ControlPlaneResponse::TopicList { .. }
-                | ControlPlaneResponse::TopicDetail(_) => Redirect::Done,
+                ServerError::TopicNotFound => Redirect::NotFound,
+                ServerError::SegmentNotLocal | ServerError::Internal(_) => Redirect::Reresolve,
+                ServerError::AlreadyExists
+                | ServerError::StaleRange
+                | ServerError::ProduceRejected(_)
+                | ServerError::EntryIdOutOfRange
+                | ServerError::KeyspaceBoundNarrowed
+                | ServerError::StaleConsumerGroupEpoch(_)
+                | ServerError::ConsumerOffsetGenerationMismatch(_)
+                | ServerError::InvalidSplitPoint => Redirect::Done,
             },
-            ClientResponse::DataPlane(dp) => match dp {
-                DataPlaneResponse::NotWriteLeader { leader_addr } => match leader_addr {
-                    Some(addr) => Redirect::Follow(addr.client_addr()),
-                    None => Redirect::Reresolve,
-                },
-                DataPlaneResponse::ShardNotLocal { hint_node } => match hint_node {
-                    Some(addr) => Redirect::Follow(addr.client_addr()),
-                    None => Redirect::Reresolve,
-                },
-                DataPlaneResponse::TopicNotFound => Redirect::NotFound,
-                DataPlaneResponse::StaleRange => Redirect::Done,
-                DataPlaneResponse::InternalError(_) => Redirect::Reresolve,
-                DataPlaneResponse::SegmentNotLocal
-                | DataPlaneResponse::Produced { .. }
-                | DataPlaneResponse::Fetched { .. }
-                | DataPlaneResponse::EntryIdOutOfRange
-                | DataPlaneResponse::KeyspaceBoundNarrowed
-                | DataPlaneResponse::RangeOffset { .. } => Redirect::Done,
-                DataPlaneResponse::ConsumerOffsetCommitted
-                | DataPlaneResponse::StaleConsumerGroupEpoch(_)
-                | DataPlaneResponse::ConsumerOffset(_)
-                | DataPlaneResponse::ConsumerOffsetGenerationMismatch(_) => Redirect::Done,
-            },
-            ClientResponse::Admin(_) => Redirect::Done,
-            // The server's writer-loop sentinel; a client never legitimately reads it.
             ClientResponse::Stop => Redirect::Reresolve,
         }
     }

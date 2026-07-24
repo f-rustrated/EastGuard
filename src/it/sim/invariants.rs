@@ -1,6 +1,6 @@
+use crate::client::ClientSuccess;
 use crate::connections::protocol::{
-    AdminRequest, AdminResponse, ClientRequest, ClientResponse, ControlPlaneRequest,
-    ControlPlaneResponse, ShardDetail, TopicSummary,
+    AdminRequest, ClientRequest, ClientResponse, ControlPlaneRequest, ShardDetail, TopicSummary,
 };
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
@@ -224,7 +224,7 @@ pub(in crate::it) async fn query_shard_leader(
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
     match response {
-        ClientResponse::Admin(AdminResponse::ShardLeader { leader }) => Ok(leader),
+        ClientResponse::Ok(ClientSuccess::ShardLeader { leader }) => Ok(leader),
         _ => Ok(None),
     }
 }
@@ -248,7 +248,7 @@ pub(in crate::it) async fn query_shard_info(
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
     match response {
-        ClientResponse::Admin(AdminResponse::ShardInfo { detail }) => Ok(detail),
+        ClientResponse::Ok(ClientSuccess::ShardInfo { detail }) => Ok(detail),
         _ => Ok(None),
     }
 }
@@ -268,7 +268,7 @@ pub(super) async fn query_topics(host: &str, port: u16) -> turmoil::Result<Box<[
     let (_, response): (_, ClientResponse) =
         tokio::time::timeout(Duration::from_secs(3), reader.read_request()).await??;
     match response {
-        ClientResponse::ControlPlane(ControlPlaneResponse::TopicList { topics }) => Ok(topics),
+        ClientResponse::Ok(ClientSuccess::TopicList { topics }) => Ok(topics),
         _ => Ok(Box::new([])),
     }
 }

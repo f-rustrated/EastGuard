@@ -6,6 +6,7 @@ pub mod error;
 pub(crate) mod event;
 pub(crate) mod range;
 
+mod producer_sessions;
 pub mod strategy;
 pub(crate) mod topic;
 

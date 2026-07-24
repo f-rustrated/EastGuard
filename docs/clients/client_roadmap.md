@@ -121,8 +121,11 @@ C2 (Producer)  C3 (Consumer)
 ---
 
 ## Backlog (beyond a working client)
-- **Idempotent / exactly-once produce** — producer session + sequence numbers, dedup
-  at the segment leader (the server-side half is its own backlog item).
+- **Idempotent produce** — the complete client/server protocol is designed in
+  [data-plane D10](../data-plane/d10_idempotent_production.md): immutable batch
+  identities, independently ordered producer-range streams, metadata-backed fencing,
+  recovery journal, and bounded retry lifetime. Cross-range transactions and end-to-end
+  exactly-once processing remain separate future work.
 - **Client-side batching & compression** — amortize round-trips and bytes.
 - **Adaptive replica selection** — pick the fastest/nearest replica per range from
   observed latency, not just `replica_set` order.

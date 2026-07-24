@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::channels::BatchSender;
+use crate::client::ServerError;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
@@ -245,13 +246,18 @@ impl MutlRaftSender {
     /// Look up a topic's full metadata on this node. Returns `None` when this
     /// node is not in the owning shard group (caller should redirect) or when
     /// the actor channel is dead.
-    pub(crate) async fn get_topic_metadata(&self, topic_name: String) -> Option<TopicMeta> {
+    pub(crate) async fn get_topic_metadata(
+        &self,
+        topic_name: String,
+    ) -> Result<TopicMeta, ServerError> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::GetTopicMetadata { topic_name, reply })
             .await;
 
-        recv.await.unwrap_or_default()
+        recv.await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .ok_or(ServerError::TopicNotFound)
     }
 
     pub(crate) async fn get_consumer_group_assignment(

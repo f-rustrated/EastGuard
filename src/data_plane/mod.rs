@@ -6,9 +6,9 @@ use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
 use crate::impl_new_struct_wrapper;
 
 pub(crate) mod actor;
+pub(crate) mod auxiliary_states;
 pub(crate) mod checkpoint;
 pub(crate) mod cold_read;
-pub(crate) mod consumer_offset_management;
 pub(crate) mod messages;
 pub(crate) mod recovery;
 pub(crate) mod segment_writer;
@@ -28,12 +28,14 @@ pub struct SegmentKey {
     pub segment_id: SegmentId,
 }
 
+pub use auxiliary_states::producer::{ProduceError, ProducerAppendIdentity};
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct EntryPayload(Bytes);
+pub struct PayloadBytes(Bytes);
 
-impl_new_struct_wrapper!(EntryPayload, Bytes);
+impl_new_struct_wrapper!(PayloadBytes, Bytes);
 
-impl From<Vec<u8>> for EntryPayload {
+impl From<Vec<u8>> for PayloadBytes {
     fn from(v: Vec<u8>) -> Self {
         Self(Bytes::from(v))
     }

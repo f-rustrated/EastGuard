@@ -21,8 +21,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
-    EntryId, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta, SegmentMetaState,
-    SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
+    EntryId, OpenProducerSession, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta,
+    SegmentMetaState, SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -39,12 +39,35 @@ pub enum ControlPlaneRequest {
         name: String,
     },
     SyncConsumerGroup(SyncConsumerGroupRequest),
+    OpenProducerSession(OpenProducerSessionRequest),
 }
 
 impl_from_variant!(
     ControlPlaneRequest,
-    SyncConsumerGroup(SyncConsumerGroupRequest)
+    SyncConsumerGroup(SyncConsumerGroupRequest),
+    OpenProducerSession(OpenProducerSessionRequest)
 );
+
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub struct OpenProducerSessionRequest {
+    pub topic_name: String,
+    pub producer_id: uuid::Uuid,
+    pub session_nonce: uuid::Uuid,
+}
+
+impl OpenProducerSessionRequest {
+    pub fn into_command(self) -> OpenProducerSession {
+        const SESSION_TIMEOUT_MS: u64 = 60_000;
+        let observed_at = crate::now_ms();
+        OpenProducerSession {
+            topic_name: self.topic_name,
+            producer_id: self.producer_id,
+            session_nonce: self.session_nonce,
+            observed_at,
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum ConsumerGroupSyncAction {
@@ -52,42 +75,19 @@ pub enum ConsumerGroupSyncAction {
     Leave,
 }
 
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
-pub enum ControlPlaneResponse {
-    // CreateTopic
-    TopicCreated,
-    AlreadyExists,
-    // DeleteTopic
-    TopicDeleted,
-    TopicNotFound,
-    // ListHostedTopics
-    TopicList {
-        topics: Box<[TopicSummary]>,
-    },
-    // DescribeTopic — when this node owns the topic's metadata
-    TopicDetail(TopicDetail),
-    // DescribeTopic — when this node does not own the topic's metadata.
-    TopicMetadataRedirect {
-        owner: NodeAddressInfo,
-    },
-    // Write landed on a member that isn't the metadata Raft leader — client retries
-    // there. `None` when the leader isn't yet known.
-    NotRaftLeader {
-        leader_addr: Option<NodeAddressInfo>,
-    },
-    ConsumerGroupAssignment(ConsumerGroupAssignmentResponse),
-    ConsumerGroupLeft,
-    // All control plane operations
-    InternalError(String),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct ProducerSessionOpened {
+    pub incarnation: u32,
+    pub expires_at: u64,
 }
 
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct ConsumerGroupAssignmentResponse {
     pub generation: GenerationId,
     pub ranges: Box<[RangeId]>,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct TopicSummary {
     pub name: String,
     pub range_count: u32,
@@ -97,7 +97,7 @@ pub struct TopicSummary {
 /// Full metadata snapshot for a topic, returned by `DescribeTopic`. Includes every
 /// range — active, sealed, and deleting — so a consumer can walk lineage from any
 /// historical ancestor forward through splits and merges.
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct TopicDetail {
     /// Resolved id, so a consumer can fetch by id directly from a holding replica
     /// (no name re-resolution on the data node). See `FetchByIdRequest`.
@@ -226,7 +226,7 @@ pub struct RebalancePlan {
 /// Per-range metadata. Lineage fields (`split_into`, `merged_into`, `merged_from`)
 /// let the consumer reconstruct the DAG; only the predecessor that owned a given
 /// key needs to be drained before its successor. See d4_consumer_range_tracking.md.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct RangeDetail {
     pub range_id: RangeId,
     pub keyspace_start: Vec<u8>,
@@ -324,7 +324,7 @@ impl RangeDetail {
 /// Per-segment metadata exposed to consumers. The replica set carries resolved
 /// client addresses so the consumer can pick a node to send fetches to without a
 /// separate address-resolution round trip.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SegmentDetail {
     pub segment_id: SegmentId,
     pub start_entry_id: EntryId,

@@ -259,7 +259,7 @@ impl MultiRaft {
             MultiRaftActorCommand::GetTopicMetadata { topic_name, reply } => {
                 let meta = self.get_topic_metadata(&topic_name);
                 self.deferred
-                    .push(DeferredReply::GetTopicMetadata(reply, meta));
+                    .push(DeferredReply::GetTopicMetadata(reply, Box::new(meta)));
             }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
@@ -309,7 +309,7 @@ impl MultiRaft {
                     let _ = sender.send(v);
                 }
                 DeferredReply::GetTopicMetadata(sender, v) => {
-                    let _ = sender.send(v);
+                    let _ = sender.send(*v);
                 }
                 DeferredReply::GetConsumerGroupAssignment(deferred) => {
                     let _ = deferred.reply.send(deferred.value);

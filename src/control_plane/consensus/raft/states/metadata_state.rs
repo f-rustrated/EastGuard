@@ -207,10 +207,49 @@ impl MetadataState {
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
             DeleteSegments(cmd) => self.delete_segments(cmd)?,
             SyncConsumerGroup(cmd) => self.sync_consumer_group(cmd)?,
+            OpenProducerSession(cmd) => self.open_producer_session(cmd)?,
+            ExpireProducerSessions(cmd) => self.expire_producer_sessions(cmd)?,
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
         Ok(())
+    }
+
+    fn open_producer_session(&mut self, cmd: OpenProducerSession) -> Result<(), MetadataError> {
+        let topic_id = self
+            .topic_name_index
+            .get(&cmd.topic_name)
+            .copied()
+            .ok_or_else(|| MetadataError::TopicNameNotFound(cmd.topic_name.clone()))?;
+        let topic = self
+            .topics
+            .get_mut(&topic_id)
+            .ok_or(MetadataError::TopicNotFound(topic_id))?;
+        topic.producer_sessions.open_producer_session(
+            cmd.producer_id,
+            cmd.session_nonce,
+            cmd.observed_at,
+            cmd.session_timeout_ms,
+        );
+        Ok(())
+    }
+
+    fn expire_producer_sessions(
+        &mut self,
+        cmd: ExpireProducerSessions,
+    ) -> Result<(), MetadataError> {
+        self.get_active_topic_mut(cmd.topic_id)?
+            .producer_sessions
+            .expire_producer_sessions(cmd.observed_at);
+        Ok(())
+    }
+
+    pub(crate) fn topics_with_expired_producer_sessions(&self, now: u64) -> Box<[TopicId]> {
+        self.topics
+            .values()
+            .filter(|topic| topic.producer_sessions.has_expired_producer_sessions(now))
+            .map(|topic| topic.id)
+            .collect()
     }
 
     fn create_topic(&mut self, cmd: CreateTopic) -> Result<(), MetadataError> {
@@ -539,8 +578,9 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
             assert_eq!(&topic.name, name);
         }
 
-        for id in self.topics.keys() {
+        for (id, topic) in &self.topics {
             assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
+            assert_eq!(*id, topic.id, "topic map key does not match topic identity");
         }
         for topic in self.topics.values() {
             topic.assert_invariants();

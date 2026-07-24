@@ -3,15 +3,20 @@ use std::collections::{HashMap, HashSet};
 use super::constants::*;
 use super::*;
 use crate::{
+    client::ServerError,
     control_plane::{
         NodeId, Replicas,
         metadata::{
             error::MetadataError,
             event::ConsumerGroupEpochSnapshot,
+            producer_sessions::ProducerSessions,
             strategy::{PartitionStrategy, StoragePolicy},
         },
     },
-    data_plane::SegmentKey,
+    data_plane::{
+        ProduceError, ProducerAppendIdentity, SegmentKey,
+        messages::command::AuthorizedProducerIdentity,
+    },
 };
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -32,7 +37,9 @@ pub struct TopicMeta {
     pub ranges: HashMap<RangeId, RangeMeta>,
     pub next_range_id: u64,
     pub(crate) consumer_groups: HashMap<String, ConsumerGroupMeta>,
+    pub(crate) producer_sessions: ProducerSessions,
 }
+
 impl TopicMeta {
     pub(crate) fn new(
         name: String,
@@ -59,6 +66,7 @@ impl TopicMeta {
             ranges: HashMap::from([(range_id, range)]),
             next_range_id: 1,
             consumer_groups: HashMap::new(),
+            producer_sessions: Default::default(),
         }
     }
 
@@ -76,6 +84,28 @@ impl TopicMeta {
         // ! SAFETY: We can safely unwrap() here because we know the Vec was built
         // ! from an array of exactly size N, so it will never fail.
         Ok(vec_ranges.try_into().unwrap())
+    }
+
+    pub(crate) fn get_range(&self, range_id: &RangeId) -> Result<&RangeMeta, MetadataError> {
+        self.ranges
+            .get(range_id)
+            .ok_or(MetadataError::RangeNotFound)
+    }
+
+    /// Resolves the active target range for a write operation.
+    /// Returns `ServerError::StaleRange` if the range is sealed/split or not active for the key.
+    pub(crate) fn resolve_writable_range(
+        &self,
+        range_id: RangeId,
+        routing_key: &[u8],
+    ) -> Result<&RangeMeta, ServerError> {
+        let range = self
+            .route_active_range(routing_key)
+            .ok_or(ServerError::TopicNotFound)?;
+        if range.range_id != range_id {
+            return Err(ServerError::StaleRange);
+        }
+        Ok(range)
     }
 
     pub(crate) fn get_range_mut(
@@ -495,10 +525,43 @@ impl TopicMeta {
     pub(crate) fn delete(&mut self) {
         self.state = TopicState::Deleted;
         self.active_ranges.clear();
+        self.producer_sessions.clear();
 
         for range in self.ranges.values_mut() {
             range.delete();
         }
+    }
+
+    pub(crate) fn verify_producer_session(
+        &self,
+        q: ProducerAppendIdentity,
+        received_at_ms: u64,
+    ) -> Result<AuthorizedProducerIdentity, ProduceError> {
+        if q.expires_at < received_at_ms {
+            return Err(ProduceError::SessionExpired);
+        }
+
+        let Some(session) = self.producer_sessions.get(&q.producer_id) else {
+            // Data replica placement is independent from metadata-Raft placement.
+            // A restarted data leader can therefore serve before its local metadata
+            // view contains this session. The durable range ledger still enforces
+            // the lease, sequence, and incarnation; do not strand recovery on a
+            // non-authoritative local metadata miss.
+            return Ok(AuthorizedProducerIdentity::ExistingOnly(q));
+        };
+
+        if q.incarnation < session.incarnation {
+            return Err(ProduceError::ProducerFenced);
+        };
+
+        if q.incarnation == session.incarnation
+            && q.expires_at <= session.expires_at
+            && q.expires_at >= received_at_ms
+        {
+            return Ok(AuthorizedProducerIdentity::MetadataVerified(q));
+        }
+
+        Err(ProduceError::SessionNotInstalled)
     }
 }
 
@@ -528,6 +591,12 @@ pub mod props {
             }
             for group in self.consumer_groups.values() {
                 group.assert_assignments(&self.active_ranges);
+            }
+            if self.state == TopicState::Deleted {
+                assert!(
+                    self.producer_sessions.is_empty(),
+                    "deleted topic retains producer sessions"
+                );
             }
         }
     }

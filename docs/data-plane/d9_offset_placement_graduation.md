@@ -179,6 +179,38 @@ positions while ordinary commits may still arrive. Sharing the reconciliation sh
 a second recovery lifecycle without pretending the two kinds of state have the same merge
 rules.
 
+### Generalization for range auxiliary state
+
+D10 extends this implemented offset-graduation path into a shared **range auxiliary-state
+graduation** framework. A placement announcement, successor-segment token, ready-source
+selection, snapshot transport, shared-WAL completion marker, joining/ready transition,
+acknowledgement drain, and reconciliation retry are placement mechanics; they should not be
+implemented again for each range-scoped ledger.
+
+The transferred snapshot is an envelope with typed sections:
+
+| Section | Merge authority | Meaning |
+|---|---|---|
+| Consumer offsets | Group generation and committed position | Where each group may safely resume |
+| Producer frontiers | Session incarnation and highest committed producer-range sequence | Which producer retries must not append again |
+
+The envelope and graduation state machine are shared, while each section owns its validation,
+monotonic merge, memory index, and snapshot encoding. A replica becomes authoritative for a
+placement only after every required section and the placement completion marker are durable.
+This avoids duplicate lifecycle machinery without hiding materially different ledger rules
+inside an untyped generic map.
+
+The same envelope becomes the node's consolidated range-auxiliary-state checkpoint. Offset
+updates and producer identities first become durable through typed records in the shared WAL.
+When reclamation needs to replace those records, one checkpoint job snapshots every auxiliary
+section at one LSN boundary, performs one asynchronous snapshot fsync, and advances one
+auxiliary watermark. Producer frontiers therefore do not add an independent snapshot file,
+fsync, or reclamation gate.
+
+The current implementation graduates consumer offsets only. Producer-frontier participation is
+part of D10 and must preserve the existing offset behavior while extending the snapshot envelope
+and readiness check.
+
 ---
 
 ## Leadership Changes
