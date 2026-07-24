@@ -276,7 +276,7 @@ impl SimScenario {
                         )
                     });
                     if !topic_exists
-                        || event.at_secs + fault.heal_after_secs >= self.simulation_secs
+                        || event.at_secs + fault.heal_after_secs + 15 >= self.simulation_secs
                     {
                         return false;
                     }
@@ -289,7 +289,7 @@ impl SimScenario {
                         )
                     });
                     if !topic_exists
-                        || event.at_secs + fault.heal_after_secs >= self.simulation_secs
+                        || event.at_secs + fault.heal_after_secs + 15 >= self.simulation_secs
                     {
                         return false;
                     }

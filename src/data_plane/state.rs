@@ -1301,6 +1301,15 @@ impl<W: WalStorage> DataPlane<W> {
         self.dirty_segments
             .insert(cmd.old_segment_key.with_segment_id(cmd.new_segment_id));
         self.needs_flush = true;
+
+        // ! Uncommitted entries are replayed into the successor segment, and self.needs_flush = true is flagged.
+        // ! If no BatchFlushTimer was scheduled for the ticker system, flush_batch() won't be triggered( when no subsequent client produce request arrived),
+        // ! leaving replayed records dirty and stranding the waiting producer client on reply_rx.await until timing out after 40s.
+        self.out
+            .store_batch_produce_timer(TimerCommand::SetSchedule {
+                seq: self.wal.next_lsn(),
+                timer: BatchFlushTimer::deadline(),
+            });
     }
 
     fn handle_segment_meta_sealed(&mut self, cmd: SegmentMetaSealed) {
