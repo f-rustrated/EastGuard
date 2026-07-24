@@ -51,6 +51,9 @@ pub enum ClientError {
     #[error("stale range routing")]
     StaleRange,
 
+    #[error("producer is closed")]
+    ProducerClosed,
+
     #[error("produce rejected: {0}")]
     ProduceRejected(ProduceError),
 
