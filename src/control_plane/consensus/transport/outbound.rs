@@ -79,8 +79,8 @@ impl RaftRpcDispatcher {
             return;
         }
 
-        self.writers.insert(peer_id, write_half);
-        tokio::spawn(reader.run(raft_tx.clone()));
+        self.writers.insert(peer_id.clone(), write_half);
+        tokio::spawn(reader.run(raft_tx.clone(), peer_id));
     }
 
     pub(super) async fn send(&mut self, packets: Vec<OutboundRaftPacket>, swim_tx: &SwimSender) {
@@ -185,7 +185,7 @@ impl RaftRpcDispatcher {
             return;
         }
         self.writers.insert(target.clone(), write_half);
-        tokio::spawn(reader.run(raft_tx.clone()));
+        tokio::spawn(reader.run(raft_tx.clone(), target.clone()));
 
         if !buffered.is_empty() {
             let _ = self.write_messages_to(&target, &buffered).await;

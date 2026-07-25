@@ -54,8 +54,8 @@ This creates four concrete gaps:
 - a non-voter can send a higher-term vote request and make a member step down;
 - a vote request can claim a candidate different from its envelope sender;
 - vote responses are counted without voter identity deduplication;
-- append and snapshot messages do not consistently bind embedded identities to
-  the authenticated sender and committed group role.
+- append and snapshot messages do not consistently bind their claimed leader to
+  the authenticated sender.
 
 D8 binds each envelope sender to the connection peer and makes every Raft handler
 authorize that peer before mutating consensus state. The current handshake
@@ -70,14 +70,28 @@ without changing the Raft API.
 |---|---|
 | Vote request | Authenticated peer equals the candidate; candidate is a committed voter |
 | Vote response | Authenticated peer equals the responder; responder is a committed voter; local node is a candidate; voter has not already responded in this term |
-| Append entries | Authenticated peer equals the claimed leader; leader is a committed voter |
-| Append response | Authenticated peer equals the responder; responder is a current voter or staged learner; local node is leader |
-| Install snapshot | Authenticated peer equals the claimed leader; leader is a committed voter |
-| Snapshot response | Authenticated peer equals the responder; responder is a current voter or staged learner; local node is leader |
+| Append entries | Authenticated peer equals the claimed leader; Raft validates term and log continuity |
+| Append response | Authenticated peer equals the responder; responder is a committed voter or staged learner; local node is leader |
+| Install snapshot | Authenticated peer equals the claimed leader; Raft validates term and snapshot continuity |
+| Snapshot response | Authenticated peer equals the responder; responder is a committed voter or staged learner; local node is leader |
 
 Voters may campaign, vote, lead, replicate, and acknowledge replication. Learners
 may receive logs or snapshots and acknowledge their progress. Learners cannot
 campaign, vote, lead, or count toward quorum.
+
+This document uses three precise terms:
+
+- **Claimed leader:** The node named as leader inside an incoming append or
+  snapshot request. Raft has not recognized it as the current leader yet.
+- **Committed voter:** A node in the applied Raft voting configuration.
+- **Staged learner:** A leader-local replication target catching up before a
+  committed promotion. It is not part of committed group membership.
+
+Claimed-leader replication requests deliberately do not consult the receiver's
+local voter set. A lagging replica may need an append or snapshot to learn the
+configuration that added the current leader. Requiring that configuration before
+accepting the replication creates a circular dependency and can strand the
+replica permanently.
 
 An unknown local group or unauthorized sender causes a single-RPC rejection. The
 application emits a rate-limited audit event and leaves the shared connection
@@ -106,7 +120,8 @@ authenticated peer + target group + RPC
                   │
              Yes  │
                   ▼
-   peer has role required by this RPC?
+   response or election sender is
+   an authorized committed voter or staged learner?
                   │
               No  ├──► drop RPC + audit
                   │
@@ -115,9 +130,11 @@ authenticated peer + target group + RPC
 apply term, role, log, and snapshot rules
 ```
 
-This order matters. A rejected outsider must not advance the term, reset an
-election timer, grant or count a vote, install itself as leader, append a log
-entry, or stage a snapshot.
+This order matters. A rejected election sender cannot advance the term, reset an
+election timer, grant or count a vote, or update replication progress. A leader
+replication request proceeds to Raft only when its claimed leader matches the
+authenticated peer; term, log, and snapshot validation then determine whether it
+can change state.
 
 ---
 
@@ -144,13 +161,20 @@ raw response counter.
 
 ## Membership Changes
 
-Sender authorization reads the target group's current committed voter set.
-Membership remains a Raft decision:
+Sender authorization reads the target group's current committed voter set for
+elections, quorum acknowledgements, and learner progress. Membership remains a
+Raft decision:
 
 - removing a voter takes effect when the removal entry applies;
 - adding a voter takes effect when the promotion entry applies;
 - a staged learner is authorized only for learner replication traffic;
 - SWIM or ring intent cannot directly authorize a Raft RPC.
+
+Claimed-leader replication requests are the exception to the local-membership
+lookup, not an exception to identity authentication. The receiver binds the
+claimed leader to the connection peer and lets Raft validate the request. This is
+necessary because the receiver's committed configuration may lag behind the
+leader's while the receiver is catching up.
 
 Temporary disagreement is handled as a stale RPC, not a transport failure. For
 example, a recently removed voter may send one last response over an otherwise
@@ -163,14 +187,17 @@ groups continue using the connection.
 
 1. Transport carries the connection peer identity with each inbound Raft RPC.
 2. The target Raft state-machine boundary performs one authorization step.
-3. Candidate, leader, and responder identities must match that peer.
-4. The RPC-specific voter or learner requirement comes from the matrix.
+3. Candidate, claimed-leader, and responder identities must match that peer.
+4. Election and response RPCs enforce the committed-voter or staged-learner
+   requirement from the matrix.
 5. Candidate votes are unique voter identities rather than a scalar count.
-6. Unauthorized RPCs return before term or state processing.
+6. Unauthorized election and response RPCs return before term or state
+   processing; claimed-leader replication requests continue through ordinary
+   Raft validation.
 
 The transport remains unaware of Raft membership and role. MultiRaft remains a
 group router. The target Raft instance owns the decision because only it has the
-committed membership and current local role.
+committed voter set, staged learners, and current local role.
 
 TLS authentication and structured security audit events remain security-roadmap
 work. They replace the handshake trust basis and rejection diagnostics,

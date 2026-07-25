@@ -780,6 +780,16 @@ impl Raft {
 
     pub fn handle_rpc(&mut self, from: NodeId, rpc: impl Into<RaftRpc>) {
         let rpc = rpc.into();
+        if !self.is_rpc_sender_authorized(&from, &rpc) {
+            tracing::debug!(
+                node = %self.node_id,
+                group = self.shard_group_id.0,
+                from = %from,
+                rpc = ?rpc,
+                "rejected unauthorized Raft RPC",
+            );
+            return;
+        }
         match rpc {
             RaftRpc::RequestVote(req) => self.handle_request_vote(from, req),
             RaftRpc::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
@@ -790,6 +800,29 @@ impl Raft {
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
+    }
+
+    fn is_rpc_sender_authorized(&self, from: &NodeId, rpc: &RaftRpc) -> bool {
+        match rpc {
+            RaftRpc::RequestVote(req) => &req.candidate_id == from && self.peers.contains(from),
+            RaftRpc::RequestVoteResponse(resp) => {
+                &resp.node_id == from
+                    && self.peers.contains(from)
+                    && matches!(self.consensus.role(), Role::Candidate { .. })
+            }
+            RaftRpc::AppendEntries(req) => &req.leader_id == from,
+            RaftRpc::AppendEntriesResponse(resp) => {
+                &resp.node_id == from
+                    && self.is_leader()
+                    && (self.peers.contains(from) || self.consensus.is_learner(from))
+            }
+            RaftRpc::InstallSnapshot(req) => &req.leader_id == from,
+            RaftRpc::InstallSnapshotResponse(resp) => {
+                &resp.node_id == from
+                    && self.is_leader()
+                    && (self.peers.contains(from) || self.consensus.is_learner(from))
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -894,7 +927,7 @@ impl Raft {
         }
         if self
             .consensus
-            .record_vote(resp.term, resp.vote_granted, self.quorum())
+            .record_vote(resp.term, resp.node_id, resp.vote_granted, self.quorum())
         {
             self.become_leader();
         }
@@ -1798,7 +1831,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
 
         // Invariant: peer_states exists only on the leader (and matches the peer
         // set when leader). Followers/candidates carry an empty peer_states.
-        match *self.consensus.role() {
+        match self.consensus.role() {
             Role::Leader => {
                 for peer in &self.peers {
                     assert!(
@@ -1848,6 +1881,19 @@ impl crate::test_traits::TAssertInvariant for Raft {
                     self.consensus.learner_state_count(),
                 );
             }
+        }
+
+        if let Role::Candidate { voters } = self.consensus.role() {
+            assert!(
+                voters.contains(&self.node_id),
+                "candidate vote set does not contain self",
+            );
+            assert!(
+                voters
+                    .iter()
+                    .all(|voter| voter == &self.node_id || self.peers.contains(voter)),
+                "candidate vote set contains a non-voter: {voters:?}",
+            );
         }
 
         // Invariant (partial): self is never in peers. The peer set is otherwise
@@ -1949,6 +1995,23 @@ mod tests {
     fn three_node_raft(id: &str) -> Raft {
         let all = ["node-1", "node-2", "node-3"];
         let peers: HashSet<NodeId> = all.iter().filter(|&&n| n != id).map(|&n| node(n)).collect();
+        Raft::new(
+            node(id),
+            peers,
+            RaftPersistentState::default(),
+            0,
+            TEST_SHARD,
+            test_timer_seqs(),
+        )
+    }
+
+    fn five_node_raft(id: &str) -> Raft {
+        let all = ["node-1", "node-2", "node-3", "node-4", "node-5"];
+        let peers = all
+            .iter()
+            .filter(|&&node_id| node_id != id)
+            .map(|&node_id| node(node_id))
+            .collect();
         Raft::new(
             node(id),
             peers,
@@ -2067,8 +2130,9 @@ mod tests {
         });
 
         assert!(matches!(
-            *raft.consensus.role(),
-            Role::Candidate { votes_received: 1 }
+            raft.consensus.role(),
+            Role::Candidate { voters }
+                if voters == &HashSet::from([NodeId::new("node-1")])
         ));
         assert_eq!(raft.consensus.current_term(), 1);
 
@@ -2104,6 +2168,47 @@ mod tests {
             raft.consensus.voted_for().cloned(),
             Some(NodeId::new("node-1"))
         );
+    }
+
+    #[test]
+    fn non_voter_vote_request_cannot_advance_term() {
+        let mut raft = three_node_raft("node-2");
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("outsider"),
+            RequestVote {
+                term: 9,
+                candidate_id: node("outsider"),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        );
+
+        assert_eq!(raft.current_term(), 0);
+        assert_eq!(raft.voted_for(), None);
+        assert_eq!(raft.consensus.role(), &Role::Follower);
+        assert!(raft.take_events().is_empty());
+    }
+
+    #[test]
+    fn vote_request_candidate_must_match_sender() {
+        let mut raft = three_node_raft("node-2");
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("node-1"),
+            RequestVote {
+                term: 9,
+                candidate_id: node("node-3"),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        );
+
+        assert_eq!(raft.current_term(), 0);
+        assert_eq!(raft.voted_for(), None);
+        assert!(raft.take_events().is_empty());
     }
 
     #[test]
@@ -2156,6 +2261,62 @@ mod tests {
         raft.handle_rpc(node("node-2"), resp);
 
         assert_eq!(*raft.consensus.role(), Role::Leader);
+    }
+
+    #[test]
+    fn duplicate_vote_response_counts_once() {
+        let mut raft = five_node_raft("node-1");
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+
+        let node_2_vote = RequestVoteResponse {
+            term: 1,
+            node_id: node("node-2"),
+            vote_granted: true,
+        };
+        raft.handle_rpc(node("node-2"), node_2_vote.clone());
+        raft.handle_rpc(node("node-2"), node_2_vote);
+
+        assert!(matches!(
+            raft.consensus.role(),
+            Role::Candidate { voters } if voters.len() == 2
+        ));
+
+        raft.handle_rpc(
+            node("node-3"),
+            RequestVoteResponse {
+                term: 1,
+                node_id: node("node-3"),
+                vote_granted: true,
+            },
+        );
+
+        assert_eq!(raft.consensus.role(), &Role::Leader);
+    }
+
+    #[test]
+    fn vote_response_identity_must_match_sender() {
+        let mut raft = three_node_raft("node-1");
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("node-2"),
+            RequestVoteResponse {
+                term: 9,
+                node_id: node("node-3"),
+                vote_granted: true,
+            },
+        );
+
+        assert_eq!(raft.current_term(), 1);
+        assert!(matches!(raft.consensus.role(), Role::Candidate { .. }));
     }
 
     #[test]
@@ -2300,6 +2461,55 @@ mod tests {
             _ => panic!("expected AppendEntriesResponse"),
         }
         assert_eq!(raft.log_last_index(), 1);
+    }
+
+    #[test]
+    fn append_entries_leader_must_match_sender() {
+        let mut raft = three_node_raft("node-2");
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("node-1"),
+            AppendEntries {
+                term: 9,
+                leader_id: node("node-3"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Default::default(),
+                leader_commit: 0,
+            },
+        );
+
+        assert_eq!(raft.current_term(), 0);
+        assert_eq!(raft.current_leader(), None);
+        assert!(raft.take_events().is_empty());
+    }
+
+    #[test]
+    fn snapshot_leader_must_match_sender() {
+        let mut raft = three_node_raft("node-2");
+        drain(&mut raft);
+
+        raft.handle_rpc(
+            node("node-1"),
+            InstallSnapshot {
+                term: 9,
+                leader_id: node("node-3"),
+                header: RaftSnapshotHeader {
+                    last_included_index: 5,
+                    last_included_term: 9,
+                    checksum: 0,
+                    size_bytes: 0,
+                },
+                offset: 0,
+                data: Default::default(),
+                done: true,
+            },
+        );
+
+        assert_eq!(raft.current_term(), 0);
+        assert_eq!(raft.consensus.last_included_index(), 0);
+        assert!(raft.take_events().is_empty());
     }
 
     #[test]
@@ -2526,6 +2736,33 @@ mod tests {
         );
 
         assert!(packets(&mut raft).is_empty());
+    }
+
+    #[test]
+    fn non_peer_responses_cannot_step_down_leader() {
+        let responses = [
+            RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
+                term: 9,
+                node_id: node("outsider"),
+                success: true,
+                last_log_index: 1,
+            }),
+            RaftRpc::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: 9,
+                node_id: node("outsider"),
+                last_included_index: 5,
+                next_byte_offset: 0,
+                success: true,
+            }),
+        ];
+
+        for response in responses {
+            let mut raft = three_node_raft_as_leader("node-1");
+            raft.handle_rpc(node("outsider"), response);
+
+            assert_eq!(raft.current_term(), 1);
+            assert_eq!(raft.consensus.role(), &Role::Leader);
+        }
     }
 
     // -------------------------------------------------------------------

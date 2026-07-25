@@ -159,11 +159,17 @@ impl ConsensusState {
 
     pub(crate) fn begin_campaign(&mut self, node_id: &NodeId) -> u64 {
         let term = self.log.begin_election(node_id);
-        self.transient.begin_campaign();
+        self.transient.begin_campaign(node_id);
         term
     }
-    pub(crate) fn record_vote(&mut self, term: u64, granted: bool, quorum: u32) -> bool {
-        term == self.current_term() && granted && self.transient.record_vote(quorum)
+    pub(crate) fn record_vote(
+        &mut self,
+        term: u64,
+        voter: NodeId,
+        granted: bool,
+        quorum: u32,
+    ) -> bool {
+        term == self.current_term() && granted && self.transient.record_vote(voter, quorum)
     }
     pub(crate) fn role(&self) -> &Role {
         &self.transient.role

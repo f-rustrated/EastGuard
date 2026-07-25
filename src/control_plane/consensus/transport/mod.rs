@@ -68,7 +68,9 @@ impl RaftTransportActor {
 mod tests {
     use super::*;
     use crate::control_plane::consensus::actor::MultiRaftActor;
-    use crate::control_plane::consensus::messages::{RaftRpc, RequestVote, WireRaftMessage};
+    use crate::control_plane::consensus::messages::{
+        MultiRaftActorCommand, RaftProtocolMessage, RaftRpc, RequestVote, WireRaftMessage,
+    };
     use crate::control_plane::membership::ShardGroupId;
     use crate::net::OwnedWriteHalf;
     use crate::net::TcpStream;
@@ -162,6 +164,62 @@ mod tests {
                 },
             )
             .await?;
+            Ok(())
+        });
+
+        sim.run()
+    }
+
+    #[test]
+    fn reader_binds_message_sender_to_connection_peer() -> turmoil::Result {
+        let mut sim = Builder::new()
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+
+        sim.host("server", || async {
+            let listener = TcpListener::bind("0.0.0.0:9000").await?;
+            let (stream, _) = listener.accept().await?;
+            let (read_half, _) = stream.into_split();
+            let mut reader = RaftRpcListener(read_half);
+            let peer = reader.read_node_id().await?;
+            let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
+
+            reader.run(raft_tx, peer.clone()).await;
+
+            let Some(MultiRaftActorCommand::ProtocolMessage(RaftProtocolMessage::InboundRaftRpc(
+                cmd,
+            ))) = raft_rx.recv().await
+            else {
+                panic!("expected one inbound Raft RPC")
+            };
+            assert_eq!(cmd.from, peer);
+            assert_eq!(cmd.shard_group_id, ShardGroupId(1));
+            assert!(raft_rx.try_recv().is_err());
+            Ok(())
+        });
+
+        sim.host("client", || async {
+            let addr = turmoil::lookup("server");
+            let stream = TcpStream::connect((addr, 9000)).await?;
+            let (_, mut writer) = stream.into_split();
+            write_frame(&mut writer, &NodeId::new("node-a")).await?;
+
+            for (group, sender) in [(1, "node-a"), (2, "node-b")] {
+                write_frame(
+                    &mut writer,
+                    &WireRaftMessage {
+                        shard_group_id: ShardGroupId(group),
+                        sender: NodeId::new(sender),
+                        rpc: RaftRpc::RequestVote(RequestVote {
+                            term: 1,
+                            candidate_id: NodeId::new(sender),
+                            last_log_index: 0,
+                            last_log_term: 0,
+                        }),
+                    },
+                )
+                .await?;
+            }
             Ok(())
         });
 

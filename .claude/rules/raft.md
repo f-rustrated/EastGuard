@@ -72,10 +72,12 @@ Relaxed compared to typical Raft — DS-RSM manages metadata (topic assignments,
 - `ElectionTimeout` ignored if node is Leader.
 - `HeartbeatTimeout` ignored if node is Follower or Candidate.
 
-The state machine first validates that the authenticated sender has the voter or
-learner role required by the RPC. Authorized RPCs may arrive while the local node
-is in any role (per Raft §5.1), but role-specific actions such as counting votes
-and tracking replication progress still guard internally.
+Every RPC must first match its connection identity. Election messages require a
+committed voter, while replication responses require a committed voter or staged
+learner. However, claimed-leader replication requests (`AppendEntries` and
+`InstallSnapshot`) do not check local membership—this allows lagging replicas to
+receive updates from new leaders and catch up. Raft term and log rules validate
+these requests instead.
 
 ## State Transitions
 
@@ -133,16 +135,20 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 9. **A learner never counts toward the commit quorum.** `learner_states` is replicated to like `peers` but excluded from `try_advance_commit_index`; and being outside `peers`, a learner is never sent `RequestVote` nor counted in an election either. This makes *"a membership addition can never reduce availability"* true by construction: staging a node that turns out unreachable (no instance, partitioned) leaves the group live on its real voters, and only a caught-up learner is promoted into the quorum. Prevents the phantom-voter freeze — where an added-but-non-participating member pushes the commit quorum out of the reach of the live members and stalls the group (the failure the coordinator-crash repair e2e exercises).
 
-10. **Installed snapshots become visible only after durable validation.** A follower buffers bounded transfer chunks without changing metadata, validates the completed size and checksum, persists the snapshot atomically, and only then replaces its application state and committed membership. An interrupted or corrupt transfer leaves the previous durable state visible.
+10. **Installed snapshots become visible only after durable validation.** A
+follower buffers bounded transfer chunks without changing metadata, validates
+the completed size and checksum, persists the snapshot atomically, and only then
+replaces its application state and committed voter set. An interrupted or corrupt
+transfer leaves the previous durable state visible.
 
 11. **A candidate counts each committed voter at most once per term.** Candidate
 vote state is a set of voter identities containing self; every other identity must
 belong to the committed peer set. Duplicate responses and responses from
 non-voters cannot manufacture a quorum.
 
-12. **RPC sender authorization precedes consensus mutation.** Vote and leader
-requests require a committed voter whose embedded identity matches the
-transport-authenticated sender. Replication and snapshot responses require a
-current voter or staged learner and the matching local role. An unauthorized RPC
-cannot advance term, reset timers, grant or count votes, recognize a leader,
-change the log, stage a snapshot, or update replication progress.
+12. **RPC identity and role authorization precede consensus mutation.** Every RPC
+must first match its connection identity. Election messages require a committed
+voter, while replication responses require a committed voter or staged learner.
+Claimed-leader replication requests skip local voter checks so out-of-date nodes
+can receive updates from new leaders—Raft term, log, and snapshot checks handle
+validation instead.

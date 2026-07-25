@@ -54,7 +54,7 @@ Periodic reconciliation repeats the comparison. This handles missed one-shot eve
 
 ---
 
-## Ring intent and committed membership can drift
+## Ring intent and committed voter set can drift
 
 The hash ring changes promptly as nodes join and die. A Raft group changes only through its own committed history. Temporary drift is expected:
 
