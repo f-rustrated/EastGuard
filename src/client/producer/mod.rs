@@ -137,15 +137,10 @@ impl Inner {
             return Err(self.flush_timeout());
         }
 
-        let routing = match tokio::time::timeout(
-            remaining,
-            self.client.resolve_topic_if_missing(&self.topic),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(self.flush_timeout()),
-        };
+        let routing =
+            tokio::time::timeout(remaining, self.client.resolve_topic_if_missing(&self.topic))
+                .await
+                .map_err(|_| self.flush_timeout())??;
 
         let session = self
             .session_manager
@@ -268,7 +263,7 @@ impl Inner {
             }
         };
         let digest = crc32fast::hash(&payload);
-        let result = match tokio::time::timeout(
+        let result = tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             self.client.produce_to_range(
                 &self.topic,
@@ -280,10 +275,7 @@ impl Inner {
             ),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(self.flush_timeout()),
-        };
+        .unwrap_or_else(|_| Err(self.flush_timeout()));
 
         match result {
             Ok(entry_id) => {
@@ -329,22 +321,19 @@ impl Inner {
             return Err(ClientError::ProducerClosed);
         }
 
-        let order = self.next_record_order.fetch_add(1, Ordering::Relaxed);
-        let routing = self.client.resolve_topic_if_missing(&self.topic).await?;
-        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
-
         let (tx, rx) = oneshot::channel();
 
         let pending = PendingRecord {
-            order,
+            order: self.next_record_order.fetch_add(1, Ordering::Relaxed),
             key: key.to_vec(),
             value,
             tx,
         };
 
-        let push_res = self.buffers.push(range_id, pending);
+        let routing = self.client.resolve_topic_if_missing(&self.topic).await?;
+        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
 
-        match push_res {
+        match self.buffers.push(range_id, pending) {
             PushResult::Flush(records_to_flush) => {
                 let flush = self.flush_gate.clone().read_owned().await;
                 self.flush_in_background(records_to_flush, flush);
