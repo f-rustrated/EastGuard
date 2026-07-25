@@ -105,50 +105,6 @@ struct Inner {
 }
 
 impl Inner {
-    async fn read_send_gate(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.send_gate.read().await
-    }
-
-    async fn read_owned_flush_gate(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.flush_gate.clone().read_owned().await
-    }
-
-    fn should_reject(&self) -> bool {
-        self.should_reject.load(Ordering::Acquire)
-    }
-
-    fn next_record_order(&self) -> u64 {
-        self.next_record_order.fetch_add(1, Ordering::Relaxed)
-    }
-
-    async fn resolve_topic_if_missing(&self) -> Result<Arc<TopicRouting>, ClientError> {
-        self.client.resolve_topic_if_missing(&self.topic).await
-    }
-
-    fn push_record(&self, range_id: RangeId, pending: PendingRecord) -> PushResult {
-        self.buffers.push(range_id, pending)
-    }
-
-    async fn produce_to_range(
-        &self,
-        range_id: RangeId,
-        first_key: &[u8],
-        payload: Vec<u8>,
-        record_count: u32,
-        append_identity: Option<crate::data_plane::ProducerAppendIdentity>,
-    ) -> Result<EntryId, ClientError> {
-        self.client
-            .produce_to_range(
-                &self.topic,
-                range_id,
-                first_key,
-                payload,
-                record_count,
-                append_identity,
-            )
-            .await
-    }
-
     fn invalidate_cache(&self) {
         self.client.cache.invalidate(&self.topic);
     }
@@ -181,7 +137,12 @@ impl Inner {
             return Err(self.flush_timeout());
         }
 
-        let routing = match tokio::time::timeout(remaining, self.resolve_topic_if_missing()).await {
+        let routing = match tokio::time::timeout(
+            remaining,
+            self.client.resolve_topic_if_missing(&self.topic),
+        )
+        .await
+        {
             Ok(result) => result?,
             Err(_) => return Err(self.flush_timeout()),
         };
@@ -309,7 +270,8 @@ impl Inner {
         let digest = crc32fast::hash(&payload);
         let result = match tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
-            self.produce_to_range(
+            self.client.produce_to_range(
+                &self.topic,
                 range_id,
                 &records[0].key,
                 payload,
@@ -353,15 +315,52 @@ impl Inner {
             let _flush = inner.flush_gate.write().await;
             inner.flush_buffers().await;
         });
-        // ! If the caller's timeout/cancellation fires, Tokio drops the flush() future—which "drops" handle.
-        // ! Dropping handle simply detaches the task, which is different than handle.abort();
-        // ! So, cancellation loses only the caller's knowledge of when the drain finished.
         let _ = handle.await;
     }
 
     async fn close(self: &Arc<Self>) {
         self.should_reject.store(true, Ordering::Release);
         self.flush().await;
+    }
+
+    async fn send(self: &Arc<Self>, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
+        let send_guard = self.send_gate.read().await;
+        if self.should_reject.load(Ordering::Acquire) {
+            return Err(ClientError::ProducerClosed);
+        }
+
+        let order = self.next_record_order.fetch_add(1, Ordering::Relaxed);
+        let routing = self.client.resolve_topic_if_missing(&self.topic).await?;
+        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
+
+        let (tx, rx) = oneshot::channel();
+
+        let pending = PendingRecord {
+            order,
+            key: key.to_vec(),
+            value,
+            tx,
+        };
+
+        let push_res = self.buffers.push(range_id, pending);
+
+        match push_res {
+            PushResult::Flush(records_to_flush) => {
+                let flush = self.flush_gate.clone().read_owned().await;
+                self.flush_in_background(records_to_flush, flush);
+            }
+            PushResult::SpawnLinger(linger, seq) => {
+                let inner = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(linger).await;
+                    inner.flush_range(range_id, seq).await;
+                });
+            }
+            PushResult::Buffered => {}
+        }
+        drop(send_guard);
+
+        rx.await.map_err(|_| ClientError::UnexpectedResponse)?
     }
 }
 
@@ -404,43 +403,7 @@ impl Producer {
     /// publication is shared work and may still complete; canceling only discards this
     /// caller's acknowledgement.
     pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
-        let send_guard = self.inner.read_send_gate().await;
-        if self.inner.should_reject() {
-            return Err(ClientError::ProducerClosed);
-        }
-
-        let order = self.inner.next_record_order();
-        let routing = self.inner.resolve_topic_if_missing().await?;
-        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
-
-        let (tx, rx) = oneshot::channel();
-
-        let pending = PendingRecord {
-            order,
-            key: key.to_vec(),
-            value,
-            tx,
-        };
-
-        let push_res = self.inner.push_record(range_id, pending);
-
-        match push_res {
-            PushResult::Flush(records_to_flush) => {
-                let flush = self.inner.read_owned_flush_gate().await;
-                self.inner.flush_in_background(records_to_flush, flush);
-            }
-            PushResult::SpawnLinger(linger, seq) => {
-                let inner = self.inner.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(linger).await;
-                    inner.flush_range(range_id, seq).await;
-                });
-            }
-            PushResult::Buffered => {}
-        }
-        drop(send_guard);
-
-        rx.await.map_err(|_| ClientError::UnexpectedResponse)?
+        self.inner.send(key, value).await
     }
 
     pub async fn flush(&self) {
