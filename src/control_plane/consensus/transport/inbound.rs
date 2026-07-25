@@ -29,14 +29,22 @@ impl RaftRpcListener {
         Ok(msg)
     }
 
-    pub(super) async fn run(mut self, tx: MutlRaftSender) {
+    pub(super) async fn run(mut self, tx: MutlRaftSender, peer: NodeId) {
         loop {
             match self.read_message().await {
                 Ok(msg) => {
+                    if msg.sender != peer {
+                        tracing::warn!(
+                            transport_peer = %peer,
+                            claimed_sender = %msg.sender,
+                            "rejected Raft message whose sender differs from the connection peer",
+                        );
+                        break;
+                    }
                     let _ = tx
                         .send(InboundRaftRpc {
                             shard_group_id: msg.shard_group_id,
-                            from: msg.sender,
+                            from: peer.clone(),
                             rpc: msg.rpc,
                         })
                         .await;

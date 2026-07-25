@@ -38,7 +38,7 @@ impl ElectionJitter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     Follower,
-    Candidate { votes_received: u32 },
+    Candidate { voters: HashSet<NodeId> },
     Leader,
 }
 
@@ -193,16 +193,18 @@ impl TransientState {
         }));
     }
 
-    pub(crate) fn begin_campaign(&mut self) {
-        self.role = Role::Candidate { votes_received: 1 };
+    pub(crate) fn begin_campaign(&mut self, node_id: &NodeId) {
+        self.role = Role::Candidate {
+            voters: HashSet::from([node_id.clone()]),
+        };
     }
 
-    pub(crate) fn record_vote(&mut self, quorum: u32) -> bool {
-        let Role::Candidate { votes_received } = &mut self.role else {
+    pub(crate) fn record_vote(&mut self, voter: NodeId, quorum: u32) -> bool {
+        let Role::Candidate { voters } = &mut self.role else {
             return false;
         };
-        *votes_received += 1;
-        *votes_received >= quorum
+        voters.insert(voter);
+        voters.len() as u32 >= quorum
     }
 
     pub(crate) fn reset_for_follower(&mut self) {

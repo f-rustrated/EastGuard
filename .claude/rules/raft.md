@@ -36,7 +36,7 @@ Raft (pure sync state machine, one per shard group)
 | Type | Description |
 |---|---|
 | `Raft` | Core state machine. Holds term, role, log, peers, commit_index, last_applied. |
-| `Role` | `Follower`, `Candidate { votes_received }`, `Leader` |
+| `Role` | `Follower`, `Candidate { voters }`, `Leader` |
 | `PeerState` | Leader-only. `next_index` (guess) and `match_index` (confirmed truth). |
 | `MemLog` | In-memory log store. 1-based indexing. |
 | `LogEntry` | `{ term, index, command }` |
@@ -72,7 +72,12 @@ Relaxed compared to typical Raft — DS-RSM manages metadata (topic assignments,
 - `ElectionTimeout` ignored if node is Leader.
 - `HeartbeatTimeout` ignored if node is Follower or Candidate.
 
-All `step()` handlers accept RPCs from any role (per Raft spec §5.1), but role-specific actions (counting votes, tracking peer state) guard internally.
+Every RPC must first match its connection identity. Election messages require a
+committed voter, while replication responses require a committed voter or staged
+learner. However, claimed-leader replication requests (`AppendEntries` and
+`InstallSnapshot`) do not check local membership—this allows lagging replicas to
+receive updates from new leaders and catch up. Raft term and log rules validate
+these requests instead.
 
 ## State Transitions
 
@@ -84,7 +89,7 @@ Follower ──[ElectionTimeout]──> Candidate ──[majority votes]──> 
 ```
 
 - **Follower → Candidate**: Election timeout fires. Increments term, votes for self, sends `RequestVote` to all peers.
-- **Candidate → Leader**: Receives majority votes. Initializes `peer_states`, cancels election timer, starts heartbeat timer, sends initial heartbeats.
+- **Candidate → Leader**: Receives votes from a unique majority of committed voters. Initializes `peer_states`, cancels election timer, starts heartbeat timer, sends initial heartbeats.
 - **Any → Follower**: Receives RPC with higher term. Resets term, clears `voted_for`, cancels timers, starts election timer.
 - **Candidate → Follower**: Receives `AppendEntries` with same term (another node already won).
 - **Single-node**: Candidate with no peers immediately becomes Leader.
@@ -114,7 +119,7 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 1. **Only the leader can propose.** `propose()` returns `Err(ProposeError::NotLeader)` if called on a follower or candidate. Followers may apply, never originate.
 
-2. **At most one leader per term.** Enforced by vote deduplication (`voted_for`) and the log-up-to-date check (§5.4.1). Two leaders in the same term would commit conflicting entries — Raft's primary safety violation.
+2. **At most one leader per term.** Enforced by `voted_for`, candidate-side voter-identity deduplication, and the log-up-to-date check (§5.4.1). Two leaders in the same term would commit conflicting entries — Raft's primary safety violation.
 
 3. **A leader commits only entries from its own term.** Entries from prior terms become committed implicitly when a current-term entry is committed (Figure 8). Direct commit of an old-term entry can be retroactively overwritten by a yet-older leader's truncation — a safety violation.
 
@@ -130,4 +135,20 @@ Converge to `next_index = match_index + 1` once peer caught up. Initial probing 
 
 9. **A learner never counts toward the commit quorum.** `learner_states` is replicated to like `peers` but excluded from `try_advance_commit_index`; and being outside `peers`, a learner is never sent `RequestVote` nor counted in an election either. This makes *"a membership addition can never reduce availability"* true by construction: staging a node that turns out unreachable (no instance, partitioned) leaves the group live on its real voters, and only a caught-up learner is promoted into the quorum. Prevents the phantom-voter freeze — where an added-but-non-participating member pushes the commit quorum out of the reach of the live members and stalls the group (the failure the coordinator-crash repair e2e exercises).
 
-10. **Installed snapshots become visible only after durable validation.** A follower buffers bounded transfer chunks without changing metadata, validates the completed size and checksum, persists the snapshot atomically, and only then replaces its application state and committed membership. An interrupted or corrupt transfer leaves the previous durable state visible.
+10. **Installed snapshots become visible only after durable validation.** A
+follower buffers bounded transfer chunks without changing metadata, validates
+the completed size and checksum, persists the snapshot atomically, and only then
+replaces its application state and committed voter set. An interrupted or corrupt
+transfer leaves the previous durable state visible.
+
+11. **A candidate counts each committed voter at most once per term.** Candidate
+vote state is a set of voter identities containing self; every other identity must
+belong to the committed peer set. Duplicate responses and responses from
+non-voters cannot manufacture a quorum.
+
+12. **RPC identity and role authorization precede consensus mutation.** Every RPC
+must first match its connection identity. Election messages require a committed
+voter, while replication responses require a committed voter or staged learner.
+Claimed-leader replication requests skip local voter checks so out-of-date nodes
+can receive updates from new leaders—Raft term, log, and snapshot checks handle
+validation instead.

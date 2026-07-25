@@ -2081,17 +2081,34 @@ mod tests {
 
     #[test]
     fn boundary_recovery_dropped_on_step_down() {
-        use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
+        use crate::control_plane::consensus::messages::{
+            AppendEntries, AppendEntriesResponse, RaftRpc,
+        };
         use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
 
         let (storage, _tmp) = temp_storage();
         let me = node("n1");
         let mut store =
             new_store_with_topology(me.clone(), storage, &[node("n1"), node("y"), node("z")]);
-        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone()]));
-        elect_leader(&mut store);
+        let peer = node("y");
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone(), peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
         store.flush();
         create_topic_via_store(&mut store, "t", vec![node("x"), node("y"), node("z")]);
+        {
+            let raft = store.groups.get_mut(&TEST_GROUP_ID).unwrap();
+            raft.handle_rpc(
+                peer.clone(),
+                AppendEntriesResponse {
+                    term: raft.current_term(),
+                    node_id: peer.clone(),
+                    success: true,
+                    last_log_index: raft.log_last_index(),
+                },
+            );
+            store.dirty.insert(TEST_GROUP_ID);
+        }
+        store.flush();
 
         let seg0 = SegmentKey::new(TopicId((TEST_GROUP_ID.0) << 32), RangeId(0), SegmentId(0));
         store.handle_node_death(node("x"));
@@ -2105,10 +2122,10 @@ mod tests {
         // recovery roll, and the leader-gated ring-check won't fire to prune it.
         store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
-            from: node("n2"),
+            from: peer.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
                 term: 99,
-                leader_id: node("n2"),
+                leader_id: peer,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: Box::new([]),
