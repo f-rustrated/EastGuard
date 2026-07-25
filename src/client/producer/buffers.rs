@@ -161,9 +161,9 @@ impl ProducerBuffers {
     }
 
     /// Take and clear all records from the buffer for a specific partition, if the task sequence matches the current batch.
-    pub fn take(&self, range_id: RangeId, task_batch_seq: u64) -> Option<Vec<PendingRecord>> {
+    pub fn take(&self, range_id: RangeId, batch_seq: u64) -> Option<Vec<PendingRecord>> {
         let mut buf = self.inner.get_mut(&range_id)?;
-        if buf.current_batch_seq != task_batch_seq {
+        if buf.current_batch_seq != batch_seq {
             return None;
         }
         if buf.records.is_empty() {

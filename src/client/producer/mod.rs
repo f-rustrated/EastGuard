@@ -99,7 +99,7 @@ struct Inner {
     codec: CompressionCodec,
     session_manager: ClientProducerSessionManager,
     send_gate: RwLock<()>,
-    flush_gate: Arc<RwLock<()>>,
+    flush_gate: RwLock<()>,
     should_reject: AtomicBool,
     next_record_order: AtomicU64,
 }
@@ -155,24 +155,28 @@ impl Inner {
 
     // ! Dedicated spawning is required because otherwise when the client cancels the operation,
     // ! It would accidantely cancel all other records in that shared batch.
-    fn flush_in_background(
-        self: &Arc<Self>,
-        records: Vec<PendingRecord>,
-        flush: tokio::sync::OwnedRwLockReadGuard<()>,
-    ) {
+    fn flush_in_background(self: &Arc<Self>, records: Vec<PendingRecord>) {
         let inner = self.clone();
         tokio::spawn(async move {
-            let _flush = flush;
+            let _flush = inner.flush_gate.read().await;
             inner.flush_records(records).await;
         });
     }
-
-    /// Flush the buffered records for a specific range if they exist.
-    async fn flush_range(self: &Arc<Self>, range_id: RangeId, task_batch_seq: u64) {
-        let _flush = self.flush_gate.read().await;
-        if let Some(records_to_flush) = self.buffers.take(range_id, task_batch_seq) {
-            self.flush_records(records_to_flush).await;
-        }
+    fn flush_range_in_background(
+        self: &Arc<Self>,
+        range_id: RangeId,
+        linger: std::time::Duration,
+        seq: u64,
+    ) {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(linger).await;
+            // Flush the buffered records for a specific range if they exist.
+            let _flush = inner.flush_gate.read().await;
+            if let Some(records_to_flush) = inner.buffers.take(range_id, seq) {
+                inner.flush_records(records_to_flush).await;
+            }
+        });
     }
 
     async fn flush_buffers(self: &Arc<Self>) {
@@ -335,15 +339,10 @@ impl Inner {
 
         match self.buffers.push(range_id, pending) {
             PushResult::Flush(records_to_flush) => {
-                let flush = self.flush_gate.clone().read_owned().await;
-                self.flush_in_background(records_to_flush, flush);
+                self.flush_in_background(records_to_flush);
             }
             PushResult::SpawnLinger(linger, seq) => {
-                let inner = self.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(linger).await;
-                    inner.flush_range(range_id, seq).await;
-                });
+                self.flush_range_in_background(range_id, linger, seq);
             }
             PushResult::Buffered => {}
         }
@@ -379,7 +378,7 @@ impl Producer {
                 codec: config.codec,
                 session_manager: ClientProducerSessionManager::new(producer_id),
                 send_gate: RwLock::new(()),
-                flush_gate: Arc::new(RwLock::new(())),
+                flush_gate: RwLock::new(()),
                 should_reject: AtomicBool::new(false),
                 next_record_order: AtomicU64::new(0),
             }),
