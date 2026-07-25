@@ -105,8 +105,263 @@ struct Inner {
 }
 
 impl Inner {
+    async fn read_send_gate(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.send_gate.read().await
+    }
+
+    async fn read_owned_flush_gate(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.flush_gate.clone().read_owned().await
+    }
+
+    fn should_reject(&self) -> bool {
+        self.should_reject.load(Ordering::Acquire)
+    }
+
+    fn next_record_order(&self) -> u64 {
+        self.next_record_order.fetch_add(1, Ordering::Relaxed)
+    }
+
     async fn resolve_topic_if_missing(&self) -> Result<Arc<TopicRouting>, ClientError> {
         self.client.resolve_topic_if_missing(&self.topic).await
+    }
+
+    fn push_record(&self, range_id: RangeId, pending: PendingRecord) -> PushResult {
+        self.buffers.push(range_id, pending)
+    }
+
+    async fn produce_to_range(
+        &self,
+        range_id: RangeId,
+        first_key: &[u8],
+        payload: Vec<u8>,
+        record_count: u32,
+        append_identity: Option<crate::data_plane::ProducerAppendIdentity>,
+    ) -> Result<EntryId, ClientError> {
+        self.client
+            .produce_to_range(
+                &self.topic,
+                range_id,
+                first_key,
+                payload,
+                record_count,
+                append_identity,
+            )
+            .await
+    }
+
+    fn invalidate_cache(&self) {
+        self.client.cache.invalidate(&self.topic);
+    }
+
+    fn retry_deadline(&self) -> std::time::Duration {
+        self.client.retry.deadline
+    }
+
+    fn initial_backoff(&self) -> std::time::Duration {
+        self.client.retry.initial_backoff
+    }
+
+    fn max_backoff(&self) -> std::time::Duration {
+        self.client.retry.max_backoff
+    }
+
+    fn flush_timeout(&self) -> ClientError {
+        ClientError::Timeout {
+            waited: self.client.retry.deadline,
+            last_error: Some("producer flush deadline elapsed".to_string()),
+        }
+    }
+
+    async fn resolve_routing_and_session(
+        &self,
+        deadline: Instant,
+    ) -> Result<(Arc<TopicRouting>, ClientProducerSession), ClientError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(self.flush_timeout());
+        }
+
+        let routing = match tokio::time::timeout(remaining, self.resolve_topic_if_missing()).await {
+            Ok(result) => result?,
+            Err(_) => return Err(self.flush_timeout()),
+        };
+
+        let session = self
+            .session_manager
+            .ensure(&self.client, &self.topic)
+            .await?;
+
+        self.session_manager
+            .observe_topology(session, routing.active_range_ids());
+
+        Ok((routing, session))
+    }
+
+    // ! Dedicated spawning is required because otherwise when the client cancels the operation,
+    // ! It would accidantely cancel all other records in that shared batch.
+    fn flush_in_background(
+        self: &Arc<Self>,
+        records: Vec<PendingRecord>,
+        flush: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _flush = flush;
+            inner.flush_records(records).await;
+        });
+    }
+
+    /// Flush the buffered records for a specific range if they exist.
+    async fn flush_range(self: &Arc<Self>, range_id: RangeId, task_batch_seq: u64) {
+        let _flush = self.flush_gate.read().await;
+        if let Some(records_to_flush) = self.buffers.take(range_id, task_batch_seq) {
+            self.flush_records(records_to_flush).await;
+        }
+    }
+
+    async fn flush_buffers(self: &Arc<Self>) {
+        let batches = self.buffers.take_all();
+        let futures = batches
+            .into_iter()
+            .map(|(_, records)| self.flush_records(records));
+        futures::future::join_all(futures).await;
+    }
+
+    /// Serialize, compress, and publish a batch of records.
+    async fn flush_records(self: &Arc<Self>, mut records_to_publish: Vec<PendingRecord>) {
+        records_to_publish.sort_unstable_by_key(|record| record.order);
+        let deadline = Instant::now() + self.retry_deadline();
+        let mut backoff = self.initial_backoff();
+
+        loop {
+            if records_to_publish.is_empty() {
+                return;
+            }
+
+            let (routing, session) = match self.resolve_routing_and_session(deadline).await {
+                Ok(res) => res,
+                Err(error) => {
+                    PendingRecord::complete_all(records_to_publish, Err(error));
+                    return;
+                }
+            };
+
+            let mut next_retry_records = Vec::new();
+            for (range_id, records) in Self::group_by_range(records_to_publish, &routing) {
+                if let Some(records) = self
+                    .publish_range_attempt(session, range_id, records, deadline)
+                    .await
+                {
+                    next_retry_records.extend(records);
+                }
+            }
+
+            if next_retry_records.is_empty() {
+                return;
+            }
+
+            let backoff_remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(backoff.min(backoff_remaining)).await;
+            backoff = (backoff * 2).min(self.max_backoff());
+            records_to_publish = next_retry_records;
+        }
+    }
+
+    fn group_by_range(
+        records: Vec<PendingRecord>,
+        routing: &TopicRouting,
+    ) -> BTreeMap<RangeId, Vec<PendingRecord>> {
+        let mut grouped: BTreeMap<RangeId, Vec<PendingRecord>> = BTreeMap::new();
+        for pending in records {
+            match routing.range_id(&pending.key) {
+                Some(range_id) => grouped.entry(range_id).or_default().push(pending),
+                None => {
+                    let _ = pending.tx.send(Err(ClientError::UnexpectedResponse));
+                }
+            }
+        }
+        grouped
+    }
+
+    /// Own one range batch for one network attempt.
+    ///
+    /// Returns the records only when the caller must retry them. Every other
+    /// outcome completes their senders before returning `None`.
+    async fn publish_range_attempt(
+        &self,
+        session: ClientProducerSession,
+        range_id: RangeId,
+        records: Vec<PendingRecord>,
+        deadline: Instant,
+    ) -> Option<Vec<PendingRecord>> {
+        let sequence = self.session_manager.sequence_for(session, range_id);
+        // Contiguous per-range sequences require serialization through durability.
+        let mut sequence = sequence.lock().await;
+
+        let payload = match self.codec.encode_payload(&records) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(?error, "failed to encode producer batch");
+                PendingRecord::complete_all(records, Err(ClientError::UnexpectedResponse));
+                return None;
+            }
+        };
+        let digest = crc32fast::hash(&payload);
+        let result = match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.produce_to_range(
+                range_id,
+                &records[0].key,
+                payload,
+                records.len() as u32,
+                Some(session.append_identity(*sequence, digest)),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.flush_timeout()),
+        };
+
+        match result {
+            Ok(entry_id) => {
+                *sequence += 1;
+                PendingRecord::complete_all(records, Ok(entry_id));
+                None
+            }
+            Err(ClientError::StaleRange) => {
+                self.invalidate_cache();
+                Some(records)
+            }
+            Err(ClientError::ProduceRejected(
+                ProduceError::SessionNotInstalled | ProduceError::RequestInFlight,
+            )) => Some(records),
+            Err(ClientError::ProduceRejected(ProduceError::SessionExpired)) => {
+                self.session_manager.mark_expired(session).await;
+                Some(records)
+            }
+            Err(error) => {
+                PendingRecord::complete_all(records, Err(error));
+                None
+            }
+        }
+    }
+    async fn flush(self: &Arc<Self>) {
+        let inner = self.clone();
+        let handle = tokio::spawn(async move {
+            let _exclusive = inner.send_gate.write().await;
+            let _flush = inner.flush_gate.write().await;
+            inner.flush_buffers().await;
+        });
+        // ! If the caller's timeout/cancellation fires, Tokio drops the flush() future—which "drops" handle.
+        // ! Dropping handle simply detaches the task, which is different than handle.abort();
+        // ! So, cancellation loses only the caller's knowledge of when the drain finished.
+        let _ = handle.await;
+    }
+
+    async fn close(self: &Arc<Self>) {
+        self.should_reject.store(true, Ordering::Release);
+        self.flush().await;
     }
 }
 
@@ -149,12 +404,12 @@ impl Producer {
     /// publication is shared work and may still complete; canceling only discards this
     /// caller's acknowledgement.
     pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
-        let send_guard = self.inner.send_gate.read().await;
-        if self.inner.should_reject.load(Ordering::Acquire) {
+        let send_guard = self.inner.read_send_gate().await;
+        if self.inner.should_reject() {
             return Err(ClientError::ProducerClosed);
         }
 
-        let order = self.inner.next_record_order.fetch_add(1, Ordering::Relaxed);
+        let order = self.inner.next_record_order();
         let routing = self.inner.resolve_topic_if_missing().await?;
         let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
 
@@ -167,18 +422,18 @@ impl Producer {
             tx,
         };
 
-        let push_res = self.inner.buffers.push(range_id, pending);
+        let push_res = self.inner.push_record(range_id, pending);
 
         match push_res {
             PushResult::Flush(records_to_flush) => {
-                let flush = self.inner.flush_gate.clone().read_owned().await;
-                self.flush_in_background(records_to_flush, flush);
+                let flush = self.inner.read_owned_flush_gate().await;
+                self.inner.flush_in_background(records_to_flush, flush);
             }
             PushResult::SpawnLinger(linger, seq) => {
-                let producer = self.clone();
+                let inner = self.inner.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(linger).await;
-                    producer.flush_range(range_id, seq).await;
+                    inner.flush_range(range_id, seq).await;
                 });
             }
             PushResult::Buffered => {}
@@ -188,39 +443,8 @@ impl Producer {
         rx.await.map_err(|_| ClientError::UnexpectedResponse)?
     }
 
-    // ! Dedicated spawning is required because otherwise when the client cancels the operation,
-    // ! It would accidantely cancel all other records in that shared batch.
-    fn flush_in_background(
-        &self,
-        records: Vec<PendingRecord>,
-        flush: tokio::sync::OwnedRwLockReadGuard<()>,
-    ) {
-        let producer = self.clone();
-        tokio::spawn(async move {
-            let _flush = flush;
-            producer.flush_records(records).await;
-        });
-    }
-
-    /// Flush the buffered records for a specific range if they exist.
-    async fn flush_range(&self, range_id: RangeId, task_batch_seq: u64) {
-        let _flush = self.inner.flush_gate.read().await;
-        if let Some(records_to_flush) = self.inner.buffers.take(range_id, task_batch_seq) {
-            self.flush_records(records_to_flush).await;
-        }
-    }
-
     pub async fn flush(&self) {
-        let producer = self.clone();
-        let handle = tokio::spawn(async move {
-            let _exclusive = producer.inner.send_gate.write().await;
-            let _flush = producer.inner.flush_gate.write().await;
-            producer.flush_buffers().await;
-        });
-        // ! If the caller's timeout/cancellation fires, Tokio drops the flush() future—which "drops" handle.
-        // ! Dropping handle simply detaches the task, which is different than handle.abort();
-        // ! So, cancellation loses only the caller's knowledge of when the drain finished.
-        let _ = handle.await;
+        self.inner.flush().await;
     }
 
     /// Close every clone and wait for accepted records to finish.
@@ -228,173 +452,7 @@ impl Producer {
     /// New sends fail with [`ClientError::ProducerClosed`]. Canceling this future keeps
     /// the producer closed, while the producer-owned drain continues in the background.
     pub async fn close(&self) {
-        self.inner.should_reject.store(true, Ordering::Release);
-        self.flush().await;
-    }
-
-    async fn flush_buffers(&self) {
-        let batches = self.inner.buffers.take_all();
-        let futures = batches
-            .into_iter()
-            .map(|(_, records)| self.flush_records(records));
-        futures::future::join_all(futures).await;
-    }
-
-    /// Serialize, compress, and publish a batch of records.
-    async fn flush_records(&self, mut records_to_publish: Vec<PendingRecord>) {
-        records_to_publish.sort_unstable_by_key(|record| record.order);
-        let deadline = Instant::now() + self.inner.client.retry.deadline;
-        let mut backoff = self.inner.client.retry.initial_backoff;
-
-        loop {
-            if records_to_publish.is_empty() {
-                return;
-            }
-
-            let routing = match self.resolve_routing(deadline).await {
-                Ok(routing) => routing,
-                Err(error) => {
-                    PendingRecord::complete_all(records_to_publish, Err(error));
-                    return;
-                }
-            };
-
-            let session = match self
-                .inner
-                .session_manager
-                .ensure(&self.inner.client, &self.inner.topic)
-                .await
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    PendingRecord::complete_all(records_to_publish, Err(error));
-                    return;
-                }
-            };
-
-            self.inner
-                .session_manager
-                .observe_topology(session, routing.active_range_ids());
-
-            let mut next_retry_records = Vec::new();
-            for (range_id, records) in Self::group_by_range(records_to_publish, &routing) {
-                if let Some(records) = self
-                    .publish_range_attempt(session, range_id, records, deadline)
-                    .await
-                {
-                    next_retry_records.extend(records);
-                }
-            }
-
-            if next_retry_records.is_empty() {
-                return;
-            }
-
-            let backoff_remaining = deadline.saturating_duration_since(Instant::now());
-            tokio::time::sleep(backoff.min(backoff_remaining)).await;
-            backoff = (backoff * 2).min(self.inner.client.retry.max_backoff);
-            records_to_publish = next_retry_records;
-        }
-    }
-
-    async fn resolve_routing(&self, deadline: Instant) -> Result<Arc<TopicRouting>, ClientError> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(self.flush_timeout());
-        }
-
-        match tokio::time::timeout(remaining, self.inner.resolve_topic_if_missing()).await {
-            Ok(result) => result,
-            Err(_) => Err(self.flush_timeout()),
-        }
-    }
-
-    fn group_by_range(
-        records: Vec<PendingRecord>,
-        routing: &TopicRouting,
-    ) -> BTreeMap<RangeId, Vec<PendingRecord>> {
-        let mut grouped: BTreeMap<RangeId, Vec<PendingRecord>> = BTreeMap::new();
-        for pending in records {
-            match routing.range_id(&pending.key) {
-                Some(range_id) => grouped.entry(range_id).or_default().push(pending),
-                None => {
-                    let _ = pending.tx.send(Err(ClientError::UnexpectedResponse));
-                }
-            }
-        }
-        grouped
-    }
-
-    /// Own one range batch for one network attempt.
-    ///
-    /// Returns the records only when the caller must retry them. Every other
-    /// outcome completes their senders before returning `None`.
-    async fn publish_range_attempt(
-        &self,
-        session: ClientProducerSession,
-        range_id: RangeId,
-        records: Vec<PendingRecord>,
-        deadline: Instant,
-    ) -> Option<Vec<PendingRecord>> {
-        let sequence = self.inner.session_manager.sequence_for(session, range_id);
-        // Contiguous per-range sequences require serialization through durability.
-        let mut sequence = sequence.lock().await;
-
-        let payload = match self.inner.codec.encode_payload(&records) {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::error!(?error, "failed to encode producer batch");
-                PendingRecord::complete_all(records, Err(ClientError::UnexpectedResponse));
-                return None;
-            }
-        };
-        let digest = crc32fast::hash(&payload);
-        let result = match tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            self.inner.client.produce_to_range(
-                &self.inner.topic,
-                range_id,
-                &records[0].key,
-                payload,
-                records.len() as u32,
-                Some(session.append_identity(*sequence, digest)),
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(self.flush_timeout()),
-        };
-
-        match result {
-            Ok(entry_id) => {
-                *sequence += 1;
-                PendingRecord::complete_all(records, Ok(entry_id));
-                None
-            }
-            Err(ClientError::StaleRange) => {
-                self.inner.client.cache.invalidate(&self.inner.topic);
-                Some(records)
-            }
-            Err(ClientError::ProduceRejected(
-                ProduceError::SessionNotInstalled | ProduceError::RequestInFlight,
-            )) => Some(records),
-            Err(ClientError::ProduceRejected(ProduceError::SessionExpired)) => {
-                self.inner.session_manager.mark_expired(session).await;
-                Some(records)
-            }
-            Err(error) => {
-                PendingRecord::complete_all(records, Err(error));
-                None
-            }
-        }
-    }
-
-    fn flush_timeout(&self) -> ClientError {
-        ClientError::Timeout {
-            waited: self.inner.client.retry.deadline,
-            last_error: Some("producer flush deadline elapsed".to_string()),
-        }
+        self.inner.close().await;
     }
 }
 
