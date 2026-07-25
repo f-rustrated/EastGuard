@@ -49,6 +49,7 @@ pub struct ConsumerGroup {
     consumer_id: Uuid,
     client: Arc<Client>,
     delivery_fenced: AtomicBool,
+    quit: AtomicBool,
     generation: AtomicU64,
     commit_lock: tokio::sync::Mutex<()>,
 }
@@ -69,6 +70,7 @@ impl ConsumerGroup {
             owned_ranges: ArcSwap::from_pointee(HashSet::new()),
             offsets: DashMap::new(),
             delivery_fenced: AtomicBool::new(true),
+            quit: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
         };
@@ -202,12 +204,39 @@ impl ConsumerGroup {
             .response
         {
             ClientResponse::Ok(ClientSuccess::ConsumerGroupAssignment(assignment)) => assignment,
-            _ => return Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => return Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => {
+                return Err(ClientError::UnexpectedResponse);
+            }
         };
 
         self.generation
             .store(*assignment.generation, AtomicOrdering::Release);
         Ok(assignment.ranges.into_vec().into_iter().collect())
+    }
+
+    pub(crate) async fn leave(&self) -> Result<(), ClientError> {
+        if self.quit.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
+        let request = SyncConsumerGroupRequest {
+            topic_name: self.topic.clone(),
+            group_id: self.group_id.clone(),
+            member_id: self.consumer_id,
+            action: ConsumerGroupSyncAction::Leave,
+        };
+        let served = self
+            .client
+            .call(self.client.next_known_node(), request)
+            .await?;
+        match served.response {
+            ClientResponse::Ok(ClientSuccess::ConsumerGroupLeft) => {
+                self.quit.store(true, AtomicOrdering::Release);
+                Ok(())
+            }
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     pub(crate) fn install_effective_ownership(&self, ranges: HashSet<RangeId>) -> Box<[RangeId]> {
@@ -261,6 +290,9 @@ impl ConsumerGroup {
 
 impl Drop for ConsumerGroup {
     fn drop(&mut self) {
+        if self.quit.load(AtomicOrdering::Acquire) {
+            return;
+        }
         let client = self.client.clone();
         let req = SyncConsumerGroupRequest {
             topic_name: self.topic.clone(),

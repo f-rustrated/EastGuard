@@ -5,6 +5,14 @@
 //! that keeps the cache honest. The server never proxies — it redirects, and this
 //! library follows. Producer (C2) and consumer (C3) layer on top of this core.
 //!
+//! # Cancellation
+//!
+//! Canceling a future stops waiting locally; it does not retract a request already
+//! written to a server. Mutating operations may therefore complete after their future
+//! is dropped. Producer batching has a stronger contract documented on
+//! [`Producer::send`]. Use [`Producer::close`] and [`Consumer::close`] for explicit
+//! graceful shutdown; dropping a handle performs only best-effort cleanup.
+//!
 //! `#![allow(dead_code)]` — C1 is the foundation; its tests and the later C2/C3 phases
 //! are the first non-test consumers (mirrors `consumer`).
 
@@ -38,7 +46,7 @@ pub use consumer::{
     CommitMode, Consumer, ConsumerConfig, ConsumerRecord, DeliverySemantic, KeyInterest,
     StartPolicy,
 };
-pub use error::ClientError;
+pub use error::{ClientError, InvalidConfiguration};
 use pool::ConnectionPool;
 pub use producer::{BufferConfig, Producer, ProducerConfig};
 use uuid::Uuid;
@@ -86,6 +94,7 @@ impl Client {
         if seeds.is_empty() {
             return Err(ClientError::NoSeeds);
         }
+        retry.validate()?;
         Ok(Self {
             pool: ConnectionPool::new(),
             cache: RoutingCache::new(),
@@ -161,7 +170,10 @@ impl Client {
                 ClientResponse::Err(ServerError::SegmentNotLocal) => {
                     last_error = Some("range offsets segment not local".to_string());
                 }
-                _ => return Err(ClientError::UnexpectedResponse),
+                ClientResponse::Err(error) => return Err(ClientError::Server(error)),
+                ClientResponse::Ok(_) | ClientResponse::Stop => {
+                    return Err(ClientError::UnexpectedResponse);
+                }
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -196,7 +208,8 @@ impl Client {
                     sealed_generation: stale,
                 })
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -239,7 +252,10 @@ impl Client {
                             sealed_generation: mismatch.observed_generation,
                         })
                     }
-                    _ => Err(ClientError::UnexpectedResponse),
+                    ClientResponse::Err(error) => Err(ClientError::Server(error)),
+                    ClientResponse::Ok(_) | ClientResponse::Stop => {
+                        Err(ClientError::UnexpectedResponse)
+                    }
                 }
             }
         });
@@ -261,7 +277,8 @@ impl Client {
         match served.response {
             ClientResponse::Ok(ClientSuccess::TopicCreated) => Ok(true),
             ClientResponse::Err(ServerError::AlreadyExists) => Ok(false),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -275,7 +292,8 @@ impl Client {
         self.cache.invalidate(name);
         match served.response {
             ClientResponse::Ok(ClientSuccess::TopicDeleted) => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -303,10 +321,8 @@ impl Client {
                 self.cache.insert(&detail);
                 Ok(detail)
             }
-            err => {
-                tracing::error!("{err:?}{}{}", file!(), line!());
-                Err(ClientError::UnexpectedResponse)
-            }
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -319,7 +335,8 @@ impl Client {
             .await?;
         match served.response {
             ClientResponse::Ok(ClientSuccess::ProducerSessionOpened(session)) => Ok(session),
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -371,7 +388,8 @@ impl Client {
             ClientResponse::Err(ServerError::ProduceRejected(error)) => {
                 Err(ClientError::ProduceRejected(error))
             }
-            _ => Err(ClientError::UnexpectedResponse),
+            ClientResponse::Err(error) => Err(ClientError::Server(error)),
+            ClientResponse::Ok(_) | ClientResponse::Stop => Err(ClientError::UnexpectedResponse),
         }
     }
 

@@ -107,6 +107,21 @@ cannot race their local committed markers.
 
 ---
 
+## Explicit Shutdown
+
+Closing a consumer does the following:
+- stops fetching
+- commits currently acknowledged progress 
+- revokes ownership 
+- leaves the group 
+
+Records already fetched into the local delivery queue but not yet returned to the application are discarded: after ownership is revoked, they are no longer valid deliveries from that consumer. In at-least-once mode, unacknowledged records therefore remain beyond the durable checkpoint and replay to a later group member.
+
+Consumer handles share one manager and one delivery stream. Closing any handle closes that
+shared stream, so every clone subsequently observes end of delivery.
+
+---
+
 ## Acknowledgement Validation
 
 An acknowledgement is accepted only when:

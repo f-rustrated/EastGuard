@@ -488,7 +488,8 @@ fn producer_compression_lz4_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Lz4,
             },
-        );
+        )
+        .unwrap();
 
         // Send 2 records concurrently so they get batched and compressed
         let (res1, res2) = tokio::join!(
@@ -584,7 +585,8 @@ fn producer_compression_zstd_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Zstd,
             },
-        );
+        )
+        .unwrap();
 
         // Send 2 records concurrently so they get batched and compressed
         let (res1, res2) = tokio::join!(
@@ -667,18 +669,21 @@ fn producer_concurrency_stress() -> turmoil::Result {
         // Warm the cache
         client.resolve_topic("prod-stress").await.expect("resolve");
 
-        let producer = Arc::new(Producer::new(
-            client.clone(),
-            "prod-stress".to_string(),
-            ProducerConfig {
-                buffer: BufferConfig {
-                    linger: Duration::from_millis(30),
-                    max_batch_bytes: 1024 * 1024,
-                    max_batch_records: 100,
+        let producer = Arc::new(
+            Producer::new(
+                client.clone(),
+                "prod-stress".to_string(),
+                ProducerConfig {
+                    buffer: BufferConfig {
+                        linger: Duration::from_millis(30),
+                        max_batch_bytes: 1024 * 1024,
+                        max_batch_records: 100,
+                    },
+                    codec: CompressionCodec::None,
                 },
-                codec: CompressionCodec::None,
-            },
-        ));
+            )
+            .unwrap(),
+        );
 
         const TASKS: usize = 50;
         const RECORDS_PER_TASK: usize = 10;
@@ -778,7 +783,8 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1) Send Record 1 -> spawns Linger 1 (100ms)
         let f1 = producer.send(b"key-1", b"val-1".to_vec());
@@ -837,6 +843,132 @@ fn producer_overlapping_linger_scenario() -> turmoil::Result {
     sim.run()
 }
 
+/// Exercises batch cancellation semantics:
+/// Canceling the threshold `send()` caller after the batch is buffered must not abort
+/// surviving senders sharing the batch.
+#[test]
+#[serial_test::serial]
+fn producer_shared_batch_cancellation_does_not_abort_surviving_senders() -> turmoil::Result {
+    let mut sim = build_sim(91);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("batch-cancel", policy())
+            .await
+            .expect("create topic");
+
+        client
+            .resolve_topic("batch-cancel")
+            .await
+            .expect("resolve");
+
+        let producer = Producer::new(
+            client.clone(),
+            "batch-cancel".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_millis(500),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 2,
+                },
+                codec: CompressionCodec::None,
+            },
+        )
+        .unwrap();
+
+        // 1) Submit first record (survivor) -> sits in buffer (records = 1).
+        let first = {
+            let producer = producer.clone();
+            tokio::spawn(async move {
+                producer
+                    .send(b"cancel-key", b"survivor".to_vec())
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // 2) Submit threshold record (trigger) -> reaches max_batch_records: 2 -> triggers PushResult::Flush.
+        let mut trigger = Box::pin(producer.send(b"cancel-key", b"canceled-caller".to_vec()));
+        tokio::select! {
+            biased;
+            result = &mut trigger => panic!("threshold send completed before cancellation: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        // 3) Cancel the threshold sender by dropping its future.
+        drop(trigger);
+
+        // 4) Assert that the surviving sender in the shared batch completes successfully.
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("surviving sender completes")
+            .expect("surviving sender task")
+            .expect("shared batch completes");
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
+#[test]
+#[serial_test::serial]
+fn producer_close_drains_buffered_sends_and_fences_clones() -> turmoil::Result {
+    let mut sim = build_sim(60);
+    host_cluster(&mut sim, &NODES, sim_cluster);
+
+    sim.client("test-client", async {
+        let client = Arc::new(Client::connect(client_seeds()).expect("client connects"));
+        client
+            .create_topic("producer-close", policy())
+            .await
+            .expect("create topic");
+        client
+            .resolve_topic("producer-close")
+            .await
+            .expect("warm routing");
+
+        let producer = Producer::new(
+            client,
+            "producer-close".to_string(),
+            ProducerConfig {
+                buffer: BufferConfig {
+                    linger: Duration::from_secs(30),
+                    max_batch_bytes: 1024 * 1024,
+                    max_batch_records: 1000,
+                },
+                codec: CompressionCodec::None,
+            },
+        )
+        .unwrap();
+
+        let sending = {
+            let producer = producer.clone();
+            tokio::spawn(async move { producer.send(b"key", b"value".to_vec()).await })
+        };
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(5), producer.close())
+            .await
+            .expect("close drains without waiting for linger");
+        sending
+            .await
+            .expect("sender task")
+            .expect("buffered send is acknowledged");
+
+        assert!(matches!(
+            producer.send(b"later", b"rejected".to_vec()).await,
+            Err(ClientError::ProducerClosed)
+        ));
+
+        Ok(())
+    });
+
+    sim.run()
+}
+
 /// E2E Consumer Test 1: Basic Consume.
 /// Produce 5 records, consume them with StartPolicy::Earliest and KeyInterest::AllKeys,
 /// and assert exact ordered delivery.
@@ -880,7 +1012,8 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         for i in 0..5 {
             let key = format!("key-{}", i);
@@ -960,6 +1093,28 @@ fn consumer_basic_consume_earliest() -> turmoil::Result {
             "Latest consumer should not receive historical records"
         );
 
+        consumer.close().await.expect("close earliest consumer");
+        consumer_latest
+            .close()
+            .await
+            .expect("close latest consumer");
+        assert!(
+            consumer
+                .next_record()
+                .await
+                .expect("closed consumer")
+                .is_none(),
+            "close terminates the earliest consumer stream"
+        );
+        assert!(
+            consumer_latest
+                .next_record()
+                .await
+                .expect("closed latest consumer")
+                .is_none(),
+            "close terminates the latest consumer stream"
+        );
+
         Ok(())
     });
 
@@ -988,7 +1143,8 @@ fn producer_resumes_cleanly_after_session_lease_expiration() -> turmoil::Result 
             client.clone(),
             "session-expire-test".into(),
             ProducerConfig::default(),
-        );
+        )
+        .unwrap();
 
         // 1. Send initial record
         let entry1 = producer
@@ -1058,7 +1214,8 @@ fn consumer_latest_starts_at_end_of_active_segment() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // Produce 5 records into the active segment (no roll)
         for i in 0..5 {
@@ -1147,7 +1304,8 @@ fn consumer_key_filtering_multi_range() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         for i in 0..3 {
             producer
@@ -1250,7 +1408,8 @@ fn consumer_range_split_consume() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1. Produce 3 records to parent range, waiting for segment rolls in between
         for i in 0..3 {
@@ -1362,7 +1521,8 @@ fn consumer_retention_recovery() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // 1. Produce record 1 (goes to segment 0, entry 0)
         producer
@@ -1451,7 +1611,8 @@ fn consumer_prefetch_sealed_segments() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         // Produce 3 records across 3 different segments by rolling them
         producer
@@ -1540,7 +1701,8 @@ fn consumer_pause_seek_resume_live_range() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         let (rec0, rec1, rec2) = tokio::join!(
             producer.send(b"k", b"rec-0".to_vec()),
@@ -1633,7 +1795,8 @@ fn consumer_seek_resume_after_sealed_segment_reassignment() -> turmoil::Result {
                 },
                 codec: CompressionCodec::None,
             },
-        );
+        )
+        .unwrap();
 
         let record = |idx: usize| {
             let mut value = format!("sealed-rec-{idx}").into_bytes();
@@ -1763,7 +1926,8 @@ fn consumer_linger_batching_end_to_end() -> turmoil::Result {
                 },
                 codec: CompressionCodec::Lz4,
             },
-        );
+        )
+        .unwrap();
 
         // Send 3 records concurrently so they get batched together as Entry 0
         let (res1, res2, res3) = tokio::join!(
@@ -1981,18 +2145,21 @@ fn producer_split_fence_retry() -> turmoil::Result {
             .expect("resolve topic initial");
         assert_eq!(detail_initial.ranges.len(), 1, "Must start with 1 range");
 
-        let producer = Arc::new(Producer::new(
-            client1.clone(),
-            topic.to_string(),
-            ProducerConfig {
-                buffer: BufferConfig {
-                    linger: Duration::from_secs(60),
-                    max_batch_bytes: 1024 * 1024,
-                    max_batch_records: 1000,
+        let producer = Arc::new(
+            Producer::new(
+                client1.clone(),
+                topic.to_string(),
+                ProducerConfig {
+                    buffer: BufferConfig {
+                        linger: Duration::from_secs(60),
+                        max_batch_bytes: 1024 * 1024,
+                        max_batch_records: 1000,
+                    },
+                    codec: CompressionCodec::None,
                 },
-                codec: CompressionCodec::None,
-            },
-        ));
+            )
+            .unwrap(),
+        );
 
         // Both keys enter the parent batch before the range splits.
         let left = {

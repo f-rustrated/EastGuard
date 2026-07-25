@@ -2,13 +2,26 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::client::RangeId;
+use crate::connections::protocol::ServerError;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::data_plane::ProduceError;
+
+/// A client configuration value that cannot produce a coherent runtime policy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid client configuration `{field}`: {reason}")]
+pub struct InvalidConfiguration {
+    pub field: &'static str,
+    pub reason: &'static str,
+}
 
 /// Errors a caller decides on. Redirect-following, reconnect, and retry-within-deadline
 /// are handled internally.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
+    #[error(transparent)]
+    InvalidConfiguration(InvalidConfiguration),
+
     /// Could not reach `addr`. Internal to the pool — the retry loop catches it and
     /// re-resolves; a persistent failure surfaces as `Timeout`, not this.
     #[error("connection to {addr} unavailable: {reason}")]
@@ -35,9 +48,18 @@ pub enum ClientError {
     #[error("unexpected response for request")]
     UnexpectedResponse,
 
+    #[error(transparent)]
+    Server(ServerError),
+
     /// Expected range has split or metadata is stale.
     #[error("stale range routing")]
     StaleRange,
+
+    #[error("producer is closed")]
+    ProducerClosed,
+
+    #[error("consumer is closed")]
+    ConsumerClosed,
 
     #[error("produce rejected: {0}")]
     ProduceRejected(ProduceError),
@@ -66,6 +88,10 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    pub(crate) fn invalid_configuration(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidConfiguration(InvalidConfiguration { field, reason })
+    }
+
     pub(crate) fn on_ack(range_id: RangeId, reason: &'static str) -> Self {
         Self::on_control("ack", range_id, reason)
     }

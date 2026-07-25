@@ -7,110 +7,180 @@ use crate::client::routing::TopicRouting;
 use crate::client::{Client, CompressionCodec};
 use crate::control_plane::metadata::{EntryId, RangeId};
 use crate::data_plane::ProduceError;
-use crate::impl_new_struct_wrapper;
 use buffers::{PendingRecord, ProducerBuffers, PushResult};
 pub use config::{BufferConfig, ProducerConfig};
 use session::{ClientProducerSession, ClientProducerSessionManager};
-
 use std::collections::BTreeMap;
-use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{RwLock, oneshot};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 /// A thread-safe, internally synchronized producer for a single topic.
 /// Cheap to clone and share across tasks.
+///
+/// Every clone refers to the same buffers and shutdown state. Closing any clone
+/// closes the producer for all clones.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use east_guard::client::{Client, Producer, ProducerConfig};
+/// use std::{net::SocketAddr, sync::Arc};
+///
+/// let seed: SocketAddr = "127.0.0.1:9091".parse()?;
+/// let client = Arc::new(Client::connect([seed])?);
+/// let producer = Producer::new(client, "orders".to_string(), ProducerConfig::default())?;
+///
+/// let sender = producer.clone();
+/// let sent = tokio::spawn(async move {
+///     sender.send(b"customer-42", b"created".to_vec()).await
+/// });
+/// let committed_entry = sent.await??;
+///
+/// producer.close().await;
+/// # let _ = committed_entry;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
-pub struct Producer(Arc<Inner>);
+pub struct Producer {
+    inner: Arc<Inner>,
+}
 
-impl_new_struct_wrapper!(Producer, Arc<Inner>);
-
-pub struct Inner {
+/// # Synchronization & Deadlock Prevention Model
+///
+/// The producer relies on two distinct `RwLock` gates to coordinate async application
+/// callers, background linger tasks, and explicit `flush()` / `close()` barriers:
+///
+/// 1. **[`send_gate`] (Application Invocation Barrier)**:
+///    - Every [`send()`] call holds [`send_gate`].read() across its entire execution
+///      (routing, pushing to buffer, and awaiting `oneshot` completion).
+///    - [`flush()`] and [`close()`] acquire [`send_gate`].write() to wait for all pre-existing
+///      `send()` callers to finish before returning.
+///
+/// 2. **[`flush_gate`] (Batch Ownership & Network Publication Barrier)**:
+///    - Any task publishing a batch over the network (immediate push or background linger task)
+///      holds [`flush_gate`].read() during payload encoding and broker RPCs.
+///    - [`flush()`] and [`close()`] acquire `flush_gate.write() after draining buffers to guarantee
+///      [`flush()`] does not return while a background linger task is still in-flight.
+///
+/// ### Why [`send_gate`]
+/// Imagine if [`flush()`] simply drained ProducerBuffers without a send gate:
+///
+/// ```text
+///     Task A (send caller)                      Task B (flush caller)
+///  --------------------                      ---------------------
+///  1. Calls producer.send(k, v)
+///  2. Awaits resolve_topic...
+///     (Record is NOT in buffer yet!)
+///                                            3. Calls producer.flush()
+///                                            4. Drains ProducerBuffers (finds 0 records)
+///                                            5. flush() RETURNS OK!
+///  6. Pushes record into buffer!
+/// ```
+///
+/// The **Bug**: Task B’s flush().await returned, assuring the application that all previously initiated records were flushed—when in reality, Task A’s record was still
+/// sitting in memory un-flushed.
+/// [`send_gate`]'s read guard allow concurrent send execution while by the time flush is really made it forces write lock acqusition for serialization.
+///
+///
+/// [`send_gate`]: Inner::send_gate
+/// [`flush_gate`]: Inner::flush_gate
+/// [`send()`]: Producer::send
+/// [`flush()`]: Producer::flush
+/// [`close()`]: Producer::close
+struct Inner {
     client: Arc<Client>,
     topic: String,
     buffers: ProducerBuffers,
     codec: CompressionCodec,
     session_manager: ClientProducerSessionManager,
-    next_record_order: std::sync::atomic::AtomicU64,
+    send_gate: RwLock<()>,
+    flush_gate: RwLock<()>,
+    should_reject: AtomicBool,
+    next_record_order: AtomicU64,
 }
 
-impl Producer {
-    /// Create a new producer for the specified topic.
-    pub fn new(client: Arc<Client>, topic: String, config: ProducerConfig) -> Self {
-        // Generate a globally unique UUID for the producer session ID (idempotency seam)
-        let producer_id = Uuid::new_v4();
-
-        Self::new_with_producer_id(client, topic, config, producer_id)
-    }
-    pub fn new_with_producer_id(
-        client: Arc<Client>,
-        topic: String,
-        config: ProducerConfig,
-        producer_id: Uuid,
-    ) -> Self {
-        Self(Arc::new(Inner {
-            client,
-            topic,
-            buffers: ProducerBuffers::new(config.buffer.clone()),
-            codec: config.codec,
-            session_manager: ClientProducerSessionManager::new(producer_id),
-            next_record_order: std::sync::atomic::AtomicU64::new(0),
-        }))
+impl Inner {
+    fn invalidate_cache(&self) {
+        self.client.cache.invalidate(&self.topic);
     }
 
-    /// Produce a single record. Returns the committed entry ID once the batch flushes.
-    pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
-        let order = self
-            .next_record_order
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let topic = &self.topic;
-        let client = &self.client;
-
-        let routing = client.resolve_topic_if_missing(topic).await?;
-        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
-
-        let (tx, rx) = oneshot::channel();
-
-        let pending = PendingRecord {
-            order,
-            key: key.to_vec(),
-            value,
-            tx,
-        };
-
-        let push_res = self.buffers.push(range_id, pending);
-
-        match push_res {
-            PushResult::Flush(records_to_flush) => {
-                self.flush_records(records_to_flush).await;
-            }
-            PushResult::SpawnLinger(linger, seq) => {
-                let producer = self.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(linger).await;
-                    producer.flush_range(range_id, seq).await;
-                });
-            }
-            PushResult::Buffered => {}
-        }
-
-        rx.await.map_err(|_| ClientError::UnexpectedResponse)?
+    fn retry_deadline(&self) -> std::time::Duration {
+        self.client.retry.deadline
     }
 
-    /// Flush the buffered records for a specific range if they exist.
-    async fn flush_range(&self, range_id: RangeId, task_batch_seq: u64) {
-        if let Some(records_to_flush) = self.buffers.take(range_id, task_batch_seq) {
-            self.flush_records(records_to_flush).await;
+    fn initial_backoff(&self) -> std::time::Duration {
+        self.client.retry.initial_backoff
+    }
+
+    fn max_backoff(&self) -> std::time::Duration {
+        self.client.retry.max_backoff
+    }
+
+    fn flush_timeout(&self) -> ClientError {
+        ClientError::Timeout {
+            waited: self.client.retry.deadline,
+            last_error: Some("producer flush deadline elapsed".to_string()),
         }
     }
 
-    /// Flush all currently buffered records across all partitions and wait for their completion.
-    pub async fn flush(&self) {
+    async fn resolve_routing_and_session(
+        &self,
+        deadline: Instant,
+    ) -> Result<(Arc<TopicRouting>, ClientProducerSession), ClientError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(self.flush_timeout());
+        }
+
+        let routing =
+            tokio::time::timeout(remaining, self.client.resolve_topic_if_missing(&self.topic))
+                .await
+                .map_err(|_| self.flush_timeout())??;
+
+        let session = self
+            .session_manager
+            .ensure(&self.client, &self.topic)
+            .await?;
+
+        self.session_manager
+            .observe_topology(session, routing.active_range_ids());
+
+        Ok((routing, session))
+    }
+
+    // ! Dedicated spawning is required because otherwise when the client cancels the operation,
+    // ! It would accidantely cancel all other records in that shared batch.
+    fn flush_in_background(self: &Arc<Self>, records: Vec<PendingRecord>) {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _flush = inner.flush_gate.read().await;
+            inner.flush_records(records).await;
+        });
+    }
+    fn flush_range_in_background(
+        self: &Arc<Self>,
+        range_id: RangeId,
+        linger: std::time::Duration,
+        seq: u64,
+    ) {
+        let inner = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(linger).await;
+            // Flush the buffered records for a specific range if they exist.
+            let _flush = inner.flush_gate.read().await;
+            if let Some(records_to_flush) = inner.buffers.take(range_id, seq) {
+                inner.flush_records(records_to_flush).await;
+            }
+        });
+    }
+
+    async fn flush_buffers(self: &Arc<Self>) {
         let batches = self.buffers.take_all();
-        if batches.is_empty() {
-            return;
-        }
         let futures = batches
             .into_iter()
             .map(|(_, records)| self.flush_records(records));
@@ -118,34 +188,23 @@ impl Producer {
     }
 
     /// Serialize, compress, and publish a batch of records.
-    async fn flush_records(&self, mut records_to_publish: Vec<PendingRecord>) {
+    async fn flush_records(self: &Arc<Self>, mut records_to_publish: Vec<PendingRecord>) {
         records_to_publish.sort_unstable_by_key(|record| record.order);
-        let deadline = Instant::now() + self.client.retry.deadline;
-        let mut backoff = self.client.retry.initial_backoff;
+        let deadline = Instant::now() + self.retry_deadline();
+        let mut backoff = self.initial_backoff();
 
         loop {
             if records_to_publish.is_empty() {
                 return;
             }
 
-            let routing = match self.resolve_routing(deadline).await {
-                Ok(routing) => routing,
+            let (routing, session) = match self.resolve_routing_and_session(deadline).await {
+                Ok(res) => res,
                 Err(error) => {
                     PendingRecord::complete_all(records_to_publish, Err(error));
                     return;
                 }
             };
-
-            let session = match self.session_manager.ensure(&self.client, &self.topic).await {
-                Ok(session) => session,
-                Err(error) => {
-                    PendingRecord::complete_all(records_to_publish, Err(error));
-                    return;
-                }
-            };
-
-            self.session_manager
-                .observe_topology(session, routing.active_range_ids());
 
             let mut next_retry_records = Vec::new();
             for (range_id, records) in Self::group_by_range(records_to_publish, &routing) {
@@ -163,22 +222,8 @@ impl Producer {
 
             let backoff_remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(backoff.min(backoff_remaining)).await;
-            backoff = (backoff * 2).min(self.client.retry.max_backoff);
+            backoff = (backoff * 2).min(self.max_backoff());
             records_to_publish = next_retry_records;
-        }
-    }
-
-    async fn resolve_routing(&self, deadline: Instant) -> Result<Arc<TopicRouting>, ClientError> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(self.flush_timeout());
-        }
-
-        match tokio::time::timeout(remaining, self.client.resolve_topic_if_missing(&self.topic))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(self.flush_timeout()),
         }
     }
 
@@ -222,7 +267,7 @@ impl Producer {
             }
         };
         let digest = crc32fast::hash(&payload);
-        let result = match tokio::time::timeout(
+        let result = tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
             self.client.produce_to_range(
                 &self.topic,
@@ -234,10 +279,7 @@ impl Producer {
             ),
         )
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(self.flush_timeout()),
-        };
+        .unwrap_or_else(|_| Err(self.flush_timeout()));
 
         match result {
             Ok(entry_id) => {
@@ -246,7 +288,7 @@ impl Producer {
                 None
             }
             Err(ClientError::StaleRange) => {
-                self.client.cache.invalidate(&self.topic);
+                self.invalidate_cache();
                 Some(records)
             }
             Err(ClientError::ProduceRejected(
@@ -262,11 +304,128 @@ impl Producer {
             }
         }
     }
+    async fn flush(self: &Arc<Self>) {
+        let inner = self.clone();
+        let handle = tokio::spawn(async move {
+            let _exclusive = inner.send_gate.write().await;
+            let _flush = inner.flush_gate.write().await;
+            inner.flush_buffers().await;
+        });
+        let _ = handle.await;
+    }
 
-    fn flush_timeout(&self) -> ClientError {
-        ClientError::Timeout {
-            waited: self.client.retry.deadline,
-            last_error: Some("producer flush deadline elapsed".to_string()),
+    async fn close(self: &Arc<Self>) {
+        self.should_reject.store(true, Ordering::Release);
+        self.flush().await;
+    }
+
+    async fn send(self: &Arc<Self>, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
+        let send_guard = self.send_gate.read().await;
+        if self.should_reject.load(Ordering::Acquire) {
+            return Err(ClientError::ProducerClosed);
         }
+
+        let (tx, rx) = oneshot::channel();
+
+        let pending = PendingRecord {
+            order: self.next_record_order.fetch_add(1, Ordering::Relaxed),
+            key: key.to_vec(),
+            value,
+            tx,
+        };
+
+        let routing = self.client.resolve_topic_if_missing(&self.topic).await?;
+        let range_id = routing.range_id(key).ok_or(ClientError::TopicNotFound)?;
+
+        match self.buffers.push(range_id, pending) {
+            PushResult::Flush(records_to_flush) => {
+                self.flush_in_background(records_to_flush);
+            }
+            PushResult::SpawnLinger(linger, seq) => {
+                self.flush_range_in_background(range_id, linger, seq);
+            }
+            PushResult::Buffered => {}
+        }
+        drop(send_guard);
+
+        rx.await.map_err(|_| ClientError::UnexpectedResponse)?
+    }
+}
+
+impl Producer {
+    /// Create a producer, returning a structured error for invalid configuration.
+    pub fn new(
+        client: Arc<Client>,
+        topic: String,
+        config: ProducerConfig,
+    ) -> Result<Self, ClientError> {
+        // Generate a globally unique UUID for the producer session ID (idempotency seam)
+        let producer_id = Uuid::new_v4();
+
+        if topic.is_empty() {
+            return Err(ClientError::invalid_configuration(
+                "producer.topic",
+                "must not be empty",
+            ));
+        }
+        config.validate()?;
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                client,
+                topic,
+                buffers: ProducerBuffers::new(config.buffer.clone()),
+                codec: config.codec,
+                session_manager: ClientProducerSessionManager::new(producer_id),
+                send_gate: RwLock::new(()),
+                flush_gate: RwLock::new(()),
+                should_reject: AtomicBool::new(false),
+                next_record_order: AtomicU64::new(0),
+            }),
+        })
+    }
+
+    /// Produce a single record. Returns the committed entry ID once the batch flushes.
+    ///
+    /// Canceling before the record enters a batch prevents publication. Once buffered,
+    /// publication is shared work and may still complete; canceling only discards this
+    /// caller's acknowledgement.
+    pub async fn send(&self, key: &[u8], value: Vec<u8>) -> Result<EntryId, ClientError> {
+        self.inner.send(key, value).await
+    }
+
+    pub async fn flush(&self) {
+        self.inner.flush().await;
+    }
+
+    /// Close every clone and wait for accepted records to finish.
+    ///
+    /// New sends fail with [`ClientError::ProducerClosed`]. Canceling this future keeps
+    /// the producer closed, while the producer-owned drain continues in the background.
+    pub async fn close(&self) {
+        self.inner.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    fn producer() -> Producer {
+        let seed = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
+        let client = Arc::new(Client::connect(vec![seed]).unwrap());
+        Producer::new(client, "topic".to_string(), ProducerConfig::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn close_empty_producer_rejects_future_sends() {
+        let producer = producer();
+
+        producer.close().await;
+        assert!(matches!(
+            producer.send(b"key", b"value".to_vec()).await,
+            Err(ClientError::ProducerClosed)
+        ));
     }
 }

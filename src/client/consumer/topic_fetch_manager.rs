@@ -3,7 +3,9 @@ use super::RangeCursor;
 use super::messages::*;
 use crate::client::consumer::config::StartPolicy;
 use crate::client::consumer::group::ConsumerGroup;
-use crate::client::consumer::range_fetcher::{RangeFetchActor, RangeFetchActorCommand};
+use crate::client::consumer::range_fetcher::{
+    RangeFetchActor, RangeFetchActorCommand, StopRangeFetch,
+};
 use crate::client::consumer::{
     ConsumerContext, ConsumerRecord, MergeSiblingState, PendingCursorStore,
 };
@@ -140,6 +142,10 @@ impl TopicFetchManagerState {
                 let result = self.retry_commit_after_epoch_refresh(ctx).await;
                 let _ = command.reply.send(result);
             }
+            TopicFetchManagerCommand::CloseConsumer(command) => {
+                let result = self.close().await;
+                let _ = command.reply.send(result);
+            }
         }
     }
 
@@ -176,7 +182,7 @@ impl TopicFetchManagerState {
     fn fence_group_fetchers(&mut self, group: &ConsumerGroup) {
         group.fence_delivery();
         for (_, stop_tx) in self.senders.drain() {
-            let _ = stop_tx.send(RangeFetchActorCommand::Stop);
+            let _ = stop_tx.send(RangeFetchActorCommand::Stop(StopRangeFetch { reply: None }));
         }
         self.pending_cursors.clear();
         group.clear_effective_ownership();
@@ -259,7 +265,7 @@ impl TopicFetchManagerState {
         for range in to_drop {
             // Revoke ownership: send Stop, remove cursor and stop channel.
             if let Some(stop_tx) = self.senders.remove(&range) {
-                let _ = stop_tx.send(RangeFetchActorCommand::Stop);
+                let _ = stop_tx.send(RangeFetchActorCommand::Stop(StopRangeFetch { reply: None }));
             }
             self.pending_cursors.remove(range);
         }
@@ -397,13 +403,38 @@ impl TopicFetchManagerState {
         Ok(EntryId::default())
     }
 
-    async fn abort_all(&mut self) {
-        for (_, stop_tx) in self.senders.drain() {
-            let _ = stop_tx.send(RangeFetchActorCommand::Stop);
+    async fn stop_all(&mut self) {
+        let stops = self.senders.drain().map(|(_, stop_tx)| async move {
+            let (reply, response) = oneshot::channel();
+            if stop_tx
+                .send_async(RangeFetchActorCommand::Stop(StopRangeFetch {
+                    reply: Some(reply),
+                }))
+                .await
+                .is_ok()
+            {
+                let _ = response.await;
+            }
+        });
+        futures::future::join_all(stops).await;
+    }
+
+    async fn close(&mut self) -> Result<(), ClientError> {
+        let group = self.consumer_group.take();
+        if let Some(group) = &group {
+            group.fence_delivery();
         }
-        if let Some(group) = &self.consumer_group {
-            let _ = tokio::time::timeout(Duration::from_secs(1), group.commit()).await;
+        self.stop_all().await;
+        self.pending_cursors.clear();
+
+        if let Some(group) = group {
+            let commit = group.commit().await;
+            group.clear_effective_ownership();
+            let leave = group.leave().await;
+            commit?;
+            leave?;
         }
+        Ok(())
     }
 
     /// Returns true if this range should NOT be started. Consolidates:
@@ -556,6 +587,9 @@ pub(crate) async fn run_topic_fetch_manager(
             res = command_rx.recv_async() => {
                 let Ok(command) = res else { break };
                 state.handle_command(command, &ctx).await;
+                if state.should_exit() {
+                    return;
+                }
             }
 
             _ = commit_interval.tick(), if state.should_auto_commit() => {
@@ -575,7 +609,7 @@ pub(crate) async fn run_topic_fetch_manager(
         state.assert_invariants();
     }
 
-    state.abort_all().await;
+    state.stop_all().await;
 }
 
 #[cfg(any(test, debug_assertions))]

@@ -63,7 +63,8 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
         let topic = format!("at_least_once_{}", Uuid::new_v4());
         create_group_test_topics(&client, &topic).await;
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer =
+            Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
         producer.send(b"k", b"first".to_vec()).await.unwrap();
 
         let group_id = format!("group-{}", Uuid::new_v4());
@@ -84,14 +85,14 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
         assert_eq!(first.value, b"first");
 
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        drop(c1);
+        c1.close().await.unwrap();
         tokio::time::sleep(Duration::from_secs(4)).await;
 
         let c2 = Consumer::new(
             client.clone(),
             topic.clone(),
             KeyInterest::AllKeys,
-            group_config(group_id),
+            group_config(group_id.clone()),
         )
         .await
         .unwrap();
@@ -103,6 +104,18 @@ fn at_least_once_auto_commit_does_not_commit_unacked_delivery() {
             .unwrap();
         assert_eq!(replayed.value, b"first");
         c2.ack(&replayed).unwrap();
+        c2.close().await.unwrap();
+
+        let c3 = Consumer::new(client, topic, KeyInterest::AllKeys, group_config(group_id))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), c3.next_record())
+                .await
+                .is_err(),
+            "final close commit prevents replay"
+        );
+        c3.close().await.unwrap();
 
         Ok(())
     });
@@ -130,7 +143,8 @@ fn at_most_once_auto_commit_commits_delivery() {
         let topic = format!("at_most_once_{}", Uuid::new_v4());
         create_group_test_topics(&client, &topic).await;
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer =
+            Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
         producer.send(b"k", b"first".to_vec()).await.unwrap();
 
         let group_id = format!("group-{}", Uuid::new_v4());
@@ -209,7 +223,8 @@ fn consumer_group_assignment_and_offsets() {
             .await
             .unwrap();
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer =
+            Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
 
         // Publish some messages to different ranges
         for i in 0..10 {
@@ -322,7 +337,7 @@ fn consumer_group_scale_out_and_rebalance() {
         let topic = format!("test_scale_out_{}", Uuid::new_v4());
         client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::Fixed }).await.unwrap();
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
         let group_id = "scale-group".to_string();
 
         let c1 = Consumer::new(
@@ -466,7 +481,8 @@ fn consumer_group_failover() {
             client_prod.clone(),
             topic.clone(),
             ProducerConfig::default(),
-        );
+        )
+        .unwrap();
         for i in 0..6 {
             producer
                 .send(format!("primer_{}", i).as_bytes(), b"data".to_vec())
@@ -558,7 +574,7 @@ fn consumer_group_independent_groups() {
         let topic = format!("test_independent_{}", Uuid::new_v4());
         client.create_topic(&topic, StoragePolicy { retention_ms: None, replication_factor: 3, partition_strategy: PartitionStrategy::Fixed }).await.unwrap();
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
         for i in 0..10 {
             producer.send(format!("key_{}", i).as_bytes(), b"data".to_vec()).await.unwrap();
         }
@@ -642,7 +658,8 @@ fn consumer_group_rebalance_survives_broker_restart_without_offset_replay() {
             producer_client,
             topic.to_string(),
             ProducerConfig::default(),
-        );
+        )
+        .unwrap();
         let group_id = "rebalance-restart-group".to_string();
         let first = Consumer::new(
             first_client,
@@ -770,7 +787,8 @@ fn restarted_offset_replica_bootstraps_missed_epoch_before_commit_ack() {
             producer_client,
             topic.to_string(),
             ProducerConfig::default(),
-        );
+        )
+        .unwrap();
         let group_id = "offset-replica-epoch-bootstrap-group".to_string();
         let first = Consumer::new(
             first_client,
@@ -886,7 +904,8 @@ fn consumer_group_split_rebalance() {
             .await
             .unwrap();
 
-        let producer = Producer::new(client.clone(), topic.clone(), ProducerConfig::default());
+        let producer =
+            Producer::new(client.clone(), topic.clone(), ProducerConfig::default()).unwrap();
         let group_id = "split-group".to_string();
 
         let c1 = Consumer::new(
