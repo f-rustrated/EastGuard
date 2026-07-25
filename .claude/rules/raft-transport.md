@@ -31,4 +31,8 @@ Length-prefixed bincode frames:
 
 5. **Frame sizes are bounded.** Handshake frames capped at 1KB; message frames at 4MB. Without bounds, a malicious or buggy peer can exhaust memory by sending a giant length prefix before any payload.
 
-6. **Transport never inspects or modifies RPC payloads.** Wire messages are routed by their `shard_group_id` envelope; the payload bytes are opaque to the transport layer. Maintains layer separation — bugs in transport cannot corrupt consensus semantics.
+6. **Transport validates envelope identity but never interprets the RPC.** The
+connection peer must match the envelope `sender`; a mismatch closes that
+connection. The transport routes by `shard_group_id` and passes the authenticated
+peer onward, but the RPC remains opaque. Voter, learner, leader, term, and log
+checks belong to the target Raft state machine.

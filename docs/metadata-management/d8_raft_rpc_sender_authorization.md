@@ -43,12 +43,11 @@ Healthy traffic for other groups continues.
 
 ---
 
-## Current Gap
+## Gap Closed by D8
 
-The existing transport forwards the group, claimed sender, and RPC to MultiRaft.
-MultiRaft looks up the local group and dispatches the RPC. The target Raft state
-machine applies term and local-role rules, but it does not yet apply a complete
-sender-authorization check before those rules.
+Before D8, the transport forwarded the group, claimed sender, and RPC to
+MultiRaft. The target Raft state machine applied term and local-role rules before
+complete sender authorization.
 
 This creates four concrete gaps:
 
@@ -58,8 +57,10 @@ This creates four concrete gaps:
 - append and snapshot messages do not consistently bind embedded identities to
   the authenticated sender and committed group role.
 
-The security transport supplies trustworthy peer identity. D8 makes every Raft
-handler use it before mutating consensus state.
+D8 binds each envelope sender to the connection peer and makes every Raft handler
+authorize that peer before mutating consensus state. The current handshake
+provides this identity seam. Security S1 will replace its trust basis with TLS
+without changing the Raft API.
 
 ---
 
@@ -158,19 +159,22 @@ groups continue using the connection.
 
 ---
 
-## Implementation Work
+## Implementation Shape
 
-1. Carry the authenticated peer identity from transport to each inbound Raft RPC.
-2. Add one authorization step at the target Raft state-machine boundary.
-3. Check embedded candidate, leader, and responder identities against that peer.
-4. Apply the RPC-specific voter or learner requirement from the matrix.
-5. Replace the scalar candidate vote count with unique voter identities.
-6. Reject unauthorized RPCs before term or state processing.
-7. Emit bounded audit events without returning a connection-close instruction.
+1. Transport carries the connection peer identity with each inbound Raft RPC.
+2. The target Raft state-machine boundary performs one authorization step.
+3. Candidate, leader, and responder identities must match that peer.
+4. The RPC-specific voter or learner requirement comes from the matrix.
+5. Candidate votes are unique voter identities rather than a scalar count.
+6. Unauthorized RPCs return before term or state processing.
 
 The transport remains unaware of Raft membership and role. MultiRaft remains a
 group router. The target Raft instance owns the decision because only it has the
 committed membership and current local role.
+
+TLS authentication and structured security audit events remain security-roadmap
+work. They replace the handshake trust basis and rejection diagnostics,
+respectively; they do not change the application authorization rules.
 
 ---
 
