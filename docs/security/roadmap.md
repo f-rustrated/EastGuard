@@ -195,19 +195,67 @@ certificate node ID. Its epoch is stale, so its sessions and gossip are rejected
 
 ### SWIM admission
 
-DTLS authenticates and protects each hop. SWIM continues to relay membership
-facts using its existing `NodeId`, incarnation, and state ordering. Per-fact
-signatures are unnecessary because compromised brokers are outside the threat
-model.
+SWIM peers reuse an established DTLS association; they do not perform a handshake
+for every datagram. DTLS authenticates the directly connected peer and protects
+packets in transit. When B relays a fact about A to C, C proves that B sent the
+packet, not that A created the fact. Per-fact signatures are unnecessary because
+compromised brokers are outside the threat model. SWIM continues to use its
+existing `NodeId`, incarnation, and state ordering.
+
+Admission stays separate from SWIM, but the SWIM actor enforces the gate:
+
+```
+metadata Raft
+  durable admission records
+          |
+          v
+SWIM actor
+  check bounded admission cache
+  reject unadmitted membership traffic
+          |
+          v
+SWIM state machine
+  track admitted nodes as Alive / Suspect / Dead
+          |
+          v
+topology and Raft reconciliation
+  propose the required AddPeer / RemovePeer
+          |
+          v
+Raft log commit
+  change the group's committed membership
+```
+
+The split is conceptual, not a new service:
+
+```
+SWIM actor
+  ├─ admission gate       may this NodeId participate?
+  └─ SWIM state machine   does this NodeId appear alive?
+```
+
+| Admission | SWIM |
+|---|---|
+| Security authorization | Failure detection |
+| Durable metadata committed by Raft | In-memory, eventually consistent gossip |
+| Orders restart and replacement | Orders Alive, Suspect, and Dead |
+| Requires quorum to change | Continues during partitions |
+| Changed by an authorized operator or node admission | Changed by network observations |
+
+If SWIM stored admission, gossip could grant cluster access and separate
+partitions could admit different replacements. Instead, the actor checks the
+durable admission record before dispatching a fact to the synchronous SWIM state
+machine. A cache refresh is asynchronous; the state machine performs no metadata
+I/O.
 
 **Gossip rule:** Process a SWIM fact only while its `NodeId` and epoch match a
-current admission in the broker's cache. Then apply the existing SWIM ordering.
+current admission in the actor's cache. A cache miss never means admitted. New
+membership fails closed; previously admitted traffic is accepted only until its
+cache deadline. The existing SWIM ordering is applied after this gate.
 
-Admission and SWIM have separate authority:
-
-- Admission decides whether a lifecycle identity may participate.
-- SWIM decides whether that admitted identity appears alive.
-- Raft membership requires both admitted and alive.
+Admission makes a node eligible for reconciliation; it does not add the node to
+every Raft group. SWIM remains the source of membership liveness. Each Raft
+group's role changes only after its own `AddPeer` or `RemovePeer` entry commits.
 
 A SWIM event cannot introduce an unadmitted `NodeId`. Revocation or a newer
 admission epoch fences the old process immediately on brokers that observe the
@@ -256,21 +304,33 @@ handles accidental loss of the last administrator.
 
 ### Sharded security records
 
-EastGuard has no dedicated security group or controller. Security records use the
+A security record is one durable metadata entry that answers one security
+question:
+
+```
+record path:  security/node/node-a
+revision:     8
+answer:       admission epoch 3 allows NodeId node-a::7f2c...
+```
+
+The record path identifies what is being protected. The revision increases when
+that record changes, allowing brokers to detect a stale cached copy.
+
+EastGuard has no dedicated security group or controller. These records use the
 existing sharded metadata system:
 
-| Key | Value |
+| Record path | Answer |
 |---|---|
 | `security/node/{certificate-node-id}` | Current admission epoch and `NodeId` |
 | `security/acl/{resource}` | ACL |
 | `security/revocation/{issuer}/{serial}` | Credential revocation |
 
-Each key hashes to an ordinary metadata shard and commits through that shard's
-Raft log. Any broker can resolve the owner. If it does not host the shard, it
-returns a redirect; the requester retries at the target.
+Each record path hashes to an ordinary metadata shard and commits through that
+shard's Raft log. Any broker can resolve the owner. If it does not host the shard,
+it returns a redirect; the requester retries at the target.
 
 ```
-requester -> any broker -> hash security key
+requester -> any broker -> hash record path
                            |
                  broker hosts shard?
                     |             |
@@ -283,18 +343,34 @@ requester -> any broker -> hash security key
                               Raft commit
 ```
 
-This adds security records to each metadata state machine, including replicated
-commands, queries, snapshots, recovery, and cache-update events. It is new
-metadata functionality, not a generic key-value capability that exists today.
+Each metadata shard can store security records, but a record exists only in the
+shard selected by its record path and is replicated by that shard's Raft group:
+
+```
+security record
+      |
+      v
+hash to one metadata shard
+      |
+      v
+replicate on that shard's Raft peers
+```
+
+This does not replace Raft membership. Admission says whether a `NodeId` may
+participate in the cluster. `AddPeer` and `RemovePeer` remain separate committed
+changes to one Raft group's membership.
+
+Supporting security records requires new metadata commands, queries, snapshots,
+recovery, and cache-update events. EastGuard does not have this storage today.
 
 Brokers authorize locally from versioned, deadline-bound snapshots of these
 records. The broker executing an operation always repeats the check, including
 after redirects and retries.
 
-Versions are per security key. An authorization decision reads one exact ACL
-record. Admission and revocation checks for a new connection require a fresh read
-from the owning shard; an unavailable owner fails closed. Existing sessions may
-use cached ACL, admission, and revocation state until its deadline.
+Each security record has its own revision. An authorization decision reads one
+exact ACL record. Admission and revocation checks for a new connection require a
+fresh read from the owning shard; an unavailable owner fails closed. Existing
+sessions may use cached ACL, admission, and revocation state until its deadline.
 
 The production maximum cache age is 60 seconds. Operators may shorten it, not
 extend it. Each effective deadline is the earliest of the record expiry,
@@ -511,7 +587,7 @@ Until then, EastGuard remains trusted-network-only.
    sequence poisoning.
 
 4. **Every cached security entry identifies its source and lifetime.** It contains
-   one security key, version, and deadline. This makes stale state detectable.
+   one record path, revision, and deadline. This makes stale state detectable.
 
 5. **Audit state stays within configured capacity.** Detail queues and aggregate
    counters never exceed their fixed bounds.
