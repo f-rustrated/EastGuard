@@ -165,8 +165,8 @@ Each restart receives a higher epoch and keeps EastGuard's newly generated
 `NodeId`. The certificate proves the certificate node ID. The first application
 frame presents the epoch and `NodeId`; the admission record must contain that
 exact pair. The envelope sender must then match the admitted `NodeId`. A peer
-accepts a new node connection only after a fresh read from the metadata shard
-that owns the admission record.
+accepts a new node connection only with an unexpired cached admission record or a
+successful read from the metadata shard that owns it.
 
 SWIM, ring placement, Raft membership, connection ownership, and data replica
 sets continue to use `NodeId`. A restart therefore remains a new protocol
@@ -265,7 +265,9 @@ same Raft-removal path as confirmed death.
 
 ### Client identity
 
-A client certificate maps to one immutable principal for the connection.
+A principal is the client ID read from an authenticated certificate and used for
+permission checks. Its text grants no authority by itself. One connection maps
+to one principal.
 Request IDs, producer IDs, consumer-group member IDs, and topic names are
 application data, not credentials.
 
@@ -296,11 +298,10 @@ on its topic; the created session key is then bound to that principal. Listing
 topics filters the result to topics for which the principal has an exact
 `topic-admin/{topic}` or `topic-data/{topic}` grant.
 
-A client certificate contains one opaque principal ID. Resources are typed values
-and comparison is exact. Topic creation checks the requested topic name. One
-security-record update changes one resource atomically. Only a principal with
-change access to `security/cluster` may grant or remove access; operator recovery
-handles accidental loss of the last administrator.
+Resources are typed values and comparison is exact. Topic creation checks the
+requested topic name. One security-record update changes one resource atomically.
+Only a principal with change access to `security/cluster` may grant or remove
+access; operator recovery handles accidental loss of the last administrator.
 
 ### Sharded security records
 
@@ -363,14 +364,14 @@ changes to one Raft group's membership.
 Supporting security records requires new metadata commands, queries, snapshots,
 recovery, and cache-update events. EastGuard does not have this storage today.
 
-Brokers authorize locally from versioned, deadline-bound snapshots of these
-records. The broker executing an operation always repeats the check, including
-after redirects and retries.
+Brokers authorize locally from cached security records and their revisions and
+expiry times. The broker executing an operation always repeats the check,
+including after redirects and retries.
 
 Each security record has its own revision. An authorization decision reads one
-exact ACL record. Admission and revocation checks for a new connection require a
-fresh read from the owning shard; an unavailable owner fails closed. Existing
-sessions may use cached ACL, admission, and revocation state until its deadline.
+exact ACL record. New and established connections may use an unexpired cached
+admission, ACL, or revocation record. A missing or expired record requires a read
+from the owning shard; an unavailable owner fails closed.
 
 The production maximum cache age is 60 seconds. Operators may shorten it, not
 extend it. Each effective deadline is the earliest of the record expiry,
@@ -444,13 +445,12 @@ policy rather than one leaf fingerprint.
 Expired credentials are rejected after a bounded clock-skew allowance. EastGuard
 warns and emits metrics before expiry.
 
-Brokers cache versioned security snapshots with absolute deadlines:
+Brokers cache security records with expiry times:
 
 | Operation while the metadata shard owning the required security record is unavailable | Policy |
 |---|---|
-| New client/node connection, join, membership, ACL, revocation, admin | Fail closed immediately |
-| Existing data traffic and required replication | Continue until snapshot expiry, then fail closed |
-| Existing cluster control connection | Reject known revocations; otherwise continue until snapshot expiry |
+| All required records are cached and unexpired | Use the cached records |
+| Any required record is missing or expired | Fail closed |
 
 Known revocations close established connections within the enforcement deadline.
 Cached policy is never used after its effective deadline.
@@ -478,7 +478,7 @@ DTLS and the fixed SWIM envelope. Oversized application packets are rejected
 before sending or decoding. Certificate handshakes may span bounded DTLS
 datagrams.
 
-Security audit events record the reporting node, normalized principal, endpoint,
+Security audit events record the reporting node, principal ID, endpoint,
 operation, resource, result, stable reason code, correlation ID, and a non-secret
 certificate fingerprint when useful.
 
@@ -547,7 +547,7 @@ Delivery is linear: S0 → S1 → S2 → S3 → S4 → S5 → S6.
 - Rotate and revoke credentials during elections, produce, fetch, replication,
   and repair.
 - Partition brokers from metadata shards owning required security records before
-  and after snapshot expiry.
+  and after cached-record expiry.
 - Cold-restart every broker with empty caches and no established sessions.
 - Test expiry, clock skew, recovery, handshake floods, audit floods, and resource
   bounds.
