@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn quinn_exchanges_datagram_under_turmoil() -> turmoil::Result {
+    fn quinn_validates_address_and_exchanges_datagram_under_turmoil() -> turmoil::Result {
         let (server_config, client_config) = configs();
         let mut sim = Builder::new()
             .simulation_duration(Duration::from_secs(10))
@@ -219,7 +219,13 @@ mod tests {
                 )
                 .unwrap();
 
-                let connection = endpoint.accept().await.unwrap().await.unwrap();
+                let initial = endpoint.accept().await.unwrap();
+                assert!(!initial.remote_address_validated());
+                initial.retry().unwrap();
+
+                let validated = endpoint.accept().await.unwrap();
+                assert!(validated.remote_address_validated());
+                let connection = validated.await.unwrap();
                 assert_eq!(connection.read_datagram().await.unwrap(), b"hello"[..]);
                 Ok(())
             }
