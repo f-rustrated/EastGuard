@@ -1,614 +1,245 @@
 # EastGuard Security Roadmap
 
-**Goal:** Make secure deployment the default without preventing online rotation,
-node restart, or recovery from a network partition.
+**Goal:** Provide a secure, default-deny production boundary for all nodes and clients without sacrificing online certificate rotation, node restarts, or network partition recovery.
 
-EastGuard will provide:
-
-1. Cryptographic identity for every node and client.
-2. TLS 1.3 for TCP and DTLS 1.3 for SWIM UDP.
-3. Default-deny authorization on every broker.
-4. Safe node admission, certificate-ID reuse, rotation, revocation, and audit.
-
-**Depends on:** SWIM membership, Raft consensus, data-plane placement, the client
-protocol, and client redirect handling.
+**Depends on:** SWIM membership, Raft consensus, data-plane placement, client protocol, and client redirect handling.
 
 ---
 
-## Current Boundary
+## 1. Overview & Threat Model
 
-EastGuard currently trusts anything that can reach its listeners. Message senders
-declare identities but do not prove them.
+EastGuard operates in two distinct security modes:
 
-| Port | Traffic |
-|---|---|
-| TCP 2921 | Client metadata, administration, produce, and fetch |
-| TCP 2922 | Raft |
-| TCP 2923 | Data replication, repair, and coordination |
-| UDP 2922 | SWIM |
+- **Secure Mode (Default):** Mutual TLS 1.3 / DTLS 1.3 enforced across all listeners. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
+- **Trusted Development Mode:** Plaintext protocols enabled strictly via explicit opt-in configuration for isolated test environments.
 
-Until this roadmap is complete, production deployment is restricted to an
-isolated trusted network.
+### Threat Model
+The production boundary defends against external network attackers attempting eavesdropping, packet modification, replay, UDP spoofing, connection injection, or TLS downgrade.
 
----
+> **Scope Note:** Compromised brokers or authorized clients are outside this threat model. Their impact is constrained by short-lived credentials, scoped ACLs, and strict principal binding. Byzantine consensus is out of scope.
 
-## Threat Model
+### Listener Architecture
 
-The production boundary protects against a network attacker who can connect,
-spoof UDP, inspect or modify traffic, replay messages, present invalid
-credentials, and exhaust handshake resources.
-
-EastGuard prevents that attacker from:
-
-- impersonating a client or node;
-- joining SWIM or a Raft group;
-- poisoning addresses or membership facts;
-- performing unauthorized administration, produce, or consume operations;
-- injecting replication or repair messages;
-- downgrading a secure connection to plaintext.
-
-A compromised broker or authorized client is outside this boundary. Scoped,
-short-lived, revocable credentials limit damage but do not make a compromised
-principal trustworthy. Byzantine consensus is not in scope.
+| Listener | Port | Protocol | Peer Authentication | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
+| **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication |
+| **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
+| **SWIM** | UDP 2922 | DTLS 1.3 | Mutual X.509 | Membership gossip & failure detection |
 
 ---
 
-## Security Modes
+## 2. Layered Architecture
 
-| Mode | Use | Behavior |
-|---|---|---|
-| **Secure** | Production and shared networks | Credentials required; plaintext rejected |
-| **Trusted development** | Isolated development and tests | Existing plaintext protocols enabled by explicit opt-in |
+Security checks are split between the transport layer and application state machines to keep state machines free of security I/O:
 
-Secure mode is the default and never downgrades. Startup fails before opening a
-listener when keys, certificates, trust roots, identity bindings, or security
-settings are invalid. Secure and trusted-development participants cannot
-communicate.
+```
+        [ TLS 1.3 / DTLS 1.3 Transport Layer ]
+  - Authenticate peer X.509 certificates
+  - Enforce framing, datagram MTU, and resource limits
+  - Bind connection envelope sender to verified identity
+                     │
+                     │ (Drop connection on transport failure)
+                     ▼
+        [ Application Layer State Machines ]
+  - Authorize requested operation against cached ACLs / placement
+  - Execute SWIM / Raft / Data-Plane state transitions
+                     │
+                     │ (Drop denied envelope only; connection stays open)
+```
+
+- **Transport Responsibility:** Performs cryptographic handshakes, validates certificates, tracks cache expiry, and binds envelope senders to verified identities. Transport errors close the connection.
+- **Application Responsibility:** Synchronous state machines (SWIM, Raft, Topology, Data Plane) process only pre-validated envelopes. An authorization failure drops the specific denied envelope without tearing down the underlying connection.
+- **Placement-Based Data-Plane Authorization:** Data-plane nodes authorize incoming replication and repair requests against local committed placement state, ignoring sender-asserted replica lists.
+- **Redirects:** A redirect is only an address hint. The destination authenticates the peer and repeats the authorization check.
 
 ---
 
-## Communication and Application Boundaries
+## 3. Node Identity & Admission Model
 
-### Protocols
+To allow safe node restarts and hardware replacement without exposing the cluster to stale process replay, EastGuard decouples reusable identity from running process instances.
 
-| Listener | Protection | Peer authentication |
-|---|---|---|
-| Client TCP 2921 | TLS 1.3 | Mutual X.509 |
-| Raft TCP 2922 | TLS 1.3 | Mutual X.509 |
-| Data TCP 2923 | TLS 1.3 | Mutual X.509 |
-| SWIM UDP 2922 | DTLS 1.3 | Mutual X.509 |
+### Identity Hierarchy
 
-TLS 1.2, DTLS 1.2, anonymous modes, plaintext, and downgrade are rejected in
-secure mode. DTLS uses replay protection and a stateless cookie before certificate
-verification or per-peer allocation.
+| Term | Scope | Lifetime / Ordering | Function |
+| :--- | :--- | :--- | :--- |
+| **Certificate Node ID** | Configuration | Long-lived / Reused | Operator-assigned node name embedded in the X.509 certificate. |
+| **Admission Epoch** | Metadata Shard | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
+| **NodeId** | Running Process | Single process lifetime | Unique ID generated on startup; used by SWIM, topology ring, Raft, and data placement. |
+| **Process Key** | Running Process | Single process lifetime | Proves that the connection belongs to the process admitted for this epoch. |
+| **SWIM Incarnation** | Running Process | Monotonically increasing counter | Incremented by the *same* process instance to refute false `Suspect`/`Dead` gossip. |
 
-S0 must prove that a maintained DTLS 1.3 implementation supports certificates,
-cookies, anti-replay, retransmission, and bounded state. If not, secure production
-delivery is blocked rather than silently falling back to DTLS 1.2. DTLS 0-RTT is
-disabled. Cookie keys rotate, handshake retries and associations are bounded, and
-address changes require revalidation.
+### Resolution Rules
 
-### Layer split
+Node identity conflicts and stale gossip are resolved in this order:
 
 ```
-TLS or DTLS
-  authenticate peer
-  enforce framing and resource limits
-  bind envelope sender to peer identity
-                  |
-                  v
-application
-  authorize the target group, segment, or client operation
+ 1. Admission Epoch   ──► Higher epoch always wins & fences older processes
+          │ (If equal)
+          ▼
+ 2. SWIM Incarnation  ──► Higher incarnation refutes stale liveness facts
+          │ (If equal)
+          ▼
+ 3. Liveness State    ──► Dead > Suspect > Alive
 ```
 
-Certificate checks, signatures, admission reads, and cache refresh happen at the
-network actor boundary. Synchronous SWIM, Raft, topology, and data-plane state
-machines receive only validated facts and perform no security I/O.
+### Partition Recovery vs. Node Restart
 
-Transport closes a connection for authentication, framing, or envelope-identity
-failure. An application authorization failure drops only that envelope, so valid
-traffic for other groups and segments continues on the shared connection.
+An **authorized operator** is a person or trusted automation using a client
+certificate whose principal has the `security/cluster` grant. In an orchestrated
+deployment, automation may approve restarts and scaling, but metadata Raft still
+commits every admission.
 
-Raft authorization follows
-[D8 — Raft RPC Sender Authorization](../metadata-management/d8_raft_rpc_sender_authorization.md).
-Metadata Raft remains the placement authority. Each data-plane node caches only
-the committed placement needed for its local segments and uses that cache—not a
-replica list supplied by an incoming message—to authorize replication, repair,
-and coordination.
+- **Healed Partition (Same Process):** Retains its existing `NodeId` and `Admission Epoch`. Increments its `SWIM Incarnation` counter to refute `Suspect` or `Dead` rumors spread during the partition.
+- **Node Restart / Replacement:** The process generates a new `NodeId` and process key. An authorized operator approves that exact process, and metadata Raft commits the new `Admission Epoch`, `NodeId`, and process public key. The higher epoch fences older processes immediately where observed and everywhere else within 60 seconds.
 
-Clients authenticate every redirect destination against the configured trust
-root. The destination authenticates and authorizes the client again; a redirect
-grants no authority.
+### Admission Gate & SWIM Separation
+
+SWIM liveness gossip is decoupled from cluster admission authority to prevent network partitions from admitting unauthorized nodes:
+
+```
+  [ Authorized Operator ] ──► Approve Joining Node's NodeId & Process Key
+                                             │
+                                             ▼
+  [ Joining Node ] ──► Limited Admission Endpoint ──► Metadata Raft
+                                                        │
+                                                        ▼
+                                  [ Epoch + NodeId + Process Public Key ]
+                                                        │
+                                                        ▼
+  [ SWIM Actor ] ◄──────────── Check Admission Cache ───┘
+           │
+           ▼ (Accepted)
+  [ SWIM State Machine ] ──► Liveness Gossip (Alive / Suspect / Dead)
+           │
+           ▼
+  [ Raft Reconciliation ] ──► Commit AddPeer / RemovePeer
+```
+
+1. **Process Proof:** A node connection proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a connection-specific value produced by TLS or DTLS, so the proof cannot be replayed on another connection. The reusable node certificate alone cannot create or claim a newer epoch.
+2. **Admission Gate:** The SWIM actor checks incoming packets against a local admission cache backed by metadata Raft before passing facts to the SWIM state machine.
+3. **Gossip Rule:** DTLS authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
+4. **Cache Policy:** Admission records are cached locally with a maximum TTL of 60 seconds. If a cache entry expires while the owning metadata shard is unreachable, the gate fails closed.
 
 ---
 
-## Identity
+## 4. Authorization & Sharded Security Records
 
-### Node lifecycle identity
-
-Security adds two terms around EastGuard's existing `NodeId` and SWIM
-incarnation:
-
-| Term | Existing or new | Meaning |
-|---|---|---|
-| **Certificate node ID** | New | Operator-chosen identity reused across restarts |
-| **Admission epoch** | New | Restart number committed by metadata; a higher number replaces an older process |
-| **NodeId** | Existing | Lifecycle-specific ID used by SWIM, topology, Raft, and data placement |
-| **SWIM incarnation** | Existing | Conflict counter increased by the same process after a healed partition |
-
-The counters answer different questions:
-
-```
-same process returns after partition
-        |
-        +-- same NodeId and admission epoch
-        +-- increase SWIM incarnation
-
-process restarts or is replaced
-        |
-        +-- metadata commits a higher admission epoch
-        +-- process starts with a new NodeId
-        +-- reject the older process
-```
-
-The admission record connects the reusable certificate identity to one running
-process:
-
-```
-certificate node ID A
-        |
-        +-- admission epoch 8
-        +-- NodeId A::7f2c...
-```
-
-Each restart receives a higher epoch and keeps EastGuard's newly generated
-`NodeId`. The certificate proves the certificate node ID. The first application
-frame presents the epoch and `NodeId`; the admission record must contain that
-exact pair. The envelope sender must then match the admitted `NodeId`. A peer
-accepts a new node connection only with an unexpired cached admission record or a
-successful read from the metadata shard that owns it.
-
-SWIM, ring placement, Raft membership, connection ownership, and data replica
-sets continue to use `NodeId`. A restart therefore remains a new protocol
-identity, matching EastGuard's current safety model.
-
-### Partition failback and restart
-
-Certificate node-ID reuse is supported in two forms:
-
-- **Healed partition:** The process keeps its `NodeId` and admission epoch. It
-  increases its SWIM incarnation to refute stale `Suspect` or `Dead` gossip.
-- **Restart or replacement:** The process receives a new admission epoch and
-  `NodeId`. The newer epoch fences every older process, regardless of its SWIM
-  incarnation.
-
-Identity facts are ordered by admission epoch first and SWIM incarnation second:
-
-```
-higher admission epoch wins
-same epoch -> higher incarnation wins
-same incarnation -> Dead > Suspect > Alive
-```
-
-An old partitioned process cannot return after a replacement and reclaim its
-certificate node ID. Its epoch is stale, so its sessions and gossip are rejected.
-
-### SWIM admission
-
-SWIM peers reuse an established DTLS association; they do not perform a handshake
-for every datagram. DTLS authenticates the directly connected peer and protects
-packets in transit. When B relays a fact about A to C, C proves that B sent the
-packet, not that A created the fact. Per-fact signatures are unnecessary because
-compromised brokers are outside the threat model. SWIM continues to use its
-existing `NodeId`, incarnation, and state ordering.
-
-Admission stays separate from SWIM, but the SWIM actor enforces the gate:
-
-```
-metadata Raft
-  durable admission records
-          |
-          v
-SWIM actor
-  check bounded admission cache
-  reject unadmitted membership traffic
-          |
-          v
-SWIM state machine
-  track admitted nodes as Alive / Suspect / Dead
-          |
-          v
-topology and Raft reconciliation
-  propose the required AddPeer / RemovePeer
-          |
-          v
-Raft log commit
-  change the group's committed membership
-```
-
-The split is conceptual, not a new service:
-
-```
-SWIM actor
-  ├─ admission gate       may this NodeId participate?
-  └─ SWIM state machine   does this NodeId appear alive?
-```
-
-| Admission | SWIM |
-|---|---|
-| Security authorization | Failure detection |
-| Durable metadata committed by Raft | In-memory, eventually consistent gossip |
-| Orders restart and replacement | Orders Alive, Suspect, and Dead |
-| Requires quorum to change | Continues during partitions |
-| Changed by an authorized operator or node admission | Changed by network observations |
-
-If SWIM stored admission, gossip could grant cluster access and separate
-partitions could admit different replacements. Instead, the actor checks the
-durable admission record before dispatching a fact to the synchronous SWIM state
-machine. A cache refresh is asynchronous; the state machine performs no metadata
-I/O.
-
-**Gossip rule:** Process a SWIM fact only while its `NodeId` and epoch match a
-current admission in the actor's cache. A cache miss never means admitted. New
-membership fails closed; previously admitted traffic is accepted only until its
-cache deadline. The existing SWIM ordering is applied after this gate.
-
-Admission makes a node eligible for reconciliation; it does not add the node to
-every Raft group. SWIM remains the source of membership liveness. Each Raft
-group's role changes only after its own `AddPeer` or `RemovePeer` entry commits.
-
-A SWIM event cannot introduce an unadmitted `NodeId`. Revocation or a newer
-admission epoch fences the old process immediately on brokers that observe the
-commit and everywhere else within the admission-cache deadline. Invalidation
-closes the old process's sessions and removes its SWIM facts, then drives the
-same Raft-removal path as confirmed death.
-
-### Client identity
-
+EastGuard enforces exact, default-deny access control lists (ACLs) without wildcards or inheritance.
 A principal is the client ID read from an authenticated certificate and used for
-permission checks. Its text grants no authority by itself. One connection maps
-to one principal.
-Request IDs, producer IDs, consumer-group member IDs, and topic names are
-application data, not credentials.
+permission checks; its text grants no authority by itself.
 
-A producer session is permanently bound to the principal that created it.
-Requests from another principal are rejected before sequence, fencing, expiry, or
-deduplication state changes.
+### ACL Resource Catalog
 
----
+| Resource Key Format | Granted Actions |
+| :--- | :--- |
+| `cluster` | Membership inspection, topology lookup, operator diagnostics |
+| `topic-admin/{topic}` | Create, delete, describe topic metadata |
+| `topic-data/{topic}` | Produce, fetch, list offsets for topic |
+| `consumer-group/{topic}/{group}` | Consume messages, read/commit consumer offsets |
+| `producer-session/{topic}/{session}` | Renew producer session (permanently bound to creator principal) |
+| `security/cluster` | Read/write ACLs, manage admissions and revocations, inspect security audit |
 
-## Authorization
+Consumer-group access permits group coordination and offset read/commit. Reading
+records separately requires `Fetch` on `topic-data/{topic}`.
 
-Secure mode uses exact, default-deny grants. There are no wildcards, inheritance,
-or payload-defined resources in the first production version.
+### Sharded Metadata Storage
 
-| Exact key | Actions |
-|---|---|
-| `cluster` | Inspect membership and shards; operator/debug actions |
-| `topic-admin/{topic}` | Create, delete, describe |
-| `topic-data/{topic}` | Produce, fetch, list offsets |
-| `consumer-group/{topic}/{group}` | Consume; inspect or reset progress |
-| `producer-session/{topic}/{session}` | Renew |
-| `security/cluster` | Read/change ACLs, admit or revoke identities, inspect audit |
+A security record is one durable admission, ACL, or revocation entry. Its record
+path selects one metadata shard; its revision lets brokers detect stale cached
+copies.
 
-`Consume` covers join, heartbeat, leave, assignment, and offset read/commit.
-Reading records also requires `Fetch` on the topic. Offset inspection or reset is
-a separate administrative grant. Opening a producer session requires `Produce`
-on its topic; the created session key is then bound to that principal. Listing
-topics filters the result to topics for which the principal has an exact
-`topic-admin/{topic}` or `topic-data/{topic}` grant.
-
-Resources are typed values and comparison is exact. Topic creation checks the
-requested topic name. One security-record update changes one resource atomically.
-Only a principal with change access to `security/cluster` may grant or remove
-access; operator recovery handles accidental loss of the last administrator.
-
-### Sharded security records
-
-A security record is one durable metadata entry that answers one security
-question:
+Security records (`security/node/{id}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
 
 ```
-record path:  security/node/node-a
-revision:     8
-answer:       admission epoch 3 allows NodeId node-a::7f2c...
+  Client/Node Request ──► Any Broker ──► Hash Record Path ──► Hosts Shard? ─┬─► Yes ──► Commit via Raft
+                                                                           └─► No  ──► Return Owner Redirect
 ```
 
-The record path identifies what is being protected. The revision increases when
-that record changes, allowing brokers to detect a stale cached copy.
+- **Local Authorization:** Brokers evaluate ACLs against local cached security records.
+- **Freshness & Expiry:** Cached records include a monotonic deadline (max 60s) and revision counter. Expired entries require re-validation from the owner metadata shard; if the owner is offline, authorization fails closed.
 
-EastGuard has no dedicated security group or controller. These records use the
-existing sharded metadata system:
+---
 
-| Record path | Answer |
-|---|---|
-| `security/node/{certificate-node-id}` | Current admission epoch and `NodeId` |
-| `security/acl/{resource}` | ACL |
-| `security/revocation/{issuer}/{serial}` | Credential revocation |
+## 5. Operations & Credential Lifecycle
 
-Each record path hashes to an ordinary metadata shard and commits through that
-shard's Raft log. Any broker can resolve the owner. If it does not host the shard,
-it returns a redirect; the requester retries at the target.
+### Bootstrap & Node Joining
+
+1. Operator initializes a cluster trust root and issues the first node certificate.
+2. The first node generates its `NodeId` and process key. Initial metadata state
+   stores that admission, the first operator principal, and its
+   `security/cluster` grant.
+3. A later joining node generates a new `NodeId` and process key.
+4. An authorized operator approves that exact `NodeId` and process public key. The reusable node certificate alone cannot authorize replacement.
+5. The joining node connects to a **limited admission endpoint** using its X.509 certificate.
+6. The endpoint routes to the owning metadata shard, which atomically commits the next `Admission Epoch`, `NodeId`, and process public key.
+7. The joining node proves possession of the process private key before entering SWIM gossip and Raft membership reconciliation.
+
+### Online Credential Rotation
+
+- **Zero-Downtime CA Rotation:** Brokers support dual trust chain loading. New root CAs can be added and leaf certificates reloaded online without restarting brokers or changing `Admission Epoch` / `NodeId`.
+- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active TLS/DTLS sessions are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
+- **Recovery:** Runbooks cover lost authorized-operator access, lost issuing keys, expiry, accidental revocation, trust-root replacement, and cold-cluster restart.
+
+---
+
+## 6. Resource Limits & Security Audit
+
+### Rate & Memory Bounds
+- Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, memory allocations, and per-source request rates.
+- **DTLS Datagram Size:** Encrypted SWIM datagram payloads are capped at **1200 bytes** to ensure the total packet fits within the 1280-byte minimum IPv6 MTU without IP fragmentation.
+
+### Audit Subsystem
+- **Non-Blocking Execution:** Security audit events (authentication success/failure, ACL denials, admissions) are queued asynchronously. Audit backpressure never blocks protocol execution or consensus.
+- **Rate-Limited Flood Protection:** High-frequency audit events use aggregate counters and sampled detail logging.
+- **Credential Hygiene:** Audit logs never record private keys, tokens, credentials, or message payloads.
+
+---
+
+## 7. Delivery Plan (S0–S6)
 
 ```
-requester -> any broker -> hash record path
-                           |
-                 broker hosts shard?
-                    |             |
-                   no            yes
-                    |             |
-                 redirect      propose or
-                    |          leader redirect
-                    v             |
-             requester retries    v
-                              Raft commit
+S0 ──► S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
+config  records  TCP     SWIM    clients  operations  production
+                 mTLS    DTLS    + ACLs   + audit     gate
 ```
 
-Each metadata shard can store security records, but a record exists only in the
-shard selected by its record path and is replicated by that shard's Raft group:
+| Phase | Target Scope | Key Deliverable | Exit Criteria |
+| :--- | :--- | :--- | :--- |
+| **S0** | Configuration | Security modes, cert loader, DTLS 1.3 feasibility | Secure mode opens no plaintext listeners; a maintained DTLS 1.3 implementation satisfies certificate, replay, cookie, and resource-bound requirements |
+| **S1** | Metadata Storage | Security record schema, sharded Raft state | Security records survive snapshot & recovery |
+| **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft D8 RPC authorization | Authenticated and authorized cluster TCP traffic |
+| **S3** | Membership | DTLS 1.3 on UDP 2922 & SWIM admission gate | Secure gossip & partition-safe admission fencing |
+| **S4** | Client API | Client mTLS on TCP 2921, principal binding, ACLs | Default-deny enforcement on all client APIs |
+| **S5** | Operations | Certificate rotation, revocation, expiry, recovery, audit logging | Online credential operations and recovery runbooks |
+| **S6** | Production Gate | Adversarial testing, fuzzing, partition stress | Passes all production readiness checks |
 
-```
-security record
-      |
-      v
-hash to one metadata shard
-      |
-      v
-replicate on that shard's Raft peers
-```
-
-This does not replace Raft membership. Admission says whether a `NodeId` may
-participate in the cluster. `AddPeer` and `RemovePeer` remain separate committed
-changes to one Raft group's membership.
-
-Supporting security records requires new metadata commands, queries, snapshots,
-recovery, and cache-update events. EastGuard does not have this storage today.
-
-Brokers authorize locally from cached security records and their revisions and
-expiry times. The broker executing an operation always repeats the check,
-including after redirects and retries.
-
-Each security record has its own revision. An authorization decision reads one
-exact ACL record. New and established connections may use an unexpired cached
-admission, ACL, or revocation record. A missing or expired record requires a read
-from the owning shard; an unavailable owner fails closed.
-
-The production maximum cache age is 60 seconds. Operators may shorten it, not
-extend it. Each effective deadline is the earliest of the record expiry,
-certificate expiry, and local receipt time plus that maximum. Elapsed cache age
-uses a monotonic timer. A backward wall-clock jump beyond the configured
-tolerance invalidates the cache instead of extending it.
+S6 must verify node and client impersonation, stale-process replay, unauthorized
+operations, protocol downgrade, rotation under live traffic, expired and revoked
+credentials, cold-cluster restart, handshake and datagram fuzzing, resource
+bounds, and secret-free diagnostics.
 
 ---
 
-## Bootstrap and Join
+## 8. Invariants & Security Rules
 
-Bootstrap starts from operator-provided trust material:
+### System Invariants
 
-1. Create a cluster-specific trust root.
-2. Issue the first node certificate.
-3. Put the first node record, the first administrator principal, and that
-   principal's `security/cluster` change grant in the initial metadata state.
-4. Start the first node in secure mode.
-5. Authenticate a later candidate's certificate on the limited pre-admission
-   endpoint.
-6. Resolve `security/node/{certificate-node-id}` and follow redirects to its
-   metadata shard.
-7. Atomically commit the next admission epoch and `NodeId`.
-8. Allow that `NodeId` to enter SWIM and Raft membership flows.
+1. **Single Connection Identity:** Every established client connection has exactly one authenticated principal; every node connection has exactly one `(Certificate Node ID, Admission Epoch, NodeId, Process Public Key)`.
+2. **Unique Active Node Admission:** Metadata state maintains at most one active `(Admission Epoch, NodeId, Process Public Key)` per Certificate Node ID.
+3. **Immutable Producer Session Principal:** Every producer session is immutably bound to the principal that created it.
+4. **Explicit Cache Bounding:** Every cached security entry specifies its source metadata shard, revision, and expiry measured with a monotonic clock (≤ 60 seconds).
+5. **Bounded Audit Footprint:** Audit queues and aggregate rate counters remain within configured capacity.
 
-Knowing a seed address grants no authority. A candidate cannot change SWIM,
-topology, or Raft state before admission commits.
+### Operational Rules
 
-The initial administrator grant is auditable and can be replaced through normal
-ACL updates; it does not bypass Raft after startup. Operator recovery is the
-quorum-protected offline path if the last administrator is lost.
-
-The pre-admission endpoint also breaks recovery cycles after a cold restart. A
-certificate-authenticated broker may use it only to read admission or revocation
-records and receive owner redirects. It grants no SWIM, Raft, data, ACL-mutation,
-or client authority. A candidate may additionally submit the one admission
-command for its own pre-authorized certificate node ID. Later candidates need not
-belong to a metadata shard: a broker returns the owner redirect, and the
-candidate retries there.
-
-Reusing a certificate node ID is a new admission, not an implicit resurrection.
-The new epoch must commit before the replacement joins. The restarted process
-does not choose an epoch: the owning metadata shard reads the current record and
-commits the next value. If that shard lacks quorum, admission waits.
-
-A valid node certificate may renew only its own existing certificate node ID.
-Adding a previously unseen certificate node ID requires a `security/cluster`
-change grant. Committing a replacement always fences the active process.
-Admission attempts are rate-limited per certificate node ID to prevent epoch
-churn.
-
----
-
-## Credential Lifecycle
-
-### Rotation
-
-1. Add the new trust chain.
-2. Reload trust while the old chain remains valid.
-3. Issue and reload new leaf certificates.
-4. Reconnect long-lived sessions.
-5. Remove the old chain and verify rejection.
-
-Nodes reload certificates and trust without restarting. Rotation does not require
-a cluster-wide outage. Reloading a certificate does not change the admission
-epoch or `NodeId`; the admission record binds the certificate node ID and issuer
-policy rather than one leaf fingerprint.
-
-### Expiry and revocation
-
-Expired credentials are rejected after a bounded clock-skew allowance. EastGuard
-warns and emits metrics before expiry.
-
-Brokers cache security records with expiry times:
-
-| Operation while the metadata shard owning the required security record is unavailable | Policy |
-|---|---|
-| All required records are cached and unexpired | Use the cached records |
-| Any required record is missing or expired | Fail closed |
-
-Known revocations close established connections within the enforcement deadline.
-Cached policy is never used after its effective deadline.
-
-Operations documentation covers lost keys, issuing-key loss, accidental
-revocation, expiry, loss of quorum in a metadata shard that owns security records,
-trust-root replacement, and certificate-node-ID recovery. Recovery never enables
-plaintext.
-
----
-
-## Resource Limits and Audit
-
-Every listener bounds connections, unauthenticated handshakes, attempts per
-source, deadlines, certificate and frame sizes, in-flight requests, tasks,
-buffers, and event rates. Invalid DTLS packets are dropped before SWIM decoding.
-Connection, handshake, and request permits are acquired before frame allocation
-or task creation. Aggregate byte limits apply across connections, not only to
-individual frames.
-
-Every encrypted SWIM application-data record fits in one UDP datagram. Its UDP
-payload is limited to 1200 bytes by default, leaving room for IPv6 and UDP headers
-within the 1280-byte minimum IPv6 MTU. The gossip budget is what remains after
-DTLS and the fixed SWIM envelope. Oversized application packets are rejected
-before sending or decoding. Certificate handshakes may span bounded DTLS
-datagrams.
-
-Security audit events record the reporting node, principal ID, endpoint,
-operation, resource, result, stable reason code, correlation ID, and a non-secret
-certificate fingerprint when useful.
-
-Audit emission uses:
-
-- bounded detail queues;
-- bounded counters by reason;
-- sampled details and periodic aggregate summaries during floods;
-- an overflow counter and recovery summary.
-
-Audit backpressure never blocks client, membership, consensus, or replication
-work. Audit output never contains keys, secrets, raw credentials, session keys, or
-request payloads.
-
----
-
-## Delivery
-
-| Phase | Build | Exit result |
-|---|---|---|
-| **S0** | Modes, configuration, key loading, DTLS feasibility | Secure mode opens no plaintext listener; DTLS choice is proven viable |
-| **S1** | Sharded security records, snapshots, initial node and administrator records | Security state survives commit, migration, snapshot, and recovery |
-| **S2** | Cluster TCP mTLS, admission fencing, envelope binding, Raft D8, data-plane authority | Authenticated cluster traffic |
-| **S3** | DTLS and the SWIM admission/liveness gate | Safe membership and partition failback |
-| **S4** | Client mTLS, principals, ACL enforcement | Every client operation is default-deny |
-| **S5** | Reload, rotation, expiry, revocation, recovery, audit | Online credential operations |
-| **S6** | Adversarial, fuzz, partition, and load tests | Production readiness gate passes |
-
-Delivery is linear: S0 → S1 → S2 → S3 → S4 → S5 → S6.
-
----
-
-## Validation
-
-### Identity and transport
-
-- Use credentials signed by an untrusted root or issued for another node.
-- Mismatch certificate node ID, admission epoch, `NodeId`, or envelope sender.
-- Replay an older admission epoch after a replacement joins.
-- Heal a partition and verify the same process refutes stale death with a higher
-  incarnation.
-- Start a replacement and verify its higher epoch fences the old partitioned boot.
-- Verify fencing is immediate where the new epoch is observed and occurs within
-  60 seconds everywhere else.
-- Modify or replay DTLS-protected SWIM packets.
-- Attempt plaintext and protocol downgrade on every listener.
-- Verify encrypted SWIM UDP payloads stay within 1200 bytes and oversized inbound
-  or outbound packets are dropped without IP fragmentation.
-- Measure encoded identity and failure-report sizes, facts per datagram,
-  admission-cache misses, and convergence time at expected and maximum cluster
-  sizes.
-- Fuzz handshakes, datagrams, routing envelopes, and frame decoders.
-
-### Application authority
-
-- Run the Raft D8 authorization suite.
-- Send data-plane messages from outside committed placement.
-- Verify one rejected group or segment does not disrupt others on the connection.
-- Test every client action with no grant, an unrelated exact grant, and the
-  required exact grant.
-- Use one principal's producer session from another principal.
-- Verify redirects and retries repeat authorization.
-
-### Operations and load
-
-- Rotate and revoke credentials during elections, produce, fetch, replication,
-  and repair.
-- Partition brokers from metadata shards owning required security records before
-  and after cached-record expiry.
-- Cold-restart every broker with empty caches and no established sessions.
-- Test expiry, clock skew, recovery, handshake floods, audit floods, and resource
-  bounds.
-- Measure reconnect storms and metadata-shard partitions at shorter cache ages.
-- Verify diagnostics disclose no credential material.
-
----
-
-## Production Readiness Gate
-
-Production deployment requires:
-
-1. Secure mode is the default and cannot downgrade.
-2. TLS protects TCP and DTLS protects SWIM.
-3. Admission epochs fence reused certificate node IDs.
-4. Every client request has a principal and authorization decision.
-5. Rotation, revocation, expiry, partition failback, restart, and recovery pass
-   live-traffic tests.
-6. Unauthenticated work and audit volume remain bounded.
-7. Bootstrap and credential-lifecycle runbooks exist.
-
-Until then, EastGuard remains trusted-network-only.
-
----
-
-## Security Invariants
-
-1. **Every secure connection has one identity.** A client connection has one
-   principal. A node connection has one certificate node ID, admission epoch,
-   and `NodeId`. This prevents ambiguous authority.
-
-2. **Every certificate node ID has one current admission.** The security state
-   contains one highest epoch and `NodeId` for each certificate node ID. This
-   fences older processes after restart or replacement.
-
-3. **Every producer session has one principal owner.** This prevents cross-tenant
-   sequence poisoning.
-
-4. **Every cached security entry identifies its source and lifetime.** It contains
-   one record path, revision, and deadline. This makes stale state detectable.
-
-5. **Audit state stays within configured capacity.** Detail queues and aggregate
-   counters never exceed their fixed bounds.
-
-### Security Rules
-
-1. Secure mode never downgrades.
-2. Transport authenticates identities; applications authorize operations.
-3. Identity mismatch closes the connection before payload dispatch.
-4. Validated transport identity accompanies every Raft and data-plane envelope.
-5. Application denial drops one envelope, not the shared connection.
-6. Within one admission epoch, higher SWIM incarnation wins.
-7. A higher admission epoch always fences every older process.
-8. Admission controls eligibility; SWIM controls liveness.
-9. SWIM facts are processed only while their `NodeId` and epoch match a current
-   admission in the local cache.
-10. The data plane authorizes senders from committed local placement.
-11. The executing broker authorizes every client operation.
-12. Membership and administrative operations fail closed without fresh security
-   state.
-13. Established traffic fails closed when cached security state expires.
-14. Resource permits are acquired before allocation or task creation.
-15. Audit backpressure never blocks protocol processing.
-16. Revoked credentials stop working within the enforcement deadline.
+1. Secure mode never downgrades to plaintext or unauthenticated protocols.
+2. Transport layers authenticate identity; application state machines authorize actions.
+3. Transport identity mismatches close the connection immediately before payload dispatch.
+4. Application authorization denials drop only the denied envelope, preserving the connection for valid traffic.
+5. A higher admission epoch fences every older process immediately where observed and no later than admission-cache expiry elsewhere.
+6. SWIM controls liveness; metadata Raft controls admission.
+7. Missing or expired security records cause authorization and admission checks to fail closed.
+8. Resource permits are acquired before allocating memory or spawning async tasks.
+9. Audit logging backpressure must never block network protocol processing or consensus.
+10. Only an authorized operator may approve a higher admission epoch.
