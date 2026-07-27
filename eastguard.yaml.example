@@ -1,5 +1,9 @@
 # EastGuard Configuration
 
+# Secure is the production default. Use trusted-development only on isolated
+# development and test networks until secure transports are configured.
+security_mode: "secure"
+
 # Sockets and networking
 client_port: 2921
 cluster_port: 2922

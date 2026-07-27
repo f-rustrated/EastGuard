@@ -1,5 +1,5 @@
 use crate::client::ClientSuccess;
-use crate::config::Environment;
+use crate::config::{Environment, SecurityMode};
 use crate::connections::protocol::{AdminRequest, ClientRequest, ClientResponse, NodeState};
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
@@ -9,6 +9,7 @@ use crate::net::TcpStream;
 
 pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
     Environment {
+        security_mode: SecurityMode::TrustedDevelopment,
         config_dir: std::env::temp_dir()
             .join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4()))
             .to_string_lossy()

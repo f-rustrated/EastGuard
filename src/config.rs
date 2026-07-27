@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use std::fs::{self, OpenOptions};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use uuid::Uuid;
 
 use crate::control_plane::membership::peer_discovery::JoinAttempt;
@@ -15,9 +15,20 @@ use crate::data_plane::sparse_index::SparseIndex;
 use crate::schedulers::ticker::TICK_PERIOD_100_MS;
 pub static ENV: LazyLock<Environment> = LazyLock::new(Environment::init);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecurityMode {
+    Secure,
+    TrustedDevelopment,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Environment {
+    /// Secure mode requires authenticated encrypted transports. Trusted-development
+    /// mode keeps the existing plaintext protocols for isolated tests and local work.
+    #[arg(long, env = "SECURITY_MODE", value_enum, default_value = "secure")]
+    pub security_mode: SecurityMode,
+
     #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
@@ -428,6 +439,7 @@ mod tests {
 
     fn make_env() -> Environment {
         Environment {
+            security_mode: SecurityMode::TrustedDevelopment,
             config_dir: "./eastguard/config".to_string(),
             config_file: None,
             data_dir: "./eastguard/data".to_string(),
@@ -494,6 +506,18 @@ mod tests {
         assert_eq!(env.host, "0.0.0.0");
         assert_eq!(env.data_dir, "/tmp/test");
         assert_eq!(env.vnodes_per_node, 8);
+        assert_eq!(env.security_mode, SecurityMode::Secure);
+    }
+
+    #[test]
+    fn security_mode_requires_explicit_trusted_development_opt_in() {
+        let secure = Environment::try_parse_from(["eastguard"]).unwrap();
+        let trusted =
+            Environment::try_parse_from(["eastguard", "--security-mode", "trusted-development"])
+                .unwrap();
+
+        assert_eq!(secure.security_mode, SecurityMode::Secure);
+        assert_eq!(trusted.security_mode, SecurityMode::TrustedDevelopment);
     }
 
     #[test]
