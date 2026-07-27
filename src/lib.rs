@@ -40,6 +40,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
+use crate::security::SecureTransportConfig;
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -66,6 +67,10 @@ impl StartUp {
     }
 
     pub async fn run(self) -> Result<()> {
+        if SecureTransportConfig::load(&self.env)?.is_some() {
+            anyhow::bail!("secure transport listeners are not implemented");
+        }
+
         // Bind sockets before spawning — fail fast on port conflicts
         let udp_socket = UdpSocket::bind(self.env.peer_bind_addr()).await?;
         let tcp_listener = TcpListener::bind(self.env.peer_bind_addr()).await?;
