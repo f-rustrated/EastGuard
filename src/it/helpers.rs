@@ -10,6 +10,9 @@ use crate::net::TcpStream;
 pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u16) -> Environment {
     Environment {
         security_mode: SecurityMode::TrustedDevelopment,
+        certificate_chain_path: None,
+        private_key_path: None,
+        trust_root_path: None,
         config_dir: std::env::temp_dir()
             .join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4()))
             .to_string_lossy()

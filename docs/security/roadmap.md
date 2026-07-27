@@ -10,7 +10,7 @@
 
 EastGuard operates in two distinct security modes:
 
-- **Secure Mode (Default):** Mutual TLS 1.3 / DTLS 1.3 enforced across all listeners. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
+- **Secure Mode (Default):** Mutual TLS 1.3 protects TCP listeners, and QUIC v1 datagrams protect SWIM UDP. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
 - **Trusted Development Mode:** Plaintext protocols enabled strictly via explicit opt-in configuration for isolated test environments.
 
 ### Threat Model
@@ -25,7 +25,7 @@ The production boundary defends against external network attackers attempting ea
 | **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
 | **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication |
 | **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
-| **SWIM** | UDP 2922 | DTLS 1.3 | Mutual X.509 | Membership gossip & failure detection |
+| **SWIM** | UDP 2922 | QUIC v1 datagrams (TLS 1.3) | Mutual X.509 | Membership gossip and failure detection |
 
 ---
 
@@ -34,7 +34,7 @@ The production boundary defends against external network attackers attempting ea
 Security checks are split between the transport layer and application state machines to keep state machines free of security I/O:
 
 ```
-        [ TLS 1.3 / DTLS 1.3 Transport Layer ]
+       [ TLS 1.3 / QUIC v1 Transport Layer ]
   - Authenticate peer X.509 certificates
   - Enforce framing, datagram MTU, and resource limits
   - Bind connection envelope sender to verified identity
@@ -116,9 +116,9 @@ SWIM liveness gossip is decoupled from cluster admission authority to prevent ne
   [ Raft Reconciliation ] ──► Commit AddPeer / RemovePeer
 ```
 
-1. **Process Proof:** A node connection proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a connection-specific value produced by TLS or DTLS, so the proof cannot be replayed on another connection. The reusable node certificate alone cannot create or claim a newer epoch.
+1. **Process Proof:** A node connection proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a connection-specific value produced by TLS or QUIC, so the proof cannot be replayed on another connection. The reusable node certificate alone cannot create or claim a newer epoch.
 2. **Admission Gate:** The SWIM actor checks incoming packets against a local admission cache backed by metadata Raft before passing facts to the SWIM state machine.
-3. **Gossip Rule:** DTLS authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
+3. **Gossip Rule:** The QUIC connection authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
 4. **Cache Policy:** Admission records are cached locally with a maximum TTL of 60 seconds. If a cache entry expires while the owning metadata shard is unreachable, the gate fails closed.
 
 ---
@@ -178,7 +178,7 @@ Security records (`security/node/{id}`, `security/acl/{resource}`, `security/rev
 ### Online Credential Rotation
 
 - **Zero-Downtime CA Rotation:** Brokers support dual trust chain loading. New root CAs can be added and leaf certificates reloaded online without restarting brokers or changing `Admission Epoch` / `NodeId`.
-- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active TLS/DTLS sessions are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
+- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active TLS and QUIC connections are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
 - **Recovery:** Runbooks cover lost authorized-operator access, lost issuing keys, expiry, accidental revocation, trust-root replacement, and cold-cluster restart.
 
 ---
@@ -187,7 +187,24 @@ Security records (`security/node/{id}`, `security/acl/{resource}`, `security/rev
 
 ### Rate & Memory Bounds
 - Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, memory allocations, and per-source request rates.
-- **DTLS Datagram Size:** Encrypted SWIM datagram payloads are capped at **1200 bytes** to ensure the total packet fits within the 1280-byte minimum IPv6 MTU without IP fragmentation.
+- **QUIC Datagram Size:** QUIC UDP payloads are capped at **1200 bytes**, which fits within the 1280-byte minimum IPv6 MTU after IPv6 and UDP headers. The SWIM payload budget is what remains after QUIC packet protection and framing.
+
+### Deterministic Simulation
+
+Secure SWIM must run under EastGuard's turmoil-based deterministic simulation
+tests. Quinn's abstract UDP socket and runtime boundaries must use
+`crate::net::UdpSocket` and Tokio's virtualized clock in test builds:
+
+```
+production                         deterministic test
+real UDP + real Tokio time         turmoil UDP + virtual Tokio time
+             \                     /
+              same Quinn protocol
+```
+
+A production-only QUIC path does not pass S0. Feasibility requires a multi-node
+turmoil test that completes mutual authentication and exchanges QUIC datagrams
+under virtual time.
 
 ### Audit Subsystem
 - **Non-Blocking Execution:** Security audit events (authentication success/failure, ACL denials, admissions) are queued asynchronously. Audit backpressure never blocks protocol execution or consensus.
@@ -201,15 +218,15 @@ Security records (`security/node/{id}`, `security/acl/{resource}`, `security/rev
 ```
 S0 ──► S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 config  records  TCP     SWIM    clients  operations  production
-                 mTLS    DTLS    + ACLs   + audit     gate
+                 mTLS    QUIC    + ACLs   + audit     gate
 ```
 
 | Phase | Target Scope | Key Deliverable | Exit Criteria |
 | :--- | :--- | :--- | :--- |
-| **S0** | Configuration | Security modes, cert loader, DTLS 1.3 feasibility | Secure mode opens no plaintext listeners; a maintained DTLS 1.3 implementation satisfies certificate, replay, cookie, and resource-bound requirements |
+| **S0** | Configuration | Security modes, certificate loader, Quinn feasibility | Secure mode opens no plaintext listeners; Quinn proves mutual certificate authentication, datagram delivery, address validation, replay protection, disabled 0-RTT, bounded connection state, and deterministic operation under turmoil |
 | **S1** | Metadata Storage | Security record schema, sharded Raft state | Security records survive snapshot & recovery |
 | **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft D8 RPC authorization | Authenticated and authorized cluster TCP traffic |
-| **S3** | Membership | DTLS 1.3 on UDP 2922 & SWIM admission gate | Secure gossip & partition-safe admission fencing |
+| **S3** | Membership | QUIC v1 datagrams on UDP 2922 and SWIM admission gate | Secure gossip and partition-safe admission fencing |
 | **S4** | Client API | Client mTLS on TCP 2921, principal binding, ACLs | Default-deny enforcement on all client APIs |
 | **S5** | Operations | Certificate rotation, revocation, expiry, recovery, audit logging | Online credential operations and recovery runbooks |
 | **S6** | Production Gate | Adversarial testing, fuzzing, partition stress | Passes all production readiness checks |
@@ -217,7 +234,8 @@ config  records  TCP     SWIM    clients  operations  production
 S6 must verify node and client impersonation, stale-process replay, unauthorized
 operations, protocol downgrade, rotation under live traffic, expired and revoked
 credentials, cold-cluster restart, handshake and datagram fuzzing, resource
-bounds, and secret-free diagnostics.
+bounds, secret-free diagnostics, and reproducible secure-SWIM behavior under
+turmoil with pinned randomness and node identities.
 
 ---
 

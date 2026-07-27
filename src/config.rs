@@ -29,6 +29,18 @@ pub struct Environment {
     #[arg(long, env = "SECURITY_MODE", value_enum, default_value = "secure")]
     pub security_mode: SecurityMode,
 
+    /// PEM certificate chain presented by this node in secure mode.
+    #[arg(long, env = "CERTIFICATE_CHAIN_PATH")]
+    pub certificate_chain_path: Option<PathBuf>,
+
+    /// PEM private key matching this node's leaf certificate.
+    #[arg(long, env = "PRIVATE_KEY_PATH")]
+    pub private_key_path: Option<PathBuf>,
+
+    /// PEM certificate authorities trusted for node and client authentication.
+    #[arg(long, env = "TRUST_ROOT_PATH")]
+    pub trust_root_path: Option<PathBuf>,
+
     #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
@@ -440,6 +452,9 @@ mod tests {
     fn make_env() -> Environment {
         Environment {
             security_mode: SecurityMode::TrustedDevelopment,
+            certificate_chain_path: None,
+            private_key_path: None,
+            trust_root_path: None,
             config_dir: "./eastguard/config".to_string(),
             config_file: None,
             data_dir: "./eastguard/data".to_string(),

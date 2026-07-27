@@ -10,6 +10,7 @@ mod data_plane;
 
 mod net;
 pub(crate) mod schedulers;
+mod security;
 
 pub(crate) mod impls;
 #[cfg(test)]
