@@ -164,6 +164,25 @@ mod tests {
 
     use super::*;
 
+    const MAX_INCOMING_HANDSHAKES: usize = 128;
+    const DATAGRAM_BUFFER_BYTES: usize = 64 * 1200;
+
+    fn endpoint_config() -> quinn::EndpointConfig {
+        let mut config = quinn::EndpointConfig::default();
+        config.max_udp_payload_size(1200).unwrap();
+        config
+    }
+
+    fn transport_config() -> Arc<quinn::TransportConfig> {
+        let mut config = quinn::TransportConfig::default();
+        config
+            .max_concurrent_bidi_streams(0_u8.into())
+            .max_concurrent_uni_streams(0_u8.into())
+            .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES))
+            .datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
+        Arc::new(config)
+    }
+
     fn configs() -> (quinn::ServerConfig, quinn::ClientConfig) {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(["server".to_string()]).unwrap();
@@ -188,13 +207,21 @@ mod tests {
                 .with_root_certificates((*roots).clone())
                 .with_client_auth_cert(vec![certificate], private_key)
                 .unwrap();
+        assert_eq!(server_crypto.max_early_data_size, 0);
+        assert!(!client_crypto.enable_early_data);
 
-        (
-            quinn::ServerConfig::with_crypto(Arc::new(
-                QuicServerConfig::try_from(server_crypto).unwrap(),
-            )),
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap())),
-        )
+        let transport = transport_config();
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        server
+            .transport_config(transport.clone())
+            .max_incoming(MAX_INCOMING_HANDSHAKES);
+        let mut client =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+        client.transport_config(transport);
+
+        (server, client)
     }
 
     #[test]
@@ -212,7 +239,7 @@ mod tests {
                     .await
                     .unwrap();
                 let endpoint = quinn::Endpoint::new_with_abstract_socket(
-                    quinn::EndpointConfig::default(),
+                    endpoint_config(),
                     Some(server_config),
                     Arc::new(QuinnUdpSocket::new(socket)),
                     Arc::new(quinn::TokioRuntime),
@@ -236,7 +263,7 @@ mod tests {
                 .await
                 .unwrap();
             let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
+                endpoint_config(),
                 None,
                 Arc::new(QuinnUdpSocket::new(socket)),
                 Arc::new(quinn::TokioRuntime),
