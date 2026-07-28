@@ -1,17 +1,109 @@
 #![allow(dead_code)]
+use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::verify_server_cert_signed_by_trust_anchor;
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::server::ParsedCertificate;
 use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, OtherError,
+    RootCertStore, ServerConfig, SignatureScheme,
+};
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::{Environment, SecurityMode};
+
+/// Verifies certificates presented to EastGuard's outbound node connections.
+///
+/// The shared client config uses this verifier when Raft or data transport
+/// connects to another broker. It retains certificate-chain, validity,
+/// server-usage, and TLS handshake-signature verification. It does not compare
+/// the certificate with a DNS name because brokers are identified by the Node
+/// Certificate Principal carried in the certificate; admission later binds
+/// that stable principal to the process-specific `NodeId`.
+///
+///  Peer certificate
+//   ├── trusted CA chain? ── no → reject
+//   ├── valid lifetime and server usage? ── no → reject
+//   ├── valid TLS handshake signature? ── no → reject
+//   └── exactly one Node Certificate Principal? ── no → reject
+struct NodeServerCertVerifier {
+    roots: Arc<RootCertStore>,
+    supported: WebPkiSupportedAlgorithms,
+}
+
+impl NodeServerCertVerifier {
+    fn new(roots: Arc<RootCertStore>) -> Self {
+        Self {
+            roots,
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl fmt::Debug for NodeServerCertVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeServerCertVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerCertVerifier for NodeServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        let certificate = ParsedCertificate::try_from(end_entity)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &certificate,
+            &self.roots,
+            intermediates,
+            now,
+            self.supported.all,
+        )?;
+        node_certificate_principal(end_entity).map_err(|error| {
+            CertificateError::Other(OtherError(Arc::new(std::io::Error::other(
+                error.to_string(),
+            ))))
+        })?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(message, certificate, signature, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(message, certificate, signature, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
 
 pub(crate) struct SecureTransportConfig {
     pub(crate) server: Arc<ServerConfig>,
@@ -55,7 +147,8 @@ impl SecureTransportConfig {
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(certificate_chain.clone(), private_key.clone_key())?;
         let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates((*trust_roots).clone())
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NodeServerCertVerifier::new(trust_roots)))
             .with_client_auth_cert(certificate_chain, private_key)?;
 
         Ok(Self {
@@ -214,6 +307,33 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "node certificate has multiple Node Certificate Principals"
+        );
+    }
+
+    #[test]
+    fn server_verifier_requires_trust_and_node_principal() {
+        let trusted = certificate_with_uris(&["urn:eastguard:node:broker-a"]);
+        let missing_principal = certificate_with_uris(&["urn:example:unrelated"]);
+        let mut roots = RootCertStore::empty();
+        roots.add(trusted.clone()).unwrap();
+        roots.add(missing_principal.clone()).unwrap();
+        let verifier = NodeServerCertVerifier::new(Arc::new(roots));
+        let server_name = ServerName::try_from("unused.eastguard").unwrap();
+
+        verifier
+            .verify_server_cert(&trusted, &[], &server_name, &[], UnixTime::now())
+            .unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&missing_principal, &[], &server_name, &[], UnixTime::now(),)
+                .is_err()
+        );
+
+        let untrusted = certificate_with_uris(&["urn:eastguard:node:broker-b"]);
+        assert!(
+            verifier
+                .verify_server_cert(&untrusted, &[], &server_name, &[], UnixTime::now())
+                .is_err()
         );
     }
 }
