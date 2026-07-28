@@ -23,7 +23,7 @@ MetadataStateMachine (one per shard group)
 │
 ├── topic_name_index: HashMap<String, TopicId>
 └── security
-    ├── admissions: Certificate Node ID → Admission Record
+    ├── admissions: Node Certificate Principal → Admission Record
     ├── ACLs: Resource → ACL Record
     └── revocations: (Issuer, Serial) → Revocation Record
 ```
@@ -85,4 +85,4 @@ MetadataStateMachine (one per shard group)
 
 22. **A committed consumer-group generation assigns each active range exactly once.** When a group has members, its assignment keys exactly equal the topic's active ranges and every assignment names a current member. When it has no members, it has no assignments. Membership or range-topology changes advance the generation and recompute the full desired assignment through the Raft log; heartbeat refreshes that do not change membership leave the generation unchanged.
 
-23. **Security map keys match their records.** Admission keys equal the record's Certificate Node ID, ACL keys equal the record's resource, and revocation keys equal the record's issuer and serial. A map therefore contains at most one current admission per Certificate Node ID and snapshot restore cannot silently associate a security record with a different lookup key.
+23. **Security map keys match their records.** Admission keys equal the record's Node Certificate Principal, ACL keys equal the record's resource, and revocation keys equal the record's issuer and serial. A map therefore contains at most one current admission per Node Certificate Principal and snapshot restore cannot silently associate a security record with a different lookup key.

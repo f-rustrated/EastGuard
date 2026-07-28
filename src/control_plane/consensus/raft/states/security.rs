@@ -15,13 +15,13 @@ pub(crate) struct SecurityState {
     pub(super) revocations: HashMap<(String, Box<[u8]>), RevocationRecord>,
 }
 
-/// Current process admitted for `security/node/{certificate_node_id}`.
+/// Current process admitted for `security/node/{node_certificate_principal}`.
 ///
 /// A restart replaces this record through its metadata shard. Admission checks
 /// accept SWIM facts only when the epoch, node ID, and process key match it.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct AdmissionRecord {
-    pub certificate_node_id: String,
+    pub node_certificate_principal: String,
     pub revision: u64,
     pub epoch: u64,
     pub node_id: NodeId,
@@ -55,10 +55,10 @@ pub(crate) struct RevocationRecord {
 #[cfg(any(test, debug_assertions))]
 impl crate::test_traits::TAssertInvariant for SecurityState {
     fn assert_invariants(&self) {
-        for (certificate_node_id, admission) in &self.admissions {
+        for (node_certificate_principal, admission) in &self.admissions {
             assert_eq!(
-                certificate_node_id, &admission.certificate_node_id,
-                "admission map key does not match Certificate Node ID"
+                node_certificate_principal, &admission.node_certificate_principal,
+                "admission map key does not match Node Certificate Principal"
             );
         }
         for (resource, acl) in &self.acls {
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn security_records_round_trip() {
         round_trip(&AdmissionRecord {
-            certificate_node_id: "broker-a".to_string(),
+            node_certificate_principal: "broker-a".to_string(),
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),

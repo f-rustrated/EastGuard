@@ -635,7 +635,7 @@ mod tests {
     fn security_records_survive_snapshot_restore() {
         let mut state = MetadataState::new(ShardGroupId(1));
         let admission = AdmissionRecord {
-            certificate_node_id: "broker-a".to_string(),
+            node_certificate_principal: "broker-a".to_string(),
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
@@ -653,10 +653,10 @@ mod tests {
             revoked_at: 100,
         };
 
-        state
-            .security
-            .admissions
-            .insert(admission.certificate_node_id.clone(), admission.clone());
+        state.security.admissions.insert(
+            admission.node_certificate_principal.clone(),
+            admission.clone(),
+        );
         state
             .security
             .acls

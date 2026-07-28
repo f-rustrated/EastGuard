@@ -63,8 +63,8 @@ To allow safe node restarts and hardware replacement without exposing the cluste
 
 | Term | Scope | Lifetime / Ordering | Function |
 | :--- | :--- | :--- | :--- |
-| **Certificate Node ID** | X.509 Certificate | Long-lived / Reused | Operator-assigned node name and stable admission-record key. |
-| **Admission Epoch** | Certificate Node ID | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
+| **Node Certificate Principal** | X.509 Certificate | Long-lived / Reused | Operator-assigned node principal read from the authenticated certificate and used as the stable admission-record key. |
+| **Admission Epoch** | Node Certificate Principal | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
 | **NodeId** | Running Process | Single process lifetime | Unique ID generated on startup; used by SWIM, topology ring, Raft, and data placement. |
 | **Process Key** | Running Process | Single process lifetime | Proves that the connection belongs to the process admitted for this epoch. |
 | **SWIM Incarnation** | Running Process | Monotonically increasing counter | Incremented by the *same* process instance to refute false `Suspect`/`Dead` gossip. |
@@ -149,7 +149,7 @@ A security record is one durable admission, ACL, or revocation entry. Its record
 path selects one metadata shard; its revision lets brokers detect stale cached
 copies.
 
-Security records (`security/node/{certificate-node-id}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
+Security records (`security/node/{node-certificate-principal}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
 
 ```
   Client/Node Request ──► Any Broker ──► Hash Record Path ──► Hosts Shard? ─┬─► Yes ──► Commit via Raft
@@ -157,11 +157,11 @@ Security records (`security/node/{certificate-node-id}`, `security/acl/{resource
 ```
 
 - **Stable Admission Key:** A restart changes the process `NodeId` and key, but
-  not the Certificate Node ID. The same record and metadata shard therefore
+  not the Node Certificate Principal. The same record and metadata shard therefore
   replace the old admitted process atomically:
 
 ```
-security/node/{certificate-node-id}
+security/node/{node-certificate-principal}
                  │
                  └── Admission Epoch + NodeId + Process Public Key
 ```
@@ -182,7 +182,7 @@ security/node/{certificate-node-id}
 3. A later joining node generates a new `NodeId` and process key.
 4. An authorized operator approves that exact `NodeId` and process public key. The reusable node certificate alone cannot authorize replacement.
 5. The joining node connects to a **limited admission endpoint** using its X.509 certificate.
-6. The endpoint uses the authenticated Certificate Node ID to route to its
+6. The endpoint uses the authenticated Node Certificate Principal to route to its
    admission record. The owning metadata shard atomically replaces the prior
    process with the next `Admission Epoch`, `NodeId`, and process public key.
 7. The joining node proves possession of the process private key before entering SWIM gossip and Raft membership reconciliation.
@@ -255,8 +255,8 @@ turmoil with pinned randomness and node identities.
 
 ### System Invariants
 
-1. **Single Connection Identity:** Every established client connection has exactly one authenticated principal; every node connection has exactly one `(Certificate Node ID, Admission Epoch, NodeId, Process Public Key)`.
-2. **Unique Active Node Admission:** Metadata state maintains at most one active `(Admission Epoch, NodeId, Process Public Key)` per Certificate Node ID.
+1. **Single Connection Identity:** Every established client connection has exactly one authenticated principal; every node connection has exactly one `(Node Certificate Principal, Admission Epoch, NodeId, Process Public Key)`.
+2. **Unique Active Node Admission:** Metadata state maintains at most one active `(Admission Epoch, NodeId, Process Public Key)` per Node Certificate Principal.
 3. **Immutable Producer Session Principal:** Every producer session is immutably bound to the principal that created it.
 4. **Explicit Cache Bounding:** Every cached security entry specifies its source metadata shard, revision, and expiry measured with a monotonic clock (≤ 60 seconds).
 5. **Bounded Audit Footprint:** Audit queues and aggregate rate counters remain within configured capacity.
