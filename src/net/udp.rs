@@ -1,11 +1,12 @@
 #![allow(dead_code)]
+use crate::impl_new_struct_wrapper;
+
 use super::inner;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -13,19 +14,7 @@ type Readiness = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 
 pub struct UdpSocket(inner::UdpSocket);
 
-impl Deref for UdpSocket {
-    type Target = inner::UdpSocket;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for UdpSocket {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+impl_new_struct_wrapper!(UdpSocket, inner::UdpSocket);
 
 impl UdpSocket {
     pub async fn bind<A: inner::ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
