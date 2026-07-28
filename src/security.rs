@@ -224,14 +224,42 @@ impl NodeTransportSecurity {
 /// the admission-record key. This function only parses the certificate; callers
 /// must use it after rustls has authenticated the peer's certificate chain.
 pub(crate) fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
-    const NODE_PRINCIPAL_URI_PREFIX: &str = "urn:eastguard:node:";
+    certificate_principal(
+        certificate,
+        "urn:eastguard:node:",
+        "node",
+        "Node Certificate Principal",
+    )
+}
 
+/// Reads the client principal from exactly one
+/// `urn:eastguard:client:<principal>` URI Subject Alternative Name.
+///
+/// TLS authentication must succeed before callers use this parsed identity for
+/// authorization.
+pub(crate) fn client_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
+    certificate_principal(
+        certificate,
+        "urn:eastguard:client:",
+        "client",
+        "Client Certificate Principal",
+    )
+}
+
+fn certificate_principal(
+    certificate: &CertificateDer<'_>,
+    uri_prefix: &str,
+    certificate_kind: &str,
+    principal_name: &str,
+) -> Result<String> {
     let (_, certificate) =
         X509Certificate::from_der(certificate.as_ref()).context("invalid X.509 certificate")?;
     let subject_alt_name = certificate
         .subject_alternative_name()
         .context("invalid X.509 subject alternative name")?
-        .context("node certificate has no subject alternative name")?;
+        .with_context(|| {
+            format!("{certificate_kind} certificate has no subject alternative name")
+        })?;
 
     let mut principals =
         subject_alt_name
@@ -239,16 +267,16 @@ pub(crate) fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Re
             .general_names
             .iter()
             .filter_map(|name| match name {
-                GeneralName::URI(uri) => uri.strip_prefix(NODE_PRINCIPAL_URI_PREFIX),
+                GeneralName::URI(uri) => uri.strip_prefix(uri_prefix),
                 _ => None,
             });
     let principal = principals
         .next()
         .filter(|principal| !principal.is_empty())
-        .context("node certificate has no Node Certificate Principal")?;
+        .with_context(|| format!("{certificate_kind} certificate has no {principal_name}"))?;
     anyhow::ensure!(
         principals.next().is_none(),
-        "node certificate has multiple Node Certificate Principals"
+        "{certificate_kind} certificate has multiple {principal_name}s"
     );
     Ok(principal.to_string())
 }
@@ -324,6 +352,39 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "node certificate has multiple Node Certificate Principals"
+        );
+    }
+
+    #[test]
+    fn reads_client_principal_from_uri_subject_alternative_name() {
+        let certificate =
+            certificate_with_uris(&["urn:example:unrelated", "urn:eastguard:client:producer-a"]);
+
+        assert_eq!(
+            client_certificate_principal(&certificate).unwrap(),
+            "producer-a"
+        );
+    }
+
+    #[test]
+    fn requires_exactly_one_client_principal() {
+        let missing = certificate_with_uris(&["urn:example:unrelated"]);
+        let ambiguous = certificate_with_uris(&[
+            "urn:eastguard:client:producer-a",
+            "urn:eastguard:client:producer-b",
+        ]);
+
+        assert_eq!(
+            client_certificate_principal(&missing)
+                .unwrap_err()
+                .to_string(),
+            "client certificate has no Client Certificate Principal"
+        );
+        assert_eq!(
+            client_certificate_principal(&ambiguous)
+                .unwrap_err()
+                .to_string(),
+            "client certificate has multiple Client Certificate Principals"
         );
     }
 
