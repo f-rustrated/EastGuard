@@ -241,7 +241,7 @@ config  records  TCP     SWIM    clients  operations  production
 | :--- | :--- | :--- | :--- |
 | **S0** | Configuration | Security modes, certificate loader, Quinn feasibility | Secure mode opens no plaintext listeners; Quinn proves mutual certificate authentication, datagram delivery, address validation, replay protection, disabled 0-RTT, bounded connection state, and deterministic operation under turmoil |
 | **S1** | Metadata Storage | Security record schema, sharded Raft state | Security records survive snapshot & recovery |
-| **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft D8 RPC authorization | Authenticated and authorized cluster TCP traffic |
+| **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft sender and role authorization | Authenticated and authorized cluster TCP traffic |
 | **S3** | Membership | QUIC v1 datagrams on UDP 2922 and SWIM admission gate | Secure gossip and partition-safe admission fencing |
 | **S4** | Client API | Client mTLS on TCP 2921, principal binding, ACLs | Default-deny enforcement on all client APIs |
 | **S5** | Operations | Certificate rotation, revocation, expiry, recovery, audit logging | Online credential operations and recovery runbooks |
