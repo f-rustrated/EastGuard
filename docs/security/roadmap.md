@@ -10,7 +10,7 @@
 
 EastGuard operates in two distinct security modes:
 
-- **Secure Mode (Default):** Mutual TLS 1.3 protects TCP listeners, and QUIC v1 datagrams protect SWIM UDP. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
+- **Secure Mode (Default):** Mutual TLS 1.3 protects TCP listeners. Secure SWIM UDP is intentionally deferred until EastGuard can adopt a suitable datagram security implementation. Until then, secure mode fails startup rather than exposing plaintext SWIM. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
 - **Trusted Development Mode:** Plaintext protocols enabled strictly via explicit opt-in configuration for isolated test environments.
 
 ### Threat Model
@@ -25,7 +25,7 @@ The production boundary defends against external network attackers attempting ea
 | **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
 | **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication |
 | **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
-| **SWIM** | UDP 2922 | QUIC v1 datagrams (TLS 1.3) | Mutual X.509 | Membership gossip and failure detection |
+| **SWIM** | UDP 2922 | Secure datagrams (deferred) | Mutual X.509 | Membership gossip and failure detection |
 
 ---
 
@@ -34,7 +34,9 @@ The production boundary defends against external network attackers attempting ea
 Security checks are split between the transport layer and application state machines to keep state machines free of security I/O:
 
 ```
-       [ TLS 1.3 / QUIC v1 Transport Layer ]
+       [ Authenticated Transport Layer ]
+       TCP: TLS 1.3
+       UDP: secure datagrams (deferred)
   - Authenticate peer X.509 certificates
   - Enforce framing, datagram MTU, and resource limits
   - Bind connection envelope sender to verified identity
@@ -120,9 +122,9 @@ SWIM liveness gossip is decoupled from cluster admission authority to prevent ne
   [ Raft Reconciliation ] ──► Commit AddPeer / RemovePeer
 ```
 
-1. **Process Proof:** A node connection proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a connection-specific value produced by TLS or QUIC, so the proof cannot be replayed on another connection. The reusable node certificate alone cannot create or claim a newer epoch.
+1. **Process Proof:** A node session proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a session-specific value produced by the authenticated transport, so the proof cannot be replayed in another session. The reusable node certificate alone cannot create or claim a newer epoch.
 2. **Admission Gate:** The SWIM actor checks incoming packets against a local admission cache backed by metadata Raft before passing facts to the SWIM state machine.
-3. **Gossip Rule:** The QUIC connection authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
+3. **Gossip Rule:** The secure datagram session authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
 4. **Cache Policy:** Admission records are cached locally with a maximum TTL of 60 seconds. If a cache entry expires while the owning metadata shard is unreachable, the gate fails closed.
 
 ---
@@ -194,7 +196,7 @@ security/node/{node-certificate-principal}
 ### Online Credential Rotation
 
 - **Zero-Downtime CA Rotation:** Brokers support dual trust chain loading. New root CAs can be added and leaf certificates reloaded online without restarting brokers or changing `Admission Epoch` / `NodeId`.
-- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active TLS and QUIC connections are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
+- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active authenticated sessions are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
 - **Recovery:** Runbooks cover lost authorized-operator access, lost issuing keys, expiry, accidental revocation, trust-root replacement, and cold-cluster restart.
 
 ---
@@ -203,24 +205,52 @@ security/node/{node-certificate-principal}
 
 ### Rate & Memory Bounds
 - Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, memory allocations, and per-source request rates.
-- **QUIC Datagram Size:** QUIC UDP payloads are capped at **1200 bytes**, which fits within the 1280-byte minimum IPv6 MTU after IPv6 and UDP headers. The SWIM payload budget is what remains after QUIC packet protection and framing.
+- The future secure UDP transport must define a payload budget that avoids IP fragmentation after authentication and encryption overhead.
 
-### Deterministic Simulation
+### Secure UDP Decision
 
-Secure SWIM must run under EastGuard's turmoil-based deterministic simulation
-tests. Quinn's abstract UDP socket and runtime boundaries must use
-`crate::net::UdpSocket` and Tokio's virtualized clock in test builds:
+EastGuard retains UDP for SWIM because connection-oriented transport does not
+fit membership at cluster scale:
 
 ```
-production                         deterministic test
-real UDP + real Tokio time         turmoil UDP + virtual Tokio time
-             \                     /
-              same Quinn protocol
+       SWIM probes one peer per interval
+                    │
+                    ▼
+              stateless UDP
+                    │
+       ┌────────────┴────────────┐
+       ▼                         ▼
+constant socket count      packet loss remains
+per node                   visible to SWIM
 ```
 
-A production-only QUIC path does not pass S0. Feasibility requires a multi-node
-turmoil test that completes mutual authentication and exchanges QUIC datagrams
-under virtual time.
+TCP with bounded connection reuse was rejected because large clusters would
+trade an unbounded connection mesh for continuous handshakes, connection churn,
+kernel connection tracking, and head-of-line blocking. QUIC datagrams preserve
+UDP delivery semantics, but their per-peer connection state and implementation
+complexity are not justified for SWIM's sparse traffic. Current DTLS options do
+not meet the combined requirements for maturity, permissive licensing, Rust
+integration, and deterministic simulation.
+
+Secure SWIM therefore remains deferred. Trusted development mode may use
+plaintext UDP in isolated environments. Secure mode must fail startup until a
+secure datagram transport is selected and implemented; it must never fall back
+to plaintext UDP.
+
+### Acceptance Criteria for a Future Secure UDP Transport
+
+The selected transport must:
+
+| Requirement | Reason |
+| :--- | :--- |
+| Preserve datagram boundaries and loss | SWIM timeouts and indirect probes must observe loss rather than transport retransmission delays |
+| Keep per-node transport state bounded independently of cluster size | Membership must remain viable for clusters with thousands of nodes |
+| Authenticate node certificates and expose the certificate principal | Admission must bind each packet source to a verified node identity |
+| Reject replay and spoofed source traffic | Old or forged membership packets must not alter liveness |
+| Avoid IP fragmentation | One lost fragment must not discard an oversized protected packet |
+| Run over EastGuard's UDP abstraction | Production and turmoil must exercise the same protocol state machine |
+| Use virtual time in deterministic tests | Handshake retry, expiry, and packet loss must be reproducible |
+| Use a mature, maintainable, permissively licensed dependency | Cluster security must not rely on an unaudited or incompatible implementation |
 
 ### Audit Subsystem
 - **Non-Blocking Execution:** Security audit events (authentication success/failure, ACL denials, admissions) are queued asynchronously. Audit backpressure never blocks protocol execution or consensus.
@@ -234,15 +264,15 @@ under virtual time.
 ```
 S0 ──► S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 config  records  TCP     SWIM    clients  operations  production
-                 mTLS    QUIC    + ACLs   + audit     gate
+                 mTLS  deferred  + ACLs   + audit     gate
 ```
 
 | Phase | Target Scope | Key Deliverable | Exit Criteria |
 | :--- | :--- | :--- | :--- |
-| **S0** | Configuration | Security modes, certificate loader, Quinn feasibility | Secure mode opens no plaintext listeners; Quinn proves mutual certificate authentication, datagram delivery, address validation, replay protection, disabled 0-RTT, bounded connection state, and deterministic operation under turmoil |
+| **S0** | Configuration | Security modes and certificate loader | Secure mode opens no plaintext listeners and fails startup while any required secure listener is unavailable |
 | **S1** | Metadata Storage | Security record schema, sharded Raft state | Security records survive snapshot & recovery |
 | **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft sender and role authorization | Authenticated and authorized cluster TCP traffic |
-| **S3** | Membership | QUIC v1 datagrams on UDP 2922 and SWIM admission gate | Secure gossip and partition-safe admission fencing |
+| **S3** | Membership (deferred) | Secure datagrams on UDP 2922 and SWIM admission gate | A transport meeting the secure UDP acceptance criteria provides authenticated gossip and partition-safe admission fencing |
 | **S4** | Client API | Client mTLS on TCP 2921, principal binding, ACLs | Default-deny enforcement on all client APIs |
 | **S5** | Operations | Certificate rotation, revocation, expiry, recovery, audit logging | Online credential operations and recovery runbooks |
 | **S6** | Production Gate | Adversarial testing, fuzzing, partition stress | Passes all production readiness checks |
@@ -251,7 +281,8 @@ S6 must verify node and client impersonation, stale-process replay, unauthorized
 operations, protocol downgrade, rotation under live traffic, expired and revoked
 credentials, cold-cluster restart, handshake and datagram fuzzing, resource
 bounds, secret-free diagnostics, and reproducible secure-SWIM behavior under
-turmoil with pinned randomness and node identities.
+turmoil with pinned randomness and node identities. S6 cannot pass while S3 is
+deferred.
 
 ---
 
