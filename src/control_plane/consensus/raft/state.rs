@@ -211,6 +211,13 @@ impl Raft {
                 if *member == self.node_id || !live_set.contains(member) {
                     continue;
                 }
+                if self.peers.contains(member) {
+                    // Bootstrap group creation can observe different ring snapshots
+                    // on different nodes. Re-applying an existing voter is a "no-op"
+                    // here, but heals followers whose initial voter set omitted it.
+                    changed |= self.propose(RaftCommand::AddPeer(member.clone())).is_ok();
+                    continue;
+                }
                 // Stage the ring member as a non-voting learner; it's promoted to a
                 // voter once caught up. Never added straight to the quorum — an
                 // un-participating ring member would otherwise freeze commits.
@@ -3830,6 +3837,28 @@ mod tests {
 
         let members = group.replicas.clone();
         (raft, reader, members)
+    }
+
+    #[test]
+    fn takeover_reasserts_bootstrap_voters_through_the_log() {
+        let (mut raft, reader, members) = ring_raft_with_stale(&[]);
+        let expected: HashSet<NodeId> = members
+            .iter()
+            .filter(|member| **member != node("node-1"))
+            .cloned()
+            .collect();
+
+        assert!(raft.reconcile(&reader, Some(members.0)));
+
+        let asserted: HashSet<NodeId> = raft
+            .consensus
+            .uncommited_log_range()
+            .filter_map(|index| match &raft.consensus.log_entry(index)?.command {
+                RaftCommand::AddPeer(node_id) => Some(node_id.clone()),
+                RaftCommand::Noop | RaftCommand::RemovePeer(_) | RaftCommand::Metadata(_) => None,
+            })
+            .collect();
+        assert_eq!(asserted, expected);
     }
 
     /// Simulate `peer` confirming replication up to the leader's last index.
