@@ -63,8 +63,8 @@ To allow safe node restarts and hardware replacement without exposing the cluste
 
 | Term | Scope | Lifetime / Ordering | Function |
 | :--- | :--- | :--- | :--- |
-| **Certificate Node ID** | Configuration | Long-lived / Reused | Operator-assigned node name embedded in the X.509 certificate. |
-| **Admission Epoch** | Metadata Shard | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
+| **Certificate Node ID** | X.509 Certificate | Long-lived / Reused | Operator-assigned node name and stable admission-record key. |
+| **Admission Epoch** | Certificate Node ID | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
 | **NodeId** | Running Process | Single process lifetime | Unique ID generated on startup; used by SWIM, topology ring, Raft, and data placement. |
 | **Process Key** | Running Process | Single process lifetime | Proves that the connection belongs to the process admitted for this epoch. |
 | **SWIM Incarnation** | Running Process | Monotonically increasing counter | Incremented by the *same* process instance to refute false `Suspect`/`Dead` gossip. |
@@ -149,11 +149,21 @@ A security record is one durable admission, ACL, or revocation entry. Its record
 path selects one metadata shard; its revision lets brokers detect stale cached
 copies.
 
-Security records (`security/node/{id}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
+Security records (`security/node/{certificate-node-id}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
 
 ```
   Client/Node Request ──► Any Broker ──► Hash Record Path ──► Hosts Shard? ─┬─► Yes ──► Commit via Raft
                                                                            └─► No  ──► Return Owner Redirect
+```
+
+- **Stable Admission Key:** A restart changes the process `NodeId` and key, but
+  not the Certificate Node ID. The same record and metadata shard therefore
+  replace the old admitted process atomically:
+
+```
+security/node/{certificate-node-id}
+                 │
+                 └── Admission Epoch + NodeId + Process Public Key
 ```
 
 - **Local Authorization:** Brokers evaluate ACLs against local cached security records.
@@ -172,7 +182,9 @@ Security records (`security/node/{id}`, `security/acl/{resource}`, `security/rev
 3. A later joining node generates a new `NodeId` and process key.
 4. An authorized operator approves that exact `NodeId` and process public key. The reusable node certificate alone cannot authorize replacement.
 5. The joining node connects to a **limited admission endpoint** using its X.509 certificate.
-6. The endpoint routes to the owning metadata shard, which atomically commits the next `Admission Epoch`, `NodeId`, and process public key.
+6. The endpoint uses the authenticated Certificate Node ID to route to its
+   admission record. The owning metadata shard atomically replaces the prior
+   process with the next `Admission Epoch`, `NodeId`, and process public key.
 7. The joining node proves possession of the process private key before entering SWIM gossip and Raft membership reconciliation.
 
 ### Online Credential Rotation
