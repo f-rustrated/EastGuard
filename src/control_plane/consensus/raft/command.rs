@@ -16,7 +16,7 @@ use crate::{impl_from_variant, impl_from_variant_via};
 pub enum RaftCommand {
     Noop,
     Metadata(MetadataCommand),
-    AddPeer(NodeId),
+    EnsurePeer(NodeId),
     RemovePeer(NodeId),
 }
 

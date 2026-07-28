@@ -215,7 +215,9 @@ impl Raft {
                     // Bootstrap group creation can observe different ring snapshots
                     // on different nodes. Re-applying an existing voter is a "no-op"
                     // here, but heals followers whose initial voter set omitted it.
-                    changed |= self.propose(RaftCommand::AddPeer(member.clone())).is_ok();
+                    changed |= self
+                        .propose(RaftCommand::EnsurePeer(member.clone()))
+                        .is_ok();
                     continue;
                 }
                 // Stage the ring member as a non-voting learner; it's promoted to a
@@ -330,7 +332,7 @@ impl Raft {
         self.consensus.uncommited_log_range().any(|i| {
             matches!(
                 self.consensus.log_entry(i).map(|e| &e.command),
-                Some(RaftCommand::AddPeer(_) | RaftCommand::RemovePeer(_))
+                Some(RaftCommand::EnsurePeer(_) | RaftCommand::RemovePeer(_))
             )
         })
     }
@@ -1169,7 +1171,7 @@ impl Raft {
             return;
         }
         if self.consensus.is_learner_ready_for_promotion(node) {
-            let _ = self.propose(RaftCommand::AddPeer(node.clone()));
+            let _ = self.propose(RaftCommand::EnsurePeer(node.clone()));
         }
     }
 
@@ -1532,7 +1534,7 @@ impl Raft {
             match entry.command {
                 RaftCommand::Noop => {}
                 RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
-                RaftCommand::AddPeer(node_id) => self.apply_add_peer(node_id),
+                RaftCommand::EnsurePeer(node_id) => self.apply_ensure_peer(node_id),
                 RaftCommand::RemovePeer(node_id) => self.apply_remove_peer(node_id),
             }
         }
@@ -1576,7 +1578,7 @@ impl Raft {
     /// Apply-only helper. Invoked from `apply_committed_entries()` when an
     /// `AddPeer` log entry commits. Never call directly — the peer set is part
     /// of the replicated state machine and must only mutate through the log.
-    fn apply_add_peer(&mut self, node_id: NodeId) {
+    fn apply_ensure_peer(&mut self, node_id: NodeId) {
         if node_id == self.node_id {
             return;
         }
@@ -1905,7 +1907,7 @@ impl crate::test_traits::TAssertInvariant for Raft {
 
         // Invariant (partial): self is never in peers. The peer set is otherwise
         // mutated only via apply of committed AddPeer/RemovePeer entries — the
-        // discipline itself is enforced by keeping `apply_add_peer`/`apply_remove_peer`
+        // discipline itself is enforced by keeping `apply_ensure_peer`/`apply_remove_peer`
         // as the sole callers of `peers.insert`/`peers.remove` (callers checked at
         // compile time by their private visibility).
         assert!(
@@ -3080,7 +3082,7 @@ mod tests {
     // Direct mutation is gone — the peer set is part of the replicated state.
 
     #[test]
-    fn add_peer_log_entry_inserts_into_peers_on_apply() {
+    fn ensure_peer_log_entry_inserts_into_peers_on_apply() {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
@@ -3090,7 +3092,8 @@ mod tests {
         assert!(raft.is_leader());
         assert_eq!(raft.peers_count(), 0);
 
-        raft.propose(RaftCommand::AddPeer(node("node-2"))).unwrap();
+        raft.propose(RaftCommand::EnsurePeer(node("node-2")))
+            .unwrap();
         raft.simulate_flush();
 
         assert!(raft.has_peer(&node("node-2")));
@@ -3098,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn add_peer_log_entry_skips_self() {
+    fn ensure_peer_log_entry_skips_self() {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
@@ -3106,7 +3109,8 @@ mod tests {
         });
         drain(&mut raft);
 
-        raft.propose(RaftCommand::AddPeer(node("node-1"))).unwrap();
+        raft.propose(RaftCommand::EnsurePeer(node("node-1")))
+            .unwrap();
         raft.simulate_flush();
 
         assert!(!raft.has_peer(&node("node-1")));
@@ -3114,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn add_peer_log_entry_leader_initializes_peer_state() {
+    fn ensure_peer_log_entry_leader_initializes_peer_state() {
         let mut raft = single_node_raft();
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
             shard_group_id: TEST_SHARD,
@@ -3123,7 +3127,8 @@ mod tests {
         drain(&mut raft);
         assert!(raft.is_leader());
 
-        raft.propose(RaftCommand::AddPeer(node("node-2"))).unwrap();
+        raft.propose(RaftCommand::EnsurePeer(node("node-2")))
+            .unwrap();
         raft.simulate_flush();
         drain(&mut raft);
 
@@ -3854,7 +3859,7 @@ mod tests {
             .consensus
             .uncommited_log_range()
             .filter_map(|index| match &raft.consensus.log_entry(index)?.command {
-                RaftCommand::AddPeer(node_id) => Some(node_id.clone()),
+                RaftCommand::EnsurePeer(node_id) => Some(node_id.clone()),
                 RaftCommand::Noop | RaftCommand::RemovePeer(_) | RaftCommand::Metadata(_) => None,
             })
             .collect();
@@ -3926,7 +3931,8 @@ mod tests {
 
         // A membership entry is in flight: the window is complete, but the
         // one-config-change-at-a-time gate must park the eviction.
-        raft.propose(RaftCommand::AddPeer(node("node-7"))).unwrap();
+        raft.propose(RaftCommand::EnsurePeer(node("node-7")))
+            .unwrap();
         assert!(
             raft.reconcile_stale_live_peers(&topology, &live).is_err(),
             "uncommitted AddPeer must park the eviction"
@@ -3943,7 +3949,7 @@ mod tests {
         assert_eq!(
             proposals_after_become_leader(&raft),
             vec![
-                RaftCommand::AddPeer(node("node-7")),
+                RaftCommand::EnsurePeer(node("node-7")),
                 RaftCommand::RemovePeer(node("node-9")),
             ],
         );

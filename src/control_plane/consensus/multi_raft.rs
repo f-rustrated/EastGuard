@@ -1849,7 +1849,7 @@ mod tests {
         let log = store.storage.load_state(gid.0).log;
         assert!(
             !log.iter()
-                .any(|e| e.command == RaftCommand::AddPeer(node("n4"))),
+                .any(|e| e.command == RaftCommand::EnsurePeer(node("n4"))),
             "the learner must not be added straight to the quorum (no immediate AddPeer, log: {:?})",
             log.iter().map(|e| &e.command).collect::<Vec<_>>()
         );
@@ -1926,7 +1926,7 @@ mod tests {
         );
         assert!(
             !log.iter()
-                .any(|e| e.command == RaftCommand::AddPeer(node("n9"))),
+                .any(|e| e.command == RaftCommand::EnsurePeer(node("n9"))),
             "the eviction must not be paired with an AddPeer"
         );
     }
