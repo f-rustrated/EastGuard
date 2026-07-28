@@ -10,7 +10,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use super::inner;
 use crate::security::{
-    NodeTransportIdentity, NodeTransportSecurity, client_certificate_principal,
+    NodeTransportSecurity, TransportIdentity, client_certificate_principal,
     node_certificate_principal,
 };
 
@@ -184,12 +184,12 @@ impl TransportTcpStream {
         }
     }
 
-    pub fn peer_identity(&self) -> NodeTransportIdentity {
+    pub fn peer_identity(&self) -> TransportIdentity {
         match self {
             Self::Secure(stream) => {
-                NodeTransportIdentity::CertificatePrincipal(stream.peer_principal().to_string())
+                TransportIdentity::CertificatePrincipal(stream.peer_principal().to_string())
             }
-            Self::TrustedDevelopment(_) => NodeTransportIdentity::TrustedDevelopment,
+            Self::TrustedDevelopment(_) => TransportIdentity::TrustedDevelopment,
         }
     }
 

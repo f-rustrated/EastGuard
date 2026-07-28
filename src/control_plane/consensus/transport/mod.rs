@@ -14,9 +14,9 @@ use crate::control_plane::consensus::messages::RaftTransportCommand;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::net::TcpListener;
 use crate::net::TransportTcpStream;
-#[cfg(test)]
-use crate::security::NodeTransportIdentity;
 use crate::security::NodeTransportSecurity;
+#[cfg(test)]
+use crate::security::TransportIdentity;
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -109,8 +109,7 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader =
-                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
+            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
 
             let peer_id = reader.read_node_id().await.unwrap();
             assert_eq!(peer_id, NodeId::new("node-abc"));
@@ -139,8 +138,7 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader =
-                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
+            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
 
             let msg = reader.read_message().await.unwrap();
             assert_eq!(msg.shard_group_id, ShardGroupId(42));
@@ -190,8 +188,7 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader =
-                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
+            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
             let peer = reader.read_node_id().await?;
             let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
 
@@ -307,8 +304,7 @@ mod tests {
             // Second connection from node-a (simulating simultaneous connect)
             let (stream2, _) = dummy_listener.accept().await?;
             let (read_half, _write_half) = stream2.into_split();
-            let mut reader =
-                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
+            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
             let peer_id = reader.read_node_id().await.unwrap();
             assert_eq!(peer_id, NodeId::new("node-a"));
 

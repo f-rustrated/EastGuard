@@ -115,7 +115,7 @@ pub(crate) enum NodeTransportSecurity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NodeTransportIdentity {
+pub(crate) enum TransportIdentity {
     CertificatePrincipal(String),
     TrustedDevelopment,
 }
