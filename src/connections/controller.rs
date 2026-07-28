@@ -28,7 +28,7 @@ use crate::data_plane::messages::command::{
 use crate::data_plane::messages::query::{
     DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset, ReadConsumerOffsetResult,
 };
-use crate::net::TcpStream;
+use crate::net::TransportTcpStream;
 use tokio::sync::mpsc;
 
 /// # Client ↔ Server request_id protocol
@@ -615,7 +615,7 @@ fn keyspace_bound_matches_range(bound: &Option<KeyspaceBound>, range: &RangeMeta
 }
 
 pub async fn handle_client_stream(
-    stream: TcpStream,
+    stream: TransportTcpStream,
     node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,

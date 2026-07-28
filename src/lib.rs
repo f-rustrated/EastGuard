@@ -37,7 +37,7 @@ use crate::data_plane::recovery;
 use crate::data_plane::transport::DataTransportActor;
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::impls::metadata_storage::MetadataStorage;
-use crate::net::{TcpListener, UdpSocket};
+use crate::net::{TcpListener, TransportTcpStream, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::security::NodeTransportSecurity;
@@ -168,7 +168,7 @@ impl StartUp {
 
         // Client handler
         let _ = self
-            .receive_client_streams(node_id, swim_sender, raft_tx, data_plane_tx)
+            .receive_client_streams(node_id, swim_sender, raft_tx, data_plane_tx, security)
             .await;
         Ok(())
     }
@@ -179,6 +179,7 @@ impl StartUp {
         swim_sender: SwimSender,
         raft_tx: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
+        security: NodeTransportSecurity,
     ) {
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
@@ -189,6 +190,13 @@ impl StartUp {
         );
 
         while let Ok((stream, _)) = listener.accept().await {
+            let stream = match TransportTcpStream::accept_client(stream, &security).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!("client authentication failed: {error}");
+                    continue;
+                }
+            };
             let node_id = node_id.clone();
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();

@@ -9,7 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use super::inner;
-use crate::security::{NodeTransportIdentity, NodeTransportSecurity, node_certificate_principal};
+use crate::security::{
+    NodeTransportIdentity, NodeTransportSecurity, client_certificate_principal,
+    node_certificate_principal,
+};
 
 macro_rules! tcp_wrapper {
     ($name:ident) => {
@@ -49,7 +52,16 @@ pub struct AuthenticatedTcpStream {
 impl AuthenticatedTcpStream {
     pub async fn accept(stream: TcpStream, config: Arc<rustls::ServerConfig>) -> Result<Self> {
         let stream = TlsAcceptor::from(config).accept(stream).await?;
-        Self::from_tls_stream(stream.into())
+
+        Self::from_tls_stream(stream.into(), node_certificate_principal)
+    }
+
+    pub async fn accept_client(
+        stream: TcpStream,
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<Self> {
+        let stream = TlsAcceptor::from(config).accept(stream).await?;
+        Self::from_tls_stream(stream.into(), client_certificate_principal)
     }
 
     pub async fn connect<A: inner::ToSocketAddrs>(
@@ -63,17 +75,20 @@ impl AuthenticatedTcpStream {
         let stream = TlsConnector::from(config)
             .connect(server_name, stream)
             .await?;
-        Self::from_tls_stream(stream.into())
+        Self::from_tls_stream(stream.into(), node_certificate_principal)
     }
 
-    fn from_tls_stream(stream: TlsStream<TcpStream>) -> Result<Self> {
+    fn from_tls_stream(
+        stream: TlsStream<TcpStream>,
+        read_principal: fn(&rustls::pki_types::CertificateDer<'_>) -> Result<String>,
+    ) -> Result<Self> {
         let certificate = stream
             .get_ref()
             .1
             .peer_certificates()
             .and_then(|certificates| certificates.first())
             .context("authenticated TLS peer supplied no certificate")?;
-        let peer_principal = node_certificate_principal(certificate)?;
+        let peer_principal = read_principal(certificate)?;
         Ok(Self {
             peer_principal,
             stream,
@@ -94,37 +109,37 @@ impl AuthenticatedTcpStream {
     }
 }
 
-/// Cluster TCP connection. Secure mode carries an authenticated certificate
+/// TCP transport connection. Secure mode carries an authenticated certificate
 /// principal; trusted-development mode preserves the existing plaintext path.
-pub enum NodeTcpStream {
+pub enum TransportTcpStream {
     TrustedDevelopment(TcpStream),
     Secure(Box<AuthenticatedTcpStream>),
 }
 
-pub enum NodeReadHalf {
+pub enum TransportReadHalf {
     TrustedDevelopment(OwnedReadHalf),
     Secure(tokio::io::ReadHalf<AuthenticatedTcpStream>),
 }
 
-pub enum NodeWriteHalf {
+pub enum TransportWriteHalf {
     TrustedDevelopment(OwnedWriteHalf),
     Secure(tokio::io::WriteHalf<AuthenticatedTcpStream>),
 }
 
-impl From<OwnedReadHalf> for NodeReadHalf {
+impl From<OwnedReadHalf> for TransportReadHalf {
     fn from(value: OwnedReadHalf) -> Self {
         Self::TrustedDevelopment(value)
     }
 }
 
-impl From<OwnedWriteHalf> for NodeWriteHalf {
+impl From<OwnedWriteHalf> for TransportWriteHalf {
     fn from(value: OwnedWriteHalf) -> Self {
         Self::TrustedDevelopment(value)
     }
 }
 
-impl NodeTcpStream {
-    pub async fn accept(stream: TcpStream, security: &NodeTransportSecurity) -> Result<Self> {
+impl TransportTcpStream {
+    pub async fn accept_node(stream: TcpStream, security: &NodeTransportSecurity) -> Result<Self> {
         match security {
             NodeTransportSecurity::Secure { server, .. } => {
                 AuthenticatedTcpStream::accept(stream, server.clone())
@@ -136,7 +151,22 @@ impl NodeTcpStream {
         }
     }
 
-    pub async fn connect<A: inner::ToSocketAddrs>(
+    pub async fn accept_client(
+        stream: TcpStream,
+        security: &NodeTransportSecurity,
+    ) -> Result<Self> {
+        match security {
+            NodeTransportSecurity::Secure { server, .. } => {
+                AuthenticatedTcpStream::accept_client(stream, server.clone())
+                    .await
+                    .map(Box::new)
+                    .map(Self::Secure)
+            }
+            NodeTransportSecurity::TrustedDevelopment => Ok(Self::TrustedDevelopment(stream)),
+        }
+    }
+
+    pub async fn connect_node<A: inner::ToSocketAddrs>(
         addr: A,
         security: &NodeTransportSecurity,
     ) -> Result<Self> {
@@ -163,24 +193,27 @@ impl NodeTcpStream {
         }
     }
 
-    pub fn into_split(self) -> (NodeReadHalf, NodeWriteHalf) {
+    pub fn into_split(self) -> (TransportReadHalf, TransportWriteHalf) {
         match self {
             Self::TrustedDevelopment(stream) => {
                 let (read, write) = TcpStream::into_split(stream);
                 (
-                    NodeReadHalf::TrustedDevelopment(read),
-                    NodeWriteHalf::TrustedDevelopment(write),
+                    TransportReadHalf::TrustedDevelopment(read),
+                    TransportWriteHalf::TrustedDevelopment(write),
                 )
             }
             Self::Secure(stream) => {
                 let (read, write) = AuthenticatedTcpStream::into_split(*stream);
-                (NodeReadHalf::Secure(read), NodeWriteHalf::Secure(write))
+                (
+                    TransportReadHalf::Secure(read),
+                    TransportWriteHalf::Secure(write),
+                )
             }
         }
     }
 }
 
-macro_rules! impl_node_io {
+macro_rules! impl_transport_io {
     ($type:ty) => {
         impl AsyncRead for $type {
             fn poll_read(
@@ -230,9 +263,9 @@ macro_rules! impl_node_io {
     };
 }
 
-impl_node_io!(NodeTcpStream);
+impl_transport_io!(TransportTcpStream);
 
-impl AsyncRead for NodeReadHalf {
+impl AsyncRead for TransportReadHalf {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -245,7 +278,7 @@ impl AsyncRead for NodeReadHalf {
     }
 }
 
-impl AsyncWrite for NodeWriteHalf {
+impl AsyncWrite for TransportWriteHalf {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -393,6 +426,7 @@ mod tests {
     use turmoil::Builder;
 
     fn certificate(
+        principal_kind: &str,
         principal: &str,
         dns_name: Option<&str>,
     ) -> (
@@ -401,7 +435,7 @@ mod tests {
     ) {
         let mut params = CertificateParams::default();
         params.subject_alt_names.push(SanType::URI(
-            Ia5String::try_from(format!("urn:eastguard:node:{principal}")).unwrap(),
+            Ia5String::try_from(format!("urn:eastguard:{principal_kind}:{principal}")).unwrap(),
         ));
         if let Some(dns_name) = dns_name {
             params
@@ -416,8 +450,8 @@ mod tests {
 
     fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
         let (server_certificate, server_key) =
-            certificate("broker-server", Some("unused.eastguard"));
-        let (client_certificate, client_key) = certificate("broker-client", None);
+            certificate("node", "broker-server", Some("unused.eastguard"));
+        let (client_certificate, client_key) = certificate("node", "broker-client", None);
 
         let mut client_roots = RootCertStore::empty();
         client_roots.add(client_certificate.clone()).unwrap();
@@ -470,6 +504,58 @@ mod tests {
             let mut message = [0; 4];
             stream.read_exact(&mut message).await?;
             assert_eq!(&message, b"pong");
+            Ok(())
+        });
+
+        sim.run()
+    }
+
+    #[test]
+    fn mutual_tls_exposes_client_principal_under_turmoil() -> turmoil::Result {
+        let (server_certificate, server_key) =
+            certificate("node", "broker-server", Some("unused.eastguard"));
+        let (client_certificate, client_key) = certificate("client", "producer-a", None);
+
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_certificate.clone()).unwrap();
+        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server_config = Arc::new(
+            ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(vec![server_certificate.clone()], server_key)
+                .unwrap(),
+        );
+
+        let mut server_roots = RootCertStore::empty();
+        server_roots.add(server_certificate).unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(server_roots)
+                .with_client_auth_cert(vec![client_certificate], client_key)
+                .unwrap(),
+        );
+
+        let mut sim = Builder::new().build();
+        sim.host("server", move || {
+            let server_config = server_config.clone();
+            async move {
+                let listener = TcpListener::bind("0.0.0.0:9000").await?;
+                let (stream, _) = listener.accept().await?;
+                let stream = AuthenticatedTcpStream::accept_client(stream, server_config)
+                    .await
+                    .unwrap();
+                assert_eq!(stream.peer_principal(), "producer-a");
+                Ok(())
+            }
+        });
+        sim.client("client", async move {
+            let stream =
+                AuthenticatedTcpStream::connect((turmoil::lookup("server"), 9000), client_config)
+                    .await
+                    .unwrap();
+            assert_eq!(stream.peer_principal(), "broker-server");
             Ok(())
         });
 

@@ -11,7 +11,7 @@ use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMess
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::transport::RaftRpcListener;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::net::{NodeTcpStream, NodeWriteHalf};
+use crate::net::{TransportTcpStream, TransportWriteHalf};
 use crate::security::NodeTransportSecurity;
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -29,7 +29,7 @@ const PENDING_DIAL_BUFFER_CAP: usize = 256;
 /// outbound connect), the tie is broken by NodeId ordering.
 pub(super) struct RaftRpcDispatcher {
     node_id: NodeId,
-    writers: HashMap<NodeId, NodeWriteHalf>,
+    writers: HashMap<NodeId, TransportWriteHalf>,
     /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
@@ -48,7 +48,7 @@ pub(super) struct RaftRpcDispatcher {
 /// Result of a background dial attempt, delivered back to the transport loop.
 pub(super) struct DialOutcome {
     target: NodeId,
-    outcome: anyhow::Result<(RaftRpcListener, NodeWriteHalf)>,
+    outcome: anyhow::Result<(RaftRpcListener, TransportWriteHalf)>,
 }
 
 impl RaftRpcDispatcher {
@@ -68,7 +68,7 @@ impl RaftRpcDispatcher {
         }
     }
 
-    pub(super) async fn accept(&mut self, stream: NodeTcpStream, raft_tx: &MutlRaftSender) {
+    pub(super) async fn accept(&mut self, stream: TransportTcpStream, raft_tx: &MutlRaftSender) {
         let transport_identity = stream.peer_identity();
         let (read_half, write_half) = stream.into_split();
         let mut reader = RaftRpcListener::new(read_half, transport_identity);
@@ -258,14 +258,14 @@ async fn dial(
     target_id: NodeId,
     swim_tx: SwimSender,
     security: NodeTransportSecurity,
-) -> anyhow::Result<(RaftRpcListener, NodeWriteHalf)> {
+) -> anyhow::Result<(RaftRpcListener, TransportWriteHalf)> {
     let Some(addr) = swim_tx.resolve_address(target_id.clone()).await? else {
         anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id);
     };
 
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        NodeTcpStream::connect(addr.cluster_addr(), &security),
+        TransportTcpStream::connect_node(addr.cluster_addr(), &security),
     )
     .await??;
 

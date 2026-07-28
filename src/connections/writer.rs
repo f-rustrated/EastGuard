@@ -2,17 +2,19 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     connections::{REQUEST_ID_SIZE, protocol::ClientResponse},
-    net::OwnedWriteHalf,
+    net::TransportWriteHalf,
 };
 use tokio::sync::mpsc;
 
 pub(crate) struct ClientRawWriter {
-    stream: OwnedWriteHalf,
+    stream: TransportWriteHalf,
 }
 
 impl ClientRawWriter {
-    pub fn new(write_half: OwnedWriteHalf) -> Self {
-        Self { stream: write_half }
+    pub fn new(write_half: impl Into<TransportWriteHalf>) -> Self {
+        Self {
+            stream: write_half.into(),
+        }
     }
 
     pub async fn write<T: borsh::BorshSerialize>(

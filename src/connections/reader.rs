@@ -16,19 +16,19 @@ use crate::connections::{LEN_PREFIX_SIZE, REQUEST_ID_SIZE};
 
 use std::io::ErrorKind;
 
-use crate::net::OwnedReadHalf;
+use crate::net::TransportReadHalf;
 use bytes::{Buf, BytesMut};
 use tokio::io::AsyncReadExt;
 
 pub struct ClientStreamReader {
-    pub(crate) stream: OwnedReadHalf,
+    pub(crate) stream: TransportReadHalf,
     buffer: BytesMut,
 }
 
 impl ClientStreamReader {
-    pub fn new(stream: OwnedReadHalf) -> Self {
+    pub fn new(stream: impl Into<TransportReadHalf>) -> Self {
         Self {
-            stream,
+            stream: stream.into(),
             buffer: BytesMut::with_capacity(1024),
         }
     }

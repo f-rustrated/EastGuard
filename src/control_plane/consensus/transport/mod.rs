@@ -12,8 +12,8 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::RaftTransportCommand;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::net::NodeTcpStream;
 use crate::net::TcpListener;
+use crate::net::TransportTcpStream;
 #[cfg(test)]
 use crate::security::NodeTransportIdentity;
 use crate::security::NodeTransportSecurity;
@@ -40,7 +40,7 @@ impl RaftTransportActor {
         loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
-                    match NodeTcpStream::accept(stream, &security).await {
+                    match TransportTcpStream::accept_node(stream, &security).await {
                         Ok(stream) => dispatcher.accept(stream, &raft_tx).await,
                         Err(error) => tracing::debug!("Raft TLS accept rejected: {error}"),
                     }
@@ -255,7 +255,7 @@ mod tests {
 
             let (stream, _) = listener.accept().await?;
             state
-                .accept(NodeTcpStream::TrustedDevelopment(stream), &raft_tx)
+                .accept(TransportTcpStream::TrustedDevelopment(stream), &raft_tx)
                 .await;
 
             assert!(
@@ -300,7 +300,7 @@ mod tests {
             // First connection from node-a
             let (stream, _) = listener.accept().await?;
             state
-                .accept(NodeTcpStream::TrustedDevelopment(stream), &raft_tx)
+                .accept(TransportTcpStream::TrustedDevelopment(stream), &raft_tx)
                 .await;
             assert!(state.contains(&NodeId::new("node-a")));
 

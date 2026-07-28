@@ -4,19 +4,22 @@ use tokio::sync::mpsc;
 use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
-use crate::net::NodeReadHalf;
+use crate::net::TransportReadHalf;
 use crate::security::NodeTransportIdentity;
 
 const NODE_ID_FRAME_MAX: usize = 1024;
 const DATA_FRAME_MAX: usize = 64 * 1024 * 1024;
 
 pub(super) struct DataReader {
-    read_half: NodeReadHalf,
+    read_half: TransportReadHalf,
     transport_identity: NodeTransportIdentity,
 }
 
 impl DataReader {
-    pub(super) fn new(read_half: NodeReadHalf, transport_identity: NodeTransportIdentity) -> Self {
+    pub(super) fn new(
+        read_half: TransportReadHalf,
+        transport_identity: NodeTransportIdentity,
+    ) -> Self {
         Self {
             read_half,
             transport_identity,

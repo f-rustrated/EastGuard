@@ -9,7 +9,7 @@ use crate::control_plane::membership::TopologyReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
 
-use crate::net::{NodeTcpStream, TcpListener};
+use crate::net::{TcpListener, TransportTcpStream};
 use crate::security::NodeTransportSecurity;
 
 use command::DataTransportCommand;
@@ -69,7 +69,7 @@ impl DataTransportActor {
                 }
 
                 Ok((stream, _)) = listener.accept() => {
-                    let stream = match NodeTcpStream::accept(stream, &security).await {
+                    let stream = match TransportTcpStream::accept_node(stream, &security).await {
                         Ok(stream) => stream,
                         Err(error) => {
                             tracing::debug!("Data TLS accept rejected: {error}");

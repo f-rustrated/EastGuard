@@ -2,18 +2,18 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
-use crate::net::NodeReadHalf;
+use crate::net::TransportReadHalf;
 use crate::security::NodeTransportIdentity;
 use tokio::io::AsyncReadExt;
 
 pub(super) struct RaftRpcListener {
-    read_half: NodeReadHalf,
+    read_half: TransportReadHalf,
     transport_identity: NodeTransportIdentity,
 }
 
 impl RaftRpcListener {
     pub(super) fn new(
-        read_half: impl Into<NodeReadHalf>,
+        read_half: impl Into<TransportReadHalf>,
         transport_identity: NodeTransportIdentity,
     ) -> Self {
         Self {
