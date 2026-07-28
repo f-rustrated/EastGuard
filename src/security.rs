@@ -209,7 +209,7 @@ impl SecureTransportConfig {
 /// `urn:eastguard:node:`. The text after that prefix is the principal used as
 /// the admission-record key. This function only parses the certificate; callers
 /// must use it after rustls has authenticated the peer's certificate chain.
-fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
+pub(crate) fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
     const NODE_PRINCIPAL_URI_PREFIX: &str = "urn:eastguard:node:";
 
     let (_, certificate) =
