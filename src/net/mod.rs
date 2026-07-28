@@ -3,7 +3,10 @@
 mod tcp;
 pub(crate) mod udp;
 
-pub use tcp::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
+pub use tcp::{
+    NodeReadHalf, NodeTcpStream, NodeWriteHalf, OwnedReadHalf, OwnedWriteHalf, TcpListener,
+    TcpStream,
+};
 pub use udp::UdpSocket;
 
 #[cfg(not(test))]

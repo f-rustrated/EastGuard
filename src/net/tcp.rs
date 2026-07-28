@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use super::inner;
-use crate::security::node_certificate_principal;
+use crate::security::{NodeTransportIdentity, NodeTransportSecurity, node_certificate_principal};
 
 macro_rules! tcp_wrapper {
     ($name:ident) => {
@@ -41,13 +41,11 @@ tcp_wrapper!(OwnedWriteHalf);
 /// TLS authenticates the certificate chain before this stream exposes the peer's
 /// Node Certificate Principal. Admission later binds that stable principal to
 /// the process-specific `NodeId` carried by the transport handshake.
-#[allow(dead_code)]
 pub struct AuthenticatedTcpStream {
     peer_principal: String,
     stream: TlsStream<TcpStream>,
 }
 
-#[allow(dead_code)]
 impl AuthenticatedTcpStream {
     pub async fn accept(stream: TcpStream, config: Arc<rustls::ServerConfig>) -> Result<Self> {
         let stream = TlsAcceptor::from(config).accept(stream).await?;
@@ -84,6 +82,193 @@ impl AuthenticatedTcpStream {
 
     pub fn peer_principal(&self) -> &str {
         &self.peer_principal
+    }
+
+    fn into_split(
+        self,
+    ) -> (
+        tokio::io::ReadHalf<AuthenticatedTcpStream>,
+        tokio::io::WriteHalf<AuthenticatedTcpStream>,
+    ) {
+        tokio::io::split(self)
+    }
+}
+
+/// Cluster TCP connection. Secure mode carries an authenticated certificate
+/// principal; trusted-development mode preserves the existing plaintext path.
+pub enum NodeTcpStream {
+    TrustedDevelopment(TcpStream),
+    Secure(Box<AuthenticatedTcpStream>),
+}
+
+pub enum NodeReadHalf {
+    TrustedDevelopment(OwnedReadHalf),
+    Secure(tokio::io::ReadHalf<AuthenticatedTcpStream>),
+}
+
+pub enum NodeWriteHalf {
+    TrustedDevelopment(OwnedWriteHalf),
+    Secure(tokio::io::WriteHalf<AuthenticatedTcpStream>),
+}
+
+impl From<OwnedReadHalf> for NodeReadHalf {
+    fn from(value: OwnedReadHalf) -> Self {
+        Self::TrustedDevelopment(value)
+    }
+}
+
+impl From<OwnedWriteHalf> for NodeWriteHalf {
+    fn from(value: OwnedWriteHalf) -> Self {
+        Self::TrustedDevelopment(value)
+    }
+}
+
+impl NodeTcpStream {
+    pub async fn accept(stream: TcpStream, security: &NodeTransportSecurity) -> Result<Self> {
+        match security {
+            NodeTransportSecurity::Secure { server, .. } => {
+                AuthenticatedTcpStream::accept(stream, server.clone())
+                    .await
+                    .map(Box::new)
+                    .map(Self::Secure)
+            }
+            NodeTransportSecurity::TrustedDevelopment => Ok(Self::TrustedDevelopment(stream)),
+        }
+    }
+
+    pub async fn connect<A: inner::ToSocketAddrs>(
+        addr: A,
+        security: &NodeTransportSecurity,
+    ) -> Result<Self> {
+        match security {
+            NodeTransportSecurity::Secure { client, .. } => {
+                AuthenticatedTcpStream::connect(addr, client.clone())
+                    .await
+                    .map(Box::new)
+                    .map(Self::Secure)
+            }
+            NodeTransportSecurity::TrustedDevelopment => TcpStream::connect(addr)
+                .await
+                .map(Self::TrustedDevelopment)
+                .map_err(Into::into),
+        }
+    }
+
+    pub fn peer_identity(&self) -> NodeTransportIdentity {
+        match self {
+            Self::Secure(stream) => {
+                NodeTransportIdentity::CertificatePrincipal(stream.peer_principal().to_string())
+            }
+            Self::TrustedDevelopment(_) => NodeTransportIdentity::TrustedDevelopment,
+        }
+    }
+
+    pub fn into_split(self) -> (NodeReadHalf, NodeWriteHalf) {
+        match self {
+            Self::TrustedDevelopment(stream) => {
+                let (read, write) = TcpStream::into_split(stream);
+                (
+                    NodeReadHalf::TrustedDevelopment(read),
+                    NodeWriteHalf::TrustedDevelopment(write),
+                )
+            }
+            Self::Secure(stream) => {
+                let (read, write) = AuthenticatedTcpStream::into_split(*stream);
+                (NodeReadHalf::Secure(read), NodeWriteHalf::Secure(write))
+            }
+        }
+    }
+}
+
+macro_rules! impl_node_io {
+    ($type:ty) => {
+        impl AsyncRead for $type {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                match &mut *self {
+                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_read(cx, buf),
+                    Self::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
+                }
+            }
+        }
+
+        impl AsyncWrite for $type {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                match &mut *self {
+                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_write(cx, buf),
+                    Self::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
+                }
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                match &mut *self {
+                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_flush(cx),
+                    Self::Secure(stream) => Pin::new(stream).poll_flush(cx),
+                }
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                match &mut *self {
+                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_shutdown(cx),
+                    Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
+                }
+            }
+        }
+    };
+}
+
+impl_node_io!(NodeTcpStream);
+
+impl AsyncRead for NodeReadHalf {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for NodeWriteHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
     }
 }
 

@@ -105,13 +105,23 @@ impl ServerCertVerifier for NodeServerCertVerifier {
     }
 }
 
-pub(crate) struct SecureTransportConfig {
-    pub(crate) server: Arc<ServerConfig>,
-    pub(crate) client: Arc<ClientConfig>,
+#[derive(Clone)]
+pub(crate) enum NodeTransportSecurity {
+    Secure {
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+    },
+    TrustedDevelopment,
 }
 
-impl SecureTransportConfig {
-    pub(crate) fn load(env: &Environment) -> Result<Option<Self>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeTransportIdentity {
+    CertificatePrincipal(String),
+    TrustedDevelopment,
+}
+
+impl NodeTransportSecurity {
+    pub(crate) fn load(env: &Environment) -> Result<Self> {
         match env.security_mode {
             SecurityMode::Secure => {
                 let certificate_chain = env
@@ -126,9 +136,9 @@ impl SecureTransportConfig {
                     .trust_root_path
                     .as_deref()
                     .context("trust_root_path is required in secure mode")?;
-                Self::load_from_paths(certificate_chain, private_key_path, trust_roots).map(Some)
+                Self::load_from_paths(certificate_chain, private_key_path, trust_roots)
             }
-            SecurityMode::TrustedDevelopment => Ok(None),
+            SecurityMode::TrustedDevelopment => Ok(Self::TrustedDevelopment),
         }
     }
 
@@ -151,10 +161,14 @@ impl SecureTransportConfig {
             .with_custom_certificate_verifier(Arc::new(NodeServerCertVerifier::new(trust_roots)))
             .with_client_auth_cert(certificate_chain, private_key)?;
 
-        Ok(Self {
+        Ok(Self::Secure {
             server: Arc::new(server),
             client: Arc::new(client),
         })
+    }
+
+    pub(crate) fn is_secure(&self) -> bool {
+        matches!(self, Self::Secure { .. })
     }
 
     fn load_certificates(path: &Path, kind: &'static str) -> Result<Vec<CertificateDer<'static>>> {
@@ -260,7 +274,7 @@ mod tests {
     fn secure_mode_requires_every_credential_path() {
         let env = Environment::try_parse_from(["eastguard"]).unwrap();
 
-        let error = SecureTransportConfig::load(&env)
+        let error = NodeTransportSecurity::load(&env)
             .err()
             .expect("secure mode without credential paths must fail");
 
@@ -276,7 +290,10 @@ mod tests {
             Environment::try_parse_from(["eastguard", "--security-mode", "trusted-development"])
                 .unwrap();
 
-        assert!(SecureTransportConfig::load(&env).unwrap().is_none());
+        assert!(matches!(
+            NodeTransportSecurity::load(&env).unwrap(),
+            NodeTransportSecurity::TrustedDevelopment
+        ));
     }
 
     #[test]

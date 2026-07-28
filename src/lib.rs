@@ -40,7 +40,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::security::SecureTransportConfig;
+use crate::security::NodeTransportSecurity;
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -67,7 +67,8 @@ impl StartUp {
     }
 
     pub async fn run(self) -> Result<()> {
-        if SecureTransportConfig::load(&self.env)?.is_some() {
+        let security = NodeTransportSecurity::load(&self.env)?;
+        if security.is_secure() {
             anyhow::bail!("secure transport listeners are not implemented");
         }
 
@@ -112,6 +113,7 @@ impl StartUp {
             raft_tx.clone(),
             raft_transport_rx,
             swim_sender.clone(),
+            security,
         ));
 
         // Protocol actors (each spawns its own scheduler internally)

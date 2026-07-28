@@ -12,7 +12,11 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::RaftTransportCommand;
 use crate::control_plane::membership::actor::SwimSender;
+use crate::net::NodeTcpStream;
 use crate::net::TcpListener;
+#[cfg(test)]
+use crate::security::NodeTransportIdentity;
+use crate::security::NodeTransportSecurity;
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -26,16 +30,20 @@ impl RaftTransportActor {
         raft_tx: MutlRaftSender,
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
+        security: NodeTransportSecurity,
     ) {
         let (dial_tx, mut dial_rx) = mpsc::channel(256);
-        let mut dispatcher = RaftRpcDispatcher::new(node_id, dial_tx);
+        let mut dispatcher = RaftRpcDispatcher::new(node_id, dial_tx, security.clone());
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await; // consume immediate first tick
 
         loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
-                    dispatcher.accept(stream, &raft_tx).await;
+                    match NodeTcpStream::accept(stream, &security).await {
+                        Ok(stream) => dispatcher.accept(stream, &raft_tx).await,
+                        Err(error) => tracing::debug!("Raft TLS accept rejected: {error}"),
+                    }
                 }
                 Some(batch) = from_actor.recv() => {
                     // Disconnects are applied first so same-batch sends already skip removed peers, then
@@ -101,7 +109,8 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener(read_half);
+            let mut reader =
+                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
 
             let peer_id = reader.read_node_id().await.unwrap();
             assert_eq!(peer_id, NodeId::new("node-abc"));
@@ -130,7 +139,8 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener(read_half);
+            let mut reader =
+                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
 
             let msg = reader.read_message().await.unwrap();
             assert_eq!(msg.shard_group_id, ShardGroupId(42));
@@ -180,7 +190,8 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener(read_half);
+            let mut reader =
+                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
             let peer = reader.read_node_id().await?;
             let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
 
@@ -236,10 +247,16 @@ mod tests {
             let (raft_tx, _raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
-            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"), dial_tx);
+            let mut state = RaftRpcDispatcher::new(
+                NodeId::new("node-b"),
+                dial_tx,
+                NodeTransportSecurity::TrustedDevelopment,
+            );
 
             let (stream, _) = listener.accept().await?;
-            state.accept(stream, &raft_tx).await;
+            state
+                .accept(NodeTcpStream::TrustedDevelopment(stream), &raft_tx)
+                .await;
 
             assert!(
                 state.contains(&NodeId::new("node-a")),
@@ -274,17 +291,24 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let dummy_listener = TcpListener::bind("0.0.0.0:9001").await?;
             let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
-            let mut state = RaftRpcDispatcher::new(NodeId::new("node-b"), dial_tx);
+            let mut state = RaftRpcDispatcher::new(
+                NodeId::new("node-b"),
+                dial_tx,
+                NodeTransportSecurity::TrustedDevelopment,
+            );
 
             // First connection from node-a
             let (stream, _) = listener.accept().await?;
-            state.accept(stream, &raft_tx).await;
+            state
+                .accept(NodeTcpStream::TrustedDevelopment(stream), &raft_tx)
+                .await;
             assert!(state.contains(&NodeId::new("node-a")));
 
             // Second connection from node-a (simulating simultaneous connect)
             let (stream2, _) = dummy_listener.accept().await?;
             let (read_half, _write_half) = stream2.into_split();
-            let mut reader = RaftRpcListener(read_half);
+            let mut reader =
+                RaftRpcListener::new(read_half, NodeTransportIdentity::TrustedDevelopment);
             let peer_id = reader.read_node_id().await.unwrap();
             assert_eq!(peer_id, NodeId::new("node-a"));
 

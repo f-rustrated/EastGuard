@@ -11,7 +11,8 @@ use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMess
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::transport::RaftRpcListener;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::net::{OwnedWriteHalf, TcpStream};
+use crate::net::{NodeTcpStream, NodeWriteHalf};
+use crate::security::NodeTransportSecurity;
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// Upper bound on messages buffered per peer while its dial is in flight;
@@ -28,7 +29,7 @@ const PENDING_DIAL_BUFFER_CAP: usize = 256;
 /// outbound connect), the tie is broken by NodeId ordering.
 pub(super) struct RaftRpcDispatcher {
     node_id: NodeId,
-    writers: HashMap<NodeId, OwnedWriteHalf>,
+    writers: HashMap<NodeId, NodeWriteHalf>,
     /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
     /// to these peers are silently dropped until a new connection is
     /// accepted (peer restart with new UUID won't hit this — different NodeId).
@@ -41,16 +42,21 @@ pub(super) struct RaftRpcDispatcher {
     /// background task; flushed (or dropped on failure) in `on_dial_result`.
     pending_dials: HashMap<NodeId, Vec<WireRaftMessage>>,
     dial_tx: mpsc::Sender<DialOutcome>,
+    security: NodeTransportSecurity,
 }
 
 /// Result of a background dial attempt, delivered back to the transport loop.
 pub(super) struct DialOutcome {
     target: NodeId,
-    outcome: anyhow::Result<(RaftRpcListener, OwnedWriteHalf)>,
+    outcome: anyhow::Result<(RaftRpcListener, NodeWriteHalf)>,
 }
 
 impl RaftRpcDispatcher {
-    pub(super) fn new(node_id: NodeId, dial_tx: mpsc::Sender<DialOutcome>) -> Self {
+    pub(super) fn new(
+        node_id: NodeId,
+        dial_tx: mpsc::Sender<DialOutcome>,
+        security: NodeTransportSecurity,
+    ) -> Self {
         Self {
             node_id,
             writers: HashMap::new(),
@@ -58,12 +64,14 @@ impl RaftRpcDispatcher {
             connect_backoffs: HashMap::new(),
             pending_dials: HashMap::new(),
             dial_tx,
+            security,
         }
     }
 
-    pub(super) async fn accept(&mut self, stream: TcpStream, raft_tx: &MutlRaftSender) {
+    pub(super) async fn accept(&mut self, stream: NodeTcpStream, raft_tx: &MutlRaftSender) {
+        let transport_identity = stream.peer_identity();
         let (read_half, write_half) = stream.into_split();
-        let mut reader = RaftRpcListener(read_half);
+        let mut reader = RaftRpcListener::new(read_half, transport_identity);
 
         let Ok(peer_id) = reader.read_node_id().await else {
             tracing::error!("Failed to read peer NodeId during accept");
@@ -139,7 +147,12 @@ impl RaftRpcDispatcher {
             return;
         }
         self.pending_dials.insert(target_id.clone(), msgs);
-        let dial_task = dial(self.node_id.clone(), target_id.clone(), swim_tx.clone());
+        let dial_task = dial(
+            self.node_id.clone(),
+            target_id.clone(),
+            swim_tx.clone(),
+            self.security.clone(),
+        );
         let dial_tx = self.dial_tx.clone();
         tokio::spawn(async move {
             let outcome = dial_task.await;
@@ -235,7 +248,7 @@ impl RaftRpcDispatcher {
     }
 }
 
-/// Resolve, connect (3s cap), and handshake — on a spawned task, so a hung
+/// Resolve, connect (3secs cap), and handshake — on a spawned task, so a hung
 /// connect can never block the transport select loop. The loop
 /// installs the writer and flushes buffered messages in `on_dial_result`.
 // ! never inline this. Actor Model should onkly do work whose duration it controls.
@@ -244,22 +257,27 @@ async fn dial(
     node_id: NodeId,
     target_id: NodeId,
     swim_tx: SwimSender,
-) -> anyhow::Result<(RaftRpcListener, OwnedWriteHalf)> {
+    security: NodeTransportSecurity,
+) -> anyhow::Result<(RaftRpcListener, NodeWriteHalf)> {
     let Some(addr) = swim_tx.resolve_address(target_id.clone()).await? else {
         anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id);
     };
 
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        TcpStream::connect(addr.cluster_addr()),
+        NodeTcpStream::connect(addr.cluster_addr(), &security),
     )
     .await??;
 
+    let transport_identity = stream.peer_identity();
     let (read_half, mut write_half) = stream.into_split();
     let bytes = borsh::to_vec(&node_id)
         .map_err(|e| anyhow::anyhow!("[{}] Handshake encode failed: {e}", node_id))?;
     let len = bytes.len() as u32;
     write_half.write_all(&len.to_be_bytes()).await?;
     write_half.write_all(&bytes).await?;
-    Ok((RaftRpcListener(read_half), write_half))
+    Ok((
+        RaftRpcListener::new(read_half, transport_identity),
+        write_half,
+    ))
 }
