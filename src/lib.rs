@@ -113,7 +113,7 @@ impl StartUp {
             raft_tx.clone(),
             raft_transport_rx,
             swim_sender.clone(),
-            security,
+            security.clone(),
         ));
 
         // Protocol actors (each spawns its own scheduler internally)
@@ -145,6 +145,7 @@ impl StartUp {
             data_transport_rx,
             swim_sender.clone(),
             topology_reader.clone(),
+            security.clone(),
         ));
 
         MultiRaftActor::spawn(

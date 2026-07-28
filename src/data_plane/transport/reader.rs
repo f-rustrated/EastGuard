@@ -4,19 +4,30 @@ use tokio::sync::mpsc;
 use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
-use crate::net::OwnedReadHalf;
+use crate::net::NodeReadHalf;
+use crate::security::NodeTransportIdentity;
 
 const NODE_ID_FRAME_MAX: usize = 1024;
 const DATA_FRAME_MAX: usize = 64 * 1024 * 1024;
 
-pub(super) struct DataReader(pub OwnedReadHalf);
+pub(super) struct DataReader {
+    read_half: NodeReadHalf,
+    transport_identity: NodeTransportIdentity,
+}
 
 impl DataReader {
+    pub(super) fn new(read_half: NodeReadHalf, transport_identity: NodeTransportIdentity) -> Self {
+        Self {
+            read_half,
+            transport_identity,
+        }
+    }
+
     async fn read_frame<T: borsh::BorshDeserialize>(&mut self, max: usize) -> anyhow::Result<T> {
-        let len = self.0.read_u32().await? as usize;
+        let len = self.read_half.read_u32().await? as usize;
         anyhow::ensure!(len <= max, "frame too large: {len} bytes (max {max})");
         let mut buf = vec![0u8; len];
-        self.0.read_exact(&mut buf).await?;
+        self.read_half.read_exact(&mut buf).await?;
         let val = borsh::from_slice::<T>(&buf)?;
         Ok(val)
     }
@@ -25,6 +36,11 @@ impl DataReader {
         self.read_frame(NODE_ID_FRAME_MAX).await
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(peer = %peer, transport_identity = ?self.transport_identity)
+    )]
     pub(crate) async fn run(
         mut self,
         data_plane_tx: DataPlaneSender,

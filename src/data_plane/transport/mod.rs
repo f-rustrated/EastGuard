@@ -9,7 +9,8 @@ use crate::control_plane::membership::TopologyReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
 
-use crate::net::TcpListener;
+use crate::net::{NodeTcpStream, TcpListener};
+use crate::security::NodeTransportSecurity;
 
 use command::DataTransportCommand;
 use writers::TransportState;
@@ -24,8 +25,9 @@ impl DataTransportActor {
         mut from_actor: mpsc::Receiver<Box<[DataTransportCommand]>>,
         swim_tx: SwimSender,
         topology: TopologyReader,
+        security: NodeTransportSecurity,
     ) {
-        let mut state = TransportState::new(node_id);
+        let mut state = TransportState::new(node_id, security.clone());
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await;
 
@@ -67,6 +69,13 @@ impl DataTransportActor {
                 }
 
                 Ok((stream, _)) = listener.accept() => {
+                    let stream = match NodeTcpStream::accept(stream, &security).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::debug!("Data TLS accept rejected: {error}");
+                            continue;
+                        }
+                    };
                     match state.accept(stream).await {
                         Ok((peer, reader)) => {
                             tokio::spawn(reader.run(data_plane_tx.clone(), peer, disconnect_tx.clone()));
