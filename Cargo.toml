@@ -34,6 +34,7 @@ futures = "0.3"
 quinn = { version = "0.11.11", default-features = false, features = ["bloom", "runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

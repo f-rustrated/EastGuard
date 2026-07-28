@@ -420,6 +420,7 @@ dependencies = [
  "tracing-subscriber",
  "turmoil",
  "uuid",
+ "x509-parser",
  "zstd",
 ]
 

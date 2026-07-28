@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use x509_parser::extensions::GeneralName;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::{Environment, SecurityMode};
 
@@ -107,10 +109,59 @@ impl SecureTransportConfig {
     }
 }
 
+/// Reads the stable node principal from a leaf certificate's URI Subject
+/// Alternative Name.
+///
+/// The certificate must contain exactly one URI beginning with
+/// `urn:eastguard:node:`. The text after that prefix is the principal used as
+/// the admission-record key. This function only parses the certificate; callers
+/// must use it after rustls has authenticated the peer's certificate chain.
+fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
+    const NODE_PRINCIPAL_URI_PREFIX: &str = "urn:eastguard:node:";
+
+    let (_, certificate) =
+        X509Certificate::from_der(certificate.as_ref()).context("invalid X.509 certificate")?;
+    let subject_alt_name = certificate
+        .subject_alternative_name()
+        .context("invalid X.509 subject alternative name")?
+        .context("node certificate has no subject alternative name")?;
+
+    let mut principals =
+        subject_alt_name
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::URI(uri) => uri.strip_prefix(NODE_PRINCIPAL_URI_PREFIX),
+                _ => None,
+            });
+    let principal = principals
+        .next()
+        .filter(|principal| !principal.is_empty())
+        .context("node certificate has no Node Certificate Principal")?;
+    anyhow::ensure!(
+        principals.next().is_none(),
+        "node certificate has multiple Node Certificate Principals"
+    );
+    Ok(principal.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use rcgen::string::Ia5String;
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    fn certificate_with_uris(uris: &[&str]) -> CertificateDer<'static> {
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = uris
+            .iter()
+            .map(|uri| SanType::URI(Ia5String::try_from(*uri).unwrap()))
+            .collect();
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().clone()
+    }
 
     #[test]
     fn secure_mode_requires_every_credential_path() {
@@ -133,5 +184,36 @@ mod tests {
                 .unwrap();
 
         assert!(SecureTransportConfig::load(&env).unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_node_principal_from_uri_subject_alternative_name() {
+        let certificate =
+            certificate_with_uris(&["urn:example:unrelated", "urn:eastguard:node:broker-a"]);
+
+        assert_eq!(
+            node_certificate_principal(&certificate).unwrap(),
+            "broker-a"
+        );
+    }
+
+    #[test]
+    fn requires_exactly_one_node_principal() {
+        let missing = certificate_with_uris(&["urn:example:unrelated"]);
+        let ambiguous =
+            certificate_with_uris(&["urn:eastguard:node:broker-a", "urn:eastguard:node:broker-b"]);
+
+        assert_eq!(
+            node_certificate_principal(&missing)
+                .unwrap_err()
+                .to_string(),
+            "node certificate has no Node Certificate Principal"
+        );
+        assert_eq!(
+            node_certificate_principal(&ambiguous)
+                .unwrap_err()
+                .to_string(),
+            "node certificate has multiple Node Certificate Principals"
+        );
     }
 }

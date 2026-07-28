@@ -69,6 +69,10 @@ To allow safe node restarts and hardware replacement without exposing the cluste
 | **Process Key** | Running Process | Single process lifetime | Proves that the connection belongs to the process admitted for this epoch. |
 | **SWIM Incarnation** | Running Process | Monotonically increasing counter | Incremented by the *same* process instance to refute false `Suspect`/`Dead` gossip. |
 
+The Node Certificate Principal is the value after `urn:eastguard:node:` in one
+URI Subject Alternative Name. A node certificate must contain exactly one such
+URI; missing or repeated values fail authentication.
+
 ### Resolution Rules
 
 Node identity conflicts and stale gossip are resolved in this order:
