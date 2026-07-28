@@ -7,6 +7,8 @@ pub(crate) mod event;
 pub(crate) mod range;
 
 mod producer_sessions;
+#[allow(dead_code)]
+pub(crate) mod security;
 pub mod strategy;
 pub(crate) mod topic;
 
