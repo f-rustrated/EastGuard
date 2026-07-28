@@ -1,3 +1,4 @@
+use crate::control_plane::consensus::raft::states::security::SecurityState;
 use crate::control_plane::metadata::SegmentMeta;
 use crate::control_plane::metadata::command::*;
 use crate::control_plane::metadata::event::*;
@@ -6,6 +7,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::Replicas;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::ConsumerGroupAssignment;
+
 use crate::control_plane::metadata::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
 use crate::data_plane::SegmentKey;
@@ -19,11 +21,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct MetadataStateSnapshot {
     topics: HashMap<TopicId, TopicMeta>,
+    security: Box<SecurityState>,
     next_topic_id: u64,
 }
 
 pub struct MetadataState {
     pub(crate) topics: HashMap<TopicId, TopicMeta>,
+    security: SecurityState,
     pub(crate) last_applied_index: u64,
     topic_name_index: HashMap<String, TopicId>,
     next_topic_id: u64,
@@ -35,6 +39,7 @@ impl MetadataState {
     pub(crate) fn new(shard_group_id: ShardGroupId) -> Self {
         MetadataState {
             topics: HashMap::new(),
+            security: SecurityState::default(),
             last_applied_index: 0,
             topic_name_index: HashMap::new(),
             next_topic_id: shard_group_id.0 << 32,
@@ -46,6 +51,7 @@ impl MetadataState {
     pub(crate) fn snapshot(&self) -> MetadataStateSnapshot {
         MetadataStateSnapshot {
             topics: self.topics.clone(),
+            security: Box::new(self.security.clone()),
             next_topic_id: self.next_topic_id,
         }
     }
@@ -58,6 +64,7 @@ impl MetadataState {
             .collect();
         Self {
             topics,
+            security: *snapshot.security,
             last_applied_index,
             topic_name_index,
             next_topic_id: snapshot.next_topic_id,
@@ -582,6 +589,8 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
             assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
             assert_eq!(*id, topic.id, "topic map key does not match topic identity");
         }
+
+        self.security.assert_invariants();
         for topic in self.topics.values() {
             topic.assert_invariants();
         }
@@ -592,6 +601,9 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
 mod tests {
     use super::*;
     use crate::connections::protocol::ConsumerGroupSyncAction;
+    use crate::control_plane::consensus::raft::states::security::{
+        AclRecord, AdmissionRecord, RevocationRecord,
+    };
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::constants::*;
     use crate::control_plane::metadata::range::*;
@@ -617,6 +629,61 @@ mod tests {
             replication_factor: 3,
             partition_strategy: PartitionStrategy::Fixed,
         }
+    }
+
+    #[test]
+    fn security_records_survive_snapshot_restore() {
+        let mut state = MetadataState::new(ShardGroupId(1));
+        let admission = AdmissionRecord {
+            certificate_node_id: "broker-a".to_string(),
+            revision: 3,
+            epoch: 2,
+            node_id: NodeId::new("broker-a::process-2"),
+            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+        };
+        let acl = AclRecord {
+            resource: "security/cluster".to_string(),
+            revision: 4,
+            principals: vec!["operator".to_string()].into_boxed_slice(),
+        };
+        let revocation = RevocationRecord {
+            issuer: "cluster-ca".to_string(),
+            serial: vec![0x12, 0x34].into_boxed_slice(),
+            revision: 5,
+            revoked_at: 100,
+        };
+
+        state
+            .security
+            .admissions
+            .insert(admission.certificate_node_id.clone(), admission.clone());
+        state
+            .security
+            .acls
+            .insert(acl.resource.clone(), acl.clone());
+        state.security.revocations.insert(
+            (revocation.issuer.clone(), revocation.serial.clone()),
+            revocation.clone(),
+        );
+
+        let bytes = borsh::to_vec(&state.snapshot()).unwrap();
+        let snapshot = borsh::from_slice(&bytes).unwrap();
+        let restored = MetadataState::from_snapshot(snapshot, 9);
+
+        assert_eq!(
+            restored.security.admissions.get("broker-a"),
+            Some(&admission)
+        );
+        assert_eq!(restored.security.acls.get("security/cluster"), Some(&acl));
+        assert_eq!(
+            restored.security.revocations.get(&(
+                "cluster-ca".to_string(),
+                vec![0x12, 0x34].into_boxed_slice()
+            )),
+            Some(&revocation)
+        );
+        assert_eq!(restored.last_applied_index, 9);
+        restored.assert_invariants();
     }
 
     fn replica_set() -> Replicas {
@@ -670,10 +737,12 @@ mod tests {
         let a = MetadataStateSnapshot {
             topics: HashMap::from([(first.id, first.clone()), (second.id, second.clone())]),
             next_topic_id: 3,
+            security: Box::default(),
         };
         let b = MetadataStateSnapshot {
             topics: HashMap::from([(second.id, second), (first.id, first)]),
             next_topic_id: 3,
+            security: Box::default(),
         };
 
         assert_eq!(borsh::to_vec(&a).unwrap(), borsh::to_vec(&b).unwrap());

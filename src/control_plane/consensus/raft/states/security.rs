@@ -1,6 +1,19 @@
+use std::collections::HashMap;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
+
+/// Security records replicated by one metadata shard.
+///
+/// The live metadata state holds this directly. Snapshots box it so security
+/// indexes do not enlarge every variant of the Raft snapshot state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub(crate) struct SecurityState {
+    pub(super) admissions: HashMap<String, AdmissionRecord>,
+    pub(super) acls: HashMap<String, AclRecord>,
+    pub(super) revocations: HashMap<(String, Box<[u8]>), RevocationRecord>,
+}
 
 /// Current process admitted for `security/node/{certificate_node_id}`.
 ///
@@ -37,6 +50,34 @@ pub(crate) struct RevocationRecord {
     pub serial: Box<[u8]>,
     pub revision: u64,
     pub revoked_at: u64,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl crate::test_traits::TAssertInvariant for SecurityState {
+    fn assert_invariants(&self) {
+        for (certificate_node_id, admission) in &self.admissions {
+            assert_eq!(
+                certificate_node_id, &admission.certificate_node_id,
+                "admission map key does not match Certificate Node ID"
+            );
+        }
+        for (resource, acl) in &self.acls {
+            assert_eq!(
+                resource, &acl.resource,
+                "ACL map key does not match resource"
+            );
+        }
+        for ((issuer, serial), revocation) in &self.revocations {
+            assert_eq!(
+                issuer, &revocation.issuer,
+                "revocation map key does not match issuer"
+            );
+            assert_eq!(
+                serial, &revocation.serial,
+                "revocation map key does not match serial"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
