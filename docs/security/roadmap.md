@@ -141,7 +141,7 @@ permission checks; its text grants no authority by itself.
 | :--- | :--- |
 | `cluster` | Membership inspection, topology lookup, operator diagnostics |
 | `topic-admin/{topic}` | Create, delete, describe topic metadata |
-| `topic-data/{topic}` | Produce, fetch, list offsets for topic |
+| `topic-data/{topic-id}` | Produce, fetch, list offsets for topic |
 | `consumer-group/{topic}/{group}` | Consume messages, read/commit consumer offsets |
 | `producer-session/{topic}/{session}` | Renew producer session (permanently bound to creator principal) |
 | `security/cluster` | Read/write ACLs, manage admissions and revocations, inspect security audit |
@@ -173,7 +173,11 @@ security/node/{node-certificate-principal}
 ```
 
 - **Local Authorization:** Brokers evaluate ACLs against local cached security records.
-- **Freshness & Expiry:** Cached records include a monotonic deadline (max 60s) and revision counter. Expired entries require re-validation from the owner metadata shard; if the owner is offline, authorization fails closed.
+  Data permissions use the stable topic ID, so a data replica can authorize a
+  request without hosting that topic's metadata shard.
+- **Freshness & Expiry:** Cached records include a monotonic deadline (max 60s)
+  and revision counter. An expired entry cannot authorize a request. The chosen
+  distribution mechanism must obtain current state or fail closed.
 
 ---
 
@@ -204,8 +208,65 @@ security/node/{node-certificate-principal}
 ## 6. Resource Limits & Security Audit
 
 ### Rate & Memory Bounds
-- Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, memory allocations, and per-source request rates.
+- Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, and memory allocations.
+- Client request-rate limits are deferred. The design must first define whether
+  replicas of one application share a principal, which limits are node-wide, and
+  how limits behave as a Kubernetes workload scales.
 - The future secure UDP transport must define a payload budget that avoids IP fragmentation after authentication and encryption overhead.
+
+### Client Request Boundary
+
+Clients normally route directly to the data replica named by their current topic
+metadata. A redirect is only recovery from stale routing; brokers never proxy a
+produce or fetch to another data node.
+
+```
+Client request
+      │
+      ▼
+Authenticate certificate
+      │
+      ▼
+Check local ACL cache
+      ├── Current grant
+      ├── Current denial ─► Return unauthorized
+      └── Missing / expired
+                   │
+                   ▼
+       Obtain current ACL state
+       (distribution design deferred)
+                   │
+             ┌─────┴─────┐
+             ▼           ▼
+           Grant      Deny / unavailable ──► Fail closed
+             │
+             ▼
+Does this node serve the requested data?
+      ├── No  ──► Return data-node redirect
+      └── Yes ──► Execute locally
+```
+
+Authorization precedes redirects so an ungranted client cannot use stale-route
+responses to discover data placement. Any remote authorization request may
+update only the ACL cache; it must never carry or execute the client's data
+operation.
+
+The ACL distribution mechanism is intentionally deferred. A later phase may use
+lazy pull, proactive push, or a push-and-pull hybrid:
+
+| Model | Benefit | Failure to handle |
+| :--- | :--- | :--- |
+| Pull on cache miss or expiry | Simple; clients that leave create no update traffic | A data node must fail closed if the owner is unavailable |
+| Push changed records | Fast local decisions | A disconnected data node can miss an update |
+| Push plus periodic pull | Fast normally; repairs missed updates | More protocol and cache synchronization logic |
+
+The same decision gate covers request-rate limiting. A Kubernetes deployment may
+give all replicas of one application a shared principal even though each replica
+has a different leaf certificate. A fixed per-principal table size or request
+budget is therefore premature: one shared principal can represent many clients,
+while one principal per replica can grow with autoscaling. No client request-rate
+limit is implemented until identity granularity, node-wide capacity bounds, and
+cache distribution are chosen together.
 
 ### Secure UDP Decision
 
