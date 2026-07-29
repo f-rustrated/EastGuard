@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
     EntryId, OpenProducerSession, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta,
-    SegmentMetaState, SyncConsumerGroupRequest, TopicId, TopicMeta, TopicState,
+    SegmentMetaState, TopicId, TopicMeta, TopicState, UpdateConsumerGroupMemberRequest,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -38,13 +38,13 @@ pub enum ControlPlaneRequest {
     DescribeTopic {
         name: String,
     },
-    SyncConsumerGroup(SyncConsumerGroupRequest),
+    SyncConsumerGroup(UpdateConsumerGroupMemberRequest),
     OpenProducerSession(OpenProducerSessionRequest),
 }
 
 impl_from_variant!(
     ControlPlaneRequest,
-    SyncConsumerGroup(SyncConsumerGroupRequest),
+    SyncConsumerGroup(UpdateConsumerGroupMemberRequest),
     OpenProducerSession(OpenProducerSessionRequest)
 );
 
@@ -70,7 +70,7 @@ impl OpenProducerSessionRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum ConsumerGroupSyncAction {
+pub enum ConsumerGroupMemberAction {
     Heartbeat,
     Leave,
 }

@@ -449,7 +449,7 @@ impl TopicMeta {
         Ok(merged_id)
     }
 
-    pub(crate) fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> bool {
+    pub(crate) fn sync_consumer_group(&mut self, cmd: UpdateConsumerGroupMember) -> bool {
         let consumer_group_meta = self
             .consumer_groups
             .entry(cmd.group_id.clone())

@@ -4,8 +4,8 @@ use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{
-    AclResource, OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest,
-    TopicState,
+    AclResource, ConsumerGroupResource, OpenProducerSession, RangeMeta, TopicState,
+    UpdateConsumerGroupMember, UpdateConsumerGroupMemberRequest,
 };
 use crate::control_plane::{
     NodeId, SwimNodeState,
@@ -130,7 +130,7 @@ impl ClientController {
             DeleteTopic { name } => self.delete_topic(name).await,
             ListHostedTopics => self.list_hosted_topics().await,
             DescribeTopic { name } => self.describe_topic(name).await,
-            SyncConsumerGroup(req) => self.sync_consumer_group(req).await,
+            SyncConsumerGroup(req) => self.update_consumer_group_member(req).await,
             OpenProducerSession(req) => self.open_producer_session(req).await,
         };
         res.into()
@@ -172,9 +172,9 @@ impl ClientController {
         ))
     }
 
-    async fn sync_consumer_group(
+    async fn update_consumer_group_member(
         &self,
-        req: SyncConsumerGroupRequest,
+        req: UpdateConsumerGroupMemberRequest,
     ) -> Result<ClientSuccess, ServerError> {
         let group = match self.route(req.topic_name.as_bytes().to_vec()).await? {
             ShardRouting::Local(group) => group,
@@ -183,10 +183,20 @@ impl ClientController {
             }
         };
 
-        self.propose_topic_write(group.id, SyncConsumerGroup::new(req.clone()))
+        let topic = self
+            .raft_sender
+            .get_topic_metadata(req.topic_name.clone())
+            .await?;
+        self.authorize_acl_resource(AclResource::ConsumerGroup(ConsumerGroupResource {
+            topic_id: topic.id,
+            group_id: req.group_id.clone(),
+        }))
+        .await?;
+
+        self.propose_topic_write(group.id, UpdateConsumerGroupMember::new(req.clone()))
             .await?;
 
-        if req.action == ConsumerGroupSyncAction::Leave {
+        if req.action == ConsumerGroupMemberAction::Leave {
             return Ok(ClientSuccess::ConsumerGroupLeft);
         }
 
@@ -270,7 +280,7 @@ impl ClientController {
             .await
     }
 
-    async fn authorize_data_access(&self, resource: AclResource) -> Result<(), ServerError> {
+    async fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
         let TransportIdentity::CertificatePrincipal(principal) = &self.transport_identity else {
             return Ok(());
         };
@@ -364,7 +374,7 @@ impl ClientController {
         &self,
         req: CommitConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(req.key.acl()).await?;
+        self.authorize_acl_resource(req.key.acl()).await?;
 
         let (tx, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -394,7 +404,7 @@ impl ClientController {
         &self,
         req: FetchConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(req.key.acl()).await?;
+        self.authorize_acl_resource(req.key.acl()).await?;
 
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -434,7 +444,7 @@ impl ClientController {
         }
 
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(AclResource::TopicData(topic.id))
+        self.authorize_acl_resource(AclResource::TopicData(topic.id))
             .await?;
 
         let producer_identity = req
@@ -489,7 +499,7 @@ impl ClientController {
     /// state machine needs to answer without any further I/O.
     async fn fetch(&self, req: FetchRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(AclResource::TopicData(topic.id))
+        self.authorize_acl_resource(AclResource::TopicData(topic.id))
             .await?;
 
         let range = topic.get_range(&req.range_id)?;
@@ -523,7 +533,7 @@ impl ClientController {
     /// serve it. No proxying: a miss returns `SegmentNotLocal` and the client
     /// retries another replica.
     async fn fetch_by_id(&self, req: FetchByIdRequest) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(AclResource::TopicData(req.topic_id))
+        self.authorize_acl_resource(AclResource::TopicData(req.topic_id))
             .await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -549,7 +559,7 @@ impl ClientController {
     /// for the range's currently-active segment on this node.
     async fn list_offsets(&self, req: RangeOffsetRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(AclResource::TopicData(topic.id))
+        self.authorize_acl_resource(AclResource::TopicData(topic.id))
             .await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -704,6 +714,8 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -843,7 +855,7 @@ mod tests {
 
         assert_eq!(
             controller
-                .authorize_data_access(AclResource::TopicData(TopicId(7)))
+                .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
                 .await,
             Ok(())
         );
@@ -889,6 +901,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_group_sync_is_authorized_before_proposal() {
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            replicas: Replicas::new(vec![node_id("self")]),
+        };
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let proposal_count = Arc::new(AtomicUsize::new(0));
+        let observed_proposals = proposal_count.clone();
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
+                let _ = reply.send(Some(topic_meta("self")));
+            }
+            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+                assert_eq!(
+                    query.resource,
+                    AclResource::ConsumerGroup(ConsumerGroupResource {
+                        topic_id: TopicId(1),
+                        group_id: "billing".to_string(),
+                    })
+                );
+                let _ = query.reply.send(Some(false));
+            }
+            MultiRaftActorCommand::ClientProposal { .. } => {
+                observed_proposals.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        });
+        let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
+
+        let result = controller
+            .update_consumer_group_member(UpdateConsumerGroupMemberRequest {
+                topic_name: "t1".to_string(),
+                group_id: "billing".to_string(),
+                member_id: uuid::Uuid::new_v4(),
+                action: ConsumerGroupMemberAction::Heartbeat,
+            })
+            .await;
+
+        assert_eq!(result, Err(ServerError::Unauthorized));
+        assert_eq!(proposal_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn certificate_client_fails_closed_when_acl_shard_is_remote() {
         let group = ShardGroup {
             id: ShardGroupId(42),
@@ -912,7 +971,7 @@ mod tests {
 
         assert_eq!(
             controller
-                .authorize_data_access(AclResource::TopicData(TopicId(7)))
+                .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
                 .await,
             Err(ServerError::Unauthorized)
         );

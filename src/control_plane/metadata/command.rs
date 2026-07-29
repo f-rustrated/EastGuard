@@ -4,7 +4,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use uuid::Uuid;
 
 use crate::{
-    connections::protocol::ConsumerGroupSyncAction,
+    connections::protocol::ConsumerGroupMemberAction,
     control_plane::{
         Replicas,
         metadata::{AclResource, EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
@@ -84,8 +84,8 @@ pub struct DeleteSegments {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct SyncConsumerGroup {
-    pub req: SyncConsumerGroupRequest,
+pub struct UpdateConsumerGroupMember {
+    pub req: UpdateConsumerGroupMemberRequest,
     // TODO consider using logical clock
     pub observed_at: u64,
     pub session_timeout_ms: u64,
@@ -119,26 +119,26 @@ pub struct RevokeAcl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct SyncConsumerGroupRequest {
+pub struct UpdateConsumerGroupMemberRequest {
     pub topic_name: String,
     pub group_id: String,
     pub member_id: Uuid,
-    pub action: ConsumerGroupSyncAction,
+    pub action: ConsumerGroupMemberAction,
 }
 
-impl Deref for SyncConsumerGroup {
-    type Target = SyncConsumerGroupRequest;
+impl Deref for UpdateConsumerGroupMember {
+    type Target = UpdateConsumerGroupMemberRequest;
 
     fn deref(&self) -> &Self::Target {
         &self.req
     }
 }
 
-impl SyncConsumerGroup {
-    pub(crate) fn new(req: SyncConsumerGroupRequest) -> Self {
+impl UpdateConsumerGroupMember {
+    pub(crate) fn new(req: UpdateConsumerGroupMemberRequest) -> Self {
         const SESSION_TIMEOUT_MS: u64 = 10_000;
         let observed_at = crate::now_ms();
-        SyncConsumerGroup {
+        UpdateConsumerGroupMember {
             req,
             observed_at,
             session_timeout_ms: SESSION_TIMEOUT_MS,
@@ -155,7 +155,7 @@ pub enum MetadataCommand {
     DeleteTopic(DeleteTopic),
     ReassignSegment(ReassignSegment),
     DeleteSegments(DeleteSegments),
-    SyncConsumerGroup(SyncConsumerGroup),
+    UpdateConsumerGroupMember(UpdateConsumerGroupMember),
     OpenProducerSession(OpenProducerSession),
     ExpireProducerSessions(ExpireProducerSessions),
     GrantAcl(GrantAcl),
@@ -171,7 +171,7 @@ impl_from_variant!(
     DeleteTopic,
     ReassignSegment,
     DeleteSegments,
-    SyncConsumerGroup,
+    UpdateConsumerGroupMember,
     OpenProducerSession,
     ExpireProducerSessions,
     GrantAcl,

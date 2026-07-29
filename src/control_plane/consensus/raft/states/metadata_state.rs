@@ -219,7 +219,7 @@ impl MetadataState {
             DeleteTopic(cmd) => self.delete_topic(cmd)?,
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
             DeleteSegments(cmd) => self.delete_segments(cmd)?,
-            SyncConsumerGroup(cmd) => self.sync_consumer_group(cmd)?,
+            UpdateConsumerGroupMember(cmd) => self.sync_consumer_group(cmd)?,
             OpenProducerSession(cmd) => self.open_producer_session(cmd)?,
             ExpireProducerSessions(cmd) => self.expire_producer_sessions(cmd)?,
             GrantAcl(cmd) => self.security.grant(cmd.resource, cmd.principal),
@@ -509,7 +509,7 @@ impl MetadataState {
         Ok(())
     }
 
-    fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> Result<(), MetadataError> {
+    fn sync_consumer_group(&mut self, cmd: UpdateConsumerGroupMember) -> Result<(), MetadataError> {
         let group_id = cmd.group_id.clone();
 
         let topic = self
@@ -608,7 +608,7 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::protocol::ConsumerGroupSyncAction;
+    use crate::connections::protocol::ConsumerGroupMemberAction;
     use crate::control_plane::consensus::raft::states::security::{
         AclRecord, AdmissionRecord, RevocationRecord,
     };
@@ -802,12 +802,12 @@ mod tests {
         let mut sm = MetadataState::new(ShardGroupId(1));
         create_topic(&mut sm, "orders");
         let member = uuid::Uuid::new_v4();
-        let command = SyncConsumerGroup {
-            req: SyncConsumerGroupRequest {
+        let command = UpdateConsumerGroupMember {
+            req: UpdateConsumerGroupMemberRequest {
                 topic_name: "orders".into(),
                 group_id: "workers".into(),
                 member_id: member,
-                action: ConsumerGroupSyncAction::Heartbeat,
+                action: ConsumerGroupMemberAction::Heartbeat,
             },
             observed_at: 100,
             session_timeout_ms: 10_000,
