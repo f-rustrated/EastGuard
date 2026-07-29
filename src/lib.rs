@@ -41,6 +41,7 @@ use crate::net::{TcpListener, TransportTcpStream, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::security::NodeTransportSecurity;
+use crate::security::acl_cache::SharedAclCache;
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -181,6 +182,7 @@ impl StartUp {
         data_plane_tx: DataPlaneSender,
         security: NodeTransportSecurity,
     ) {
+        let acl_cache = SharedAclCache::default();
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -202,7 +204,14 @@ impl StartUp {
             let raft = raft_tx.clone();
             let dp = data_plane_tx.clone();
 
-            tokio::spawn(handle_client_stream(stream, node_id, swim_tx, raft, dp));
+            tokio::spawn(handle_client_stream(
+                stream,
+                node_id,
+                swim_tx,
+                raft,
+                dp,
+                acl_cache.clone(),
+            ));
         }
     }
 }

@@ -31,6 +31,7 @@ use crate::data_plane::messages::query::{
 };
 use crate::net::TransportTcpStream;
 use crate::security::TransportIdentity;
+use crate::security::acl_cache::SharedAclCache;
 use tokio::sync::mpsc;
 
 /// # Client ↔ Server request_id protocol
@@ -54,6 +55,7 @@ pub struct ClientController {
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
+    acl_cache: SharedAclCache,
 }
 
 impl ClientController {
@@ -63,6 +65,7 @@ impl ClientController {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
+        acl_cache: SharedAclCache,
     ) -> Self {
         Self {
             transport_identity,
@@ -70,6 +73,7 @@ impl ClientController {
             swim_sender,
             raft_sender,
             data_plane_tx,
+            acl_cache,
         }
     }
 
@@ -313,14 +317,12 @@ impl ClientController {
             return Err(ServerError::Unauthorized);
         };
 
-        match self
-            .raft_sender
-            .authorize_principal(group.id, resource, principal.clone())
+        self.acl_cache
+            .authorize_or_refresh(&resource, group.id, principal, || {
+                self.raft_sender
+                    .get_acl_snapshot(group.id, resource.clone())
+            })
             .await
-        {
-            Some(true) => Ok(()),
-            Some(false) | None => Err(ServerError::Unauthorized),
-        }
     }
 
     /// Structural redirect for a control-plane op that isn't local: to the member if
@@ -697,6 +699,7 @@ pub async fn handle_client_stream(
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
+    acl_cache: SharedAclCache,
 ) {
     let transport_identity = stream.peer_identity();
     let (read_half, write_half) = stream.into_split();
@@ -707,6 +710,7 @@ pub async fn handle_client_stream(
         swim_sender,
         raft_sender,
         data_plane_tx,
+        acl_cache,
     );
     tokio::spawn(run_client_writer(
         ClientRawWriter::new(write_half),
@@ -726,6 +730,7 @@ mod tests {
     };
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
+    use crate::control_plane::consensus::raft::states::security::AclRecord;
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
@@ -815,6 +820,7 @@ mod tests {
             swim_sender,
             raft_sender,
             data_plane_tx,
+            SharedAclCache::default(),
         )
     }
 
@@ -824,13 +830,41 @@ mod tests {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
     ) -> ClientController {
+        authenticated_controller_with_cache(
+            principal,
+            node_id,
+            swim_sender,
+            raft_sender,
+            SharedAclCache::default(),
+        )
+    }
+
+    fn authenticated_controller_with_cache(
+        principal: &str,
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_sender: MutlRaftSender,
+        acl_cache: SharedAclCache,
+    ) -> ClientController {
         ClientController::new(
             TransportIdentity::CertificatePrincipal(principal.into()),
             node_id,
             swim_sender,
             raft_sender,
             dp_stub(),
+            acl_cache,
         )
+    }
+
+    fn acl_snapshot(resource: AclResource, principals: &[&str]) -> AclRecord {
+        AclRecord {
+            resource,
+            revision: 1,
+            principals: principals
+                .iter()
+                .map(|principal| (*principal).to_owned())
+                .collect(),
+        }
     }
 
     fn produce_req() -> ClientRequest {
@@ -871,12 +905,12 @@ mod tests {
             }
         });
         let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
+            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
                 assert_eq!(query.shard_group_id, ShardGroupId(42));
                 assert_eq!(query.resource, AclResource::TopicData(TopicId(7)));
                 let _ = query
                     .reply
-                    .send(Some(query.principal.as_ref() == "orders-service"));
+                    .send(Some(acl_snapshot(query.resource, &["orders-service"])));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
@@ -887,6 +921,66 @@ mod tests {
                 .await,
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_acl_cache_authorizes_without_a_raft_query() {
+        let group = test_shard_group();
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let cache = SharedAclCache::default();
+        let resource = AclResource::TopicData(TopicId(7));
+        assert_eq!(
+            cache
+                .authorize_or_refresh(&resource, ShardGroupId(42), "orders-service", || async {
+                    Some(acl_snapshot(resource.clone(), &["orders-service"]))
+                })
+                .await,
+            Ok(())
+        );
+        let controller = authenticated_controller_with_cache(
+            "orders-service",
+            node_id("node-1"),
+            swim,
+            raft_sender_with(|_| panic!("fresh ACL cache must not query Raft")),
+            cache,
+        );
+
+        assert_eq!(controller.authorize_acl_resource(resource).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn acl_cache_miss_reads_the_local_snapshot_once() {
+        let group = test_shard_group();
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let observed_query_count = query_count.clone();
+        let raft = raft_sender_with(move |cmd| {
+            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
+                observed_query_count.fetch_add(1, Ordering::Relaxed);
+                let _ = query
+                    .reply
+                    .send(Some(acl_snapshot(query.resource, &["orders-service"])));
+            }
+        });
+        let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
+
+        for _ in 0..2 {
+            assert_eq!(
+                controller
+                    .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
+                    .await,
+                Ok(())
+            );
+        }
+        assert_eq!(query_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -903,9 +997,9 @@ mod tests {
             MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
                 let _ = reply.send(Some(topic_meta("node-1")));
             }
-            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+            MultiRaftActorCommand::GetAclSnapshot(query) => {
                 assert_eq!(query.resource, AclResource::TopicAdmin(TopicId(1)));
-                let _ = query.reply.send(Some(false));
+                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -936,9 +1030,9 @@ mod tests {
         let proposal_count = Arc::new(AtomicUsize::new(0));
         let observed_proposals = proposal_count.clone();
         let raft = raft_sender_with(move |cmd| match cmd {
-            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+            MultiRaftActorCommand::GetAclSnapshot(query) => {
                 assert_eq!(query.resource, AclResource::Cluster);
-                let _ = query.reply.send(Some(false));
+                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -983,7 +1077,7 @@ mod tests {
             }
         });
         let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
+            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
                 assert_eq!(
                     query.resource,
                     AclResource::ConsumerGroup(ConsumerGroupResource {
@@ -991,7 +1085,7 @@ mod tests {
                         group_id: "billing".to_string(),
                     })
                 );
-                let _ = query.reply.send(Some(false));
+                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
@@ -1027,7 +1121,7 @@ mod tests {
             MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
                 let _ = reply.send(Some(topic_meta("self")));
             }
-            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+            MultiRaftActorCommand::GetAclSnapshot(query) => {
                 assert_eq!(
                     query.resource,
                     AclResource::ConsumerGroup(ConsumerGroupResource {
@@ -1035,7 +1129,7 @@ mod tests {
                         group_id: "billing".to_string(),
                     })
                 );
-                let _ = query.reply.send(Some(false));
+                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);

@@ -8,6 +8,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::errors::ProposalError;
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
@@ -278,22 +279,19 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
-    /// Checks ACL state only when this node hosts the selected metadata shard.
-    ///
-    /// `None` means the shard is not local or the actor stopped. `Some(false)`
-    /// is an authoritative default-deny decision from local replicated state.
-    pub(crate) async fn authorize_principal(
+    /// Reads the committed ACL snapshot only when this node hosts the selected
+    /// metadata shard. A missing ACL is an empty, cacheable denial; `None`
+    /// means the shard is no longer local or the actor stopped.
+    pub(crate) async fn get_acl_snapshot(
         &self,
         shard_group_id: ShardGroupId,
         resource: AclResource,
-        principal: Box<str>,
-    ) -> Option<bool> {
+    ) -> Option<AclRecord> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
-            .send(AuthorizePrincipal {
+            .send(GetAclSnapshot {
                 shard_group_id,
                 resource,
-                principal,
                 reply,
             })
             .await;

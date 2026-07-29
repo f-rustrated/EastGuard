@@ -54,14 +54,19 @@ pub(crate) struct RevocationRecord {
 }
 
 impl SecurityState {
-    /// Returns whether an exact principal is listed on an exact ACL resource.
-    ///
-    /// Missing records and missing principals deny by default. Resource
-    /// hierarchy or wildcard matching is intentionally not inferred here.
-    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
+    /// Returns the current ACL record, or an empty revision-zero record when
+    /// the resource has never been granted to any principal. Both forms deny
+    /// by default; representing absence explicitly lets callers cache that
+    /// denial and avoid repeatedly querying the owning shard.
+    pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
         self.acls
             .get(resource)
-            .is_some_and(|acl| acl.principals.iter().any(|entry| entry == principal))
+            .cloned()
+            .unwrap_or_else(|| AclRecord {
+                resource: resource.clone(),
+                revision: 0,
+                principals: Box::new([]),
+            })
     }
 
     pub(super) fn grant(&mut self, resource: AclResource, principal: String) {
@@ -162,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn acl_authorization_is_exact_and_defaults_to_deny() {
+    fn acl_snapshot_returns_the_exact_record_or_an_empty_denial() {
         let mut security = SecurityState::default();
         let resource = AclResource::TopicData(TopicId(42));
         security.acls.insert(
@@ -174,8 +179,29 @@ mod tests {
             },
         );
 
-        assert!(security.authorizes(&resource, "orders-service"));
-        assert!(!security.authorizes(&resource, "unknown-service"));
-        assert!(!security.authorizes(&AclResource::TopicData(TopicId(43)), "orders-service"));
+        assert_eq!(
+            security.acl_snapshot(&resource).principals,
+            vec!["orders-service".to_string()].into_boxed_slice()
+        );
+        assert_eq!(
+            security
+                .acl_snapshot(&AclResource::TopicData(TopicId(43)))
+                .revision,
+            0
+        );
+    }
+
+    #[test]
+    fn missing_acl_snapshot_is_an_empty_revision_zero_record() {
+        let resource = AclResource::TopicData(TopicId(42));
+
+        assert_eq!(
+            SecurityState::default().acl_snapshot(&resource),
+            AclRecord {
+                resource,
+                revision: 0,
+                principals: Box::new([]),
+            }
+        );
     }
 }

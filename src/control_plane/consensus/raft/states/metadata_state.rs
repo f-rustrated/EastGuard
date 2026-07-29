@@ -1,4 +1,4 @@
-use crate::control_plane::consensus::raft::states::security::SecurityState;
+use crate::control_plane::consensus::raft::states::security::{AclRecord, SecurityState};
 use crate::control_plane::metadata::SegmentMeta;
 use crate::control_plane::metadata::command::*;
 use crate::control_plane::metadata::event::*;
@@ -91,8 +91,8 @@ impl MetadataState {
         range.segments.get(&key.segment_id)
     }
 
-    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
-        self.security.authorizes(resource, principal)
+    pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
+        self.security.acl_snapshot(resource)
     }
 
     pub(crate) fn get_consumer_group_assignment(
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_authorization_defaults_to_deny() {
+    fn metadata_acl_snapshot_returns_the_exact_record_or_an_empty_denial() {
         let mut state = MetadataState::new(ShardGroupId(1));
         let resource = AclResource::TopicData(TopicId(42));
         state.security.acls.insert(
@@ -701,9 +701,16 @@ mod tests {
             },
         );
 
-        assert!(state.authorizes(&resource, "orders-service"));
-        assert!(!state.authorizes(&resource, "unknown-service"));
-        assert!(!state.authorizes(&AclResource::TopicData(TopicId(43)), "orders-service"));
+        assert_eq!(
+            state.acl_snapshot(&resource).principals,
+            vec!["orders-service".to_string()].into_boxed_slice()
+        );
+        assert_eq!(
+            state
+                .acl_snapshot(&AclResource::TopicData(TopicId(43)))
+                .revision,
+            0
+        );
     }
 
     #[test]
@@ -720,12 +727,15 @@ mod tests {
 
         state.apply(grant.clone().into()).unwrap();
         state.apply(grant.into()).unwrap();
-        assert!(state.authorizes(&revoke.resource, "orders-service"));
+        assert_eq!(
+            state.acl_snapshot(&revoke.resource).principals,
+            vec!["orders-service".to_string()].into_boxed_slice()
+        );
         assert_eq!(state.security.acls[&revoke.resource].revision, 1);
 
         state.apply(revoke.clone().into()).unwrap();
         state.apply(revoke.clone().into()).unwrap();
-        assert!(!state.authorizes(&revoke.resource, "orders-service"));
+        assert!(state.acl_snapshot(&revoke.resource).principals.is_empty());
         assert_eq!(state.security.acls[&revoke.resource].revision, 2);
     }
 

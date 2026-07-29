@@ -235,26 +235,37 @@ Check local ACL cache
       └── Missing / expired
                    │
                    ▼
-       Obtain current ACL state
-       (distribution design deferred)
-                   │
-             ┌─────┴─────┐
-             ▼           ▼
-           Grant      Deny / unavailable ──► Fail closed
-             │
-             ▼
-Does this node serve the requested data?
+      Is the ACL shard local?
+            ├── No  ──► Return unauthorized
+            └── Yes
+                  │
+                  ▼
+          Read committed ACL state
+                  │
+                  ▼
+             Refresh cache
+                  │
+            ┌─────┴─────┐
+            ▼           ▼
+          Grant      Deny / unavailable ──► Fail closed
+            │
+            ▼
+ Does this node serve the requested data?
       ├── No  ──► Return data-node redirect
       └── Yes ──► Execute locally
 ```
 
 Authorization precedes redirects so an ungranted client cannot use stale-route
-responses to discover data placement. Any remote authorization request may
-update only the ACL cache; it must never carry or execute the client's data
-operation.
+responses to discover data placement. The current implementation refreshes a
+missing or expired cache entry only when the broker hosts the ACL's metadata
+shard. It reads that shard's committed ACL record, including an empty record for
+default denial, and stores it for no more than 60 seconds. When another broker
+owns the ACL shard, the request fails closed; it does not forward or proxy the
+client data operation.
 
-The ACL distribution mechanism is intentionally deferred. A later phase may use
-lazy pull, proactive push, or a push-and-pull hybrid:
+Fetching an ACL record from a remote owner is still deferred. That later path may
+use lazy pull, proactive push, or a push-and-pull hybrid. It may update only the
+ACL cache; it must never carry or execute the client's data operation:
 
 | Model | Benefit | Failure to handle |
 | :--- | :--- | :--- |

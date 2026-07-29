@@ -8,6 +8,7 @@ use crate::control_plane::consensus::raft::states::consensus::{
     ConsensusState, PeerState, Role, SNAPSHOT_CHUNK_BYTES, SnapshotInstallOutcome,
 };
 use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::{
     RaftPersistentState, RaftSnapshot, SnapshotData,
 };
@@ -161,8 +162,8 @@ impl Raft {
         self.metadata.get_topic_by_name(name)
     }
 
-    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
-        self.metadata.authorizes(resource, principal)
+    pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
+        self.metadata.acl_snapshot(resource)
     }
 
     pub(crate) fn get_consumer_group_assignment(

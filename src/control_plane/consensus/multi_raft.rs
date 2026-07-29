@@ -3,13 +3,13 @@ use crate::control_plane::consensus::boundary_recovery::{
     BoundaryRecoveryAction, SegmentBoundaryRecovery,
 };
 use crate::control_plane::consensus::messages::{
-    DeferredAuthorization, DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc,
-    LogMutation, MetadataProposal, MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent,
-    RaftProtocolMessage, RaftTimeoutCallback,
+    DeferredReply, DeferredResponse, InboundRaftRpc, LogMutation, MetadataProposal,
+    MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
@@ -239,11 +239,19 @@ impl MultiRaft {
             }
             MultiRaftActorCommand::GetLeader { group_id, reply } => {
                 let result = self.get_leader(group_id);
-                self.deferred.push(DeferredReply::GetLeader(reply, result));
+                self.deferred
+                    .push(DeferredReply::GetLeader(DeferredResponse {
+                        reply,
+                        value: result,
+                    }));
             }
             MultiRaftActorCommand::GetPeers { group_id, reply } => {
                 let result = self.get_peers(group_id);
-                self.deferred.push(DeferredReply::GetPeers(reply, result));
+                self.deferred
+                    .push(DeferredReply::GetPeers(DeferredResponse {
+                        reply,
+                        value: result,
+                    }));
             }
             MultiRaftActorCommand::ClientProposal { propose, reply } => {
                 self.propose(propose, reply);
@@ -251,26 +259,32 @@ impl MultiRaft {
 
             MultiRaftActorCommand::GetTopics { reply } => {
                 let topics = self.get_topics();
-                self.deferred.push(DeferredReply::GetTopics(reply, topics));
+                self.deferred
+                    .push(DeferredReply::GetTopics(DeferredResponse {
+                        reply,
+                        value: topics,
+                    }));
             }
             MultiRaftActorCommand::GetTopicStats { reply } => {
                 let stats = self.get_topic_stats();
                 self.deferred
-                    .push(DeferredReply::GetTopicStats(reply, stats));
+                    .push(DeferredReply::GetTopicStats(DeferredResponse {
+                        reply,
+                        value: stats,
+                    }));
             }
             MultiRaftActorCommand::GetTopicMetadata { topic_name, reply } => {
                 let meta = self.get_topic_metadata(&topic_name);
                 self.deferred
-                    .push(DeferredReply::GetTopicMetadata(reply, Box::new(meta)));
+                    .push(DeferredReply::GetTopicMetadata(DeferredResponse {
+                        reply,
+                        value: meta,
+                    }));
             }
-            MultiRaftActorCommand::AuthorizePrincipal(query) => {
-                let value = self.authorize_principal(
-                    query.shard_group_id,
-                    &query.resource,
-                    &query.principal,
-                );
+            MultiRaftActorCommand::GetAclSnapshot(query) => {
+                let value = self.acl_snapshot(query.shard_group_id, &query.resource);
                 self.deferred
-                    .push(DeferredReply::AuthorizePrincipal(DeferredAuthorization {
+                    .push(DeferredReply::GetAclSnapshot(DeferredResponse {
                         reply: query.reply,
                         value,
                     }));
@@ -283,7 +297,7 @@ impl MultiRaft {
                 );
                 self.deferred
                     .push(DeferredReply::GetConsumerGroupAssignment(
-                        DeferredConsumerGroupAssignment {
+                        DeferredResponse {
                             reply: query.reply,
                             value,
                         },
@@ -307,30 +321,14 @@ impl MultiRaft {
     pub(crate) fn fire_deferred(&mut self) {
         for reply in self.deferred.drain(..) {
             match reply {
-                DeferredReply::GetLeader(sender, v) => {
-                    let _ = sender.send(v);
-                }
-                DeferredReply::GetPeers(sender, v) => {
-                    let _ = sender.send(v);
-                }
-                DeferredReply::Propose(sender, v) => {
-                    let _ = sender.send(v);
-                }
-                DeferredReply::GetTopics(sender, v) => {
-                    let _ = sender.send(v);
-                }
-                DeferredReply::GetTopicStats(sender, v) => {
-                    let _ = sender.send(v);
-                }
-                DeferredReply::GetTopicMetadata(sender, v) => {
-                    let _ = sender.send(*v);
-                }
-                DeferredReply::AuthorizePrincipal(deferred) => {
-                    let _ = deferred.reply.send(deferred.value);
-                }
-                DeferredReply::GetConsumerGroupAssignment(deferred) => {
-                    let _ = deferred.reply.send(deferred.value);
-                }
+                DeferredReply::GetLeader(deferred) => deferred.send(),
+                DeferredReply::GetPeers(deferred) => deferred.send(),
+                DeferredReply::Propose(deferred) => deferred.send(),
+                DeferredReply::GetTopics(deferred) => deferred.send(),
+                DeferredReply::GetTopicStats(deferred) => deferred.send(),
+                DeferredReply::GetTopicMetadata(deferred) => deferred.send(),
+                DeferredReply::GetAclSnapshot(deferred) => deferred.send(),
+                DeferredReply::GetConsumerGroupAssignment(deferred) => deferred.send(),
             }
         }
     }
@@ -495,15 +493,14 @@ impl MultiRaft {
             .find_map(|raft| raft.get_topic_by_name(name).cloned())
     }
 
-    fn authorize_principal(
+    fn acl_snapshot(
         &self,
         shard_group_id: ShardGroupId,
         resource: &AclResource,
-        principal: &str,
-    ) -> Option<bool> {
+    ) -> Option<AclRecord> {
         self.groups
             .get(&shard_group_id)
-            .map(|raft| raft.authorizes(resource, principal))
+            .map(|raft| raft.acl_snapshot(resource))
     }
 
     fn get_consumer_group_assignment(
@@ -775,7 +772,10 @@ impl MultiRaft {
                 self.pending_proposes.insert((gid, index), reply);
             }
             Err(e) => {
-                self.deferred.push(DeferredReply::Propose(reply, Err(e)));
+                self.deferred.push(DeferredReply::Propose(DeferredResponse {
+                    reply,
+                    value: Err(e),
+                }));
             }
         }
     }
