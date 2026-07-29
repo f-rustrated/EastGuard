@@ -35,6 +35,7 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring", "s
 rustls-pemfile = "2.2.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 x509-parser = "0.18.1"
+ring = "0.17.14"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

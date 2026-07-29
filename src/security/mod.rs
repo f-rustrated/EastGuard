@@ -2,6 +2,7 @@
 
 pub(crate) mod acl_cache;
 
+mod admission_proof;
 mod certificates;
 mod transport;
 
