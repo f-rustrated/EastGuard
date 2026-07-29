@@ -107,6 +107,18 @@ pub struct ExpireProducerSessions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct GrantAcl {
+    pub resource: String,
+    pub principal: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct RevokeAcl {
+    pub resource: String,
+    pub principal: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct SyncConsumerGroupRequest {
     pub topic_name: String,
     pub group_id: String,
@@ -146,6 +158,8 @@ pub enum MetadataCommand {
     SyncConsumerGroup(SyncConsumerGroup),
     OpenProducerSession(OpenProducerSession),
     ExpireProducerSessions(ExpireProducerSessions),
+    GrantAcl(GrantAcl),
+    RevokeAcl(RevokeAcl),
 }
 
 impl_from_variant!(
@@ -159,5 +173,7 @@ impl_from_variant!(
     DeleteSegments,
     SyncConsumerGroup,
     OpenProducerSession,
-    ExpireProducerSessions
+    ExpireProducerSessions,
+    GrantAcl,
+    RevokeAcl
 );

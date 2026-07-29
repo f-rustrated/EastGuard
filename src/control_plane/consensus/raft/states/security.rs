@@ -62,6 +62,39 @@ impl SecurityState {
             .get(resource)
             .is_some_and(|acl| acl.principals.iter().any(|entry| entry == principal))
     }
+
+    pub(super) fn grant(&mut self, resource: String, principal: String) {
+        let acl = self
+            .acls
+            .entry(resource.clone())
+            .or_insert_with(|| AclRecord {
+                resource,
+                revision: 0,
+                principals: Box::new([]),
+            });
+        if acl.principals.contains(&principal) {
+            return;
+        }
+
+        let mut principals = std::mem::take(&mut acl.principals).into_vec();
+        principals.push(principal);
+        acl.principals = principals.into_boxed_slice();
+        acl.revision += 1;
+    }
+
+    pub(super) fn revoke(&mut self, resource: String, principal: &str) {
+        let Some(acl) = self.acls.get_mut(&resource) else {
+            return;
+        };
+        let Some(index) = acl.principals.iter().position(|entry| entry == principal) else {
+            return;
+        };
+
+        let mut principals = std::mem::take(&mut acl.principals).into_vec();
+        principals.remove(index);
+        acl.principals = principals.into_boxed_slice();
+        acl.revision += 1;
+    }
 }
 
 #[cfg(any(test, debug_assertions))]

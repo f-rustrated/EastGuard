@@ -220,6 +220,8 @@ impl MetadataState {
             SyncConsumerGroup(cmd) => self.sync_consumer_group(cmd)?,
             OpenProducerSession(cmd) => self.open_producer_session(cmd)?,
             ExpireProducerSessions(cmd) => self.expire_producer_sessions(cmd)?,
+            GrantAcl(cmd) => self.security.grant(cmd.resource, cmd.principal),
+            RevokeAcl(cmd) => self.security.revoke(cmd.resource, &cmd.principal),
         }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
@@ -705,6 +707,29 @@ mod tests {
         assert!(state.authorizes("topic-data/42", "orders-service"));
         assert!(!state.authorizes("topic-data/42", "unknown-service"));
         assert!(!state.authorizes("topic-data/43", "orders-service"));
+    }
+
+    #[test]
+    fn acl_grant_and_revoke_are_idempotent() {
+        let mut state = MetadataState::new(ShardGroupId(1));
+        let grant = GrantAcl {
+            resource: "topic-data/42".to_string(),
+            principal: "orders-service".to_string(),
+        };
+        let revoke = RevokeAcl {
+            resource: grant.resource.clone(),
+            principal: grant.principal.clone(),
+        };
+
+        state.apply(grant.clone().into()).unwrap();
+        state.apply(grant.into()).unwrap();
+        assert!(state.authorizes("topic-data/42", "orders-service"));
+        assert_eq!(state.security.acls["topic-data/42"].revision, 1);
+
+        state.apply(revoke.clone().into()).unwrap();
+        state.apply(revoke.into()).unwrap();
+        assert!(!state.authorizes("topic-data/42", "orders-service"));
+        assert_eq!(state.security.acls["topic-data/42"].revision, 2);
     }
 
     fn replica_set() -> Replicas {
