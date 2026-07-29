@@ -3,8 +3,9 @@ use crate::control_plane::consensus::boundary_recovery::{
     BoundaryRecoveryAction, SegmentBoundaryRecovery,
 };
 use crate::control_plane::consensus::messages::{
-    DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc, LogMutation, MetadataProposal,
-    MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
+    DeferredAuthorization, DeferredConsumerGroupAssignment, DeferredReply, InboundRaftRpc,
+    LogMutation, MetadataProposal, MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent,
+    RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
@@ -261,6 +262,18 @@ impl MultiRaft {
                 self.deferred
                     .push(DeferredReply::GetTopicMetadata(reply, Box::new(meta)));
             }
+            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+                let value = self.authorize_principal(
+                    query.shard_group_id,
+                    &query.resource,
+                    &query.principal,
+                );
+                self.deferred
+                    .push(DeferredReply::AuthorizePrincipal(DeferredAuthorization {
+                        reply: query.reply,
+                        value,
+                    }));
+            }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
                     &query.topic_name,
@@ -310,6 +323,9 @@ impl MultiRaft {
                 }
                 DeferredReply::GetTopicMetadata(sender, v) => {
                     let _ = sender.send(*v);
+                }
+                DeferredReply::AuthorizePrincipal(deferred) => {
+                    let _ = deferred.reply.send(deferred.value);
                 }
                 DeferredReply::GetConsumerGroupAssignment(deferred) => {
                     let _ = deferred.reply.send(deferred.value);
@@ -476,6 +492,17 @@ impl MultiRaft {
         self.groups
             .values()
             .find_map(|raft| raft.get_topic_by_name(name).cloned())
+    }
+
+    fn authorize_principal(
+        &self,
+        shard_group_id: ShardGroupId,
+        resource: &str,
+        principal: &str,
+    ) -> Option<bool> {
+        self.groups
+            .get(&shard_group_id)
+            .map(|raft| raft.authorizes(resource, principal))
     }
 
     fn get_consumer_group_assignment(

@@ -52,6 +52,7 @@ pub enum MultiRaftActorCommand {
         topic_name: String,
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
+    AuthorizePrincipal(AuthorizePrincipal),
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data-plane request forwarded to the metadata coordinator for proposal.
     ProposeSegmentRoll(ProposeSegmentRoll),
@@ -74,6 +75,13 @@ pub struct GetConsumerGroupAssignment {
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
 }
 
+pub struct AuthorizePrincipal {
+    pub(crate) shard_group_id: ShardGroupId,
+    pub(crate) resource: String,
+    pub(crate) principal: String,
+    pub(crate) reply: oneshot::Sender<Option<bool>>,
+}
+
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {
     fn from(cmd: RaftProtocolMessage) -> Self {
         MultiRaftActorCommand::ProtocolMessage(cmd)
@@ -94,11 +102,20 @@ impl_from_variant_via!(
     RemoveGroup,
 );
 
-impl_from_variant!(MultiRaftActorCommand, GetConsumerGroupAssignment);
+impl_from_variant!(
+    MultiRaftActorCommand,
+    AuthorizePrincipal,
+    GetConsumerGroupAssignment,
+);
 
 pub(crate) struct DeferredConsumerGroupAssignment {
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
     pub(crate) value: Option<ConsumerGroupAssignment>,
+}
+
+pub(crate) struct DeferredAuthorization {
+    pub(crate) reply: oneshot::Sender<Option<bool>>,
+    pub(crate) value: Option<bool>,
 }
 
 pub(crate) enum DeferredReply {
@@ -111,5 +128,6 @@ pub(crate) enum DeferredReply {
     GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
     GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),
     GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Box<Option<TopicMeta>>),
+    AuthorizePrincipal(DeferredAuthorization),
     GetConsumerGroupAssignment(DeferredConsumerGroupAssignment),
 }

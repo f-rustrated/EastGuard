@@ -278,6 +278,28 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
+    /// Checks ACL state only when this node hosts the selected metadata shard.
+    ///
+    /// `None` means the shard is not local or the actor stopped. `Some(false)`
+    /// is an authoritative default-deny decision from local replicated state.
+    pub(crate) async fn authorize_principal(
+        &self,
+        shard_group_id: ShardGroupId,
+        resource: String,
+        principal: String,
+    ) -> Option<bool> {
+        let (reply, recv) = tokio::sync::oneshot::channel();
+        let _ = self
+            .send(AuthorizePrincipal {
+                shard_group_id,
+                resource,
+                principal,
+                reply,
+            })
+            .await;
+        recv.await.ok().flatten()
+    }
+
     pub(crate) async fn send(
         &self,
         cmd: impl Into<MultiRaftActorCommand>,

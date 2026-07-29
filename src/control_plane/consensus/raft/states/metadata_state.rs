@@ -89,6 +89,10 @@ impl MetadataState {
         range.segments.get(&key.segment_id)
     }
 
+    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+        self.security.authorizes(resource, principal)
+    }
+
     pub(crate) fn get_consumer_group_assignment(
         &self,
         topic_name: &str,
@@ -684,6 +688,23 @@ mod tests {
         );
         assert_eq!(restored.last_applied_index, 9);
         restored.assert_invariants();
+    }
+
+    #[test]
+    fn metadata_authorization_defaults_to_deny() {
+        let mut state = MetadataState::new(ShardGroupId(1));
+        state.security.acls.insert(
+            "topic-data/42".to_string(),
+            AclRecord {
+                resource: "topic-data/42".to_string(),
+                revision: 1,
+                principals: vec!["orders-service".to_string()].into_boxed_slice(),
+            },
+        );
+
+        assert!(state.authorizes("topic-data/42", "orders-service"));
+        assert!(!state.authorizes("topic-data/42", "unknown-service"));
+        assert!(!state.authorizes("topic-data/43", "orders-service"));
     }
 
     fn replica_set() -> Replicas {

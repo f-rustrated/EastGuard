@@ -161,6 +161,10 @@ impl Raft {
         self.metadata.get_topic_by_name(name)
     }
 
+    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+        self.metadata.authorizes(resource, principal)
+    }
+
     pub(crate) fn get_consumer_group_assignment(
         &self,
         topic_name: &str,

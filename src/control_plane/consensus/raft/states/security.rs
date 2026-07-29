@@ -52,6 +52,18 @@ pub(crate) struct RevocationRecord {
     pub revoked_at: u64,
 }
 
+impl SecurityState {
+    /// Returns whether an exact principal is listed on an exact ACL resource.
+    ///
+    /// Missing records and missing principals deny by default. Resource
+    /// hierarchy or wildcard matching is intentionally not inferred here.
+    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+        self.acls
+            .get(resource)
+            .is_some_and(|acl| acl.principals.iter().any(|entry| entry == principal))
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 impl crate::test_traits::TAssertInvariant for SecurityState {
     fn assert_invariants(&self) {
@@ -112,5 +124,23 @@ mod tests {
             revision: 5,
             revoked_at: 100,
         });
+    }
+
+    #[test]
+    fn acl_authorization_is_exact_and_defaults_to_deny() {
+        let mut security = SecurityState::default();
+        security.acls.insert(
+            "topic-data/42".to_string(),
+            AclRecord {
+                resource: "topic-data/42".to_string(),
+                revision: 1,
+                principals: vec!["orders-service".to_string()].into_boxed_slice(),
+            },
+        );
+
+        assert!(security.authorizes("topic-data/42", "orders-service"));
+        assert!(!security.authorizes("topic-data/42", "unknown-service"));
+        assert!(!security.authorizes("topic-data/43", "orders-service"));
+        assert!(!security.authorizes("topic-data", "orders-service"));
     }
 }
