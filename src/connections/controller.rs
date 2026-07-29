@@ -115,7 +115,7 @@ impl ClientController {
         match request {
             ClientRequest::ControlPlane(cp) => self.handle_control_plane(cp).await,
             ClientRequest::DataPlane(dp) => self.handle_data_plane(dp).await,
-            ClientRequest::Admin(admin) => self.handle_admin(admin).await,
+            ClientRequest::Admin(admin) => self.handle_admin(admin).await.into(),
         }
     }
 
@@ -239,6 +239,8 @@ impl ClientController {
         }
 
         let topic = self.raft_sender.get_topic_metadata(topic_name).await?;
+        self.authorize_acl_resource(AclResource::TopicAdmin(topic.id))
+            .await?;
 
         let addresses = self.swim_sender.list_all_node_addresses().await?;
         let detail = TopicDetail::from_meta(topic, &addresses);
@@ -256,6 +258,9 @@ impl ClientController {
                 return Err(self.control_plane_redirect(member));
             }
         };
+        // A new topic has no stable ID yet, so its creator needs the cluster-wide
+        // grant. Once created, topic-admin/{topic-id} governs its metadata.
+        self.authorize_acl_resource(AclResource::Cluster).await?;
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -279,6 +284,12 @@ impl ClientController {
                 return Err(self.control_plane_redirect(member));
             }
         };
+        let topic = self
+            .raft_sender
+            .get_topic_metadata(topic_name.clone())
+            .await?;
+        self.authorize_acl_resource(AclResource::TopicAdmin(topic.id))
+            .await?;
 
         let cmd = DeleteTopic { name: topic_name };
         self.propose_topic_write(group.id, cmd).await?;
@@ -355,6 +366,8 @@ impl ClientController {
     }
 
     async fn list_hosted_topics(&self) -> Result<ClientSuccess, ServerError> {
+        self.authorize_acl_resource(AclResource::Cluster).await?;
+
         let topics = self
             .raft_sender
             .get_topics()
@@ -593,17 +606,17 @@ impl ClientController {
         Ok(ClientSuccess::RangeOffset(range_offset))
     }
 
-    async fn handle_admin(&self, request: AdminRequest) -> ClientResponse {
+    async fn handle_admin(&self, request: AdminRequest) -> Result<ClientSuccess, ServerError> {
         use AdminRequest::*;
 
-        let res = match request {
+        self.authorize_acl_resource(AclResource::Cluster).await?;
+
+        match request {
             DescribeCluster => self.describe_cluster().await,
             ListHostedTopicsWithStats => self.list_hosted_topics_with_stats().await,
-
             GetShardInfo { key } => self.get_shard_info(key).await,
             GetShardLeader { shard_group_id } => self.handle_get_shard_leader(shard_group_id).await,
-        };
-        res.into()
+        }
     }
 
     async fn describe_cluster(&self) -> Result<ClientSuccess, ServerError> {
@@ -874,6 +887,88 @@ mod tests {
                 .await,
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn topic_metadata_operations_require_topic_admin_acl() {
+        let group = test_shard_group();
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let proposal_count = Arc::new(AtomicUsize::new(0));
+        let observed_proposals = proposal_count.clone();
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
+                let _ = reply.send(Some(topic_meta("node-1")));
+            }
+            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+                assert_eq!(query.resource, AclResource::TopicAdmin(TopicId(1)));
+                let _ = query.reply.send(Some(false));
+            }
+            MultiRaftActorCommand::ClientProposal { .. } => {
+                observed_proposals.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        });
+        let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
+
+        assert_eq!(
+            controller.describe_topic("t1".into()).await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(
+            controller.delete_topic("t1".into()).await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(proposal_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_scoped_apis_require_cluster_acl() {
+        let group = test_shard_group();
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let proposal_count = Arc::new(AtomicUsize::new(0));
+        let observed_proposals = proposal_count.clone();
+        let raft = raft_sender_with(move |cmd| match cmd {
+            MultiRaftActorCommand::AuthorizePrincipal(query) => {
+                assert_eq!(query.resource, AclResource::Cluster);
+                let _ = query.reply.send(Some(false));
+            }
+            MultiRaftActorCommand::ClientProposal { .. } => {
+                observed_proposals.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        });
+        let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
+
+        assert_eq!(
+            controller
+                .handle_create_topic(
+                    "t1".into(),
+                    StoragePolicy {
+                        retention_ms: Some(3_600_000),
+                        replication_factor: 1,
+                        partition_strategy: PartitionStrategy::AutoSplit,
+                    },
+                )
+                .await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(
+            controller.list_hosted_topics().await,
+            Err(ServerError::Unauthorized)
+        );
+        assert!(matches!(
+            controller.handle_admin(AdminRequest::DescribeCluster).await,
+            Err(ServerError::Unauthorized)
+        ));
+        assert_eq!(proposal_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1208,10 +1303,14 @@ mod tests {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
-        let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::ClientProposal { reply, .. } = cmd {
+        let raft = raft_sender_with(|cmd| match cmd {
+            MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
+                let _ = reply.send(Some(topic_meta("node-1")));
+            }
+            MultiRaftActorCommand::ClientProposal { reply, .. } => {
                 let _ = reply.send(Ok(()));
             }
+            _ => {}
         });
         let resp = trusted_controller(node_id("node-1"), swim, raft, dp_stub())
             .dispatch(ClientRequest::ControlPlane(

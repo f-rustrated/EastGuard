@@ -139,8 +139,8 @@ permission checks; its text grants no authority by itself.
 
 | Resource Key Format | Granted Actions |
 | :--- | :--- |
-| `cluster` | Membership inspection, topology lookup, operator diagnostics |
-| `topic-admin/{topic-id}` | Create, delete, describe topic metadata |
+| `cluster` | Create and list topics, membership inspection, topology lookup, operator diagnostics |
+| `topic-admin/{topic-id}` | Delete and describe topic metadata |
 | `topic-data/{topic-id}` | Produce, fetch, list offsets for topic |
 | `consumer-group/{topic-id}/{group-id}` | Coordinate the group and read/commit its offsets |
 | `producer-session/{topic-id}/{producer-id}` | Renew the session, bound to its creator for the session lifetime |
