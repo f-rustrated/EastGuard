@@ -14,10 +14,11 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::transport::ClusterMessageReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::net::{TransportTcpStream, TransportWriteHalf};
-use crate::security::NodeTransportSecurity;
+use crate::security::{NodeTransportSecurity, TransportIdentity};
 
 use super::protocol::{
-    AclSnapshotRequest, AclSnapshotResponse, InitialClusterMessage, encode_frame,
+    AclSnapshotRequest, AclSnapshotResponse, AdmissionLookupRequest, AdmissionLookupResponse,
+    InitialClusterMessage, encode_frame,
 };
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -77,7 +78,7 @@ impl RaftRpcDispatcher {
     pub(super) async fn accept(&mut self, stream: TransportTcpStream, raft_tx: &MutlRaftSender) {
         let transport_identity = stream.peer_identity();
         let (read_half, write_half) = stream.into_split();
-        let mut reader = ClusterMessageReader::new(read_half, transport_identity);
+        let mut reader = ClusterMessageReader::new(read_half, transport_identity.clone());
 
         let Ok(initial_message) = reader.read_initial_message().await else {
             tracing::debug!("cluster connection closed before its initial message");
@@ -85,6 +86,14 @@ impl RaftRpcDispatcher {
         };
 
         match initial_message {
+            InitialClusterMessage::AdmissionLookup(request) => {
+                tokio::spawn(serve_admission_lookup_request(
+                    transport_identity,
+                    request,
+                    raft_tx.clone(),
+                    write_half,
+                ));
+            }
             InitialClusterMessage::AclSnapshot(request) => {
                 let peer_id = request.requester_node_id.clone();
                 tokio::spawn(serve_acl_snapshot_request(
@@ -306,6 +315,40 @@ async fn dial(
         ClusterMessageReader::new(read_half, transport_identity),
         write_half,
     ))
+}
+
+async fn serve_admission_lookup_request(
+    transport_identity: TransportIdentity,
+    request: AdmissionLookupRequest,
+    raft_tx: MutlRaftSender,
+    mut writer: TransportWriteHalf,
+) {
+    let admission = match raft_tx
+        .get_admission(request.shard_group_id, request.node_certificate_principal)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            tracing::debug!(
+                ?transport_identity,
+                "admission lookup failed before response: {error}"
+            );
+            return;
+        }
+    };
+    let Ok(frame) = encode_frame(&AdmissionLookupResponse { admission }) else {
+        tracing::debug!(
+            ?transport_identity,
+            "failed to encode admission lookup response"
+        );
+        return;
+    };
+    if let Err(error) = writer.write_all(&frame).await {
+        tracing::debug!(
+            ?transport_identity,
+            "failed to send admission lookup response: {error}"
+        );
+    }
 }
 
 async fn serve_acl_snapshot_request(

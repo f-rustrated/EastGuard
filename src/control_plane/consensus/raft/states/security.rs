@@ -54,6 +54,10 @@ pub(crate) struct RevocationRecord {
 }
 
 impl SecurityState {
+    pub(crate) fn admission(&self, node_certificate_principal: &str) -> Option<AdmissionRecord> {
+        self.admissions.get(node_certificate_principal).cloned()
+    }
+
     /// Returns the current ACL record, or an empty revision-zero record when
     /// the resource has never been granted to any principal. Both forms deny
     /// by default; representing absence explicitly lets callers cache that
@@ -164,6 +168,25 @@ mod tests {
             revision: 5,
             revoked_at: 100,
         });
+    }
+
+    #[test]
+    fn admission_lookup_uses_the_certificate_principal() {
+        let mut security = SecurityState::default();
+        let admission = AdmissionRecord {
+            node_certificate_principal: "broker-a".to_string(),
+            revision: 3,
+            epoch: 2,
+            node_id: NodeId::new("broker-a::process-2"),
+            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+        };
+        security.admissions.insert(
+            admission.node_certificate_principal.clone(),
+            admission.clone(),
+        );
+
+        assert_eq!(security.admission("broker-a"), Some(admission));
+        assert_eq!(security.admission("broker-b"), None);
     }
 
     #[test]

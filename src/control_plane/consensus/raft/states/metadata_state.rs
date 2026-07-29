@@ -1,4 +1,6 @@
-use crate::control_plane::consensus::raft::states::security::{AclRecord, SecurityState};
+use crate::control_plane::consensus::raft::states::security::{
+    AclRecord, AdmissionRecord, SecurityState,
+};
 use crate::control_plane::metadata::SegmentMeta;
 use crate::control_plane::metadata::command::*;
 use crate::control_plane::metadata::event::*;
@@ -93,6 +95,10 @@ impl MetadataState {
 
     pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
         self.security.acl_snapshot(resource)
+    }
+
+    pub(crate) fn admission(&self, node_certificate_principal: &str) -> Option<AdmissionRecord> {
+        self.security.admission(node_certificate_principal)
     }
 
     pub(crate) fn get_consumer_group_assignment(

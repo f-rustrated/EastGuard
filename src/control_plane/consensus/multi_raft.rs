@@ -1,3 +1,4 @@
+use crate::client::ServerError;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::boundary_recovery::{
     BoundaryRecoveryAction, SegmentBoundaryRecovery,
@@ -9,7 +10,7 @@ use crate::control_plane::consensus::messages::{
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
-use crate::control_plane::consensus::raft::states::security::AclRecord;
+use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
@@ -289,6 +290,14 @@ impl MultiRaft {
                         value,
                     }));
             }
+            MultiRaftActorCommand::GetAdmission(query) => {
+                let value = self.admission(query.shard_group_id, &query.node_certificate_principal);
+                self.deferred
+                    .push(DeferredReply::GetAdmission(DeferredResponse {
+                        reply: query.reply,
+                        value,
+                    }));
+            }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
                     &query.topic_name,
@@ -328,6 +337,7 @@ impl MultiRaft {
                 DeferredReply::GetTopicStats(deferred) => deferred.send(),
                 DeferredReply::GetTopicMetadata(deferred) => deferred.send(),
                 DeferredReply::GetAclSnapshot(deferred) => deferred.send(),
+                DeferredReply::GetAdmission(deferred) => deferred.send(),
                 DeferredReply::GetConsumerGroupAssignment(deferred) => deferred.send(),
             }
         }
@@ -501,6 +511,18 @@ impl MultiRaft {
         self.groups
             .get(&shard_group_id)
             .map(|raft| raft.acl_snapshot(resource))
+    }
+
+    fn admission(
+        &self,
+        shard_group_id: ShardGroupId,
+        node_certificate_principal: &str,
+    ) -> Result<Option<AdmissionRecord>, ServerError> {
+        let raft = self
+            .groups
+            .get(&shard_group_id)
+            .ok_or(ServerError::ShardNotLocal { hint_node: None })?;
+        Ok(raft.admission(node_certificate_principal))
     }
 
     fn get_consumer_group_assignment(

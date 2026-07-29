@@ -2,6 +2,7 @@
 
 mod acl;
 pub(crate) use acl::{AclSnapshotActor, AclSnapshotSender};
+mod admission;
 mod inbound;
 use inbound::*;
 mod outbound;
@@ -83,8 +84,9 @@ mod tests {
     use crate::control_plane::consensus::messages::{
         MultiRaftActorCommand, RaftProtocolMessage, RaftRpc, RequestVote, WireRaftMessage,
     };
-    use crate::control_plane::consensus::raft::states::security::AclRecord;
+    use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
     use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::membership::actor::{RemoteShard, ShardRouting};
     use crate::control_plane::metadata::{AclResource, TopicId};
     use crate::control_plane::{NodeAddress, NodeAddressInfo};
     use crate::net::OwnedWriteHalf;
@@ -457,6 +459,97 @@ mod tests {
                 );
                 assert_eq!(first, Some(expected_snapshot.clone()));
                 assert_eq!(second, Some(expected_snapshot));
+                requester_completion.notify_one();
+                Ok(())
+            }
+        });
+
+        sim.run()
+    }
+
+    #[test]
+    fn admission_lookup_actor_coalesces_remote_reads() -> turmoil::Result {
+        let admission = AdmissionRecord {
+            node_certificate_principal: "broker-a".to_string(),
+            revision: 3,
+            epoch: 8,
+            node_id: NodeId::new("broker-a::process-2"),
+            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+        };
+        let owner = NodeAddressInfo::new(
+            NodeId::new("owner"),
+            NodeAddress::test(
+                "127.0.0.1:9000".parse().unwrap(),
+                "127.0.0.1:9001".parse().unwrap(),
+            ),
+        );
+        let response_received = std::sync::Arc::new(Notify::new());
+        let mut sim = Builder::new()
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+
+        let server_admission = admission.clone();
+        let server_response_received = response_received.clone();
+        sim.host("owner", move || {
+            let expected_admission = server_admission.clone();
+            let owner_completion = server_response_received.clone();
+            async move {
+                let listener = TcpListener::bind("0.0.0.0:9000").await?;
+                let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
+                let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
+                let mut dispatcher = RaftRpcDispatcher::new(
+                    NodeId::new("owner"),
+                    dial_tx,
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
+
+                let (stream, _) = listener.accept().await?;
+                dispatcher
+                    .accept(TransportTcpStream::TrustedDevelopment(stream), &raft_tx)
+                    .await;
+
+                let Some(MultiRaftActorCommand::GetAdmission(query)) = raft_rx.recv().await else {
+                    panic!("expected admission query");
+                };
+                assert_eq!(query.shard_group_id, ShardGroupId(42));
+                assert_eq!(query.node_certificate_principal.as_ref(), "broker-a");
+                let _ = query.reply.send(Ok(Some(expected_admission)));
+                owner_completion.notified().await;
+                Ok(())
+            }
+        });
+
+        let client_admission = admission.clone();
+        let client_owner = owner.clone();
+        sim.host("requester", move || {
+            let expected_admission = client_admission.clone();
+            let remote_owner = client_owner.clone();
+            let requester_completion = response_received.clone();
+            async move {
+                let (raft_tx, _raft_rx) = MultiRaftActor::channel(8);
+                let lookup = admission::AdmissionLookupActor::spawn(
+                    raft_tx,
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
+                let first_owner = remote_owner.clone();
+                let (first, second) = tokio::join!(
+                    lookup.lookup(
+                        ShardRouting::Redirect(Some(RemoteShard {
+                            group_id: ShardGroupId(42),
+                            member: Some(first_owner),
+                        })),
+                        "broker-a".into(),
+                    ),
+                    lookup.lookup(
+                        ShardRouting::Redirect(Some(RemoteShard {
+                            group_id: ShardGroupId(42),
+                            member: Some(remote_owner),
+                        })),
+                        "broker-a".into(),
+                    ),
+                );
+                assert_eq!(first, Ok(Some(expected_admission.clone())));
+                assert_eq!(second, Ok(Some(expected_admission)));
                 requester_completion.notify_one();
                 Ok(())
             }

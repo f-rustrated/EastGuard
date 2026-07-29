@@ -7,7 +7,7 @@ use crate::security::TransportIdentity;
 use borsh::BorshDeserialize;
 use tokio::io::AsyncReadExt;
 
-use super::protocol::{AclSnapshotResponse, InitialClusterMessage};
+use super::protocol::{AclSnapshotResponse, AdmissionLookupResponse, InitialClusterMessage};
 
 pub(super) struct ClusterMessageReader {
     read_half: TransportReadHalf,
@@ -38,6 +38,13 @@ impl ClusterMessageReader {
         &mut self,
     ) -> anyhow::Result<AclSnapshotResponse> {
         self.read_frame(4 * 1024 * 1024, "ACL snapshot response")
+            .await
+    }
+
+    pub(super) async fn read_admission_lookup_response(
+        &mut self,
+    ) -> anyhow::Result<AdmissionLookupResponse> {
+        self.read_frame(4 * 1024 * 1024, "admission lookup response")
             .await
     }
 

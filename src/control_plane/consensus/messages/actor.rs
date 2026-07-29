@@ -1,9 +1,10 @@
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::connections::protocol::ServerError;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::consensus::raft::states::security::AclRecord;
+use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{AclResource, ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
@@ -54,6 +55,7 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
     GetAclSnapshot(GetAclSnapshot),
+    GetAdmission(GetAdmission),
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data-plane request forwarded to the metadata coordinator for proposal.
     ProposeSegmentRoll(ProposeSegmentRoll),
@@ -86,6 +88,13 @@ pub struct GetAclSnapshot {
     pub(crate) reply: oneshot::Sender<Option<AclRecord>>,
 }
 
+/// Returns one admission record from a metadata shard hosted by this node.
+pub struct GetAdmission {
+    pub(crate) shard_group_id: ShardGroupId,
+    pub(crate) node_certificate_principal: Box<str>,
+    pub(crate) reply: oneshot::Sender<Result<Option<AdmissionRecord>, ServerError>>,
+}
+
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {
     fn from(cmd: RaftProtocolMessage) -> Self {
         MultiRaftActorCommand::ProtocolMessage(cmd)
@@ -109,6 +118,7 @@ impl_from_variant_via!(
 impl_from_variant!(
     MultiRaftActorCommand,
     GetAclSnapshot,
+    GetAdmission,
     GetConsumerGroupAssignment,
 );
 
@@ -132,5 +142,6 @@ pub(crate) enum DeferredReply {
     GetTopicStats(DeferredResponse<Box<[TopicStats]>>),
     GetTopicMetadata(DeferredResponse<Option<TopicMeta>>),
     GetAclSnapshot(DeferredResponse<Option<AclRecord>>),
+    GetAdmission(DeferredResponse<Result<Option<AdmissionRecord>, ServerError>>),
     GetConsumerGroupAssignment(DeferredResponse<Option<ConsumerGroupAssignment>>),
 }
