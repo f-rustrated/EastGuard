@@ -5,7 +5,7 @@ use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{
     AclResource, OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest,
-    TopicId, TopicState,
+    TopicState,
 };
 use crate::control_plane::{
     NodeId, SwimNodeState,
@@ -270,12 +270,11 @@ impl ClientController {
             .await
     }
 
-    async fn authorize_data_access(&self, topic_id: TopicId) -> Result<(), ServerError> {
+    async fn authorize_data_access(&self, resource: AclResource) -> Result<(), ServerError> {
         let TransportIdentity::CertificatePrincipal(principal) = &self.transport_identity else {
             return Ok(());
         };
 
-        let resource = AclResource::TopicData(topic_id);
         let ShardRouting::Local(group) = self.route(resource.routing_key()).await? else {
             return Err(ServerError::Unauthorized);
         };
@@ -365,7 +364,7 @@ impl ClientController {
         &self,
         req: CommitConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(req.key.topic_id).await?;
+        self.authorize_data_access(req.key.acl()).await?;
 
         let (tx, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -395,7 +394,7 @@ impl ClientController {
         &self,
         req: FetchConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(req.key.topic_id).await?;
+        self.authorize_data_access(req.key.acl()).await?;
 
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -435,7 +434,8 @@ impl ClientController {
         }
 
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(topic.id).await?;
+        self.authorize_data_access(AclResource::TopicData(topic.id))
+            .await?;
 
         let producer_identity = req
             .producer_identity
@@ -489,7 +489,8 @@ impl ClientController {
     /// state machine needs to answer without any further I/O.
     async fn fetch(&self, req: FetchRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(topic.id).await?;
+        self.authorize_data_access(AclResource::TopicData(topic.id))
+            .await?;
 
         let range = topic.get_range(&req.range_id)?;
 
@@ -522,7 +523,8 @@ impl ClientController {
     /// serve it. No proxying: a miss returns `SegmentNotLocal` and the client
     /// retries another replica.
     async fn fetch_by_id(&self, req: FetchByIdRequest) -> Result<ClientSuccess, ServerError> {
-        self.authorize_data_access(req.topic_id).await?;
+        self.authorize_data_access(AclResource::TopicData(req.topic_id))
+            .await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = Fetch {
@@ -547,7 +549,8 @@ impl ClientController {
     /// for the range's currently-active segment on this node.
     async fn list_offsets(&self, req: RangeOffsetRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_data_access(topic.id).await?;
+        self.authorize_data_access(AclResource::TopicData(topic.id))
+            .await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
@@ -691,11 +694,13 @@ mod tests {
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
     };
-    use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
+    use crate::control_plane::metadata::consumer_group::GenerationId;
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+    use crate::control_plane::metadata::{ConsumerGroupResource, TopicStats as MetadataTopicStats};
     use crate::control_plane::metadata::{RangeId, TopicId, TopicMeta};
     use crate::control_plane::{NodeAddress, NodeId, Replicas, SwimNode, SwimNodeState};
     use crate::data_plane::actor::DataPlaneSender;
+    use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetKey;
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use std::net::SocketAddr;
@@ -836,7 +841,51 @@ mod tests {
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
 
-        assert_eq!(controller.authorize_data_access(TopicId(7)).await, Ok(()));
+        assert_eq!(
+            controller
+                .authorize_data_access(AclResource::TopicData(TopicId(7)))
+                .await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_offset_requires_its_group_acl() {
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            replicas: Replicas::new(vec![node_id("self")]),
+        };
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
+                assert_eq!(
+                    query.resource,
+                    AclResource::ConsumerGroup(ConsumerGroupResource {
+                        topic_id: TopicId(7),
+                        group_id: "billing".to_string(),
+                    })
+                );
+                let _ = query.reply.send(Some(false));
+            }
+        });
+        let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
+
+        let result = controller
+            .handle_fetch_consumer_offset(FetchConsumerOffsetRequest {
+                key: ConsumerOffsetKey {
+                    topic_id: TopicId(7),
+                    range_id: RangeId(0),
+                    group_id: "billing".to_string(),
+                },
+                generation: GenerationId(1),
+            })
+            .await;
+
+        assert_eq!(result, Err(ServerError::Unauthorized));
     }
 
     #[tokio::test]
@@ -862,7 +911,9 @@ mod tests {
         );
 
         assert_eq!(
-            controller.authorize_data_access(TopicId(7)).await,
+            controller
+                .authorize_data_access(AclResource::TopicData(TopicId(7)))
+                .await,
             Err(ServerError::Unauthorized)
         );
     }
