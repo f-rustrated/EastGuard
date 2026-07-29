@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 
+mod acl;
+pub(crate) use acl::{AclSnapshotActor, AclSnapshotSender};
 mod inbound;
 use inbound::*;
 mod outbound;
 use outbound::*;
+mod protocol;
 
 use tokio::sync::mpsc;
 
@@ -74,16 +77,21 @@ impl RaftTransportActor {
 
 #[cfg(test)]
 mod tests {
+    use super::protocol::InitialClusterMessage;
     use super::*;
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::{
         MultiRaftActorCommand, RaftProtocolMessage, RaftRpc, RequestVote, WireRaftMessage,
     };
+    use crate::control_plane::consensus::raft::states::security::AclRecord;
     use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::metadata::{AclResource, TopicId};
+    use crate::control_plane::{NodeAddress, NodeAddressInfo};
     use crate::net::OwnedWriteHalf;
     use crate::net::TcpStream;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Notify;
     use turmoil::Builder;
 
     /// Write a length-prefixed borsh-encoded value to a raw write half.
@@ -99,8 +107,21 @@ mod tests {
         Ok(())
     }
 
+    fn request_vote_message(shard_group_id: u64, sender: &str) -> WireRaftMessage {
+        WireRaftMessage {
+            shard_group_id: ShardGroupId(shard_group_id),
+            sender: NodeId::new(sender),
+            rpc: RaftRpc::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId::new(sender),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        }
+    }
+
     #[test]
-    fn handshake_write_then_read_node_id() -> turmoil::Result {
+    fn initial_raft_message_identifies_the_peer() -> turmoil::Result {
         let mut sim = Builder::new()
             .simulation_duration(Duration::from_secs(5))
             .build();
@@ -109,10 +130,14 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
+            let mut reader =
+                ClusterMessageReader::new(read_half, TransportIdentity::TrustedDevelopment);
 
-            let peer_id = reader.read_node_id().await.unwrap();
-            assert_eq!(peer_id, NodeId::new("node-abc"));
+            let InitialClusterMessage::Raft(message) = reader.read_initial_message().await.unwrap()
+            else {
+                panic!("expected initial Raft message");
+            };
+            assert_eq!(message.sender, NodeId::new("node-abc"));
             Ok(())
         });
 
@@ -121,7 +146,11 @@ mod tests {
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream.into_split();
 
-            write_frame(&mut write_half, &NodeId::new("node-abc")).await?;
+            write_frame(
+                &mut write_half,
+                &InitialClusterMessage::Raft(request_vote_message(42, "node-abc")),
+            )
+            .await?;
             Ok(())
         });
 
@@ -138,9 +167,10 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
+            let mut reader =
+                ClusterMessageReader::new(read_half, TransportIdentity::TrustedDevelopment);
 
-            let msg = reader.read_message().await.unwrap();
+            let msg = reader.read_raft_message().await.unwrap();
             assert_eq!(msg.shard_group_id, ShardGroupId(42));
             assert_eq!(msg.sender, NodeId::new("sender-1"));
             match msg.rpc {
@@ -188,8 +218,9 @@ mod tests {
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (stream, _) = listener.accept().await?;
             let (read_half, _) = stream.into_split();
-            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
-            let peer = reader.read_node_id().await?;
+            let reader =
+                ClusterMessageReader::new(read_half, TransportIdentity::TrustedDevelopment);
+            let peer = NodeId::new("node-a");
             let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
 
             reader.run(raft_tx, peer.clone()).await;
@@ -200,7 +231,7 @@ mod tests {
             else {
                 panic!("expected one inbound Raft RPC")
             };
-            assert_eq!(cmd.from, peer);
+            assert_eq!(cmd.peer_id, peer);
             assert_eq!(cmd.shard_group_id, ShardGroupId(1));
             assert!(raft_rx.try_recv().is_err());
             Ok(())
@@ -210,24 +241,8 @@ mod tests {
             let addr = turmoil::lookup("server");
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut writer) = stream.into_split();
-            write_frame(&mut writer, &NodeId::new("node-a")).await?;
-
-            for (group, sender) in [(1, "node-a"), (2, "node-b")] {
-                write_frame(
-                    &mut writer,
-                    &WireRaftMessage {
-                        shard_group_id: ShardGroupId(group),
-                        sender: NodeId::new(sender),
-                        rpc: RaftRpc::RequestVote(RequestVote {
-                            term: 1,
-                            candidate_id: NodeId::new(sender),
-                            last_log_index: 0,
-                            last_log_term: 0,
-                        }),
-                    },
-                )
-                .await?;
-            }
+            write_frame(&mut writer, &request_vote_message(1, "node-a")).await?;
+            write_frame(&mut writer, &request_vote_message(2, "node-b")).await?;
             Ok(())
         });
 
@@ -235,13 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn accepted_connection_registers_writer_after_handshake() -> turmoil::Result {
+    fn accepted_connection_registers_writer_after_initial_raft_message() -> turmoil::Result {
         let mut sim = Builder::new()
             .simulation_duration(Duration::from_secs(5))
             .build();
 
         sim.host("acceptor", || async {
-            let (raft_tx, _raft_rx) = MultiRaftActor::channel(16);
+            let (raft_tx, mut raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
             let mut state = RaftRpcDispatcher::new(
@@ -257,8 +272,15 @@ mod tests {
 
             assert!(
                 state.contains(&NodeId::new("node-a")),
-                "writer should be registered after handshake"
+                "writer should be registered after the initial Raft message"
             );
+            let Some(MultiRaftActorCommand::ProtocolMessage(RaftProtocolMessage::InboundRaftRpc(
+                rpc,
+            ))) = raft_rx.recv().await
+            else {
+                panic!("expected the initial Raft RPC")
+            };
+            assert_eq!(rpc.peer_id, NodeId::new("node-a"));
             Ok(())
         });
 
@@ -266,7 +288,11 @@ mod tests {
             let addr = turmoil::lookup("acceptor");
             let stream = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream.into_split();
-            write_frame(&mut write_half, &NodeId::new("node-a")).await?;
+            write_frame(
+                &mut write_half,
+                &InitialClusterMessage::Raft(request_vote_message(1, "node-a")),
+            )
+            .await?;
             Ok(())
         });
 
@@ -304,8 +330,14 @@ mod tests {
             // Second connection from node-a (simulating simultaneous connect)
             let (stream2, _) = dummy_listener.accept().await?;
             let (read_half, _write_half) = stream2.into_split();
-            let mut reader = RaftRpcListener::new(read_half, TransportIdentity::TrustedDevelopment);
-            let peer_id = reader.read_node_id().await.unwrap();
+            let mut reader =
+                ClusterMessageReader::new(read_half, TransportIdentity::TrustedDevelopment);
+            let InitialClusterMessage::Raft(initial_raft_message) =
+                reader.read_initial_message().await.unwrap()
+            else {
+                panic!("expected initial Raft message");
+            };
+            let peer_id = initial_raft_message.sender;
             assert_eq!(peer_id, NodeId::new("node-a"));
 
             // Conflict: node-a < node-b → incoming wins, replace
@@ -323,13 +355,111 @@ mod tests {
 
             let stream1 = TcpStream::connect((addr, 9000)).await?;
             let (_, mut write_half) = stream1.into_split();
-            write_frame(&mut write_half, &NodeId::new("node-a")).await?;
+            write_frame(
+                &mut write_half,
+                &InitialClusterMessage::Raft(request_vote_message(1, "node-a")),
+            )
+            .await?;
 
             let stream2 = TcpStream::connect((addr, 9001)).await?;
             let (_, mut write_half2) = stream2.into_split();
-            write_frame(&mut write_half2, &NodeId::new("node-a")).await?;
+            write_frame(
+                &mut write_half2,
+                &InitialClusterMessage::Raft(request_vote_message(1, "node-a")),
+            )
+            .await?;
 
             Ok(())
+        });
+
+        sim.run()
+    }
+
+    #[test]
+    fn acl_snapshot_actor_coalesces_concurrent_refreshes() -> turmoil::Result {
+        let resource = AclResource::TopicData(TopicId(7));
+        let snapshot = AclRecord {
+            resource: resource.clone(),
+            revision: 3,
+            principals: vec!["orders-service".to_owned()].into(),
+        };
+        let owner = NodeAddressInfo::new(
+            NodeId::new("owner"),
+            NodeAddress::test(
+                "127.0.0.1:9000".parse().unwrap(),
+                "127.0.0.1:9001".parse().unwrap(),
+            ),
+        );
+        let response_received = std::sync::Arc::new(Notify::new());
+        let mut sim = Builder::new()
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+
+        let server_snapshot = snapshot.clone();
+        let server_resource = resource.clone();
+        let server_response_received = response_received.clone();
+        sim.host("owner", move || {
+            let expected_snapshot = server_snapshot.clone();
+            let expected_resource = server_resource.clone();
+            let owner_completion = server_response_received.clone();
+            async move {
+                let listener = TcpListener::bind("0.0.0.0:9000").await?;
+                let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
+                let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(8);
+                let mut dispatcher = RaftRpcDispatcher::new(
+                    NodeId::new("owner"),
+                    dial_tx,
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
+
+                let (stream, _) = listener.accept().await?;
+                dispatcher
+                    .accept(TransportTcpStream::TrustedDevelopment(stream), &raft_tx)
+                    .await;
+
+                let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await
+                else {
+                    panic!("expected ACL snapshot query");
+                };
+                assert_eq!(query.shard_group_id, ShardGroupId(42));
+                assert_eq!(query.resource, expected_resource);
+                let _ = query.reply.send(Some(expected_snapshot));
+                owner_completion.notified().await;
+                Ok(())
+            }
+        });
+
+        let client_resource = resource.clone();
+        let client_snapshot = snapshot.clone();
+        let client_owner = owner.clone();
+        sim.host("requester", move || {
+            let requested_resource = client_resource.clone();
+            let expected_snapshot = client_snapshot.clone();
+            let remote_owner = client_owner.clone();
+            let requester_completion = response_received.clone();
+            async move {
+                let client = AclSnapshotActor::spawn(NodeTransportSecurity::TrustedDevelopment);
+                let first_owner = remote_owner.clone();
+                let first_resource = requested_resource.clone();
+                let (first, second) = tokio::join!(
+                    client.fetch(
+                        NodeId::new("requester"),
+                        first_owner,
+                        ShardGroupId(42),
+                        first_resource,
+                    ),
+                    client.fetch(
+                        NodeId::new("requester"),
+                        remote_owner,
+                        ShardGroupId(42),
+                        requested_resource,
+                    ),
+                );
+                assert_eq!(first, Some(expected_snapshot.clone()));
+                assert_eq!(second, Some(expected_snapshot));
+                requester_completion.notify_one();
+                Ok(())
+            }
         });
 
         sim.run()

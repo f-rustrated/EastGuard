@@ -6,13 +6,19 @@ use tokio::time::Instant;
 
 use crate::control_plane::consensus::actor::MutlRaftSender;
 
-use crate::control_plane::consensus::messages::{OutboundRaftPacket, WireRaftMessage};
+use crate::control_plane::consensus::messages::{
+    InboundRaftRpc, OutboundRaftPacket, WireRaftMessage,
+};
 
 use crate::control_plane::NodeId;
-use crate::control_plane::consensus::transport::RaftRpcListener;
+use crate::control_plane::consensus::transport::ClusterMessageReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::net::{TransportTcpStream, TransportWriteHalf};
 use crate::security::NodeTransportSecurity;
+
+use super::protocol::{
+    AclSnapshotRequest, AclSnapshotResponse, InitialClusterMessage, encode_frame,
+};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// Upper bound on messages buffered per peer while its dial is in flight;
@@ -24,9 +30,9 @@ const PENDING_DIAL_BUFFER_CAP: usize = 256;
 /// On simultaneous connect, the connection initiated by the **lower `NodeId`**
 /// wins; the other is dropped.
 ///
-/// Handshake: after connecting, the initiator sends its `NodeId`. The acceptor
-/// reads it, and if a connection to that peer already exists (from our own
-/// outbound connect), the tie is broken by NodeId ordering.
+/// A connection begins with its first Raft message, which identifies the peer.
+/// The acceptor uses that sender to key the writer slot and resolve simultaneous
+/// connection conflicts.
 pub(super) struct RaftRpcDispatcher {
     node_id: NodeId,
     writers: HashMap<NodeId, TransportWriteHalf>,
@@ -48,7 +54,7 @@ pub(super) struct RaftRpcDispatcher {
 /// Result of a background dial attempt, delivered back to the transport loop.
 pub(super) struct DialOutcome {
     target: NodeId,
-    outcome: anyhow::Result<(RaftRpcListener, TransportWriteHalf)>,
+    outcome: anyhow::Result<(ClusterMessageReader, TransportWriteHalf)>,
 }
 
 impl RaftRpcDispatcher {
@@ -71,24 +77,44 @@ impl RaftRpcDispatcher {
     pub(super) async fn accept(&mut self, stream: TransportTcpStream, raft_tx: &MutlRaftSender) {
         let transport_identity = stream.peer_identity();
         let (read_half, write_half) = stream.into_split();
-        let mut reader = RaftRpcListener::new(read_half, transport_identity);
+        let mut reader = ClusterMessageReader::new(read_half, transport_identity);
 
-        let Ok(peer_id) = reader.read_node_id().await else {
-            tracing::error!("Failed to read peer NodeId during accept");
+        let Ok(initial_message) = reader.read_initial_message().await else {
+            tracing::debug!("cluster connection closed before its initial message");
             return;
         };
 
-        if self.writers.contains_key(&peer_id) && peer_id > self.node_id {
-            tracing::debug!(
-                peer = %peer_id,
-                "simultaneous connect: dropping accepted connection, \
-                 our outbound dial wins the tie-break (lower NodeId)",
-            );
-            return;
+        match initial_message {
+            InitialClusterMessage::AclSnapshot(request) => {
+                let peer_id = request.requester_node_id.clone();
+                tokio::spawn(serve_acl_snapshot_request(
+                    peer_id,
+                    request,
+                    raft_tx.clone(),
+                    write_half,
+                ));
+            }
+            InitialClusterMessage::Raft(initial_raft_message) => {
+                let initial_rpc = InboundRaftRpc {
+                    shard_group_id: initial_raft_message.shard_group_id,
+                    peer_id: initial_raft_message.sender,
+                    rpc: initial_raft_message.rpc,
+                };
+                if self.writers.contains_key(&initial_rpc.peer_id)
+                    && initial_rpc.peer_id > self.node_id
+                {
+                    // simultaneous connect: dropping accepted connection
+                    return;
+                }
+                self.writers.insert(initial_rpc.peer_id.clone(), write_half);
+                let raft_tx = raft_tx.clone();
+                tokio::spawn(async move {
+                    let peer_id = initial_rpc.peer_id.clone();
+                    let _ = raft_tx.send(initial_rpc).await;
+                    reader.run(raft_tx, peer_id).await;
+                });
+            }
         }
-
-        self.writers.insert(peer_id.clone(), write_half);
-        tokio::spawn(reader.run(raft_tx.clone(), peer_id));
     }
 
     pub(super) async fn send(&mut self, packets: Vec<OutboundRaftPacket>, swim_tx: &SwimSender) {
@@ -121,7 +147,7 @@ impl RaftRpcDispatcher {
     async fn send_to_target(
         &mut self,
         target_id: NodeId,
-        msgs: Vec<WireRaftMessage>,
+        mut msgs: Vec<WireRaftMessage>,
         swim_tx: &SwimSender,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
@@ -146,13 +172,15 @@ impl RaftRpcDispatcher {
             }
             return;
         }
+        let initial_raft_message = msgs.remove(0);
         self.pending_dials.insert(target_id.clone(), msgs);
         let dial_task = dial(
-            self.node_id.clone(),
             target_id.clone(),
             swim_tx.clone(),
             self.security.clone(),
+            initial_raft_message,
         );
+
         let dial_tx = self.dial_tx.clone();
         tokio::spawn(async move {
             let outcome = dial_task.await;
@@ -230,10 +258,8 @@ impl RaftRpcDispatcher {
         })?;
         let mut buf = Vec::new();
         for msg in msgs {
-            let bytes = borsh::to_vec(msg)?;
-            let len = bytes.len() as u32;
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(&bytes);
+            let frame = encode_frame(msg).map_err(std::io::Error::other)?;
+            buf.extend_from_slice(&frame);
         }
         let result = writer.write_all(&buf).await;
         if result.is_err() {
@@ -248,19 +274,19 @@ impl RaftRpcDispatcher {
     }
 }
 
-/// Resolve, connect (3secs cap), and handshake — on a spawned task, so a hung
-/// connect can never block the transport select loop. The loop
+/// Resolve, connect (3secs cap), and send the opening Raft message on a spawned
+/// task, so a hung connect can never block the transport select loop. The loop
 /// installs the writer and flushes buffered messages in `on_dial_result`.
-// ! never inline this. Actor Model should onkly do work whose duration it controls.
+// ! never inline this. Actor Model should only do work whose duration it controls.
 // ! Anything whose latency the outside actor controls must not be awaited in the handler.
 async fn dial(
-    node_id: NodeId,
     target_id: NodeId,
     swim_tx: SwimSender,
     security: NodeTransportSecurity,
-) -> anyhow::Result<(RaftRpcListener, TransportWriteHalf)> {
+    initial_raft_message: WireRaftMessage,
+) -> anyhow::Result<(ClusterMessageReader, TransportWriteHalf)> {
     let Some(addr) = swim_tx.resolve_address(target_id.clone()).await? else {
-        anyhow::bail!("[{}] Cannot resolve address for {:?}", node_id, target_id);
+        anyhow::bail!("cannot resolve address for {target_id}");
     };
 
     let stream = tokio::time::timeout(
@@ -271,13 +297,31 @@ async fn dial(
 
     let transport_identity = stream.peer_identity();
     let (read_half, mut write_half) = stream.into_split();
-    let bytes = borsh::to_vec(&node_id)
-        .map_err(|e| anyhow::anyhow!("[{}] Handshake encode failed: {e}", node_id))?;
-    let len = bytes.len() as u32;
-    write_half.write_all(&len.to_be_bytes()).await?;
-    write_half.write_all(&bytes).await?;
+    write_half
+        .write_all(&encode_frame(&InitialClusterMessage::Raft(
+            initial_raft_message,
+        ))?)
+        .await?;
     Ok((
-        RaftRpcListener::new(read_half, transport_identity),
+        ClusterMessageReader::new(read_half, transport_identity),
         write_half,
     ))
+}
+
+async fn serve_acl_snapshot_request(
+    peer_id: NodeId,
+    request: AclSnapshotRequest,
+    raft_tx: MutlRaftSender,
+    mut writer: TransportWriteHalf,
+) {
+    let snapshot = raft_tx
+        .get_acl_snapshot(request.shard_group_id, request.resource)
+        .await;
+    let Ok(frame) = encode_frame(&AclSnapshotResponse { snapshot }) else {
+        tracing::debug!(peer = %peer_id, "failed to encode ACL snapshot response");
+        return;
+    };
+    if let Err(error) = writer.write_all(&frame).await {
+        tracing::debug!(peer = %peer_id, "failed to send ACL snapshot response: {error}");
+    }
 }

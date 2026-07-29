@@ -422,10 +422,10 @@ impl MultiRaft {
         tracing::info!("[{}] Removed Raft group {:?}", self.node_id, group_id);
     }
 
-    #[tracing::instrument(level = "trace", skip_all, fields(group = cmd.shard_group_id.0, from = %cmd.from))]
+    #[tracing::instrument(level = "trace", skip_all, fields(group = cmd.shard_group_id.0, from = %cmd.peer_id))]
     fn handle_rpc(&mut self, cmd: InboundRaftRpc) {
         if let Some(raft) = self.groups.get_mut(&cmd.shard_group_id) {
-            raft.handle_rpc(cmd.from, cmd.rpc);
+            raft.handle_rpc(cmd.peer_id, cmd.rpc);
             self.dirty.insert(cmd.shard_group_id);
         }
     }
@@ -1376,7 +1376,7 @@ mod tests {
         // n2 is acting as leader at term 1.  Send two entries to n1 (follower).
         store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
-            from: n2.clone(),
+            peer_id: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
                 term: 1,
                 leader_id: n2.clone(),
@@ -1411,7 +1411,7 @@ mod tests {
         // Raft truncates from index 1 and replaces with the new entry.
         store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
-            from: n2.clone(),
+            peer_id: n2.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
                 term: 2,
                 leader_id: n2.clone(),
@@ -2150,7 +2150,7 @@ mod tests {
         // recovery roll, and the leader-gated ring-check won't fire to prune it.
         store.handle_consensus(InboundRaftRpc {
             shard_group_id: TEST_GROUP_ID,
-            from: peer.clone(),
+            peer_id: peer.clone(),
             rpc: RaftRpc::AppendEntries(AppendEntries {
                 term: 99,
                 leader_id: peer,

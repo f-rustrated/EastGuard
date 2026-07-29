@@ -4,14 +4,17 @@ use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::net::TransportReadHalf;
 use crate::security::TransportIdentity;
+use borsh::BorshDeserialize;
 use tokio::io::AsyncReadExt;
 
-pub(super) struct RaftRpcListener {
+use super::protocol::{AclSnapshotResponse, InitialClusterMessage};
+
+pub(super) struct ClusterMessageReader {
     read_half: TransportReadHalf,
     transport_identity: TransportIdentity,
 }
 
-impl RaftRpcListener {
+impl ClusterMessageReader {
     pub(super) fn new(
         read_half: impl Into<TransportReadHalf>,
         transport_identity: TransportIdentity,
@@ -22,25 +25,35 @@ impl RaftRpcListener {
         }
     }
 
-    pub(super) async fn read_node_id(&mut self) -> anyhow::Result<NodeId> {
-        let len = self.read_half.read_u32().await? as usize;
-        anyhow::ensure!(len <= 1024, "NodeId frame too large: {len} bytes");
-        let mut buf = vec![0u8; len];
-        self.read_half.read_exact(&mut buf).await?;
-        let id = borsh::from_slice::<NodeId>(&buf)?;
-        Ok(id)
+    pub(super) async fn read_initial_message(&mut self) -> anyhow::Result<InitialClusterMessage> {
+        self.read_frame(4 * 1024 * 1024, "initial cluster message")
+            .await
     }
 
-    pub(super) async fn read_message(&mut self) -> anyhow::Result<WireRaftMessage> {
+    pub(super) async fn read_raft_message(&mut self) -> anyhow::Result<WireRaftMessage> {
+        self.read_frame(4 * 1024 * 1024, "Raft message").await
+    }
+
+    pub(super) async fn read_acl_snapshot_response(
+        &mut self,
+    ) -> anyhow::Result<AclSnapshotResponse> {
+        self.read_frame(4 * 1024 * 1024, "ACL snapshot response")
+            .await
+    }
+
+    async fn read_frame<T: BorshDeserialize>(
+        &mut self,
+        maximum_size: usize,
+        frame_name: &str,
+    ) -> anyhow::Result<T> {
         let len = self.read_half.read_u32().await? as usize;
         anyhow::ensure!(
-            len <= 4 * 1024 * 1024,
-            "Raft message frame too large: {len} bytes"
+            len <= maximum_size,
+            "{frame_name} frame too large: {len} bytes"
         );
         let mut buf = vec![0u8; len];
         self.read_half.read_exact(&mut buf).await?;
-        let msg = borsh::from_slice::<WireRaftMessage>(&buf)?;
-        Ok(msg)
+        Ok(borsh::from_slice(&buf)?)
     }
 
     #[tracing::instrument(
@@ -50,21 +63,21 @@ impl RaftRpcListener {
     )]
     pub(super) async fn run(mut self, tx: MutlRaftSender, peer: NodeId) {
         loop {
-            match self.read_message().await {
-                Ok(msg) => {
-                    if msg.sender != peer {
+            match self.read_raft_message().await {
+                Ok(message) => {
+                    if message.sender != peer {
                         tracing::warn!(
                             transport_peer = %peer,
-                            claimed_sender = %msg.sender,
+                            claimed_sender = %message.sender,
                             "rejected Raft message whose sender differs from the connection peer",
                         );
                         break;
                     }
                     let _ = tx
                         .send(InboundRaftRpc {
-                            shard_group_id: msg.shard_group_id,
-                            from: peer.clone(),
-                            rpc: msg.rpc,
+                            shard_group_id: message.shard_group_id,
+                            peer_id: peer.clone(),
+                            rpc: message.rpc,
                         })
                         .await;
                 }

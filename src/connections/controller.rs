@@ -3,6 +3,7 @@ use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
+use crate::control_plane::consensus::transport::AclSnapshotSender;
 use crate::control_plane::metadata::{
     AclResource, ConsumerGroupResource, OpenProducerSession, ProducerSessionOwner, RangeMeta,
     TopicState, UpdateConsumerGroupMember, UpdateConsumerGroupMemberRequest,
@@ -11,7 +12,7 @@ use crate::control_plane::{
     NodeId, SwimNodeState,
     consensus::actor::MutlRaftSender,
     membership::{
-        ShardGroupId,
+        ShardGroup, ShardGroupId,
         actor::{ShardRouting, SwimSender},
     },
     metadata::{
@@ -56,6 +57,7 @@ pub struct ClientController {
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
     acl_cache: SharedAclCache,
+    acl_snapshot_sender: AclSnapshotSender,
 }
 
 impl ClientController {
@@ -66,6 +68,7 @@ impl ClientController {
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
         acl_cache: SharedAclCache,
+        acl_snapshot_sender: AclSnapshotSender,
     ) -> Self {
         Self {
             transport_identity,
@@ -74,6 +77,7 @@ impl ClientController {
             raft_sender,
             data_plane_tx,
             acl_cache,
+            acl_snapshot_sender,
         }
     }
 
@@ -151,12 +155,9 @@ impl ClientController {
 
         let command: OpenProducerSession = req.into_command(owner.clone());
 
-        let group = match self.route(command.topic_name.as_bytes().to_vec()).await? {
-            ShardRouting::Local(group) => group,
-            ShardRouting::Redirect(member) => {
-                return Err(self.control_plane_redirect(member));
-            }
-        };
+        let group = self
+            .route_local(command.topic_name.as_bytes().to_vec())
+            .await?;
 
         let topic_meta = self
             .raft_sender
@@ -193,12 +194,7 @@ impl ClientController {
         &self,
         req: UpdateConsumerGroupMemberRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        let group = match self.route(req.topic_name.as_bytes().to_vec()).await? {
-            ShardRouting::Local(group) => group,
-            ShardRouting::Redirect(member) => {
-                return Err(self.control_plane_redirect(member));
-            }
-        };
+        let group = self.route_local(req.topic_name.as_bytes().to_vec()).await?;
 
         let topic = self
             .raft_sender
@@ -238,9 +234,7 @@ impl ClientController {
     /// otherwise it redirects to a member so the consumer retries against the right
     /// node — no server-side proxying.
     async fn describe_topic(&self, topic_name: String) -> Result<ClientSuccess, ServerError> {
-        if let ShardRouting::Redirect(member) = self.route(topic_name.as_bytes().to_vec()).await? {
-            return Err(self.control_plane_redirect(member));
-        }
+        self.route_local(topic_name.as_bytes().to_vec()).await?;
 
         let topic = self.raft_sender.get_topic_metadata(topic_name).await?;
         self.authorize_acl_resource(AclResource::TopicAdmin(topic.id))
@@ -256,12 +250,7 @@ impl ClientController {
         name: String,
         storage_policy: StoragePolicy,
     ) -> Result<ClientSuccess, ServerError> {
-        let group = match self.route(name.as_bytes().to_vec()).await? {
-            ShardRouting::Local(group) => group,
-            ShardRouting::Redirect(member) => {
-                return Err(self.control_plane_redirect(member));
-            }
-        };
+        let group = self.route_local(name.as_bytes().to_vec()).await?;
         // A new topic has no stable ID yet, so its creator needs the cluster-wide
         // grant. Once created, topic-admin/{topic-id} governs its metadata.
         self.authorize_acl_resource(AclResource::Cluster).await?;
@@ -282,12 +271,7 @@ impl ClientController {
     }
 
     async fn delete_topic(&self, topic_name: String) -> Result<ClientSuccess, ServerError> {
-        let group = match self.route(topic_name.as_bytes().to_vec()).await? {
-            ShardRouting::Local(group) => group,
-            ShardRouting::Redirect(member) => {
-                return Err(self.control_plane_redirect(member));
-            }
-        };
+        let group = self.route_local(topic_name.as_bytes().to_vec()).await?;
         let topic = self
             .raft_sender
             .get_topic_metadata(topic_name.clone())
@@ -308,21 +292,48 @@ impl ClientController {
             .await
     }
 
+    /// Resolves a local metadata shard or returns a redirect for a normal
+    /// client request. ACL authorization needs the richer route directly.
+    async fn route_local(&self, key: Vec<u8>) -> Result<ShardGroup, ServerError> {
+        match self.route(key).await? {
+            ShardRouting::Local(group) => Ok(group),
+            ShardRouting::Redirect(remote) => {
+                Err(self.control_plane_redirect(remote.and_then(|remote| remote.member)))
+            }
+        }
+    }
+
     async fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
         let TransportIdentity::CertificatePrincipal(principal) = &self.transport_identity else {
             return Ok(());
         };
 
-        let ShardRouting::Local(group) = self.route(resource.routing_key()).await? else {
-            return Err(ServerError::Unauthorized);
-        };
-
-        self.acl_cache
-            .authorize_or_refresh(&resource, group.id, principal, || {
-                self.raft_sender
-                    .get_acl_snapshot(group.id, resource.clone())
-            })
-            .await
+        match self.route(resource.routing_key()).await? {
+            ShardRouting::Local(group) => {
+                self.acl_cache
+                    .authorize_or_refresh(&resource, group.id, principal, || {
+                        self.raft_sender
+                            .get_acl_snapshot(group.id, resource.clone())
+                    })
+                    .await
+            }
+            ShardRouting::Redirect(Some(remote)) => {
+                let Some(owner) = remote.member else {
+                    return Err(ServerError::Unauthorized);
+                };
+                self.acl_cache
+                    .authorize_or_refresh(&resource, remote.group_id, principal, || {
+                        self.acl_snapshot_sender.fetch(
+                            self.node_id.clone(),
+                            owner,
+                            remote.group_id,
+                            resource.clone(),
+                        )
+                    })
+                    .await
+            }
+            ShardRouting::Redirect(None) => Err(ServerError::Unauthorized),
+        }
     }
 
     /// Structural redirect for a control-plane op that isn't local: to the member if
@@ -465,10 +476,12 @@ impl ClientController {
         let received_at_ms = crate::now_ms();
         // Not local (ring unconverged or this node isn't a member) → retriable
         // redirect; the hint is best-effort, absent until SWIM converges.
-        if let ShardRouting::Redirect(hint_node) =
+        if let ShardRouting::Redirect(remote) =
             self.route(req.topic_name.as_bytes().to_vec()).await?
         {
-            return Err(ServerError::ShardNotLocal { hint_node });
+            return Err(ServerError::ShardNotLocal {
+                hint_node: remote.and_then(|remote| remote.member),
+            });
         }
 
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
@@ -700,6 +713,7 @@ pub async fn handle_client_stream(
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
     acl_cache: SharedAclCache,
+    acl_snapshot_sender: AclSnapshotSender,
 ) {
     let transport_identity = stream.peer_identity();
     let (read_half, write_half) = stream.into_split();
@@ -711,6 +725,7 @@ pub async fn handle_client_stream(
         raft_sender,
         data_plane_tx,
         acl_cache,
+        acl_snapshot_sender,
     );
     tokio::spawn(run_client_writer(
         ClientRawWriter::new(write_half),
@@ -731,6 +746,7 @@ mod tests {
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
     use crate::control_plane::consensus::raft::states::security::AclRecord;
+    use crate::control_plane::consensus::transport::{AclSnapshotActor, RaftTransportActor};
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
@@ -744,9 +760,14 @@ mod tests {
     use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetKey;
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
+    use crate::net::TcpListener;
+    use crate::security::NodeTransportSecurity;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use turmoil::Builder;
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -814,6 +835,8 @@ mod tests {
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
+        let acl_snapshot_sender =
+            AclSnapshotActor::spawn(NodeTransportSecurity::TrustedDevelopment);
         ClientController::new(
             TransportIdentity::TrustedDevelopment,
             node_id,
@@ -821,6 +844,7 @@ mod tests {
             raft_sender,
             data_plane_tx,
             SharedAclCache::default(),
+            acl_snapshot_sender,
         )
     }
 
@@ -846,6 +870,8 @@ mod tests {
         raft_sender: MutlRaftSender,
         acl_cache: SharedAclCache,
     ) -> ClientController {
+        let acl_snapshot_sender =
+            AclSnapshotActor::spawn(NodeTransportSecurity::TrustedDevelopment);
         ClientController::new(
             TransportIdentity::CertificatePrincipal(principal.into()),
             node_id,
@@ -853,6 +879,7 @@ mod tests {
             raft_sender,
             dp_stub(),
             acl_cache,
+            acl_snapshot_sender,
         )
     }
 
@@ -1179,6 +1206,88 @@ mod tests {
                 .await,
             Err(ServerError::Unauthorized)
         );
+    }
+
+    #[test]
+    fn certificate_client_refreshes_acl_from_remote_shard_host() -> turmoil::Result {
+        let resource = AclResource::TopicData(TopicId(7));
+        let snapshot = acl_snapshot(resource.clone(), &["orders-service"]);
+        let response_received = Arc::new(Notify::new());
+        let mut sim = Builder::new()
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+
+        let owner_snapshot = snapshot.clone();
+        let owner_resource = resource.clone();
+        let owner_response_received = response_received.clone();
+        sim.host("owner", move || {
+            let expected_snapshot = owner_snapshot.clone();
+            let expected_resource = owner_resource.clone();
+            let owner_completion = owner_response_received.clone();
+            async move {
+                let listener = TcpListener::bind("0.0.0.0:9000").await?;
+                let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
+                let (_transport_tx, transport_rx) = mpsc::channel(1);
+                let (swim_tx, _swim_rx) = SwimActor::channel(1);
+                tokio::spawn(RaftTransportActor::run(
+                    node_id("owner"),
+                    listener,
+                    raft_tx,
+                    transport_rx,
+                    swim_tx,
+                    NodeTransportSecurity::TrustedDevelopment,
+                ));
+
+                let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await
+                else {
+                    panic!("expected remote ACL snapshot query");
+                };
+                assert_eq!(query.shard_group_id, ShardGroupId(42));
+                assert_eq!(query.resource, expected_resource);
+                let _ = query.reply.send(Some(expected_snapshot));
+                owner_completion.notified().await;
+                Ok(())
+            }
+        });
+
+        let requester_resource = resource.clone();
+        sim.host("requester", move || {
+            let requested_resource = requester_resource.clone();
+            let requester_completion = response_received.clone();
+            async move {
+                let owner_addr = turmoil::lookup("owner");
+                let group = ShardGroup {
+                    id: ShardGroupId(42),
+                    replicas: Replicas::new(vec![node_id("owner")]),
+                };
+                let owner = NodeAddress::test(
+                    SocketAddr::new(owner_addr, 9000),
+                    SocketAddr::new(owner_addr, 9001),
+                );
+                let swim = swim_sender_with(move |cmd| match cmd {
+                    SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
+                        let _ = reply.send(Some(group.clone()));
+                    }
+                    SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) => {
+                        let _ = reply.send(Some(owner));
+                    }
+                    _ => {}
+                });
+                let controller = authenticated_controller(
+                    "orders-service",
+                    node_id("requester"),
+                    swim,
+                    raft_sender_with(|_| panic!("remote ACL refresh must not query local Raft")),
+                );
+
+                let result = controller.authorize_acl_resource(requested_resource).await;
+                requester_completion.notify_one();
+                assert_eq!(result, Ok(()));
+                Ok(())
+            }
+        });
+
+        sim.run()
     }
 
     /// Ring can't map the key yet (topology not converged) → retriable

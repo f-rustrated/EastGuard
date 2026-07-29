@@ -144,9 +144,18 @@ pub(crate) enum ShardRouting {
     /// This node hosts the key's shard group — proceed locally. Carries the group
     /// for callers that need its members/id (control-plane writes).
     Local(ShardGroup),
-    /// Not local; redirect the client to a member. `None` until the ring/addresses
-    /// converge here — still retriable.
-    Redirect(Option<NodeAddressInfo>),
+    /// A client should retry elsewhere. `None` means the ring cannot map the
+    /// key yet; a remote shard can still lack an address while SWIM converges.
+    Redirect(Option<RemoteShard>),
+}
+
+/// A shard this node does not host, with an optional reachable member.
+///
+/// The shard ID lets internal callers validate cached records against the
+/// current owner even when the client-facing redirect has no usable address.
+pub(crate) struct RemoteShard {
+    pub(crate) group_id: ShardGroupId,
+    pub(crate) member: Option<NodeAddressInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,8 +238,9 @@ impl SwimSender {
         Ok(None)
     }
 
-    /// Route a key relative to `node_id`: `Local` if it hosts the key's shard group,
-    /// else a `Redirect` to a resolvable member (no hint until the ring converges).
+    /// Route a key relative to `node_id`: `Local` if it hosts the key's shard
+    /// group, otherwise a redirect. A resolved remote shard retains its ID for
+    /// internal ACL refreshes; an unresolved ring has no remote shard yet.
     pub(crate) async fn resolve_shard_routing(
         &self,
         key: Vec<u8>,
@@ -243,7 +253,10 @@ impl SwimSender {
             return Ok(ShardRouting::Local(group));
         }
         let member = self.resolve_any(&group.replicas).await?;
-        Ok(ShardRouting::Redirect(member))
+        Ok(ShardRouting::Redirect(Some(RemoteShard {
+            group_id: group.id,
+            member,
+        })))
     }
 
     pub(crate) async fn list_all_node_addresses(

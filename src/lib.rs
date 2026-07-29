@@ -28,6 +28,7 @@ use crate::control_plane::consensus::messages::{
     MultiRaftActorCommand, RaftTimer, RaftTransportCommand,
 };
 use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::consensus::transport::{AclSnapshotActor, AclSnapshotSender};
 use crate::control_plane::membership::OutboundPacket;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::topology_channel;
@@ -167,9 +168,18 @@ impl StartUp {
             self.env.raft_snapshot_entry_threshold,
         );
 
+        let acl_snapshot_sender = AclSnapshotActor::spawn(security.clone());
+
         // Client handler
         let _ = self
-            .receive_client_streams(node_id, swim_sender, raft_tx, data_plane_tx, security)
+            .receive_client_streams(
+                node_id,
+                swim_sender,
+                raft_tx,
+                data_plane_tx,
+                security,
+                acl_snapshot_sender,
+            )
             .await;
         Ok(())
     }
@@ -181,6 +191,7 @@ impl StartUp {
         raft_tx: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
         security: NodeTransportSecurity,
+        acl_snapshot_sender: AclSnapshotSender,
     ) {
         let acl_cache = SharedAclCache::default();
         let addr = self.env.bind_addr();
@@ -203,6 +214,7 @@ impl StartUp {
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
             let dp = data_plane_tx.clone();
+            let acl_sender = acl_snapshot_sender.clone();
 
             tokio::spawn(handle_client_stream(
                 stream,
@@ -211,6 +223,7 @@ impl StartUp {
                 raft,
                 dp,
                 acl_cache.clone(),
+                acl_sender,
             ));
         }
     }

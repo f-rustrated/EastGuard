@@ -23,7 +23,7 @@ The production boundary defends against external network attackers attempting ea
 | Listener | Port | Protocol | Peer Authentication | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
-| **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication |
+| **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication and one-shot ACL-cache refreshes between brokers |
 | **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
 | **SWIM** | UDP 2922 | Secure datagrams (deferred) | Mutual X.509 | Membership gossip and failure detection |
 
@@ -178,8 +178,8 @@ security/node/{node-certificate-principal}
   Data permissions use the stable topic ID, so a data replica can authorize a
   request without hosting that topic's metadata shard.
 - **Freshness & Expiry:** Cached records include a monotonic deadline (max 60s)
-  and revision counter. An expired entry cannot authorize a request. The chosen
-  distribution mechanism must obtain current state or fail closed.
+  and revision counter. An expired entry cannot authorize a request. The broker
+  reads the current owner directly when needed, or fails closed.
 
 ---
 
@@ -235,12 +235,9 @@ Check local ACL cache
       └── Missing / expired
                    │
                    ▼
-      Is the ACL shard local?
-            ├── No  ──► Return unauthorized
-            └── Yes
-                  │
-                  ▼
-          Read committed ACL state
+      Read committed ACL state
+            ├── Local shard ─────────► Local metadata read
+            └── Remote shard ────────► One authenticated node request
                   │
                   ▼
              Refresh cache
@@ -256,22 +253,47 @@ Check local ACL cache
 ```
 
 Authorization precedes redirects so an ungranted client cannot use stale-route
-responses to discover data placement. The current implementation refreshes a
-missing or expired cache entry only when the broker hosts the ACL's metadata
-shard. It reads that shard's committed ACL record, including an empty record for
-default denial, and stores it for no more than 60 seconds. When another broker
-owns the ACL shard, the request fails closed; it does not forward or proxy the
-client data operation.
+responses to discover data placement. A missing or expired entry triggers a
+lazy pull from the ACL shard's current host. A local host reads its committed
+state directly; a remote host receives one short authenticated node request and
+returns only the ACL record. The request never carries client data and never
+turns the broker into a data proxy. A missing record is a bounded cached denial;
+an unavailable owner also denies the request.
 
-Fetching an ACL record from a remote owner is still deferred. That later path may
-use lazy pull, proactive push, or a push-and-pull hybrid. It may update only the
-ACL cache; it must never carry or execute the client's data operation:
+```
+Data broker                         ACL shard host
+    │                                      │
+    │── authenticated ACL-only read ──────►│
+    │                                      │── read committed record
+    │◄──────── record or unavailable ──────│
+    │
+    └── refresh local cache (at most 60s) ──► allow or deny client request
+```
 
-| Model | Benefit | Failure to handle |
-| :--- | :--- | :--- |
-| Pull on cache miss or expiry | Simple; clients that leave create no update traffic | A data node must fail closed if the owner is unavailable |
-| Push changed records | Fast local decisions | A disconnected data node can miss an update |
-| Push plus periodic pull | Fast normally; repairs missed updates | More protocol and cache synchronization logic |
+This pull-on-miss path is deliberately small: cache expiry is 60 seconds, so a
+second connection pool would add persistent state for infrequent reads. A future
+push or hybrid distribution scheme remains optional; it must preserve the same
+fail-closed behavior and update only the ACL cache.
+
+One broker-local refresh worker owns these remote reads. It bounds active and
+queued work, and combines simultaneous requests for the same ACL record into
+one read. When that worker is full, stopped, or too slow, callers deny rather
+than opening more connections:
+
+```
+many cache misses
+       │
+       ▼
+ ACL refresh worker
+       ├── same shard + resource ──► one read, reply to all waiters
+       ├── different records ──────► bounded active work and queue
+       └── full / unavailable ─────► deny
+```
+
+The worker combines only identical records. Several different records owned by
+the same remote shard host can still create several short connections. If that
+becomes material, the next step is one request containing several resources for
+the same owner and shard—not delaying mailbox reads or adding a connection pool.
 
 The same decision gate covers request-rate limiting. A Kubernetes deployment may
 give all replicas of one application a shared principal even though each replica
