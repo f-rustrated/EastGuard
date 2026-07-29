@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{AclResource, ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
@@ -77,7 +77,7 @@ pub struct GetConsumerGroupAssignment {
 
 pub struct AuthorizePrincipal {
     pub(crate) shard_group_id: ShardGroupId,
-    pub(crate) resource: String,
+    pub(crate) resource: AclResource,
     pub(crate) principal: String,
     pub(crate) reply: oneshot::Sender<Option<bool>>,
 }

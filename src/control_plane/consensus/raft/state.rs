@@ -16,8 +16,8 @@ use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::{DeleteSegments, ExpireProducerSessions};
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
-    SegmentRollIntent, TopicId, TopicMeta, TopicStats,
+    AclResource, ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment,
+    RollSegment, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
@@ -161,7 +161,7 @@ impl Raft {
         self.metadata.get_topic_by_name(name)
     }
 
-    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
         self.metadata.authorizes(resource, principal)
     }
 

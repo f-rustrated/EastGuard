@@ -140,14 +140,16 @@ permission checks; its text grants no authority by itself.
 | Resource Key Format | Granted Actions |
 | :--- | :--- |
 | `cluster` | Membership inspection, topology lookup, operator diagnostics |
-| `topic-admin/{topic}` | Create, delete, describe topic metadata |
+| `topic-admin/{topic-id}` | Create, delete, describe topic metadata |
 | `topic-data/{topic-id}` | Produce, fetch, list offsets for topic |
-| `consumer-group/{topic}/{group}` | Consume messages, read/commit consumer offsets |
-| `producer-session/{topic}/{session}` | Renew producer session (permanently bound to creator principal) |
+| `consumer-group/{topic-id}/{group-id}` | Coordinate the group and read/commit its offsets |
+| `producer-session/{topic-id}/{producer-id}` | Renew the producer session permanently bound to its creator |
 | `security/cluster` | Read/write ACLs, manage admissions and revocations, inspect security audit |
 
 Consumer-group access permits group coordination and offset read/commit. Reading
-records separately requires `Fetch` on `topic-data/{topic}`.
+records separately requires `Fetch` on `topic-data/{topic-id}`. Text resource
+keys are used only at routing and administrative boundaries; replicated records
+store the typed resource directly.
 
 ### Sharded Metadata Storage
 

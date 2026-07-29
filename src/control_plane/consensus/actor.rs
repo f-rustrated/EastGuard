@@ -12,7 +12,7 @@ use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
+    AclResource, ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
@@ -285,7 +285,7 @@ impl MutlRaftSender {
     pub(crate) async fn authorize_principal(
         &self,
         shard_group_id: ShardGroupId,
-        resource: String,
+        resource: AclResource,
         principal: String,
     ) -> Option<bool> {
         let (reply, recv) = tokio::sync::oneshot::channel();

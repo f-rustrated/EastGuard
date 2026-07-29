@@ -9,7 +9,9 @@ use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::ConsumerGroupAssignment;
 
 use crate::control_plane::metadata::topic::{TopicMeta, TopicState, TopicStats};
-use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
+use crate::control_plane::metadata::{
+    AclResource, EntryId, RangeId, SegmentId, TopicId, error::MetadataError,
+};
 use crate::data_plane::SegmentKey;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
@@ -89,7 +91,7 @@ impl MetadataState {
         range.segments.get(&key.segment_id)
     }
 
-    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
         self.security.authorizes(resource, principal)
     }
 
@@ -648,7 +650,7 @@ mod tests {
             process_public_key: vec![1, 2, 3].into_boxed_slice(),
         };
         let acl = AclRecord {
-            resource: "security/cluster".to_string(),
+            resource: AclResource::TopicData(TopicId(42)),
             revision: 4,
             principals: vec!["operator".to_string()].into_boxed_slice(),
         };
@@ -680,7 +682,7 @@ mod tests {
             restored.security.admissions.get("broker-a"),
             Some(&admission)
         );
-        assert_eq!(restored.security.acls.get("security/cluster"), Some(&acl));
+        assert_eq!(restored.security.acls.get(&acl.resource), Some(&acl));
         assert_eq!(
             restored.security.revocations.get(&(
                 "cluster-ca".to_string(),
@@ -695,25 +697,26 @@ mod tests {
     #[test]
     fn metadata_authorization_defaults_to_deny() {
         let mut state = MetadataState::new(ShardGroupId(1));
+        let resource = AclResource::TopicData(TopicId(42));
         state.security.acls.insert(
-            "topic-data/42".to_string(),
+            resource.clone(),
             AclRecord {
-                resource: "topic-data/42".to_string(),
+                resource: resource.clone(),
                 revision: 1,
                 principals: vec!["orders-service".to_string()].into_boxed_slice(),
             },
         );
 
-        assert!(state.authorizes("topic-data/42", "orders-service"));
-        assert!(!state.authorizes("topic-data/42", "unknown-service"));
-        assert!(!state.authorizes("topic-data/43", "orders-service"));
+        assert!(state.authorizes(&resource, "orders-service"));
+        assert!(!state.authorizes(&resource, "unknown-service"));
+        assert!(!state.authorizes(&AclResource::TopicData(TopicId(43)), "orders-service"));
     }
 
     #[test]
     fn acl_grant_and_revoke_are_idempotent() {
         let mut state = MetadataState::new(ShardGroupId(1));
         let grant = GrantAcl {
-            resource: "topic-data/42".to_string(),
+            resource: AclResource::TopicData(TopicId(42)),
             principal: "orders-service".to_string(),
         };
         let revoke = RevokeAcl {
@@ -723,13 +726,13 @@ mod tests {
 
         state.apply(grant.clone().into()).unwrap();
         state.apply(grant.into()).unwrap();
-        assert!(state.authorizes("topic-data/42", "orders-service"));
-        assert_eq!(state.security.acls["topic-data/42"].revision, 1);
+        assert!(state.authorizes(&revoke.resource, "orders-service"));
+        assert_eq!(state.security.acls[&revoke.resource].revision, 1);
 
         state.apply(revoke.clone().into()).unwrap();
-        state.apply(revoke.into()).unwrap();
-        assert!(!state.authorizes("topic-data/42", "orders-service"));
-        assert_eq!(state.security.acls["topic-data/42"].revision, 2);
+        state.apply(revoke.clone().into()).unwrap();
+        assert!(!state.authorizes(&revoke.resource, "orders-service"));
+        assert_eq!(state.security.acls[&revoke.resource].revision, 2);
     }
 
     fn replica_set() -> Replicas {

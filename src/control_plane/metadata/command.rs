@@ -7,7 +7,7 @@ use crate::{
     connections::protocol::ConsumerGroupSyncAction,
     control_plane::{
         Replicas,
-        metadata::{EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+        metadata::{AclResource, EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
     },
     data_plane::SegmentKey,
     impl_from_variant,
@@ -108,13 +108,13 @@ pub struct ExpireProducerSessions {
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct GrantAcl {
-    pub resource: String,
+    pub resource: AclResource,
     pub principal: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct RevokeAcl {
-    pub resource: String,
+    pub resource: AclResource,
     pub principal: String,
 }
 

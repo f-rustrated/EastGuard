@@ -4,8 +4,8 @@ use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{
-    OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest, TopicId,
-    TopicState,
+    AclResource, OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest,
+    TopicId, TopicState,
 };
 use crate::control_plane::{
     NodeId, SwimNodeState,
@@ -275,8 +275,8 @@ impl ClientController {
             return Ok(());
         };
 
-        let resource = format!("topic-data/{}", topic_id.0);
-        let ShardRouting::Local(group) = self.route(resource.as_bytes().to_vec()).await? else {
+        let resource = AclResource::TopicData(topic_id);
+        let ShardRouting::Local(group) = self.route(resource.routing_key()).await? else {
             return Err(ServerError::Unauthorized);
         };
 
@@ -830,7 +830,7 @@ mod tests {
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
                 assert_eq!(query.shard_group_id, ShardGroupId(42));
-                assert_eq!(query.resource, "topic-data/7");
+                assert_eq!(query.resource, AclResource::TopicData(TopicId(7)));
                 let _ = query.reply.send(Some(query.principal == "orders-service"));
             }
         });

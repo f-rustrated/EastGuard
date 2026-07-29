@@ -16,7 +16,8 @@ use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader}
 use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
+    AclResource, ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta,
+    TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
@@ -497,7 +498,7 @@ impl MultiRaft {
     fn authorize_principal(
         &self,
         shard_group_id: ShardGroupId,
-        resource: &str,
+        resource: &AclResource,
         principal: &str,
     ) -> Option<bool> {
         self.groups

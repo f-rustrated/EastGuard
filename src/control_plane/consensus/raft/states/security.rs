@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::AclResource;
 
 /// Security records replicated by one metadata shard.
 ///
@@ -11,7 +12,7 @@ use crate::control_plane::NodeId;
 #[derive(Debug, Clone, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct SecurityState {
     pub(super) admissions: HashMap<String, AdmissionRecord>,
-    pub(super) acls: HashMap<String, AclRecord>,
+    pub(super) acls: HashMap<AclResource, AclRecord>,
     pub(super) revocations: HashMap<(String, Box<[u8]>), RevocationRecord>,
 }
 
@@ -35,7 +36,7 @@ pub(crate) struct AdmissionRecord {
 /// principals and missing records deny access.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct AclRecord {
-    pub resource: String,
+    pub resource: AclResource,
     pub revision: u64,
     pub principals: Box<[String]>,
 }
@@ -57,13 +58,13 @@ impl SecurityState {
     ///
     /// Missing records and missing principals deny by default. Resource
     /// hierarchy or wildcard matching is intentionally not inferred here.
-    pub(crate) fn authorizes(&self, resource: &str, principal: &str) -> bool {
+    pub(crate) fn authorizes(&self, resource: &AclResource, principal: &str) -> bool {
         self.acls
             .get(resource)
             .is_some_and(|acl| acl.principals.iter().any(|entry| entry == principal))
     }
 
-    pub(super) fn grant(&mut self, resource: String, principal: String) {
+    pub(super) fn grant(&mut self, resource: AclResource, principal: String) {
         let acl = self
             .acls
             .entry(resource.clone())
@@ -82,7 +83,7 @@ impl SecurityState {
         acl.revision += 1;
     }
 
-    pub(super) fn revoke(&mut self, resource: String, principal: &str) {
+    pub(super) fn revoke(&mut self, resource: AclResource, principal: &str) {
         let Some(acl) = self.acls.get_mut(&resource) else {
             return;
         };
@@ -128,6 +129,7 @@ impl crate::test_traits::TAssertInvariant for SecurityState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::metadata::TopicId;
 
     fn round_trip<T>(value: &T)
     where
@@ -147,7 +149,7 @@ mod tests {
             process_public_key: vec![1, 2, 3].into_boxed_slice(),
         });
         round_trip(&AclRecord {
-            resource: "security/cluster".to_string(),
+            resource: AclResource::TopicData(TopicId(42)),
             revision: 4,
             principals: vec!["operator".to_string()].into_boxed_slice(),
         });
@@ -162,18 +164,18 @@ mod tests {
     #[test]
     fn acl_authorization_is_exact_and_defaults_to_deny() {
         let mut security = SecurityState::default();
+        let resource = AclResource::TopicData(TopicId(42));
         security.acls.insert(
-            "topic-data/42".to_string(),
+            resource.clone(),
             AclRecord {
-                resource: "topic-data/42".to_string(),
+                resource: resource.clone(),
                 revision: 1,
                 principals: vec!["orders-service".to_string()].into_boxed_slice(),
             },
         );
 
-        assert!(security.authorizes("topic-data/42", "orders-service"));
-        assert!(!security.authorizes("topic-data/42", "unknown-service"));
-        assert!(!security.authorizes("topic-data/43", "orders-service"));
-        assert!(!security.authorizes("topic-data", "orders-service"));
+        assert!(security.authorizes(&resource, "orders-service"));
+        assert!(!security.authorizes(&resource, "unknown-service"));
+        assert!(!security.authorizes(&AclResource::TopicData(TopicId(43)), "orders-service"));
     }
 }
