@@ -506,6 +506,7 @@ impl Client {
                 ServerError::TopicNotFound => Redirect::NotFound,
                 ServerError::SegmentNotLocal | ServerError::Internal(_) => Redirect::Reresolve,
                 ServerError::AlreadyExists
+                | ServerError::Unauthorized
                 | ServerError::StaleRange
                 | ServerError::ProduceRejected(_)
                 | ServerError::EntryIdOutOfRange

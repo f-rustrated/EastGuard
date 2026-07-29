@@ -4,7 +4,8 @@ use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{
-    OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest, TopicState,
+    OpenProducerSession, RangeMeta, SyncConsumerGroup, SyncConsumerGroupRequest, TopicId,
+    TopicState,
 };
 use crate::control_plane::{
     NodeId, SwimNodeState,
@@ -269,6 +270,26 @@ impl ClientController {
             .await
     }
 
+    async fn authorize_data_access(&self, topic_id: TopicId) -> Result<(), ServerError> {
+        let TransportIdentity::CertificatePrincipal(principal) = &self.transport_identity else {
+            return Ok(());
+        };
+
+        let resource = format!("topic-data/{}", topic_id.0);
+        let ShardRouting::Local(group) = self.route(resource.as_bytes().to_vec()).await? else {
+            return Err(ServerError::Unauthorized);
+        };
+
+        match self
+            .raft_sender
+            .authorize_principal(group.id, resource, principal.clone())
+            .await
+        {
+            Some(true) => Ok(()),
+            Some(false) | None => Err(ServerError::Unauthorized),
+        }
+    }
+
     /// Structural redirect for a control-plane op that isn't local: to the member if
     /// one resolves, else a retriable error (no member's address known here yet).
     fn control_plane_redirect(&self, member: Option<NodeAddressInfo>) -> ServerError {
@@ -344,6 +365,8 @@ impl ClientController {
         &self,
         req: CommitConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
+        self.authorize_data_access(req.key.topic_id).await?;
+
         let (tx, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
             .send_async(CommitConsumerOffset {
@@ -372,6 +395,8 @@ impl ClientController {
         &self,
         req: FetchConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
+        self.authorize_data_access(req.key.topic_id).await?;
+
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
             .send_async(ReadConsumerOffset {
@@ -410,6 +435,7 @@ impl ClientController {
         }
 
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
+        self.authorize_data_access(topic.id).await?;
 
         let producer_identity = req
             .producer_identity
@@ -463,6 +489,7 @@ impl ClientController {
     /// state machine needs to answer without any further I/O.
     async fn fetch(&self, req: FetchRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
+        self.authorize_data_access(topic.id).await?;
 
         let range = topic.get_range(&req.range_id)?;
 
@@ -495,6 +522,8 @@ impl ClientController {
     /// serve it. No proxying: a miss returns `SegmentNotLocal` and the client
     /// retries another replica.
     async fn fetch_by_id(&self, req: FetchByIdRequest) -> Result<ClientSuccess, ServerError> {
+        self.authorize_data_access(req.topic_id).await?;
+
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = Fetch {
             topic_id: req.topic_id,
@@ -518,6 +547,7 @@ impl ClientController {
     /// for the range's currently-active segment on this node.
     async fn list_offsets(&self, req: RangeOffsetRequest) -> Result<ClientSuccess, ServerError> {
         let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
+        self.authorize_data_access(topic.id).await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
@@ -745,6 +775,21 @@ mod tests {
         )
     }
 
+    fn authenticated_controller(
+        principal: &str,
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_sender: MutlRaftSender,
+    ) -> ClientController {
+        ClientController::new(
+            TransportIdentity::CertificatePrincipal(principal.to_string()),
+            node_id,
+            swim_sender,
+            raft_sender,
+            dp_stub(),
+        )
+    }
+
     fn produce_req() -> ClientRequest {
         ClientRequest::DataPlane(ClientDataPlaneRequest::Produce(ProduceRequest {
             topic_name: "t1".into(),
@@ -769,6 +814,57 @@ mod tests {
                 partition_strategy: PartitionStrategy::AutoSplit,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn certificate_client_requires_exact_topic_acl() {
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            replicas: Replicas::new(vec![node_id("self")]),
+        };
+        let swim = swim_sender_with(move |cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(group.clone()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| {
+            if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
+                assert_eq!(query.shard_group_id, ShardGroupId(42));
+                assert_eq!(query.resource, "topic-data/7");
+                let _ = query.reply.send(Some(query.principal == "orders-service"));
+            }
+        });
+        let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
+
+        assert_eq!(controller.authorize_data_access(TopicId(7)).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn certificate_client_fails_closed_when_acl_shard_is_remote() {
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            replicas: Replicas::new(vec![node_id("other")]),
+        };
+        let swim = swim_sender_with(move |cmd| match cmd {
+            SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
+                let _ = reply.send(Some(group.clone()));
+            }
+            SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) => {
+                let _ = reply.send(None);
+            }
+            _ => {}
+        });
+        let controller = authenticated_controller(
+            "orders-service",
+            node_id("self"),
+            swim,
+            raft_sender_with(|_| panic!("remote ACL shard must not be queried locally")),
+        );
+
+        assert_eq!(
+            controller.authorize_data_access(TopicId(7)).await,
+            Err(ServerError::Unauthorized)
+        );
     }
 
     /// Ring can't map the key yet (topology not converged) → retriable

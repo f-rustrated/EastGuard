@@ -29,6 +29,9 @@ pub enum ServerError {
     #[error("topic already exists")]
     AlreadyExists,
 
+    #[error("unauthorized")]
+    Unauthorized,
+
     #[error("stale range")]
     StaleRange,
 
