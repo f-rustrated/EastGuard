@@ -26,4 +26,6 @@ pub enum MetadataError {
     RangesNotAdjacent,
     #[error("invalid split point")]
     InvalidSplitPoint,
+    #[error("produce session belongs to another principal")]
+    ProducerSessionOwnerMismatch,
 }

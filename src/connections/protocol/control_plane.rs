@@ -21,8 +21,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::control_plane::metadata::{
-    EntryId, OpenProducerSession, RangeId, RangeMeta, RangeState, SegmentId, SegmentMeta,
-    SegmentMetaState, TopicId, TopicMeta, TopicState, UpdateConsumerGroupMemberRequest,
+    EntryId, OpenProducerSession, ProducerSessionOwner, RangeId, RangeMeta, RangeState, SegmentId,
+    SegmentMeta, SegmentMetaState, TopicId, TopicMeta, TopicState,
+    UpdateConsumerGroupMemberRequest,
 };
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -56,13 +57,14 @@ pub struct OpenProducerSessionRequest {
 }
 
 impl OpenProducerSessionRequest {
-    pub fn into_command(self) -> OpenProducerSession {
+    pub fn into_command(self, owner: ProducerSessionOwner) -> OpenProducerSession {
         const SESSION_TIMEOUT_MS: u64 = 60_000;
         let observed_at = crate::now_ms();
         OpenProducerSession {
-            topic_name: self.topic_name,
+            topic_name: self.topic_name.into_boxed_str(),
             producer_id: self.producer_id,
             session_nonce: self.session_nonce,
+            owner,
             observed_at,
             session_timeout_ms: SESSION_TIMEOUT_MS,
         }

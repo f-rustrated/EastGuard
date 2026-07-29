@@ -24,7 +24,7 @@ pub(crate) use consumer_group::{ConsumerGroupAssignment, ConsumerGroupMeta, Cons
 
 pub(crate) use segment::*;
 
-use crate::impl_new_struct_wrapper;
+use crate::{impl_new_struct_wrapper, security::TransportIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct TopicId(pub(crate) u64);
@@ -51,6 +51,28 @@ pub struct ConsumerGroupResource {
 pub struct ProducerSessionResource {
     pub topic_id: TopicId,
     pub producer_id: Uuid,
+}
+
+/// Durable owner of one producer session.
+///
+/// This is deliberately separate from the connection's transport identity:
+/// Raft snapshots retain ownership after the TLS connection disappears, and
+/// transport refactors must not change the persisted metadata schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ser, Deser)]
+pub enum ProducerSessionOwner {
+    CertificatePrincipal(Box<str>),
+    TrustedDevelopment,
+}
+
+impl ProducerSessionOwner {
+    pub(crate) fn from(transport_identity: &TransportIdentity) -> Self {
+        match transport_identity {
+            TransportIdentity::CertificatePrincipal(principal) => {
+                ProducerSessionOwner::CertificatePrincipal(principal.clone())
+            }
+            TransportIdentity::TrustedDevelopment => ProducerSessionOwner::TrustedDevelopment,
+        }
+    }
 }
 
 impl AclResource {

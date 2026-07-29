@@ -143,7 +143,7 @@ permission checks; its text grants no authority by itself.
 | `topic-admin/{topic-id}` | Create, delete, describe topic metadata |
 | `topic-data/{topic-id}` | Produce, fetch, list offsets for topic |
 | `consumer-group/{topic-id}/{group-id}` | Coordinate the group and read/commit its offsets |
-| `producer-session/{topic-id}/{producer-id}` | Renew the producer session permanently bound to its creator |
+| `producer-session/{topic-id}/{producer-id}` | Renew the session, bound to its creator for the session lifetime |
 | `security/cluster` | Read/write ACLs, manage admissions and revocations, inspect security audit |
 
 Consumer-group access permits group coordination and offset read/commit. Reading

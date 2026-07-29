@@ -4,8 +4,8 @@ use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::{
-    AclResource, ConsumerGroupResource, OpenProducerSession, RangeMeta, TopicState,
-    UpdateConsumerGroupMember, UpdateConsumerGroupMemberRequest,
+    AclResource, ConsumerGroupResource, OpenProducerSession, ProducerSessionOwner, RangeMeta,
+    TopicState, UpdateConsumerGroupMember, UpdateConsumerGroupMemberRequest,
 };
 use crate::control_plane::{
     NodeId, SwimNodeState,
@@ -140,7 +140,12 @@ impl ClientController {
         &self,
         req: OpenProducerSessionRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        let command: OpenProducerSession = req.into_command();
+        // Convert ephemeral authentication evidence into the durable owner
+        // carried by the Raft command. The persisted type intentionally does
+        // not depend on TLS or stream implementation details.
+        let owner = ProducerSessionOwner::from(&self.transport_identity);
+
+        let command: OpenProducerSession = req.into_command(owner.clone());
 
         let group = match self.route(command.topic_name.as_bytes().to_vec()).await? {
             ShardRouting::Local(group) => group,
@@ -149,20 +154,28 @@ impl ClientController {
             }
         };
 
-        self.propose_topic_write(group.id, command.clone()).await?;
-
         let topic_meta = self
             .raft_sender
-            .get_topic_metadata(command.topic_name)
+            .get_topic_metadata(command.topic_name.to_string())
+            .await?;
+        self.authorize_acl_resource(AclResource::TopicData(topic_meta.id))
+            .await?;
+        topic_meta
+            .producer_sessions
+            .get_for_owner(&command.producer_id, &owner)?;
+
+        self.propose_topic_write(group.id, command.clone()).await?;
+
+        let committed_topic = self
+            .raft_sender
+            .get_topic_metadata(command.topic_name.to_string())
             .await?;
 
-        let session = topic_meta
+        let session = committed_topic
             .producer_sessions
-            .get(&command.producer_id)
-            .copied()
-            .ok_or_else(|| {
-                ServerError::Internal("committed producer session is unavailable".into())
-            })?;
+            .get_for_owner(&command.producer_id, &owner)?
+            .cloned()
+            .ok_or(ServerError::Unauthorized)?;
 
         Ok(ClientSuccess::ProducerSessionOpened(
             ProducerSessionOpened {
@@ -799,7 +812,7 @@ mod tests {
         raft_sender: MutlRaftSender,
     ) -> ClientController {
         ClientController::new(
-            TransportIdentity::CertificatePrincipal(principal.to_string()),
+            TransportIdentity::CertificatePrincipal(principal.into()),
             node_id,
             swim_sender,
             raft_sender,
@@ -848,7 +861,9 @@ mod tests {
             if let MultiRaftActorCommand::AuthorizePrincipal(query) = cmd {
                 assert_eq!(query.shard_group_id, ShardGroupId(42));
                 assert_eq!(query.resource, AclResource::TopicData(TopicId(7)));
-                let _ = query.reply.send(Some(query.principal == "orders-service"));
+                let _ = query
+                    .reply
+                    .send(Some(query.principal.as_ref() == "orders-service"));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);

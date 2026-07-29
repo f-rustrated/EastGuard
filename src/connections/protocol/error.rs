@@ -84,6 +84,7 @@ impl From<crate::control_plane::metadata::error::MetadataError> for ServerError 
             TopicNotActive(_) | RangeNotFound | RangeNotActive => ServerError::StaleRange,
             SegmentNotFound | SegmentNotActive | SegmentNotSealed => ServerError::SegmentNotLocal,
             InvalidSplitPoint => ServerError::InvalidSplitPoint,
+            ProducerSessionOwnerMismatch => ServerError::Unauthorized,
             SplitNotAllowed(_) | RangesNotAdjacent => ServerError::Internal(err.to_string()),
         }
     }

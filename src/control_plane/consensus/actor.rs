@@ -286,7 +286,7 @@ impl MutlRaftSender {
         &self,
         shard_group_id: ShardGroupId,
         resource: AclResource,
-        principal: String,
+        principal: Box<str>,
     ) -> Option<bool> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self

@@ -116,7 +116,9 @@ pub(crate) enum NodeTransportSecurity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransportIdentity {
-    CertificatePrincipal(String),
+    /// Principal authenticated for this live TLS connection. This is transport
+    /// evidence, not a durable authorization or ownership record.
+    CertificatePrincipal(Box<str>),
     TrustedDevelopment,
 }
 

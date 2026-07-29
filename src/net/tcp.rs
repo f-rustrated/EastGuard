@@ -187,7 +187,7 @@ impl TransportTcpStream {
     pub fn peer_identity(&self) -> TransportIdentity {
         match self {
             Self::Secure(stream) => {
-                TransportIdentity::CertificatePrincipal(stream.peer_principal().to_string())
+                TransportIdentity::CertificatePrincipal(stream.peer_principal().into())
             }
             Self::TrustedDevelopment(_) => TransportIdentity::TrustedDevelopment,
         }

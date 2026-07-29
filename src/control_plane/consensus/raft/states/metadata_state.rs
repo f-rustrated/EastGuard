@@ -233,20 +233,14 @@ impl MetadataState {
     fn open_producer_session(&mut self, cmd: OpenProducerSession) -> Result<(), MetadataError> {
         let topic_id = self
             .topic_name_index
-            .get(&cmd.topic_name)
+            .get(cmd.topic_name.as_ref())
             .copied()
-            .ok_or_else(|| MetadataError::TopicNameNotFound(cmd.topic_name.clone()))?;
+            .ok_or_else(|| MetadataError::TopicNameNotFound(cmd.topic_name.to_string()))?;
         let topic = self
             .topics
             .get_mut(&topic_id)
             .ok_or(MetadataError::TopicNotFound(topic_id))?;
-        topic.producer_sessions.open_producer_session(
-            cmd.producer_id,
-            cmd.session_nonce,
-            cmd.observed_at,
-            cmd.session_timeout_ms,
-        );
-        Ok(())
+        topic.producer_sessions.open_producer_session(cmd)
     }
 
     fn expire_producer_sessions(

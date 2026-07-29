@@ -126,4 +126,8 @@ impl_from_variant_via!(
     FetchConsumerOffsetRequest
 );
 
-impl_from_variant_via!(ClientRequest, ControlPlaneRequest, UpdateConsumerGroupMemberRequest);
+impl_from_variant_via!(
+    ClientRequest,
+    ControlPlaneRequest,
+    UpdateConsumerGroupMemberRequest
+);

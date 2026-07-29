@@ -7,7 +7,10 @@ use crate::{
     connections::protocol::ConsumerGroupMemberAction,
     control_plane::{
         Replicas,
-        metadata::{AclResource, EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+        metadata::{
+            AclResource, EntryId, ProducerSessionOwner, RangeId, SegmentId, TopicId,
+            strategy::StoragePolicy,
+        },
     },
     data_plane::SegmentKey,
     impl_from_variant,
@@ -93,9 +96,10 @@ pub struct UpdateConsumerGroupMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct OpenProducerSession {
-    pub topic_name: String,
+    pub topic_name: Box<str>,
     pub producer_id: Uuid,
     pub session_nonce: Uuid,
+    pub owner: ProducerSessionOwner,
     pub observed_at: u64,
     pub session_timeout_ms: u64,
 }

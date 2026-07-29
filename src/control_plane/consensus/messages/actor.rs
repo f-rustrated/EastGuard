@@ -78,7 +78,7 @@ pub struct GetConsumerGroupAssignment {
 pub struct AuthorizePrincipal {
     pub(crate) shard_group_id: ShardGroupId,
     pub(crate) resource: AclResource,
-    pub(crate) principal: String,
+    pub(crate) principal: Box<str>,
     pub(crate) reply: oneshot::Sender<Option<bool>>,
 }
 
