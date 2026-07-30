@@ -8,22 +8,23 @@
 
 ## 1. Overview & Threat Model
 
-EastGuard operates in two distinct security modes:
-
-- **Secure Mode (Default):** Mutual TLS 1.3 protects TCP listeners. Secure SWIM UDP is intentionally deferred until EastGuard can adopt a suitable datagram security implementation. Until then, secure mode fails startup rather than exposing plaintext SWIM. Unauthenticated or unauthorized traffic is immediately rejected. Plaintext connections and protocol downgrades are forbidden; invalid configuration prevents startup.
-- **Trusted Development Mode:** Plaintext protocols enabled strictly via explicit opt-in configuration for isolated test environments.
+| Mode | Boundary |
+| :--- | :--- |
+| **Secure (default)** | TLS 1.3 protects TCP. Plaintext, downgrade, invalid configuration, and unauthenticated or unauthorized traffic are rejected. Startup fails while secure SWIM UDP is unavailable. |
+| **Trusted development** | Explicit opt-in permits plaintext only in isolated test environments. |
 
 ### Threat Model
-The production boundary defends against external network attackers attempting eavesdropping, packet modification, replay, UDP spoofing, connection injection, or TLS downgrade.
 
-> **Scope Note:** Compromised brokers or authorized clients are outside this threat model. Their impact is constrained by short-lived credentials, scoped ACLs, and strict principal binding. Byzantine consensus is out of scope.
+The boundary covers eavesdropping, modification, replay, UDP spoofing,
+connection injection, and downgrade. Compromised brokers, authorized clients,
+and Byzantine consensus are out of scope.
 
 ### Listener Architecture
 
 | Listener | Port | Protocol | Peer Authentication | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
-| **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 | Metadata shard consensus log replication and one-shot ACL-cache refreshes between brokers |
+| **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 + process admission | Metadata shard consensus, one-shot ACL-cache refreshes, and limited admission-record reads between brokers |
 | **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
 | **SWIM** | UDP 2922 | Secure datagrams (deferred) | Mutual X.509 | Membership gossip and failure detection |
 
@@ -34,26 +35,29 @@ The production boundary defends against external network attackers attempting ea
 Security checks are split between the transport layer and application state machines to keep state machines free of security I/O:
 
 ```
-       [ Authenticated Transport Layer ]
+[ Authenticated Transport Layer ]
        TCP: TLS 1.3
        UDP: secure datagrams (deferred)
   - Authenticate peer X.509 certificates
+  - Prove that a node connection belongs to the currently admitted process
   - Enforce framing, datagram MTU, and resource limits
   - Bind connection envelope sender to verified identity
                      │
                      │ (Drop connection on transport failure)
                      ▼
-        [ Application Layer State Machines ]
+[ Application Layer State Machines ]
   - Authorize requested operation against cached ACLs / placement
   - Execute SWIM / Raft / Data-Plane state transitions
                      │
                      │ (Drop denied envelope only; connection stays open)
 ```
 
-- **Transport Responsibility:** Performs cryptographic handshakes, validates certificates, tracks cache expiry, and binds envelope senders to verified identities. Transport errors close the connection.
-- **Application Responsibility:** Synchronous state machines (SWIM, Raft, Topology, Data Plane) process only pre-validated envelopes. An authorization failure drops the specific denied envelope without tearing down the underlying connection.
-- **Placement-Based Data-Plane Authorization:** Data-plane nodes authorize incoming replication and repair requests against local committed placement state, ignoring sender-asserted replica lists.
-- **Redirects:** A redirect is only an address hint. The destination authenticates the peer and repeats the authorization check.
+| Boundary | Rule |
+| :--- | :--- |
+| Transport | Authenticates, bounds frames and caches, and binds senders to verified identities. Failure closes the connection. |
+| State machine | Authorizes pre-validated envelopes. Denial drops one envelope, not the connection. |
+| Data placement | Replication and repair use local committed placement, never a sender-asserted replica list. |
+| Redirect | Carries only an address hint. The destination repeats authentication and authorization. |
 
 ---
 
@@ -65,11 +69,11 @@ To allow safe node restarts and hardware replacement without exposing the cluste
 
 | Term | Scope | Lifetime / Ordering | Function |
 | :--- | :--- | :--- | :--- |
-| **Node Certificate Principal** | X.509 Certificate | Long-lived / Reused | Operator-assigned node principal read from the authenticated certificate and used as the stable admission-record key. |
-| **Admission Epoch** | Node Certificate Principal | Monotonically increasing `u64` | Assigned by metadata Raft upon restart; higher epoch **fences** older instances. |
-| **NodeId** | Running Process | Single process lifetime | Unique ID generated on startup; used by SWIM, topology ring, Raft, and data placement. |
+| **Node Certificate Principal** | X.509 Certificate | Long-lived / Reused | Stable admission-record key read from the certificate. |
+| **Admission Epoch** | Node Certificate Principal | Increasing `u64` | Metadata Raft assigns it; a higher value fences older processes. |
+| **NodeId** | Running Process | Single process lifetime | Startup-generated ID used by SWIM, topology, Raft, and placement. |
 | **Process Key** | Running Process | Single process lifetime | Proves that the connection belongs to the process admitted for this epoch. |
-| **SWIM Incarnation** | Running Process | Monotonically increasing counter | Incremented by the *same* process instance to refute false `Suspect`/`Dead` gossip. |
+| **SWIM Incarnation** | Running Process | Increasing counter | The same process increments it to refute stale liveness gossip. |
 
 The Node Certificate Principal is the value after `urn:eastguard:node:` in one
 URI Subject Alternative Name. A node certificate must contain exactly one such
@@ -91,13 +95,13 @@ Node identity conflicts and stale gossip are resolved in this order:
 
 ### Partition Recovery vs. Node Restart
 
-An **authorized operator** is a person or trusted automation using a client
-certificate whose principal has the `security/cluster` grant. In an orchestrated
-deployment, automation may approve restarts and scaling, but metadata Raft still
-commits every admission.
+An **authorized operator** is a person or automation whose client-certificate
+principal has the `security/cluster` grant.
 
-- **Healed Partition (Same Process):** Retains its existing `NodeId` and `Admission Epoch`. Increments its `SWIM Incarnation` counter to refute `Suspect` or `Dead` rumors spread during the partition.
-- **Node Restart / Replacement:** The process generates a new `NodeId` and process key. An authorized operator approves that exact process, and metadata Raft commits the new `Admission Epoch`, `NodeId`, and process public key. The higher epoch fences older processes immediately where observed and everywhere else within 60 seconds.
+| Event | Identity and recovery |
+| :--- | :--- |
+| Healed partition; same process | Keep the `NodeId` and epoch. Increase the SWIM incarnation to refute stale `Suspect` or `Dead` gossip. |
+| Restart or replacement | Create a new `NodeId` and process key. The operator approves them; metadata Raft commits a higher epoch. Cache expiry fences the old process everywhere within 60 seconds. |
 
 ### Admission Gate & SWIM Separation
 
@@ -122,18 +126,97 @@ SWIM liveness gossip is decoupled from cluster admission authority to prevent ne
   [ Raft Reconciliation ] ──► Commit AddPeer / RemovePeer
 ```
 
-1. **Process Proof:** A node session proves possession of the process private key bound to its admitted epoch. The process key signs the admitted identity and a session-specific value produced by the authenticated transport, so the proof cannot be replayed in another session. The reusable node certificate alone cannot create or claim a newer epoch.
-2. **Admission Gate:** The SWIM actor checks incoming packets against a local admission cache backed by metadata Raft before passing facts to the SWIM state machine.
-3. **Gossip Rule:** The secure datagram session authenticates the immediate sender. Every relayed membership fact is separately accepted only when its subject `NodeId` and `Admission Epoch` match an active admission record.
-4. **Cache Policy:** Admission records are cached locally with a maximum TTL of 60 seconds. If a cache entry expires while the owning metadata shard is unreachable, the gate fails closed.
+- Metadata Raft decides admission; SWIM reports only liveness.
+- The transport authenticates the immediate sender. A relayed fact is accepted
+  only when its subject `NodeId` and epoch match an active admission.
+- The local admission cache expires within 60 seconds and fails closed when its
+  owning shard is unavailable.
+
+### Why a TLS Session Proof Is Necessary
+
+A node certificate identifies a reusable broker principal, not one process
+start. A UUID prevents accidental identity collisions, but it is public cluster
+data. An old process that still has the reusable certificate can observe and
+claim the current `NodeId` and `Admission Epoch`.
+
+```
+NodeId       ──► which process the record names
+Epoch        ──► which admission is newer
+Process key  ──► proof that the speaker owns that admission
+TLS value    ──► proof is valid only on this connection
+```
+
+The admission record therefore stores a public key for one process start. It is
+approved and committed before the connection. The broker sends a signature, not
+a replacement key. Both sides prove their keys because Raft traffic is
+bidirectional.
+
+```
+Connecting broker                         Accepting broker
+       │                                         │
+       │◄────────────── mTLS ───────────────────►│
+       │ derive the same fresh TLS session value │
+       │── process proof + Raft / ACL ──────────►│
+       │                                         │ verify current admission
+       │◄──────────── process proof ─────────────│
+       │ verify current admission                │
+       │◄──────── admitted connection ──────────►│
+```
+
+A TLS exporter derives application-specific bytes from a completed handshake:
+
+```
+connection 1: broker A derives X    broker B derives X
+connection 2: broker A derives Y    broker B derives Y
+                                      X != Y
+network:      sends signatures over X or Y, never X or Y itself
+```
+
+“Shared” means both ends of one connection derive the same value. A signature
+over `X` fails on a connection using `Y`; this removes the need for another
+challenge. Missing or stale admission, identity mismatch, or bad signature
+closes the connection before Raft or ACL dispatch.
+
+### Why Admission Lookup Is Separate
+
+The admission record may live on another broker. A normal cluster connection
+would recurse:
+
+```
+Need record ──► open admitted connection ──► need record ──► loop
+```
+
+A narrow pre-admission path breaks the loop:
+
+```
+Accepting broker                         Admission shard host
+       │                                          │
+  1. Open ─────────────── mTLS ──────────────────►│
+       │                                          │
+  2. Ask ─────── one admission-record key ───────►│
+       │                                          │ read committed state
+  3. Return ◄────────── record or no record ──────│
+       │                                          │
+       └──────────────── connection closes ───────┘
+```
+
+- **Authentication:** Secure mode requires mTLS. It authenticates the reusable
+  node certificate, not the running process.
+- **One purpose:** The connection reads one admission record. It cannot carry
+  Raft messages, ACL reads, client requests, or admission writes.
+- **Bounded work:** One broker-local worker limits concurrent and queued reads
+  and combines simultaneous requests for the same record.
+- **Cache result:** A record or confirmed missing record is cached for at most
+  60 seconds. A missing record denies admission.
+- **Do not cache failure:** Timeout, routing failure, or an unavailable shard
+  denies the current connection but is retried by a later lookup.
 
 ---
 
 ## 4. Authorization & Sharded Security Records
 
-EastGuard enforces exact, default-deny access control lists (ACLs) without wildcards or inheritance.
-A principal is the client ID read from an authenticated certificate and used for
-permission checks; its text grants no authority by itself.
+ACLs are exact and default deny, with no wildcards or inheritance. A principal
+comes from the client certificate; its text grants no authority by itself.
 
 ### ACL Resource Catalog
 
@@ -146,27 +229,18 @@ permission checks; its text grants no authority by itself.
 | `producer-session/{topic-id}/{producer-id}` | Renew the session, bound to its creator for the session lifetime |
 | `security/cluster` | Read/write ACLs, manage admissions and revocations, inspect security audit |
 
-Consumer-group access permits group coordination and offset read/commit. Reading
-records separately requires `Fetch` on `topic-data/{topic-id}`. Text resource
-keys are used only at routing and administrative boundaries; replicated records
-store the typed resource directly.
+Consumer-group access covers coordination and offsets. Fetching records also
+requires `topic-data/{topic-id}`. Text keys exist only at routing and
+administrative boundaries; replicated state stores typed resources.
 
 ### Sharded Metadata Storage
 
-A security record is one durable admission, ACL, or revocation entry. Its record
-path selects one metadata shard; its revision lets brokers detect stale cached
-copies.
-
-Security records (`security/node/{node-certificate-principal}`, `security/acl/{resource}`, `security/revocation/{issuer}/{serial}`) do not rely on a centralized security controller. Instead, they hash to standard metadata shards and replicate via Raft:
+Admission, ACL, and revocation paths hash to standard metadata shards:
 
 ```
-  Client/Node Request ──► Any Broker ──► Hash Record Path ──► Hosts Shard? ─┬─► Yes ──► Commit via Raft
-                                                                           └─► No  ──► Return Owner Redirect
+Request ──► hash record path ──► shard host? ─┬─► yes: commit through Raft
+                                              └─► no: return owner redirect
 ```
-
-- **Stable Admission Key:** A restart changes the process `NodeId` and key, but
-  not the Node Certificate Principal. The same record and metadata shard therefore
-  replace the old admitted process atomically:
 
 ```
 security/node/{node-certificate-principal}
@@ -174,12 +248,12 @@ security/node/{node-certificate-principal}
                  └── Admission Epoch + NodeId + Process Public Key
 ```
 
-- **Local Authorization:** Brokers evaluate ACLs against local cached security records.
-  Data permissions use the stable topic ID, so a data replica can authorize a
-  request without hosting that topic's metadata shard.
-- **Freshness & Expiry:** Cached records include a monotonic deadline (max 60s)
-  and revision counter. An expired entry cannot authorize a request. The broker
-  reads the current owner directly when needed, or fails closed.
+| Property | Rule |
+| :--- | :--- |
+| No controller | Every record is owned and replicated by its ordinary metadata shard. |
+| Stable admission key | Restart changes the `NodeId` and process key, not the certificate principal, so one record atomically replaces the old process. |
+| Local authorization | Cached ACLs and stable topic IDs let a data replica authorize without hosting topic metadata. |
+| Freshness | Cache entries carry source shard, revision, and a monotonic deadline no later than 60 seconds. Expiry triggers refresh or denial. |
 
 ---
 
@@ -187,34 +261,34 @@ security/node/{node-certificate-principal}
 
 ### Bootstrap & Node Joining
 
-1. Operator initializes a cluster trust root and issues the first node certificate.
-2. The first node generates its `NodeId` and process key. Initial metadata state
-   stores that admission, the first operator principal, and its
-   `security/cluster` grant.
-3. A later joining node generates a new `NodeId` and process key.
-4. An authorized operator approves that exact `NodeId` and process public key. The reusable node certificate alone cannot authorize replacement.
-5. The joining node connects to a **limited admission endpoint** using its X.509 certificate.
-6. The endpoint uses the authenticated Node Certificate Principal to route to its
-   admission record. The owning metadata shard atomically replaces the prior
-   process with the next `Admission Epoch`, `NodeId`, and process public key.
-7. The joining node proves possession of the process private key before entering SWIM gossip and Raft membership reconciliation.
+| Moment | Operator and cluster action |
+| :--- | :--- |
+| First broker | Create the trust root and node certificate. Initial metadata stores the first process admission, operator principal, and `security/cluster` grant. |
+| Every later start | The process creates a new `NodeId` and process key. An authorized operator approves both. The owning shard increments the admission epoch and replaces the old process atomically. |
+| Cluster connection | Each side follows the admission gate in Section 3. Raft or ACL traffic starts only after mutual process proof succeeds. |
+
+The reusable node certificate alone cannot replace an admitted process. SWIM
+also remains blocked until the secure datagram admission gate in S3 exists.
 
 ### Online Credential Rotation
 
-- **Zero-Downtime CA Rotation:** Brokers support dual trust chain loading. New root CAs can be added and leaf certificates reloaded online without restarting brokers or changing `Admission Epoch` / `NodeId`.
-- **Revocation & Expiry:** Certificate revocations commit to metadata Raft records. Active authenticated sessions are terminated within the cache enforcement window. Expired certificates are rejected with clock-skew tolerance.
-- **Recovery:** Runbooks cover lost authorized-operator access, lost issuing keys, expiry, accidental revocation, trust-root replacement, and cold-cluster restart.
+| Operation | Required behavior |
+| :--- | :--- |
+| CA or leaf rotation | Load old and new trust chains together; reload leaves without restart or process-identity change. |
+| Revocation or expiry | Commit revocations through metadata Raft; close active sessions within cache expiry; allow bounded clock skew. |
+| Recovery | Cover lost operator access or issuing keys, accidental revocation, trust-root replacement, and cold restart. |
 
 ---
 
 ## 6. Resource Limits & Security Audit
 
 ### Rate & Memory Bounds
-- Every listener enforces strict limits on unauthenticated handshakes, concurrent connections, in-flight frames, and memory allocations.
-- Client request-rate limits are deferred. The design must first define whether
-  replicas of one application share a principal, which limits are node-wide, and
-  how limits behave as a Kubernetes workload scales.
-- The future secure UDP transport must define a payload budget that avoids IP fragmentation after authentication and encryption overhead.
+
+| Boundary | Limit |
+| :--- | :--- |
+| Listener | Bound unauthenticated handshakes, connections, in-flight frames, and allocations. |
+| Client requests | Rate limiting is deferred until principal sharing and node-wide limits are defined for autoscaling workloads. |
+| Future secure UDP | Keep protected payloads below the IP-fragmentation threshold. |
 
 ### Client Request Boundary
 
@@ -252,28 +326,15 @@ Check local ACL cache
       └── Yes ──► Execute locally
 ```
 
-Authorization precedes redirects so an ungranted client cannot use stale-route
-responses to discover data placement. A missing or expired entry triggers a
-lazy pull from the ACL shard's current host. A local host reads its committed
-state directly; a remote host receives one short authenticated node request and
-returns only the ACL record. The request never carries client data and never
-turns the broker into a data proxy. A missing record is a bounded cached denial;
-an unavailable owner also denies the request.
+| Decision | Rule |
+| :--- | :--- |
+| Authorize before redirect | An ungranted client cannot discover placement through stale-route responses. |
+| Refresh on cache miss | Read local committed state or make one authenticated ACL-only request to the shard host. Never proxy client data. |
+| Fail closed | Cache a missing record as a bounded denial. An unavailable owner denies without caching the failure. |
 
-```
-Data broker                         ACL shard host
-    │                                      │
-    │── authenticated ACL-only read ──────►│
-    │                                      │── read committed record
-    │◄──────── record or unavailable ──────│
-    │
-    └── refresh local cache (at most 60s) ──► allow or deny client request
-```
-
-This pull-on-miss path is deliberately small: cache expiry is 60 seconds, so a
-second connection pool would add persistent state for infrequent reads. A future
-push or hybrid distribution scheme remains optional; it must preserve the same
-fail-closed behavior and update only the ACL cache.
+Pull-on-miss avoids a second connection pool for reads needed at most once per
+cache window. A future push or hybrid design may update only the same cache and
+must remain fail closed.
 
 One broker-local refresh worker owns these remote reads. It bounds active and
 queued work, and combines simultaneous requests for the same ACL record into
@@ -290,18 +351,19 @@ many cache misses
        └── full / unavailable ─────► deny
 ```
 
-The worker combines only identical records. Several different records owned by
-the same remote shard host can still create several short connections. If that
-becomes material, the next step is one request containing several resources for
-the same owner and shard—not delaying mailbox reads or adding a connection pool.
+Only identical records combine. If distinct records to one shard become costly,
+batch those resource keys in one request; do not delay mailbox reads or add a
+connection pool.
 
-The same decision gate covers request-rate limiting. A Kubernetes deployment may
-give all replicas of one application a shared principal even though each replica
-has a different leaf certificate. A fixed per-principal table size or request
-budget is therefore premature: one shared principal can represent many clients,
-while one principal per replica can grow with autoscaling. No client request-rate
-limit is implemented until identity granularity, node-wide capacity bounds, and
-cache distribution are chosen together.
+Client rate limiting remains deferred:
+
+| Principal model | Problem with a fixed per-principal limit |
+| :--- | :--- |
+| Shared by application replicas | One limit represents an autoscaling workload. |
+| Unique per replica | Principal state grows with replica count. |
+
+Identity granularity, node-wide capacity, and cache distribution must be chosen
+together before adding a limit.
 
 ### Secure UDP Decision
 
@@ -320,18 +382,14 @@ constant socket count      packet loss remains
 per node                   visible to SWIM
 ```
 
-TCP with bounded connection reuse was rejected because large clusters would
-trade an unbounded connection mesh for continuous handshakes, connection churn,
-kernel connection tracking, and head-of-line blocking. QUIC datagrams preserve
-UDP delivery semantics, but their per-peer connection state and implementation
-complexity are not justified for SWIM's sparse traffic. Current DTLS options do
-not meet the combined requirements for maturity, permissive licensing, Rust
-integration, and deterministic simulation.
+| Alternative | Why it is not selected now |
+| :--- | :--- |
+| TCP | Either keeps a connection mesh or causes handshake churn, kernel tracking, and head-of-line blocking. |
+| QUIC datagrams | Preserve loss, but add per-peer connection state and complexity for sparse probes. |
+| Current DTLS libraries | Do not yet combine maturity, permissive licensing, Rust integration, and deterministic simulation. |
 
-Secure SWIM therefore remains deferred. Trusted development mode may use
-plaintext UDP in isolated environments. Secure mode must fail startup until a
-secure datagram transport is selected and implemented; it must never fall back
-to plaintext UDP.
+Secure SWIM remains deferred. Trusted development may use plaintext UDP in
+isolation; secure mode fails startup and never falls back to it.
 
 ### Acceptance Criteria for a Future Secure UDP Transport
 
@@ -357,50 +415,12 @@ The selected transport must:
 
 ## 7. Delivery Plan (S0–S6)
 
-```
-S0 ──► S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
-config  records  TCP     SWIM    clients  operations  production
-                 mTLS  deferred  + ACLs   + audit     gate
-```
-
-| Phase | Target Scope | Key Deliverable | Exit Criteria |
-| :--- | :--- | :--- | :--- |
-| **S0** | Configuration | Security modes and certificate loader | Secure mode opens no plaintext listeners and fails startup while any required secure listener is unavailable |
-| **S1** | Metadata Storage | Security record schema, sharded Raft state | Security records survive snapshot & recovery |
-| **S2** | Cluster Transport | TLS 1.3 on TCP 2922/2923, Raft sender and role authorization | Authenticated and authorized cluster TCP traffic |
-| **S3** | Membership (deferred) | Secure datagrams on UDP 2922 and SWIM admission gate | A transport meeting the secure UDP acceptance criteria provides authenticated gossip and partition-safe admission fencing |
-| **S4** | Client API | Client mTLS on TCP 2921, principal binding, ACLs | Default-deny enforcement on all client APIs |
-| **S5** | Operations | Certificate rotation, revocation, expiry, recovery, audit logging | Online credential operations and recovery runbooks |
-| **S6** | Production Gate | Adversarial testing, fuzzing, partition stress | Passes all production readiness checks |
-
-S6 must verify node and client impersonation, stale-process replay, unauthorized
-operations, protocol downgrade, rotation under live traffic, expired and revoked
-credentials, cold-cluster restart, handshake and datagram fuzzing, resource
-bounds, secret-free diagnostics, and reproducible secure-SWIM behavior under
-turmoil with pinned randomness and node identities. S6 cannot pass while S3 is
-deferred.
-
----
-
-## 8. Invariants & Security Rules
-
-### System Invariants
-
-1. **Single Connection Identity:** Every established client connection has exactly one authenticated principal; every node connection has exactly one `(Node Certificate Principal, Admission Epoch, NodeId, Process Public Key)`.
-2. **Unique Active Node Admission:** Metadata state maintains at most one active `(Admission Epoch, NodeId, Process Public Key)` per Node Certificate Principal.
-3. **Immutable Producer Session Principal:** Every producer session is immutably bound to the principal that created it.
-4. **Explicit Cache Bounding:** Every cached security entry specifies its source metadata shard, revision, and expiry measured with a monotonic clock (≤ 60 seconds).
-5. **Bounded Audit Footprint:** Audit queues and aggregate rate counters remain within configured capacity.
-
-### Operational Rules
-
-1. Secure mode never downgrades to plaintext or unauthenticated protocols.
-2. Transport layers authenticate identity; application state machines authorize actions.
-3. Transport identity mismatches close the connection immediately before payload dispatch.
-4. Application authorization denials drop only the denied envelope, preserving the connection for valid traffic.
-5. A higher admission epoch fences every older process immediately where observed and no later than admission-cache expiry elsewhere.
-6. SWIM controls liveness; metadata Raft controls admission.
-7. Missing or expired security records cause authorization and admission checks to fail closed.
-8. Resource permits are acquired before allocating memory or spawning async tasks.
-9. Audit logging backpressure must never block network protocol processing or consensus.
-10. Only an authorized operator may approve a higher admission epoch.
+| Phase | Complete when |
+| :--- | :--- |
+| **S0 — Configuration** | Secure configuration loads certificates, opens no plaintext listener, and fails startup when a required secure listener is unavailable. |
+| **S1 — Records** | Sharded admission, ACL, and revocation records survive snapshot and recovery. |
+| **S2 — Cluster TCP** | TLS 1.3 and session-bound process proof admit Raft, ACL, and data traffic only from the current process. |
+| **S3 — SWIM (deferred)** | A transport meeting Section 6's UDP criteria provides authenticated gossip and partition-safe admission fencing. |
+| **S4 — Clients** | Client mTLS and ACLs enforce default deny on every API. |
+| **S5 — Operations** | Rotation, revocation, expiry, recovery, and non-blocking audit work online. |
+| **S6 — Production** | Impersonation, replay, downgrade, fuzzing, resource bounds, recovery, and reproducible secure-SWIM tests pass. S3 must be complete. |
