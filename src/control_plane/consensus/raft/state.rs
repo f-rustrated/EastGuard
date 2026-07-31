@@ -3618,9 +3618,7 @@ mod tests {
     // verify the proposals appear in the log.
     // -------------------------------------------------------------------
 
-    use crate::control_plane::membership::{
-        Topology, TopologyConfig, TopologyReader, topology_channel,
-    };
+    use crate::control_plane::membership::{Topology, TopologyConfig, TopologyReader};
 
     /// Build a `TopologyReader` seeded with `nodes` as live members. The
     /// publisher half is dropped on return — the reader's own Arc keeps the
@@ -3633,7 +3631,7 @@ mod tests {
                 replication_factor: 3,
             },
         );
-        let (_pub_handle, reader) = topology_channel(topology);
+        let (_pub_handle, reader) = topology.channel();
         reader
     }
 

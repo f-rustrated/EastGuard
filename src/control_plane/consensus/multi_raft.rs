@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     fn new_store(node_id: NodeId, storage: Box<dyn RaftStorage>) -> MultiRaft {
-        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        use crate::control_plane::membership::{Topology, TopologyConfig};
         // Tests just need a valid topology reader; empty topology is fine —
         // these tests don't exercise reconciliation or ring picks.
         let topology = Topology::new(
@@ -1085,7 +1085,7 @@ mod tests {
                 replication_factor: 1,
             },
         );
-        let (_pub_handle, reader) = topology_channel(topology);
+        let (_pub_handle, reader) = topology.channel();
         MultiRaft::new(node_id, 0, storage, reader, 10000)
     }
 
@@ -1645,7 +1645,7 @@ mod tests {
         storage: Box<dyn RaftStorage>,
         all_nodes: &[NodeId],
     ) -> MultiRaft {
-        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        use crate::control_plane::membership::{Topology, TopologyConfig};
         let topology = Topology::new(
             all_nodes.iter().cloned(),
             TopologyConfig {
@@ -1653,7 +1653,7 @@ mod tests {
                 replication_factor: 3,
             },
         );
-        let (_pub_handle, reader) = topology_channel(topology);
+        let (_pub_handle, reader) = topology.channel();
         MultiRaft::new(node_id, 0, storage, reader, 10000)
     }
 
@@ -1668,7 +1668,7 @@ mod tests {
         MultiRaft,
         std::sync::Arc<arc_swap::ArcSwap<crate::control_plane::membership::Topology>>,
     ) {
-        use crate::control_plane::membership::{Topology, TopologyConfig, topology_channel};
+        use crate::control_plane::membership::{Topology, TopologyConfig};
         let topology = Topology::new(
             all_nodes.iter().cloned(),
             TopologyConfig {
@@ -1676,7 +1676,7 @@ mod tests {
                 replication_factor: 3,
             },
         );
-        let (pub_handle, reader) = topology_channel(topology);
+        let (pub_handle, reader) = topology.channel();
         (
             MultiRaft::new(node_id, 0, storage, reader, 10000),
             pub_handle,

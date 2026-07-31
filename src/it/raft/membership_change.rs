@@ -11,7 +11,7 @@ use turmoil::Builder;
 
 use crate::control_plane::consensus::actor::{MultiRaftActor, MutlRaftSender};
 use crate::control_plane::consensus::messages::*;
-use crate::control_plane::consensus::transport::{ClusterSecurity, RaftTransportActor};
+use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, Topology};
 use crate::control_plane::{NodeId, Replicas, SwimNodeState};
@@ -20,6 +20,7 @@ use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
+use crate::security::{NodeTransportSecurity, SecurityActor};
 
 use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
@@ -68,13 +69,19 @@ async fn start_raft_node(
         Some(PROBE_INTERVAL_TICKS),
     );
 
+    let security = SecurityActor::spawn(
+        node_id.clone(),
+        swim_tx.clone(),
+        raft_tx.clone(),
+        NodeTransportSecurity::TrustedDevelopment,
+    );
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,
         raft_tx.clone(),
         transport_rx,
         swim_tx.clone(),
-        ClusterSecurity::TrustedDevelopment,
+        security,
     ));
     let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     let election_jitter_seed = {

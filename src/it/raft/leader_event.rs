@@ -9,7 +9,7 @@ use turmoil::Builder;
 
 use crate::control_plane::consensus::actor::MultiRaftActor;
 use crate::control_plane::consensus::messages::*;
-use crate::control_plane::consensus::transport::{ClusterSecurity, RaftTransportActor};
+use crate::control_plane::consensus::transport::RaftTransportActor;
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{
     QueryCommand, ShardGroup, ShardGroupId, SwimActorCommand, SwimCommand,
@@ -19,6 +19,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
+use crate::security::{NodeTransportSecurity, SecurityActor};
 
 use super::CLUSTER_PORT;
 
@@ -114,13 +115,19 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
                 );
+                let security = SecurityActor::spawn(
+                    node_id.clone(),
+                    swim_tx.clone(),
+                    raft_tx.clone(),
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
                     listener,
                     raft_tx.clone(),
                     transport_rx,
                     swim_tx.clone(),
-                    ClusterSecurity::TrustedDevelopment,
+                    security,
                 ));
                 let db = MetadataStorage::open(
                     std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),

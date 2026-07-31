@@ -149,17 +149,6 @@ impl TopologyReader {
     }
 }
 
-/// Construct a (publisher, reader) pair sharing one underlying `ArcSwap`.
-///
-/// The publisher half stays with `SwimActor` (single writer); the reader can
-/// be cloned freely to any number of consumers. Both see the same atomic slot;
-/// what differs is the API surface — readers can only `load()`.
-pub(crate) fn topology_channel(initial: Topology) -> (Arc<ArcSwap<Topology>>, TopologyReader) {
-    let arc = Arc::new(ArcSwap::from_pointee(initial));
-    let reader = TopologyReader(arc.clone());
-    (arc, reader)
-}
-
 impl Topology {
     pub fn new(nodes: impl IntoIterator<Item = NodeId>, config: TopologyConfig) -> Self {
         let mut topology = Self {
@@ -179,6 +168,17 @@ impl Topology {
         // directly, so we leave `dirty` cleared.
         topology.dirty = false;
         topology
+    }
+
+    /// Construct a (publisher, reader) pair sharing one underlying `ArcSwap`.
+    ///
+    /// The publisher half stays with `SwimActor` (single writer); the reader can
+    /// be cloned freely to any number of consumers. Both see the same atomic slot;
+    /// what differs is the API surface — readers can only `load()`.
+    pub(crate) fn channel(self) -> (Arc<ArcSwap<Self>>, TopologyReader) {
+        let arc = Arc::new(ArcSwap::from_pointee(self));
+        let reader = TopologyReader(arc.clone());
+        (arc, reader)
     }
 
     /// Consume the dirty flag. Returns true if the topology has been mutated
@@ -838,7 +838,7 @@ mod tests {
                 replication_factor: 2,
             },
         );
-        let (_pub_handle, reader) = topology_channel(topology);
+        let (_pub_handle, reader) = topology.channel();
 
         assert_eq!(reader.live_nodes().len(), 2);
     }
@@ -852,7 +852,7 @@ mod tests {
                 replication_factor: 1,
             },
         );
-        let (pub_handle, reader) = topology_channel(topology);
+        let (pub_handle, reader) = topology.channel();
         assert_eq!(reader.live_nodes().len(), 1);
 
         // Simulate what SwimActor does at the end of an iteration: build a fresh
@@ -878,7 +878,7 @@ mod tests {
                 replication_factor: 1,
             },
         );
-        let (pub_handle, reader1) = topology_channel(topology);
+        let (pub_handle, reader1) = topology.channel();
         let reader2 = reader1.clone();
 
         pub_handle.store(Arc::new(topology_from(
