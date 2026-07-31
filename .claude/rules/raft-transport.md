@@ -13,14 +13,13 @@ Separate from SWIM's UDP transport. Raft uses TCP for reliable, ordered delivery
 ```
 cluster listener (TCP)
         │
-        ├── limited admission read ──► read one record → reply → close
+        ├── limited admission read ──► security actor → Raft → reply → close
         │
         └── request with process proof
               │
               ├── both sides verify a TLS-session-bound process proof
-              │
               ├── Raft ──► persistent reader + one writer per peer
-              └── ACL ───► read committed ACL → reply → close
+              └── ACL ───► security actor → Raft → reply → close
 ```
 
 ## Wire Protocol
@@ -87,7 +86,7 @@ carry Raft, ACL, client, or admission-write traffic.
 An ACL snapshot request is not a Raft RPC and never enters a Raft state machine.
 In secure mode it is served only after the requester completes process
 admission. It asks the local multi-Raft actor for the selected shard's committed
-ACL record, returns that record on the same connection, then closes. It carries
-no client data request and cannot proxy one. A connection admitted for Raft
-carries only raw Raft frames after its first message; an invalid frame closes
-the connection.
+ACL record through the broker security actor, returns that record on the same
+connection, then closes. It carries no client data request and cannot proxy one.
+A connection admitted for Raft carries only raw Raft frames after its first
+message; an invalid frame closes the connection.

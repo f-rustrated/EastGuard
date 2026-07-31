@@ -32,7 +32,8 @@ and Byzantine consensus are out of scope.
 
 ## 2. Layered Architecture
 
-Security checks are split between the transport layer and application state machines to keep state machines free of security I/O:
+Security checks are split across transport, one broker security actor, and the
+application state machines. This keeps security I/O out of state machines:
 
 ```
 [ Authenticated Transport Layer ]
@@ -45,19 +46,30 @@ Security checks are split between the transport layer and application state mach
                      │
                      │ (Drop connection on transport failure)
                      ▼
-[ Application Layer State Machines ]
-  - Authorize requested operation against cached ACLs / placement
-  - Execute SWIM / Raft / Data-Plane state transitions
+[ Broker Security Actor ]
+  - Cache admission and ACL records
+  - Route record reads to local Raft or one remote broker
+  - Authorize the authenticated principal
                      │
-                     │ (Drop denied envelope only; connection stays open)
+                     │ (Deny one request on authorization failure)
+                     ▼
+[ Application Layer State Machines ]
+  - Execute SWIM / Raft / Data-Plane state transitions
 ```
 
 | Boundary | Rule |
 | :--- | :--- |
-| Transport | Authenticates, bounds frames and caches, and binds senders to verified identities. Failure closes the connection. |
-| State machine | Authorizes pre-validated envelopes. Denial drops one envelope, not the connection. |
+| Transport | Authenticates, bounds frames and handshakes, and binds senders to verified identities. Failure closes the connection. |
+| Security actor | Owns caches, record reads, and authorization. Denial drops one request, not the connection. |
+| State machine | Applies only authenticated and authorized operations. |
 | Data placement | Replication and repair use local committed placement, never a sender-asserted replica list. |
 | Redirect | Carries only an address hint. The destination repeats authentication and authorization. |
+
+The actor owns only shared, non-durable state: both caches, record routing, and
+identical-read combining. Certificates, connection lifetimes, frame parsing,
+and durable records stay outside. Slow remote reads run in the background.
+Admission and ACL refreshes share one active-read limit; saturation fails
+closed instead of creating another queue or actor.
 
 ---
 
@@ -177,7 +189,7 @@ over `X` fails on a connection using `Y`; this removes the need for another
 challenge. Missing or stale admission, identity mismatch, or bad signature
 closes the connection before Raft or ACL dispatch.
 
-### Why Admission Lookup Is Separate
+### Why Admission Lookup Has a Narrow Wire Path
 
 The admission record may live on another broker. A normal cluster connection
 would recurse:
@@ -204,8 +216,8 @@ Accepting broker                         Admission shard host
   node certificate, not the running process.
 - **One purpose:** The connection reads one admission record. It cannot carry
   Raft messages, ACL reads, client requests, or admission writes.
-- **Bounded work:** One broker-local worker limits concurrent and queued reads
-  and combines simultaneous requests for the same record.
+- **Bounded work:** The broker security actor combines simultaneous reads for
+  the same record. Admission and ACL reads share one active-read limit.
 - **Cache result:** A record or confirmed missing record is cached for at most
   60 seconds. A missing record denies admission.
 - **Do not cache failure:** Timeout, routing failure, or an unavailable shard
@@ -336,18 +348,17 @@ Pull-on-miss avoids a second connection pool for reads needed at most once per
 cache window. A future push or hybrid design may update only the same cache and
 must remain fail closed.
 
-One broker-local refresh worker owns these remote reads. It bounds active and
-queued work, and combines simultaneous requests for the same ACL record into
-one read. When that worker is full, stopped, or too slow, callers deny rather
-than opening more connections:
+The broker security actor owns these remote reads and combines simultaneous
+requests for the same ACL record. When its shared read limit is full, stopped,
+or too slow, callers deny rather than opening more connections:
 
 ```
 many cache misses
        │
        ▼
- ACL refresh worker
+ broker security actor
        ├── same shard + resource ──► one read, reply to all waiters
-       ├── different records ──────► bounded active work and queue
+       ├── different records ──────► bounded background reads
        └── full / unavailable ─────► deny
 ```
 
