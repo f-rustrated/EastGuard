@@ -17,6 +17,7 @@ use crate::control_plane::metadata::{
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
+use crate::security::CertificatePrincipal;
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -304,7 +305,7 @@ impl MutlRaftSender {
     pub(crate) async fn get_admission(
         &self,
         shard_group_id: ShardGroupId,
-        node_certificate_principal: Box<str>,
+        node_certificate_principal: CertificatePrincipal,
     ) -> Result<Option<AdmissionRecord>, ServerError> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.send(GetAdmission {

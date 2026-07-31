@@ -25,6 +25,7 @@ use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{PlaceSegment, SegmentCaughtUp, SegmentPlaced};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
+use crate::security::CertificatePrincipal;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use std::collections::{BTreeSet, HashSet};
@@ -166,7 +167,10 @@ impl Raft {
         self.metadata.acl_snapshot(resource)
     }
 
-    pub(crate) fn admission(&self, node_certificate_principal: &str) -> Option<AdmissionRecord> {
+    pub(crate) fn admission(
+        &self,
+        node_certificate_principal: &CertificatePrincipal,
+    ) -> Option<AdmissionRecord> {
         self.metadata.admission(node_certificate_principal)
     }
 

@@ -3,6 +3,8 @@ use rustls::pki_types::CertificateDer;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+use crate::security::CertificatePrincipal;
+
 /// Reads the stable node principal from a leaf certificate's URI Subject
 /// Alternative Name.
 ///
@@ -10,7 +12,9 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 /// `urn:eastguard:node:`. The text after that prefix is the principal used as
 /// the admission-record key. This function only parses the certificate; callers
 /// must use it after rustls has authenticated the peer's certificate chain.
-pub(crate) fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
+pub(crate) fn node_certificate_principal(
+    certificate: &CertificateDer<'_>,
+) -> Result<CertificatePrincipal> {
     certificate_principal(
         certificate,
         "urn:eastguard:node:",
@@ -24,7 +28,9 @@ pub(crate) fn node_certificate_principal(certificate: &CertificateDer<'_>) -> Re
 ///
 /// TLS authentication must succeed before callers use this parsed identity for
 /// authorization.
-pub(crate) fn client_certificate_principal(certificate: &CertificateDer<'_>) -> Result<String> {
+pub(crate) fn client_certificate_principal(
+    certificate: &CertificateDer<'_>,
+) -> Result<CertificatePrincipal> {
     certificate_principal(
         certificate,
         "urn:eastguard:client:",
@@ -38,7 +44,7 @@ fn certificate_principal(
     uri_prefix: &str,
     certificate_kind: &str,
     principal_name: &str,
-) -> Result<String> {
+) -> Result<CertificatePrincipal> {
     let (_, certificate) =
         X509Certificate::from_der(certificate.as_ref()).context("invalid X.509 certificate")?;
     let subject_alt_name = certificate
@@ -65,7 +71,7 @@ fn certificate_principal(
         principals.next().is_none(),
         "{certificate_kind} certificate has multiple {principal_name}s"
     );
-    Ok(principal.to_string())
+    Ok(CertificatePrincipal::new(principal))
 }
 
 #[cfg(test)]
@@ -90,7 +96,7 @@ mod tests {
             certificate_with_uris(&["urn:example:unrelated", "urn:eastguard:node:broker-a"]);
 
         assert_eq!(
-            node_certificate_principal(&certificate).unwrap(),
+            node_certificate_principal(&certificate).unwrap().as_ref(),
             "broker-a"
         );
     }
@@ -121,7 +127,7 @@ mod tests {
             certificate_with_uris(&["urn:example:unrelated", "urn:eastguard:client:producer-a"]);
 
         assert_eq!(
-            client_certificate_principal(&certificate).unwrap(),
+            client_certificate_principal(&certificate).unwrap().as_ref(),
             "producer-a"
         );
     }

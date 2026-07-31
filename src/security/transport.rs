@@ -4,7 +4,12 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::admission_proof::{AdmissionProof, ProcessSigningKey};
+use super::certificates::node_certificate_principal;
+use crate::config::{Environment, SecurityMode};
+use crate::control_plane::NodeId;
 use anyhow::{Context, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
@@ -15,9 +20,6 @@ use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, OtherError,
     RootCertStore, ServerConfig, SignatureScheme,
 };
-
-use super::certificates::node_certificate_principal;
-use crate::config::{Environment, SecurityMode};
 
 /// Verifies certificates presented to EastGuard's outbound node connections.
 ///
@@ -105,18 +107,7 @@ impl ServerCertVerifier for NodeServerCertVerifier {
 
 #[derive(Clone)]
 pub(crate) enum NodeTransportSecurity {
-    Secure {
-        server: Arc<ServerConfig>,
-        client: Arc<ClientConfig>,
-    },
-    TrustedDevelopment,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TransportIdentity {
-    /// Principal authenticated for this live TLS connection. This is transport
-    /// evidence, not a durable authorization or ownership record.
-    CertificatePrincipal(Box<str>),
+    Secure(NodeCredentials),
     TrustedDevelopment,
 }
 
@@ -136,7 +127,11 @@ impl NodeTransportSecurity {
                     .trust_root_path
                     .as_deref()
                     .context("trust_root_path is required in secure mode")?;
-                Self::load_from_paths(certificate_chain, private_key_path, trust_roots)
+                Ok(Self::Secure(Self::load_from_paths(
+                    certificate_chain,
+                    private_key_path,
+                    trust_roots,
+                )?))
             }
             SecurityMode::TrustedDevelopment => Ok(Self::TrustedDevelopment),
         }
@@ -146,12 +141,12 @@ impl NodeTransportSecurity {
         certificate_chain_path: &Path,
         private_key_path: &Path,
         trust_root_path: &Path,
-    ) -> Result<Self> {
+    ) -> Result<NodeCredentials> {
         let certificate_chain =
             Self::load_certificates(certificate_chain_path, "certificate chain")?;
+        let node_certificate_principal = node_certificate_principal(&certificate_chain[0])?;
         let private_key = Self::load_private_key(private_key_path)?;
         let trust_roots = Arc::new(Self::load_trust_roots(trust_root_path)?);
-
         let client_verifier = WebPkiClientVerifier::builder(trust_roots.clone()).build()?;
         let server = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_client_cert_verifier(client_verifier)
@@ -161,14 +156,16 @@ impl NodeTransportSecurity {
             .with_custom_certificate_verifier(Arc::new(NodeServerCertVerifier::new(trust_roots)))
             .with_client_auth_cert(certificate_chain, private_key)?;
 
-        Ok(Self::Secure {
+        Ok(NodeCredentials {
             server: Arc::new(server),
             client: Arc::new(client),
+            node_certificate_principal,
+            process_signing_key: Arc::new(ProcessSigningKey::generate()?),
         })
     }
 
     pub(crate) fn is_secure(&self) -> bool {
-        matches!(self, Self::Secure { .. })
+        matches!(self, Self::Secure(_))
     }
 
     fn load_certificates(path: &Path, kind: &'static str) -> Result<Vec<CertificateDer<'static>>> {
@@ -213,6 +210,56 @@ impl NodeTransportSecurity {
                 .with_context(|| format!("invalid trust root in {}", path.display()))?;
         }
         Ok(roots)
+    }
+}
+
+/// TLS credentials and process identity loaded for secure mode.
+#[derive(Clone)]
+pub(crate) struct NodeCredentials {
+    server: Arc<ServerConfig>,
+    client: Arc<ClientConfig>,
+    node_certificate_principal: CertificatePrincipal,
+    process_signing_key: Arc<ProcessSigningKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, BorshSerialize, BorshDeserialize)]
+pub(crate) struct CertificatePrincipal(Box<str>);
+
+impl CertificatePrincipal {
+    pub(crate) fn new(principal: impl Into<Box<str>>) -> Self {
+        Self(principal.into())
+    }
+}
+
+impl AsRef<str> for CertificatePrincipal {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl NodeCredentials {
+    pub(crate) fn server_config(&self) -> Arc<ServerConfig> {
+        self.server.clone()
+    }
+
+    pub(crate) fn client_config(&self) -> Arc<ClientConfig> {
+        self.client.clone()
+    }
+
+    /// Creates proof that a node connection belongs to this exact process.
+    ///
+    /// The TLS session binding makes the proof unique to one connection. Only
+    /// the process public key is stored in metadata Raft.
+    pub(crate) fn create_admission_proof(
+        &self,
+        node_id: &NodeId,
+        tls_session_binding: &[u8],
+    ) -> Result<AdmissionProof> {
+        self.process_signing_key.sign(
+            &self.node_certificate_principal,
+            node_id,
+            tls_session_binding,
+        )
     }
 }
 

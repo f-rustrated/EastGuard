@@ -15,6 +15,7 @@ use crate::control_plane::metadata::{
     AclResource, EntryId, RangeId, SegmentId, TopicId, error::MetadataError,
 };
 use crate::data_plane::SegmentKey;
+use crate::security::CertificatePrincipal;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use MetadataError::*;
@@ -97,7 +98,10 @@ impl MetadataState {
         self.security.acl_snapshot(resource)
     }
 
-    pub(crate) fn admission(&self, node_certificate_principal: &str) -> Option<AdmissionRecord> {
+    pub(crate) fn admission(
+        &self,
+        node_certificate_principal: &CertificatePrincipal,
+    ) -> Option<AdmissionRecord> {
         self.security.admission(node_certificate_principal)
     }
 
@@ -643,7 +647,7 @@ mod tests {
     fn security_records_survive_snapshot_restore() {
         let mut state = MetadataState::new(ShardGroupId(1));
         let admission = AdmissionRecord {
-            node_certificate_principal: "broker-a".to_string(),
+            node_certificate_principal: CertificatePrincipal::new("broker-a"),
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
@@ -679,7 +683,10 @@ mod tests {
         let restored = MetadataState::from_snapshot(snapshot, 9);
 
         assert_eq!(
-            restored.security.admissions.get("broker-a"),
+            restored
+                .security
+                .admissions
+                .get(&CertificatePrincipal::new("broker-a")),
             Some(&admission)
         );
         assert_eq!(restored.security.acls.get(&acl.resource), Some(&acl));

@@ -10,6 +10,7 @@ use crate::control_plane::metadata::{AclResource, ConsumerGroupAssignment, Topic
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
+use crate::security::CertificatePrincipal;
 
 use super::command::{
     EnsureGroup, InboundRaftRpc, MetadataProposal, ProposeSegmentRoll, RaftProtocolMessage,
@@ -91,7 +92,7 @@ pub struct GetAclSnapshot {
 /// Returns one admission record from a metadata shard hosted by this node.
 pub struct GetAdmission {
     pub(crate) shard_group_id: ShardGroupId,
-    pub(crate) node_certificate_principal: Box<str>,
+    pub(crate) node_certificate_principal: CertificatePrincipal,
     pub(crate) reply: oneshot::Sender<Result<Option<AdmissionRecord>, ServerError>>,
 }
 

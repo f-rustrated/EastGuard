@@ -25,6 +25,7 @@ use crate::data_plane::messages::command::{
     DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentPlaced,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
+use crate::security::CertificatePrincipal;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use tokio::sync::oneshot;
@@ -516,7 +517,7 @@ impl MultiRaft {
     fn admission(
         &self,
         shard_group_id: ShardGroupId,
-        node_certificate_principal: &str,
+        node_certificate_principal: &CertificatePrincipal,
     ) -> Result<Option<AdmissionRecord>, ServerError> {
         let raft = self
             .groups

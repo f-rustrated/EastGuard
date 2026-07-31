@@ -4,6 +4,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::AclResource;
+use crate::security::CertificatePrincipal;
 
 /// Security records replicated by one metadata shard.
 ///
@@ -11,7 +12,7 @@ use crate::control_plane::metadata::AclResource;
 /// indexes do not enlarge every variant of the Raft snapshot state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct SecurityState {
-    pub(super) admissions: HashMap<String, AdmissionRecord>,
+    pub(super) admissions: HashMap<CertificatePrincipal, AdmissionRecord>,
     pub(super) acls: HashMap<AclResource, AclRecord>,
     pub(super) revocations: HashMap<(String, Box<[u8]>), RevocationRecord>,
 }
@@ -22,7 +23,7 @@ pub(crate) struct SecurityState {
 /// accept SWIM facts only when the epoch, node ID, and process key match it.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct AdmissionRecord {
-    pub node_certificate_principal: String,
+    pub node_certificate_principal: CertificatePrincipal,
     pub revision: u64,
     pub epoch: u64,
     pub node_id: NodeId,
@@ -54,7 +55,10 @@ pub(crate) struct RevocationRecord {
 }
 
 impl SecurityState {
-    pub(crate) fn admission(&self, node_certificate_principal: &str) -> Option<AdmissionRecord> {
+    pub(crate) fn admission(
+        &self,
+        node_certificate_principal: &CertificatePrincipal,
+    ) -> Option<AdmissionRecord> {
         self.admissions.get(node_certificate_principal).cloned()
     }
 
@@ -151,7 +155,7 @@ mod tests {
     #[test]
     fn security_records_round_trip() {
         round_trip(&AdmissionRecord {
-            node_certificate_principal: "broker-a".to_string(),
+            node_certificate_principal: CertificatePrincipal::new("broker-a"),
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
@@ -174,7 +178,7 @@ mod tests {
     fn admission_lookup_uses_the_certificate_principal() {
         let mut security = SecurityState::default();
         let admission = AdmissionRecord {
-            node_certificate_principal: "broker-a".to_string(),
+            node_certificate_principal: CertificatePrincipal::new("broker-a"),
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
@@ -185,8 +189,14 @@ mod tests {
             admission.clone(),
         );
 
-        assert_eq!(security.admission("broker-a"), Some(admission));
-        assert_eq!(security.admission("broker-b"), None);
+        assert_eq!(
+            security.admission(&CertificatePrincipal::new("broker-a")),
+            Some(admission)
+        );
+        assert_eq!(
+            security.admission(&CertificatePrincipal::new("broker-b")),
+            None
+        );
     }
 
     #[test]
