@@ -15,7 +15,7 @@ cluster listener (TCP)
         │
         ├── limited admission read ──► read one record → reply → close
         │
-        └── admitted request
+        └── request with process proof
               │
               ├── both sides verify a TLS-session-bound process proof
               │
@@ -27,8 +27,8 @@ cluster listener (TCP)
 
 Length-prefixed Borsh frames:
 
-1. **Secure initial message:** either one limited `AdmissionLookupRequest` or
-   `AdmittedClusterMessage`, which contains the dialer's process proof plus a
+1. **Secure initial message:** either `AdmissionLookup(AdmissionRecordKey)` or
+   `ProcessAdmissionRequest`, which contains the dialer's process proof plus a
    Raft message or ACL snapshot request.
 2. **Mutual admission:** the acceptor verifies the dialer, then replies with its
    own `AdmissionProof`. Both proofs sign the same TLS exporter value and are
@@ -64,7 +64,7 @@ spawning a handshake task, applies a total handshake deadline, and uses a
 bounded queue to return verified Raft streams to the dispatcher. A slow TLS,
 admission lookup, or proof exchange never blocks the transport select loop.
 
-6. **Frame sizes are bounded.** Initial, admitted, Raft, proof, and response
+6. **Frame sizes are bounded.** Initial, process-admission, Raft, proof, and response
 frames are capped before allocating their payload.
 
 7. **Transport validates message identity but never interprets the RPC.** The
@@ -77,10 +77,10 @@ checks belong to the target Raft state machine.
 
 Admission records are sharded, so the acceptor may need another broker to read
 the record required for its proof check. Requiring process admission for that
-read would recurse. `AdmissionLookupRequest` is therefore accepted after mTLS
-but before process admission. It can read one named admission record from one
-shard, returns one `AdmissionLookupResponse`, and closes. It cannot carry Raft,
-ACL, client, or admission-write traffic.
+read would recurse. `AdmissionLookup(AdmissionRecordKey)` is therefore accepted
+after mTLS but before process admission. It can read one named admission record
+from one shard, returns one `AdmissionLookupResponse`, and closes. It cannot
+carry Raft, ACL, client, or admission-write traffic.
 
 ## ACL Snapshot Rule
 

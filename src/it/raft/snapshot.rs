@@ -9,7 +9,7 @@ use turmoil::Builder;
 
 use crate::control_plane::consensus::actor::MultiRaftActor;
 use crate::control_plane::consensus::messages::EnsureGroup;
-use crate::control_plane::consensus::transport::RaftTransportActor;
+use crate::control_plane::consensus::transport::{ClusterSecurity, RaftTransportActor};
 use crate::control_plane::membership::actor::SwimActor;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::metadata::CreateTopic;
@@ -19,7 +19,6 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::security::NodeTransportSecurity;
 
 use super::{CLUSTER_PORT, mock_swim_handler};
 
@@ -56,7 +55,7 @@ async fn run_node(name: &'static str, ordinal: u16) -> Result<(), Box<dyn std::e
         raft_tx.clone(),
         transport_rx,
         swim_tx.clone(),
-        NodeTransportSecurity::TrustedDevelopment,
+        ClusterSecurity::TrustedDevelopment,
     ));
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     node_id.hash(&mut hasher);
