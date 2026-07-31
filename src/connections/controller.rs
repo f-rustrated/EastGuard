@@ -746,7 +746,9 @@ mod tests {
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
     use crate::control_plane::consensus::raft::states::security::AclRecord;
-    use crate::control_plane::consensus::transport::{AclSnapshotActor, RaftTransportActor};
+    use crate::control_plane::consensus::transport::{
+        AclSnapshotActor, ClusterSecurity, RaftTransportActor,
+    };
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
@@ -761,7 +763,6 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use crate::net::TcpListener;
-    use crate::security::NodeTransportSecurity;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -835,8 +836,7 @@ mod tests {
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
-        let acl_snapshot_sender =
-            AclSnapshotActor::spawn(NodeTransportSecurity::TrustedDevelopment);
+        let acl_snapshot_sender = AclSnapshotActor::spawn(ClusterSecurity::TrustedDevelopment);
         ClientController::new(
             TransportIdentity::TrustedDevelopment,
             node_id,
@@ -870,8 +870,7 @@ mod tests {
         raft_sender: MutlRaftSender,
         acl_cache: SharedAclCache,
     ) -> ClientController {
-        let acl_snapshot_sender =
-            AclSnapshotActor::spawn(NodeTransportSecurity::TrustedDevelopment);
+        let acl_snapshot_sender = AclSnapshotActor::spawn(ClusterSecurity::TrustedDevelopment);
         ClientController::new(
             TransportIdentity::CertificatePrincipal(principal.into()),
             node_id,
@@ -1235,7 +1234,7 @@ mod tests {
                     raft_tx,
                     transport_rx,
                     swim_tx,
-                    NodeTransportSecurity::TrustedDevelopment,
+                    ClusterSecurity::TrustedDevelopment,
                 ));
 
                 let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await
