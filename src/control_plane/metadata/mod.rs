@@ -24,7 +24,7 @@ pub(crate) use consumer_group::{ConsumerGroupAssignment, ConsumerGroupMeta, Cons
 
 pub(crate) use segment::*;
 
-use crate::{impl_new_struct_wrapper, security::TransportIdentity};
+use crate::{impl_new_struct_wrapper, security::CertificatePrincipal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Ser, Deser)]
 pub struct TopicId(pub(crate) u64);
@@ -55,22 +55,21 @@ pub struct ProducerSessionResource {
 
 /// Durable owner of one producer session.
 ///
-/// This is deliberately separate from the connection's transport identity:
-/// Raft snapshots retain ownership after the TLS connection disappears, and
-/// transport refactors must not change the persisted metadata schema.
+/// This is deliberately separate from the connection's optional certificate
+/// principal: Raft snapshots retain ownership after the TLS connection
+/// disappears, and trusted-development ownership must remain explicit in
+/// persisted metadata rather than being encoded as an absent value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ser, Deser)]
 pub enum ProducerSessionOwner {
     CertificatePrincipal(Box<str>),
     TrustedDevelopment,
 }
 
-impl ProducerSessionOwner {
-    pub(crate) fn from(transport_identity: &TransportIdentity) -> Self {
-        match transport_identity {
-            TransportIdentity::CertificatePrincipal(principal) => {
-                ProducerSessionOwner::CertificatePrincipal(principal.clone())
-            }
-            TransportIdentity::TrustedDevelopment => ProducerSessionOwner::TrustedDevelopment,
+impl From<Option<&CertificatePrincipal>> for ProducerSessionOwner {
+    fn from(certificate_principal: Option<&CertificatePrincipal>) -> Self {
+        match certificate_principal {
+            Some(principal) => Self::CertificatePrincipal(principal.as_ref().into()),
+            None => Self::TrustedDevelopment,
         }
     }
 }

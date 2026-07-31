@@ -8,4 +8,4 @@ mod transport;
 pub(crate) use actor::{SecurityActor, SecurityHandle};
 pub(crate) use admission_proof::AdmissionProof;
 pub(crate) use certificates::{client_certificate_principal, node_certificate_principal};
-pub(crate) use transport::{NodeTransportSecurity, SecureNodeTransport, TransportIdentity};
+pub(crate) use transport::{CertificatePrincipal, NodeCredentials, NodeTransportSecurity};

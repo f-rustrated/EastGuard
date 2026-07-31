@@ -28,10 +28,9 @@ use crate::control_plane::consensus::messages::{
     MultiRaftActorCommand, RaftTimer, RaftTransportCommand,
 };
 use crate::control_plane::consensus::transport::RaftTransportActor;
-use crate::control_plane::consensus::transport::{AclSnapshotActor, AclSnapshotSender};
 use crate::control_plane::membership::OutboundPacket;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::membership::topology_channel;
+
 use crate::data_plane::actor::{DataPlaneActor, DataPlaneSender};
 use crate::data_plane::checkpoint::CheckpointWorker;
 use crate::data_plane::recovery;
@@ -41,8 +40,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TransportTcpStream, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::security::NodeTransportSecurity;
-use crate::security::acl_cache::SharedAclCache;
+use crate::security::{NodeTransportSecurity, SecurityActor, SecurityHandle};
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -88,12 +86,18 @@ impl StartUp {
         let (data_transport_tx, data_transport_rx) =
             mpsc::channel::<Box<[DataTransportCommand]>>(100);
 
-        let state = self.env.swim(self.rng_seed);
-        let node_id = state.node_id.clone();
+        let swim = self.env.swim(self.rng_seed);
+        let node_id = swim.node_id.clone();
+        let security_handle = SecurityActor::spawn(
+            node_id.clone(),
+            swim_sender.clone(),
+            raft_tx.clone(),
+            security.clone(),
+        );
 
         // Topology snapshot channel: SwimActor publishes, all other actors read.
         // Single-writer / many-readers via ArcSwap — no locks, no contention.
-        let (topology_pub, topology_reader) = topology_channel(state.topology.clone());
+        let (topology_pub, topology_reader) = swim.topology.clone().channel();
 
         // Recover local durable state before this node serves or joins the
         // cluster: scan + replay the WAL into the segment files, then clear the
@@ -115,14 +119,14 @@ impl StartUp {
             raft_tx.clone(),
             raft_transport_rx,
             swim_sender.clone(),
-            security.clone(),
+            security_handle.clone(),
         ));
 
         // Protocol actors (each spawns its own scheduler internally)
         SwimActor::spawn(
             swim_sender.clone(),
             swim_mailbox,
-            state,
+            swim,
             tx_outbound,
             raft_tx.clone().into(),
             topology_pub,
@@ -168,8 +172,6 @@ impl StartUp {
             self.env.raft_snapshot_entry_threshold,
         );
 
-        let acl_snapshot_sender = AclSnapshotActor::spawn(security.clone());
-
         // Client handler
         let _ = self
             .receive_client_streams(
@@ -178,7 +180,7 @@ impl StartUp {
                 raft_tx,
                 data_plane_tx,
                 security,
-                acl_snapshot_sender,
+                security_handle,
             )
             .await;
         Ok(())
@@ -191,9 +193,8 @@ impl StartUp {
         raft_tx: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
         security: NodeTransportSecurity,
-        acl_snapshot_sender: AclSnapshotSender,
+        security_handle: SecurityHandle,
     ) {
-        let acl_cache = SharedAclCache::default();
         let addr = self.env.bind_addr();
         let listener = TcpListener::bind(&addr).await.unwrap();
         tracing::info!(
@@ -214,7 +215,7 @@ impl StartUp {
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
             let dp = data_plane_tx.clone();
-            let acl_sender = acl_snapshot_sender.clone();
+            let security_handle = security_handle.clone();
 
             tokio::spawn(handle_client_stream(
                 stream,
@@ -222,8 +223,7 @@ impl StartUp {
                 swim_tx,
                 raft,
                 dp,
-                acl_cache.clone(),
-                acl_sender,
+                security_handle,
             ));
         }
     }

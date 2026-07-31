@@ -44,9 +44,9 @@ impl TransportState {
         &mut self,
         stream: TransportTcpStream,
     ) -> anyhow::Result<(NodeId, DataReader)> {
-        let transport_identity = stream.peer_identity();
+        let certificate_principal = stream.peer_principal();
         let (read_half, write_half) = stream.into_split();
-        let mut reader = DataReader::new(read_half, transport_identity);
+        let mut reader = DataReader::new(read_half, certificate_principal);
 
         let peer_id = reader.read_node_id().await?;
 
@@ -142,7 +142,7 @@ impl TransportState {
         .context("connect timed out")?
         .context("TCP connect failed")?;
 
-        let transport_identity = stream.peer_identity();
+        let certificate_principal = stream.peer_principal();
         let (read_half, write_half) = stream.into_split();
         self.writers.insert(target_id.clone(), write_half);
 
@@ -156,7 +156,7 @@ impl TransportState {
             return Err(e).context("initial write failed");
         }
 
-        Ok(DataReader::new(read_half, transport_identity))
+        Ok(DataReader::new(read_half, certificate_principal))
     }
 
     pub fn disconnect(&mut self, peer_id: NodeId) {

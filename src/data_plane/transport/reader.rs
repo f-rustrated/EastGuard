@@ -5,21 +5,24 @@ use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
 use crate::net::TransportReadHalf;
-use crate::security::TransportIdentity;
+use crate::security::CertificatePrincipal;
 
 const NODE_ID_FRAME_MAX: usize = 1024;
 const DATA_FRAME_MAX: usize = 64 * 1024 * 1024;
 
 pub(super) struct DataReader {
     read_half: TransportReadHalf,
-    transport_identity: TransportIdentity,
+    certificate_principal: Option<CertificatePrincipal>,
 }
 
 impl DataReader {
-    pub(super) fn new(read_half: TransportReadHalf, transport_identity: TransportIdentity) -> Self {
+    pub(super) fn new(
+        read_half: TransportReadHalf,
+        certificate_principal: Option<CertificatePrincipal>,
+    ) -> Self {
         Self {
             read_half,
-            transport_identity,
+            certificate_principal,
         }
     }
 
@@ -39,7 +42,7 @@ impl DataReader {
     #[tracing::instrument(
         level = "trace",
         skip_all,
-        fields(peer = %peer, transport_identity = ?self.transport_identity)
+        fields(peer = %peer, certificate_principal = ?self.certificate_principal)
     )]
     pub(crate) async fn run(
         mut self,

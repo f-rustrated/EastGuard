@@ -3,7 +3,6 @@ use crate::connections::writer::ClientRawWriter;
 use crate::connections::{protocol::*, run_client_writer};
 use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::consensus::transport::AclSnapshotSender;
 use crate::control_plane::metadata::{
     AclResource, ConsumerGroupResource, OpenProducerSession, ProducerSessionOwner, RangeMeta,
     TopicState, UpdateConsumerGroupMember, UpdateConsumerGroupMemberRequest,
@@ -31,8 +30,7 @@ use crate::data_plane::messages::query::{
     DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset, ReadConsumerOffsetResult,
 };
 use crate::net::TransportTcpStream;
-use crate::security::TransportIdentity;
-use crate::security::acl_cache::SharedAclCache;
+use crate::security::{CertificatePrincipal, SecurityHandle};
 use tokio::sync::mpsc;
 
 /// # Client ↔ Server request_id protocol
@@ -51,33 +49,30 @@ use tokio::sync::mpsc;
 /// with responses arriving in any order.
 #[derive(Clone)]
 pub struct ClientController {
-    transport_identity: TransportIdentity,
+    certificate_principal: Option<CertificatePrincipal>,
     node_id: NodeId,
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    acl_cache: SharedAclCache,
-    acl_snapshot_sender: AclSnapshotSender,
+    security: SecurityHandle,
 }
 
 impl ClientController {
     fn new(
-        transport_identity: TransportIdentity,
+        certificate_principal: Option<CertificatePrincipal>,
         node_id: NodeId,
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
-        acl_cache: SharedAclCache,
-        acl_snapshot_sender: AclSnapshotSender,
+        security: SecurityHandle,
     ) -> Self {
         Self {
-            transport_identity,
+            certificate_principal,
             node_id,
             swim_sender,
             raft_sender,
             data_plane_tx,
-            acl_cache,
-            acl_snapshot_sender,
+            security,
         }
     }
 
@@ -117,7 +112,7 @@ impl ClientController {
 
     pub async fn dispatch(&self, request: ClientRequest) -> ClientResponse {
         tracing::trace!(
-            transport_identity = ?self.transport_identity,
+            certificate_principal = ?self.certificate_principal,
             "dispatching client request"
         );
         match request {
@@ -151,7 +146,7 @@ impl ClientController {
         // Convert ephemeral authentication evidence into the durable owner
         // carried by the Raft command. The persisted type intentionally does
         // not depend on TLS or stream implementation details.
-        let owner = ProducerSessionOwner::from(&self.transport_identity);
+        let owner = ProducerSessionOwner::from(self.certificate_principal.as_ref());
 
         let command: OpenProducerSession = req.into_command(owner.clone());
 
@@ -304,36 +299,9 @@ impl ClientController {
     }
 
     async fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
-        let TransportIdentity::CertificatePrincipal(principal) = &self.transport_identity else {
-            return Ok(());
-        };
-
-        match self.route(resource.routing_key()).await? {
-            ShardRouting::Local(group) => {
-                self.acl_cache
-                    .authorize_or_refresh(&resource, group.id, principal, || {
-                        self.raft_sender
-                            .get_acl_snapshot(group.id, resource.clone())
-                    })
-                    .await
-            }
-            ShardRouting::Redirect(Some(remote)) => {
-                let Some(owner) = remote.member else {
-                    return Err(ServerError::Unauthorized);
-                };
-                self.acl_cache
-                    .authorize_or_refresh(&resource, remote.group_id, principal, || {
-                        self.acl_snapshot_sender.fetch(
-                            self.node_id.clone(),
-                            owner,
-                            remote.group_id,
-                            resource.clone(),
-                        )
-                    })
-                    .await
-            }
-            ShardRouting::Redirect(None) => Err(ServerError::Unauthorized),
-        }
+        self.security
+            .authorize(self.certificate_principal.as_ref(), resource)
+            .await
     }
 
     /// Structural redirect for a control-plane op that isn't local: to the member if
@@ -712,20 +680,18 @@ pub async fn handle_client_stream(
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    acl_cache: SharedAclCache,
-    acl_snapshot_sender: AclSnapshotSender,
+    security: SecurityHandle,
 ) {
-    let transport_identity = stream.peer_identity();
+    let certificate_principal = stream.peer_principal();
     let (read_half, write_half) = stream.into_split();
     let (writer_tx, writer_rx) = mpsc::channel(128);
     let handler = ClientController::new(
-        transport_identity,
+        certificate_principal,
         node_id,
         swim_sender,
         raft_sender,
         data_plane_tx,
-        acl_cache,
-        acl_snapshot_sender,
+        security,
     );
     tokio::spawn(run_client_writer(
         ClientRawWriter::new(write_half),
@@ -746,9 +712,7 @@ mod tests {
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
     use crate::control_plane::consensus::raft::states::security::AclRecord;
-    use crate::control_plane::consensus::transport::{
-        AclSnapshotActor, ClusterSecurity, RaftTransportActor,
-    };
+    use crate::control_plane::consensus::transport::RaftTransportActor;
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{
         QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
@@ -763,6 +727,7 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use crate::net::TcpListener;
+    use crate::security::{NodeTransportSecurity, SecurityActor};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -836,15 +801,19 @@ mod tests {
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
-        let acl_snapshot_sender = AclSnapshotActor::spawn(ClusterSecurity::TrustedDevelopment);
+        let security = SecurityActor::spawn(
+            node_id.clone(),
+            swim_sender.clone(),
+            raft_sender.clone(),
+            NodeTransportSecurity::TrustedDevelopment,
+        );
         ClientController::new(
-            TransportIdentity::TrustedDevelopment,
+            None,
             node_id,
             swim_sender,
             raft_sender,
             data_plane_tx,
-            SharedAclCache::default(),
-            acl_snapshot_sender,
+            security,
         )
     }
 
@@ -854,31 +823,19 @@ mod tests {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
     ) -> ClientController {
-        authenticated_controller_with_cache(
-            principal,
-            node_id,
-            swim_sender,
-            raft_sender,
-            SharedAclCache::default(),
-        )
-    }
-
-    fn authenticated_controller_with_cache(
-        principal: &str,
-        node_id: NodeId,
-        swim_sender: SwimSender,
-        raft_sender: MutlRaftSender,
-        acl_cache: SharedAclCache,
-    ) -> ClientController {
-        let acl_snapshot_sender = AclSnapshotActor::spawn(ClusterSecurity::TrustedDevelopment);
+        let security = SecurityActor::spawn(
+            node_id.clone(),
+            swim_sender.clone(),
+            raft_sender.clone(),
+            NodeTransportSecurity::TrustedDevelopment,
+        );
         ClientController::new(
-            TransportIdentity::CertificatePrincipal(principal.into()),
+            Some(CertificatePrincipal::new(principal)),
             node_id,
             swim_sender,
             raft_sender,
             dp_stub(),
-            acl_cache,
-            acl_snapshot_sender,
+            security,
         )
     }
 
@@ -947,35 +904,6 @@ mod tests {
                 .await,
             Ok(())
         );
-    }
-
-    #[tokio::test]
-    async fn fresh_acl_cache_authorizes_without_a_raft_query() {
-        let group = test_shard_group();
-        let swim = swim_sender_with(move |cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
-                let _ = reply.send(Some(group.clone()));
-            }
-        });
-        let cache = SharedAclCache::default();
-        let resource = AclResource::TopicData(TopicId(7));
-        assert_eq!(
-            cache
-                .authorize_or_refresh(&resource, ShardGroupId(42), "orders-service", || async {
-                    Some(acl_snapshot(resource.clone(), &["orders-service"]))
-                })
-                .await,
-            Ok(())
-        );
-        let controller = authenticated_controller_with_cache(
-            "orders-service",
-            node_id("node-1"),
-            swim,
-            raft_sender_with(|_| panic!("fresh ACL cache must not query Raft")),
-            cache,
-        );
-
-        assert_eq!(controller.authorize_acl_resource(resource).await, Ok(()));
     }
 
     #[tokio::test]
@@ -1228,13 +1156,19 @@ mod tests {
                 let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
                 let (_transport_tx, transport_rx) = mpsc::channel(1);
                 let (swim_tx, _swim_rx) = SwimActor::channel(1);
+                let security = SecurityActor::spawn(
+                    node_id("owner"),
+                    swim_tx.clone(),
+                    raft_tx.clone(),
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
                 tokio::spawn(RaftTransportActor::run(
                     node_id("owner"),
                     listener,
                     raft_tx,
                     transport_rx,
                     swim_tx,
-                    ClusterSecurity::TrustedDevelopment,
+                    security,
                 ));
 
                 let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await
