@@ -40,7 +40,9 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TransportTcpStream, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::security::{NodeTransportSecurity, SecurityActor, SecurityHandle};
+use crate::security::{
+    NodeTransportSecurity, SecurityActor, SecurityHandle, client_certificate_principal,
+};
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -204,13 +206,16 @@ impl StartUp {
         );
 
         while let Ok((stream, _)) = listener.accept().await {
-            let stream = match TransportTcpStream::accept_client(stream, &security).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::debug!("client authentication failed: {error}");
-                    continue;
-                }
-            };
+            let stream =
+                match TransportTcpStream::accept(stream, &security, client_certificate_principal)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::debug!("client authentication failed: {error}");
+                        continue;
+                    }
+                };
             let node_id = node_id.clone();
             let swim_tx = swim_sender.clone();
             let raft = raft_tx.clone();
