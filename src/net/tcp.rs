@@ -9,10 +9,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use super::inner;
-use crate::security::{
-    NodeTransportSecurity, TransportIdentity, client_certificate_principal,
-    node_certificate_principal,
-};
+use crate::security::{CertificatePrincipal, NodeTransportSecurity, node_certificate_principal};
+
+const NODE_ADMISSION_EXPORTER_LABEL: &[u8] = b"EXPORTER-EastGuard-node-admission-v1";
+const NODE_ADMISSION_BINDING_BYTES: usize = 32;
 
 macro_rules! tcp_wrapper {
     ($name:ident) => {
@@ -45,25 +45,11 @@ tcp_wrapper!(OwnedWriteHalf);
 /// Node Certificate Principal. Admission later binds that stable principal to
 /// the process-specific `NodeId` carried by the transport handshake.
 pub struct AuthenticatedTcpStream {
-    peer_principal: String,
+    peer_principal: CertificatePrincipal,
     stream: TlsStream<TcpStream>,
 }
 
 impl AuthenticatedTcpStream {
-    pub async fn accept(stream: TcpStream, config: Arc<rustls::ServerConfig>) -> Result<Self> {
-        let stream = TlsAcceptor::from(config).accept(stream).await?;
-
-        Self::from_tls_stream(stream.into(), node_certificate_principal)
-    }
-
-    pub async fn accept_client(
-        stream: TcpStream,
-        config: Arc<rustls::ServerConfig>,
-    ) -> Result<Self> {
-        let stream = TlsAcceptor::from(config).accept(stream).await?;
-        Self::from_tls_stream(stream.into(), client_certificate_principal)
-    }
-
     pub async fn connect<A: inner::ToSocketAddrs>(
         addr: A,
         config: Arc<rustls::ClientConfig>,
@@ -80,7 +66,7 @@ impl AuthenticatedTcpStream {
 
     fn from_tls_stream(
         stream: TlsStream<TcpStream>,
-        read_principal: fn(&rustls::pki_types::CertificateDer<'_>) -> Result<String>,
+        read_principal: fn(&rustls::pki_types::CertificateDer<'_>) -> Result<CertificatePrincipal>,
     ) -> Result<Self> {
         let certificate = stream
             .get_ref()
@@ -95,8 +81,29 @@ impl AuthenticatedTcpStream {
         })
     }
 
-    pub fn peer_principal(&self) -> &str {
+    pub fn peer_principal(&self) -> &CertificatePrincipal {
         &self.peer_principal
+    }
+
+    /// Derives a value unique to this completed TLS session.
+    ///
+    /// Both peers derive the same bytes. Signing them binds a process-admission
+    /// proof to this connection, so a captured proof cannot be replayed.
+    fn admission_binding(&self) -> Result<[u8; NODE_ADMISSION_BINDING_BYTES]> {
+        let output = [0; NODE_ADMISSION_BINDING_BYTES];
+        match &self.stream {
+            TlsStream::Client(stream) => stream.get_ref().1.export_keying_material(
+                output,
+                NODE_ADMISSION_EXPORTER_LABEL,
+                None,
+            ),
+            TlsStream::Server(stream) => stream.get_ref().1.export_keying_material(
+                output,
+                NODE_ADMISSION_EXPORTER_LABEL,
+                None,
+            ),
+        }
+        .context("failed to derive node-admission TLS session binding")
     }
 
     fn into_split(
@@ -139,26 +146,17 @@ impl From<OwnedWriteHalf> for TransportWriteHalf {
 }
 
 impl TransportTcpStream {
-    pub async fn accept_node(stream: TcpStream, security: &NodeTransportSecurity) -> Result<Self> {
-        match security {
-            NodeTransportSecurity::Secure { server, .. } => {
-                AuthenticatedTcpStream::accept(stream, server.clone())
-                    .await
-                    .map(Box::new)
-                    .map(Self::Secure)
-            }
-            NodeTransportSecurity::TrustedDevelopment => Ok(Self::TrustedDevelopment(stream)),
-        }
-    }
-
-    pub async fn accept_client(
+    pub async fn accept(
         stream: TcpStream,
         security: &NodeTransportSecurity,
+        read_principal: fn(&rustls::pki_types::CertificateDer<'_>) -> Result<CertificatePrincipal>,
     ) -> Result<Self> {
         match security {
-            NodeTransportSecurity::Secure { server, .. } => {
-                AuthenticatedTcpStream::accept_client(stream, server.clone())
-                    .await
+            NodeTransportSecurity::Secure(security) => {
+                let stream = TlsAcceptor::from(security.server_config())
+                    .accept(stream)
+                    .await?;
+                AuthenticatedTcpStream::from_tls_stream(stream.into(), read_principal)
                     .map(Box::new)
                     .map(Self::Secure)
             }
@@ -171,8 +169,8 @@ impl TransportTcpStream {
         security: &NodeTransportSecurity,
     ) -> Result<Self> {
         match security {
-            NodeTransportSecurity::Secure { client, .. } => {
-                AuthenticatedTcpStream::connect(addr, client.clone())
+            NodeTransportSecurity::Secure(security) => {
+                AuthenticatedTcpStream::connect(addr, security.client_config())
                     .await
                     .map(Box::new)
                     .map(Self::Secure)
@@ -184,12 +182,19 @@ impl TransportTcpStream {
         }
     }
 
-    pub fn peer_identity(&self) -> TransportIdentity {
+    pub fn peer_principal(&self) -> Option<CertificatePrincipal> {
         match self {
-            Self::Secure(stream) => {
-                TransportIdentity::CertificatePrincipal(stream.peer_principal().into())
+            Self::Secure(stream) => Some(stream.peer_principal().clone()),
+            Self::TrustedDevelopment(_) => None,
+        }
+    }
+
+    pub(crate) fn admission_binding(&self) -> Result<[u8; NODE_ADMISSION_BINDING_BYTES]> {
+        match self {
+            Self::Secure(stream) => stream.admission_binding(),
+            Self::TrustedDevelopment(_) => {
+                anyhow::bail!("trusted-development connections have no TLS session binding")
             }
-            Self::TrustedDevelopment(_) => TransportIdentity::TrustedDevelopment,
         }
     }
 
@@ -417,6 +422,7 @@ impl TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::client_certificate_principal;
     use rcgen::string::Ia5String;
     use rcgen::{CertificateParams, KeyPair, SanType};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -473,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn mutual_tls_exposes_peer_principals_under_turmoil() -> turmoil::Result {
+    fn mutual_tls_shares_session_binding_under_turmoil() -> turmoil::Result {
         let (server_config, client_config) = tls_configs();
         let mut sim = Builder::new().build();
 
@@ -482,14 +488,18 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (stream, _) = listener.accept().await?;
-                let mut stream = AuthenticatedTcpStream::accept(stream, server_config)
-                    .await
-                    .unwrap();
-                assert_eq!(stream.peer_principal(), "broker-client");
+                let stream = TlsAcceptor::from(server_config).accept(stream).await?;
+                let mut stream = AuthenticatedTcpStream::from_tls_stream(
+                    stream.into(),
+                    node_certificate_principal,
+                )?;
+                assert_eq!(stream.peer_principal().as_ref(), "broker-client");
+                let session_binding = stream.admission_binding().unwrap();
                 let mut message = [0; 4];
                 stream.read_exact(&mut message).await?;
                 assert_eq!(&message, b"ping");
                 stream.write_all(b"pong").await?;
+                stream.write_all(&session_binding).await?;
                 Ok(())
             }
         });
@@ -499,11 +509,15 @@ mod tests {
                 AuthenticatedTcpStream::connect((turmoil::lookup("server"), 9000), client_config)
                     .await
                     .unwrap();
-            assert_eq!(stream.peer_principal(), "broker-server");
+            assert_eq!(stream.peer_principal().as_ref(), "broker-server");
+            let session_binding = stream.admission_binding().unwrap();
             stream.write_all(b"ping").await?;
             let mut message = [0; 4];
             stream.read_exact(&mut message).await?;
             assert_eq!(&message, b"pong");
+            let mut peer_session_binding = [0; NODE_ADMISSION_BINDING_BYTES];
+            stream.read_exact(&mut peer_session_binding).await?;
+            assert_eq!(peer_session_binding, session_binding);
             Ok(())
         });
 
@@ -543,10 +557,12 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (stream, _) = listener.accept().await?;
-                let stream = AuthenticatedTcpStream::accept_client(stream, server_config)
-                    .await
-                    .unwrap();
-                assert_eq!(stream.peer_principal(), "producer-a");
+                let stream = TlsAcceptor::from(server_config).accept(stream).await?;
+                let stream = AuthenticatedTcpStream::from_tls_stream(
+                    stream.into(),
+                    client_certificate_principal,
+                )?;
+                assert_eq!(stream.peer_principal().as_ref(), "producer-a");
                 Ok(())
             }
         });
@@ -555,7 +571,7 @@ mod tests {
                 AuthenticatedTcpStream::connect((turmoil::lookup("server"), 9000), client_config)
                     .await
                     .unwrap();
-            assert_eq!(stream.peer_principal(), "broker-server");
+            assert_eq!(stream.peer_principal().as_ref(), "broker-server");
             Ok(())
         });
 
