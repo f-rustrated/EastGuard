@@ -6,60 +6,65 @@ use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::AclResource;
-use crate::impl_from_variant;
+use crate::security::{AdmissionProof, CertificatePrincipal};
 
 /// The first frame on a cluster TCP connection.
 ///
-/// A Raft connection begins with its first Raft message, which already names
-/// its sender. ACL and admission lookup connections contain one read request.
-/// Later Raft frames are raw; lookup connections return one response and close.
+/// Secure Raft and ACL requests carry a process proof bound to their TLS
+/// session. The limited admission lookup is the only secure request allowed
+/// without that proof. Trusted-development connections carry a direct request.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(super) enum InitialClusterMessage {
+pub(crate) enum InitialClusterMessage {
+    AdmissionLookup(AdmissionRecordKey),
+    Request(ClusterRequest),
+    ProcessAdmission(AdmissionRequest),
+}
+
+/// Requests process admission and carries the first protected cluster request.
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub(crate) struct AdmissionRequest {
+    pub(crate) proof: AdmissionProof,
+    pub(crate) request: ClusterRequest,
+}
+
+/// Cluster requests that require current process admission in secure mode.
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub(crate) enum ClusterRequest {
     Raft(WireRaftMessage),
     AclSnapshot(AclSnapshotRequest),
-    AdmissionLookup(AdmissionLookupRequest),
 }
 
 /// One read of a committed ACL record from a shard host.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(super) struct AclSnapshotRequest {
-    pub(super) requester_node_id: NodeId,
-    pub(super) shard_group_id: ShardGroupId,
-    pub(super) resource: AclResource,
+pub(crate) struct AclSnapshotRequest {
+    pub(crate) requester_node_id: NodeId,
+    pub(crate) shard_group_id: ShardGroupId,
+    pub(crate) resource: AclResource,
 }
 
 /// The response to one ACL snapshot request on its dedicated connection.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(super) struct AclSnapshotResponse {
-    pub(super) snapshot: Option<AclRecord>,
+pub(crate) struct AclSnapshotResponse {
+    pub(crate) snapshot: Option<AclRecord>,
 }
 
-/// Limited bootstrap read of one admission record from its metadata shard.
+/// Identifies one admission record in its metadata shard.
 ///
-/// In secure mode TLS authenticates the caller's node certificate, but this
-/// request intentionally does not require process admission: admission is the
-/// record the caller is trying to resolve. It cannot carry Raft, ACL, or client
-/// data.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(super) struct AdmissionLookupRequest {
-    pub(super) shard_group_id: ShardGroupId,
-    pub(super) node_certificate_principal: Box<str>,
+/// The admission lookup actor uses the same value for routing, cache
+/// coalescing, and the limited wire request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
+pub(crate) struct AdmissionRecordKey {
+    pub(crate) shard_group_id: ShardGroupId,
+    pub(crate) node_certificate_principal: CertificatePrincipal,
 }
 
 /// Response to one limited admission lookup, after which the connection closes.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(super) struct AdmissionLookupResponse {
-    pub(super) admission: Option<AdmissionRecord>,
+pub(crate) struct AdmissionLookupResponse {
+    pub(crate) admission: Option<AdmissionRecord>,
 }
 
-impl_from_variant!(
-    InitialClusterMessage,
-    Raft(WireRaftMessage),
-    AclSnapshot(AclSnapshotRequest),
-    AdmissionLookup(AdmissionLookupRequest),
-);
-
-pub(super) fn encode_frame(value: &impl BorshSerialize) -> Result<Vec<u8>> {
+pub(crate) fn encode_frame(value: &impl BorshSerialize) -> Result<Vec<u8>> {
     let bytes = borsh::to_vec(value)?;
     let len = u32::try_from(bytes.len())?;
     let mut frame = Vec::with_capacity(std::mem::size_of::<u32>() + bytes.len());
