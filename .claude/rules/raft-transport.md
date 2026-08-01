@@ -28,9 +28,10 @@ Length-prefixed Borsh frames:
 
 1. **Secure initial message:** either `AdmissionLookup(AdmissionRecordKey)` or
    `ProcessAdmission(AdmissionRequest)`. The admission request contains the
-   dialer's process proof and one `ClusterRequest`: Raft or ACL snapshot.
-2. **Mutual admission:** the acceptor verifies the dialer, then replies with its
-   own `AdmissionProof`. Both proofs sign the same TLS exporter value and are
+   connecting node's process proof and one `ClusterRequest`: Raft or ACL
+   snapshot.
+2. **Mutual admission:** the acceptor verifies the connecting node, then replies
+   with its own `AdmissionProof`. Both proofs sign the same TLS exporter value and are
    checked against the peer's current admission record. The exporter lets both
    ends derive identical connection-specific bytes without sending those bytes;
    another TLS connection derives a different value.
