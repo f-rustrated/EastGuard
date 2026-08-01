@@ -266,7 +266,7 @@ async fn connect_peer(
 
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            security.connect_cluster(addr.cluster_addr()),
+            TransportTcpStream::connect_node(addr.cluster_addr(), security.node_transport()),
         )
         .await??;
 
