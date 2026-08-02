@@ -16,7 +16,7 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::net::{TransportTcpStream, TransportWriteHalf};
 use crate::security::{AdmissionProof, CertificatePrincipal};
 
-use super::protocol::{AdmissionRequest, ClusterRequest, InitialClusterMessage, encode_frame};
+use super::protocol::{ClusterRequest, InitialClusterMessage, encode_frame};
 use crate::security::SecurityHandle;
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -326,19 +326,22 @@ impl OutboundClusterConnection {
         security: &SecurityHandle,
         request: ClusterRequest,
     ) -> anyhow::Result<()> {
+        let admission_proof = match self.tls_peer.as_ref() {
+            Some((_, tls_session_binding)) => {
+                Some(security.create_admission_proof(tls_session_binding)?)
+            }
+            None => None,
+        };
+        self.writer
+            .write_all(&encode_frame(&InitialClusterMessage {
+                admission_proof,
+                request,
+            })?)
+            .await?;
+
         let Some((peer_principal, tls_session_binding)) = self.tls_peer.as_ref() else {
-            let initial = InitialClusterMessage::Request(request);
-            self.writer.write_all(&encode_frame(&initial)?).await?;
             return Ok(());
         };
-        let local_proof = security.create_admission_proof(tls_session_binding)?;
-        let process_admission = InitialClusterMessage::ProcessAdmission(AdmissionRequest {
-            proof: local_proof,
-            request,
-        });
-        self.writer
-            .write_all(&encode_frame(&process_admission)?)
-            .await?;
         let peer_admission = security.lookup_admission(peer_principal).await?;
         let peer_proof = self
             .reader

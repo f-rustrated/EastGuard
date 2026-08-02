@@ -26,10 +26,9 @@ cluster listener (TCP)
 
 Length-prefixed Borsh frames:
 
-1. **Secure initial message:** either `AdmissionLookup(AdmissionRecordKey)` or
-   `ProcessAdmission(AdmissionRequest)`. The admission request contains the
-   connecting node's process proof and one `ClusterRequest`: Raft or ACL
-   snapshot.
+1. **Initial message:** `InitialClusterMessage` carries one `ClusterRequest` and
+   an optional process-admission proof. Secure Raft and ACL requests include the
+   proof; the limited admission lookup omits it.
 2. **Mutual admission:** the acceptor verifies the connecting node, then replies
    with its own `AdmissionProof`. Both proofs sign the same TLS exporter value and are
    checked against the peer's current admission record. The exporter lets both
@@ -41,7 +40,7 @@ Length-prefixed Borsh frames:
    - An ACL snapshot request carries its requesting node, shard, and resource.
      Its response is one `AclSnapshotResponse`, then the connection closes.
 4. **Trusted-development initial message:** no cryptographic admission exchange;
-   `Request(ClusterRequest)` directly carries the Raft or ACL snapshot request.
+   the Raft or ACL request carries no admission proof.
 
 ## Invariants
 

@@ -6,30 +6,23 @@ use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::AclResource;
+
 use crate::security::{AdmissionProof, CertificatePrincipal};
 
 /// The first frame on a cluster TCP connection.
 ///
-/// Secure Raft and ACL requests carry a process proof bound to their TLS
-/// session. The limited admission lookup is the only secure request allowed
-/// without that proof. Trusted-development connections carry a direct request.
+/// Secure Raft and ACL requests include a process proof bound to their TLS
+/// session. Admission lookups and trusted-development requests omit it.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(crate) enum InitialClusterMessage {
-    AdmissionLookup(AdmissionRecordKey),
-    Request(ClusterRequest),
-    ProcessAdmission(AdmissionRequest),
-}
-
-/// Requests process admission and carries the first protected cluster request.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub(crate) struct AdmissionRequest {
-    pub(crate) proof: AdmissionProof,
+pub(crate) struct InitialClusterMessage {
+    pub(crate) admission_proof: Option<AdmissionProof>,
     pub(crate) request: ClusterRequest,
 }
 
-/// Cluster requests that require current process admission in secure mode.
+/// Requests accepted as the first frame on a cluster connection.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub(crate) enum ClusterRequest {
+    AdmissionLookup(AdmissionRecordKey),
     Raft(WireRaftMessage),
     AclSnapshot(AclSnapshotRequest),
 }
