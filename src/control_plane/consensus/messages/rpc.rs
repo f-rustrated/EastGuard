@@ -102,6 +102,6 @@ impl OutboundRaftPacket {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct WireRaftMessage {
     pub shard_group_id: ShardGroupId,
-    pub sender: NodeId,
+    pub peer_id: NodeId,
     pub rpc: RaftRpc,
 }

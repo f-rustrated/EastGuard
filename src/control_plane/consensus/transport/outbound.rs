@@ -120,7 +120,7 @@ impl RaftRpcDispatcher {
                 .or_default()
                 .push(WireRaftMessage {
                     shard_group_id: pkt.shard_group_id,
-                    sender: self.node_id.clone(),
+                    peer_id: self.node_id.clone(),
                     rpc: pkt.rpc,
                 });
         }
