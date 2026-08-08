@@ -150,11 +150,7 @@ pub(crate) enum ShardRouting {
 }
 
 /// A shard this node does not host, with an optional reachable member.
-///
-/// The shard ID lets internal callers validate cached records against the
-/// current owner even when the client-facing redirect has no usable address.
 pub(crate) struct RemoteShard {
-    pub(crate) group_id: ShardGroupId,
     pub(crate) member: Option<NodeAddressInfo>,
 }
 
@@ -239,8 +235,7 @@ impl SwimSender {
     }
 
     /// Route a key relative to `node_id`: `Local` if it hosts the key's shard
-    /// group, otherwise a redirect. A resolved remote shard retains its ID for
-    /// internal ACL refreshes; an unresolved ring has no remote shard yet.
+    /// group, otherwise a redirect. An unresolved ring has no remote shard yet.
     pub(crate) async fn resolve_shard_routing(
         &self,
         key: Vec<u8>,
@@ -253,10 +248,7 @@ impl SwimSender {
             return Ok(ShardRouting::Local(group));
         }
         let member = self.resolve_any(&group.replicas).await?;
-        Ok(ShardRouting::Redirect(Some(RemoteShard {
-            group_id: group.id,
-            member,
-        })))
+        Ok(ShardRouting::Redirect(Some(RemoteShard { member })))
     }
 
     pub(crate) async fn list_all_node_addresses(

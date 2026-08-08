@@ -31,7 +31,7 @@ impl ProcessSigningKey {
     }
 
     #[cfg(test)]
-    fn public_key(&self) -> Box<[u8]> {
+    pub(crate) fn public_key(&self) -> Box<[u8]> {
         self.0.public_key().as_ref().into()
     }
 

@@ -50,10 +50,12 @@ async fn run_node(name: &'static str, ordinal: u16) -> Result<(), Box<dyn std::e
         TICK_PERIOD_100_MS,
         Some(PROBE_INTERVAL_TICKS),
     );
+    let topology_reader = super::stub_topology_reader(&all);
     let security = SecurityActor::spawn(
         node_id.clone(),
         swim_tx.clone(),
         raft_tx.clone(),
+        topology_reader.clone(),
         NodeTransportSecurity::TrustedDevelopment,
     );
     tokio::spawn(RaftTransportActor::run(
@@ -78,7 +80,7 @@ async fn run_node(name: &'static str, ordinal: u16) -> Result<(), Box<dyn std::e
         transport_tx,
         swim_tx,
         data_tx,
-        super::stub_topology_reader(&all),
+        topology_reader,
         2,
     );
     raft_tx

@@ -159,7 +159,7 @@ mod tests {
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
-            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+            process_public_key: vec![7; 32].into_boxed_slice(),
         });
         round_trip(&AclRecord {
             resource: AclResource::TopicData(TopicId(42)),
@@ -182,7 +182,7 @@ mod tests {
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
-            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+            process_public_key: vec![7; 32].into_boxed_slice(),
         };
         security.admissions.insert(
             admission.node_certificate_principal.clone(),

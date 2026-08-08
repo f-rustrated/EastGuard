@@ -93,6 +93,10 @@ pub struct Topology {
 pub(crate) struct TopologyReader(Arc<ArcSwap<Topology>>);
 
 impl TopologyReader {
+    pub(crate) fn shard_group_for(&self, key: &[u8]) -> Option<ShardGroup> {
+        self.0.load().shard_group_for(key).cloned()
+    }
+
     pub(crate) fn live_nodes(&self) -> Vec<NodeId> {
         self.0.load().live_nodes()
     }

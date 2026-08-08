@@ -10,6 +10,8 @@ pub enum ProposalError {
     ShardNotFound,
     #[error("Shard group removed")]
     ShardGroupRemoved,
+    #[error("Proposal exceeds the Raft transport entry size limit")]
+    EntryTooLarge,
 }
 
 #[derive(Debug)]

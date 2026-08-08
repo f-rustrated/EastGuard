@@ -79,17 +79,19 @@ pub struct GetConsumerGroupAssignment {
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
 }
 
-/// Returns this node's committed ACL state for a shard it hosts.
+/// Returns committed ACL state after a quorum-backed read barrier on the
+/// shard leader.
 ///
 /// The caller has already routed the resource to this shard. A missing ACL is
 /// returned as an empty record so it can be cached as a bounded denial.
 pub struct GetAclSnapshot {
     pub(crate) shard_group_id: ShardGroupId,
     pub(crate) resource: AclResource,
-    pub(crate) reply: oneshot::Sender<Option<AclRecord>>,
+    pub(crate) reply: oneshot::Sender<Result<AclRecord, ServerError>>,
 }
 
-/// Returns one admission record from a metadata shard hosted by this node.
+/// Returns one admission record after a quorum-backed read barrier on the
+/// metadata shard leader.
 pub struct GetAdmission {
     pub(crate) shard_group_id: ShardGroupId,
     pub(crate) node_certificate_principal: CertificatePrincipal,
@@ -142,7 +144,7 @@ pub(crate) enum DeferredReply {
     GetTopics(DeferredResponse<Box<[String]>>),
     GetTopicStats(DeferredResponse<Box<[TopicStats]>>),
     GetTopicMetadata(DeferredResponse<Option<TopicMeta>>),
-    GetAclSnapshot(DeferredResponse<Option<AclRecord>>),
+    GetAclSnapshot(DeferredResponse<Result<AclRecord, ServerError>>),
     GetAdmission(DeferredResponse<Result<Option<AdmissionRecord>, ServerError>>),
     GetConsumerGroupAssignment(DeferredResponse<Option<ConsumerGroupAssignment>>),
 }

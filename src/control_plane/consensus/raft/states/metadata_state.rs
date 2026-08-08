@@ -206,13 +206,17 @@ impl MetadataState {
             .collect()
     }
 
-    pub(crate) fn expipred_segments(&self, now: u64) -> Vec<(TopicId, RangeId, Box<[SegmentId]>)> {
+    pub(crate) fn expired_segments(
+        &self,
+        now: u64,
+        max_segments_per_range: usize,
+    ) -> Vec<(TopicId, RangeId, Box<[SegmentId]>)> {
         self.topics
             .values()
             .flat_map(|topic| {
                 let topic_id = topic.id;
                 topic
-                    .expired_segments(now)
+                    .expired_segments(now, max_segments_per_range)
                     .into_iter()
                     .map(move |(range_id, ids)| (topic_id, range_id, ids))
             })
@@ -651,7 +655,7 @@ mod tests {
             revision: 3,
             epoch: 2,
             node_id: NodeId::new("broker-a::process-2"),
-            process_public_key: vec![1, 2, 3].into_boxed_slice(),
+            process_public_key: vec![7; 32].into_boxed_slice(),
         };
         let acl = AclRecord {
             resource: AclResource::TopicData(TopicId(42)),
@@ -1020,11 +1024,30 @@ mod tests {
 
         // now such that segs 0,1 are past the window but seg 2 isn't.
         let now = 200 + 3_600_000 + 1;
-        let prefixes = topic.expired_segments(now);
+        let prefixes = topic.expired_segments(now, usize::MAX);
         assert_eq!(prefixes.len(), 1);
         let (range_id, ids) = &prefixes[0];
         assert_eq!(*range_id, RangeId(0));
         assert_eq!(ids.as_ref(), &[SegmentId(0), SegmentId(1)]);
+    }
+
+    #[test]
+    fn expired_prefix_limit_drains_in_oldest_first_chunks() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let topic_id = topic_with_three_sealed(&mut sm);
+
+        let first = sm
+            .get_topic(&topic_id)
+            .unwrap()
+            .expired_segments(u64::MAX, 2);
+        assert_eq!(first[0].1.as_ref(), &[SegmentId(0), SegmentId(1)]);
+
+        delete_segments(&mut sm, topic_id, &[0, 1]).unwrap();
+        let second = sm
+            .get_topic(&topic_id)
+            .unwrap()
+            .expired_segments(u64::MAX, 2);
+        assert_eq!(second[0].1.as_ref(), &[SegmentId(2)]);
     }
 
     #[test]
@@ -1053,7 +1076,7 @@ mod tests {
         assert!(
             sm.get_topic(&t)
                 .unwrap()
-                .expired_segments(u64::MAX)
+                .expired_segments(u64::MAX, usize::MAX)
                 .is_empty()
         );
     }

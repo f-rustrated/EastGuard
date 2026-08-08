@@ -280,28 +280,29 @@ impl MutlRaftSender {
         recv.await.unwrap_or_default()
     }
 
-    /// Reads the committed ACL snapshot only when this node hosts the selected
-    /// metadata shard. A missing ACL is an empty, cacheable denial; `None`
-    /// means the shard is no longer local or the actor stopped.
+    /// Reads the committed ACL snapshot from the selected metadata shard's
+    /// leader. A missing ACL is an empty, cacheable denial; routing and actor
+    /// failures remain observable errors and must not be cached.
     pub(crate) async fn get_acl_snapshot(
         &self,
         shard_group_id: ShardGroupId,
         resource: AclResource,
-    ) -> Option<AclRecord> {
+    ) -> Result<AclRecord, ServerError> {
         let (reply, recv) = tokio::sync::oneshot::channel();
-        let _ = self
-            .send(GetAclSnapshot {
-                shard_group_id,
-                resource,
-                reply,
-            })
-            .await;
-        recv.await.ok().flatten()
+        self.send(GetAclSnapshot {
+            shard_group_id,
+            resource,
+            reply,
+        })
+        .await
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+        recv.await
+            .map_err(|error| ServerError::Internal(error.to_string()))?
     }
 
-    /// Reads the current admission record only when this node hosts the
-    /// selected metadata shard. Absence is an authoritative `None`; routing or
-    /// actor failures remain observable errors and must not be cached.
+    /// Reads the current admission record from the selected metadata shard's
+    /// leader. Absence is an authoritative `None`; routing or actor failures
+    /// remain observable errors and must not be cached.
     pub(crate) async fn get_admission(
         &self,
         shard_group_id: ShardGroupId,

@@ -115,10 +115,14 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
                 );
+                let all_nodes: Vec<&str> =
+                    std::iter::once(name).chain(peers.iter().copied()).collect();
+                let topology_reader = super::stub_topology_reader(&all_nodes);
                 let security = SecurityActor::spawn(
                     node_id.clone(),
                     swim_tx.clone(),
                     raft_tx.clone(),
+                    topology_reader.clone(),
                     NodeTransportSecurity::TrustedDevelopment,
                 );
                 tokio::spawn(RaftTransportActor::run(
@@ -138,9 +142,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     h.finish()
                 };
                 let (data_tx, _) = tokio::sync::mpsc::channel(1);
-                let all_nodes: Vec<&str> =
-                    std::iter::once(name).chain(peers.iter().copied()).collect();
-                let topology_reader = super::stub_topology_reader(&all_nodes);
                 MultiRaftActor::spawn(
                     ticker_tx.clone(),
                     raft_mailbox,

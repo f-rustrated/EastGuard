@@ -69,10 +69,16 @@ async fn start_raft_node(
         Some(PROBE_INTERVAL_TICKS),
     );
 
+    let all_nodes: Vec<&str> = std::iter::once(node_name)
+        .chain(peer_names.iter().copied())
+        .collect();
+    let (topology_pub, topology_reader) = super::stub_topology_channel(&all_nodes);
+
     let security = SecurityActor::spawn(
         node_id.clone(),
         swim_tx.clone(),
         raft_tx.clone(),
+        topology_reader.clone(),
         NodeTransportSecurity::TrustedDevelopment,
     );
     tokio::spawn(RaftTransportActor::run(
@@ -90,10 +96,6 @@ async fn start_raft_node(
         h.finish()
     };
     let (data_tx, _) = tokio::sync::mpsc::channel(1);
-    let all_nodes: Vec<&str> = std::iter::once(node_name)
-        .chain(peer_names.iter().copied())
-        .collect();
-    let (topology_pub, topology_reader) = super::stub_topology_channel(&all_nodes);
 
     MultiRaftActor::spawn(
         ticker_tx.clone(),
