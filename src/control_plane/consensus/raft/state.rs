@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::control_plane::consensus::messages::MAX_APPEND_ENTRIES_BATCH_BYTES;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::{EvictionError, ProposalError};
@@ -39,6 +40,7 @@ use std::collections::{BTreeSet, HashSet};
 /// legitimate owner just because our local snapshot was briefly incorrect
 /// during a rebalance.
 pub(crate) const RING_STABLE_OBSERVATIONS: u32 = 3;
+const MAX_RETENTION_DELETE_SEGMENTS_PER_PROPOSAL: usize = 64 * 1024;
 
 // Peer tracking (LEADER-ONLY)
 // - next_index: Index of the next log entry to send to this peer.
@@ -598,7 +600,9 @@ impl Raft {
     /// leader-only so cross-node skew can't diverge replicas), and propose
     /// `DeleteSegments`. Topics with no retention policy contribute nothing.
     fn reconcile_retention_deletes(&mut self, now: u64) -> bool {
-        let targets = self.metadata.expipred_segments(now);
+        let targets = self
+            .metadata
+            .expired_segments(now, MAX_RETENTION_DELETE_SEGMENTS_PER_PROPOSAL);
 
         let mut changed = false;
         for (topic_id, range_id, segment_ids) in targets {
@@ -731,6 +735,10 @@ impl Raft {
 
     pub fn current_leader(&self) -> Option<&NodeId> {
         self.consensus.current_leader()
+    }
+
+    pub(crate) fn current_term(&self) -> u64 {
+        self.consensus.current_term()
     }
 
     pub fn is_leader(&self) -> bool {
@@ -1000,7 +1008,13 @@ impl Raft {
         // preceding entries from earlier terms can be committed.
         // Without this, old-term entries remain in limbo until a real
         // client proposal arrives.
-        self.add_new_entry(RaftCommand::Noop);
+
+        let entry = LogEntry {
+            term: self.consensus.current_term(),
+            index: self.log_last_index() + 1,
+            command: RaftCommand::Noop,
+        };
+        self.consensus.append_log(entry);
 
         // Send AppendEntries (with the Noop) to all peers.
         self.send_heartbeats();
@@ -1201,7 +1215,9 @@ impl Raft {
 
         let prev_log_index = peer_state.next_index.saturating_sub(1);
         let prev_log_term = self.consensus.log_term_at(prev_log_index);
-        let entries = self.consensus.log_entries_from(peer_state.next_index);
+        let entries = self
+            .consensus
+            .log_entries_from(peer_state.next_index, MAX_APPEND_ENTRIES_BATCH_BYTES);
 
         self.raise(OutboundRaftPacket::new(
             self.shard_group_id,
@@ -1451,8 +1467,15 @@ impl Raft {
                     self.maybe_promote_learner(&node_id);
                 }
             } else {
-                // Decrement next_index and retry.
+                // Decrement next_index
                 peer_state.next_index = peer_state.next_index.saturating_sub(1).max(1);
+            }
+
+            if self
+                .consensus
+                .peer_state(&node_id)
+                .is_some_and(|state| state.next_index <= self.log_last_index())
+            {
                 self.send_append_entries(node_id);
             }
         }
@@ -1618,15 +1641,6 @@ impl Raft {
         }
     }
 
-    fn add_new_entry(&mut self, command: RaftCommand) {
-        let entry = LogEntry {
-            term: self.consensus.current_term(),
-            index: self.log_last_index() + 1,
-            command,
-        };
-        self.consensus.append_log(entry);
-    }
-
     /// Propose a command to the Raft log. Only the leader can accept proposals.
     /// In the DS-RSM context, the flow would be as follows:
     //
@@ -1645,7 +1659,16 @@ impl Raft {
             ));
         }
 
-        self.add_new_entry(command);
+        let entry = LogEntry {
+            term: self.consensus.current_term(),
+            index: self.log_last_index() + 1,
+            command,
+        };
+        let entry_bytes = borsh::object_length(&entry).unwrap_or(usize::MAX);
+        if std::mem::size_of::<u32>().saturating_add(entry_bytes) > MAX_APPEND_ENTRIES_BATCH_BYTES {
+            return Err(ProposalError::EntryTooLarge);
+        }
+        self.consensus.append_log(entry);
         let index = self.log_last_index();
 
         // Immediately replicate to all peers.
@@ -1945,10 +1968,6 @@ mod tests {
         pub(crate) fn simulate_flush(&mut self) {
             self.advance_stabled_index(self.log_last_index());
             self.apply_committed_entries();
-        }
-
-        pub(crate) fn current_term(&self) -> u64 {
-            self.consensus.current_term()
         }
 
         pub(crate) fn voted_for(&self) -> Option<NodeId> {
@@ -2454,6 +2473,112 @@ mod tests {
             assert_eq!(ae.term, 1);
             assert!(ae.entries.is_empty(), "heartbeat after ack should be empty");
         }
+    }
+
+    #[test]
+    fn lagging_follower_catches_up_in_byte_bounded_batches() {
+        use crate::control_plane::metadata::command::GrantAcl;
+
+        let mut raft = three_node_raft("node-1");
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+        raft.handle_rpc(
+            node("node-2"),
+            RequestVoteResponse {
+                term: 1,
+                node_id: node("node-2"),
+                vote_granted: true,
+            },
+        );
+        drain(&mut raft);
+
+        let principal = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES / 2);
+        for topic_id in [1, 2] {
+            raft.propose(RaftCommand::Metadata(
+                GrantAcl {
+                    resource: AclResource::TopicData(TopicId(topic_id)),
+                    principal: principal.clone(),
+                }
+                .into(),
+            ))
+            .unwrap();
+        }
+        drain(&mut raft);
+
+        raft.handle_timeout(RaftTimeoutCallback::RpcTimeout {
+            shard_group_id: TEST_SHARD,
+        });
+        let first_round = packets(&mut raft);
+        let first_batch = first_round
+            .iter()
+            .find(|packet| packet.target == node("node-2"))
+            .and_then(|packet| match &packet.rpc {
+                RaftRpc::AppendEntries(append) => Some(append),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            first_batch
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            borsh::object_length(&first_batch.entries).unwrap() <= MAX_APPEND_ENTRIES_BATCH_BYTES
+        );
+
+        raft.handle_rpc(
+            node("node-2"),
+            AppendEntriesResponse {
+                term: 1,
+                node_id: node("node-2"),
+                success: true,
+                last_log_index: 2,
+            },
+        );
+        let second_round = packets(&mut raft);
+        let second_batch = second_round
+            .iter()
+            .find(|packet| packet.target == node("node-2"))
+            .and_then(|packet| match &packet.rpc {
+                RaftRpc::AppendEntries(append) => Some(append),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            second_batch
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn proposal_rejects_an_entry_larger_than_a_transport_batch() {
+        use crate::control_plane::metadata::command::GrantAcl;
+
+        let mut raft = three_node_raft_as_leader("node-1");
+        let before = raft.log_last_index();
+        let principal = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES);
+
+        let result = raft.propose(RaftCommand::Metadata(
+            GrantAcl {
+                resource: AclResource::Cluster,
+                principal,
+            }
+            .into(),
+        ));
+
+        assert_eq!(result, Err(ProposalError::EntryTooLarge));
+        assert_eq!(raft.log_last_index(), before);
+        assert!(packets(&mut raft).is_empty());
     }
 
     #[test]

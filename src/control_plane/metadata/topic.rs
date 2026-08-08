@@ -373,14 +373,19 @@ impl TopicMeta {
     /// Retention (D7): per-range oldest-first prefixes of sealed segments expired
     /// under this topic's policy as of `now`. Empty when the topic has no retention
     /// set (`retention_ms = None`, the default — keep everything).
-    pub(crate) fn expired_segments(&self, now: u64) -> Vec<(RangeId, Box<[SegmentId]>)> {
+    pub(crate) fn expired_segments(
+        &self,
+        now: u64,
+        max_segments_per_range: usize,
+    ) -> Vec<(RangeId, Box<[SegmentId]>)> {
         let Some(retention_ms) = self.storage_policy.retention_ms else {
             return Vec::new();
         };
+
         self.ranges
             .values()
             .filter_map(|range| {
-                let ids = range.expired_sealed_prefix(now, retention_ms);
+                let ids = range.expired_sealed_prefix(now, retention_ms, max_segments_per_range);
                 (!ids.is_empty()).then(|| (range.range_id, ids.into_boxed_slice()))
             })
             .collect()
