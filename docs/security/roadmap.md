@@ -160,18 +160,20 @@ TLS value    ──► proof is valid only on this connection
 
 The admission record therefore stores a public key for one process start. It is
 approved and committed before the connection. The broker sends a signature, not
-a replacement key. Both sides prove their keys because Raft traffic is
-bidirectional.
+a replacement key. Both sides prove their keys before the request frame because
+Raft traffic is bidirectional; combining the first request with the initiator's
+proof would expose that request before the acceptor proves its own admission.
 
 ```
 Connecting broker                         Accepting broker
        │                                         │
        │◄────────────── mTLS ───────────────────►│
        │ derive the same fresh TLS session value │
-       │── process proof + Raft / ACL ──────────►│
+       │──────────── process proof ─────────────►│
        │                                         │ verify current admission
        │◄──────────── process proof ─────────────│
        │ verify current admission                │
+       │──────────── Raft / ACL ────────────────►│
        │◄──────── admitted connection ──────────►│
 ```
 
