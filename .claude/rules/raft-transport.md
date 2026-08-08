@@ -1,8 +1,8 @@
-# Raft Transport (Invariants)
+# Raft Transport (Rules)
 
 `RaftTransportActor` — async TCP transport for Raft RPCs. It manages persistent
 bidirectional Raft connections between nodes. Each connection splits into a
-reader task and a writer half held in the per-node `writers` map. 
+reader task and a writer half held together in the per-node `connections` map.
 The same authenticated cluster listener also serves a one-shot ACL snapshot read used to
 refresh a broker's local authorization cache and a limited admission-record read used to authenticate a connecting process.
 
@@ -14,35 +14,37 @@ Separate from SWIM's UDP transport. Raft uses TCP for reliable, ordered delivery
 cluster listener (TCP)
         │
         ├── limited admission read ──► security actor → Raft → reply → close
-        │
-        └── request with process proof
-              │
-              ├── both sides verify a TLS-session-bound process proof
-              ├── Raft ──► persistent reader + one writer per peer
-              └── ACL ───► security actor → Raft → reply → close
+        └── process proof ──► peer process proof ──► request
+                                      │
+                                      ├── Raft ──► one connection slot per peer
+                                      └── ACL ───► security actor → Raft → reply → close
 ```
 
 ## Wire Protocol
 
 Length-prefixed Borsh frames:
 
-1. **Initial message:** `InitialClusterMessage` carries one `ClusterRequest` and
-   an optional process-admission proof. Secure Raft and ACL requests include the
-   proof; the limited admission lookup omits it.
-2. **Mutual admission:** the acceptor verifies the connecting node, then replies
-   with its own `AdmissionProof`. Both proofs sign the same TLS exporter value and are
-   checked against the peer's current admission record. The exporter lets both
-   ends derive identical connection-specific bytes without sending those bytes;
-   another TLS connection derives a different value.
+1. **Handshake:** `ClusterHandshake` carries exactly one of:
+   - `Authenticate`, containing only the initiator's process proof;
+   - `AdmissionLookup`, containing one certificate principal; or
+   - `TrustedRequest`, containing a request only in trusted-development mode.
+2. **Mutual admission:** on a secure request, the acceptor verifies the
+   initiator and replies with its own `AdmissionProof`. The initiator verifies
+   that proof before sending any `ClusterRequest`. Both proofs sign the same TLS
+   exporter value and are checked against the peer's current admission record.
+   The exporter lets both ends derive identical connection-specific bytes
+   without sending those bytes; another TLS connection derives a different
+   value.
 3. **After mutual admission:**
    - The first Raft message carries its sender. Later frames are raw
      `WireRaftMessage` values until close. Each carries `shard_group_id`.
-   - An ACL snapshot request carries its requesting node, shard, and resource.
-     Its response is one `AclSnapshotResponse`, then the connection closes.
-4. **Trusted-development initial message:** no cryptographic admission exchange;
-   the Raft or ACL request carries no admission proof.
+   - An ACL snapshot request carries only its resource. The accepting broker
+     derives the current shard locally, serves it only when that shard is local,
+     and returns one `AclSnapshotResponse` before closing.
+4. **Trusted-development request:** no cryptographic admission exchange; the
+   first request is carried directly inside `TrustedRequest`.
 
-## Invariants
+## Rules
 
 1. **Secure connection identity comes from mTLS plus mutual process admission.**
    TLS supplies each stable Node Certificate Principal. A signature over the TLS
@@ -52,9 +54,16 @@ Length-prefixed Borsh frames:
    must equal its admitted `NodeId`. The first Raft sender then keys the writer slot
    and detects the simultaneous-connect race.
 
-2. **At most one writer per peer.** `writers` is keyed by `NodeId`. Coexisting writers would split messages to the same peer across two TCP connections; per-connection ordering would let later messages overtake earlier ones in unpredictable patterns, causing the leader to chase its own retries.
+2. **At most one live connection slot per peer.** `connections` is keyed by
+   `NodeId` and owns the matching reader task and writer half. Replacing or
+   removing a slot closes both halves. A reader-close event removes only its
+   own generation, so an old reader cannot tear down its replacement.
 
-3. **Lower NodeId wins on simultaneous connect.** When both sides connect concurrently, the acceptor drops the incoming connection if a writer for the peer already exists AND `peer_id > self.node_id`. Without this rule, both sides retain both connections (each thinks it won), violating invariant 2.
+3. **Lower NodeId wins on simultaneous connect.** When both sides connect
+   concurrently, the acceptor drops the incoming connection if a locally
+   initiated connection for the peer already exists AND
+   `peer_id > self.node_id`. Without this rule, both sides retain both
+   connections (each thinks it won), violating rule 2.
 
 4. **Address resolution is always live.** Every connect attempt queries SWIM for the peer's current address; the transport keeps no local address cache. A stale local cache would connect to the wrong host after a peer moves or restarts on a different address.
 
@@ -72,21 +81,30 @@ connection. The transport routes by `shard_group_id` and passes the authenticate
 peer onward, but the RPC remains opaque. Voter, learner, leader, term, and log
 checks belong to the target Raft state machine.
 
+8. **Admission leases bound persistent traffic.** A successful admission lookup
+   carries the original cache deadline. Reader dispatch and writer operations
+   stop no later than that deadline, forcing a new quorum-backed admission read
+   before traffic can resume. A handshake never starts a new 60-second validity
+   window.
+
 ## Limited Admission Lookup Rule
 
 Admission records are sharded, so the acceptor may need another broker to read
 the record required for its proof check. Requiring process admission for that
-read would recurse. `AdmissionLookup(AdmissionRecordKey)` is therefore accepted
-after mTLS but before process admission. It can read one named admission record
-from one shard, returns one `AdmissionLookupResponse`, and closes. It cannot
-carry Raft, ACL, client, or admission-write traffic.
+read would recurse. `AdmissionLookup` is therefore accepted after mTLS but
+before process admission. It carries one certificate principal; the accepting
+broker derives the current shard and serves the read only when that shard is
+local and its Raft instance proves current leadership with a quorum-backed read
+barrier. The endpoint returns one `AdmissionLookupResponse` and closes. It
+cannot carry Raft, ACL, client, or admission-write traffic.
 
 ## ACL Snapshot Rule
 
 An ACL snapshot request is not a Raft RPC and never enters a Raft state machine.
 In secure mode it is served only after the requester completes process
-admission. It asks the local multi-Raft actor for the selected shard's committed
-ACL record through the broker security actor, returns that record on the same
-connection, then closes. It carries no client data request and cannot proxy one.
+admission. The accepting broker derives the selected shard from the resource;
+the broker security actor asks the local multi-Raft leader for a quorum-backed
+ACL record, returns that record on the same connection, then closes. It carries
+no client data request and cannot proxy one.
 A connection admitted for Raft carries only raw Raft frames after its first
 message; an invalid frame closes the connection.
