@@ -245,10 +245,10 @@ impl ClientController {
         name: String,
         storage_policy: StoragePolicy,
     ) -> Result<ClientSuccess, ServerError> {
-        let group = self.route_local(name.as_bytes().to_vec()).await?;
         // A new topic has no stable ID yet, so its creator needs the cluster-wide
         // grant. Once created, topic-admin/{topic-id} governs its metadata.
         self.authorize_acl_resource(AclResource::Cluster).await?;
+        let group = self.route_local(name.as_bytes().to_vec()).await?;
 
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -331,6 +331,11 @@ impl ClientController {
         let leader = match err {
             ProposalError::NotLeader(leader) => leader,
             ProposalError::ShardNotFound | ProposalError::ShardGroupRemoved => None,
+            ProposalError::EntryTooLarge => {
+                return Err(ServerError::Internal(
+                    "metadata proposal exceeds the Raft transport limit".into(),
+                ));
+            }
         };
 
         let leader_addr = self.resolve_id_to_addr(leader).await;
@@ -714,8 +719,10 @@ mod tests {
     use crate::control_plane::consensus::raft::states::security::AclRecord;
     use crate::control_plane::consensus::transport::RaftTransportActor;
     use crate::control_plane::membership::actor::SwimActor;
+    use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
     use crate::control_plane::membership::{
-        QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
+        QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, Topology,
+        TopologyConfig, TopologyReader,
     };
     use crate::control_plane::metadata::consumer_group::GenerationId;
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
@@ -795,16 +802,30 @@ mod tests {
         DataPlaneSender(tx)
     }
 
+    fn test_topology_reader(nodes: impl IntoIterator<Item = NodeId>) -> TopologyReader {
+        Topology::new(
+            nodes,
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 1,
+            },
+        )
+        .channel()
+        .1
+    }
+
     fn trusted_controller(
         node_id: NodeId,
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
+        let topology = test_topology_reader([node_id.clone()]);
         let security = SecurityActor::spawn(
             node_id.clone(),
             swim_sender.clone(),
             raft_sender.clone(),
+            topology,
             NodeTransportSecurity::TrustedDevelopment,
         );
         ClientController::new(
@@ -823,10 +844,28 @@ mod tests {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
     ) -> ClientController {
+        let topology = test_topology_reader([node_id.clone()]);
+        authenticated_controller_with_topology(
+            principal,
+            node_id,
+            swim_sender,
+            raft_sender,
+            topology,
+        )
+    }
+
+    fn authenticated_controller_with_topology(
+        principal: &str,
+        node_id: NodeId,
+        swim_sender: SwimSender,
+        raft_sender: MutlRaftSender,
+        topology: TopologyReader,
+    ) -> ClientController {
         let security = SecurityActor::spawn(
             node_id.clone(),
             swim_sender.clone(),
             raft_sender.clone(),
+            topology,
             NodeTransportSecurity::TrustedDevelopment,
         );
         ClientController::new(
@@ -889,11 +928,10 @@ mod tests {
         });
         let raft = raft_sender_with(|cmd| {
             if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
-                assert_eq!(query.shard_group_id, ShardGroupId(42));
                 assert_eq!(query.resource, AclResource::TopicData(TopicId(7)));
                 let _ = query
                     .reply
-                    .send(Some(acl_snapshot(query.resource, &["orders-service"])));
+                    .send(Ok(acl_snapshot(query.resource, &["orders-service"])));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
@@ -921,7 +959,7 @@ mod tests {
                 observed_query_count.fetch_add(1, Ordering::Relaxed);
                 let _ = query
                     .reply
-                    .send(Some(acl_snapshot(query.resource, &["orders-service"])));
+                    .send(Ok(acl_snapshot(query.resource, &["orders-service"])));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
@@ -953,7 +991,7 @@ mod tests {
             }
             MultiRaftActorCommand::GetAclSnapshot(query) => {
                 assert_eq!(query.resource, AclResource::TopicAdmin(TopicId(1)));
-                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
+                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -975,7 +1013,10 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_scoped_apis_require_cluster_acl() {
-        let group = test_shard_group();
+        let group = ShardGroup {
+            id: ShardGroupId(42),
+            replicas: Replicas::new(vec![node_id("other")]),
+        };
         let swim = swim_sender_with(move |cmd| {
             if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
                 let _ = reply.send(Some(group.clone()));
@@ -986,7 +1027,7 @@ mod tests {
         let raft = raft_sender_with(move |cmd| match cmd {
             MultiRaftActorCommand::GetAclSnapshot(query) => {
                 assert_eq!(query.resource, AclResource::Cluster);
-                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
+                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -1039,7 +1080,7 @@ mod tests {
                         group_id: "billing".to_string(),
                     })
                 );
-                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
+                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
             }
         });
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
@@ -1083,7 +1124,7 @@ mod tests {
                         group_id: "billing".to_string(),
                     })
                 );
-                let _ = query.reply.send(Some(acl_snapshot(query.resource, &[])));
+                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -1120,11 +1161,13 @@ mod tests {
             }
             _ => {}
         });
-        let controller = authenticated_controller(
+        let topology = test_topology_reader([node_id("other")]);
+        let controller = authenticated_controller_with_topology(
             "orders-service",
             node_id("self"),
             swim,
             raft_sender_with(|_| panic!("remote ACL shard must not be queried locally")),
+            topology,
         );
 
         assert_eq!(
@@ -1140,6 +1183,24 @@ mod tests {
         let resource = AclResource::TopicData(TopicId(7));
         let snapshot = acl_snapshot(resource.clone(), &["orders-service"]);
         let response_received = Arc::new(Notify::new());
+        let mut topology = Topology::new(
+            [node_id("owner"), node_id("requester")],
+            TopologyConfig {
+                vnodes_per_pnode: 4,
+                replication_factor: 2,
+            },
+        );
+        let remote_group_id = topology
+            .shard_group_for(&resource.routing_key())
+            .expect("two-node test topology must resolve every key")
+            .id;
+        topology.update_shard_leader(&ShardLeaderInfo {
+            shard_group_id: remote_group_id,
+            leader_node_id: node_id("owner"),
+            leader_addr: NodeAddress::test(addr(9000), addr(9001)),
+            term: 1,
+        });
+        let remote_topology = topology.channel().1;
         let mut sim = Builder::new()
             .simulation_duration(Duration::from_secs(5))
             .build();
@@ -1147,10 +1208,12 @@ mod tests {
         let owner_snapshot = snapshot.clone();
         let owner_resource = resource.clone();
         let owner_response_received = response_received.clone();
+        let owner_topology = remote_topology.clone();
         sim.host("owner", move || {
             let expected_snapshot = owner_snapshot.clone();
             let expected_resource = owner_resource.clone();
             let owner_completion = owner_response_received.clone();
+            let owner_topology_reader = owner_topology.clone();
             async move {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
@@ -1160,6 +1223,7 @@ mod tests {
                     node_id("owner"),
                     swim_tx.clone(),
                     raft_tx.clone(),
+                    owner_topology_reader,
                     NodeTransportSecurity::TrustedDevelopment,
                 );
                 tokio::spawn(RaftTransportActor::run(
@@ -1175,42 +1239,38 @@ mod tests {
                 else {
                     panic!("expected remote ACL snapshot query");
                 };
-                assert_eq!(query.shard_group_id, ShardGroupId(42));
+                assert_eq!(query.shard_group_id, remote_group_id);
                 assert_eq!(query.resource, expected_resource);
-                let _ = query.reply.send(Some(expected_snapshot));
+                let _ = query.reply.send(Ok(expected_snapshot));
                 owner_completion.notified().await;
                 Ok(())
             }
         });
 
         let requester_resource = resource.clone();
+        let requester_topology = remote_topology.clone();
         sim.host("requester", move || {
             let requested_resource = requester_resource.clone();
             let requester_completion = response_received.clone();
+            let requester_topology_reader = requester_topology.clone();
             async move {
                 let owner_addr = turmoil::lookup("owner");
-                let group = ShardGroup {
-                    id: ShardGroupId(42),
-                    replicas: Replicas::new(vec![node_id("owner")]),
-                };
                 let owner = NodeAddress::test(
                     SocketAddr::new(owner_addr, 9000),
                     SocketAddr::new(owner_addr, 9001),
                 );
-                let swim = swim_sender_with(move |cmd| match cmd {
-                    SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
-                        let _ = reply.send(Some(group.clone()));
-                    }
-                    SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) => {
+                let swim = swim_sender_with(move |cmd| {
+                    if let SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) = cmd
+                    {
                         let _ = reply.send(Some(owner));
                     }
-                    _ => {}
                 });
-                let controller = authenticated_controller(
+                let controller = authenticated_controller_with_topology(
                     "orders-service",
                     node_id("requester"),
                     swim,
                     raft_sender_with(|_| panic!("remote ACL refresh must not query local Raft")),
+                    requester_topology_reader,
                 );
 
                 let result = controller.authorize_acl_resource(requested_resource).await;
