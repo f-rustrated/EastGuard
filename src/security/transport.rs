@@ -144,9 +144,25 @@ impl NodeTransportSecurity {
     ) -> Result<NodeCredentials> {
         let certificate_chain =
             Self::load_certificates(certificate_chain_path, "certificate chain")?;
-        let node_certificate_principal = node_certificate_principal(&certificate_chain[0])?;
         let private_key = Self::load_private_key(private_key_path)?;
-        let trust_roots = Arc::new(Self::load_trust_roots(trust_root_path)?);
+        let trust_roots = Self::load_trust_roots(trust_root_path)?;
+        Self::build_credentials(certificate_chain, private_key, trust_roots)
+    }
+
+    fn build_credentials(
+        certificate_chain: Vec<CertificateDer<'static>>,
+        private_key: PrivateKeyDer<'static>,
+        trust_roots: RootCertStore,
+    ) -> Result<NodeCredentials> {
+        let leaf = certificate_chain
+            .first()
+            .context("node certificate chain is empty")?;
+        let node_certificate_principal = node_certificate_principal(leaf)?;
+        anyhow::ensure!(
+            node_certificate_principal.has_valid_length(),
+            "Node Certificate Principal exceeds the security key limit"
+        );
+        let trust_roots = Arc::new(trust_roots);
         let client_verifier = WebPkiClientVerifier::builder(trust_roots.clone()).build()?;
         let server = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_client_cert_verifier(client_verifier)
@@ -166,6 +182,24 @@ impl NodeTransportSecurity {
 
     pub(crate) fn is_secure(&self) -> bool {
         matches!(self, Self::Secure(_))
+    }
+
+    /// Creates this process's proof for one TLS connection.
+    ///
+    /// Trusted-development connections deliberately have no process proof.
+    pub(crate) fn create_admission_proof(
+        &self,
+        node_id: &NodeId,
+        tls_session_binding: &[u8],
+    ) -> Result<AdmissionProof> {
+        match self {
+            Self::Secure(credentials) => {
+                credentials.create_admission_proof(node_id, tls_session_binding)
+            }
+            Self::TrustedDevelopment => {
+                anyhow::bail!("trusted-development transport has no admission proof")
+            }
+        }
     }
 
     fn load_certificates(path: &Path, kind: &'static str) -> Result<Vec<CertificateDer<'static>>> {
@@ -211,6 +245,28 @@ impl NodeTransportSecurity {
         }
         Ok(roots)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_secure(
+        certificate_chain: Vec<CertificateDer<'static>>,
+        private_key: PrivateKeyDer<'static>,
+        trust_certificates: &[CertificateDer<'static>],
+    ) -> Result<Self> {
+        let mut trust_roots = RootCertStore::empty();
+        for certificate in trust_certificates {
+            trust_roots.add(certificate.clone())?;
+        }
+        Self::build_credentials(certificate_chain, private_key, trust_roots).map(Self::Secure)
+    }
+    #[cfg(test)]
+    pub(crate) fn process_public_key(&self) -> Result<Box<[u8]>> {
+        match self {
+            Self::Secure(credentials) => Ok(credentials.process_signing_key.public_key()),
+            Self::TrustedDevelopment => {
+                anyhow::bail!("trusted-development transport has no process public key")
+            }
+        }
+    }
 }
 
 /// TLS credentials and process identity loaded for secure mode.
@@ -228,6 +284,10 @@ pub(crate) struct CertificatePrincipal(Box<str>);
 impl CertificatePrincipal {
     pub(crate) fn new(principal: impl Into<Box<str>>) -> Self {
         Self(principal.into())
+    }
+
+    pub(crate) fn has_valid_length(&self) -> bool {
+        !self.0.is_empty() && self.0.len() <= super::MAX_SECURITY_ID_BYTES
     }
 }
 
