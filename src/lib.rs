@@ -71,7 +71,9 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         let security = NodeTransportSecurity::load(&self.env)?;
         if security.is_secure() {
-            anyhow::bail!("secure transport listeners are not implemented");
+            anyhow::bail!(
+                "secure startup is unavailable: authenticated SWIM datagrams, data-plane process admission, and admission/revocation operations are incomplete"
+            );
         }
 
         // Bind sockets before spawning — fail fast on port conflicts
@@ -90,16 +92,18 @@ impl StartUp {
 
         let swim = self.env.swim(self.rng_seed);
         let node_id = swim.node_id.clone();
-        let security_handle = SecurityActor::spawn(
-            node_id.clone(),
-            swim_sender.clone(),
-            raft_tx.clone(),
-            security.clone(),
-        );
 
         // Topology snapshot channel: SwimActor publishes, all other actors read.
         // Single-writer / many-readers via ArcSwap — no locks, no contention.
         let (topology_pub, topology_reader) = swim.topology.clone().channel();
+
+        let security_handle = SecurityActor::spawn(
+            node_id.clone(),
+            swim_sender.clone(),
+            raft_tx.clone(),
+            topology_reader.clone(),
+            security.clone(),
+        );
 
         // Recover local durable state before this node serves or joins the
         // cluster: scan + replay the WAL into the segment files, then clear the
