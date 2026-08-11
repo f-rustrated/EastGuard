@@ -215,7 +215,11 @@ impl SecurityReadBarriers {
                 .pending
                 .range((*id, 0)..)
                 .take_while(|((group_id, _), _)| group_id == id)
-                .filter_map(|(&key, pending)| pending.can_resolve(key.1, raft).then_some(key))
+                .filter_map(|(&(group, barrier_index), read_barrier)| {
+                    read_barrier
+                        .can_resolve(barrier_index, raft)
+                        .then_some((group, barrier_index))
+                })
                 .collect();
 
             for key in keys {
