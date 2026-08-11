@@ -2,6 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::connections::protocol::data_plane::ConsumerOffsetGenerationMismatch;
 use crate::control_plane::NodeAddressInfo;
+use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::data_plane::ProduceError;
 
@@ -71,6 +72,20 @@ impl ServerError {
                 | ServerError::SegmentNotLocal
                 | ServerError::StaleRange
         )
+    }
+}
+
+impl From<ProposalError> for ServerError {
+    fn from(error: ProposalError) -> Self {
+        match error {
+            ProposalError::NotLeader(_) => Self::NotRaftLeader { leader_addr: None },
+            ProposalError::ShardNotFound | ProposalError::ShardGroupRemoved => {
+                Self::ShardNotLocal { hint_node: None }
+            }
+            ProposalError::EntryTooLarge => {
+                Self::Internal("metadata proposal exceeds the Raft transport limit".into())
+            }
+        }
     }
 }
 
