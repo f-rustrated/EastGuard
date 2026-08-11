@@ -78,6 +78,21 @@ impl AclResource {
     pub(crate) fn routing_key(&self) -> Vec<u8> {
         self.to_string().into_bytes()
     }
+
+    /// Validates the only variable-length ACL identifier. Fixed-width resource
+    /// variants have no consumer-group ID and therefore always qualify.
+    pub(crate) fn has_valid_identifier_length(&self, max_group_id_bytes: usize) -> bool {
+        match self {
+            Self::ConsumerGroup(resource) => {
+                !resource.group_id.is_empty() && resource.group_id.len() <= max_group_id_bytes
+            }
+            Self::Cluster
+            | Self::TopicAdmin(_)
+            | Self::TopicData(_)
+            | Self::ProducerSession(_)
+            | Self::SecurityCluster => true,
+        }
+    }
 }
 
 impl std::fmt::Display for AclResource {
