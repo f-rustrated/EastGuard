@@ -7,25 +7,24 @@ use crate::control_plane::consensus::messages::{
     DeferredReply, DeferredResponse, InboundRaftRpc, LogMutation, MetadataProposal,
     MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
+use crate::control_plane::consensus::pending_rolls::{PendingRollTracker, RollRequestContext};
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
-use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
+use crate::control_plane::consensus::security_read::{SecurityQuery, SecurityReadBarriers};
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
-    AclResource, ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta,
-    TopicStats,
+    ConsumerGroupAssignment, EntryId, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, RequestDurableSegmentEnd, SegmentCaughtUp, SegmentPlaced,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
-use crate::security::CertificatePrincipal;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use tokio::sync::oneshot;
@@ -43,6 +42,7 @@ pub(crate) struct MultiRaft {
     deferred: Vec<DeferredReply>,
     /// Senders waiting for a specific (shard, log index) to be committed and applied.
     pending_proposes: BTreeMap<(ShardGroupId, u64), oneshot::Sender<Result<(), ProposalError>>>,
+    security_read_barriers: SecurityReadBarriers,
 
     pending_rolls: PendingRollTracker,
     /// Leader-crash boundary recoveries (one per leader-crashed segment).
@@ -50,80 +50,6 @@ pub(crate) struct MultiRaft {
 
     topology: TopologyReader,
     snapshot_entry_threshold: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct RollRequestContext {
-    pub(crate) requester: NodeId,
-    pub(crate) segment_key: SegmentKey,
-}
-// Bookkeeping for in-flight roll proposals.
-#[derive(Default)]
-struct PendingRollTracker {
-    by_group: HashMap<ShardGroupId, BTreeMap<u64, RollRequestContext>>,
-    by_key: HashSet<SegmentKey>,
-}
-
-impl PendingRollTracker {
-    fn contains(&self, key: &SegmentKey) -> bool {
-        self.by_key.contains(key)
-    }
-
-    fn insert(&mut self, group_id: ShardGroupId, log_index: u64, roll: RollRequestContext) {
-        self.by_key.insert(roll.segment_key);
-        self.by_group
-            .entry(group_id)
-            .or_default()
-            .insert(log_index, roll);
-    }
-    fn remove(&mut self, group_id: ShardGroupId, log_index: u64) -> Option<RollRequestContext> {
-        let group_map = self.by_group.get_mut(&group_id)?;
-        let roll = group_map.remove(&log_index)?;
-
-        // Clean up the empty map to prevent memory leaks over time
-        if group_map.is_empty() {
-            self.by_group.remove(&group_id);
-        }
-
-        self.by_key.remove(&roll.segment_key);
-        Some(roll)
-    }
-
-    fn pop_roll_context(
-        &mut self,
-        group_id: ShardGroupId,
-        log_index: u64,
-    ) -> Option<RollRequestContext> {
-        self.remove(group_id, log_index)
-    }
-
-    /// Drop pending roll contexts for `group_id` whose log indices were
-    /// truncated by a new leader. Prevents unbounded growth of `by_key` /
-    /// `by_index` when proposals are rejected by truncation.
-    fn drop_from(&mut self, group_id: ShardGroupId, from_index: u64) {
-        if let Some(group_map) = self.by_group.get_mut(&group_id) {
-            let stale = group_map.split_off(&from_index);
-            for roll in stale.into_values() {
-                self.by_key.remove(&roll.segment_key);
-            }
-
-            if group_map.is_empty() {
-                self.by_group.remove(&group_id);
-            }
-        }
-    }
-
-    /// Drop every pending roll context for `group_id`. Called when a leader
-    /// steps down — any not-yet-committed proposals will either be truncated
-    /// by the new leader or commit there, but this replica will no longer be
-    /// the one to dispatch `SegmentRollCommitted`.
-    fn drop_group(&mut self, group_id: ShardGroupId) {
-        if let Some(stale_group) = self.by_group.remove(&group_id) {
-            for roll in stale_group.into_values() {
-                self.by_key.remove(&roll.segment_key);
-            }
-        }
-    }
 }
 
 impl MultiRaft {
@@ -144,6 +70,7 @@ impl MultiRaft {
             pending_events: Vec::new(),
             deferred: Vec::new(),
             pending_proposes: BTreeMap::new(),
+            security_read_barriers: SecurityReadBarriers::default(),
             pending_rolls: PendingRollTracker::default(),
             boundary_recovery: SegmentBoundaryRecovery::default(),
             topology,
@@ -179,17 +106,16 @@ impl MultiRaft {
             return;
         };
 
-        // * Tick-path filter: only chase ring deltas. Asserting already-present
-        // * members is the takeover path's genesis-divergence heal (#133/#134);
-        // * repeating it every interval would spam the log with no-op AddPeers.
-        // * hash_peer() saves recurring log spam, covered by takeover
+        // Tick-path filter: only chase ring deltas. Asserting already-present
+        // members is the takeover path's genesis-divergence heal (#133/#134);
+        // repeating it every interval would spam the log with no-op EnsurePeers.
         let target_members = self
             .topology
             .group_ring_members(shard_group_id)
             .map(|members| {
                 members
                     .iter()
-                    .filter(|m| !raft.has_peer(m))
+                    .filter(|m| **m != self.node_id && !raft.has_peer(m))
                     .cloned()
                     .collect::<Box<[NodeId]>>()
             });
@@ -284,20 +210,10 @@ impl MultiRaft {
                     }));
             }
             MultiRaftActorCommand::GetAclSnapshot(query) => {
-                let value = self.acl_snapshot(query.shard_group_id, &query.resource);
-                self.deferred
-                    .push(DeferredReply::GetAclSnapshot(DeferredResponse {
-                        reply: query.reply,
-                        value,
-                    }));
+                self.queue_security_query(query.into());
             }
             MultiRaftActorCommand::GetAdmission(query) => {
-                let value = self.admission(query.shard_group_id, &query.node_certificate_principal);
-                self.deferred
-                    .push(DeferredReply::GetAdmission(DeferredResponse {
-                        reply: query.reply,
-                        value,
-                    }));
+                self.queue_security_query(query.into());
             }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
@@ -413,6 +329,7 @@ impl MultiRaft {
         let Some(mut raft) = self.groups.remove(&group_id) else {
             return;
         };
+        self.dirty.remove(&group_id);
         raft.cancel_all_timers();
         self.pending_events.extend(raft.take_events());
 
@@ -427,6 +344,12 @@ impl MultiRaft {
                 let _ = sender.send(Err(ProposalError::ShardGroupRemoved));
             }
         }
+
+        self.security_read_barriers.fail_group(
+            group_id,
+            ServerError::ShardNotLocal { hint_node: None },
+            &mut self.deferred,
+        );
 
         self.storage.delete_group(group_id);
 
@@ -502,28 +425,6 @@ impl MultiRaft {
         self.groups
             .values()
             .find_map(|raft| raft.get_topic_by_name(name).cloned())
-    }
-
-    fn acl_snapshot(
-        &self,
-        shard_group_id: ShardGroupId,
-        resource: &AclResource,
-    ) -> Option<AclRecord> {
-        self.groups
-            .get(&shard_group_id)
-            .map(|raft| raft.acl_snapshot(resource))
-    }
-
-    fn admission(
-        &self,
-        shard_group_id: ShardGroupId,
-        node_certificate_principal: &CertificatePrincipal,
-    ) -> Result<Option<AdmissionRecord>, ServerError> {
-        let raft = self
-            .groups
-            .get(&shard_group_id)
-            .ok_or(ServerError::ShardNotLocal { hint_node: None })?;
-        Ok(raft.admission(node_certificate_principal))
     }
 
     fn get_consumer_group_assignment(
@@ -803,6 +704,17 @@ impl MultiRaft {
         }
     }
 
+    fn queue_security_query(&mut self, query: SecurityQuery) {
+        let shard_group_id = query.shard_group_id();
+        if let Some(dirty) = self.security_read_barriers.queue(
+            query,
+            self.groups.get_mut(&shard_group_id),
+            &mut self.deferred,
+        ) {
+            self.dirty.insert(dirty);
+        }
+    }
+
     fn propose_internal(&mut self, cmd: MetadataProposal) -> Result<u64, ProposalError> {
         match self.groups.get_mut(&cmd.shard_group_id) {
             Some(raft) => {
@@ -815,6 +727,10 @@ impl MultiRaft {
     }
 
     pub(crate) fn flush(&mut self) -> Vec<RaftEvent> {
+        // Reads received in one mailbox batch may share its final per-shard
+        // barrier. Once flush starts, that barrier can be observed by peers and
+        // must never authorize a later request.
+        self.security_read_barriers.close_all();
         let dirty: Vec<ShardGroupId> = std::mem::take(&mut self.dirty).into_iter().collect();
         self.flush_auto_proposals(&dirty);
         let (mutations, last_indices) = self.collect_mutations(&dirty);
@@ -822,6 +738,8 @@ impl MultiRaft {
         self.apply_received_snapshots(&dirty);
         self.create_eligible_snapshots(&dirty);
         self.resolve_pending_proposes(&dirty);
+        self.security_read_barriers
+            .resolve(&dirty, &self.groups, &mut self.deferred);
 
         #[cfg(any(test, debug_assertions))]
         {
@@ -911,8 +829,7 @@ impl MultiRaft {
                 // Only the roll event answers the requester. Other metadata events
                 // from the same log entry must not consume its pending context.
                 if matches!(committed.event, MetadataEvent::SegmentRolled(_)) {
-                    committed.roll_context =
-                        self.pending_rolls.pop_roll_context(id, committed.log_index);
+                    committed.roll_context = self.pending_rolls.take(id, committed.log_index);
                 }
             }
             self.pending_events.push(event);
@@ -1043,10 +960,14 @@ mod tests {
 
     use crate::control_plane::Replicas;
     use crate::control_plane::consensus::boundary_recovery;
+    use crate::control_plane::consensus::raft::states::security::AclRecord;
     use crate::control_plane::consensus::raft::storage::RaftPersistentState;
+    use crate::control_plane::metadata::AclResource;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
+    use crate::security::CertificatePrincipal;
     use std::collections::BTreeSet;
+    use tokio::sync::oneshot::error::TryRecvError;
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id)
@@ -1287,7 +1208,9 @@ mod tests {
     // Unit 2 — flush() writes to RocksDB
     // -----------------------------------------------------------------------
 
-    use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
+    use crate::control_plane::consensus::messages::{
+        AppendEntries, GetAclSnapshot, GetAdmission, RaftRpc,
+    };
     use crate::control_plane::consensus::raft::command::RaftCommand;
     use crate::control_plane::consensus::raft::log::LogEntry;
 
@@ -1317,6 +1240,425 @@ mod tests {
 
     fn read_hard_state(store: &MultiRaft) -> RaftPersistentState {
         store.storage.load_state(TEST_GROUP_ID.0)
+    }
+
+    #[test]
+    fn security_reads_complete_only_after_their_barrier_is_applied() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me]));
+        elect_leader(&mut store);
+        store.flush();
+
+        let resource = AclResource::TopicData(TopicId(7));
+        let applied_before_read = store
+            .groups
+            .get(&TEST_GROUP_ID)
+            .unwrap()
+            .last_applied_index();
+        let (acl_reply, mut acl_receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: resource.clone(),
+                reply: acl_reply,
+            }
+            .into(),
+        );
+
+        assert_eq!(acl_receive.try_recv(), Err(TryRecvError::Empty));
+        store.flush();
+        assert!(
+            store
+                .groups
+                .get(&TEST_GROUP_ID)
+                .unwrap()
+                .last_applied_index()
+                > applied_before_read
+        );
+        assert_eq!(acl_receive.try_recv(), Err(TryRecvError::Empty));
+        store.fire_deferred();
+        assert_eq!(
+            acl_receive.try_recv(),
+            Ok(Ok(AclRecord {
+                resource,
+                revision: 0,
+                principals: Box::new([]),
+            }))
+        );
+
+        let (admission_reply, mut admission_receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: TEST_GROUP_ID,
+                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                reply: admission_reply,
+            }
+            .into(),
+        );
+        assert_eq!(admission_receive.try_recv(), Err(TryRecvError::Empty));
+        store.flush();
+        store.fire_deferred();
+        assert_eq!(admission_receive.try_recv(), Ok(Ok(None)));
+    }
+
+    #[test]
+    fn concurrent_security_reads_share_one_shard_barrier() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me]));
+        elect_leader(&mut store);
+        store.flush();
+
+        let before = store.groups[&TEST_GROUP_ID].log_last_index();
+        let resource = AclResource::TopicData(TopicId(7));
+        let (acl_reply, mut acl_receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: resource.clone(),
+                reply: acl_reply,
+            }
+            .into(),
+        );
+        let (admission_reply, mut admission_receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: TEST_GROUP_ID,
+                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                reply: admission_reply,
+            }
+            .into(),
+        );
+
+        assert_eq!(store.groups[&TEST_GROUP_ID].log_last_index(), before + 1);
+        assert_eq!(store.security_read_barriers.counts(), (1, 2));
+
+        store.flush();
+        store.fire_deferred();
+        assert_eq!(
+            acl_receive.try_recv(),
+            Ok(Ok(AclRecord {
+                resource,
+                revision: 0,
+                principals: Box::new([]),
+            }))
+        );
+        assert_eq!(admission_receive.try_recv(), Ok(Ok(None)));
+    }
+
+    #[test]
+    fn security_read_after_a_write_gets_a_later_barrier() {
+        use crate::control_plane::metadata::command::GrantAcl;
+
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let peer = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me, peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        store.flush();
+
+        let before = store.groups[&TEST_GROUP_ID].log_last_index();
+        let resource = AclResource::TopicData(TopicId(7));
+        let (first_reply, _first_receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: resource.clone(),
+                reply: first_reply,
+            }
+            .into(),
+        );
+        store
+            .propose_internal(MetadataProposal {
+                shard_group_id: TEST_GROUP_ID,
+                command: GrantAcl {
+                    resource: resource.clone(),
+                    principal: "client-a".to_string(),
+                }
+                .into(),
+            })
+            .unwrap();
+        let (second_reply, _second_receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource,
+                reply: second_reply,
+            }
+            .into(),
+        );
+
+        assert_eq!(store.groups[&TEST_GROUP_ID].log_last_index(), before + 3);
+        assert_eq!(store.security_read_barriers.counts().0, 2);
+    }
+
+    #[test]
+    fn later_security_read_does_not_join_a_flushed_barrier() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let peer = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me, peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        store.flush();
+
+        let (first_reply, _first_receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: TEST_GROUP_ID,
+                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                reply: first_reply,
+            }
+            .into(),
+        );
+        let first_barrier = store.groups[&TEST_GROUP_ID].log_last_index();
+        store.flush();
+
+        let (second_reply, _second_receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: TEST_GROUP_ID,
+                node_certificate_principal: CertificatePrincipal::new("broker-b"),
+                reply: second_reply,
+            }
+            .into(),
+        );
+
+        assert_eq!(
+            store.groups[&TEST_GROUP_ID].log_last_index(),
+            first_barrier + 1
+        );
+        assert_eq!(store.security_read_barriers.counts().0, 2);
+    }
+
+    #[test]
+    fn multi_voter_security_read_returns_mutation_committed_by_its_barrier() {
+        use crate::control_plane::consensus::messages::AppendEntriesResponse;
+        use crate::control_plane::metadata::command::GrantAcl;
+
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let peer = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone(), peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        store.flush();
+
+        let resource = AclResource::TopicData(TopicId(7));
+        let principal = "client-a".to_string();
+        store
+            .propose_internal(MetadataProposal {
+                shard_group_id: TEST_GROUP_ID,
+                command: GrantAcl {
+                    resource: resource.clone(),
+                    principal: principal.clone(),
+                }
+                .into(),
+            })
+            .expect("ACL grant proposal must be accepted by the leader");
+
+        let (reply, mut receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: resource.clone(),
+                reply,
+            }
+            .into(),
+        );
+        let (term, barrier_index) = {
+            let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
+            (raft.current_term(), raft.log_last_index())
+        };
+
+        store.flush();
+        store.fire_deferred();
+        assert!(
+            store
+                .groups
+                .get(&TEST_GROUP_ID)
+                .unwrap()
+                .last_applied_index()
+                < barrier_index
+        );
+        assert_eq!(receive.try_recv(), Err(TryRecvError::Empty));
+
+        store.handle_consensus(InboundRaftRpc {
+            shard_group_id: TEST_GROUP_ID,
+            peer_id: peer.clone(),
+            rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
+                term,
+                node_id: peer,
+                success: true,
+                last_log_index: barrier_index,
+            }),
+        });
+        store.flush();
+        assert!(
+            store
+                .groups
+                .get(&TEST_GROUP_ID)
+                .unwrap()
+                .last_applied_index()
+                >= barrier_index
+        );
+        assert_eq!(receive.try_recv(), Err(TryRecvError::Empty));
+        store.fire_deferred();
+
+        assert_eq!(
+            receive.try_recv(),
+            Ok(Ok(AclRecord {
+                resource,
+                revision: 1,
+                principals: vec![principal].into_boxed_slice(),
+            }))
+        );
+    }
+
+    #[test]
+    fn security_reads_reject_followers_and_missing_groups() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me, node("n2")]));
+        store.flush();
+
+        let (follower_reply, mut follower_receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: AclResource::TopicData(TopicId(7)),
+                reply: follower_reply,
+            }
+            .into(),
+        );
+        let (missing_reply, mut missing_receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: ShardGroupId(999),
+                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                reply: missing_reply,
+            }
+            .into(),
+        );
+        store.flush();
+        store.fire_deferred();
+
+        assert_eq!(
+            follower_receive.try_recv(),
+            Ok(Err(ServerError::NotRaftLeader { leader_addr: None }))
+        );
+        assert_eq!(
+            missing_receive.try_recv(),
+            Ok(Err(ServerError::ShardNotLocal { hint_node: None }))
+        );
+        assert_eq!(store.security_read_barriers.counts(), (0, 0));
+    }
+
+    #[test]
+    fn removing_group_rejects_its_pending_security_read() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me]));
+        elect_leader(&mut store);
+        store.flush();
+
+        let (reply, mut receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: AclResource::TopicData(TopicId(7)),
+                reply,
+            }
+            .into(),
+        );
+        store.remove_group(TEST_GROUP_ID);
+        store.flush();
+        store.fire_deferred();
+
+        assert_eq!(
+            receive.try_recv(),
+            Ok(Err(ServerError::ShardNotLocal { hint_node: None }))
+        );
+        assert_eq!(store.security_read_barriers.counts(), (0, 0));
+    }
+
+    #[test]
+    fn security_read_rejects_leadership_loss_even_after_regaining_leadership() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let peer = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me.clone(), peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        store.flush();
+
+        let (reply, mut receive) = oneshot::channel();
+        store.process(
+            GetAclSnapshot {
+                shard_group_id: TEST_GROUP_ID,
+                resource: AclResource::TopicData(TopicId(7)),
+                reply,
+            }
+            .into(),
+        );
+        store.handle_consensus(InboundRaftRpc {
+            shard_group_id: TEST_GROUP_ID,
+            peer_id: peer.clone(),
+            rpc: RaftRpc::AppendEntries(AppendEntries {
+                term: 99,
+                leader_id: peer.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Box::new([]),
+                leader_commit: 0,
+            }),
+        });
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        assert!(store.groups.get(&TEST_GROUP_ID).unwrap().is_leader());
+
+        store.flush();
+        store.fire_deferred();
+        assert_eq!(
+            receive.try_recv(),
+            Ok(Err(ServerError::NotRaftLeader { leader_addr: None }))
+        );
+    }
+
+    #[test]
+    fn security_read_without_quorum_stays_pending_and_drops_closed_reply() {
+        let (storage, _) = temp_storage();
+        let me = node("n1");
+        let peer = node("n2");
+        let mut store = new_store(me.clone(), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![me, peer.clone()]));
+        elect_leader_with_peers(&mut store, std::slice::from_ref(&peer));
+        store.flush();
+
+        let (reply, mut receive) = oneshot::channel();
+        store.process(
+            GetAdmission {
+                shard_group_id: TEST_GROUP_ID,
+                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                reply,
+            }
+            .into(),
+        );
+        store.flush();
+        store.fire_deferred();
+
+        // The caller's timeout is the fail-closed result for an unavailable
+        // quorum; consensus must never substitute a stale local read.
+        assert_eq!(receive.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(store.security_read_barriers.counts().0, 1);
+        drop(receive);
+        store.flush();
+        assert_eq!(store.security_read_barriers.counts(), (0, 0));
     }
 
     #[test]
