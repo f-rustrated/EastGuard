@@ -202,7 +202,8 @@ impl Raft {
     ///
     /// Run on takeover and the periodic ring check.
     ///
-    /// `target_members` is the ring members to assert as peers via `AddPeer` (only the live, non-self ones are proposed).
+    /// `target_members` is the ring members to assert as peers via `EnsurePeer`;
+    /// dead members are skipped.
     ///
     /// The caller picks the shape:
     /// - **takeover** passes the group's *full* member set — re-assert everything
@@ -222,14 +223,13 @@ impl Raft {
         let live_set: HashSet<NodeId> = topology.live_nodes().into_iter().collect();
         if let Some(members) = target_members {
             for member in members.iter() {
-                // skip self && dead peer
-                if *member == self.node_id || !live_set.contains(member) {
+                if !live_set.contains(member) {
                     continue;
                 }
-                if self.peers.contains(member) {
+                if *member == self.node_id || self.peers.contains(member) {
                     // Bootstrap group creation can observe different ring snapshots
-                    // on different nodes. Re-applying an existing voter is a "no-op"
-                    // here, but heals followers whose initial voter set omitted it.
+                    // on different nodes. Re-applying every known voter, including
+                    // the leader, heals followers whose initial voter set omitted it.
                     changed |= self
                         .propose(RaftCommand::EnsurePeer(member.clone()))
                         .is_ok();
@@ -1393,9 +1393,19 @@ impl Raft {
             self.reject_append_entries(from);
             return;
         }
+
+        // ! heartbeat or probe message does not hold entries. the following makes sure
+        // ! folllower doesn't advance its commit_index beyond logs
+        let matched_index = req
+            .entries
+            .last()
+            .map_or(req.prev_log_index, |entry| entry.index);
         self.replicate_entries(req.entries);
-        self.advance_follower_commit(req.leader_commit);
-        self.accept_append_entries(from);
+
+        self.advance_follower_commit(req.leader_commit.min(matched_index));
+
+        // Acknowledgment to Leader
+        self.accept_append_entries(from, matched_index);
     }
 
     fn recognize_leader(&mut self, req: &AppendEntries) {
@@ -1444,8 +1454,10 @@ impl Raft {
     // ! - term guard
     // ! - only leaders track peer state
     fn handle_append_entries_response(&mut self, resp: AppendEntriesResponse) {
-        if resp.term > self.consensus.current_term() {
-            self.step_down(resp.term);
+        if resp.term != self.consensus.current_term() {
+            if resp.term > self.consensus.current_term() {
+                self.step_down(resp.term);
+            }
             return;
         }
 
@@ -1456,11 +1468,12 @@ impl Raft {
         // The responder may be a voting peer or a catching-up learner.
         let node_id = resp.node_id.clone();
         let is_voter = self.consensus.is_voter(&node_id);
+        let confirmed_index = resp.last_log_index.min(self.log_last_index());
         let peer_state = self.consensus.peer_state_mut(&node_id);
         if let Some(peer_state) = peer_state {
             if resp.success {
-                peer_state.match_index = resp.last_log_index;
-                peer_state.next_index = resp.last_log_index + 1;
+                peer_state.match_index = peer_state.match_index.max(confirmed_index);
+                peer_state.next_index = peer_state.match_index + 1;
                 self.try_advance_commit_index();
                 // A caught-up learner graduates to a voting peer.
                 if !is_voter {
@@ -1468,7 +1481,10 @@ impl Raft {
                 }
             } else {
                 // Decrement next_index
-                peer_state.next_index = peer_state.next_index.saturating_sub(1).max(1);
+                peer_state.next_index = peer_state
+                    .next_index
+                    .saturating_sub(1)
+                    .max(peer_state.match_index + 1);
             }
 
             if self
@@ -1481,15 +1497,15 @@ impl Raft {
         }
     }
 
-    fn accept_append_entries(&mut self, target: NodeId) {
-        self.send_append_entries_response(target, true);
+    fn accept_append_entries(&mut self, target: NodeId, matched_index: u64) {
+        self.send_append_entries_response(target, true, matched_index);
     }
 
     fn reject_append_entries(&mut self, target: NodeId) {
-        self.send_append_entries_response(target, false);
+        self.send_append_entries_response(target, false, 0);
     }
 
-    fn send_append_entries_response(&mut self, target: NodeId, success: bool) {
+    fn send_append_entries_response(&mut self, target: NodeId, success: bool, matched_index: u64) {
         self.raise(OutboundRaftPacket::new(
             self.shard_group_id,
             target,
@@ -1497,7 +1513,7 @@ impl Raft {
                 term: self.consensus.current_term(),
                 node_id: self.node_id.clone(),
                 success,
-                last_log_index: self.log_last_index(),
+                last_log_index: matched_index,
             },
         ));
     }
@@ -2611,6 +2627,66 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_does_not_confirm_or_commit_an_unverified_suffix() {
+        let mut raft = three_node_raft("node-2");
+        for index in 1..=6 {
+            raft.consensus.append_log(LogEntry {
+                term: 1,
+                index,
+                command: RaftCommand::Noop,
+            });
+        }
+
+        raft.handle_rpc(
+            node("node-1"),
+            AppendEntries {
+                term: 2,
+                leader_id: node("node-1"),
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: Box::new([LogEntry {
+                    term: 1,
+                    index: 4,
+                    command: RaftCommand::Noop,
+                }]),
+                leader_commit: 6,
+            },
+        );
+
+        let response = packets(&mut raft)
+            .into_iter()
+            .find_map(|packet| match packet.rpc {
+                RaftRpc::AppendEntriesResponse(response) => Some(response),
+                RaftRpc::RequestVote(_)
+                | RaftRpc::RequestVoteResponse(_)
+                | RaftRpc::AppendEntries(_)
+                | RaftRpc::InstallSnapshot(_)
+                | RaftRpc::InstallSnapshotResponse(_) => None,
+            });
+        assert_eq!(raft.log_last_index(), 6);
+        assert_eq!(raft.consensus.commit_index(), 4);
+        assert_eq!(response.unwrap().last_log_index, 4);
+
+        raft.handle_rpc(
+            node("node-1"),
+            AppendEntries {
+                term: 2,
+                leader_id: node("node-1"),
+                prev_log_index: 4,
+                prev_log_term: 1,
+                entries: Box::new([LogEntry {
+                    term: 2,
+                    index: 5,
+                    command: RaftCommand::Noop,
+                }]),
+                leader_commit: 6,
+            },
+        );
+        assert_eq!(raft.log_last_index(), 5);
+        assert_eq!(raft.consensus.commit_index(), 5);
+    }
+
+    #[test]
     fn append_entries_leader_must_match_sender() {
         let mut raft = three_node_raft("node-2");
         drain(&mut raft);
@@ -2752,6 +2828,70 @@ mod tests {
     }
 
     #[test]
+    fn stale_success_response_cannot_regress_confirmed_progress() {
+        let mut raft = three_node_raft_as_leader("node-1");
+        raft.propose_noop().unwrap();
+        drain(&mut raft);
+
+        for last_log_index in [2, 1] {
+            raft.handle_rpc(
+                node("node-2"),
+                AppendEntriesResponse {
+                    term: raft.current_term(),
+                    node_id: node("node-2"),
+                    success: true,
+                    last_log_index,
+                },
+            );
+            drain(&mut raft);
+        }
+
+        let peer = raft.consensus.peer_state(&node("node-2")).unwrap();
+        assert_eq!(peer.match_index, 2);
+        assert_eq!(peer.next_index, 3);
+    }
+
+    #[test]
+    fn old_term_success_cannot_commit_current_term_barrier() {
+        let mut raft = three_node_raft_as_leader("node-1");
+        let old_term = raft.current_term();
+        raft.step_down(old_term + 1);
+        raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: TEST_SHARD,
+            epoch: u64::MAX,
+        });
+        drain(&mut raft);
+        let current_term = raft.current_term();
+        raft.handle_rpc(
+            node("node-2"),
+            RequestVoteResponse {
+                term: current_term,
+                node_id: node("node-2"),
+                vote_granted: true,
+            },
+        );
+        drain(&mut raft);
+
+        let barrier_index = raft.log_last_index();
+        let progress_before = raft.consensus.peer_state(&node("node-2")).unwrap().clone();
+        let commit_before = raft.consensus.commit_index();
+        raft.handle_rpc(
+            node("node-2"),
+            AppendEntriesResponse {
+                term: old_term,
+                node_id: node("node-2"),
+                success: true,
+                last_log_index: barrier_index,
+            },
+        );
+
+        let progress = raft.consensus.peer_state(&node("node-2")).unwrap();
+        assert_eq!(progress.match_index, progress_before.match_index);
+        assert_eq!(progress.next_index, progress_before.next_index);
+        assert_eq!(raft.consensus.commit_index(), commit_before);
+    }
+
+    #[test]
     fn follower_cannot_propose() {
         let mut raft = three_node_raft("node-1");
         assert_eq!(
@@ -2807,6 +2947,30 @@ mod tests {
         raft.handle_rpc(node("node-1"), ae);
         drain(&mut raft);
 
+        assert_eq!(raft.consensus.commit_index(), 1);
+    }
+
+    #[test]
+    fn follower_caps_leader_commit_at_its_replicated_suffix() {
+        let mut raft = three_node_raft("node-2");
+
+        raft.handle_rpc(
+            node("node-1"),
+            AppendEntries {
+                term: 1,
+                leader_id: node("node-1"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Box::new([LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: RaftCommand::Noop,
+                }]),
+                leader_commit: 6,
+            },
+        );
+
+        assert_eq!(raft.log_last_index(), 1);
         assert_eq!(raft.consensus.commit_index(), 1);
     }
 
@@ -3981,15 +4145,11 @@ mod tests {
     }
 
     #[test]
-    fn takeover_reasserts_bootstrap_voters_through_the_log() {
+    fn takeover_reasserts_every_ring_member_through_the_log() {
         let (mut raft, reader, members) = ring_raft_with_stale(&[]);
-        let expected: HashSet<NodeId> = members
-            .iter()
-            .filter(|member| **member != node("node-1"))
-            .cloned()
-            .collect();
+        let expected: HashSet<NodeId> = members.iter().cloned().collect();
 
-        assert!(raft.reconcile(&reader, Some(members.0)));
+        assert!(raft.reconcile(&reader, Some(members.0.clone())));
 
         let asserted: HashSet<NodeId> = raft
             .consensus
@@ -4000,6 +4160,54 @@ mod tests {
             })
             .collect();
         assert_eq!(asserted, expected);
+
+        let follower_id = members
+            .iter()
+            .find(|member| **member != node("node-1"))
+            .unwrap()
+            .clone();
+        let other_ring_member = members
+            .iter()
+            .find(|member| **member != node("node-1") && **member != follower_id)
+            .unwrap()
+            .clone();
+        let mut follower = Raft::new(
+            follower_id.clone(),
+            HashSet::from([node("node-9"), other_ring_member]),
+            RaftPersistentState::default(),
+            0,
+            raft.shard_group_id,
+            test_timer_seqs(),
+        );
+        follower.handle_rpc(
+            node("node-1"),
+            AppendEntries {
+                term: raft.current_term(),
+                leader_id: node("node-1"),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: raft.consensus.log_entries().into(),
+                leader_commit: raft.log_last_index(),
+            },
+        );
+        follower.simulate_flush_and_apply();
+        assert!(follower.has_peer(&node("node-1")));
+
+        follower.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
+            shard_group_id: raft.shard_group_id,
+            epoch: u64::MAX,
+        });
+        drain(&mut follower);
+        let term = follower.current_term();
+        follower.handle_rpc(
+            node("node-9"),
+            RequestVoteResponse {
+                term,
+                node_id: node("node-9"),
+                vote_granted: true,
+            },
+        );
+        assert!(matches!(follower.consensus.role(), Role::Candidate { .. }));
     }
 
     /// Simulate `peer` confirming replication up to the leader's last index.
