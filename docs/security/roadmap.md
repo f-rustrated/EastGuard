@@ -25,7 +25,7 @@ and Byzantine consensus are out of scope.
 | :--- | :--- | :--- | :--- | :--- |
 | **Client** | TCP 2921 | TLS 1.3 | Mutual X.509 | Metadata queries, administration, produce, fetch |
 | **Raft** | TCP 2922 | TLS 1.3 | Mutual X.509 + process admission | Metadata shard consensus, one-shot ACL-cache refreshes, and limited admission-record reads between brokers |
-| **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 | Segment replication, repair, and coordination |
+| **Data** | TCP 2923 | TLS 1.3 | Mutual X.509 + process admission | Segment replication, repair, and coordination |
 | **SWIM** | UDP 2922 | Secure datagrams (deferred) | Mutual X.509 | Membership gossip and failure detection |
 
 ---
@@ -48,7 +48,7 @@ application state machines. This keeps security I/O out of state machines:
                      ▼
 [ Broker Security Actor ]
   - Cache admission and ACL records
-  - Route record reads to local Raft or one remote broker
+  - Route record reads to local Raft or leader-first replica candidates
   - Authorize the authenticated principal
                      │
                      │ (Deny one request on authorization failure)
@@ -113,7 +113,12 @@ principal has the `security/cluster` grant.
 | Event | Identity and recovery |
 | :--- | :--- |
 | Healed partition; same process | Keep the `NodeId` and epoch. Increase the SWIM incarnation to refute stale `Suspect` or `Dead` gossip. |
-| Restart or replacement | Create a new `NodeId` and process key. The operator approves them; metadata Raft commits a higher epoch. Cache expiry fences the old process everywhere within 60 seconds. |
+| Restart or replacement | Create a new `NodeId` and process key. A separately authorized operator or automation approves them; metadata Raft commits a higher epoch. Cache expiry fences the old process everywhere within 60 seconds. |
+
+Routine approval may be automated, but the authority must remain separate from
+the reusable node certificate. A stale process still holds that certificate; if
+certificate possession could advance the admission epoch, the stale process
+could re-admit itself and fence its replacement.
 
 ### Admission Gate & SWIM Separation
 
@@ -139,6 +144,9 @@ SWIM liveness gossip is decoupled from cluster admission authority to prevent ne
 ```
 
 - Metadata Raft decides admission; SWIM reports only liveness.
+- A joining process cannot approve its own process key. Operator automation may
+  perform approval, but it authenticates with the separate `security/cluster`
+  authority.
 - The transport authenticates the immediate sender. A relayed fact is accepted
   only when its subject `NodeId` and epoch match an active admission.
 - The local admission cache expires within 60 seconds and fails closed when its
@@ -224,6 +232,9 @@ Accepting broker                         Admission shard host
   60 seconds. A missing record denies admission.
 - **Do not cache failure:** Timeout, routing failure, or an unavailable shard
   denies the current connection but is retried by a later lookup.
+- **No pre-admission pool:** Cache reuse and identical-read combining absorb
+  routine misses. Pooling this narrow capability would add persistent
+  pre-admission state and multiplexing without removing the bootstrap recursion.
 
 ---
 
@@ -278,11 +289,38 @@ security/node/{node-certificate-principal}
 | Moment | Operator and cluster action |
 | :--- | :--- |
 | First broker | Create the trust root and node certificate. Initial metadata stores the first process admission, operator principal, and `security/cluster` grant. |
-| Every later start | The process creates a new `NodeId` and process key. An authorized operator approves both. The owning shard increments the admission epoch and replaces the old process atomically. |
+| Every later start | The process creates a new `NodeId` and process key. A separately authorized operator or automation approves both. The owning shard increments the admission epoch and replaces the old process atomically. |
 | Cluster connection | Each side follows the admission gate in Section 3. Raft or ACL traffic starts only after mutual process proof succeeds. |
 
 The reusable node certificate alone cannot replace an admitted process. SWIM
 also remains blocked until the secure datagram admission gate in S3 exists.
+
+### Security Administration
+
+Security mutations use the separate `security/cluster` privilege rather than
+the ordinary cluster-inspection grant. ACL grants and revocations route one
+exact resource to its owning metadata shard. Admission replacement carries the
+stable node principal, new process identity, and process public key; the owning
+shard assigns revision and epoch rather than trusting caller-supplied counters.
+
+The first useful wire surface is exact-record mutation and lookup. Listing all
+ACLs is deferred because the records are sharded: a correct global listing
+needs bounded pagination, shard enumeration, and partial-failure semantics, not
+one optional resource field on a request.
+
+### Genesis Bootstrap
+
+Secure genesis is a cluster-formation operation, not a local “storage is empty”
+default. Local metadata storage does not yet know the initial shard topology, so
+independent injection could seed different security records on different Raft
+replicas.
+
+Before secure startup is enabled, cluster formation must define one immutable
+genesis input containing the initial members, their first process admissions,
+and the first operator grants. Initial members must agree on that input before
+serving traffic, persist that genesis was applied, and reject a conflicting
+input on restart. The concrete formation mechanism remains delivery work;
+secure startup continues to fail closed until it exists.
 
 ### Online Credential Rotation
 
@@ -400,6 +438,8 @@ per node                   visible to SWIM
 | TCP | Either keeps a connection mesh or causes handshake churn, kernel tracking, and head-of-line blocking. |
 | QUIC datagrams | Preserve loss, but add per-peer connection state and complexity for sparse probes. |
 | Current DTLS libraries | Do not yet combine maturity, permissive licensing, Rust integration, and deterministic simulation. |
+| Cluster-wide HMAC or AEAD key | Proves possession of a shared secret, not the currently admitted process. It also leaves replay windows, nonce uniqueness, rotation, and indirect-probe identity unresolved. |
+| Isolated network only | Useful defense in depth, but not authentication. This is the trusted-development assumption, not the secure boundary. |
 
 Secure SWIM remains deferred. Trusted development may use plaintext UDP in
 isolation; secure mode fails startup and never falls back to it.
@@ -427,6 +467,14 @@ The selected transport must:
 ---
 
 ## 7. Delivery Plan (S0–S6)
+
+### Current Implementation Boundary
+
+The process-proof primitive and Raft transport integration exist. Data
+connections currently authenticate node certificates but do not yet bind the
+framed `NodeId` to the current admission or enforce its expiry. SWIM datagrams
+are still plaintext, and security administration plus genesis formation are not
+implemented. Secure startup therefore remains intentionally unavailable.
 
 | Phase | Complete when |
 | :--- | :--- |
