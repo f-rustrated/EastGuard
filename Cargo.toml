@@ -53,6 +53,14 @@ serde_json = "1"
 [profile.dev.package.librocksdb-sys]
 debug = false
 
+[profile.dev]
+# Level 1: line tables only (drastically smaller target/ folder)
+debug = 1
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = 1
+
 [lints.clippy]
 shadow_unrelated = "deny"
 
