@@ -11,9 +11,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use super::inner;
 use crate::security::{CertificatePrincipal, NodeTransportSecurity, node_certificate_principal};
 
-const NODE_ADMISSION_EXPORTER_LABEL: &[u8] = b"EXPORTER-EastGuard-node-admission-v1";
-const NODE_ADMISSION_BINDING_BYTES: usize = 32;
-
 macro_rules! tcp_wrapper {
     ($name:ident) => {
         pub struct $name(pub(super) inner::$name);
@@ -42,8 +39,8 @@ tcp_wrapper!(OwnedWriteHalf);
 /// Mutually authenticated node connection used by the Raft and data transports.
 ///
 /// TLS authenticates the certificate chain before this stream exposes the peer's
-/// Node Certificate Principal. Admission later binds that stable principal to
-/// the process-specific `NodeId` carried by the transport handshake.
+/// Node Certificate Principal. The transport identity exchange binds the
+/// claimed node ID to that certificate's namespace.
 pub struct AuthenticatedTcpStream {
     peer_principal: CertificatePrincipal,
     stream: TlsStream<TcpStream>,
@@ -83,27 +80,6 @@ impl AuthenticatedTcpStream {
 
     pub fn peer_principal(&self) -> &CertificatePrincipal {
         &self.peer_principal
-    }
-
-    /// Derives a value unique to this completed TLS session.
-    ///
-    /// Both peers derive the same bytes. Signing them binds a process-admission
-    /// proof to this connection, so a captured proof cannot be replayed.
-    fn admission_binding(&self) -> Result<[u8; NODE_ADMISSION_BINDING_BYTES]> {
-        let output = [0; NODE_ADMISSION_BINDING_BYTES];
-        match &self.stream {
-            TlsStream::Client(stream) => stream.get_ref().1.export_keying_material(
-                output,
-                NODE_ADMISSION_EXPORTER_LABEL,
-                None,
-            ),
-            TlsStream::Server(stream) => stream.get_ref().1.export_keying_material(
-                output,
-                NODE_ADMISSION_EXPORTER_LABEL,
-                None,
-            ),
-        }
-        .context("failed to derive node-admission TLS session binding")
     }
 
     fn into_split(
@@ -186,15 +162,6 @@ impl TransportTcpStream {
         match self {
             Self::Secure(stream) => Some(stream.peer_principal().clone()),
             Self::TrustedDevelopment(_) => None,
-        }
-    }
-
-    pub(crate) fn admission_binding(&self) -> Result<[u8; NODE_ADMISSION_BINDING_BYTES]> {
-        match self {
-            Self::Secure(stream) => stream.admission_binding(),
-            Self::TrustedDevelopment(_) => {
-                anyhow::bail!("trusted-development connections have no TLS session binding")
-            }
         }
     }
 
@@ -479,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn mutual_tls_shares_session_binding_under_turmoil() -> turmoil::Result {
+    fn mutual_tls_authenticates_both_nodes_under_turmoil() -> turmoil::Result {
         let (server_config, client_config) = tls_configs();
         let mut sim = Builder::new().build();
 
@@ -494,12 +461,10 @@ mod tests {
                     node_certificate_principal,
                 )?;
                 assert_eq!(stream.peer_principal().as_ref(), "broker-client");
-                let session_binding = stream.admission_binding().unwrap();
                 let mut message = [0; 4];
                 stream.read_exact(&mut message).await?;
                 assert_eq!(&message, b"ping");
                 stream.write_all(b"pong").await?;
-                stream.write_all(&session_binding).await?;
                 Ok(())
             }
         });
@@ -510,14 +475,10 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(stream.peer_principal().as_ref(), "broker-server");
-            let session_binding = stream.admission_binding().unwrap();
             stream.write_all(b"ping").await?;
             let mut message = [0; 4];
             stream.read_exact(&mut message).await?;
             assert_eq!(&message, b"pong");
-            let mut peer_session_binding = [0; NODE_ADMISSION_BINDING_BYTES];
-            stream.read_exact(&mut peer_session_binding).await?;
-            assert_eq!(peer_session_binding, session_binding);
             Ok(())
         });
 

@@ -1,77 +1,36 @@
 use std::collections::BTreeMap;
 
 use crate::client::ServerError;
-use crate::control_plane::consensus::messages::{
-    DeferredReply, DeferredResponse, GetAclSnapshot, GetAdmission,
-};
+use crate::control_plane::consensus::messages::{DeferredReply, DeferredResponse, GetAclSnapshot};
 use crate::control_plane::consensus::raft::command::RaftCommand;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::consensus::raft::state::Raft;
 use crate::control_plane::membership::ShardGroupId;
-use crate::impl_from_variant;
 
-/// Private pending-query wrapper; actor messages remain in `messages::actor`.
-pub(super) enum SecurityQuery {
-    GetAclSnapshot(GetAclSnapshot),
-    GetAdmission(GetAdmission),
-}
-
-impl_from_variant!(SecurityQuery, GetAclSnapshot, GetAdmission);
-
-impl SecurityQuery {
-    pub(super) fn shard_group_id(&self) -> ShardGroupId {
-        match self {
-            SecurityQuery::GetAclSnapshot(read) => read.shard_group_id,
-            SecurityQuery::GetAdmission(read) => read.shard_group_id,
-        }
-    }
-
-    fn reply_is_closed(&self) -> bool {
-        match self {
-            SecurityQuery::GetAclSnapshot(read) => read.reply.is_closed(),
-            SecurityQuery::GetAdmission(read) => read.reply.is_closed(),
-        }
-    }
-
+impl GetAclSnapshot {
     fn complete(self, raft: &Raft) -> DeferredReply {
-        match self {
-            SecurityQuery::GetAclSnapshot(read) => {
-                DeferredReply::GetAclSnapshot(DeferredResponse {
-                    value: Ok(raft.acl_snapshot(&read.resource)),
-                    reply: read.reply,
-                })
-            }
-            SecurityQuery::GetAdmission(read) => DeferredReply::GetAdmission(DeferredResponse {
-                value: Ok(raft.admission(&read.node_certificate_principal)),
-                reply: read.reply,
-            }),
-        }
+        DeferredReply::GetAclSnapshot(DeferredResponse {
+            value: Ok(raft.acl_snapshot(&self.resource)),
+            reply: self.reply,
+        })
     }
 
     fn fail(self, error: ServerError) -> DeferredReply {
-        match self {
-            SecurityQuery::GetAclSnapshot(read) => {
-                DeferredReply::GetAclSnapshot(DeferredResponse {
-                    value: Err(error),
-                    reply: read.reply,
-                })
-            }
-            SecurityQuery::GetAdmission(read) => DeferredReply::GetAdmission(DeferredResponse {
-                value: Err(error),
-                reply: read.reply,
-            }),
-        }
+        DeferredReply::GetAclSnapshot(DeferredResponse {
+            value: Err(error),
+            reply: self.reply,
+        })
     }
 }
 
 struct SecurityReadBarrier {
     leader_term: u64,
     open: bool,
-    queries: Vec<SecurityQuery>,
+    queries: Vec<GetAclSnapshot>,
 }
 
 impl SecurityReadBarrier {
-    fn new(leader_term: u64, query: SecurityQuery) -> Self {
+    fn new(leader_term: u64, query: GetAclSnapshot) -> Self {
         Self {
             leader_term,
             open: true,
@@ -87,12 +46,12 @@ impl SecurityReadBarrier {
         self.open = false;
     }
 
-    fn push(&mut self, query: SecurityQuery) {
+    fn push(&mut self, query: GetAclSnapshot) {
         self.queries.push(query);
     }
 
     fn retain_live_queries(&mut self) -> bool {
-        self.queries.retain(|query| !query.reply_is_closed());
+        self.queries.retain(|query| !query.reply.is_closed());
         !self.queries.is_empty()
     }
 
@@ -131,11 +90,11 @@ impl SecurityReadBarriers {
     /// touched Raft and the caller must flush it.
     pub(super) fn queue(
         &mut self,
-        query: SecurityQuery,
+        query: GetAclSnapshot,
         raft: Option<&mut Raft>,
         deferred: &mut Vec<DeferredReply>,
     ) -> Option<ShardGroupId> {
-        let shard_group_id = query.shard_group_id();
+        let shard_group_id = query.shard_group_id;
         let Some(raft) = raft else {
             deferred.push(query.fail(ProposalError::ShardNotFound.into()));
             return None;

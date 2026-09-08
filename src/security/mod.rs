@@ -1,5 +1,4 @@
 mod actor;
-mod admission_proof;
 mod certificates;
 mod message;
 mod record_reader;
@@ -9,7 +8,5 @@ mod transport;
 pub(crate) const MAX_SECURITY_ID_BYTES: usize = 4 * 1024;
 
 pub(crate) use actor::{SecurityActor, SecurityHandle};
-pub(crate) use admission_proof::AdmissionProof;
 pub(crate) use certificates::{client_certificate_principal, node_certificate_principal};
-pub(crate) use message::CurrentAdmission;
 pub(crate) use transport::{CertificatePrincipal, NodeTransportSecurity};

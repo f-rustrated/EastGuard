@@ -8,7 +8,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
@@ -17,7 +17,6 @@ use crate::control_plane::metadata::{
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
-use crate::security::CertificatePrincipal;
 
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -292,26 +291,6 @@ impl MutlRaftSender {
         self.send(GetAclSnapshot {
             shard_group_id,
             resource,
-            reply,
-        })
-        .await
-        .map_err(|error| ServerError::Internal(error.to_string()))?;
-        recv.await
-            .map_err(|error| ServerError::Internal(error.to_string()))?
-    }
-
-    /// Reads the current admission record from the selected metadata shard's
-    /// leader. Absence is an authoritative `None`; routing or actor failures
-    /// remain observable errors and must not be cached.
-    pub(crate) async fn get_admission(
-        &self,
-        shard_group_id: ShardGroupId,
-        node_certificate_principal: CertificatePrincipal,
-    ) -> Result<Option<AdmissionRecord>, ServerError> {
-        let (reply, recv) = tokio::sync::oneshot::channel();
-        self.send(GetAdmission {
-            shard_group_id,
-            node_certificate_principal,
             reply,
         })
         .await

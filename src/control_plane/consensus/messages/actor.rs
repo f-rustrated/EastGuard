@@ -4,13 +4,12 @@ use uuid::Uuid;
 use crate::connections::protocol::ServerError;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::{AclResource, ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
-use crate::security::CertificatePrincipal;
 
 use super::command::{
     EnsureGroup, InboundRaftRpc, MetadataProposal, ProposeSegmentRoll, RaftProtocolMessage,
@@ -56,7 +55,6 @@ pub enum MultiRaftActorCommand {
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
     GetAclSnapshot(GetAclSnapshot),
-    GetAdmission(GetAdmission),
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data-plane request forwarded to the metadata coordinator for proposal.
     ProposeSegmentRoll(ProposeSegmentRoll),
@@ -90,14 +88,6 @@ pub struct GetAclSnapshot {
     pub(crate) reply: oneshot::Sender<Result<AclRecord, ServerError>>,
 }
 
-/// Returns one admission record after a quorum-backed read barrier on the
-/// metadata shard leader.
-pub struct GetAdmission {
-    pub(crate) shard_group_id: ShardGroupId,
-    pub(crate) node_certificate_principal: CertificatePrincipal,
-    pub(crate) reply: oneshot::Sender<Result<Option<AdmissionRecord>, ServerError>>,
-}
-
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {
     fn from(cmd: RaftProtocolMessage) -> Self {
         MultiRaftActorCommand::ProtocolMessage(cmd)
@@ -121,7 +111,6 @@ impl_from_variant_via!(
 impl_from_variant!(
     MultiRaftActorCommand,
     GetAclSnapshot,
-    GetAdmission,
     GetConsumerGroupAssignment,
 );
 
@@ -145,6 +134,5 @@ pub(crate) enum DeferredReply {
     GetTopicStats(DeferredResponse<Box<[TopicStats]>>),
     GetTopicMetadata(DeferredResponse<Option<TopicMeta>>),
     GetAclSnapshot(DeferredResponse<Result<AclRecord, ServerError>>),
-    GetAdmission(DeferredResponse<Result<Option<AdmissionRecord>, ServerError>>),
     GetConsumerGroupAssignment(DeferredResponse<Option<ConsumerGroupAssignment>>),
 }

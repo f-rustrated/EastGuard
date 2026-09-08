@@ -10,7 +10,7 @@ use crate::security::CertificatePrincipal;
 ///
 /// The certificate must contain exactly one URI beginning with
 /// `urn:eastguard:node:`. The text after that prefix is the principal used as
-/// the admission-record key. This function only parses the certificate; callers
+/// the broker's node-ID prefix. This function only parses the certificate; callers
 /// must use it after rustls has authenticated the peer's certificate chain.
 pub(crate) fn node_certificate_principal(
     certificate: &CertificateDer<'_>,
@@ -71,7 +71,12 @@ fn certificate_principal(
         principals.next().is_none(),
         "{certificate_kind} certificate has multiple {principal_name}s"
     );
-    Ok(CertificatePrincipal::new(principal))
+    let principal = CertificatePrincipal::new(principal);
+    anyhow::ensure!(
+        principal.has_valid_length(),
+        "certificate principal exceeds the security key limit"
+    );
+    Ok(principal)
 }
 
 #[cfg(test)]

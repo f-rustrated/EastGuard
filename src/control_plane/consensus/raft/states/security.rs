@@ -12,15 +12,14 @@ use crate::security::CertificatePrincipal;
 /// indexes do not enlarge every variant of the Raft snapshot state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct SecurityState {
+    // Kept in its original position for Borsh snapshot compatibility; not used for authentication.
     pub(super) admissions: HashMap<CertificatePrincipal, AdmissionRecord>,
     pub(super) acls: HashMap<AclResource, AclRecord>,
     pub(super) revocations: HashMap<(String, Box<[u8]>), RevocationRecord>,
 }
 
-/// Current process admitted for `security/node/{node_certificate_principal}`.
-///
-/// A restart replaces this record through its metadata shard. Admission checks
-/// accept SWIM facts only when the epoch, node ID, and process key match it.
+/// Legacy process-admission record retained only to decode and preserve snapshots.
+/// Certificate authentication no longer reads or enforces these records.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub(crate) struct AdmissionRecord {
     pub node_certificate_principal: CertificatePrincipal,
@@ -55,13 +54,6 @@ pub(crate) struct RevocationRecord {
 }
 
 impl SecurityState {
-    pub(crate) fn admission(
-        &self,
-        node_certificate_principal: &CertificatePrincipal,
-    ) -> Option<AdmissionRecord> {
-        self.admissions.get(node_certificate_principal).cloned()
-    }
-
     /// Returns the current ACL record, or an empty revision-zero record when
     /// the resource has never been granted to any principal. Both forms deny
     /// by default; representing absence explicitly lets callers cache that
@@ -172,31 +164,6 @@ mod tests {
             revision: 5,
             revoked_at: 100,
         });
-    }
-
-    #[test]
-    fn admission_lookup_uses_the_certificate_principal() {
-        let mut security = SecurityState::default();
-        let admission = AdmissionRecord {
-            node_certificate_principal: CertificatePrincipal::new("broker-a"),
-            revision: 3,
-            epoch: 2,
-            node_id: NodeId::new("broker-a::process-2"),
-            process_public_key: vec![7; 32].into_boxed_slice(),
-        };
-        security.admissions.insert(
-            admission.node_certificate_principal.clone(),
-            admission.clone(),
-        );
-
-        assert_eq!(
-            security.admission(&CertificatePrincipal::new("broker-a")),
-            Some(admission)
-        );
-        assert_eq!(
-            security.admission(&CertificatePrincipal::new("broker-b")),
-            None
-        );
     }
 
     #[test]

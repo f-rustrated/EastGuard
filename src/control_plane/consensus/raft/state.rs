@@ -9,7 +9,7 @@ use crate::control_plane::consensus::raft::states::consensus::{
     ConsensusState, PeerState, Role, SNAPSHOT_CHUNK_BYTES, SnapshotInstallOutcome,
 };
 use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
-use crate::control_plane::consensus::raft::states::security::{AclRecord, AdmissionRecord};
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::{
     RaftPersistentState, RaftSnapshot, SnapshotData,
 };
@@ -26,7 +26,6 @@ use crate::data_plane::SegmentKey;
 use crate::data_plane::messages::command::{PlaceSegment, SegmentCaughtUp, SegmentPlaced};
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::TimerCommand;
-use crate::security::CertificatePrincipal;
 #[cfg(any(test, debug_assertions))]
 use crate::test_traits::TAssertInvariant;
 use std::collections::{BTreeSet, HashSet};
@@ -167,13 +166,6 @@ impl Raft {
 
     pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
         self.metadata.acl_snapshot(resource)
-    }
-
-    pub(crate) fn admission(
-        &self,
-        node_certificate_principal: &CertificatePrincipal,
-    ) -> Option<AdmissionRecord> {
-        self.metadata.admission(node_certificate_principal)
     }
 
     pub(crate) fn get_consumer_group_assignment(

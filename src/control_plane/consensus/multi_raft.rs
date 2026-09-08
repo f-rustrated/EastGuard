@@ -4,7 +4,7 @@ use crate::control_plane::consensus::boundary_recovery::{
     BoundaryRecoveryAction, SegmentBoundaryRecovery,
 };
 use crate::control_plane::consensus::messages::{
-    DeferredReply, DeferredResponse, InboundRaftRpc, LogMutation, MetadataProposal,
+    DeferredReply, DeferredResponse, GetAclSnapshot, InboundRaftRpc, LogMutation, MetadataProposal,
     MultiRaftActorCommand, ProposeSegmentRoll, RaftEvent, RaftProtocolMessage, RaftTimeoutCallback,
 };
 use crate::control_plane::consensus::pending_rolls::{PendingRollTracker, RollRequestContext};
@@ -13,7 +13,7 @@ use crate::control_plane::consensus::raft::state::{Raft, TimerSeqs};
 use crate::control_plane::consensus::raft::states::consensus::LeaderlessSegments;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
-use crate::control_plane::consensus::security_read::{SecurityQuery, SecurityReadBarriers};
+use crate::control_plane::consensus::security_read::SecurityReadBarriers;
 use crate::control_plane::membership::{ShardGroup, ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::RollSegment;
 use crate::control_plane::metadata::event::MetadataEvent;
@@ -210,10 +210,7 @@ impl MultiRaft {
                     }));
             }
             MultiRaftActorCommand::GetAclSnapshot(query) => {
-                self.queue_security_query(query.into());
-            }
-            MultiRaftActorCommand::GetAdmission(query) => {
-                self.queue_security_query(query.into());
+                self.queue_security_query(query);
             }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
@@ -254,7 +251,6 @@ impl MultiRaft {
                 DeferredReply::GetTopicStats(deferred) => deferred.send(),
                 DeferredReply::GetTopicMetadata(deferred) => deferred.send(),
                 DeferredReply::GetAclSnapshot(deferred) => deferred.send(),
-                DeferredReply::GetAdmission(deferred) => deferred.send(),
                 DeferredReply::GetConsumerGroupAssignment(deferred) => deferred.send(),
             }
         }
@@ -704,8 +700,8 @@ impl MultiRaft {
         }
     }
 
-    fn queue_security_query(&mut self, query: SecurityQuery) {
-        let shard_group_id = query.shard_group_id();
+    fn queue_security_query(&mut self, query: GetAclSnapshot) {
+        let shard_group_id = query.shard_group_id;
         if let Some(dirty) = self.security_read_barriers.queue(
             query,
             self.groups.get_mut(&shard_group_id),
@@ -965,7 +961,6 @@ mod tests {
     use crate::control_plane::metadata::AclResource;
     use crate::impls::metadata_storage::MetadataStorage;
     use crate::schedulers::ticker_message::TimerCommand;
-    use crate::security::CertificatePrincipal;
     use std::collections::BTreeSet;
     use tokio::sync::oneshot::error::TryRecvError;
 
@@ -1208,9 +1203,7 @@ mod tests {
     // Unit 2 — flush() writes to RocksDB
     // -----------------------------------------------------------------------
 
-    use crate::control_plane::consensus::messages::{
-        AppendEntries, GetAclSnapshot, GetAdmission, RaftRpc,
-    };
+    use crate::control_plane::consensus::messages::{AppendEntries, RaftRpc};
     use crate::control_plane::consensus::raft::command::RaftCommand;
     use crate::control_plane::consensus::raft::log::LogEntry;
 
@@ -1288,19 +1281,26 @@ mod tests {
             }))
         );
 
-        let (admission_reply, mut admission_receive) = oneshot::channel();
+        let (second_acl_reply, mut second_acl_receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: TEST_GROUP_ID,
-                node_certificate_principal: CertificatePrincipal::new("broker-a"),
-                reply: admission_reply,
+                resource: AclResource::Cluster,
+                reply: second_acl_reply,
             }
             .into(),
         );
-        assert_eq!(admission_receive.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(second_acl_receive.try_recv(), Err(TryRecvError::Empty));
         store.flush();
         store.fire_deferred();
-        assert_eq!(admission_receive.try_recv(), Ok(Ok(None)));
+        assert_eq!(
+            second_acl_receive.try_recv(),
+            Ok(Ok(AclRecord {
+                resource: AclResource::Cluster,
+                revision: 0,
+                principals: Box::new([]),
+            }))
+        );
     }
 
     #[test]
@@ -1323,12 +1323,12 @@ mod tests {
             }
             .into(),
         );
-        let (admission_reply, mut admission_receive) = oneshot::channel();
+        let (second_acl_reply, mut second_acl_receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: TEST_GROUP_ID,
-                node_certificate_principal: CertificatePrincipal::new("broker-a"),
-                reply: admission_reply,
+                resource: AclResource::Cluster,
+                reply: second_acl_reply,
             }
             .into(),
         );
@@ -1346,7 +1346,14 @@ mod tests {
                 principals: Box::new([]),
             }))
         );
-        assert_eq!(admission_receive.try_recv(), Ok(Ok(None)));
+        assert_eq!(
+            second_acl_receive.try_recv(),
+            Ok(Ok(AclRecord {
+                resource: AclResource::Cluster,
+                revision: 0,
+                principals: Box::new([]),
+            }))
+        );
     }
 
     #[test]
@@ -1408,9 +1415,9 @@ mod tests {
 
         let (first_reply, _first_receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: TEST_GROUP_ID,
-                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                resource: AclResource::Cluster,
                 reply: first_reply,
             }
             .into(),
@@ -1420,9 +1427,9 @@ mod tests {
 
         let (second_reply, _second_receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: TEST_GROUP_ID,
-                node_certificate_principal: CertificatePrincipal::new("broker-b"),
+                resource: AclResource::SecurityCluster,
                 reply: second_reply,
             }
             .into(),
@@ -1538,9 +1545,9 @@ mod tests {
         );
         let (missing_reply, mut missing_receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: ShardGroupId(999),
-                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                resource: AclResource::Cluster,
                 reply: missing_reply,
             }
             .into(),
@@ -1642,9 +1649,9 @@ mod tests {
 
         let (reply, mut receive) = oneshot::channel();
         store.process(
-            GetAdmission {
+            GetAclSnapshot {
                 shard_group_id: TEST_GROUP_ID,
-                node_certificate_principal: CertificatePrincipal::new("broker-a"),
+                resource: AclResource::Cluster,
                 reply,
             }
             .into(),
