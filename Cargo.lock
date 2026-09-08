@@ -403,7 +403,6 @@ dependencies = [
  "murmur3",
  "rand 0.10.1",
  "rcgen",
- "ring",
  "rocksdb",
  "rustls",
  "rustls-pemfile",
