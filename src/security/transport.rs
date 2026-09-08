@@ -4,10 +4,10 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::admission_proof::{AdmissionProof, ProcessSigningKey};
 use super::certificates::node_certificate_principal;
 use crate::config::{Environment, SecurityMode};
 use crate::control_plane::NodeId;
+use crate::net::TransportTcpStream;
 use anyhow::{Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -20,6 +20,7 @@ use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, OtherError,
     RootCertStore, ServerConfig, SignatureScheme,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Verifies certificates presented to EastGuard's outbound node connections.
 ///
@@ -27,8 +28,8 @@ use rustls::{
 /// connects to another broker. It retains certificate-chain, validity,
 /// server-usage, and TLS handshake-signature verification. It does not compare
 /// the certificate with a DNS name because brokers are identified by the Node
-/// Certificate Principal carried in the certificate; admission later binds
-/// that stable principal to the process-specific `NodeId`.
+/// Certificate Principal carried in the certificate. The identity exchange
+/// checks that the process-specific `NodeId` belongs to that principal.
 ///
 ///  Peer certificate
 //   ├── trusted CA chain? ── no → reject
@@ -127,11 +128,10 @@ impl NodeTransportSecurity {
                     .trust_root_path
                     .as_deref()
                     .context("trust_root_path is required in secure mode")?;
-                Ok(Self::Secure(Self::load_from_paths(
-                    certificate_chain,
-                    private_key_path,
-                    trust_roots,
-                )?))
+                let credentials =
+                    Self::load_from_paths(certificate_chain, private_key_path, trust_roots)?;
+                credentials.validate_node_prefix(env.node_id_prefix.as_deref())?;
+                Ok(Self::Secure(credentials))
             }
             SecurityMode::TrustedDevelopment => Ok(Self::TrustedDevelopment),
         }
@@ -158,10 +158,6 @@ impl NodeTransportSecurity {
             .first()
             .context("node certificate chain is empty")?;
         let node_certificate_principal = node_certificate_principal(leaf)?;
-        anyhow::ensure!(
-            node_certificate_principal.has_valid_length(),
-            "Node Certificate Principal exceeds the security key limit"
-        );
         let trust_roots = Arc::new(trust_roots);
         let client_verifier = WebPkiClientVerifier::builder(trust_roots.clone()).build()?;
         let server = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -176,7 +172,6 @@ impl NodeTransportSecurity {
             server: Arc::new(server),
             client: Arc::new(client),
             node_certificate_principal,
-            process_signing_key: Arc::new(ProcessSigningKey::generate()?),
         })
     }
 
@@ -184,22 +179,40 @@ impl NodeTransportSecurity {
         matches!(self, Self::Secure(_))
     }
 
-    /// Creates this process's proof for one TLS connection.
-    ///
-    /// Trusted-development connections deliberately have no process proof.
-    pub(crate) fn create_admission_proof(
+    /// Exchanges bounded node IDs inside mTLS, without consulting metadata.
+    /// A certificate authorizes its own `principal::suffix` namespace only.
+    /// Callers must additionally compare an outbound peer with their target.
+    pub(crate) async fn exchange_node_identity(
         &self,
+        stream: &mut TransportTcpStream,
         node_id: &NodeId,
-        tls_session_binding: &[u8],
-    ) -> Result<AdmissionProof> {
-        match self {
-            Self::Secure(credentials) => {
-                credentials.create_admission_proof(node_id, tls_session_binding)
-            }
-            Self::TrustedDevelopment => {
-                anyhow::bail!("trusted-development transport has no admission proof")
-            }
-        }
+    ) -> Result<NodeId> {
+        let Self::Secure(credentials) = self else {
+            anyhow::bail!("node identity exchange requires secure transport");
+        };
+        credentials
+            .node_certificate_principal
+            .verify_node_id(node_id)?;
+        let peer_principal = stream
+            .peer_principal()
+            .context("node connection has no certificate")?;
+
+        // ponytail: holders of the same certificate are equally trusted;
+        // use independently issued process credentials if fencing is required.
+        let payload = borsh::to_vec(node_id)?;
+        stream.write_u32(u32::try_from(payload.len())?).await?;
+        stream.write_all(&payload).await?;
+        stream.flush().await?;
+        let len = stream.read_u32().await? as usize;
+        anyhow::ensure!(
+            len <= super::MAX_SECURITY_ID_BYTES + std::mem::size_of::<u32>(),
+            "node identity frame too large"
+        );
+        let mut peer_payload = vec![0; len];
+        stream.read_exact(&mut peer_payload).await?;
+        let peer = borsh::from_slice(&peer_payload)?;
+        peer_principal.verify_node_id(&peer)?;
+        Ok(peer)
     }
 
     fn load_certificates(path: &Path, kind: &'static str) -> Result<Vec<CertificateDer<'static>>> {
@@ -258,24 +271,14 @@ impl NodeTransportSecurity {
         }
         Self::build_credentials(certificate_chain, private_key, trust_roots).map(Self::Secure)
     }
-    #[cfg(test)]
-    pub(crate) fn process_public_key(&self) -> Result<Box<[u8]>> {
-        match self {
-            Self::Secure(credentials) => Ok(credentials.process_signing_key.public_key()),
-            Self::TrustedDevelopment => {
-                anyhow::bail!("trusted-development transport has no process public key")
-            }
-        }
-    }
 }
 
-/// TLS credentials and process identity loaded for secure mode.
+/// TLS credentials loaded for secure mode.
 #[derive(Clone)]
 pub(crate) struct NodeCredentials {
     server: Arc<ServerConfig>,
     client: Arc<ClientConfig>,
     node_certificate_principal: CertificatePrincipal,
-    process_signing_key: Arc<ProcessSigningKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, BorshSerialize, BorshDeserialize)]
@@ -289,6 +292,20 @@ impl CertificatePrincipal {
     pub(crate) fn has_valid_length(&self) -> bool {
         !self.0.is_empty() && self.0.len() <= super::MAX_SECURITY_ID_BYTES
     }
+
+    pub(crate) fn verify_node_id(&self, node_id: &NodeId) -> Result<()> {
+        anyhow::ensure!(
+            self.has_valid_length()
+                && node_id.len() <= super::MAX_SECURITY_ID_BYTES
+                && node_id
+                    .rsplit_once("::")
+                    .is_some_and(|(principal, suffix)| {
+                        principal == self.as_ref() && !suffix.is_empty()
+                    }),
+            "node ID does not belong to the certificate principal"
+        );
+        Ok(())
+    }
 }
 
 impl AsRef<str> for CertificatePrincipal {
@@ -298,28 +315,20 @@ impl AsRef<str> for CertificatePrincipal {
 }
 
 impl NodeCredentials {
+    fn validate_node_prefix(&self, prefix: Option<&str>) -> Result<()> {
+        anyhow::ensure!(
+            prefix == Some(self.node_certificate_principal.as_ref()),
+            "node_id_prefix must match the node certificate principal in secure mode"
+        );
+        Ok(())
+    }
+
     pub(crate) fn server_config(&self) -> Arc<ServerConfig> {
         self.server.clone()
     }
 
     pub(crate) fn client_config(&self) -> Arc<ClientConfig> {
         self.client.clone()
-    }
-
-    /// Creates proof that a node connection belongs to this exact process.
-    ///
-    /// The TLS session binding makes the proof unique to one connection. Only
-    /// the process public key is stored in metadata Raft.
-    pub(crate) fn create_admission_proof(
-        &self,
-        node_id: &NodeId,
-        tls_session_binding: &[u8],
-    ) -> Result<AdmissionProof> {
-        self.process_signing_key.sign(
-            &self.node_certificate_principal,
-            node_id,
-            tls_session_binding,
-        )
     }
 }
 
@@ -338,6 +347,57 @@ mod tests {
             .collect();
         let key = KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().der().clone()
+    }
+
+    #[test]
+    fn certificate_owns_only_its_exact_node_id_namespace() {
+        let principal = CertificatePrincipal::new("broker-a");
+        for valid in ["broker-a::1", "broker-a::2"] {
+            principal.verify_node_id(&NodeId::new(valid)).unwrap();
+        }
+        for invalid in [
+            "",
+            "broker-a",
+            "broker-a::",
+            "broker-ab::1",
+            "broker-b::1",
+            "broker-a::1::2",
+        ] {
+            assert!(
+                principal.verify_node_id(&NodeId::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            principal
+                .verify_node_id(&NodeId::new(format!(
+                    "broker-a::{}",
+                    "x".repeat(super::super::MAX_SECURITY_ID_BYTES)
+                )))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn secure_config_requires_certificate_bound_node_prefix() {
+        let mut params = CertificateParams::default();
+        params.subject_alt_names.push(SanType::URI(
+            Ia5String::try_from("urn:eastguard:node:broker-a").unwrap(),
+        ));
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let security = NodeTransportSecurity::test_secure(
+            vec![certificate.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            &[certificate.der().clone()],
+        )
+        .unwrap();
+        let NodeTransportSecurity::Secure(credentials) = security else {
+            unreachable!()
+        };
+        assert!(credentials.validate_node_prefix(None).is_err());
+        assert!(credentials.validate_node_prefix(Some("broker-b")).is_err());
+        credentials.validate_node_prefix(Some("broker-a")).unwrap();
     }
 
     #[test]

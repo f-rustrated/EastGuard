@@ -39,7 +39,11 @@ pub(crate) async fn run_client_writer(
         if matches!(response, ClientResponse::Stop) {
             break;
         }
-        write_half.write(request_id, &response).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_half.write(request_id, &response),
+        )
+        .await??;
     }
     Ok(())
 }

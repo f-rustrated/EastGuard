@@ -81,15 +81,6 @@ impl AuthenticatedTcpStream {
     pub fn peer_principal(&self) -> &CertificatePrincipal {
         &self.peer_principal
     }
-
-    fn into_split(
-        self,
-    ) -> (
-        tokio::io::ReadHalf<AuthenticatedTcpStream>,
-        tokio::io::WriteHalf<AuthenticatedTcpStream>,
-    ) {
-        tokio::io::split(self)
-    }
 }
 
 /// TCP transport connection. Secure mode carries an authenticated certificate
@@ -101,12 +92,12 @@ pub enum TransportTcpStream {
 
 pub enum TransportReadHalf {
     TrustedDevelopment(OwnedReadHalf),
-    Secure(tokio::io::ReadHalf<AuthenticatedTcpStream>),
+    Secure(tokio::io::ReadHalf<TlsStream<TcpStream>>),
 }
 
 pub enum TransportWriteHalf {
     TrustedDevelopment(OwnedWriteHalf),
-    Secure(tokio::io::WriteHalf<AuthenticatedTcpStream>),
+    Secure(tokio::io::WriteHalf<TlsStream<TcpStream>>),
 }
 
 impl From<OwnedReadHalf> for TransportReadHalf {
@@ -175,7 +166,7 @@ impl TransportTcpStream {
                 )
             }
             Self::Secure(stream) => {
-                let (read, write) = AuthenticatedTcpStream::into_split(*stream);
+                let (read, write) = tokio::io::split(stream.stream);
                 (
                     TransportReadHalf::Secure(read),
                     TransportWriteHalf::Secure(write),
@@ -185,57 +176,45 @@ impl TransportTcpStream {
     }
 }
 
-macro_rules! impl_transport_io {
-    ($type:ty) => {
-        impl AsyncRead for $type {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                match &mut *self {
-                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_read(cx, buf),
-                    Self::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
-                }
-            }
+impl AsyncRead for TransportTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Secure(stream) => Pin::new(&mut stream.stream).poll_read(cx, buf),
         }
-
-        impl AsyncWrite for $type {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                match &mut *self {
-                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_write(cx, buf),
-                    Self::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
-                }
-            }
-
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                match &mut *self {
-                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_flush(cx),
-                    Self::Secure(stream) => Pin::new(stream).poll_flush(cx),
-                }
-            }
-
-            fn poll_shutdown(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                match &mut *self {
-                    Self::TrustedDevelopment(stream) => Pin::new(stream).poll_shutdown(cx),
-                    Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
-                }
-            }
-        }
-    };
+    }
 }
 
-impl_transport_io!(TransportTcpStream);
+impl AsyncWrite for TransportTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Secure(stream) => Pin::new(&mut stream.stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Secure(stream) => Pin::new(&mut stream.stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::TrustedDevelopment(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Secure(stream) => Pin::new(&mut stream.stream).poll_shutdown(cx),
+        }
+    }
+}
 
 impl AsyncRead for TransportReadHalf {
     fn poll_read(
@@ -274,34 +253,6 @@ impl AsyncWrite for TransportWriteHalf {
             Self::TrustedDevelopment(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
         }
-    }
-}
-
-impl AsyncRead for AuthenticatedTcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for AuthenticatedTcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -456,26 +407,31 @@ mod tests {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (stream, _) = listener.accept().await?;
                 let stream = TlsAcceptor::from(server_config).accept(stream).await?;
-                let mut stream = AuthenticatedTcpStream::from_tls_stream(
+                let stream = AuthenticatedTcpStream::from_tls_stream(
                     stream.into(),
                     node_certificate_principal,
                 )?;
                 assert_eq!(stream.peer_principal().as_ref(), "broker-client");
+                let (mut reader, mut writer) =
+                    TransportTcpStream::Secure(Box::new(stream)).into_split();
                 let mut message = [0; 4];
-                stream.read_exact(&mut message).await?;
+                reader.read_exact(&mut message).await?;
                 assert_eq!(&message, b"ping");
-                stream.write_all(b"pong").await?;
+                writer.write_all(b"pong").await?;
+                writer.flush().await?;
                 Ok(())
             }
         });
 
         sim.client("client", async move {
-            let mut stream =
+            let stream =
                 AuthenticatedTcpStream::connect((turmoil::lookup("server"), 9000), client_config)
                     .await
                     .unwrap();
             assert_eq!(stream.peer_principal().as_ref(), "broker-server");
+            let mut stream = TransportTcpStream::Secure(Box::new(stream));
             stream.write_all(b"ping").await?;
+            stream.flush().await?;
             let mut message = [0; 4];
             stream.read_exact(&mut message).await?;
             assert_eq!(&message, b"pong");
