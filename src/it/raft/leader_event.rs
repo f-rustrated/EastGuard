@@ -19,6 +19,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
+use crate::security::{NodeTransportSecurity, SecurityActor};
 
 use super::CLUSTER_PORT;
 
@@ -114,12 +115,23 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     TICK_PERIOD_100_MS,
                     Some(PROBE_INTERVAL_TICKS),
                 );
+                let all_nodes: Vec<&str> =
+                    std::iter::once(name).chain(peers.iter().copied()).collect();
+                let topology_reader = super::stub_topology_reader(&all_nodes);
+                let security = SecurityActor::spawn(
+                    node_id.clone(),
+                    swim_tx.clone(),
+                    raft_tx.clone(),
+                    topology_reader.clone(),
+                    NodeTransportSecurity::TrustedDevelopment,
+                );
                 tokio::spawn(RaftTransportActor::run(
                     node_id.clone(),
                     listener,
                     raft_tx.clone(),
                     transport_rx,
                     swim_tx.clone(),
+                    security,
                 ));
                 let db = MetadataStorage::open(
                     std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
@@ -130,9 +142,6 @@ fn leader_election_emits_leader_change_event() -> turmoil::Result {
                     h.finish()
                 };
                 let (data_tx, _) = tokio::sync::mpsc::channel(1);
-                let all_nodes: Vec<&str> =
-                    std::iter::once(name).chain(peers.iter().copied()).collect();
-                let topology_reader = super::stub_topology_reader(&all_nodes);
                 MultiRaftActor::spawn(
                     ticker_tx.clone(),
                     raft_mailbox,

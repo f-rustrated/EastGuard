@@ -30,7 +30,7 @@ pub use error::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{EntryId, SyncConsumerGroupRequest},
+    control_plane::metadata::{EntryId, UpdateConsumerGroupMemberRequest},
     data_plane::{
         auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition,
         messages::query::RangeOffsets,
@@ -126,4 +126,8 @@ impl_from_variant_via!(
     FetchConsumerOffsetRequest
 );
 
-impl_from_variant_via!(ClientRequest, ControlPlaneRequest, SyncConsumerGroupRequest);
+impl_from_variant_via!(
+    ClientRequest,
+    ControlPlaneRequest,
+    UpdateConsumerGroupMemberRequest
+);

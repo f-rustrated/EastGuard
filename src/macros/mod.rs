@@ -32,7 +32,6 @@ macro_rules! impl_new_struct_wrapper {
                 $wrapper_name(val)
             }
         }
-
         $crate::smart_pointer!($wrapper_name, $type);
     };
 }

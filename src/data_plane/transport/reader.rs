@@ -1,48 +1,55 @@
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
 use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
-use crate::net::OwnedReadHalf;
+use crate::net::TransportReadHalf;
 
-const NODE_ID_FRAME_MAX: usize = 1024;
-const DATA_FRAME_MAX: usize = 64 * 1024 * 1024;
+use super::connection::{DATA_FRAME_MAX, read_frame};
 
-pub(super) struct DataReader(pub OwnedReadHalf);
+pub(super) struct ConnectionClosed {
+    pub(super) peer: NodeId,
+    pub(super) generation: u64,
+}
+
+pub(super) struct DataReader {
+    read_half: TransportReadHalf,
+}
 
 impl DataReader {
-    async fn read_frame<T: borsh::BorshDeserialize>(&mut self, max: usize) -> anyhow::Result<T> {
-        let len = self.0.read_u32().await? as usize;
-        anyhow::ensure!(len <= max, "frame too large: {len} bytes (max {max})");
-        let mut buf = vec![0u8; len];
-        self.0.read_exact(&mut buf).await?;
-        let val = borsh::from_slice::<T>(&buf)?;
-        Ok(val)
+    pub(super) fn new(read_half: TransportReadHalf) -> Self {
+        Self { read_half }
     }
 
-    pub(crate) async fn read_node_id(&mut self) -> anyhow::Result<NodeId> {
-        self.read_frame(NODE_ID_FRAME_MAX).await
-    }
-
+    #[tracing::instrument(
+        level = "trace",
+        skip_all,
+        fields(peer = %closed.peer)
+    )]
     pub(crate) async fn run(
         mut self,
         data_plane_tx: DataPlaneSender,
-        peer: NodeId,
-        disconnect_tx: mpsc::Sender<NodeId>,
+        closed: ConnectionClosed,
+        disconnect_tx: mpsc::Sender<ConnectionClosed>,
     ) {
         loop {
-            match self.read_frame::<ReceivePeerMessage>(DATA_FRAME_MAX).await {
+            match read_frame::<ReceivePeerMessage>(&mut self.read_half, DATA_FRAME_MAX).await {
                 Ok(message) => {
-                    if message.from != peer {
+                    if message.from != closed.peer {
                         tracing::warn!(
-                            transport_peer = ?peer,
+                            transport_peer = ?closed.peer,
                             claimed_sender = ?message.from,
                             "rejected peer message whose sender differs from the connection peer"
                         );
-                        return;
+                        break;
                     }
-                    let _ = data_plane_tx.send(DataPlaneCommand::ReceivePeerMessage(message));
+                    if data_plane_tx
+                        .send_async(DataPlaneCommand::ReceivePeerMessage(message))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("DataReader connection closed: {e}");
@@ -51,13 +58,61 @@ impl DataReader {
             }
         }
 
-        // Read inbound frames until the connection closes, then signal the
-        // transport to evict `peer`'s cached writer. Without this, a connection
-        // that dies (peer reset, or the loser of a simultaneous-connect race) would
-        // leave a half-open writer behind — `write_message` keeps succeeding into
-        // the local TCP buffer and bytes silently vanish, so retries never recover.
-        // Eviction forces the next send to reconnect; a spurious eviction only
-        // costs one reconnect, so it's always safe.
-        let _ = disconnect_tx.send(peer).await;
+        // A replaced reader must not evict a newer connection for the same peer.
+        let _ = disconnect_tx.send(closed).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::connection::write_frame;
+    use super::*;
+    use crate::data_plane::messages::command::DeleteSegments;
+    use crate::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    #[test]
+    fn forged_sender_is_not_dispatched_and_evicts_its_writer() -> turmoil::Result {
+        let mut sim = turmoil::Builder::new()
+            .rng_seed(13)
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+        sim.host("server", || async {
+            let listener = TcpListener::bind("0.0.0.0:9000").await?;
+            let (mut stream, _) = listener.accept().await?;
+            let message = ReceivePeerMessage {
+                from: NodeId::new("forged"),
+                message: Box::new(
+                    DeleteSegments {
+                        segment_keys: Box::new([]),
+                    }
+                    .into(),
+                ),
+            };
+            write_frame(&mut stream, &message, DATA_FRAME_MAX).await?;
+            std::future::pending::<turmoil::Result>().await
+        });
+        sim.client("client", async {
+            let stream = TcpStream::connect((turmoil::lookup("server"), 9000)).await?;
+            let (reader, _writer) = stream.into_split();
+            let (data_tx, data_rx) = flume::bounded(1);
+            let (closed_tx, mut closed_rx) = mpsc::channel(1);
+            DataReader::new(reader.into())
+                .run(
+                    DataPlaneSender(data_tx),
+                    ConnectionClosed {
+                        peer: NodeId::new("server"),
+                        generation: 7,
+                    },
+                    closed_tx,
+                )
+                .await;
+            assert!(data_rx.is_empty());
+            let closed = closed_rx.recv().await.unwrap();
+            assert_eq!(closed.peer, NodeId::new("server"));
+            assert_eq!(closed.generation, 7);
+            Ok(())
+        });
+        sim.run()
     }
 }

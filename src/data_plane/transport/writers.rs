@@ -11,7 +11,8 @@ use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{
     DataPlaneCommand, DataPlanePeerMessage, ReceivePeerMessage,
 };
-use crate::net::{OwnedWriteHalf, TcpStream};
+use crate::net::{TransportTcpStream, TransportWriteHalf};
+use crate::security::NodeTransportSecurity;
 
 use super::reader::DataReader;
 
@@ -19,30 +20,33 @@ const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(super) struct TransportState {
     node_id: NodeId,
-    writers: HashMap<NodeId, OwnedWriteHalf>,
+    writers: HashMap<NodeId, TransportWriteHalf>,
     dead_peers: HashSet<NodeId>,
     /// Tracks when the last connect attempt to a peer failed. Skips retry
     /// for CONNECT_BACKOFF (2s) to avoid blocking the select loop on repeated
     /// 3s TCP timeouts to unreachable peers. Cleared by periodic cleanup (300s).
     connect_backoffs: HashMap<NodeId, Instant>,
+    security: NodeTransportSecurity,
 }
 
 impl TransportState {
-    pub fn new(node_id: NodeId) -> Self {
+    pub fn new(node_id: NodeId, security: NodeTransportSecurity) -> Self {
         Self {
             node_id,
             writers: HashMap::new(),
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
+            security,
         }
     }
 
     pub async fn accept(
         &mut self,
-        stream: crate::net::TcpStream,
+        stream: TransportTcpStream,
     ) -> anyhow::Result<(NodeId, DataReader)> {
+        let certificate_principal = stream.peer_principal();
         let (read_half, write_half) = stream.into_split();
-        let mut reader = DataReader(read_half);
+        let mut reader = DataReader::new(read_half, certificate_principal);
 
         let peer_id = reader.read_node_id().await?;
 
@@ -132,12 +136,13 @@ impl TransportState {
 
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            TcpStream::connect(node_addr.data_addr()),
+            TransportTcpStream::connect_node(node_addr.data_addr(), &self.security),
         )
         .await
         .context("connect timed out")?
         .context("TCP connect failed")?;
 
+        let certificate_principal = stream.peer_principal();
         let (read_half, write_half) = stream.into_split();
         self.writers.insert(target_id.clone(), write_half);
 
@@ -151,7 +156,7 @@ impl TransportState {
             return Err(e).context("initial write failed");
         }
 
-        Ok(DataReader(read_half))
+        Ok(DataReader::new(read_half, certificate_principal))
     }
 
     pub fn disconnect(&mut self, peer_id: NodeId) {

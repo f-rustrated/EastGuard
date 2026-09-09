@@ -21,7 +21,11 @@ MetadataStateMachine (one per shard group)
 │
 │   SegmentMeta (nested inside RangeMeta)
 │
-└── topic_name_index: HashMap<String, TopicId>
+├── topic_name_index: HashMap<String, TopicId>
+└── security
+    ├── admissions: Node Certificate Principal → Admission Record
+    ├── ACLs: Resource → ACL Record
+    └── revocations: (Issuer, Serial) → Revocation Record
 ```
 
 ## Commands
@@ -80,3 +84,5 @@ MetadataStateMachine (one per shard group)
 21. **`ReassignSegment` only re-points a sealed segment.** `apply_reassign_segment()` accepts only a `Sealed` segment, swaps `replica_set`, and changes nothing else — state stays `Sealed`; data, offsets, lineage, and timestamps stay frozen (invariant 3). An active, deleting, or unknown segment is rejected (`SegmentNotSealed` / `SegmentNotFound`), logged but not fatal (invariant 11). Re-applying with the same `replica_set` succeeds without raising a metadata event, tolerating duplicate death detection and no-leader re-proposals (cf. invariant 19). The swap runs through `apply`, so the umbrella `assert_invariants` re-checks every other invariant afterward — a reassignment cannot leave the machine inconsistent.
 
 22. **A committed consumer-group generation assigns each active range exactly once.** When a group has members, its assignment keys exactly equal the topic's active ranges and every assignment names a current member. When it has no members, it has no assignments. Membership or range-topology changes advance the generation and recompute the full desired assignment through the Raft log; heartbeat refreshes that do not change membership leave the generation unchanged.
+
+23. **Security map keys match their records.** Admission keys equal the record's Node Certificate Principal, ACL keys equal the record's resource, and revocation keys equal the record's issuer and serial. A map therefore contains at most one current admission per Node Certificate Principal and snapshot restore cannot silently associate a security record with a different lookup key.

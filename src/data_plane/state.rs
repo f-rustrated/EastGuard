@@ -3682,8 +3682,8 @@ mod tests {
     /// `WalRecord` format agreement with `checkpoint.rs`, and `record_count`
     /// round-tripping through the file. Bypasses the coordinator seal round-trip
     /// (driven directly) so it's deterministic.
-    #[test]
-    fn cold_fetch_serves_sealed_segment_from_disk() {
+    #[tokio::test]
+    async fn cold_fetch_serves_sealed_segment_from_disk() {
         use crate::connections::protocol::RangeProgressSignal;
         use crate::data_plane::cold_read::ColdReadPool;
         use crate::data_plane::messages::query::{DataPlaneQuery, Fetch};
@@ -3777,9 +3777,7 @@ mod tests {
             reply,
         })));
 
-        let result = reply_rx
-            .blocking_recv()
-            .expect("cold-read pool dropped the reply");
+        let result = reply_rx.await.expect("cold-read pool dropped the reply");
         let FetchedRecords {
             entries,
             next_entry_id,

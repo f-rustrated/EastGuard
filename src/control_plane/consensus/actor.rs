@@ -8,11 +8,12 @@ use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::*;
 use crate::control_plane::consensus::multi_raft::MultiRaft;
 use crate::control_plane::consensus::raft::errors::ProposalError;
+use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
+    AclResource, ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
@@ -276,6 +277,26 @@ impl MutlRaftSender {
             })
             .await;
         recv.await.unwrap_or_default()
+    }
+
+    /// Reads the committed ACL snapshot from the selected metadata shard's
+    /// leader. A missing ACL is an empty, cacheable denial; routing and actor
+    /// failures remain observable errors and must not be cached.
+    pub(crate) async fn get_acl_snapshot(
+        &self,
+        shard_group_id: ShardGroupId,
+        resource: AclResource,
+    ) -> Result<AclRecord, ServerError> {
+        let (reply, recv) = tokio::sync::oneshot::channel();
+        self.send(GetAclSnapshot {
+            shard_group_id,
+            resource,
+            reply,
+        })
+        .await
+        .map_err(|error| ServerError::Internal(error.to_string()))?;
+        recv.await
+            .map_err(|error| ServerError::Internal(error.to_string()))?
     }
 
     pub(crate) async fn send(

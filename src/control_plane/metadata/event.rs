@@ -1,5 +1,5 @@
 use crate::control_plane::Replicas;
-use crate::control_plane::consensus::multi_raft::RollRequestContext;
+use crate::control_plane::consensus::pending_rolls::RollRequestContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};

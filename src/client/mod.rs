@@ -36,7 +36,7 @@ use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
+use crate::control_plane::metadata::{TopicId, UpdateConsumerGroupMemberRequest};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, CommitConsumerOffsetRequest,
-    ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
+    ConsumerGroupAssignmentResponse, ConsumerGroupMemberAction, ControlPlaneRequest,
     FetchConsumerOffsetRequest, OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened,
     RangeOffsetRequest,
 };
@@ -504,8 +504,11 @@ impl Client {
                     Redirect::Follow(owner.client_addr())
                 }
                 ServerError::TopicNotFound => Redirect::NotFound,
-                ServerError::SegmentNotLocal | ServerError::Internal(_) => Redirect::Reresolve,
+                ServerError::SegmentNotLocal | ServerError::Internal(_) | ServerError::Busy => {
+                    Redirect::Reresolve
+                }
                 ServerError::AlreadyExists
+                | ServerError::Unauthorized
                 | ServerError::StaleRange
                 | ServerError::ProduceRejected(_)
                 | ServerError::EntryIdOutOfRange
