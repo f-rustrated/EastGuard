@@ -32,6 +32,7 @@ use crate::data_plane::messages::query::{
 use crate::net::TransportTcpStream;
 use crate::security::{CertificatePrincipal, SecurityHandle};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 /// # Client ↔ Server request_id protocol
 ///
@@ -76,16 +77,26 @@ impl ClientController {
         }
     }
 
-    /// Reads frames in a loop, spawning one handler task per request.
+    /// Spawns up to 32 handlers; excess requests get Busy before dispatch.
     pub async fn run(
         &self,
         mut reader: ClientStreamReader,
         writer_tx: mpsc::Sender<(u64, ClientResponse)>,
     ) {
+        // per-connection cap; add a node-wide budget if load tests require one.
+        let mut handlers = JoinSet::new();
         loop {
             // TODO idempotency based on request id (or separate idempotence key)
             match reader.read_request::<ClientRequest>().await {
                 Ok((request_id, request)) => {
+                    while handlers.try_join_next().is_some() {}
+                    if handlers.len() >= 32 {
+                        let response = ClientResponse::Err(ServerError::Busy);
+                        if writer_tx.send((request_id, response)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let writer_tx = writer_tx.clone();
                     let controller = self.clone();
                     // Spawn a task per request to process them concurrently. This prevents
@@ -93,8 +104,18 @@ impl ClientController {
                     // (e.g. disk reads or consensus proposals) won't block fast hot-cache reads
                     // from other concurrent client threads. Strict partition-level ordering for
                     // sequential clients remains intact because they await responses sequentially.
-                    tokio::spawn(async move {
-                        let response = controller.dispatch(request).await;
+                    handlers.spawn(async move {
+                        let response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            controller.dispatch(request),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => ClientResponse::Err(ServerError::Internal(
+                                "request timed out".into(),
+                            )),
+                        };
                         if writer_tx.send((request_id, response)).await.is_err() {
                             tracing::debug!("client writer closed");
                         }
@@ -698,13 +719,11 @@ pub async fn handle_client_stream(
         data_plane_tx,
         security,
     );
-    tokio::spawn(run_client_writer(
-        ClientRawWriter::new(write_half),
-        writer_rx,
-    ));
-    handler
-        .run(ClientStreamReader::new(read_half), writer_tx)
-        .await;
+    // Once either side observes closure, cancel the other and its handlers.
+    tokio::select! {
+        _ = run_client_writer(ClientRawWriter::new(write_half), writer_rx) => {}
+        _ = handler.run(ClientStreamReader::new(read_half), writer_tx) => {}
+    }
 }
 
 #[cfg(test)]
@@ -744,6 +763,74 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn busy_requests_are_not_dispatched_and_can_retry_on_the_same_connection() -> turmoil::Result {
+        let mut sim = Builder::new()
+            .rng_seed(17)
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+        sim.client("handler", async {
+            let (swim, mut mailbox) = SwimActor::channel(64);
+            let (raft, _raft_rx) = MultiRaftActor::channel(1);
+            let controller = trusted_controller(node_id("node-1"), swim, raft, dp_stub());
+            let listener = TcpListener::bind("0.0.0.0:9000").await?;
+            let (client, server) = tokio::join!(
+                crate::net::TcpStream::connect((turmoil::lookup("handler"), 9000)),
+                listener.accept(),
+            );
+            let (read_half, write_half) = server?.0.into_split();
+            let (responses, response_rx) = mpsc::channel(128);
+            let handler = tokio::spawn(async move {
+                tokio::select! {
+                    _ = controller.run(ClientStreamReader::new(read_half), responses) => {}
+                    _ = run_client_writer(ClientRawWriter::new(write_half), response_rx) => {}
+                }
+            });
+            let (reader, writer) = client?.into_split();
+            let mut reader = ClientStreamReader::new(reader);
+            let mut writer = ClientRawWriter::new(writer);
+            let request = ClientRequest::Admin(AdminRequest::DescribeCluster);
+            for id in 0..33 {
+                writer.write(id, &request).await?;
+            }
+            let (overflow_id, rejection) = reader.read_request::<ClientResponse>().await?;
+            assert_eq!(overflow_id, 32);
+            assert!(matches!(rejection, ClientResponse::Err(ServerError::Busy)));
+
+            let mut pending = Vec::new();
+            for _ in 0..32 {
+                let Some(SwimActorCommand::Query(QueryCommand::GetMembers { reply })) =
+                    mailbox.recv().await
+                else {
+                    panic!("accepted request should execute");
+                };
+                pending.push(reply);
+            }
+            assert!(mailbox.try_recv().is_err());
+            pending.pop().unwrap().send(Vec::new()).unwrap();
+            let (_, completed) = reader.read_request::<ClientResponse>().await?;
+            assert!(matches!(completed, ClientResponse::Ok(_)));
+
+            writer.write(33, &request).await?;
+            let Some(SwimActorCommand::Query(QueryCommand::GetMembers { reply })) =
+                mailbox.recv().await
+            else {
+                panic!("retry should execute after a handler finishes");
+            };
+            reply.send(Vec::new()).unwrap();
+            let (retry_id, retried) = reader.read_request::<ClientResponse>().await?;
+            assert_eq!(retry_id, 33);
+            assert!(matches!(retried, ClientResponse::Ok(_)));
+
+            handler.abort();
+            assert!(handler.await.unwrap_err().is_cancelled());
+            tokio::task::yield_now().await;
+            assert!(pending.iter().all(tokio::sync::oneshot::Sender::is_closed));
+            Ok(())
+        });
+        sim.run()
     }
 
     fn node_id(s: &str) -> NodeId {

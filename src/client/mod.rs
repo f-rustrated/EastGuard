@@ -504,7 +504,9 @@ impl Client {
                     Redirect::Follow(owner.client_addr())
                 }
                 ServerError::TopicNotFound => Redirect::NotFound,
-                ServerError::SegmentNotLocal | ServerError::Internal(_) => Redirect::Reresolve,
+                ServerError::SegmentNotLocal | ServerError::Internal(_) | ServerError::Busy => {
+                    Redirect::Reresolve
+                }
                 ServerError::AlreadyExists
                 | ServerError::Unauthorized
                 | ServerError::StaleRange

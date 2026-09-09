@@ -59,6 +59,10 @@ pub enum ServerError {
 
     #[error("internal server error: {0}")]
     Internal(String),
+
+    /// This attempt was rejected before dispatch; retry with backoff.
+    #[error("server busy; retry later")]
+    Busy,
 }
 
 impl ServerError {
