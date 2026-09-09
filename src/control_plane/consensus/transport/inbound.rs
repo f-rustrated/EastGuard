@@ -94,6 +94,7 @@ pub(super) async fn accept_cluster_connection(
         stream,
         security.node_transport(),
         node_certificate_principal,
+        super::CLUSTER_HANDSHAKE_TIMEOUT,
     )
     .await?;
 

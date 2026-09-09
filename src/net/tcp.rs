@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use rustls::pki_types::ServerName;
@@ -117,12 +118,16 @@ impl TransportTcpStream {
         stream: TcpStream,
         security: &NodeTransportSecurity,
         read_principal: fn(&rustls::pki_types::CertificateDer<'_>) -> Result<CertificatePrincipal>,
+        handshake_timeout: Duration,
     ) -> Result<Self> {
         match security {
             NodeTransportSecurity::Secure(security) => {
-                let stream = TlsAcceptor::from(security.server_config())
-                    .accept(stream)
-                    .await?;
+                let stream = tokio::time::timeout(
+                    handshake_timeout,
+                    TlsAcceptor::from(security.server_config()).accept(stream),
+                )
+                .await
+                .context("TLS handshake timed out")??;
                 AuthenticatedTcpStream::from_tls_stream(stream.into(), read_principal)
                     .map(Box::new)
                     .map(Self::Secure)
@@ -344,8 +349,7 @@ mod tests {
     use rcgen::string::Ia5String;
     use rcgen::{CertificateParams, KeyPair, SanType};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::server::WebPkiClientVerifier;
-    use rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use rustls::{ClientConfig, RootCertStore};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use turmoil::Builder;
 
@@ -372,20 +376,17 @@ mod tests {
         (certificate, key)
     }
 
-    fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    fn tls_configs() -> (NodeTransportSecurity, Arc<ClientConfig>) {
         let (server_certificate, server_key) =
             certificate("node", "broker-server", Some("unused.eastguard"));
         let (client_certificate, client_key) = certificate("node", "broker-client", None);
 
-        let mut client_roots = RootCertStore::empty();
-        client_roots.add(client_certificate.clone()).unwrap();
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-            .build()
-            .unwrap();
-        let server = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(vec![server_certificate.clone()], server_key)
-            .unwrap();
+        let server = NodeTransportSecurity::test_secure(
+            vec![server_certificate.clone()],
+            server_key,
+            std::slice::from_ref(&client_certificate),
+        )
+        .unwrap();
 
         let mut server_roots = RootCertStore::empty();
         server_roots.add(server_certificate).unwrap();
@@ -393,7 +394,7 @@ mod tests {
             .with_root_certificates(server_roots)
             .with_client_auth_cert(vec![client_certificate], client_key)
             .unwrap();
-        (Arc::new(server), Arc::new(client))
+        (server, Arc::new(client))
     }
 
     #[test]
@@ -406,14 +407,15 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (stream, _) = listener.accept().await?;
-                let stream = TlsAcceptor::from(server_config).accept(stream).await?;
-                let stream = AuthenticatedTcpStream::from_tls_stream(
-                    stream.into(),
+                let stream = TransportTcpStream::accept(
+                    stream,
+                    &server_config,
                     node_certificate_principal,
-                )?;
-                assert_eq!(stream.peer_principal().as_ref(), "broker-client");
-                let (mut reader, mut writer) =
-                    TransportTcpStream::Secure(Box::new(stream)).into_split();
+                    Duration::from_secs(1),
+                )
+                .await?;
+                assert_eq!(stream.peer_principal().unwrap().as_ref(), "broker-client");
+                let (mut reader, mut writer) = stream.into_split();
                 let mut message = [0; 4];
                 reader.read_exact(&mut message).await?;
                 assert_eq!(&message, b"ping");
@@ -447,17 +449,11 @@ mod tests {
             certificate("node", "broker-server", Some("unused.eastguard"));
         let (client_certificate, client_key) = certificate("client", "producer-a", None);
 
-        let mut client_roots = RootCertStore::empty();
-        client_roots.add(client_certificate.clone()).unwrap();
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-            .build()
-            .unwrap();
-        let server_config = Arc::new(
-            ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_client_cert_verifier(client_verifier)
-                .with_single_cert(vec![server_certificate.clone()], server_key)
-                .unwrap(),
-        );
+        let server_config = NodeTransportSecurity::test_secure(
+            vec![server_certificate.clone()],
+            server_key,
+            std::slice::from_ref(&client_certificate),
+        )?;
 
         let mut server_roots = RootCertStore::empty();
         server_roots.add(server_certificate).unwrap();
@@ -474,12 +470,14 @@ mod tests {
             async move {
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
                 let (stream, _) = listener.accept().await?;
-                let stream = TlsAcceptor::from(server_config).accept(stream).await?;
-                let stream = AuthenticatedTcpStream::from_tls_stream(
-                    stream.into(),
+                let stream = TransportTcpStream::accept(
+                    stream,
+                    &server_config,
                     client_certificate_principal,
-                )?;
-                assert_eq!(stream.peer_principal().as_ref(), "producer-a");
+                    Duration::from_secs(1),
+                )
+                .await?;
+                assert_eq!(stream.peer_principal().unwrap().as_ref(), "producer-a");
                 Ok(())
             }
         });
@@ -493,5 +491,59 @@ mod tests {
         });
 
         sim.run()
+    }
+
+    #[test]
+    fn accept_uses_the_callers_tls_timeout() -> turmoil::Result {
+        let (security, _) = tls_configs();
+        for timeout_ms in [25, 75] {
+            let handshake_timeout = Duration::from_millis(timeout_ms);
+            let mut sim = Builder::new().rng_seed(7).build();
+            sim.host("server", {
+                let security = security.clone();
+                move || {
+                    let security = security.clone();
+                    async move {
+                        let listener = TcpListener::bind("0.0.0.0:9000").await?;
+                        let (stream, _) = listener.accept().await?;
+                        let started = tokio::time::Instant::now();
+                        let Err(error) = TransportTcpStream::accept(
+                            stream,
+                            &security,
+                            node_certificate_principal,
+                            handshake_timeout,
+                        )
+                        .await
+                        else {
+                            panic!("a silent peer must not finish TLS");
+                        };
+                        assert!(
+                            error
+                                .downcast_ref::<tokio::time::error::Elapsed>()
+                                .is_some()
+                        );
+                        assert!(started.elapsed() >= handshake_timeout);
+                        assert!(started.elapsed() < handshake_timeout + Duration::from_millis(10));
+                        Ok(())
+                    }
+                }
+            });
+            sim.client("silent", async move {
+                let mut stream = TcpStream::connect((turmoil::lookup("server"), 9000)).await?;
+                let mut byte = [0; 1];
+                assert_eq!(
+                    tokio::time::timeout(
+                        handshake_timeout + Duration::from_millis(100),
+                        stream.read(&mut byte),
+                    )
+                    .await??,
+                    0,
+                    "the timed-out handshake must close its socket",
+                );
+                Ok(())
+            });
+            sim.run()?;
+        }
+        Ok(())
     }
 }
