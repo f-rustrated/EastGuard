@@ -349,7 +349,7 @@ mod tests {
                     if handshake_ok {
                         let mut connection = result?;
                         connection
-                            .send_raft_request(request_vote_message(42, sender))
+                            .send_request(request_vote_message(42, sender).into())
                             .await?;
                         if request_ok {
                             let (_, mut writer) = connection.into_parts();
