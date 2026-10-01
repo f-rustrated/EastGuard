@@ -1,8 +1,8 @@
 # EastGuard Security Roadmap
 
-**Goal:** Encrypt traffic, authenticate brokers and clients, and allow clients
-only explicitly granted actions. Use ordinary certificate-based broker trust,
-with no live metadata read required to establish a broker connection.
+**Goal:** Integrate standard authentication, enforce the application's required
+permissions, and bound protocol work. Delegate credential infrastructure to the
+operator. Choose the deployment trust model before adding security features.
 
 **Depends on:** SWIM, metadata Raft, data placement, and client routing.
 
@@ -13,6 +13,34 @@ an isolated environment. Section 7 separates working code from remaining work.
 ---
 
 ## 1. Trust Model
+
+The proposed near-term scope is authenticated clients with operator-managed
+static permissions. Runtime grant/revoke is an extension for deployments that
+need it. This proposal does not describe a new working configuration: the
+current permission checks still use persisted ACLs, and secure startup still
+aborts before opening listeners.
+
+| Responsibility | Owner |
+| --- | --- |
+| Identity provisioning, certificate issuance, secret distribution, and rotation procedures | Operator's identity and security infrastructure |
+| Encryption and network access restrictions | Deployment infrastructure and/or standard TLS libraries |
+| Topic, consumer-group, and administration permissions | EastGuard |
+| Malformed input, bounded allocations, and protocol correctness | EastGuard |
+
+If every admitted client is deliberately trusted with every operation, a
+deployment-enforced access boundary is another possible product scope. It
+provides no topic-level separation between those clients. That choice must be
+explicit and tested; the existing trusted-development mode is not automatically
+a supported production deployment.
+
+A TCP proxy cannot decide whether a request may fetch or delete a topic without
+understanding EastGuard's protocol. Where permissions are required, the broker
+needs a trustworthy client identity even if infrastructure terminates TLS.
+Persisted permissions are an ordinary broker design: [Kafka stores ACLs in its
+metadata log](https://kafka.apache.org/42/security/authorization-and-acls/), and
+[Pulsar provides authentication and authorization](https://pulsar.apache.org/docs/4.2.x/security-overview/).
+Their existence alone does not justify removing them; deployment requirements
+decide whether EastGuard needs their administration and recovery machinery.
 
 A broker certificate is a school ID: it proves who may enter, not who may lead
 the class or use every toy. Raft membership, data placement, and client
@@ -39,7 +67,7 @@ EastGuard's separate data-replication protocol has their correctness guarantees.
 | Client | TCP 2921 | TLS 1.3, client certificate, request ACL |
 | Raft | TCP 2922 | TLS 1.3, node certificate, certificate-bound node ID |
 | Data | TCP 2923 | Same identity checks as Raft |
-| SWIM | UDP 2922 | Authenticated, encrypted, replay-protected datagrams; deferred |
+| SWIM | UDP 2922 | Deployment protection covering UDP, or a standard secure datagram transport |
 
 Use cluster-specific trust roots and a different private key for each broker.
 Do not use a shared broker identity or a general public CA trust store.
@@ -47,6 +75,8 @@ A redirect is only an address hint: its destination must authenticate and
 authorize again.
 
 ## 2. Who Checks What
+
+The current implementation uses Raft-backed permissions:
 
 ```
 Local certificates and trust roots
@@ -127,7 +157,18 @@ SWIM continues to drive membership discovery and reconciliation. Changes to a
 Raft group's voting membership still commit through its log. Gossip is not an
 independent grant of voter or data-replica authority.
 
-## 4. Client Permissions and the ACL Cache
+## 4. Client Permissions and the Existing ACL Cache
+
+For the proposed static-permission baseline, operators would distribute the
+permission policy with deployment configuration. Missing or invalid policy must
+deny access. Policy changes would use a documented deployment or restart
+procedure. Static policy loading is not implemented yet; it would replace the
+authorization source, while keeping checks at the broker request boundary.
+
+The existing persisted path below remains in use until that transition is
+implemented. Preserve existing snapshot readability. If a deployment keeps
+persisted permissions, their recovery remains required even when wire
+administration is deferred.
 
 Client identity comes from exactly one
 `urn:eastguard:client:<principal>` certificate URI. Grants are exact, with no
@@ -142,9 +183,12 @@ wildcards or inherited permissions. Unknown identities and missing grants deny.
 | `security/cluster` | Manage ACLs and security administration |
 
 Fetching group data also requires topic-data permission. Producer-session
-creation and renewal currently use topic-data permission and bind the session
-to its creator. A separate producer-session resource exists in storage but is
-not an enforced permission.
+creation and renewal use topic-data permission and bind the session to its
+creator. Appends also verify that owner. When local session metadata is absent,
+authenticated appends fail closed because the recovered data ledger cannot
+prove ownership; trusted-development recovery can still use that ledger.
+A separate producer-session resource exists in storage but is not an enforced
+permission.
 
 ACL records stay in ordinary metadata shards. Each change commits through the
 owning shard's Raft group. Reads prove current leadership through a quorum;
@@ -170,14 +214,15 @@ authorize by stable topic ID even when it does not host the topic's metadata.
 
 **Remaining gaps:** some name-based APIs discover placement before checking an
 ACL, produce still depends on local topic metadata, and the Rust client still
-needs mTLS for initial connections and redirects. Exact ACL administration
-comes before global listing, which needs pagination and partial-failure handling.
+needs mTLS for initial connections and redirects. Dynamic ACL administration,
+global listing, pagination, and their recovery requirements belong to the
+runtime grant/revoke extension, rather than the proposed static baseline.
 
 Legacy admission records remain in snapshots solely to preserve the existing
 storage format. They are not read for authentication. Stored revocation records
 also do not enforce revocation by themselves.
 
-## 5. Bootstrap and Credential Operations
+## 5. Bootstrap and Operator-Managed Credentials
 
 Credentials and trust policy must be locally available before Raft starts.
 Their verification must not require a fresh read through the Raft connection
@@ -189,22 +234,29 @@ empty directory. Initial members must agree on initial membership and the first
 operator grant. Persist that initialization was applied and reject conflicting
 input on restart.
 
-Shard recovery must preserve ACL records as membership changes. Hashing a
-record path does not transfer its state to a new owner.
+Shard recovery must preserve any ACL records still used for authorization as
+membership changes. Hashing a record path does not transfer its state to a new
+owner. A static policy source removes that particular dependency only after
+the broker actually uses it.
 
-| Operation | Required result |
+EastGuard consumes credentials; it does not issue certificates, distribute
+private keys, or replace the operator's identity service. The deployment
+contract must state how credentials change and how access is withdrawn.
+
+| Operation | Integration requirement |
 | --- | --- |
 | Process restart | Fresh node ID under the same certified broker name; no metadata admission |
-| Leaf or CA rotation | Online reload, overlapping old/new trust roots, no process identity change |
-| Certificate revocation | Reject new sessions and close matching active sessions within 60 seconds; distribution and freshness policy still need design |
-| Certificate expiry | Reject new sessions and close active ones by expiry, with a bounded clock-skew policy |
-| Recovery | Procedures for lost operator keys, accidental revocation, trust-root replacement, full restart, and partition healing |
+| Leaf or CA rotation | Operator distributes credentials and chooses a tested restart procedure or reload integration |
+| Certificate revocation | State who enforces it and whether existing sessions are closed; promise a deadline only when implemented and tested |
+| Certificate expiry | Standard TLS checks new sessions; choose and document treatment of sessions that outlive the certificate |
+| Recovery | Operator owns credential recovery; EastGuard owns cluster formation, durable state recovery, and partition behavior |
 
 Revocation must not recreate the admission loop. A bounded revocation promise
 requires independently refreshed, locally verifiable policy and fail-closed
 behavior when that policy becomes too old. A Raft row or a long-lived
-certificate alone cannot provide that promise. This remains a production gate,
-not an implemented guarantee.
+certificate alone cannot provide that promise. The earlier 60-second closure
+target is an optional service guarantee, not a universal release requirement.
+Deployments requiring it must supply and test its enforcement before release.
 
 Credentials currently load once, and certificate lifetime is checked during
 the TLS handshake. Online reload, revocation enforcement, and active-session
@@ -235,47 +287,64 @@ handshakes, with total deadlines of 16 and 24 seconds respectively. Those totals
 include TLS and the remaining opening protocol. Load-test these initial limits
 before production.
 
-Keep audit off the protocol's critical path: use a bounded queue, count dropped
-events, and sample repeated failures. Never log private keys or message payloads.
-Per-principal rates remain deferred until shared application identities and
-autoscaling are defined.
+Client frame bodies are limited to 4 MiB, including the request ID. Writers
+measure the encoded size before allocating the serialized body. Hot and cold
+fetches budget entry headers and range metadata before assembling a response;
+even the first entry must fit the wire limit. Large requests return a bounded
+page and a continuation position.
 
-### Secure SWIM remains unfinished
+SDK decoded batches are limited to 4 MiB for uncompressed, LZ4, and Zstd data.
+Record counts must fit both that limit and the payload's minimum eight bytes
+per record before the record array is allocated. Failed SDK writes log request
+kind, request ID, destination, and error, without message contents.
 
-Keep UDP message boundaries and visible packet loss. Select a maintained,
-permissively licensed datagram-security implementation providing encryption,
-broker authentication, and replay rejection. Do not invent custom cryptography.
+Never log private keys or message payloads. Add an audit pipeline when a
+deployment needs one; keep it off the protocol's critical path with a bounded
+queue and observable drops. Per-principal rates remain deferred until shared
+application identities and autoscaling are defined.
 
-It must run through EastGuard's UDP abstraction and virtual time so turmoil can
-test loss, retries, replay, and expiry. Define validation of relayed membership
-facts under the trusted-broker model, without restoring process admission.
+### SWIM needs an explicit deployment boundary
 
-Bound handshake, session, and replay-tracking memory. Per-peer state is
-acceptable; eviction must not make captured packets valid again. Limit payloads
-to avoid IP fragmentation. A single cluster-wide key does not identify individual
-brokers, and network isolation alone is development protection.
+SWIM is currently plaintext UDP. Deployment infrastructure may protect that
+traffic if the chosen trust model accepts its broker admission boundary and
+prevents untrusted access. Verify UDP coverage separately: [Istio does not proxy
+UDP](https://istio.io/latest/docs/ops/configuration/traffic-management/protocol-selection/).
+
+If the deployment requires EastGuard itself to authenticate individual datagrams,
+select a maintained, permissively licensed secure datagram implementation.
+Preserve UDP message boundaries and visible packet loss, and test authentication,
+replay rejection, and expiry through virtual time. Do not invent custom
+cryptography or restore process admission through metadata.
+
+That integration must bound handshake, session, and replay-tracking memory.
+Eviction must not make captured packets valid again. A shared cluster key does
+not identify individual brokers. Protecting transport does not replace correct
+membership and placement checks inside EastGuard.
 
 ## 7. Delivery Plan
 
-| Phase | Current state | Complete when |
+| Work | Current state | Scope decision |
 | --- | --- | --- |
-| S0 — Configuration | Secure is default; credential and node-prefix checks exist; startup fails before listeners | No secure configuration opens a plaintext listener |
-| S1 — ACLs | Records, internal grant/revoke, quorum reads, and bounded cache exist | Authorized wire administration and durable recovery across ownership changes work |
-| S2 — Cluster TCP | Raft/data use mTLS and certificate-bound node IDs without admission reads | Full restart, partition healing, and committed placement tests pass |
-| S3 — SWIM | Development UDP is plaintext | Authenticated, encrypted, replay-protected membership works under simulation |
-| S4 — Clients | Server mTLS, ACL checks, and request bounds exist | Client mTLS, authorization before redirects, and stable-ID data routing cover every API |
-| S5 — Operations | Incomplete | Genesis, rotation, revocation, active-session expiry, recovery, and bounded audit work |
-| S6 — Production | Blocked | Earlier gates, malformed-input/fuzz tests, and measured resource bounds pass |
+| Deployment contract | Secure startup aborts; explicit trusted-development mode exists | Select which clients and brokers are trusted, and who protects every listener |
+| Protocol hardening | Frame, fetch, decompression, and record-count bounds; payload-free write-error logs | Required under every trust model; malformed-input tests and load measurements remain relevant |
+| Standard authentication | Server and broker mTLS exist; SDK integration is unfinished | Complete the identity path required by the selected deployment, including redirects |
+| Minimal permissions | Broker checks use persisted ACLs | Proposed baseline: operator-managed static policy; implement and test that source before retiring the existing path |
+| Cluster correctness | Sender-supplied placement and restart/recovery gaps remain | Required wherever those protocols operate, regardless of who secures transport |
+| SWIM protection | Plaintext UDP | Prove deployment coverage, or integrate a standard secure datagram transport when required |
+| Dynamic ACL administration | Internal grant/revoke, quorum reads, and cache exist | Add wire administration when runtime permission changes are required; preserve durability while persisted ACLs are in use |
+| Credential lifecycle and audit | Credentials load at startup; advanced session controls are unfinished | Delegate infrastructure; add reload, revocation deadlines, session expiry, and audit features to satisfy explicit deployment commitments |
 
 Do next:
 
-1. Define and test secure genesis and durable recovery using certificate-authenticated transport.
-2. Finish exact ACL administration, client mTLS, and authorization/routing.
-3. Enforce committed data placement and implement credential lifecycle operations.
-4. Select secure SWIM, then run full-cluster restart, partition, replay, and load tests.
+1. Confirm the deployment trust model and its credential and TCP/UDP boundaries.
+2. Complete standard client authentication and minimal permission checks for that model.
+3. Prove cluster formation, recovery, and committed data placement under that boundary.
+4. Run malformed-input, restart, partition, and resource-bound tests. Add dynamic administration and advanced credential operations only for identified requirements.
 
-Keep secure startup closed until these gates pass. Passing transport tests
-does not establish a secure, recoverable production cluster.
+The current secure startup guard stays closed. Enabling a supported deployment
+requires implementing and testing its chosen boundary; completing every optional
+extension in this document is not a universal production requirement. Passing
+transport tests alone does not establish a recoverable cluster.
 
 The internal opening TCP frames changed. This is not a rolling-compatible
 upgrade of the old development protocol; update all brokers together.

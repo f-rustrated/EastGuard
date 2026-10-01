@@ -482,11 +482,11 @@ impl ClientController {
         self.authorize_acl_resource(AclResource::TopicData(topic.id))
             .await?;
 
+        let owner = ProducerSessionOwner::from(self.certificate_principal.as_ref());
         let producer_identity = req
             .producer_identity
-            .map(|id| topic.verify_producer_session(id, received_at_ms))
-            .transpose()
-            .map_err(ServerError::ProduceRejected)?;
+            .map(|id| topic.verify_producer_session(id, &owner, received_at_ms))
+            .transpose()?;
 
         let range = topic.resolve_writable_range(req.range_id, &req.routing_key)?;
         let seg = range.active_write_segment()?;
@@ -1482,6 +1482,78 @@ mod tests {
             panic!("expected Produced, got {resp:?}");
         };
         assert_eq!(entry_id, 7.into());
+    }
+
+    #[tokio::test]
+    async fn topic_data_grant_does_not_allow_appending_as_another_producer() {
+        let expires_at = crate::now_ms() + 60_000;
+        let producer_id = uuid::Uuid::new_v4();
+        let mut topic = topic_meta("node-1");
+        topic
+            .producer_sessions
+            .open_producer_session(OpenProducerSession {
+                topic_name: "t1".into(),
+                producer_id,
+                session_nonce: uuid::Uuid::new_v4(),
+                owner: ProducerSessionOwner::CertificatePrincipal("owner".into()),
+                observed_at: expires_at - 60_000,
+                session_timeout_ms: 60_000,
+            })
+            .unwrap();
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(test_shard_group()));
+            }
+        });
+        let raft = raft_sender_with(move |cmd| {
+            if let MultiRaftActorCommand::GetTopicMetadata { reply, .. } = cmd {
+                let _ = reply.send(Some(topic.clone()));
+            } else if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
+                let _ = query
+                    .reply
+                    .send(Ok(acl_snapshot(query.resource, &["owner", "other"])));
+            }
+        });
+        for principal in ["owner", "other"] {
+            let mut controller =
+                authenticated_controller(principal, node_id("node-1"), swim.clone(), raft.clone());
+            let (tx, rx) = flume::bounded(1);
+            controller.data_plane_tx = DataPlaneSender(tx);
+            let request = ProduceRequest {
+                topic_name: "t1".into(),
+                range_id: RangeId(0),
+                routing_key: b"k".to_vec(),
+                data: b"data".to_vec().into(),
+                record_count: 1,
+                producer_identity: Some(crate::data_plane::ProducerAppendIdentity {
+                    producer_id,
+                    incarnation: 0,
+                    expires_at,
+                    sequence: 0,
+                    digest: 1,
+                }),
+            };
+            if principal == "owner" {
+                let (result, ()) = tokio::join!(controller.produce_entry(request), async {
+                    let DataPlaneMessage::Command(DataPlaneCommand::Produce(produce)) =
+                        rx.recv_async().await.unwrap()
+                    else {
+                        panic!("expected produce");
+                    };
+                    produce.reply.send(ProduceAck::Ok(7.into())).unwrap();
+                });
+                assert_eq!(result, Ok(ClientSuccess::Produced(7.into())));
+            } else {
+                assert_eq!(
+                    controller.produce_entry(request).await,
+                    Err(ServerError::Unauthorized)
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "unauthorized append reached the data plane"
+                );
+            }
+        }
     }
 
     /// A control-plane write on a non-member node returns the structural redirect

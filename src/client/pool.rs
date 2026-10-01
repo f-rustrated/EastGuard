@@ -59,7 +59,7 @@ impl NodeConnection {
         let inflight: Inflight = Arc::new(DashMap::new());
         let alive = Arc::new(AtomicBool::new(true));
 
-        tokio::spawn(Self::write_loop(ClientRawWriter::new(write_half), rx));
+        tokio::spawn(Self::write_loop(addr, ClientRawWriter::new(write_half), rx));
         tokio::spawn(Self::read_loop(
             ClientStreamReader::new(read_half),
             inflight.clone(),
@@ -77,10 +77,20 @@ impl NodeConnection {
 
     /// Drains the outbound queue onto the wire. Ends when the connection is dropped
     /// (all senders gone) or a write fails — either way the reader observes the close.
-    async fn write_loop(mut writer: ClientRawWriter, mut rx: mpsc::Receiver<(u64, ClientRequest)>) {
+    async fn write_loop(
+        addr: SocketAddr,
+        mut writer: ClientRawWriter,
+        mut rx: mpsc::Receiver<(u64, ClientRequest)>,
+    ) {
         while let Some((id, req)) = rx.recv().await {
-            if writer.write(id, &req).await.is_err() {
-                tracing::error!("client {:?} write loop closes...", req);
+            if let Err(error) = writer.write(id, &req).await {
+                tracing::error!(
+                    request_kind = req.kind(),
+                    request_id = id,
+                    destination = %addr,
+                    %error,
+                    "client write loop closed"
+                );
                 break;
             }
         }
@@ -214,5 +224,80 @@ impl ConnectionPool {
                 current.clone()
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connections::MAX_FRAME_SIZE;
+    use crate::connections::protocol::ProduceRequest;
+    use crate::control_plane::metadata::RangeId;
+    use crate::net::TcpListener;
+    use std::sync::Mutex;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_writes_log_context_without_request_payloads() -> turmoil::Result {
+        let mut sim = turmoil::Builder::new().rng_seed(7).build();
+        sim.client("writer", async {
+            let listener = TcpListener::bind("0.0.0.0:9000").await?;
+            let destination = SocketAddr::new(turmoil::lookup("writer"), 9000);
+            let (client, server) = tokio::join!(TcpStream::connect(destination), listener.accept());
+            let _server = server?;
+            let (_, write_half) = client?.into_split();
+            let (tx, rx) = mpsc::channel(1);
+            let mut payload = vec![0; MAX_FRAME_SIZE];
+            payload[..16].copy_from_slice(b"private-payload!");
+            tx.send((
+                73,
+                ProduceRequest {
+                    topic_name: "private-topic".into(),
+                    range_id: RangeId(0),
+                    routing_key: b"private-key".to_vec(),
+                    data: payload.into(),
+                    record_count: 1,
+                    producer_identity: None,
+                }
+                .into(),
+            ))
+            .await?;
+            let captured = LogCapture::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            NodeConnection::write_loop(destination, ClientRawWriter::new(write_half), rx)
+                .with_subscriber(subscriber)
+                .await;
+            let log = String::from_utf8(captured.0.lock().unwrap().clone())?;
+            assert!(log.contains("request_kind=\"Produce\""));
+            assert!(log.contains("request_id=73"));
+            assert!(log.contains(&format!("destination={destination}")));
+            assert!(log.contains("error=Message exceeds the 4 MiB frame limit"));
+            assert!(!log.contains("private-"));
+            assert!(
+                !log.contains("112, 114, 105, 118"),
+                "payload bytes leaked: {log}"
+            );
+            Ok(())
+        });
+        sim.run()
     }
 }

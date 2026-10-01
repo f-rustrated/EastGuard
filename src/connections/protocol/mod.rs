@@ -47,6 +47,35 @@ pub enum ClientRequest {
     Admin(AdminRequest),
 }
 
+impl ClientRequest {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::ControlPlane(request) => match request {
+                ControlPlaneRequest::CreateTopic { .. } => "CreateTopic",
+                ControlPlaneRequest::DeleteTopic { .. } => "DeleteTopic",
+                ControlPlaneRequest::ListHostedTopics => "ListHostedTopics",
+                ControlPlaneRequest::DescribeTopic { .. } => "DescribeTopic",
+                ControlPlaneRequest::SyncConsumerGroup(_) => "SyncConsumerGroup",
+                ControlPlaneRequest::OpenProducerSession(_) => "OpenProducerSession",
+            },
+            Self::DataPlane(request) => match request {
+                ClientDataPlaneRequest::Produce(_) => "Produce",
+                ClientDataPlaneRequest::Fetch(_) => "Fetch",
+                ClientDataPlaneRequest::FetchById(_) => "FetchById",
+                ClientDataPlaneRequest::ListOffsets(_) => "ListOffsets",
+                ClientDataPlaneRequest::CommitConsumerOffset(_) => "CommitConsumerOffset",
+                ClientDataPlaneRequest::FetchConsumerOffset(_) => "FetchConsumerOffset",
+            },
+            Self::Admin(request) => match request {
+                AdminRequest::DescribeCluster => "DescribeCluster",
+                AdminRequest::ListHostedTopicsWithStats => "ListHostedTopicsWithStats",
+                AdminRequest::GetShardInfo { .. } => "GetShardInfo",
+                AdminRequest::GetShardLeader { .. } => "GetShardLeader",
+            },
+        }
+    }
+}
+
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
 pub enum ClientResponse {
     Ok(ClientSuccess),

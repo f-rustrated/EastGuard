@@ -29,6 +29,8 @@ pub struct EntryPayload {
 }
 
 impl EntryPayload {
+    pub(crate) const WIRE_HEADER_SIZE: usize = size_of::<u64>() + 2 * size_of::<u32>();
+
     pub fn from_fetched_record(r: FetchedRecords) -> ClientSuccess {
         let wire_entries = r
             .entries
@@ -178,6 +180,24 @@ pub enum RangeTransition {
 }
 
 impl RangeProgressSignal {
+    /// Space left for entries after the request ID, response tags, entry count,
+    /// next entry ID, and range progress metadata have been accounted for.
+    pub(crate) fn fetch_entries_max_bytes(&self) -> std::io::Result<usize> {
+        let overhead = crate::connections::REQUEST_ID_SIZE
+            + 2
+            + size_of::<u32>()
+            + size_of::<u64>()
+            + borsh::object_length(self)?;
+        crate::connections::MAX_FRAME_SIZE
+            .checked_sub(overhead)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Fetch metadata exceeds the frame limit",
+                )
+            })
+    }
+
     /// Derive the `RangeProgressSignal` the wire ships to the consumer from the
     /// range's metadata snapshot. Active → `Active`. Sealed → `Sealed{end_offset,
     /// transition}` where `end_offset` comes from `next_offset - 1` and the
@@ -231,5 +251,45 @@ impl RangeProgressSignal {
                 merged_from: [range.range_id, range.range_id],
             },
         }
+    }
+}
+
+#[test]
+fn fetch_wire_budget_includes_entry_headers_and_all_progress_signals() {
+    use crate::connections::protocol::ClientResponse;
+    use crate::connections::{MAX_FRAME_SIZE, REQUEST_ID_SIZE};
+
+    for progress_signal in [
+        RangeProgressSignal::Active,
+        RangeProgressSignal::Sealed {
+            end_entry_id: EntryId(5),
+            transition: RangeTransition::Split {
+                left_range_id: RangeId(1),
+                right_range_id: RangeId(2),
+                split_point: vec![128; 8],
+            },
+        },
+        RangeProgressSignal::Sealed {
+            end_entry_id: EntryId(5),
+            transition: RangeTransition::Merged {
+                merged_range_id: RangeId(3),
+                merged_from: [RangeId(1), RangeId(2)],
+            },
+        },
+    ] {
+        let budget = progress_signal.fetch_entries_max_bytes().unwrap();
+        let response = ClientResponse::Ok(ClientSuccess::Fetched {
+            entries: Box::new([EntryPayload {
+                entry_id: EntryId(0),
+                record_count: 1,
+                data: vec![0; budget - EntryPayload::WIRE_HEADER_SIZE],
+            }]),
+            next_entry_id: EntryId(1),
+            progress_signal,
+        });
+        assert_eq!(
+            borsh::object_length(&response).unwrap() + REQUEST_ID_SIZE,
+            MAX_FRAME_SIZE
+        );
     }
 }
