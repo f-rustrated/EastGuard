@@ -373,14 +373,19 @@ impl TopicMeta {
     /// Retention (D7): per-range oldest-first prefixes of sealed segments expired
     /// under this topic's policy as of `now`. Empty when the topic has no retention
     /// set (`retention_ms = None`, the default — keep everything).
-    pub(crate) fn expired_segments(&self, now: u64) -> Vec<(RangeId, Box<[SegmentId]>)> {
+    pub(crate) fn expired_segments(
+        &self,
+        now: u64,
+        max_segments_per_range: usize,
+    ) -> Vec<(RangeId, Box<[SegmentId]>)> {
         let Some(retention_ms) = self.storage_policy.retention_ms else {
             return Vec::new();
         };
+
         self.ranges
             .values()
             .filter_map(|range| {
-                let ids = range.expired_sealed_prefix(now, retention_ms);
+                let ids = range.expired_sealed_prefix(now, retention_ms, max_segments_per_range);
                 (!ids.is_empty()).then(|| (range.range_id, ids.into_boxed_slice()))
             })
             .collect()
@@ -449,7 +454,7 @@ impl TopicMeta {
         Ok(merged_id)
     }
 
-    pub(crate) fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> bool {
+    pub(crate) fn sync_consumer_group(&mut self, cmd: UpdateConsumerGroupMember) -> bool {
         let consumer_group_meta = self
             .consumer_groups
             .entry(cmd.group_id.clone())
@@ -535,13 +540,24 @@ impl TopicMeta {
     pub(crate) fn verify_producer_session(
         &self,
         q: ProducerAppendIdentity,
+        owner: &ProducerSessionOwner,
         received_at_ms: u64,
-    ) -> Result<AuthorizedProducerIdentity, ProduceError> {
+    ) -> Result<AuthorizedProducerIdentity, ServerError> {
         if q.expires_at < received_at_ms {
-            return Err(ProduceError::SessionExpired);
+            return Err(ServerError::ProduceRejected(ProduceError::SessionExpired));
         }
 
-        let Some(session) = self.producer_sessions.get(&q.producer_id) else {
+        let Some(session) = self
+            .producer_sessions
+            .get_for_owner(&q.producer_id, owner)?
+        else {
+            // The recovered data ledger has no durable owner. Authenticated
+            // clients must wait for metadata that can verify their ownership.
+            if !matches!(owner, ProducerSessionOwner::TrustedDevelopment) {
+                return Err(ServerError::ProduceRejected(
+                    ProduceError::SessionNotInstalled,
+                ));
+            }
             // Data replica placement is independent from metadata-Raft placement.
             // A restarted data leader can therefore serve before its local metadata
             // view contains this session. The durable range ledger still enforces
@@ -551,7 +567,7 @@ impl TopicMeta {
         };
 
         if q.incarnation < session.incarnation {
-            return Err(ProduceError::ProducerFenced);
+            return Err(ServerError::ProduceRejected(ProduceError::ProducerFenced));
         };
 
         if q.incarnation == session.incarnation
@@ -561,7 +577,9 @@ impl TopicMeta {
             return Ok(AuthorizedProducerIdentity::MetadataVerified(q));
         }
 
-        Err(ProduceError::SessionNotInstalled)
+        Err(ServerError::ProduceRejected(
+            ProduceError::SessionNotInstalled,
+        ))
     }
 }
 
@@ -711,6 +729,60 @@ mod routing_tests {
             0,
             policy(),
         )
+    }
+
+    #[test]
+    fn append_requires_the_session_owner_and_fails_closed_without_metadata() {
+        let mut topic = topic();
+        let producer_id = uuid::Uuid::new_v4();
+        let owner = ProducerSessionOwner::CertificatePrincipal("owner".into());
+        let other = ProducerSessionOwner::CertificatePrincipal("other".into());
+        let identity = ProducerAppendIdentity {
+            producer_id,
+            incarnation: 0,
+            expires_at: 100,
+            sequence: 0,
+            digest: 1,
+        };
+        topic
+            .producer_sessions
+            .open_producer_session(OpenProducerSession {
+                topic_name: topic.name.clone().into(),
+                topic_id: topic.id,
+                producer_id,
+                session_nonce: uuid::Uuid::new_v4(),
+                owner: owner.clone(),
+                observed_at: 0,
+                session_timeout_ms: 100,
+            })
+            .unwrap();
+        assert!(matches!(
+            topic.verify_producer_session(identity, &owner, 50),
+            Ok(AuthorizedProducerIdentity::MetadataVerified(_))
+        ));
+        for wrong_owner in [&other, &ProducerSessionOwner::TrustedDevelopment] {
+            assert!(matches!(
+                topic.verify_producer_session(identity, wrong_owner, 50),
+                Err(ServerError::Unauthorized)
+            ));
+        }
+        assert!(matches!(
+            topic.verify_producer_session(identity, &owner, 101),
+            Err(ServerError::ProduceRejected(ProduceError::SessionExpired))
+        ));
+        topic.producer_sessions.clear();
+        for principal in [&owner, &other] {
+            assert!(matches!(
+                topic.verify_producer_session(identity, principal, 50),
+                Err(ServerError::ProduceRejected(
+                    ProduceError::SessionNotInstalled
+                ))
+            ));
+        }
+        assert!(matches!(
+            topic.verify_producer_session(identity, &ProducerSessionOwner::TrustedDevelopment, 50),
+            Ok(AuthorizedProducerIdentity::ExistingOnly(_))
+        ));
     }
 
     #[test]

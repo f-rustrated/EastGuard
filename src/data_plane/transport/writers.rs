@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::control_plane::NodeId;
@@ -11,55 +11,91 @@ use crate::data_plane::actor::DataPlaneSender;
 use crate::data_plane::messages::command::{
     DataPlaneCommand, DataPlanePeerMessage, ReceivePeerMessage,
 };
-use crate::net::{OwnedWriteHalf, TcpStream};
+use crate::net::{TransportTcpStream, TransportWriteHalf, before_deadline};
+use crate::security::NodeTransportSecurity;
 
-use super::reader::DataReader;
+use super::connection::{DATA_FRAME_MAX, DataConnection, write_frame};
+use super::reader::{ConnectionClosed, DataReader};
 
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(PartialEq)]
+enum ConnectionOrigin {
+    Local,
+    Remote,
+}
+
+struct ActiveConnection {
+    generation: u64,
+    origin: ConnectionOrigin,
+    writer: TransportWriteHalf,
+    reader_task: JoinHandle<()>,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
+}
 
 pub(super) struct TransportState {
     node_id: NodeId,
-    writers: HashMap<NodeId, OwnedWriteHalf>,
+    writers: HashMap<NodeId, ActiveConnection>,
     dead_peers: HashSet<NodeId>,
     /// Tracks when the last connect attempt to a peer failed. Skips retry
     /// for CONNECT_BACKOFF (2s) to avoid blocking the select loop on repeated
     /// 3s TCP timeouts to unreachable peers. Cleared by periodic cleanup (300s).
     connect_backoffs: HashMap<NodeId, Instant>,
+    node_transport: NodeTransportSecurity,
+    next_generation: u64,
 }
 
 impl TransportState {
-    pub fn new(node_id: NodeId) -> Self {
+    pub fn new(node_id: NodeId, node_transport: NodeTransportSecurity) -> Self {
         Self {
             node_id,
             writers: HashMap::new(),
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
+            node_transport,
+            next_generation: 0,
         }
     }
 
-    pub async fn accept(
+    pub(super) fn accept(
         &mut self,
-        stream: crate::net::TcpStream,
-    ) -> anyhow::Result<(NodeId, DataReader)> {
-        let (read_half, write_half) = stream.into_split();
-        let mut reader = DataReader(read_half);
-
-        let peer_id = reader.read_node_id().await?;
-
+        connection: DataConnection,
+        data_plane_tx: &DataPlaneSender,
+        disconnect_tx: &mpsc::Sender<ConnectionClosed>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !(self.writers.contains_key(&peer_id) && peer_id > self.node_id),
-            "duplicate connection from {peer_id} dropped (lower NodeId wins)"
+            !self.writers.get(&connection.peer).is_some_and(|current| {
+                current.origin == ConnectionOrigin::Local
+                    && !current.reader_task.is_finished()
+                    && connection.peer > self.node_id
+            }),
+            "duplicate data connection dropped (lower NodeId wins)"
         );
-
-        self.writers.insert(peer_id.clone(), write_half);
-        Ok((peer_id, reader))
+        self.install(
+            connection,
+            ConnectionOrigin::Remote,
+            data_plane_tx,
+            disconnect_tx,
+        )
     }
 
     /// Drop a peer's cached writer (without marking it dead) so the next send
     /// re-establishes a fresh connection. Called when that peer's reader task
     /// ends — see `DataReader::run`.
-    pub fn evict_writer(&mut self, peer: &NodeId) {
-        self.writers.remove(peer);
+    pub(super) fn evict_writer(&mut self, closed: ConnectionClosed) {
+        if self
+            .writers
+            .get(&closed.peer)
+            .is_some_and(|connection| connection.generation == closed.generation)
+        {
+            self.writers.remove(&closed.peer);
+        }
     }
 
     pub async fn send(
@@ -68,17 +104,18 @@ impl TransportState {
         msg: &DataPlanePeerMessage,
         swim_tx: &SwimSender,
         data_plane_tx: &DataPlaneSender,
-        disconnect_tx: &mpsc::Sender<NodeId>,
+        disconnect_tx: &mpsc::Sender<ConnectionClosed>,
     ) {
         for target in targets {
             // Self-delivery: a node can be its own target (e.g. a PlaceSegment
             // to `replica_set[0]`
             if *target == self.node_id {
-                let _ =
-                    data_plane_tx.send(DataPlaneCommand::ReceivePeerMessage(ReceivePeerMessage {
+                let _ = data_plane_tx
+                    .send_async(DataPlaneCommand::ReceivePeerMessage(ReceivePeerMessage {
                         from: self.node_id.clone(),
                         message: Box::new(msg.clone()),
-                    }));
+                    }))
+                    .await;
                 continue;
             }
 
@@ -100,58 +137,81 @@ impl TransportState {
                 self.writers.remove(target);
             }
 
-            match self.connect_and_send(target.clone(), msg, swim_tx).await {
-                Ok(reader) => {
-                    tokio::spawn(reader.run(
-                        data_plane_tx.clone(),
-                        target.clone(),
-                        disconnect_tx.clone(),
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[{}] connect_and_send to {target} failed: {e}",
-                        self.node_id
-                    );
-                    self.connect_backoffs.insert(target.clone(), Instant::now());
-                }
+            let result = async {
+                let connection = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, async {
+                    let node_addr = swim_tx
+                        .resolve_address(target.clone())
+                        .await?
+                        .with_context(|| format!("no address known for {target}"))?;
+                    let stream = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        TransportTcpStream::connect_node(
+                            node_addr.data_addr(),
+                            &self.node_transport,
+                        ),
+                    )
+                    .await
+                    .context("data TLS connect timed out")??;
+                    DataConnection::connect(stream, target, &self.node_id, &self.node_transport)
+                        .await
+                })
+                .await
+                .context("data handshake timed out")??;
+                self.install(
+                    connection,
+                    ConnectionOrigin::Local,
+                    data_plane_tx,
+                    disconnect_tx,
+                )?;
+                self.write_message(target, msg)
+                    .await
+                    .context("initial write failed")
+            }
+            .await;
+            if let Err(e) = result {
+                self.writers.remove(target);
+                tracing::warn!(
+                    "[{}] data connection or initial write to {target} failed: {e}",
+                    self.node_id
+                );
+                self.connect_backoffs.insert(target.clone(), Instant::now());
             }
         }
     }
 
-    async fn connect_and_send(
+    fn install(
         &mut self,
-        target_id: NodeId,
-        msg: &DataPlanePeerMessage,
-        swim_tx: &SwimSender,
-    ) -> anyhow::Result<DataReader> {
-        let node_addr = swim_tx
-            .resolve_address(target_id.clone())
-            .await?
-            .with_context(|| format!("no address known for {target_id}"))?;
-
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(node_addr.data_addr()),
-        )
-        .await
-        .context("connect timed out")?
-        .context("TCP connect failed")?;
-
-        let (read_half, write_half) = stream.into_split();
-        self.writers.insert(target_id.clone(), write_half);
-
-        if let Err(e) = self.handshake(&target_id).await {
-            self.writers.remove(&target_id);
-            return Err(e).context("handshake failed");
-        }
-
-        if let Err(e) = self.write_message(&target_id, msg).await {
-            self.writers.remove(&target_id);
-            return Err(e).context("initial write failed");
-        }
-
-        Ok(DataReader(read_half))
+        connection: DataConnection,
+        origin: ConnectionOrigin,
+        data_plane_tx: &DataPlaneSender,
+        disconnect_tx: &mpsc::Sender<ConnectionClosed>,
+    ) -> anyhow::Result<()> {
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .context("data connection generation exhausted")?;
+        let peer = connection.peer;
+        let reader_task = tokio::spawn(DataReader::new(connection.reader).run(
+            data_plane_tx.clone(),
+            ConnectionClosed {
+                peer: peer.clone(),
+                generation,
+            },
+            disconnect_tx.clone(),
+        ));
+        self.dead_peers.remove(&peer);
+        self.connect_backoffs.remove(&peer);
+        self.writers.insert(
+            peer,
+            ActiveConnection {
+                generation,
+                origin,
+                writer: connection.writer,
+                reader_task,
+            },
+        );
+        Ok(())
     }
 
     pub fn disconnect(&mut self, peer_id: NodeId) {
@@ -164,36 +224,94 @@ impl TransportState {
         self.connect_backoffs.clear();
     }
 
-    async fn handshake(&mut self, target: &NodeId) -> anyhow::Result<()> {
-        let writer = self
-            .writers
-            .get_mut(target)
-            .context("no writer for target")?;
-        let bytes = borsh::to_vec(&self.node_id)?;
-        let len = bytes.len() as u32;
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&bytes).await?;
-        Ok(())
-    }
-
     async fn write_message(
         &mut self,
         target: &NodeId,
         msg: &DataPlanePeerMessage,
     ) -> anyhow::Result<()> {
-        let writer = self
+        let connection = self
             .writers
             .get_mut(target)
             .context("no writer for target")?;
-        let bytes = borsh::to_vec(&ReceivePeerMessage {
+        anyhow::ensure!(!connection.reader_task.is_finished(), "data reader closed");
+        let message = ReceivePeerMessage {
             from: self.node_id.clone(),
             message: Box::new(msg.clone()),
-        })?;
-        let len = bytes.len() as u32;
-        let mut buf = Vec::with_capacity(4 + bytes.len());
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(&bytes);
-        writer.write_all(&buf).await?;
-        Ok(())
+        };
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        before_deadline(
+            deadline,
+            write_frame(&mut connection.writer, &message, DATA_FRAME_MAX),
+        )
+        .await
+        .context("data write deadline expired")?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    #[test]
+    fn replacement_closes_only_the_matching_connection() -> turmoil::Result {
+        let mut sim = turmoil::Builder::new()
+            .rng_seed(11)
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+        sim.host("server", || async {
+            let listener = TcpListener::bind("0.0.0.0:9000").await?;
+            let mut sockets = Vec::new();
+            loop {
+                sockets.push(listener.accept().await?.0);
+            }
+        });
+        sim.client("client", async {
+            let local = NodeId::new("client");
+            let peer = NodeId::new("server");
+            let mut state = TransportState::new(local, NodeTransportSecurity::TrustedDevelopment);
+            let (data, _data_rx) = flume::bounded(1);
+            let data = DataPlaneSender(data);
+            let (closed_tx, _closed_rx) = mpsc::channel(4);
+            let address = (turmoil::lookup("server"), 9000);
+            let first = TcpStream::connect(address).await?;
+            let (reader, writer) = first.into_split();
+            state.install(
+                DataConnection {
+                    peer: peer.clone(),
+                    reader: reader.into(),
+                    writer: writer.into(),
+                },
+                ConnectionOrigin::Remote,
+                &data,
+                &closed_tx,
+            )?;
+            let old_generation = state.writers[&peer].generation;
+            let old_reader = state.writers[&peer].reader_task.abort_handle();
+
+            let second = TcpStream::connect(address).await?;
+            let (replacement_reader, replacement_writer) = second.into_split();
+            state.install(
+                DataConnection {
+                    peer: peer.clone(),
+                    reader: replacement_reader.into(),
+                    writer: replacement_writer.into(),
+                },
+                ConnectionOrigin::Remote,
+                &data,
+                &closed_tx,
+            )?;
+            tokio::task::yield_now().await;
+            assert!(old_reader.is_finished());
+            state.evict_writer(ConnectionClosed {
+                peer: peer.clone(),
+                generation: old_generation,
+            });
+            assert_eq!(state.writers[&peer].generation, old_generation + 1);
+
+            Ok(())
+        });
+        sim.run()
     }
 }

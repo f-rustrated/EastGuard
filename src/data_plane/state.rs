@@ -245,7 +245,8 @@ impl<W: WalStorage> DataPlane<W> {
     ///
     /// Returns `SegmentNotLocal` when no locally-hosted segment of the range
     /// covers the offset (the consumer re-resolves via `DescribeTopic`).
-    fn handle_fetch(&self, cmd: Fetch) {
+    fn handle_fetch(&self, mut cmd: Fetch) {
+        cmd.max_bytes = cmd.max_bytes.min(crate::connections::MAX_FRAME_SIZE as u32);
         let Some(read_stat) = self
             .segments
             .resolve(cmd.topic_id, cmd.range_id, cmd.entry_id)
@@ -296,15 +297,36 @@ impl<W: WalStorage> DataPlane<W> {
         let mut next_entry_id = cmd.entry_id;
         let mut bytes_read: usize = 0;
         let max_bytes = cmd.max_bytes as usize;
+        let mut wire_budget = match cmd.progress_signal.fetch_entries_max_bytes() {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = cmd
+                    .reply
+                    .send(Err(ServerError::Internal(error.to_string())));
+                return;
+            }
+        };
 
         while let Some(entry_arc) =
             cache.read_committed(*next_entry_id.saturating_sub(*start_entry_id))
         {
             let payload_len = entry_arc.data.len();
-            // Always include at least one entry (even if max_bytes is small).
+            let wire_len =
+                payload_len + crate::connections::protocol::EntryPayload::WIRE_HEADER_SIZE;
+            if wire_len > wire_budget {
+                if entries.is_empty() {
+                    let _ = cmd.reply.send(Err(ServerError::Internal(
+                        "Fetch entry exceeds the frame limit".into(),
+                    )));
+                    return;
+                }
+                break;
+            }
+            // A first entry may exceed the requested size, but never the wire limit.
             if !entries.is_empty() && bytes_read + payload_len > max_bytes {
                 break;
             }
+            wire_budget -= wire_len;
             next_entry_id = entry_arc.entry_id + 1u64;
             entries.push(entry_arc);
             bytes_read += payload_len;
@@ -3682,8 +3704,8 @@ mod tests {
     /// `WalRecord` format agreement with `checkpoint.rs`, and `record_count`
     /// round-tripping through the file. Bypasses the coordinator seal round-trip
     /// (driven directly) so it's deterministic.
-    #[test]
-    fn cold_fetch_serves_sealed_segment_from_disk() {
+    #[tokio::test]
+    async fn cold_fetch_serves_sealed_segment_from_disk() {
         use crate::connections::protocol::RangeProgressSignal;
         use crate::data_plane::cold_read::ColdReadPool;
         use crate::data_plane::messages::query::{DataPlaneQuery, Fetch};
@@ -3777,9 +3799,7 @@ mod tests {
             reply,
         })));
 
-        let result = reply_rx
-            .blocking_recv()
-            .expect("cold-read pool dropped the reply");
+        let result = reply_rx.await.expect("cold-read pool dropped the reply");
         let FetchedRecords {
             entries,
             next_entry_id,
@@ -3802,6 +3822,69 @@ mod tests {
     }
 
     // ── Catch-up source side (commit 20) ──────────────────────────────────
+
+    #[test]
+    fn hot_fetch_bounds_assembly_by_wire_size() {
+        use crate::connections::protocol::{
+            ClientResponse, EntryPayload, RangeProgressSignal, RangeTransition,
+        };
+        use crate::connections::{MAX_FRAME_SIZE, REQUEST_ID_SIZE};
+
+        for (payload_len, count, progress_signal, expected_count) in [
+            (2 * 1024 * 1024, 3, RangeProgressSignal::Active, Some(1)),
+            (
+                0,
+                6,
+                RangeProgressSignal::Sealed {
+                    end_entry_id: EntryId(5),
+                    transition: RangeTransition::Split {
+                        left_range_id: RangeId(1),
+                        right_range_id: RangeId(2),
+                        split_point: vec![0; MAX_FRAME_SIZE - 128],
+                    },
+                },
+                Some(4),
+            ),
+            (MAX_FRAME_SIZE, 1, RangeProgressSignal::Active, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut dp = make_data_plane(&dir);
+            dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+            for _ in 0..count {
+                let (reply, _rx) = oneshot::channel();
+                dp.handle_command(Produce {
+                    segment_key: test_key(),
+                    data: Bytes::from(vec![0; payload_len]).into(),
+                    record_count: 1,
+                    received_at_ms: 0,
+                    producer_identity: None,
+                    reply,
+                });
+            }
+            dp.flush_batch();
+            let (reply, mut rx) = oneshot::channel();
+            dp.handle_query(DataPlaneQuery::Fetch(Fetch {
+                topic_id: TopicId(1),
+                range_id: RangeId(0),
+                entry_id: EntryId(0),
+                max_bytes: u32::MAX,
+                progress_signal,
+                reply,
+            }));
+            let result = rx.try_recv().unwrap();
+            if let Some(expected) = expected_count {
+                let fetched = result.unwrap();
+                assert_eq!(fetched.entries.len(), expected);
+                assert_eq!(fetched.next_entry_id, EntryId(expected as u64));
+                let response = ClientResponse::Ok(EntryPayload::from_fetched_record(fetched));
+                assert!(
+                    borsh::object_length(&response).unwrap() + REQUEST_ID_SIZE <= MAX_FRAME_SIZE
+                );
+            } else {
+                assert!(matches!(result, Err(ServerError::Internal(_))));
+            }
+        }
+    }
 
     /// Build a data plane that captures cold-read dispatches and already holds a
     /// sealed segment `test_key()` spanning `[0, 10]` — a stand-in for a healthy

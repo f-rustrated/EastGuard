@@ -6,6 +6,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::Replicas;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::ConsumerGroupAssignment;
+
 use crate::control_plane::metadata::topic::{TopicMeta, TopicState, TopicStats};
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId, error::MetadataError};
 use crate::data_plane::SegmentKey;
@@ -54,6 +55,7 @@ impl MetadataState {
         let topics = snapshot.topics;
         let topic_name_index = topics
             .values()
+            .filter(|topic| topic.state != TopicState::Deleted)
             .map(|topic| (topic.name.clone(), topic.id))
             .collect();
         Self {
@@ -84,12 +86,13 @@ impl MetadataState {
 
     pub(crate) fn get_consumer_group_assignment(
         &self,
-        topic_name: &str,
+        topic_id: TopicId,
         group_id: &str,
         member_id: Uuid,
     ) -> Option<ConsumerGroupAssignment> {
         Some(
-            self.get_topic_by_name(topic_name)?
+            self.get_topic(&topic_id)
+                .filter(|topic| topic.state == TopicState::Active)?
                 .consumer_groups
                 .get(group_id)?
                 .assignment_for(member_id),
@@ -183,13 +186,17 @@ impl MetadataState {
             .collect()
     }
 
-    pub(crate) fn expipred_segments(&self, now: u64) -> Vec<(TopicId, RangeId, Box<[SegmentId]>)> {
+    pub(crate) fn expired_segments(
+        &self,
+        now: u64,
+        max_segments_per_range: usize,
+    ) -> Vec<(TopicId, RangeId, Box<[SegmentId]>)> {
         self.topics
             .values()
             .flat_map(|topic| {
                 let topic_id = topic.id;
                 topic
-                    .expired_segments(now)
+                    .expired_segments(now, max_segments_per_range)
                     .into_iter()
                     .map(move |(range_id, ids)| (topic_id, range_id, ids))
             })
@@ -206,7 +213,7 @@ impl MetadataState {
             DeleteTopic(cmd) => self.delete_topic(cmd)?,
             ReassignSegment(cmd) => self.reassign_segment(cmd)?,
             DeleteSegments(cmd) => self.delete_segments(cmd)?,
-            SyncConsumerGroup(cmd) => self.sync_consumer_group(cmd)?,
+            UpdateConsumerGroupMember(cmd) => self.sync_consumer_group(cmd)?,
             OpenProducerSession(cmd) => self.open_producer_session(cmd)?,
             ExpireProducerSessions(cmd) => self.expire_producer_sessions(cmd)?,
         }
@@ -216,22 +223,8 @@ impl MetadataState {
     }
 
     fn open_producer_session(&mut self, cmd: OpenProducerSession) -> Result<(), MetadataError> {
-        let topic_id = self
-            .topic_name_index
-            .get(&cmd.topic_name)
-            .copied()
-            .ok_or_else(|| MetadataError::TopicNameNotFound(cmd.topic_name.clone()))?;
-        let topic = self
-            .topics
-            .get_mut(&topic_id)
-            .ok_or(MetadataError::TopicNotFound(topic_id))?;
-        topic.producer_sessions.open_producer_session(
-            cmd.producer_id,
-            cmd.session_nonce,
-            cmd.observed_at,
-            cmd.session_timeout_ms,
-        );
-        Ok(())
+        let topic = self.get_named_topic_mut(&cmd.topic_name, cmd.topic_id)?;
+        topic.producer_sessions.open_producer_session(cmd)
     }
 
     fn expire_producer_sessions(
@@ -415,6 +408,22 @@ impl MetadataState {
         Ok(topic)
     }
 
+    /// A queued command may outlive the topic it was authorized against.
+    fn get_named_topic_mut(
+        &mut self,
+        name: &str,
+        id: TopicId,
+    ) -> Result<&mut TopicMeta, MetadataError> {
+        let current_id = self
+            .topic_name_index
+            .get(name)
+            .ok_or_else(|| TopicNameNotFound(name.to_string()))?;
+        if *current_id != id {
+            return Err(TopicNotFound(id));
+        }
+        self.get_active_topic_mut(id)
+    }
+
     fn split_range(&mut self, cmd: SplitRange) -> Result<(), MetadataError> {
         let topic = self
             .topics
@@ -494,15 +503,10 @@ impl MetadataState {
         Ok(())
     }
 
-    fn sync_consumer_group(&mut self, cmd: SyncConsumerGroup) -> Result<(), MetadataError> {
+    fn sync_consumer_group(&mut self, cmd: UpdateConsumerGroupMember) -> Result<(), MetadataError> {
         let group_id = cmd.group_id.clone();
 
-        let topic = self
-            .topic_name_index
-            .get(&cmd.topic_name)
-            .and_then(|topic_id| self.topics.get_mut(topic_id))
-            .ok_or_else(|| TopicNameNotFound(cmd.topic_name.clone()))?;
-        topic.validate_active()?;
+        let topic = self.get_named_topic_mut(&cmd.topic_name, cmd.topic_id)?;
         if !topic.sync_consumer_group(cmd) {
             return Ok(());
         }
@@ -532,15 +536,7 @@ impl MetadataState {
     }
 
     fn delete_topic(&mut self, cmd: DeleteTopic) -> Result<(), MetadataError> {
-        let topic_id = self
-            .topic_name_index
-            .get(&cmd.name)
-            .copied()
-            .ok_or(MetadataError::TopicNameNotFound(cmd.name.clone()))?;
-
-        // Safety: topic_name_index and topics are always in sync —
-        // see invariant below.
-        let topic = self.topics.get_mut(&topic_id).unwrap();
+        let topic = self.get_named_topic_mut(&cmd.name, cmd.topic_id)?;
         topic.delete();
 
         let consumer_group_epochs = topic.rebalance_consumer_groups();
@@ -582,6 +578,7 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
             assert!(id.0 < self.next_topic_id, "topic ID >= next_topic_id");
             assert_eq!(*id, topic.id, "topic map key does not match topic identity");
         }
+
         for topic in self.topics.values() {
             topic.assert_invariants();
         }
@@ -591,7 +588,7 @@ impl crate::test_traits::TAssertInvariant for MetadataState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connections::protocol::ConsumerGroupSyncAction;
+    use crate::connections::protocol::ConsumerGroupMemberAction;
     use crate::control_plane::membership::ShardGroupId;
     use crate::control_plane::metadata::constants::*;
     use crate::control_plane::metadata::range::*;
@@ -682,14 +679,15 @@ mod tests {
     #[test]
     fn consumer_group_generation_is_applied_through_metadata_log_command() {
         let mut sm = MetadataState::new(ShardGroupId(1));
-        create_topic(&mut sm, "orders");
+        let topic_id = create_topic(&mut sm, "orders");
         let member = uuid::Uuid::new_v4();
-        let command = SyncConsumerGroup {
-            req: SyncConsumerGroupRequest {
+        let command = UpdateConsumerGroupMember {
+            topic_id,
+            req: UpdateConsumerGroupMemberRequest {
                 topic_name: "orders".into(),
                 group_id: "workers".into(),
                 member_id: member,
-                action: ConsumerGroupSyncAction::Heartbeat,
+                action: ConsumerGroupMemberAction::Heartbeat,
             },
             observed_at: 100,
             session_timeout_ms: 10_000,
@@ -702,7 +700,7 @@ mod tests {
         assert_eq!(*epoch.generation, 1);
         assert_eq!(epoch.ranges.len(), 1);
         let assignment = sm
-            .get_consumer_group_assignment("orders", "workers", member)
+            .get_consumer_group_assignment(topic_id, "workers", member)
             .unwrap();
         assert_eq!(*assignment.generation, 1);
         assert_eq!(assignment.ranges.as_ref(), &[RangeId(0)]);
@@ -711,7 +709,7 @@ mod tests {
         heartbeat.observed_at = 200;
         assert!(apply_command(&mut sm, heartbeat.into()).unwrap().is_empty());
         assert_eq!(
-            *sm.get_consumer_group_assignment("orders", "workers", member)
+            *sm.get_consumer_group_assignment(topic_id, "workers", member)
                 .unwrap()
                 .generation,
             1
@@ -885,11 +883,30 @@ mod tests {
 
         // now such that segs 0,1 are past the window but seg 2 isn't.
         let now = 200 + 3_600_000 + 1;
-        let prefixes = topic.expired_segments(now);
+        let prefixes = topic.expired_segments(now, usize::MAX);
         assert_eq!(prefixes.len(), 1);
         let (range_id, ids) = &prefixes[0];
         assert_eq!(*range_id, RangeId(0));
         assert_eq!(ids.as_ref(), &[SegmentId(0), SegmentId(1)]);
+    }
+
+    #[test]
+    fn expired_prefix_limit_drains_in_oldest_first_chunks() {
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let topic_id = topic_with_three_sealed(&mut sm);
+
+        let first = sm
+            .get_topic(&topic_id)
+            .unwrap()
+            .expired_segments(u64::MAX, 2);
+        assert_eq!(first[0].1.as_ref(), &[SegmentId(0), SegmentId(1)]);
+
+        delete_segments(&mut sm, topic_id, &[0, 1]).unwrap();
+        let second = sm
+            .get_topic(&topic_id)
+            .unwrap()
+            .expired_segments(u64::MAX, 2);
+        assert_eq!(second[0].1.as_ref(), &[SegmentId(2)]);
     }
 
     #[test]
@@ -918,7 +935,7 @@ mod tests {
         assert!(
             sm.get_topic(&t)
                 .unwrap()
-                .expired_segments(u64::MAX)
+                .expired_segments(u64::MAX, usize::MAX)
                 .is_empty()
         );
     }
@@ -1437,6 +1454,85 @@ mod tests {
     // --- DeleteTopic ---
 
     #[test]
+    fn stale_topic_commands_cannot_mutate_a_recreated_topic() {
+        use crate::control_plane::metadata::ProducerSessionOwner;
+
+        let producer_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let commands = |topic_id| {
+            let group = UpdateConsumerGroupMember {
+                topic_id,
+                req: UpdateConsumerGroupMemberRequest {
+                    topic_name: "orders".into(),
+                    group_id: "workers".into(),
+                    member_id,
+                    action: ConsumerGroupMemberAction::Heartbeat,
+                },
+                observed_at: 100,
+                session_timeout_ms: 10_000,
+            };
+            let mut leave = group.clone();
+            leave.req.action = ConsumerGroupMemberAction::Leave;
+            [
+                OpenProducerSession {
+                    topic_name: "orders".into(),
+                    topic_id,
+                    producer_id,
+                    session_nonce: Uuid::new_v4(),
+                    owner: ProducerSessionOwner::CertificatePrincipal("writer".into()),
+                    observed_at: 100,
+                    session_timeout_ms: 10_000,
+                }
+                .into(),
+                group.into(),
+                leave.into(),
+                DeleteTopic {
+                    name: "orders".into(),
+                    topic_id,
+                }
+                .into(),
+            ]
+        };
+        let mut sm = MetadataState::new(ShardGroupId(0));
+        let old_id = create_topic(&mut sm, "orders");
+        for command in commands(old_id) {
+            apply_command(&mut sm, command).unwrap();
+        }
+        let new_id = create_topic(&mut sm, "orders");
+        assert_ne!(old_id, new_id);
+        for command in commands(new_id).into_iter().take(2) {
+            apply_command(&mut sm, command).unwrap();
+        }
+
+        let recovered = MetadataState::from_snapshot(sm.snapshot(), 10);
+        for mut state in [sm, recovered] {
+            assert_eq!(state.get_topic_by_name("orders").unwrap().id, new_id);
+            assert!(
+                state
+                    .get_consumer_group_assignment(old_id, "workers", member_id)
+                    .is_none()
+            );
+            assert!(
+                state
+                    .get_consumer_group_assignment(new_id, "workers", member_id)
+                    .is_some()
+            );
+            let before = state.snapshot();
+            for command in commands(old_id) {
+                // Exercise the committed representation, including its topic ID.
+                let command = borsh::from_slice(&borsh::to_vec(&command).unwrap()).unwrap();
+                assert_eq!(state.apply(command), Err(TopicNotFound(old_id)));
+                assert_eq!(state.snapshot(), before);
+                assert!(state.take_pending_events().is_empty());
+                state.assert_invariants();
+            }
+            for command in commands(new_id) {
+                apply_command(&mut state, command).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn delete_topic_cascades() {
         let mut sm = MetadataState::new(ShardGroupId(0));
         let tid = create_topic(&mut sm, "blue");
@@ -1445,6 +1541,7 @@ mod tests {
             &mut sm,
             MetadataCommand::DeleteTopic(DeleteTopic {
                 name: "blue".into(),
+                topic_id: tid,
             }),
         )
         .unwrap();
@@ -1464,12 +1561,13 @@ mod tests {
     #[test]
     fn delete_topic_removes_name_index() {
         let mut sm = MetadataState::new(ShardGroupId(0));
-        let _tid = create_topic(&mut sm, "blue");
+        let tid = create_topic(&mut sm, "blue");
 
         apply_command(
             &mut sm,
             MetadataCommand::DeleteTopic(DeleteTopic {
                 name: "blue".into(),
+                topic_id: tid,
             }),
         )
         .unwrap();
@@ -1484,6 +1582,7 @@ mod tests {
             &mut sm,
             MetadataCommand::DeleteTopic(DeleteTopic {
                 name: "nope".into(),
+                topic_id: TopicId(0),
             }),
         );
         assert_eq!(result, Err(MetadataError::TopicNameNotFound("nope".into())));

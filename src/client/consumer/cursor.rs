@@ -299,7 +299,7 @@ impl RangeCursor {
             .map(|r| {
                 RangeCursor::new(
                     r.range_id,
-                    r.first_segment_start_offset().map_or(EntryId(0), |id| id),
+                    r.first_segment_start_offset().unwrap_or(EntryId(0)),
                     r.keyspace_start.clone(),
                     r.keyspace_end.clone(),
                 )

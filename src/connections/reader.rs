@@ -12,23 +12,23 @@
 ///
 /// This allows multiple requests to be in-flight on a single connection simultaneously,
 /// with responses arriving in any order.
-use crate::connections::{LEN_PREFIX_SIZE, REQUEST_ID_SIZE};
+use crate::connections::{LEN_PREFIX_SIZE, MAX_FRAME_SIZE, REQUEST_ID_SIZE};
 
 use std::io::ErrorKind;
 
-use crate::net::OwnedReadHalf;
+use crate::net::TransportReadHalf;
 use bytes::{Buf, BytesMut};
 use tokio::io::AsyncReadExt;
 
 pub struct ClientStreamReader {
-    pub(crate) stream: OwnedReadHalf,
+    pub(crate) stream: TransportReadHalf,
     buffer: BytesMut,
 }
 
 impl ClientStreamReader {
-    pub fn new(stream: OwnedReadHalf) -> Self {
+    pub fn new(stream: impl Into<TransportReadHalf>) -> Self {
         Self {
-            stream,
+            stream: stream.into(),
             buffer: BytesMut::with_capacity(1024),
         }
     }
@@ -58,8 +58,6 @@ impl ClientStreamReader {
     /// Frame layout: `[len: u32][request_id: u64][payload: len-REQUEST_ID_SIZE bytes]`
     /// Returns `Ok(None)` if more data is needed.
     pub fn parse_frame(&mut self) -> Result<Option<(u64, BytesMut)>, std::io::Error> {
-        const MAX_MSG_SIZE: usize = 4 * 1024 * 1024; // 4MB
-
         // 1. Do we have enough for the length prefix?
         if self.buffer.len() < LEN_PREFIX_SIZE {
             return Ok(None);
@@ -71,10 +69,10 @@ impl ClientStreamReader {
         let len = len_bytes.get_u32() as usize;
 
         // 3. Security check: prevent massive allocations from malicious clients.
-        if len > MAX_MSG_SIZE {
+        if len > MAX_FRAME_SIZE {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
-                format!("Message length {len} exceeds maximum allowed {MAX_MSG_SIZE}"),
+                format!("Message length {len} exceeds maximum allowed {MAX_FRAME_SIZE}"),
             ));
         }
 

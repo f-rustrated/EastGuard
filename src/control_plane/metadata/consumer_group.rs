@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use borsh::{BorshDeserialize, BorshSerialize};
 use uuid::Uuid;
 
-use crate::{connections::protocol::ConsumerGroupSyncAction, impl_new_struct_wrapper};
+use crate::{connections::protocol::ConsumerGroupMemberAction, impl_new_struct_wrapper};
 
 use super::RangeId;
 
@@ -38,7 +38,7 @@ impl ConsumerGroupMeta {
     pub(crate) fn sync_member(
         &mut self,
         member_id: ConsumerMemberId,
-        action: ConsumerGroupSyncAction,
+        action: ConsumerGroupMemberAction,
         observed_at: u64,
         session_timeout_ms: u64,
         active_ranges: &[RangeId],
@@ -48,10 +48,10 @@ impl ConsumerGroupMeta {
             .retain(|_, last_seen| observed_at.saturating_sub(*last_seen) <= session_timeout_ms);
 
         match action {
-            ConsumerGroupSyncAction::Heartbeat => {
+            ConsumerGroupMemberAction::Heartbeat => {
                 self.members.insert(member_id, observed_at);
             }
-            ConsumerGroupSyncAction::Leave => {
+            ConsumerGroupMemberAction::Leave => {
                 self.members.remove(&member_id);
             }
         }
@@ -150,14 +150,14 @@ mod tests {
         let a = uuid::Uuid::new_v4();
         let b = uuid::Uuid::new_v4();
 
-        assert!(group.sync_member(a, ConsumerGroupSyncAction::Heartbeat, 1, 10, &ranges));
+        assert!(group.sync_member(a, ConsumerGroupMemberAction::Heartbeat, 1, 10, &ranges));
         assert_eq!(*group.generation, 1);
         assert_eq!(group.ranges_for(a).as_ref(), &ranges);
 
-        assert!(!group.sync_member(a, ConsumerGroupSyncAction::Heartbeat, 2, 10, &ranges));
+        assert!(!group.sync_member(a, ConsumerGroupMemberAction::Heartbeat, 2, 10, &ranges));
         assert_eq!(*group.generation, 1);
 
-        assert!(group.sync_member(b, ConsumerGroupSyncAction::Heartbeat, 3, 10, &ranges));
+        assert!(group.sync_member(b, ConsumerGroupMemberAction::Heartbeat, 3, 10, &ranges));
         assert_eq!(*group.generation, 2);
         group.assert_assignments(&ranges);
     }
@@ -168,10 +168,10 @@ mod tests {
         let ranges = [RangeId(1), RangeId(2)];
         let stale = uuid::Uuid::new_v4();
         let live = uuid::Uuid::new_v4();
-        group.sync_member(stale, ConsumerGroupSyncAction::Heartbeat, 1, 10, &ranges);
-        group.sync_member(live, ConsumerGroupSyncAction::Heartbeat, 2, 10, &ranges);
+        group.sync_member(stale, ConsumerGroupMemberAction::Heartbeat, 1, 10, &ranges);
+        group.sync_member(live, ConsumerGroupMemberAction::Heartbeat, 2, 10, &ranges);
 
-        assert!(group.sync_member(live, ConsumerGroupSyncAction::Heartbeat, 20, 10, &ranges));
+        assert!(group.sync_member(live, ConsumerGroupMemberAction::Heartbeat, 20, 10, &ranges));
         assert_eq!(*group.generation, 3);
         assert!(group.ranges_for(stale).is_empty());
         assert_eq!(group.ranges_for(live).as_ref(), &ranges);

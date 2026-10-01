@@ -6,6 +6,12 @@ use crate::control_plane::consensus::raft::storage::RaftSnapshotHeader;
 use crate::control_plane::membership::ShardGroupId;
 use crate::impl_from_variant;
 
+/// Maximum Borsh size of the entries slice in one AppendEntries request.
+///
+/// The transport frame limit is larger so one client command accepted at the
+/// 4 MiB client boundary still fits after Raft and cluster-wire envelopes.
+pub(crate) const MAX_APPEND_ENTRIES_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct RequestVote {
     pub term: u64,
@@ -102,6 +108,6 @@ impl OutboundRaftPacket {
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct WireRaftMessage {
     pub shard_group_id: ShardGroupId,
-    pub sender: NodeId,
+    pub peer_id: NodeId,
     pub rpc: RaftRpc,
 }

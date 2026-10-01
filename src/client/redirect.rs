@@ -1,6 +1,6 @@
 //! The redirect-follow loop — the SDK's one retry path, bounded by a [`RetryPolicy`]
 //! deadline. A hint (redirect carrying an address) is followed at once; a transient
-//! (no leader, unreachable, unconverged gossip) re-resolves to a seed with exponential
+//! (busy, no leader, unreachable, unconverged gossip) re-resolves with exponential
 //! backoff; `TopicNotFound` re-resolves too (metadata may still be propagating) and is
 //! reported only if the deadline expires still not-found. The deadline lives here, so
 //! callers don't wrap calls in their own retry loops. See `c1_routing_and_connections.md`.
@@ -209,6 +209,10 @@ mod tests {
 
     #[test]
     fn data_plane_redirects_map_to_actions() {
+        assert_eq!(
+            classify(&ClientResponse::Err(ServerError::Busy)),
+            "reresolve"
+        );
         assert_eq!(
             classify(&ClientResponse::Err(ServerError::NotWriteLeader {
                 leader_addr: Some(info(8083))

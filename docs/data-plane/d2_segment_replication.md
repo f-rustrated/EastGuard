@@ -256,14 +256,24 @@ D2 uses two separate timer types, each implementing `TTimer`. No single `DataPla
 
 ## DataTransportActor
 
-Same architectural pattern as `RaftTransportActor` (see `raft-transport.md`) — `HashMap<NodeId, OwnedWriteHalf>`, lower-`NodeId`-wins conflict resolution, length-prefixed bincode frames, identical connection lifecycle (outbound resolve, inbound accept, disconnect on SWIM death, 300s cleanup).
+The data transport follows the same broad shape as the Raft transport (see
+`raft-transport.md`): a separate TCP listener, per-peer writers,
+lower-`NodeId`-wins conflict resolution, length-prefixed Borsh frames, live
+address resolution, and cleanup after peer death.
+
+Both transports use standard mutual TLS, bind the exchanged node identity to
+its certificate principal, and verify the exact destination process identity.
+Operators provision credentials and close existing connections when withdrawing
+access. The remaining secure-startup gates are tracked in the
+[security roadmap](../security/roadmap.md).
 
 **Differences from RaftTransportActor:**
 
 | | RaftTransportActor | DataTransportActor |
 |---|---|---|
 | Port | `raft_port` | `data_port` (2923) |
-| Frame size cap | 4MB | 64MB (record batches up to 10MB per segment) |
+| Frame size cap | 8 MiB (4 MiB entry batches) | 64 MiB (record batches up to 10 MiB per segment) |
+| Node authentication | Mutual TLS and certificate-bound node identity | Same |
 | Runtime | tokio | tokio |
 
 **Threading note:** `DataTransportActor` runs on tokio (async TCP I/O, no blocking calls). `DataPlaneActor` runs on a dedicated OS thread (blocking WAL fsync) — a pinned thread keeps hot data (write buffers, segment trackers, WAL write buffer) in L1/L2 cache across batches.

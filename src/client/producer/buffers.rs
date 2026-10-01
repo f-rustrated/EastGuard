@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 pub(crate) type Records = Box<[(Vec<u8>, Vec<u8>)]>;
+pub(crate) const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+// Even empty keys and values need two u32 length prefixes.
+const MAX_BATCH_RECORDS: usize = MAX_BATCH_BYTES / 8;
 
 /// A thread-safe, encapsulated manager for partition-level range buffers.
 pub struct ProducerBuffers {
@@ -74,6 +77,15 @@ impl PendingRecord {
 
     /// Deserialize a byte buffer into a vector of records.
     pub fn deserialize_batch(mut buf: &[u8], count: u32) -> Result<Records, std::io::Error> {
+        if buf.len() > MAX_BATCH_BYTES
+            || count as usize > MAX_BATCH_RECORDS
+            || count as usize > buf.len() / 8
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Batch size or record count exceeds the payload limit",
+            ));
+        }
         let mut records = Vec::with_capacity(count as usize);
         for _ in 0..count {
             if buf.len() < 4 {
@@ -113,6 +125,12 @@ impl PendingRecord {
             buf = &buf[val_len..];
 
             records.push((key, value));
+        }
+        if !buf.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Trailing bytes after batch records",
+            ));
         }
         Ok(records.into_boxed_slice())
     }

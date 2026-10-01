@@ -4,7 +4,7 @@ use crate::control_plane::NodeId;
 use crate::control_plane::metadata::ReassignSegment;
 use crate::control_plane::metadata::command::{
     CreateTopic, DeleteSegments, DeleteTopic, ExpireProducerSessions, MergeRange, MetadataCommand,
-    OpenProducerSession, RollSegment, SplitRange, SyncConsumerGroup,
+    OpenProducerSession, RollSegment, SplitRange, UpdateConsumerGroupMember,
 };
 use crate::{impl_from_variant, impl_from_variant_via};
 
@@ -16,7 +16,7 @@ use crate::{impl_from_variant, impl_from_variant_via};
 pub enum RaftCommand {
     Noop,
     Metadata(MetadataCommand),
-    AddPeer(NodeId),
+    EnsurePeer(NodeId),
     RemovePeer(NodeId),
 }
 
@@ -31,7 +31,7 @@ impl_from_variant_via!(
     DeleteTopic,
     ReassignSegment,
     DeleteSegments,
-    SyncConsumerGroup,
+    UpdateConsumerGroupMember,
     OpenProducerSession,
     ExpireProducerSessions
 );

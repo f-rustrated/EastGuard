@@ -2,6 +2,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::connections::protocol::data_plane::ConsumerOffsetGenerationMismatch;
 use crate::control_plane::NodeAddressInfo;
+use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::data_plane::ProduceError;
 
@@ -29,6 +30,9 @@ pub enum ServerError {
     #[error("topic already exists")]
     AlreadyExists,
 
+    #[error("unauthorized")]
+    Unauthorized,
+
     #[error("stale range")]
     StaleRange,
 
@@ -55,6 +59,10 @@ pub enum ServerError {
 
     #[error("internal server error: {0}")]
     Internal(String),
+
+    /// This attempt was rejected before dispatch; retry with backoff.
+    #[error("server busy; retry later")]
+    Busy,
 }
 
 impl ServerError {
@@ -71,6 +79,20 @@ impl ServerError {
     }
 }
 
+impl From<ProposalError> for ServerError {
+    fn from(error: ProposalError) -> Self {
+        match error {
+            ProposalError::NotLeader(_) => Self::NotRaftLeader { leader_addr: None },
+            ProposalError::ShardNotFound | ProposalError::ShardGroupRemoved => {
+                Self::ShardNotLocal { hint_node: None }
+            }
+            ProposalError::EntryTooLarge => {
+                Self::Internal("metadata proposal exceeds the Raft transport limit".into())
+            }
+        }
+    }
+}
+
 impl From<crate::control_plane::metadata::error::MetadataError> for ServerError {
     fn from(err: crate::control_plane::metadata::error::MetadataError) -> Self {
         use crate::control_plane::metadata::error::MetadataError::*;
@@ -81,6 +103,7 @@ impl From<crate::control_plane::metadata::error::MetadataError> for ServerError 
             TopicNotActive(_) | RangeNotFound | RangeNotActive => ServerError::StaleRange,
             SegmentNotFound | SegmentNotActive | SegmentNotSealed => ServerError::SegmentNotLocal,
             InvalidSplitPoint => ServerError::InvalidSplitPoint,
+            ProducerSessionOwnerMismatch => ServerError::Unauthorized,
             SplitNotAllowed(_) | RangesNotAdjacent => ServerError::Internal(err.to_string()),
         }
     }

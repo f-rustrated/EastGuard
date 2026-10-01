@@ -8,9 +8,9 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::client::{Client, ClientError, ClientSuccess};
-use crate::connections::protocol::{ClientResponse, ConsumerGroupSyncAction};
+use crate::connections::protocol::{ClientResponse, ConsumerGroupMemberAction};
 use crate::control_plane::metadata::consumer_group::GenerationId;
-use crate::control_plane::metadata::{EntryId, RangeId, SyncConsumerGroupRequest, TopicId};
+use crate::control_plane::metadata::{EntryId, RangeId, TopicId, UpdateConsumerGroupMemberRequest};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition, ConsumerOffsetUpdate,
 };
@@ -190,11 +190,11 @@ impl ConsumerGroup {
     }
 
     pub(crate) async fn request_assignment(&self) -> Result<HashSet<RangeId>, ClientError> {
-        let request = SyncConsumerGroupRequest {
+        let request = UpdateConsumerGroupMemberRequest {
             topic_name: self.topic.to_string(),
             group_id: self.group_id.to_string(),
             member_id: self.consumer_id,
-            action: ConsumerGroupSyncAction::Heartbeat,
+            action: ConsumerGroupMemberAction::Heartbeat,
         };
 
         let assignment = match self
@@ -219,11 +219,11 @@ impl ConsumerGroup {
         if self.quit.load(AtomicOrdering::Acquire) {
             return Ok(());
         }
-        let request = SyncConsumerGroupRequest {
+        let request = UpdateConsumerGroupMemberRequest {
             topic_name: self.topic.clone(),
             group_id: self.group_id.clone(),
             member_id: self.consumer_id,
-            action: ConsumerGroupSyncAction::Leave,
+            action: ConsumerGroupMemberAction::Leave,
         };
         let served = self
             .client
@@ -294,11 +294,11 @@ impl Drop for ConsumerGroup {
             return;
         }
         let client = self.client.clone();
-        let req = SyncConsumerGroupRequest {
+        let req = UpdateConsumerGroupMemberRequest {
             topic_name: self.topic.clone(),
             group_id: self.group_id.clone(),
             member_id: self.consumer_id,
-            action: ConsumerGroupSyncAction::Leave,
+            action: ConsumerGroupMemberAction::Leave,
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
