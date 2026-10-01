@@ -4,12 +4,11 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::certificates::node_certificate_principal;
+use super::certificates::{CertificatePrincipal, node_certificate_principal};
 use crate::config::{Environment, SecurityMode};
 use crate::control_plane::NodeId;
 use crate::net::TransportTcpStream;
 use anyhow::{Context, Result};
-use borsh::{BorshDeserialize, BorshSerialize};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
@@ -179,6 +178,33 @@ impl NodeTransportSecurity {
         matches!(self, Self::Secure(_))
     }
 
+    /// Binds an outbound connection to its exact target before application data.
+    /// Shared by Raft, ACL reads, and data replication.
+    pub(crate) async fn authenticate_outbound(
+        &self,
+        stream: &mut TransportTcpStream,
+        local_node_id: &NodeId,
+        expected_peer: &NodeId,
+    ) -> Result<()> {
+        if self.is_secure() {
+            stream
+                .peer_principal()
+                .context("secure peer has no certificate")?
+                .verify_node_id(expected_peer)?;
+            let peer = self.exchange_node_identity(stream, local_node_id).await?;
+            anyhow::ensure!(
+                peer == *expected_peer,
+                "connected broker differs from expected node"
+            );
+        } else {
+            anyhow::ensure!(
+                stream.peer_principal().is_none(),
+                "development connection unexpectedly used TLS"
+            );
+        }
+        Ok(())
+    }
+
     /// Exchanges bounded node IDs inside mTLS, without consulting metadata.
     /// A certificate authorizes its own `principal::suffix` namespace only.
     /// Callers must additionally compare an outbound peer with their target.
@@ -281,39 +307,6 @@ pub(crate) struct NodeCredentials {
     node_certificate_principal: CertificatePrincipal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, BorshSerialize, BorshDeserialize)]
-pub(crate) struct CertificatePrincipal(Box<str>);
-
-impl CertificatePrincipal {
-    pub(crate) fn new(principal: impl Into<Box<str>>) -> Self {
-        Self(principal.into())
-    }
-
-    pub(crate) fn has_valid_length(&self) -> bool {
-        !self.0.is_empty() && self.0.len() <= super::MAX_SECURITY_ID_BYTES
-    }
-
-    pub(crate) fn verify_node_id(&self, node_id: &NodeId) -> Result<()> {
-        anyhow::ensure!(
-            self.has_valid_length()
-                && node_id.len() <= super::MAX_SECURITY_ID_BYTES
-                && node_id
-                    .rsplit_once("::")
-                    .is_some_and(|(principal, suffix)| {
-                        principal == self.as_ref() && !suffix.is_empty()
-                    }),
-            "node ID does not belong to the certificate principal"
-        );
-        Ok(())
-    }
-}
-
-impl AsRef<str> for CertificatePrincipal {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 impl NodeCredentials {
     fn validate_node_prefix(&self, prefix: Option<&str>) -> Result<()> {
         anyhow::ensure!(
@@ -347,35 +340,6 @@ mod tests {
             .collect();
         let key = KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().der().clone()
-    }
-
-    #[test]
-    fn certificate_owns_only_its_exact_node_id_namespace() {
-        let principal = CertificatePrincipal::new("broker-a");
-        for valid in ["broker-a::1", "broker-a::2"] {
-            principal.verify_node_id(&NodeId::new(valid)).unwrap();
-        }
-        for invalid in [
-            "",
-            "broker-a",
-            "broker-a::",
-            "broker-ab::1",
-            "broker-b::1",
-            "broker-a::1::2",
-        ] {
-            assert!(
-                principal.verify_node_id(&NodeId::new(invalid)).is_err(),
-                "{invalid}"
-            );
-        }
-        assert!(
-            principal
-                .verify_node_id(&NodeId::new(format!(
-                    "broker-a::{}",
-                    "x".repeat(super::super::MAX_SECURITY_ID_BYTES)
-                )))
-                .is_err()
-        );
     }
 
     #[test]

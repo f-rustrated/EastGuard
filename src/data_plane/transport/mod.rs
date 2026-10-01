@@ -13,7 +13,7 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
 
 use crate::net::TcpListener;
-use crate::security::SecurityHandle;
+use crate::security::NodeTransportSecurity;
 
 use command::DataTransportCommand;
 use connection::DataConnection;
@@ -32,9 +32,9 @@ impl DataTransportActor {
         mut from_actor: mpsc::Receiver<Box<[DataTransportCommand]>>,
         swim_tx: SwimSender,
         topology: TopologyReader,
-        security: SecurityHandle,
+        node_transport: NodeTransportSecurity,
     ) {
-        let mut state = TransportState::new(node_id, security.clone());
+        let mut state = TransportState::new(node_id.clone(), node_transport.clone());
         let mut handshakes = JoinSet::new();
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await;
@@ -80,9 +80,10 @@ impl DataTransportActor {
                         tracing::debug!("data handshake limit reached");
                         continue;
                     }
-                    let security = security.clone();
+                    let node_transport = node_transport.clone();
+                    let node_id = node_id.clone();
                     handshakes.spawn(async move {
-                        tokio::time::timeout(HANDSHAKE_TIMEOUT, DataConnection::accept(stream, &security)).await
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, DataConnection::accept(stream, &node_id, &node_transport)).await
                             .context("data handshake timed out")?
                     });
                 }
@@ -113,7 +114,6 @@ impl DataTransportActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::membership::actor::SwimActor;
     use crate::control_plane::membership::{Topology, TopologyConfig};
     use crate::data_plane::messages::DataPlaneMessage;
@@ -121,7 +121,6 @@ mod tests {
         DataPlaneCommand, DeleteSegments, ReceivePeerMessage,
     };
     use crate::net::TcpStream;
-    use crate::security::{NodeTransportSecurity, SecurityActor};
 
     #[test]
     fn stalled_data_handshake_does_not_block_another_peer() -> turmoil::Result {
@@ -132,7 +131,6 @@ mod tests {
         sim.client("node", async {
             let local = NodeId::new("node");
             let (swim, _swim_rx) = SwimActor::channel(1);
-            let (raft, _raft_rx) = MultiRaftActor::channel(1);
             let topology = Topology::new(
                 [local.clone()],
                 TopologyConfig {
@@ -142,13 +140,6 @@ mod tests {
             )
             .channel()
             .1;
-            let security = SecurityActor::spawn(
-                local.clone(),
-                swim.clone(),
-                raft,
-                topology.clone(),
-                NodeTransportSecurity::TrustedDevelopment,
-            );
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (data, mailbox) = flume::bounded(1);
             let (_commands, commands_rx) = mpsc::channel(1);
@@ -159,7 +150,7 @@ mod tests {
                 commands_rx,
                 swim,
                 topology,
-                security,
+                NodeTransportSecurity::TrustedDevelopment,
             ));
             let address = (turmoil::lookup("node"), 9000);
             let _stalled = TcpStream::connect(address).await?;

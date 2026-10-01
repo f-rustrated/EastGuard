@@ -20,7 +20,7 @@ use crate::net::{TcpListener, TcpStream};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
-use crate::security::{NodeTransportSecurity, SecurityActor};
+use crate::security::{AclActor, NodeTransportSecurity};
 
 use super::{CLUSTER_PORT, QUERY_PORT, mock_swim_handler};
 
@@ -74,7 +74,7 @@ async fn start_raft_node(
         .collect();
     let (topology_pub, topology_reader) = super::stub_topology_channel(&all_nodes);
 
-    let security = SecurityActor::spawn(
+    let acl = AclActor::spawn(
         node_id.clone(),
         swim_tx.clone(),
         raft_tx.clone(),
@@ -87,7 +87,8 @@ async fn start_raft_node(
         raft_tx.clone(),
         transport_rx,
         swim_tx.clone(),
-        security,
+        NodeTransportSecurity::TrustedDevelopment,
+        acl,
     ));
     let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     let election_jitter_seed = {

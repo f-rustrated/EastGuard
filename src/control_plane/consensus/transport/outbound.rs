@@ -1,137 +1,281 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::time::Duration;
 
+use anyhow::Context;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::control_plane::NodeId;
 use crate::control_plane::consensus::actor::MutlRaftSender;
-
 use crate::control_plane::consensus::messages::{
-    InboundRaftRpc, OutboundRaftPacket, WireRaftMessage,
+    InboundRaftRpc, OutboundRaftPacket, RaftTransportCommand, WireRaftMessage,
+};
+use crate::control_plane::consensus::raft::states::security::AclRecord;
+use crate::control_plane::membership::actor::SwimSender;
+use crate::control_plane::metadata::AclResource;
+use crate::impl_from_variant;
+use crate::net::{TransportTcpStream, TransportWriteHalf};
+use crate::security::NodeTransportSecurity;
+
+use super::before_deadline;
+use super::inbound::{AcceptedRaftConnection, ClusterMessageReader};
+use super::protocol::{
+    AclSnapshotRequest, AclSnapshotResponse, ClusterRequest, MAX_CLUSTER_FRAME_SIZE, encode_frame,
 };
 
-use crate::control_plane::NodeId;
-use crate::control_plane::consensus::transport::{AcceptedRaftConnection, ClusterMessageReader};
-use crate::control_plane::membership::actor::SwimSender;
-use crate::net::{TransportTcpStream, TransportWriteHalf};
-use crate::security::{AdmissionProof, CertificatePrincipal};
-
-use super::protocol::{ClusterRequest, InitialClusterMessage, encode_frame};
-use crate::security::SecurityHandle;
-
-const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-const ADMISSION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-/// Upper bound on messages buffered per peer while its connection is in flight;
-/// overflow is dropped (raft retries by timer).
+const CONNECT_BACKOFF: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const IDENTITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const RAFT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds aggregate dial tasks and their per-peer message buffers. Overflow is
+/// safe to drop because Raft re-drives unacknowledged RPCs.
+const MAX_CONNECTING_PEERS: usize = 16;
+/// Upper bounds on work buffered per peer while its connection is in flight;
+/// overflow is dropped (Raft retries by timer).
 const CONNECTING_PEER_BUFFER_CAP: usize = 256;
+const CONNECTING_PEER_BUFFER_BYTE_CAP: usize = MAX_CLUSTER_FRAME_SIZE * 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionOrigin {
+    Local,
+    Remote,
+}
+
+/// A writer and its matching reader task. Dropping the slot always closes both
+/// halves, including when a newer authenticated connection replaces it.
+struct ActiveConnection {
+    generation: u64,
+    origin: ConnectionOrigin,
+    writer: TransportWriteHalf,
+    reader_task: JoinHandle<()>,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
+}
+
+impl ActiveConnection {
+    async fn write_messages_before(
+        &mut self,
+        messages: &[WireRaftMessage],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if deadline <= Instant::now() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+
+        for message in messages {
+            let frame = encode_frame(message).map_err(io::Error::other)?;
+            before_deadline(deadline, self.writer.write_all(&frame))
+                .await
+                .ok_or(io::ErrorKind::TimedOut)??;
+        }
+        before_deadline(deadline, self.writer.flush())
+            .await
+            .ok_or(io::ErrorKind::TimedOut)?
+    }
+}
+
+struct ConnectingPeer {
+    generation: u64,
+    messages: Vec<WireRaftMessage>,
+    serialized_bytes: usize,
+    task: JoinHandle<()>,
+}
+
+impl ConnectingPeer {
+    fn extend(&mut self, messages: impl IntoIterator<Item = WireRaftMessage>) {
+        for message in messages {
+            if self.messages.len() == CONNECTING_PEER_BUFFER_CAP {
+                break;
+            }
+            let Ok(message_bytes) = borsh::object_length(&message) else {
+                break;
+            };
+            let serialized_bytes = self
+                .serialized_bytes
+                .saturating_add(message_bytes)
+                .saturating_add(std::mem::size_of::<u32>());
+            if serialized_bytes > CONNECTING_PEER_BUFFER_BYTE_CAP {
+                break;
+            }
+            self.messages.push(message);
+            self.serialized_bytes = serialized_bytes;
+        }
+    }
+}
+
+impl Drop for ConnectingPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A background connection attempt completed.
+pub(super) struct ConnectionAttemptCompleted {
+    target: NodeId,
+    generation: u64,
+    result: anyhow::Result<OutboundClusterConnection>,
+}
+
+/// A particular generation's reader stopped.
+pub(super) struct ConnectionReaderClosed {
+    peer_id: NodeId,
+    generation: u64,
+}
+
+pub(super) enum ConnectionEvent {
+    AttemptCompleted(ConnectionAttemptCompleted),
+    ReaderClosed(ConnectionReaderClosed),
+}
+
+impl_from_variant!(
+    ConnectionEvent,
+    AttemptCompleted(ConnectionAttemptCompleted),
+    ReaderClosed(ConnectionReaderClosed),
+);
 
 /// Manages peer connections, address resolution, and dead-peer tracking.
 ///
-/// On simultaneous connect, the connection initiated by the **lower `NodeId`**
-/// wins; the other is dropped.
-///
-/// A connection begins with its first Raft message, which identifies the peer.
-/// The acceptor uses that sender to key the writer slot and resolve simultaneous
-/// connection conflicts.
+/// On simultaneous connect, the connection initiated by the lower `NodeId`
+/// wins. A newer authenticated connection with the same origin replaces the
+/// older generation.
 pub(super) struct RaftRpcDispatcher {
     node_id: NodeId,
-    writers: HashMap<NodeId, TransportWriteHalf>,
-    /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs
-    /// to these peers are silently dropped until a new connection is
-    /// accepted (peer restart with new UUID won't hit this — different NodeId).
+    connections: HashMap<NodeId, ActiveConnection>,
+    next_generation: u64,
+    next_send_start: usize,
+    /// Peers explicitly disconnected via DisconnectPeer. Outbound RPCs to
+    /// these peers are dropped until an authenticated connection is accepted.
     dead_peers: HashSet<NodeId>,
-    /// Tracks when the last connect attempt to a peer failed. Prevents
-    /// rapid reconnect storms to dead/unreachable peers that would block
-    /// the transport's select loop and stall flush_events in MultiRaftActor.
     connect_backoffs: HashMap<NodeId, Instant>,
-    /// Messages buffered for peers whose connection is being established on a
-    /// background task; flushed (or dropped on failure) in `on_connection_result`.
-    connecting_peers: HashMap<NodeId, Vec<WireRaftMessage>>,
-    connection_result_tx: mpsc::Sender<ConnectionAttemptResult>,
-    security: SecurityHandle,
-}
-
-/// Result of a background connection attempt, delivered to the transport loop.
-pub(super) struct ConnectionAttemptResult {
-    target: NodeId,
-    result: anyhow::Result<(ClusterMessageReader, TransportWriteHalf)>,
+    connecting_peers: HashMap<NodeId, ConnectingPeer>,
+    connection_event_tx: mpsc::Sender<ConnectionEvent>,
+    node_transport: NodeTransportSecurity,
 }
 
 impl RaftRpcDispatcher {
     pub(super) fn new(
         node_id: NodeId,
-        connection_result_tx: mpsc::Sender<ConnectionAttemptResult>,
-        security: SecurityHandle,
+        connection_event_tx: mpsc::Sender<ConnectionEvent>,
+        node_transport: NodeTransportSecurity,
     ) -> Self {
         Self {
             node_id,
-            writers: HashMap::new(),
+            connections: HashMap::new(),
+            next_generation: 0,
+            next_send_start: 0,
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
             connecting_peers: HashMap::new(),
-            connection_result_tx,
-            security,
+            connection_event_tx,
+            node_transport,
         }
     }
 
     pub(super) fn accept(&mut self, connection: AcceptedRaftConnection, raft_tx: &MutlRaftSender) {
         let AcceptedRaftConnection {
-            peer_id: connection_peer_id,
             initial_message,
             reader,
             writer,
         } = connection;
+        let peer_id = initial_message.peer_id.clone();
+
+        // Authentication is positive evidence that a formerly-dead peer is
+        // back. Do this even when the deterministic connection tie-break keeps
+        // an already-installed connection.
+        self.dead_peers.remove(&peer_id);
+        self.connect_backoffs.remove(&peer_id);
+
+        if self.existing_connection_wins(&peer_id, ConnectionOrigin::Remote) {
+            // The local node is the lower initiator, so its connection wins.
+            return;
+        }
 
         let initial_rpc = InboundRaftRpc {
             shard_group_id: initial_message.shard_group_id,
-            peer_id: connection_peer_id,
+            peer_id: peer_id.clone(),
             rpc: initial_message.rpc,
         };
-        if self.writers.contains_key(&initial_rpc.peer_id) && initial_rpc.peer_id > self.node_id {
-            // simultaneous connect: dropping accepted connection
-            return;
+        self.install_connection(
+            peer_id,
+            ConnectionOrigin::Remote,
+            reader,
+            writer,
+            Some(initial_rpc),
+            raft_tx,
+        );
+    }
+
+    pub(super) async fn handle_commands(
+        &mut self,
+        batch: Box<[RaftTransportCommand]>,
+        swim_tx: &SwimSender,
+    ) {
+        // Apply disconnects before sending so packets in the same batch already
+        // skip removed peers.
+        let mut packets = Vec::new();
+        for command in batch {
+            match command {
+                RaftTransportCommand::Send(outbound) => packets.extend(outbound),
+                RaftTransportCommand::DisconnectPeer(peer_id) => self.disconnect(peer_id),
+            }
         }
-        self.writers.insert(initial_rpc.peer_id.clone(), writer);
-        let raft_tx = raft_tx.clone();
-        tokio::spawn(async move {
-            let reader_peer_id = initial_rpc.peer_id.clone();
-            let _ = raft_tx.send(initial_rpc).await;
-            reader.run(raft_tx, reader_peer_id).await;
-        });
+        if !packets.is_empty() {
+            self.send(packets, swim_tx).await;
+        }
     }
 
     pub(super) async fn send(&mut self, packets: Vec<OutboundRaftPacket>, swim_tx: &SwimSender) {
-        for (target_id, msgs) in self.group_packets(packets) {
-            self.send_to_target(target_id, msgs, swim_tx).await;
+        let batch_write_deadline = Instant::now() + RAFT_WRITE_TIMEOUT;
+        for (target_id, messages) in self.group_packets(packets) {
+            if batch_write_deadline <= Instant::now() {
+                break;
+            }
+            self.send_to_target(target_id, messages, swim_tx, batch_write_deadline)
+                .await;
         }
     }
 
     fn group_packets(
-        &self,
+        &mut self,
         packets: Vec<OutboundRaftPacket>,
-    ) -> BTreeMap<NodeId, Vec<WireRaftMessage>> {
+    ) -> Vec<(NodeId, Vec<WireRaftMessage>)> {
         let mut by_target: BTreeMap<NodeId, Vec<WireRaftMessage>> = BTreeMap::new();
-        for pkt in packets {
-            if self.dead_peers.contains(&pkt.target) {
+        for packet in packets {
+            if self.dead_peers.contains(&packet.target) {
                 continue;
             }
             by_target
-                .entry(pkt.target)
+                .entry(packet.target)
                 .or_default()
                 .push(WireRaftMessage {
-                    shard_group_id: pkt.shard_group_id,
+                    shard_group_id: packet.shard_group_id,
                     peer_id: self.node_id.clone(),
-                    rpc: pkt.rpc,
+                    rpc: packet.rpc,
                 });
         }
-        by_target
+        let mut groups: Vec<_> = by_target.into_iter().collect();
+        if !groups.is_empty() {
+            let start = self.next_send_start % groups.len();
+            groups.rotate_left(start);
+            self.next_send_start = self.next_send_start.wrapping_add(1);
+        }
+        groups
     }
 
     async fn send_to_target(
         &mut self,
         target_id: NodeId,
-        mut msgs: Vec<WireRaftMessage>,
+        mut messages: Vec<WireRaftMessage>,
         swim_tx: &SwimSender,
+        batch_write_deadline: Instant,
     ) {
         if let Some(&failed_at) = self.connect_backoffs.get(&target_id) {
             if failed_at.elapsed() < CONNECT_BACKOFF {
@@ -139,79 +283,229 @@ impl RaftRpcDispatcher {
             }
             self.connect_backoffs.remove(&target_id);
         }
-        if self.writers.contains_key(&target_id)
-            && self.write_messages_to(&target_id, &msgs).await.is_ok()
+        if self.connections.contains_key(&target_id)
+            && self
+                .write_messages_to_before(&target_id, &messages, batch_write_deadline)
+                .await
+                .is_ok()
         {
             return;
         }
-        // No usable writer: hand the messages to the in-flight connection (if
-        // any) or start one on a background task. Connection attempts must
-        // never run inline: a hung connect blocks this select loop for the full
-        // timeout, stalling every queued batch and the accept arm with it (#133).
-        if let Some(buffered) = self.connecting_peers.get_mut(&target_id) {
-            if buffered.len() + msgs.len() <= CONNECTING_PEER_BUFFER_CAP {
-                buffered.extend(msgs);
-            }
+        if batch_write_deadline <= Instant::now() {
             return;
         }
-        let initial_raft_message = msgs.remove(0);
-        self.connecting_peers.insert(target_id.clone(), msgs);
+        if let Some(connecting) = self.connecting_peers.get_mut(&target_id) {
+            connecting.extend(messages);
+            return;
+        }
+        if self.connecting_peers.len() == MAX_CONNECTING_PEERS {
+            tracing::debug!(
+                peer = %target_id,
+                "Raft connection attempt dropped: global attempt limit reached"
+            );
+            return;
+        }
 
-        tokio::spawn(connect_peer(
-            target_id,
-            swim_tx.clone(),
-            self.security.clone(),
-            initial_raft_message,
-            self.connection_result_tx.clone(),
-        ));
+        let initial_raft_message = messages.remove(0);
+        let generation = self.allocate_generation();
+        let peer_id = target_id.clone();
+        let local_node_id = self.node_id.clone();
+        let swim_tx = swim_tx.clone();
+        let node_transport = self.node_transport.clone();
+        let event_tx = self.connection_event_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = OutboundClusterConnection::connect_raft(
+                &peer_id,
+                &local_node_id,
+                &swim_tx,
+                &node_transport,
+                initial_raft_message,
+            )
+            .await;
+            let _ = event_tx
+                .send(
+                    ConnectionAttemptCompleted {
+                        target: peer_id,
+                        generation,
+                        result,
+                    }
+                    .into(),
+                )
+                .await;
+        });
+        let mut connecting = ConnectingPeer {
+            generation,
+            messages: Vec::new(),
+            serialized_bytes: 0,
+            task,
+        };
+        connecting.extend(messages);
+        self.connecting_peers.insert(target_id, connecting);
     }
 
-    /// Installs (or discards, per the NodeId tie-break) a completed connection
-    /// and flushes any messages buffered while it was in flight.
-    pub(super) async fn on_connection_result(
+    pub(super) async fn on_connection_event(
         &mut self,
-        attempt: ConnectionAttemptResult,
+        event: ConnectionEvent,
         raft_tx: &MutlRaftSender,
     ) {
-        let ConnectionAttemptResult { target, result } = attempt;
-        let buffered = self.connecting_peers.remove(&target).unwrap_or_default();
+        match event {
+            ConnectionEvent::AttemptCompleted(completed) => {
+                self.on_connection_attempt_completed(completed, raft_tx)
+                    .await;
+            }
+            ConnectionEvent::ReaderClosed(closed) => {
+                let is_current = self
+                    .connections
+                    .get(&closed.peer_id)
+                    .is_some_and(|connection| connection.generation == closed.generation);
+                if is_current {
+                    self.connections.remove(&closed.peer_id);
+                }
+            }
+        }
+    }
 
-        let Ok((reader, write_half)) = result.inspect_err(|err| {
-            tracing::warn!(peer = %target, "connection attempt failed: {err}");
-        }) else {
-            self.connect_backoffs.insert(target, Instant::now());
+    async fn on_connection_attempt_completed(
+        &mut self,
+        completed: ConnectionAttemptCompleted,
+        raft_tx: &MutlRaftSender,
+    ) {
+        let ConnectionAttemptCompleted {
+            target,
+            generation,
+            result,
+        } = completed;
+        let Some(attempt) = self
+            .connecting_peers
+            .get_mut(&target)
+            .filter(|attempt| attempt.generation == generation)
+        else {
+            tracing::debug!(peer = %target, generation, "ignoring stale connection attempt");
             return;
+        };
+        let buffered = std::mem::take(&mut attempt.messages);
+        self.connecting_peers.remove(&target);
+        let established = match result {
+            Ok(established) => established,
+            Err(error) => {
+                tracing::warn!(peer = %target, "connection attempt failed: {error}");
+                if self.connections.contains_key(&target) {
+                    self.flush_buffered_messages(&target, &buffered).await;
+                } else {
+                    self.connect_backoffs.insert(target, Instant::now());
+                }
+                return;
+            }
         };
 
         if self.dead_peers.contains(&target) {
             return;
         }
-        // Mirror `accept`'s tie-break: the connection initiated by
-        // the lower NodeId wins, and we initiated this one. Losing the
-        // tie-break must not lose the buffered messages — deliver them
-        // over the surviving (accepted) connection instead;
-        if self.writers.contains_key(&target) && self.node_id > target {
+        if self.existing_connection_wins(&target, ConnectionOrigin::Local) {
             tracing::debug!(
                 peer = %target,
                 buffered = buffered.len(),
-                "simultaneous connect: discarding our connection, peer's connection \
-                 wins the tie-break (lower NodeId); rerouting buffered messages",
+                "simultaneous connect: peer's lower-NodeId connection wins",
             );
-            if !buffered.is_empty() {
-                let _ = self.write_messages_to(&target, &buffered).await;
-            }
+            self.flush_buffered_messages(&target, &buffered).await;
             return;
         }
-        self.writers.insert(target.clone(), write_half);
-        tokio::spawn(reader.run(raft_tx.clone(), target.clone()));
 
-        if !buffered.is_empty() {
-            let _ = self.write_messages_to(&target, &buffered).await;
+        let (reader, writer) = established.into_parts();
+        self.install_connection(
+            target.clone(),
+            ConnectionOrigin::Local,
+            reader,
+            writer,
+            None,
+            raft_tx,
+        );
+        self.flush_buffered_messages(&target, &buffered).await;
+    }
+
+    /// The connection initiated by the lower NodeId wins. A newer connection
+    /// with the same origin replaces the older generation.
+    fn existing_connection_wins(
+        &self,
+        peer_id: &NodeId,
+        incoming_origin: ConnectionOrigin,
+    ) -> bool {
+        self.connections.get(peer_id).is_some_and(|existing| {
+            !existing.reader_task.is_finished()
+                && match (existing.origin, incoming_origin) {
+                    (ConnectionOrigin::Local, ConnectionOrigin::Remote) => &self.node_id < peer_id,
+                    (ConnectionOrigin::Remote, ConnectionOrigin::Local) => peer_id < &self.node_id,
+                    (ConnectionOrigin::Local, ConnectionOrigin::Local)
+                    | (ConnectionOrigin::Remote, ConnectionOrigin::Remote) => false,
+                }
+        })
+    }
+
+    async fn flush_buffered_messages(&mut self, target: &NodeId, messages: &[WireRaftMessage]) {
+        if !messages.is_empty()
+            && let Err(error) = self
+                .write_messages_to_before(target, messages, Instant::now() + RAFT_WRITE_TIMEOUT)
+                .await
+        {
+            tracing::debug!(
+                peer = %target,
+                "failed to flush buffered Raft messages: {error}"
+            );
         }
     }
 
+    fn allocate_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        generation
+    }
+
+    fn install_connection(
+        &mut self,
+        peer_id: NodeId,
+        origin: ConnectionOrigin,
+        reader: ClusterMessageReader,
+        writer: TransportWriteHalf,
+        initial_rpc: Option<InboundRaftRpc>,
+        raft_tx: &MutlRaftSender,
+    ) {
+        let generation = self.allocate_generation();
+
+        let reader_peer_id = peer_id.clone();
+        let raft_tx = raft_tx.clone();
+        let event_tx = self.connection_event_tx.clone();
+        let reader_task = tokio::spawn(async move {
+            let actor_available = match initial_rpc {
+                Some(initial_rpc) => raft_tx.send(initial_rpc).await.is_ok(),
+                None => true,
+            };
+            if actor_available {
+                reader.run(raft_tx, reader_peer_id.clone()).await;
+            }
+            let _ = event_tx
+                .send(
+                    ConnectionReaderClosed {
+                        peer_id: reader_peer_id,
+                        generation,
+                    }
+                    .into(),
+                )
+                .await;
+        });
+
+        self.connections.insert(
+            peer_id,
+            ActiveConnection {
+                generation,
+                origin,
+                writer,
+                reader_task,
+            },
+        );
+    }
+
     pub(super) fn disconnect(&mut self, peer_id: NodeId) {
-        self.writers.remove(&peer_id);
+        self.connections.remove(&peer_id);
         self.connecting_peers.remove(&peer_id);
         tracing::info!("[{}] Disconnected dead peer {:?}", self.node_id, peer_id);
         self.dead_peers.insert(peer_id);
@@ -222,141 +516,340 @@ impl RaftRpcDispatcher {
         self.connect_backoffs.clear();
     }
 
-    // --- Wire helpers ---
-    // On error, writer is removed from the map so subsequent calls reconnect.
-    /// Encode all messages into a single buffer, write to target's connection.
-    async fn write_messages_to(
+    /// Writes one batch within a single deadline. A timeout may leave a partial
+    /// frame on the stream, so any error drops the entire connection.
+    async fn write_messages_to_before(
         &mut self,
         target: &NodeId,
-        msgs: &[WireRaftMessage],
-    ) -> std::io::Result<()> {
-        let writer = self.writers.get_mut(target).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "no writer for target")
-        })?;
-        let mut buf = Vec::new();
-        for msg in msgs {
-            let frame = encode_frame(msg).map_err(std::io::Error::other)?;
-            buf.extend_from_slice(&frame);
+        messages: &[WireRaftMessage],
+        batch_write_deadline: Instant,
+    ) -> io::Result<()> {
+        if batch_write_deadline <= Instant::now() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Raft transport batch write deadline elapsed",
+            ));
         }
-        let result = writer.write_all(&buf).await;
+
+        let result = {
+            let connection = self.connections.get_mut(target).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no writer for target")
+            })?;
+            connection
+                .write_messages_before(messages, batch_write_deadline)
+                .await
+        };
+
         if result.is_err() {
-            self.writers.remove(target);
+            self.connections.remove(target);
         }
         result
     }
 
     #[cfg(test)]
     pub fn contains(&self, node_id: &NodeId) -> bool {
-        self.writers.contains_key(node_id)
+        self.connections.contains_key(node_id)
+    }
+
+    #[cfg(test)]
+    pub fn connection_generation(&self, node_id: &NodeId) -> Option<u64> {
+        self.connections
+            .get(node_id)
+            .map(|connection| connection.generation)
+    }
+
+    #[cfg(test)]
+    pub fn is_dead(&self, node_id: &NodeId) -> bool {
+        self.dead_peers.contains(node_id)
     }
 }
 
-/// Connects, performs the opening Raft exchange, and reports the result.
-async fn connect_peer(
-    target_id: NodeId,
-    swim_tx: SwimSender,
-    security: SecurityHandle,
-    initial_raft_message: WireRaftMessage,
-    connection_result_tx: mpsc::Sender<ConnectionAttemptResult>,
-) {
-    let result = async {
-        let Some(addr) = swim_tx.resolve_address(target_id.clone()).await? else {
-            anyhow::bail!("cannot resolve address for {target_id}");
-        };
-
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TransportTcpStream::connect_node(addr.cluster_addr(), security.node_transport()),
-        )
-        .await??;
-
-        let mut connection = OutboundClusterConnection::new(stream, target_id.clone())?;
-        tokio::time::timeout(
-            ADMISSION_HANDSHAKE_TIMEOUT,
-            connection.send_initial_request(&security, ClusterRequest::Raft(initial_raft_message)),
-        )
-        .await??;
-        Ok(connection.into_parts())
-    }
-    .await;
-
-    let _ = connection_result_tx
-        .send(ConnectionAttemptResult {
-            target: target_id,
-            result,
-        })
-        .await;
-}
-
-/// One outbound cluster stream before its first Raft or ACL message.
-///
-/// It owns the expected peer identity and both stream halves so callers cannot
-/// accidentally perform only one side of the mutual admission exchange.
+/// One authenticated outbound cluster stream.
 pub(crate) struct OutboundClusterConnection {
-    pub(crate) reader: ClusterMessageReader,
+    reader: ClusterMessageReader,
     writer: TransportWriteHalf,
-    expected_peer_id: NodeId,
-    /// Present only for a TLS stream; trusted-development streams skip
-    /// admission entirely.
-    tls_peer: Option<(CertificatePrincipal, [u8; 32])>,
 }
 
 impl OutboundClusterConnection {
-    pub(crate) fn new(
-        stream: TransportTcpStream,
-        expected_peer_id: NodeId,
+    /// Connects, authenticates, and sends the opening Raft request.
+    async fn connect_raft(
+        target_id: &NodeId,
+        local_node_id: &NodeId,
+        swim_tx: &SwimSender,
+        node_transport: &NodeTransportSecurity,
+        initial_raft_message: WireRaftMessage,
     ) -> anyhow::Result<Self> {
-        let certificate_principal = stream.peer_principal();
-        let tls_peer = match &certificate_principal {
-            Some(principal) => Some((principal.clone(), stream.admission_binding()?)),
-            None => None,
-        };
+        tokio::time::timeout(CONNECTION_ATTEMPT_TIMEOUT, async {
+            let Some(address) = swim_tx.resolve_address(target_id.clone()).await? else {
+                anyhow::bail!("cannot resolve address for {target_id}");
+            };
 
-        let (read_half, writer) = stream.into_split();
+            let stream = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                TransportTcpStream::connect_node(address.cluster_addr(), node_transport),
+            )
+            .await??;
+            tokio::time::timeout(IDENTITY_HANDSHAKE_TIMEOUT, async {
+                let mut connection =
+                    Self::new(stream, target_id, local_node_id, node_transport).await?;
+                connection.send_request(initial_raft_message.into()).await?;
+                Ok(connection)
+            })
+            .await?
+        })
+        .await
+        .context("connection attempt timed out")?
+    }
+
+    pub(crate) async fn new(
+        mut stream: TransportTcpStream,
+        expected_peer_id: &NodeId,
+        local_node_id: &NodeId,
+        node_transport: &NodeTransportSecurity,
+    ) -> anyhow::Result<Self> {
+        node_transport
+            .authenticate_outbound(&mut stream, local_node_id, expected_peer_id)
+            .await?;
+        let (reader, writer) = stream.into_split();
         Ok(Self {
-            reader: ClusterMessageReader::new(read_half, certificate_principal),
+            reader: ClusterMessageReader::new(reader),
             writer,
-            expected_peer_id,
-            tls_peer,
         })
     }
 
-    pub(crate) async fn send_initial_request(
+    pub(crate) async fn read_acl_snapshot(
         &mut self,
-        security: &SecurityHandle,
-        request: ClusterRequest,
-    ) -> anyhow::Result<()> {
-        let admission_proof = match self.tls_peer.as_ref() {
-            Some((_, tls_session_binding)) => {
-                Some(security.create_admission_proof(tls_session_binding)?)
-            }
-            None => None,
-        };
-        self.writer
-            .write_all(&encode_frame(&InitialClusterMessage {
-                admission_proof,
-                request,
-            })?)
+        resource: AclResource,
+    ) -> anyhow::Result<AclRecord> {
+        self.send_request(AclSnapshotRequest { resource }.into())
             .await?;
-
-        let Some((peer_principal, tls_session_binding)) = self.tls_peer.as_ref() else {
-            return Ok(());
-        };
-        let peer_admission = security.lookup_admission(peer_principal).await?;
-        let peer_proof = self
+        Ok(self
             .reader
-            .read_frame::<AdmissionProof>(4 * 1024, "admission proof")
-            .await?;
-        let admitted_peer =
-            peer_proof.verify_admission(&peer_admission, peer_principal, tls_session_binding)?;
-        anyhow::ensure!(
-            admitted_peer == self.expected_peer_id,
-            "connected broker differs from the expected admitted process"
-        );
+            .read_frame::<AclSnapshotResponse>(MAX_CLUSTER_FRAME_SIZE, "ACL snapshot response")
+            .await?
+            .snapshot)
+    }
+
+    pub(super) async fn send_request(&mut self, request: ClusterRequest) -> anyhow::Result<()> {
+        self.writer.write_all(&encode_frame(&request)?).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
-    fn into_parts(self) -> (ClusterMessageReader, TransportWriteHalf) {
+    pub(super) fn into_parts(self) -> (ClusterMessageReader, TransportWriteHalf) {
         (self.reader, self.writer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::consensus::actor::MultiRaftActor;
+    use crate::control_plane::consensus::messages::{InstallSnapshot, RaftRpc};
+    use crate::control_plane::consensus::raft::storage::RaftSnapshotHeader;
+    use crate::control_plane::membership::ShardGroupId;
+    use crate::control_plane::membership::actor::SwimActor;
+    use crate::net::TcpStream;
+    use turmoil::Builder;
+
+    fn snapshot_message(offset: u64, payload_len: usize) -> WireRaftMessage {
+        WireRaftMessage {
+            shard_group_id: ShardGroupId(1),
+            peer_id: NodeId::new("peer"),
+            rpc: InstallSnapshot {
+                term: 1,
+                leader_id: NodeId::new("peer"),
+                header: RaftSnapshotHeader {
+                    last_included_index: 1,
+                    last_included_term: 1,
+                    checksum: 0,
+                    size_bytes: payload_len as u64,
+                },
+                offset,
+                data: vec![0; payload_len].into_boxed_slice(),
+                done: false,
+            }
+            .into(),
+        }
+    }
+
+    fn test_dispatcher(local_node_id: NodeId) -> (RaftRpcDispatcher, MutlRaftSender) {
+        let (raft_tx, _raft_mailbox) = MultiRaftActor::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        (
+            RaftRpcDispatcher::new(
+                local_node_id,
+                event_tx,
+                NodeTransportSecurity::TrustedDevelopment,
+            ),
+            raft_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_messages_preserve_prefix_at_byte_cap() {
+        let payload_len = CONNECTING_PEER_BUFFER_BYTE_CAP / 3;
+        let mut pending = ConnectingPeer {
+            generation: 0,
+            messages: Vec::new(),
+            serialized_bytes: 0,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        pending.extend((0..3).map(|offset| snapshot_message(offset, payload_len)));
+
+        assert_eq!(pending.messages.len(), 2);
+        assert!(pending.serialized_bytes <= CONNECTING_PEER_BUFFER_BYTE_CAP);
+        let offsets: Vec<_> = pending
+            .messages
+            .iter()
+            .map(|message| {
+                let RaftRpc::InstallSnapshot(snapshot) = &message.rpc else {
+                    panic!("test constructed a non-snapshot message")
+                };
+                snapshot.offset
+            })
+            .collect();
+        assert_eq!(offsets, [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn batch_start_rotates_across_peers() {
+        let (mut dispatcher, _raft_tx) = test_dispatcher(NodeId::new("local"));
+        let targets = ["a", "b", "c"];
+
+        for expected in targets.into_iter().cycle().take(6) {
+            let packets = targets
+                .iter()
+                .map(|target| {
+                    let message = snapshot_message(0, 0);
+                    OutboundRaftPacket::new(
+                        message.shard_group_id,
+                        NodeId::new(*target),
+                        message.rpc,
+                    )
+                })
+                .collect();
+            let groups = dispatcher.group_packets(packets);
+
+            assert_eq!(groups[0].0, NodeId::new(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_completion_keeps_the_replacement_attempt() {
+        let local_node_id = NodeId::new("local");
+        let target = NodeId::new("peer");
+        let (mut dispatcher, raft_tx) = test_dispatcher(local_node_id);
+        dispatcher.connecting_peers.insert(
+            target.clone(),
+            ConnectingPeer {
+                generation: 2,
+                messages: Vec::new(),
+                serialized_bytes: 0,
+                task: tokio::spawn(std::future::pending()),
+            },
+        );
+
+        dispatcher
+            .on_connection_attempt_completed(
+                ConnectionAttemptCompleted {
+                    target: target.clone(),
+                    generation: 1,
+                    result: Err(anyhow::anyhow!("stale attempt")),
+                },
+                &raft_tx,
+            )
+            .await;
+
+        assert_eq!(dispatcher.connecting_peers[&target].generation, 2);
+    }
+
+    #[test]
+    fn expired_write_budget_does_not_remove_live_connection() -> turmoil::Result {
+        let mut simulation = Builder::new()
+            .simulation_duration(Duration::from_secs(5))
+            .build();
+
+        simulation.host("server", || async {
+            let listener = crate::net::TcpListener::bind("0.0.0.0:9000").await?;
+            let (_healthy, _) = listener.accept().await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
+        });
+
+        simulation.host("client", || async {
+            let target = NodeId::new("peer");
+            let (mut dispatcher, _raft_tx) = test_dispatcher(NodeId::new("local"));
+            let address = (turmoil::lookup("server"), 9000);
+
+            let healthy = TcpStream::connect(address).await?;
+            let (_healthy_reader, healthy_writer) = healthy.into_split();
+            let healthy_generation = dispatcher.allocate_generation();
+            dispatcher.connections.insert(
+                target.clone(),
+                ActiveConnection {
+                    generation: healthy_generation,
+                    origin: ConnectionOrigin::Local,
+                    writer: healthy_writer.into(),
+                    reader_task: tokio::spawn(std::future::pending()),
+                },
+            );
+            assert!(
+                dispatcher
+                    .write_messages_to_before(&target, &[], Instant::now())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                dispatcher.connection_generation(&target),
+                Some(healthy_generation)
+            );
+            assert!(dispatcher.existing_connection_wins(&target, ConnectionOrigin::Remote));
+
+            let connection = dispatcher.connections.get_mut(&target).unwrap();
+            connection.reader_task.abort();
+            assert!(
+                (&mut connection.reader_task)
+                    .await
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(!dispatcher.existing_connection_wins(&target, ConnectionOrigin::Remote));
+
+            Ok(())
+        });
+
+        simulation.run()
+    }
+
+    #[test]
+    fn stalled_address_resolution_completes_with_timeout() -> turmoil::Result {
+        let mut simulation = Builder::new()
+            .simulation_duration(Duration::from_secs(35))
+            .build();
+
+        simulation.host("node", || async {
+            let local_node_id = NodeId::new("local");
+            let target = NodeId::new("stalled-peer");
+            let (swim_tx, swim_mailbox) = SwimActor::channel(1);
+            let _swim_mailbox = swim_mailbox;
+            let result = OutboundClusterConnection::connect_raft(
+                &target,
+                &local_node_id,
+                &swim_tx,
+                &NodeTransportSecurity::TrustedDevelopment,
+                snapshot_message(0, 0),
+            )
+            .await;
+
+            let Err(error) = result else {
+                panic!("stalled resolution must time out")
+            };
+            assert_eq!(error.to_string(), "connection attempt timed out");
+            Ok(())
+        });
+
+        simulation.run()
     }
 }

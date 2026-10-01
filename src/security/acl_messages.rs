@@ -3,7 +3,6 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::connections::protocol::ServerError;
-use crate::control_plane::Replicas;
 use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::AclResource;
@@ -11,9 +10,9 @@ use crate::impl_from_variant;
 use crate::security::CertificatePrincipal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct SecurityRequestId(pub(super) u64);
+pub(super) struct AuthorizationRequestId(pub(super) u64);
 
-pub(super) enum SecurityCommand {
+pub(super) enum AclCommand {
     Authorize(Authorize),
     ReadLocalAcl(ReadLocalAcl),
 }
@@ -29,29 +28,23 @@ pub(super) struct ReadLocalAcl {
     pub(super) reply: oneshot::Sender<Result<AclRecord, ServerError>>,
 }
 
-impl_from_variant!(SecurityCommand, Authorize, ReadLocalAcl,);
+impl_from_variant!(AclCommand, Authorize, ReadLocalAcl,);
 
-pub(super) enum SecurityEvent {
-    AclFetchRequested(AclFetch),
+pub(super) enum AclEvent {
+    AclFetchRequested(AclRecordKey),
     AuthorizationResolved(AuthorizationResolved),
 }
 
 impl_from_variant!(
-    SecurityEvent,
-    AclFetchRequested(AclFetch),
+    AclEvent,
+    AclFetchRequested(AclRecordKey),
     AuthorizationResolved,
 );
 
 #[derive(Debug)]
 pub(super) struct AuthorizationResolved {
-    pub(super) request_id: SecurityRequestId,
+    pub(super) request_id: AuthorizationRequestId,
     pub(super) authorized: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct AclFetch {
-    pub(super) key: AclRecordKey,
-    pub(super) candidates: Replicas,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -63,10 +56,6 @@ pub(super) struct AclRecordKey {
 #[derive(Debug)]
 pub(super) struct AclFetchCompleted {
     pub(super) key: AclRecordKey,
-    pub(super) result: Result<AclRecord, AclUnavailable>,
+    pub(super) result: anyhow::Result<AclRecord>,
     pub(super) requested_at: Duration,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("ACL record unavailable")]
-pub(super) struct AclUnavailable;

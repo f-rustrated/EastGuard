@@ -21,7 +21,7 @@ use crate::control_plane::membership::actor::SwimSender;
 use crate::net::{TcpListener, before_deadline};
 #[cfg(test)]
 use crate::security::CertificatePrincipal;
-use crate::security::SecurityHandle;
+use crate::security::{AclHandle, NodeTransportSecurity};
 
 const MAX_IN_FLIGHT_CLUSTER_HANDSHAKES: usize = 128;
 // Covers TLS, the bounded identity exchange, and an optional one-shot ACL read.
@@ -37,12 +37,14 @@ impl RaftTransportActor {
         raft_tx: MutlRaftSender,
         mut from_actor: mpsc::Receiver<Box<[RaftTransportCommand]>>,
         swim_tx: SwimSender,
-        security: SecurityHandle,
+        node_transport: NodeTransportSecurity,
+        acl: AclHandle,
     ) {
         let (connection_event_tx, mut connection_event_rx) = mpsc::channel(256);
 
         let mut handshakes = JoinSet::new();
-        let mut dispatcher = RaftRpcDispatcher::new(node_id, connection_event_tx, security.clone());
+        let mut dispatcher =
+            RaftRpcDispatcher::new(node_id.clone(), connection_event_tx, node_transport.clone());
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await; // consume immediate first tick
 
@@ -53,11 +55,13 @@ impl RaftTransportActor {
                         tracing::debug!("cluster connection rejected: handshake limit reached");
                         continue;
                     }
-                    let security = security.clone();
+                    let local_node_id = node_id.clone();
+                    let node_transport = node_transport.clone();
+                    let acl = acl.clone();
                     handshakes.spawn(async move {
                         tokio::time::timeout(
                             CLUSTER_HANDSHAKE_TIMEOUT,
-                            accept_cluster_connection(stream, security),
+                            accept_cluster_connection(stream, &local_node_id, &node_transport, &acl),
                         ).await.context("cluster handshake timed out")?
                     });
                 }
@@ -99,7 +103,7 @@ mod tests {
     use crate::control_plane::{NodeAddress, NodeAddressInfo, Replicas};
     use crate::net::OwnedWriteHalf;
     use crate::net::{TcpStream, TransportTcpStream};
-    use crate::security::{NodeTransportSecurity, SecurityActor, SecurityHandle};
+    use crate::security::AclActor;
     use rcgen::string::Ia5String;
     use rcgen::{CertificateParams, KeyPair, SanType};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -147,7 +151,7 @@ mod tests {
         }
     }
 
-    fn test_security(raft_tx: MutlRaftSender) -> SecurityHandle {
+    fn test_acl(raft_tx: MutlRaftSender) -> AclHandle {
         let (swim_tx, _swim_rx) = SwimActor::channel(1);
         let node_id = NodeId::new("test-node");
         let topology = Topology::new(
@@ -159,7 +163,7 @@ mod tests {
         )
         .channel()
         .1;
-        SecurityActor::spawn(
+        AclActor::spawn(
             node_id,
             swim_tx,
             raft_tx,
@@ -177,7 +181,7 @@ mod tests {
             .build();
         sim.client("node", async {
             let (raft_tx, mut raft_rx) = MultiRaftActor::channel(1);
-            let security = test_security(raft_tx.clone());
+            let acl = test_acl(raft_tx.clone());
             let (swim_tx, _swim_rx) = SwimActor::channel(1);
             let (_commands, commands_rx) = mpsc::channel(1);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
@@ -187,7 +191,8 @@ mod tests {
                 raft_tx,
                 commands_rx,
                 swim_tx,
-                security,
+                NodeTransportSecurity::TrustedDevelopment,
+                acl,
             ));
             let address = (turmoil::lookup("node"), 9000);
             let mut stalled = futures::future::try_join_all(
@@ -262,7 +267,7 @@ mod tests {
         .unwrap()
     }
 
-    fn secure_test_security(node_id: NodeId, transport: NodeTransportSecurity) -> SecurityHandle {
+    fn secure_test_acl(node_id: NodeId, transport: NodeTransportSecurity) -> AclHandle {
         let (raft_tx, raft_rx) = MultiRaftActor::channel(1);
         drop(raft_rx); // No metadata service is available during these handshakes.
         let (swim_tx, _swim_rx) = SwimActor::channel(1);
@@ -275,7 +280,7 @@ mod tests {
         )
         .channel()
         .1;
-        SecurityActor::spawn(node_id, swim_tx, raft_tx, topology, transport)
+        AclActor::spawn(node_id, swim_tx, raft_tx, topology, transport)
     }
 
     #[test]
@@ -309,9 +314,11 @@ mod tests {
                 let transport = server_transport.clone();
                 async move {
                     let listener = TcpListener::bind("0.0.0.0:9000").await?;
-                    let security = secure_test_security(NodeId::new(server_id), transport);
+                    let local_node_id = NodeId::new(server_id);
+                    let acl = secure_test_acl(local_node_id.clone(), transport.clone());
                     let (stream, _) = listener.accept().await?;
-                    let result = accept_cluster_connection(stream, security).await;
+                    let result =
+                        accept_cluster_connection(stream, &local_node_id, &transport, &acl).await;
                     if request_ok {
                         let mut accepted = result?.expect("expected authenticated Raft stream");
                         assert_eq!(accepted.initial_message.peer_id, NodeId::new("broker-a::1"));
@@ -333,17 +340,18 @@ mod tests {
             sim.host("client", move || {
                 let transport = client_transport.clone();
                 async move {
-                    let security = secure_test_security(NodeId::new("broker-a::1"), transport);
+                    let local_node_id = NodeId::new("broker-a::1");
+                    let acl = secure_test_acl(local_node_id.clone(), transport.clone());
                     let stream = TransportTcpStream::connect_node(
                         (turmoil::lookup("server"), 9000),
-                        security.node_transport(),
+                        &transport,
                     )
                     .await?;
                     let result = OutboundClusterConnection::new(
                         stream,
                         &NodeId::new(target_id),
-                        security.local_node_id(),
-                        security.node_transport(),
+                        &local_node_id,
+                        &transport,
                     )
                     .await;
                     if handshake_ok {
@@ -362,12 +370,11 @@ mod tests {
                                 .await?;
                             writer.flush().await?;
                             assert_eq!(
-                                security
-                                    .authorize(
-                                        Some(&CertificatePrincipal::new("client-a")),
-                                        AclResource::Cluster,
-                                    )
-                                    .await,
+                                acl.authorize(
+                                    Some(&CertificatePrincipal::new("client-a")),
+                                    AclResource::Cluster,
+                                )
+                                .await,
                                 Err(crate::client::ServerError::Unauthorized)
                             );
                         }
@@ -408,9 +415,11 @@ mod tests {
                 let transport = server_transport.clone();
                 async move {
                     let listener = TcpListener::bind("0.0.0.0:9000").await?;
-                    let security = secure_test_security(NodeId::new("broker-b::1"), transport);
+                    let local_node_id = NodeId::new("broker-b::1");
+                    let acl = secure_test_acl(local_node_id.clone(), transport.clone());
                     let (stream, _) = listener.accept().await?;
-                    match accept_cluster_connection(stream, security).await {
+                    match accept_cluster_connection(stream, &local_node_id, &transport, &acl).await
+                    {
                         Err(error) => assert!(error.to_string().contains(expected_error)),
                         Ok(_) => panic!("invalid node identity was accepted"),
                     }
@@ -451,11 +460,7 @@ mod tests {
         Ok(())
     }
 
-    fn remote_security(
-        node_id: NodeId,
-        raft_tx: MutlRaftSender,
-        owner: NodeAddressInfo,
-    ) -> SecurityHandle {
+    fn remote_acl(node_id: NodeId, raft_tx: MutlRaftSender, owner: NodeAddressInfo) -> AclHandle {
         let (swim_tx, mut swim_rx) = SwimActor::channel(8);
         let group = ShardGroup {
             id: ShardGroupId(42),
@@ -483,7 +488,7 @@ mod tests {
                 }
             }
         });
-        SecurityActor::spawn(
+        AclActor::spawn(
             node_id,
             swim_tx,
             raft_tx,
@@ -634,15 +639,22 @@ mod tests {
             let (raft_tx, mut raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (connection_result_tx, _connection_result_rx) = tokio::sync::mpsc::channel(8);
+            let local_node_id = NodeId::new("node-b");
+            let node_transport = NodeTransportSecurity::TrustedDevelopment;
             let mut state = RaftRpcDispatcher::new(
-                NodeId::new("node-b"),
+                local_node_id.clone(),
                 connection_result_tx,
-                test_security(raft_tx.clone()),
+                node_transport.clone(),
             );
             let (stream, _) = listener.accept().await?;
-            let connection = accept_cluster_connection(stream, test_security(raft_tx.clone()))
-                .await?
-                .expect("expected Raft stream");
+            let connection = accept_cluster_connection(
+                stream,
+                &local_node_id,
+                &node_transport,
+                &test_acl(raft_tx.clone()),
+            )
+            .await?
+            .expect("expected Raft stream");
             state.accept(connection, &raft_tx);
 
             assert!(
@@ -688,17 +700,20 @@ mod tests {
             let (raft_tx, _raft_rx) = MultiRaftActor::channel(16);
             let listener = TcpListener::bind("0.0.0.0:9000").await?;
             let (connection_result_tx, _connection_result_rx) = tokio::sync::mpsc::channel(8);
-            let security = test_security(raft_tx.clone());
+            let acl = test_acl(raft_tx.clone());
+            let local_node_id = NodeId::new("node-b");
+            let node_transport = NodeTransportSecurity::TrustedDevelopment;
             let mut state = RaftRpcDispatcher::new(
-                NodeId::new("node-b"),
+                local_node_id.clone(),
                 connection_result_tx,
-                security.clone(),
+                node_transport.clone(),
             );
 
             let (first_stream, _) = listener.accept().await?;
-            let connection = accept_cluster_connection(first_stream, security.clone())
-                .await?
-                .expect("expected Raft stream");
+            let connection =
+                accept_cluster_connection(first_stream, &local_node_id, &node_transport, &acl)
+                    .await?
+                    .expect("expected Raft stream");
             state.accept(connection, &raft_tx);
             let peer_id = NodeId::new("node-a");
             let first_generation = state
@@ -706,9 +721,14 @@ mod tests {
                 .expect("first connection should be installed");
 
             let (replacement_stream, _) = listener.accept().await?;
-            let replacement = accept_cluster_connection(replacement_stream, security.clone())
-                .await?
-                .expect("expected replacement Raft stream");
+            let replacement = accept_cluster_connection(
+                replacement_stream,
+                &local_node_id,
+                &node_transport,
+                &acl,
+            )
+            .await?
+            .expect("expected replacement Raft stream");
             state.accept(replacement, &raft_tx);
             let replacement_generation = state
                 .connection_generation(&peer_id)
@@ -719,9 +739,10 @@ mod tests {
             assert!(state.is_dead(&peer_id));
 
             let (restarted_stream, _) = listener.accept().await?;
-            let restarted = accept_cluster_connection(restarted_stream, security)
-                .await?
-                .expect("expected restarted peer's Raft stream");
+            let restarted =
+                accept_cluster_connection(restarted_stream, &local_node_id, &node_transport, &acl)
+                    .await?
+                    .expect("expected restarted peer's Raft stream");
             state.accept(restarted, &raft_tx);
             assert!(state.contains(&peer_id));
             assert!(!state.is_dead(&peer_id));
@@ -769,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn security_actor_coalesces_concurrent_acl_reads() -> turmoil::Result {
+    fn acl_actor_coalesces_concurrent_acl_reads() -> turmoil::Result {
         let resource = AclResource::TopicData(TopicId(7));
         let snapshot = AclRecord {
             resource: resource.clone(),
@@ -801,9 +822,14 @@ mod tests {
                 });
                 let (stream, _) = listener.accept().await?;
                 assert!(
-                    accept_cluster_connection(stream, test_security(raft_tx))
-                        .await?
-                        .is_none()
+                    accept_cluster_connection(
+                        stream,
+                        &NodeId::new("test-node"),
+                        &NodeTransportSecurity::TrustedDevelopment,
+                        &test_acl(raft_tx),
+                    )
+                    .await?
+                    .is_none()
                 );
                 responder.await?;
                 owner_completion.notified().await;
@@ -822,12 +848,12 @@ mod tests {
                     NodeAddress::test((owner_addr, 9000).into(), (owner_addr, 9001).into()),
                 );
                 let (raft_tx, _raft_rx) = MultiRaftActor::channel(8);
-                let security = remote_security(NodeId::new("requester"), raft_tx, owner);
+                let acl = remote_acl(NodeId::new("requester"), raft_tx, owner);
                 let principal = CertificatePrincipal::new("orders-service");
                 let first_resource = requested_resource.clone();
                 let (first, second) = tokio::join!(
-                    security.authorize(Some(&principal), first_resource),
-                    security.authorize(Some(&principal), requested_resource),
+                    acl.authorize(Some(&principal), first_resource),
+                    acl.authorize(Some(&principal), requested_resource),
                 );
                 assert_eq!(first, Ok(()));
                 assert_eq!(second, Ok(()));

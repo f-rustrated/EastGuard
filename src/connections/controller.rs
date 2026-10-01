@@ -30,7 +30,7 @@ use crate::data_plane::messages::query::{
     DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset, ReadConsumerOffsetResult,
 };
 use crate::net::TransportTcpStream;
-use crate::security::{CertificatePrincipal, SecurityHandle};
+use crate::security::{AclHandle, CertificatePrincipal};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -55,7 +55,7 @@ pub struct ClientController {
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    security: SecurityHandle,
+    authorization: AclHandle,
 }
 
 impl ClientController {
@@ -65,7 +65,7 @@ impl ClientController {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
-        security: SecurityHandle,
+        authorization: AclHandle,
     ) -> Self {
         Self {
             certificate_principal,
@@ -73,7 +73,7 @@ impl ClientController {
             swim_sender,
             raft_sender,
             data_plane_tx,
-            security,
+            authorization,
         }
     }
 
@@ -320,7 +320,7 @@ impl ClientController {
     }
 
     async fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
-        self.security
+        self.authorization
             .authorize(self.certificate_principal.as_ref(), resource)
             .await
     }
@@ -706,7 +706,7 @@ pub async fn handle_client_stream(
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    security: SecurityHandle,
+    authorization: AclHandle,
 ) {
     let certificate_principal = stream.peer_principal();
     let (read_half, write_half) = stream.into_split();
@@ -717,7 +717,7 @@ pub async fn handle_client_stream(
         swim_sender,
         raft_sender,
         data_plane_tx,
-        security,
+        authorization,
     );
     // Once either side observes closure, cancel the other and its handlers.
     tokio::select! {
@@ -753,7 +753,7 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use crate::net::TcpListener;
-    use crate::security::{NodeTransportSecurity, SecurityActor};
+    use crate::security::{AclActor, NodeTransportSecurity};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -908,7 +908,7 @@ mod tests {
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
         let topology = test_topology_reader([node_id.clone()]);
-        let security = SecurityActor::spawn(
+        let authorization = AclActor::spawn(
             node_id.clone(),
             swim_sender.clone(),
             raft_sender.clone(),
@@ -921,7 +921,7 @@ mod tests {
             swim_sender,
             raft_sender,
             data_plane_tx,
-            security,
+            authorization,
         )
     }
 
@@ -948,7 +948,7 @@ mod tests {
         raft_sender: MutlRaftSender,
         topology: TopologyReader,
     ) -> ClientController {
-        let security = SecurityActor::spawn(
+        let authorization = AclActor::spawn(
             node_id.clone(),
             swim_sender.clone(),
             raft_sender.clone(),
@@ -961,7 +961,7 @@ mod tests {
             swim_sender,
             raft_sender,
             dp_stub(),
-            security,
+            authorization,
         )
     }
 
@@ -1306,7 +1306,7 @@ mod tests {
                 let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
                 let (_transport_tx, transport_rx) = mpsc::channel(1);
                 let (swim_tx, _swim_rx) = SwimActor::channel(1);
-                let security = SecurityActor::spawn(
+                let authorization = AclActor::spawn(
                     node_id("owner"),
                     swim_tx.clone(),
                     raft_tx.clone(),
@@ -1319,7 +1319,8 @@ mod tests {
                     raft_tx,
                     transport_rx,
                     swim_tx,
-                    security,
+                    NodeTransportSecurity::TrustedDevelopment,
+                    authorization,
                 ));
 
                 let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await

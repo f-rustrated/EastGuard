@@ -1,9 +1,44 @@
 use anyhow::{Context, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use rustls::pki_types::CertificateDer;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-use crate::security::CertificatePrincipal;
+use crate::control_plane::NodeId;
+
+/// Certificate identity and its permitted node-ID namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, BorshSerialize, BorshDeserialize)]
+pub(crate) struct CertificatePrincipal(Box<str>);
+
+impl CertificatePrincipal {
+    pub(crate) fn new(principal: impl Into<Box<str>>) -> Self {
+        Self(principal.into())
+    }
+
+    pub(crate) fn has_valid_length(&self) -> bool {
+        !self.0.is_empty() && self.0.len() <= super::MAX_SECURITY_ID_BYTES
+    }
+
+    pub(crate) fn verify_node_id(&self, node_id: &NodeId) -> Result<()> {
+        anyhow::ensure!(
+            self.has_valid_length()
+                && node_id.len() <= super::MAX_SECURITY_ID_BYTES
+                && node_id
+                    .rsplit_once("::")
+                    .is_some_and(|(principal, suffix)| {
+                        principal == self.as_ref() && !suffix.is_empty()
+                    }),
+            "node ID does not belong to the certificate principal"
+        );
+        Ok(())
+    }
+}
+
+impl AsRef<str> for CertificatePrincipal {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Reads the stable node principal from a leaf certificate's URI Subject
 /// Alternative Name.
@@ -93,6 +128,35 @@ mod tests {
             .collect();
         let key = KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().der().clone()
+    }
+
+    #[test]
+    fn certificate_owns_only_its_exact_node_id_namespace() {
+        let principal = CertificatePrincipal::new("broker-a");
+        for valid in ["broker-a::1", "broker-a::2"] {
+            principal.verify_node_id(&NodeId::new(valid)).unwrap();
+        }
+        for invalid in [
+            "",
+            "broker-a",
+            "broker-a::",
+            "broker-ab::1",
+            "broker-b::1",
+            "broker-a::1::2",
+        ] {
+            assert!(
+                principal.verify_node_id(&NodeId::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            principal
+                .verify_node_id(&NodeId::new(format!(
+                    "broker-a::{}",
+                    "x".repeat(super::super::MAX_SECURITY_ID_BYTES)
+                )))
+                .is_err()
+        );
     }
 
     #[test]

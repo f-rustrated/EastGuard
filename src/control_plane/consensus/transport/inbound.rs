@@ -3,7 +3,7 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::net::{TcpStream, TransportReadHalf, TransportTcpStream, TransportWriteHalf};
-use crate::security::{SecurityHandle, node_certificate_principal};
+use crate::security::{AclHandle, NodeTransportSecurity, node_certificate_principal};
 use borsh::BorshDeserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -88,21 +88,22 @@ pub(super) struct AcceptedRaftConnection {
 /// returned to the persistent connection dispatcher.
 pub(super) async fn accept_cluster_connection(
     stream: TcpStream,
-    security: SecurityHandle,
+    local_node_id: &NodeId,
+    node_transport: &NodeTransportSecurity,
+    acl: &AclHandle,
 ) -> anyhow::Result<Option<AcceptedRaftConnection>> {
     let mut stream = TransportTcpStream::accept(
         stream,
-        security.node_transport(),
+        node_transport,
         node_certificate_principal,
         super::CLUSTER_HANDSHAKE_TIMEOUT,
     )
     .await?;
 
-    let peer = if security.node_transport().is_secure() {
+    let peer = if node_transport.is_secure() {
         Some(
-            security
-                .node_transport()
-                .exchange_node_identity(&mut stream, security.local_node_id())
+            node_transport
+                .exchange_node_identity(&mut stream, local_node_id)
                 .await?,
         )
     } else {
@@ -129,7 +130,7 @@ pub(super) async fn accept_cluster_connection(
             }))
         }
         ClusterRequest::AclSnapshot(request) => {
-            handle_acl_snapshot(request, &security, &mut write_half).await?;
+            handle_acl_snapshot(request, acl, &mut write_half).await?;
             Ok(None)
         }
     }
@@ -137,10 +138,10 @@ pub(super) async fn accept_cluster_connection(
 
 async fn handle_acl_snapshot(
     request: AclSnapshotRequest,
-    security: &SecurityHandle,
+    acl: &AclHandle,
     write_half: &mut TransportWriteHalf,
 ) -> anyhow::Result<()> {
-    let snapshot = security.read_local_acl(request.resource).await?;
+    let snapshot = acl.read_local_acl(request.resource).await?;
     write_half
         .write_all(&encode_frame(&AclSnapshotResponse { snapshot })?)
         .await?;

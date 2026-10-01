@@ -40,9 +40,7 @@ use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TransportTcpStream, UdpSocket};
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
-use crate::security::{
-    NodeTransportSecurity, SecurityActor, SecurityHandle, client_certificate_principal,
-};
+use crate::security::{AclActor, AclHandle, NodeTransportSecurity, client_certificate_principal};
 use crate::{
     config::ENV,
     control_plane::membership::{actor::SwimActor, transport::SwimTransportActor},
@@ -71,8 +69,8 @@ impl StartUp {
     }
 
     pub async fn run(self) -> Result<()> {
-        let security = NodeTransportSecurity::load(&self.env)?;
-        if security.is_secure() {
+        let node_transport = NodeTransportSecurity::load(&self.env)?;
+        if node_transport.is_secure() {
             anyhow::bail!(
                 "secure startup is unavailable: authenticated SWIM datagrams, secure genesis, client routing, placement authorization, and credential lifecycle operations are incomplete"
             );
@@ -100,12 +98,12 @@ impl StartUp {
         // Single-writer / many-readers via ArcSwap — no locks, no contention.
         let (topology_pub, topology_reader) = swim.topology.clone().channel();
 
-        let security_handle = SecurityActor::spawn(
+        let acl = AclActor::spawn(
             node_id.clone(),
             swim_sender.clone(),
             raft_tx.clone(),
             topology_reader.clone(),
-            security.clone(),
+            node_transport.clone(),
         );
 
         // Recover local durable state before this node serves or joins the
@@ -128,7 +126,8 @@ impl StartUp {
             raft_tx.clone(),
             raft_transport_rx,
             swim_sender.clone(),
-            security_handle.clone(),
+            node_transport.clone(),
+            acl.clone(),
         ));
 
         // Protocol actors (each spawns its own scheduler internally)
@@ -160,7 +159,7 @@ impl StartUp {
             data_transport_rx,
             swim_sender.clone(),
             topology_reader.clone(),
-            security_handle.clone(),
+            node_transport.clone(),
         ));
 
         MultiRaftActor::spawn(
@@ -182,32 +181,31 @@ impl StartUp {
         );
 
         // Client handler
-        self.receive_client_streams(
+        Self::receive_client_streams(
             node_id,
             swim_sender,
             raft_tx,
             data_plane_tx,
             client_listener,
-            security_handle,
+            node_transport,
+            acl,
         )
         .await?;
         Ok(())
     }
 
     async fn receive_client_streams(
-        self,
         node_id: NodeId,
         swim_sender: SwimSender,
         raft_tx: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
         listener: TcpListener,
-        security_handle: SecurityHandle,
+        node_transport: NodeTransportSecurity,
+        acl: AclHandle,
     ) -> Result<()> {
-        let addr = self.env.bind_addr();
         tracing::info!(
-            "[{}] EastGuard listening on {}",
-            self.env.resolve_node_id(),
-            addr
+            "[{node_id}] EastGuard listening on {}",
+            listener.local_addr()?
         );
 
         let mut handshakes = JoinSet::new();
@@ -225,7 +223,7 @@ impl StartUp {
                                 swim_sender.clone(),
                                 raft_tx.clone(),
                                 data_plane_tx.clone(),
-                                security_handle.clone(),
+                                acl.clone(),
                             ));
                         }
                         Err(error) => tracing::debug!("client handshake failed: {error:#}"),
@@ -246,11 +244,11 @@ impl StartUp {
                         tracing::debug!("client handshake limit reached");
                         continue;
                     }
-                    let security = security_handle.node_transport().clone();
+                    let node_transport = node_transport.clone();
                     handshakes.spawn(async move {
                         TransportTcpStream::accept(
                             stream,
-                            &security,
+                            &node_transport,
                             client_certificate_principal,
                             Duration::from_secs(10),
                         ).await
@@ -273,7 +271,6 @@ mod tests {
     use super::*;
     use crate::control_plane::membership::{Topology, TopologyConfig};
     use crate::net::TcpStream;
-    use clap::Parser;
     use rcgen::{CertificateParams, KeyPair, SanType, string::Ia5String};
     use rustls::pki_types::PrivatePkcs8KeyDer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,22 +312,22 @@ mod tests {
                 )
                 .channel()
                 .1;
-                let security = SecurityActor::spawn(
+                let acl = AclActor::spawn(
                     node.clone(),
                     swim.clone(),
                     raft.clone(),
                     topology,
-                    transport,
+                    transport.clone(),
                 );
                 let listener = TcpListener::bind("0.0.0.0:9000").await?;
-                let startup = StartUp::with_env(Environment::parse_from(["test"]), 0);
-                let task = tokio::spawn(startup.receive_client_streams(
+                let task = tokio::spawn(StartUp::receive_client_streams(
                     node,
                     swim,
                     raft,
                     DataPlaneSender(data),
                     listener,
-                    security,
+                    transport,
+                    acl,
                 ));
                 let address = (turmoil::lookup("node"), 9000);
                 let mut sockets = Vec::new();
