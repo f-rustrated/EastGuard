@@ -161,8 +161,8 @@ impl SwimSender {
     pub(crate) async fn send(
         &self,
         cmd: impl Into<SwimActorCommand>,
-    ) -> Result<(), SendError<SwimActorCommand>> {
-        self.0.send(cmd.into()).await
+    ) -> Result<(), Box<SendError<SwimActorCommand>>> {
+        self.0.send(cmd.into()).await.map_err(Box::new)
     }
 
     pub(crate) async fn resolve_shard_group(
