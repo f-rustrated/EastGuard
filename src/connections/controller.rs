@@ -169,20 +169,16 @@ impl ClientController {
         // not depend on TLS or stream implementation details.
         let owner = ProducerSessionOwner::from(self.certificate_principal.as_ref());
 
-        let command: OpenProducerSession = req.into_command(owner.clone());
-        self.authorize_topic(&command.topic_name, AclResource::TopicData)?;
+        self.authorize_topic(&req.topic_name, AclResource::TopicData)?;
 
-        let group = self
-            .route_local(command.topic_name.as_bytes().to_vec())
-            .await?;
+        let group = self.route_local(req.topic_name.as_bytes().to_vec()).await?;
 
-        let topic_meta = self
-            .get_topic_metadata(command.topic_name.to_string())
-            .await?;
+        let topic_meta = self.get_topic_metadata(req.topic_name.clone()).await?;
         topic_meta
             .producer_sessions
-            .get_for_owner(&command.producer_id, &owner)?;
+            .get_for_owner(&req.producer_id, &owner)?;
 
+        let command: OpenProducerSession = req.into_command(topic_meta.id, owner.clone());
         self.propose_topic_write(group.id, command.clone()).await?;
 
         let committed_topic = self
@@ -215,10 +211,13 @@ impl ClientController {
         })?;
         let group = self.route_local(req.topic_name.as_bytes().to_vec()).await?;
 
-        self.get_topic_metadata(req.topic_name.clone()).await?;
+        let topic = self.get_topic_metadata(req.topic_name.clone()).await?;
 
-        self.propose_topic_write(group.id, UpdateConsumerGroupMember::new(req.clone()))
-            .await?;
+        self.propose_topic_write(
+            group.id,
+            UpdateConsumerGroupMember::new(req.clone(), topic.id),
+        )
+        .await?;
 
         if req.action == ConsumerGroupMemberAction::Leave {
             return Ok(ClientSuccess::ConsumerGroupLeft);
@@ -226,7 +225,7 @@ impl ClientController {
 
         let Some(assignment) = self
             .raft_sender
-            .get_consumer_group_assignment(req.topic_name, req.group_id, req.member_id)
+            .get_consumer_group_assignment(topic.id, req.group_id, req.member_id)
             .await
         else {
             return Err(ServerError::Internal(
@@ -292,9 +291,12 @@ impl ClientController {
     async fn delete_topic(&self, topic_name: String) -> Result<ClientSuccess, ServerError> {
         self.authorize_topic(&topic_name, AclResource::TopicAdmin)?;
         let group = self.route_local(topic_name.as_bytes().to_vec()).await?;
-        self.get_topic_metadata(topic_name.clone()).await?;
+        let topic = self.get_topic_metadata(topic_name.clone()).await?;
 
-        let cmd = DeleteTopic { name: topic_name };
+        let cmd = DeleteTopic {
+            name: topic_name,
+            topic_id: topic.id,
+        };
         self.propose_topic_write(group.id, cmd).await?;
         Ok(ClientSuccess::TopicDeleted)
     }
@@ -1319,6 +1321,7 @@ mod tests {
             .producer_sessions
             .open_producer_session(OpenProducerSession {
                 topic_name: "t1".into(),
+                topic_id: topic.id,
                 producer_id,
                 session_nonce: uuid::Uuid::new_v4(),
                 owner: ProducerSessionOwner::CertificatePrincipal("owner".into()),
@@ -1475,30 +1478,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_topic_ok() {
+    async fn metadata_mutations_carry_the_authorized_topic_id() {
         let swim = swim_sender_with(|cmd| {
             if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
                 let _ = reply.send(Some(test_shard_group()));
             }
         });
-        let raft = raft_sender_with(|cmd| match cmd {
-            MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
-                let _ = reply.send(Some(topic_meta("node-1")));
+        let topic = std::sync::Mutex::new(topic_meta("node-1"));
+        let raft = raft_sender_with(move |cmd| {
+            let mut topic = topic.lock().unwrap();
+            match cmd {
+                MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
+                    let _ = reply.send(Some(topic.clone()));
+                }
+                MultiRaftActorCommand::ClientProposal { propose, reply } => {
+                    match propose.command {
+                        MetadataCommand::OpenProducerSession(command) => {
+                            assert_eq!(command.topic_id, topic.id);
+                            topic
+                                .producer_sessions
+                                .open_producer_session(command)
+                                .unwrap();
+                        }
+                        MetadataCommand::UpdateConsumerGroupMember(command) => {
+                            assert_eq!(command.topic_id, topic.id);
+                            topic.sync_consumer_group(command);
+                        }
+                        MetadataCommand::DeleteTopic(command) => {
+                            assert_eq!(command.topic_id, topic.id)
+                        }
+                        command => panic!("unexpected proposal: {command:?}"),
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
+                    assert_eq!(query.topic_id, topic.id);
+                    let _ = query.reply.send(Some(
+                        topic.consumer_groups[&query.group_id].assignment_for(query.member_id),
+                    ));
+                }
+                _ => {}
             }
-            MultiRaftActorCommand::ClientProposal { reply, .. } => {
-                let _ = reply.send(Ok(()));
-            }
-            _ => {}
         });
-        let resp = trusted_controller(node_id("node-1"), swim, raft, dp_stub())
-            .dispatch(ClientRequest::ControlPlane(
-                ControlPlaneRequest::DeleteTopic { name: "t1".into() },
-            ))
-            .await;
-        assert!(
-            matches!(resp, ClientResponse::Ok(ClientSuccess::TopicDeleted)),
-            "expected TopicDeleted, got {resp:?}"
+        let controller = ClientController::new(
+            Some(CertificatePrincipal::new("operator")), node_id("node-1"), swim, raft, dp_stub(),
+            Permissions::parse(br#"{"topics":{"t1":1},"grants":{"topic-data/1":["operator"],"topic-admin/1":["operator"],"consumer-group/1/workers":["operator"]}}"#).unwrap(),
         );
+        let member_id = uuid::Uuid::new_v4();
+        for request in [
+            OpenProducerSessionRequest {
+                topic_name: "t1".into(),
+                producer_id: uuid::Uuid::new_v4(),
+                session_nonce: uuid::Uuid::new_v4(),
+            }
+            .into(),
+            UpdateConsumerGroupMemberRequest {
+                topic_name: "t1".into(),
+                group_id: "workers".into(),
+                member_id,
+                action: ConsumerGroupMemberAction::Heartbeat,
+            }
+            .into(),
+            UpdateConsumerGroupMemberRequest {
+                topic_name: "t1".into(),
+                group_id: "workers".into(),
+                member_id,
+                action: ConsumerGroupMemberAction::Leave,
+            }
+            .into(),
+            ControlPlaneRequest::DeleteTopic { name: "t1".into() },
+        ] {
+            let response = controller
+                .dispatch(ClientRequest::ControlPlane(request))
+                .await;
+            assert!(matches!(response, ClientResponse::Ok(_)), "{response:?}");
+        }
     }
 
     #[tokio::test]

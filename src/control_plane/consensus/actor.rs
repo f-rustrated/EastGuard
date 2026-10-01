@@ -12,7 +12,7 @@ use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, MetadataCommand, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
@@ -200,10 +200,10 @@ impl MutlRaftSender {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::ClientProposal {
-                propose: MetadataProposal {
+                propose: Box::new(MetadataProposal {
                     shard_group_id,
                     command,
-                },
+                }),
                 reply,
             })
             .await;
@@ -262,14 +262,14 @@ impl MutlRaftSender {
 
     pub(crate) async fn get_consumer_group_assignment(
         &self,
-        topic_name: String,
+        topic_id: TopicId,
         group_id: String,
         member_id: Uuid,
     ) -> Option<ConsumerGroupAssignment> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(GetConsumerGroupAssignment {
-                topic_name,
+                topic_id,
                 group_id,
                 member_id,
                 reply,

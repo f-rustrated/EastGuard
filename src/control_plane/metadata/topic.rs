@@ -748,6 +748,7 @@ mod routing_tests {
             .producer_sessions
             .open_producer_session(OpenProducerSession {
                 topic_name: topic.name.clone().into(),
+                topic_id: topic.id,
                 producer_id,
                 session_nonce: uuid::Uuid::new_v4(),
                 owner: owner.clone(),

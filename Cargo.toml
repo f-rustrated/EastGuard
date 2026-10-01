@@ -40,6 +40,7 @@ x509-parser = "0.18.1"
 libc = "0.2"
 
 [dev-dependencies]
+data-encoding = "2.11.0"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 tempfile = "3.27.0"
 serial_test = "4.0.1"

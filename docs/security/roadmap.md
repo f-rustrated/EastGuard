@@ -17,9 +17,9 @@ credential replacement, and closing existing sessions when access is withdrawn.
 
 - Bounded startup policy, with exact topic-data, topic-admin, consumer-group,
   and cluster grants. Missing identity or permission denies access.
-- Authorization before routing/redirects; topic name/ID binding; producer-owner
-  checks. Data clients can discover routes without deletion permission.
-- SDK mTLS across seeds, redirects, and reconnects, including destination checks.
+- Authorization before redirects and topic-ID checks at committed apply, including
+  after recovery. Producer-owner checks; discovery without deletion permission.
+- SDK and operator CLI mTLS across seeds, redirects, and reconnects.
 - Distributed ACL actors, quorum reads, caches, expiry bookkeeping, persisted
   security records, and grant/revoke commands removed. No legacy compatibility:
   this project has never been deployed.

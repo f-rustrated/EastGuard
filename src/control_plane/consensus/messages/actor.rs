@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicId, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
@@ -32,7 +32,7 @@ pub enum MultiRaftActorCommand {
     },
     /// Propose a command to a shard group's Raft log. Leader-only.
     ClientProposal {
-        propose: MetadataProposal,
+        propose: Box<MetadataProposal>,
         reply: oneshot::Sender<Result<(), ProposalError>>,
     },
     /// Query all topic names from all shard groups on this node.
@@ -68,7 +68,7 @@ pub enum MultiRaftActorCommand {
 }
 
 pub struct GetConsumerGroupAssignment {
-    pub(crate) topic_name: String,
+    pub(crate) topic_id: TopicId,
     pub(crate) group_id: String,
     pub(crate) member_id: Uuid,
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,

@@ -1,6 +1,6 @@
 # Static Security Deployment
 
-**Status:** Policy loading and SDK mTLS are implemented. Secure startup remains
+**Status:** Policy loading and SDK/CLI mTLS are implemented. Secure startup remains
 disabled until the [remaining placement and recovery work](roadmap.md) is verified.
 
 ## Trust boundary
@@ -20,6 +20,18 @@ The SDK's `Client::connect_secure` accepts a standard rustls client configuratio
 with trust roots and a client certificate. Broker certificates must also cover
 their advertised IP addresses. Seeds, redirects, and reconnects use the same TLS
 configuration. Plaintext SDK constructors are for trusted development.
+
+The operator CLI accepts the same PEM credentials:
+
+```sh
+eg-cli --seeds 10.0.0.10:2921 \
+  --certificate-chain-path operator.pem \
+  --private-key-path operator.key \
+  --trust-root-path ca.pem
+```
+
+Supply all three paths to enable mTLS. Invalid credentials fail startup; omitting
+all three selects plaintext trusted development. Restart the CLI to reload files.
 
 ## Permissions
 
@@ -50,7 +62,9 @@ or deletion permission. Producer-session ownership remains enforced on append.
 To provision a topic, an operator creates it and discovers its ID using cluster
 permission, then installs its name/ID mapping and grants on all brokers. The
 binding allows authorization before redirects and rejects a recreated topic
-until its new ID is configured. There are no runtime grant/revoke endpoints.
+until its new ID is configured. Queued mutations retain the authorized ID and
+cannot affect a replacement topic, including after snapshot recovery. There are
+no runtime grant/revoke endpoints.
 
 ## Rotation and access withdrawal
 

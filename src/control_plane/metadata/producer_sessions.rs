@@ -76,6 +76,7 @@ fn producer_session_recovery_bumps_incarnation_and_expiry_removes_it() {
 
     let command = |session_nonce, session_owner, observed_at| OpenProducerSession {
         topic_name: "orders".into(),
+        topic_id: crate::control_plane::metadata::TopicId(1),
         producer_id,
         session_nonce,
         owner: session_owner,

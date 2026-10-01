@@ -396,6 +396,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "dashmap",
+ "data-encoding",
  "flume",
  "futures",
  "libc",

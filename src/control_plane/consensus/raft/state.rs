@@ -165,12 +165,12 @@ impl Raft {
 
     pub(crate) fn get_consumer_group_assignment(
         &self,
-        topic_name: &str,
+        topic_id: TopicId,
         group_id: &str,
         member_id: ConsumerMemberId,
     ) -> Option<ConsumerGroupAssignment> {
         self.metadata
-            .get_consumer_group_assignment(topic_name, group_id, member_id)
+            .get_consumer_group_assignment(topic_id, group_id, member_id)
     }
 
     pub(crate) fn active_segments_for_node(
@@ -2501,7 +2501,11 @@ mod tests {
         let name = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES / 2);
         for _ in 0..2 {
             raft.propose(RaftCommand::Metadata(
-                DeleteTopic { name: name.clone() }.into(),
+                DeleteTopic {
+                    name: name.clone(),
+                    topic_id: TopicId(0),
+                }
+                .into(),
             ))
             .unwrap();
         }
@@ -2567,7 +2571,13 @@ mod tests {
         let before = raft.log_last_index();
         let name = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES);
 
-        let result = raft.propose(RaftCommand::Metadata(DeleteTopic { name }.into()));
+        let result = raft.propose(RaftCommand::Metadata(
+            DeleteTopic {
+                name,
+                topic_id: TopicId(0),
+            }
+            .into(),
+        ));
 
         assert_eq!(result, Err(ProposalError::EntryTooLarge));
         assert_eq!(raft.log_last_index(), before);

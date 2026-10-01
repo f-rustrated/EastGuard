@@ -57,11 +57,16 @@ pub struct OpenProducerSessionRequest {
 }
 
 impl OpenProducerSessionRequest {
-    pub fn into_command(self, owner: ProducerSessionOwner) -> OpenProducerSession {
+    pub fn into_command(
+        self,
+        topic_id: TopicId,
+        owner: ProducerSessionOwner,
+    ) -> OpenProducerSession {
         const SESSION_TIMEOUT_MS: u64 = 60_000;
         let observed_at = crate::now_ms();
         OpenProducerSession {
             topic_name: self.topic_name.into_boxed_str(),
+            topic_id,
             producer_id: self.producer_id,
             session_nonce: self.session_nonce,
             owner,

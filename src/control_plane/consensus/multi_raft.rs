@@ -178,7 +178,7 @@ impl MultiRaft {
                     }));
             }
             MultiRaftActorCommand::ClientProposal { propose, reply } => {
-                self.propose(propose, reply);
+                self.propose(*propose, reply);
             }
 
             MultiRaftActorCommand::GetTopics { reply } => {
@@ -205,7 +205,7 @@ impl MultiRaft {
             }
             MultiRaftActorCommand::GetConsumerGroupAssignment(query) => {
                 let value = self.get_consumer_group_assignment(
-                    &query.topic_name,
+                    query.topic_id,
                     &query.group_id,
                     query.member_id,
                 );
@@ -409,13 +409,13 @@ impl MultiRaft {
 
     fn get_consumer_group_assignment(
         &self,
-        topic_name: &str,
+        topic_id: TopicId,
         group_id: &str,
         member_id: Uuid,
     ) -> Option<ConsumerGroupAssignment> {
         self.groups
             .values()
-            .find_map(|raft| raft.get_consumer_group_assignment(topic_name, group_id, member_id))
+            .find_map(|raft| raft.get_consumer_group_assignment(topic_id, group_id, member_id))
     }
 
     // Full scan over groups is acceptable — node death is rare (~6-7s SWIM detection)
