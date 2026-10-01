@@ -17,7 +17,6 @@ pub(crate) use topic::{TopicMeta, TopicState, TopicStats};
 pub(crate) mod segment;
 
 use borsh::{BorshDeserialize as Deser, BorshSerialize as Ser};
-use uuid::Uuid;
 
 pub(crate) use command::*;
 pub(crate) use consumer_group::{ConsumerGroupAssignment, ConsumerGroupMeta, ConsumerMemberId};
@@ -31,26 +30,18 @@ pub struct TopicId(pub(crate) u64);
 
 impl_new_struct_wrapper!(TopicId, u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Ser, Deser)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AclResource {
     Cluster,
     TopicAdmin(TopicId),
     TopicData(TopicId),
     ConsumerGroup(ConsumerGroupResource),
-    ProducerSession(ProducerSessionResource),
-    SecurityCluster,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Ser, Deser)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConsumerGroupResource {
     pub topic_id: TopicId,
     pub group_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Ser, Deser)]
-pub struct ProducerSessionResource {
-    pub topic_id: TopicId,
-    pub producer_id: Uuid,
 }
 
 /// Durable owner of one producer session.
@@ -75,10 +66,6 @@ impl From<Option<&CertificatePrincipal>> for ProducerSessionOwner {
 }
 
 impl AclResource {
-    pub(crate) fn routing_key(&self) -> Vec<u8> {
-        self.to_string().into_bytes()
-    }
-
     /// Validates the only variable-length ACL identifier. Fixed-width resource
     /// variants have no consumer-group ID and therefore always qualify.
     pub(crate) fn has_valid_identifier_length(&self, max_group_id_bytes: usize) -> bool {
@@ -86,11 +73,7 @@ impl AclResource {
             Self::ConsumerGroup(resource) => {
                 !resource.group_id.is_empty() && resource.group_id.len() <= max_group_id_bytes
             }
-            Self::Cluster
-            | Self::TopicAdmin(_)
-            | Self::TopicData(_)
-            | Self::ProducerSession(_)
-            | Self::SecurityCluster => true,
+            Self::Cluster | Self::TopicAdmin(_) | Self::TopicData(_) => true,
         }
     }
 }
@@ -106,12 +89,6 @@ impl std::fmt::Display for AclResource {
                 "consumer-group/{}/{}",
                 resource.topic_id.0, resource.group_id
             ),
-            Self::ProducerSession(resource) => write!(
-                formatter,
-                "producer-session/{}/{}",
-                resource.topic_id.0, resource.producer_id
-            ),
-            Self::SecurityCluster => formatter.write_str("security/cluster"),
         }
     }
 }
@@ -130,9 +107,6 @@ impl std::str::FromStr for AclResource {
         if input == "cluster" {
             return Ok(Self::Cluster);
         }
-        if input == "security/cluster" {
-            return Ok(Self::SecurityCluster);
-        }
         if let Some(topic) = input.strip_prefix("topic-admin/") {
             return topic_id(topic).map(Self::TopicAdmin);
         }
@@ -149,17 +123,6 @@ impl std::str::FromStr for AclResource {
             return Ok(Self::ConsumerGroup(ConsumerGroupResource {
                 topic_id: topic_id(topic)?,
                 group_id: group_id.to_string(),
-            }));
-        }
-        if let Some(producer_session) = input.strip_prefix("producer-session/") {
-            let (topic, producer_id) = producer_session
-                .split_once('/')
-                .ok_or_else(|| "producer-session ACL requires a producer ID".to_string())?;
-            let producer_id = Uuid::parse_str(producer_id)
-                .map_err(|_| format!("invalid ACL producer ID: {producer_id}"))?;
-            return Ok(Self::ProducerSession(ProducerSessionResource {
-                topic_id: topic_id(topic)?,
-                producer_id,
             }));
         }
 
@@ -301,7 +264,6 @@ mod acl_resource_tests {
 
     #[test]
     fn resources_round_trip_through_canonical_routing_keys() {
-        let producer_id = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
         let resources = [
             AclResource::Cluster,
             AclResource::TopicAdmin(TopicId(42)),
@@ -310,17 +272,11 @@ mod acl_resource_tests {
                 topic_id: TopicId(42),
                 group_id: "billing/readers".to_string(),
             }),
-            AclResource::ProducerSession(ProducerSessionResource {
-                topic_id: TopicId(42),
-                producer_id,
-            }),
-            AclResource::SecurityCluster,
         ];
 
         for resource in resources {
             let key = resource.to_string();
             assert_eq!(key.parse::<AclResource>(), Ok(resource.clone()));
-            assert_eq!(resource.routing_key(), key.as_bytes());
         }
     }
 

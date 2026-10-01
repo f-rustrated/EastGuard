@@ -1,11 +1,12 @@
 # EastGuard Configuration
 
-# Secure is the production default. Use trusted-development only on isolated
-# development and test networks until secure transports are configured.
+# Secure startup is still gated: see docs/security/roadmap.md.
+# Use trusted-development only on isolated test networks; omit permissions_path there.
 security_mode: "secure"
 certificate_chain_path: "./eastguard/config/node-chain.pem"
 private_key_path: "./eastguard/config/node-key.pem"
 trust_root_path: "./eastguard/config/cluster-ca.pem"
+permissions_path: "./eastguard/config/permissions.json" # format: docs/security/deployment.md
 
 # Sockets and networking
 client_port: 2921

@@ -18,7 +18,7 @@ use crate::client::error::ClientError;
 use crate::connections::protocol::{ClientRequest, ClientResponse};
 use crate::connections::reader::ClientStreamReader;
 use crate::connections::writer::ClientRawWriter;
-use crate::net::TcpStream;
+use crate::net::TransportTcpStream;
 
 /// Responses arrive out of order.
 /// So we shouldn't assume "pipeline"-ed data arrival with the use of VecDeque.
@@ -40,18 +40,24 @@ pub(crate) struct NodeConnection {
 impl NodeConnection {
     /// Dial `addr` and spawn the writer + reader loops. Fails only if the dial fails;
     /// a later peer death surfaces on the next `send`.
-    async fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
+    async fn connect(
+        addr: SocketAddr,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> Result<Self, ClientError> {
         let dial = ClientError::Connection {
             addr,
             reason: "connect timed out".into(),
         };
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| dial)?
-            .map_err(|e| ClientError::Connection {
-                addr,
-                reason: e.to_string(),
-            })?;
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            TransportTcpStream::connect_client(addr, tls),
+        )
+        .await
+        .map_err(|_| dial)?
+        .map_err(|e| ClientError::Connection {
+            addr,
+            reason: e.to_string(),
+        })?;
 
         let (read_half, write_half) = stream.into_split();
 
@@ -157,12 +163,14 @@ impl NodeConnection {
 /// Lazy, wait-free pool of multiplexed connections keyed by node address.
 pub(crate) struct ConnectionPool {
     connections: ArcSwap<HashMap<SocketAddr, Arc<NodeConnection>>>,
+    pub(super) tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl ConnectionPool {
     pub(crate) fn new() -> Self {
         Self {
             connections: ArcSwap::from_pointee(HashMap::new()),
+            tls: None,
         }
     }
 
@@ -181,7 +189,7 @@ impl ConnectionPool {
             return Ok(conn);
         }
 
-        let new_conn = Arc::new(NodeConnection::connect(addr).await?);
+        let new_conn = Arc::new(NodeConnection::connect(addr, self.tls.clone()).await?);
 
         self.connections.rcu(|current| {
             if current.get(&addr).is_some_and(|c| c.is_alive()) {
@@ -233,9 +241,141 @@ mod tests {
     use crate::connections::MAX_FRAME_SIZE;
     use crate::connections::protocol::ProduceRequest;
     use crate::control_plane::metadata::RangeId;
-    use crate::net::TcpListener;
+    use crate::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use tracing::instrument::WithSubscriber;
+
+    #[test]
+    fn sdk_redirects_and_reconnects_use_mutual_tls() -> turmoil::Result {
+        use crate::client::{Client, RetryPolicy};
+        use crate::connections::protocol::{AdminRequest, ClientSuccess, ServerError};
+        use crate::control_plane::{NodeAddress, NodeAddressInfo, NodeId};
+        use crate::security::{NodeTransportSecurity, client_certificate_principal};
+        use rcgen::{CertificateParams, KeyPair, SanType, string::Ia5String};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut sim = turmoil::Builder::new().rng_seed(27).build();
+        sim.client("sdk", async {
+            let ip = turmoil::lookup("sdk");
+            let certificate = |uri: &str, ip_san| {
+                let mut params = CertificateParams::default();
+                params.subject_alt_names = vec![
+                    SanType::URI(Ia5String::try_from(uri).unwrap()),
+                    SanType::IpAddress(ip_san),
+                ];
+                let key = KeyPair::generate().unwrap();
+                (
+                    params.self_signed(&key).unwrap().der().clone(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                )
+            };
+            let (client_cert, client_key) = certificate("urn:eastguard:client:reader", ip);
+            let (server_cert, server_key) = certificate("urn:eastguard:node:broker", ip);
+            let server = NodeTransportSecurity::test_secure(
+                vec![server_cert.clone()],
+                server_key,
+                std::slice::from_ref(&client_cert),
+            )?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(server_cert)?;
+            let tls = Arc::new(
+                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(vec![client_cert.clone()], client_key)?,
+            );
+            let first = SocketAddr::new(ip, 9000);
+            let second = SocketAddr::new(ip, 9001);
+            let mut tasks = Vec::new();
+            for address in [first, second] {
+                let listener = TcpListener::bind(("0.0.0.0", address.port())).await?;
+                let server = server.clone();
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..2 {
+                        let (stream, _) = listener.accept().await?;
+                        let stream = TransportTcpStream::accept(
+                            stream,
+                            &server,
+                            client_certificate_principal,
+                            Duration::from_secs(1),
+                        )
+                        .await?;
+                        assert_eq!(stream.peer_principal().unwrap().as_ref(), "reader");
+                        let (read, write) = stream.into_split();
+                        let (id, _): (_, ClientRequest) =
+                            ClientStreamReader::new(read).read_request().await?;
+                        let response = if address == first {
+                            ClientResponse::Err(ServerError::TopicMetadataRedirect {
+                                owner: NodeAddressInfo::new(
+                                    NodeId::new("broker::2"),
+                                    NodeAddress::test(second, second),
+                                ),
+                            })
+                        } else {
+                            ClientResponse::Ok(ClientSuccess::ClusterInfo {
+                                nodes: Box::new([]),
+                            })
+                        };
+                        ClientRawWriter::new(write).write(id, &response).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }));
+            }
+            let client = Client::connect_secure(vec![first], RetryPolicy::default(), tls.clone())?;
+            for _ in 0..2 {
+                let served = client
+                    .call(first, ClientRequest::Admin(AdminRequest::DescribeCluster))
+                    .await?;
+                assert!(served.redirected);
+                assert!(matches!(
+                    served.response,
+                    ClientResponse::Ok(ClientSuccess::ClusterInfo { .. })
+                ));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            for task in tasks {
+                task.await??;
+            }
+
+            // A trusted certificate for another IP must still fail. No fallback
+            // connection or application bytes may reach the redirected destination.
+            let (wrong_cert, wrong_key) =
+                certificate("urn:eastguard:node:wrong", "127.0.0.1".parse().unwrap());
+            let wrong_server = NodeTransportSecurity::test_secure(
+                vec![wrong_cert.clone()],
+                wrong_key,
+                &[client_cert],
+            )?;
+            let mut wrong_tls = (*tls).clone();
+            let mut wrong_roots = rustls::RootCertStore::empty();
+            wrong_roots.add(wrong_cert)?;
+            wrong_tls.dangerous().set_certificate_verifier(
+                rustls::client::WebPkiServerVerifier::builder(Arc::new(wrong_roots)).build()?,
+            );
+            let listener = TcpListener::bind(("0.0.0.0", first.port())).await?;
+            let accept = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                assert!(
+                    TransportTcpStream::accept(
+                        stream,
+                        &wrong_server,
+                        client_certificate_principal,
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+                );
+                Ok::<_, anyhow::Error>(())
+            });
+            assert!(
+                TransportTcpStream::connect_client(first, Some(Arc::new(wrong_tls)))
+                    .await
+                    .is_err()
+            );
+            accept.await??;
+            Ok(())
+        });
+        sim.run()
+    }
 
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);

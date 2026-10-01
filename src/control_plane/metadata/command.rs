@@ -8,8 +8,7 @@ use crate::{
     control_plane::{
         Replicas,
         metadata::{
-            AclResource, EntryId, ProducerSessionOwner, RangeId, SegmentId, TopicId,
-            strategy::StoragePolicy,
+            EntryId, ProducerSessionOwner, RangeId, SegmentId, TopicId, strategy::StoragePolicy,
         },
     },
     data_plane::SegmentKey,
@@ -111,18 +110,6 @@ pub struct ExpireProducerSessions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct GrantAcl {
-    pub resource: AclResource,
-    pub principal: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct RevokeAcl {
-    pub resource: AclResource,
-    pub principal: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct UpdateConsumerGroupMemberRequest {
     pub topic_name: String,
     pub group_id: String,
@@ -162,8 +149,6 @@ pub enum MetadataCommand {
     UpdateConsumerGroupMember(UpdateConsumerGroupMember),
     OpenProducerSession(OpenProducerSession),
     ExpireProducerSessions(ExpireProducerSessions),
-    GrantAcl(GrantAcl),
-    RevokeAcl(RevokeAcl),
 }
 
 impl_from_variant!(
@@ -178,6 +163,4 @@ impl_from_variant!(
     UpdateConsumerGroupMember,
     OpenProducerSession,
     ExpireProducerSessions,
-    GrantAcl,
-    RevokeAcl
 );

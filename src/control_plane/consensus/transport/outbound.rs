@@ -13,18 +13,14 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::{
     InboundRaftRpc, OutboundRaftPacket, RaftTransportCommand, WireRaftMessage,
 };
-use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::membership::actor::SwimSender;
-use crate::control_plane::metadata::AclResource;
 use crate::impl_from_variant;
 use crate::net::{TransportTcpStream, TransportWriteHalf};
 use crate::security::NodeTransportSecurity;
 
 use super::before_deadline;
 use super::inbound::{AcceptedRaftConnection, ClusterMessageReader};
-use super::protocol::{
-    AclSnapshotRequest, AclSnapshotResponse, ClusterRequest, MAX_CLUSTER_FRAME_SIZE, encode_frame,
-};
+use super::protocol::{MAX_CLUSTER_FRAME_SIZE, encode_frame};
 
 const CONNECT_BACKOFF: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -592,7 +588,7 @@ impl OutboundClusterConnection {
             tokio::time::timeout(IDENTITY_HANDSHAKE_TIMEOUT, async {
                 let mut connection =
                     Self::new(stream, target_id, local_node_id, node_transport).await?;
-                connection.send_request(initial_raft_message.into()).await?;
+                connection.send_request(initial_raft_message).await?;
                 Ok(connection)
             })
             .await?
@@ -617,20 +613,7 @@ impl OutboundClusterConnection {
         })
     }
 
-    pub(crate) async fn read_acl_snapshot(
-        &mut self,
-        resource: AclResource,
-    ) -> anyhow::Result<AclRecord> {
-        self.send_request(AclSnapshotRequest { resource }.into())
-            .await?;
-        Ok(self
-            .reader
-            .read_frame::<AclSnapshotResponse>(MAX_CLUSTER_FRAME_SIZE, "ACL snapshot response")
-            .await?
-            .snapshot)
-    }
-
-    pub(super) async fn send_request(&mut self, request: ClusterRequest) -> anyhow::Result<()> {
+    pub(super) async fn send_request(&mut self, request: WireRaftMessage) -> anyhow::Result<()> {
         self.writer.write_all(&encode_frame(&request)?).await?;
         self.writer.flush().await?;
         Ok(())

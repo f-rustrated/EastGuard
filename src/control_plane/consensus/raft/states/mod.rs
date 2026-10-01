@@ -43,5 +43,3 @@ boundaries describe the control-plane Raft metadata log.
 */
 pub(crate) mod consensus;
 pub(crate) mod metadata_state;
-
-pub(crate) mod security;

@@ -30,7 +30,7 @@ use crate::data_plane::messages::query::{
     DataPlaneQuery, Fetch, ListOffsets, ReadConsumerOffset, ReadConsumerOffsetResult,
 };
 use crate::net::TransportTcpStream;
-use crate::security::{AclHandle, CertificatePrincipal};
+use crate::security::{CertificatePrincipal, Permissions};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -55,7 +55,7 @@ pub struct ClientController {
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    authorization: AclHandle,
+    authorization: Permissions,
 }
 
 impl ClientController {
@@ -65,7 +65,7 @@ impl ClientController {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
-        authorization: AclHandle,
+        authorization: Permissions,
     ) -> Self {
         Self {
             certificate_principal,
@@ -170,16 +170,14 @@ impl ClientController {
         let owner = ProducerSessionOwner::from(self.certificate_principal.as_ref());
 
         let command: OpenProducerSession = req.into_command(owner.clone());
+        self.authorize_topic(&command.topic_name, AclResource::TopicData)?;
 
         let group = self
             .route_local(command.topic_name.as_bytes().to_vec())
             .await?;
 
         let topic_meta = self
-            .raft_sender
             .get_topic_metadata(command.topic_name.to_string())
-            .await?;
-        self.authorize_acl_resource(AclResource::TopicData(topic_meta.id))
             .await?;
         topic_meta
             .producer_sessions
@@ -188,7 +186,6 @@ impl ClientController {
         self.propose_topic_write(group.id, command.clone()).await?;
 
         let committed_topic = self
-            .raft_sender
             .get_topic_metadata(command.topic_name.to_string())
             .await?;
 
@@ -210,17 +207,15 @@ impl ClientController {
         &self,
         req: UpdateConsumerGroupMemberRequest,
     ) -> Result<ClientSuccess, ServerError> {
+        self.authorize_topic(&req.topic_name, |topic_id| {
+            AclResource::ConsumerGroup(ConsumerGroupResource {
+                topic_id,
+                group_id: req.group_id.clone(),
+            })
+        })?;
         let group = self.route_local(req.topic_name.as_bytes().to_vec()).await?;
 
-        let topic = self
-            .raft_sender
-            .get_topic_metadata(req.topic_name.clone())
-            .await?;
-        self.authorize_acl_resource(AclResource::ConsumerGroup(ConsumerGroupResource {
-            topic_id: topic.id,
-            group_id: req.group_id.clone(),
-        }))
-        .await?;
+        self.get_topic_metadata(req.topic_name.clone()).await?;
 
         self.propose_topic_write(group.id, UpdateConsumerGroupMember::new(req.clone()))
             .await?;
@@ -250,15 +245,23 @@ impl ClientController {
     /// otherwise it redirects to a member so the consumer retries against the right
     /// node — no server-side proxying.
     async fn describe_topic(&self, topic_name: String) -> Result<ClientSuccess, ServerError> {
+        let cluster_admin = self.authorize_acl_resource(AclResource::Cluster).is_ok();
+        if !cluster_admin {
+            self.authorize_topic(&topic_name, AclResource::TopicAdmin)
+                .or_else(|_| self.authorize_topic(&topic_name, AclResource::TopicData))?;
+        }
         self.route_local(topic_name.as_bytes().to_vec()).await?;
-
-        let topic = self.raft_sender.get_topic_metadata(topic_name).await?;
-        self.authorize_acl_resource(AclResource::TopicAdmin(topic.id))
+        let topic = self
+            .raft_sender
+            .get_topic_metadata(topic_name.clone())
             .await?;
-
+        if !cluster_admin {
+            self.authorization.verify_topic(&topic_name, topic.id)?;
+        }
         let addresses = self.swim_sender.list_all_node_addresses().await?;
-        let detail = TopicDetail::from_meta(topic, &addresses);
-        Ok(ClientSuccess::TopicDetail(detail))
+        Ok(ClientSuccess::TopicDetail(TopicDetail::from_meta(
+            topic, &addresses,
+        )))
     }
 
     async fn handle_create_topic(
@@ -268,7 +271,7 @@ impl ClientController {
     ) -> Result<ClientSuccess, ServerError> {
         // A new topic has no stable ID yet, so its creator needs the cluster-wide
         // grant. Once created, topic-admin/{topic-id} governs its metadata.
-        self.authorize_acl_resource(AclResource::Cluster).await?;
+        self.authorize_acl_resource(AclResource::Cluster)?;
         let group = self.route_local(name.as_bytes().to_vec()).await?;
 
         let created_at = std::time::SystemTime::now()
@@ -287,13 +290,9 @@ impl ClientController {
     }
 
     async fn delete_topic(&self, topic_name: String) -> Result<ClientSuccess, ServerError> {
+        self.authorize_topic(&topic_name, AclResource::TopicAdmin)?;
         let group = self.route_local(topic_name.as_bytes().to_vec()).await?;
-        let topic = self
-            .raft_sender
-            .get_topic_metadata(topic_name.clone())
-            .await?;
-        self.authorize_acl_resource(AclResource::TopicAdmin(topic.id))
-            .await?;
+        self.get_topic_metadata(topic_name.clone()).await?;
 
         let cmd = DeleteTopic { name: topic_name };
         self.propose_topic_write(group.id, cmd).await?;
@@ -309,7 +308,7 @@ impl ClientController {
     }
 
     /// Resolves a local metadata shard or returns a redirect for a normal
-    /// client request. ACL authorization needs the richer route directly.
+    /// client request after authorization.
     async fn route_local(&self, key: Vec<u8>) -> Result<ShardGroup, ServerError> {
         match self.route(key).await? {
             ShardRouting::Local(group) => Ok(group),
@@ -319,10 +318,27 @@ impl ClientController {
         }
     }
 
-    async fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
+    fn authorize_topic(
+        &self,
+        name: &str,
+        resource: impl FnOnce(crate::control_plane::metadata::TopicId) -> AclResource,
+    ) -> Result<(), ServerError> {
+        self.authorization
+            .authorize_topic(self.certificate_principal.as_ref(), name, resource)
+    }
+
+    async fn get_topic_metadata(
+        &self,
+        name: String,
+    ) -> Result<crate::control_plane::metadata::TopicMeta, ServerError> {
+        let topic = self.raft_sender.get_topic_metadata(name.clone()).await?;
+        self.authorization.verify_topic(&name, topic.id)?;
+        Ok(topic)
+    }
+
+    fn authorize_acl_resource(&self, resource: AclResource) -> Result<(), ServerError> {
         self.authorization
             .authorize(self.certificate_principal.as_ref(), resource)
-            .await
     }
 
     /// Structural redirect for a control-plane op that isn't local: to the member if
@@ -373,7 +389,7 @@ impl ClientController {
     }
 
     async fn list_hosted_topics(&self) -> Result<ClientSuccess, ServerError> {
-        self.authorize_acl_resource(AclResource::Cluster).await?;
+        self.authorize_acl_resource(AclResource::Cluster)?;
 
         let topics = self
             .raft_sender
@@ -407,7 +423,7 @@ impl ClientController {
         &self,
         req: CommitConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_acl_resource(req.key.acl()).await?;
+        self.authorize_acl_resource(req.key.acl())?;
 
         let (tx, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -437,7 +453,7 @@ impl ClientController {
         &self,
         req: FetchConsumerOffsetRequest,
     ) -> Result<ClientSuccess, ServerError> {
-        self.authorize_acl_resource(req.key.acl()).await?;
+        self.authorize_acl_resource(req.key.acl())?;
 
         let (reply, recv) = tokio::sync::oneshot::channel();
         self.data_plane_tx
@@ -467,6 +483,7 @@ impl ClientController {
     /// redirecting if this node isn't it. Membership-first (like `handle_describe_topic`)
     /// so we can tell "topic absent" from "not hosted here".
     async fn produce_entry(&self, req: ProduceRequest) -> Result<ClientSuccess, ServerError> {
+        self.authorize_topic(&req.topic_name, AclResource::TopicData)?;
         let received_at_ms = crate::now_ms();
         // Not local (ring unconverged or this node isn't a member) → retriable
         // redirect; the hint is best-effort, absent until SWIM converges.
@@ -478,9 +495,7 @@ impl ClientController {
             });
         }
 
-        let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_acl_resource(AclResource::TopicData(topic.id))
-            .await?;
+        let topic = self.get_topic_metadata(req.topic_name).await?;
 
         let owner = ProducerSessionOwner::from(self.certificate_principal.as_ref());
         let producer_identity = req
@@ -533,9 +548,8 @@ impl ClientController {
     ///
     /// state machine needs to answer without any further I/O.
     async fn fetch(&self, req: FetchRequest) -> Result<ClientSuccess, ServerError> {
-        let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_acl_resource(AclResource::TopicData(topic.id))
-            .await?;
+        self.authorize_topic(&req.topic_name, AclResource::TopicData)?;
+        let topic = self.get_topic_metadata(req.topic_name).await?;
 
         let range = topic.get_range(&req.range_id)?;
 
@@ -568,8 +582,7 @@ impl ClientController {
     /// serve it. No proxying: a miss returns `SegmentNotLocal` and the client
     /// retries another replica.
     async fn fetch_by_id(&self, req: FetchByIdRequest) -> Result<ClientSuccess, ServerError> {
-        self.authorize_acl_resource(AclResource::TopicData(req.topic_id))
-            .await?;
+        self.authorize_acl_resource(AclResource::TopicData(req.topic_id))?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let query = Fetch {
@@ -593,9 +606,8 @@ impl ClientController {
     /// Offset-bounds query — used by consumers to bound their read window
     /// for the range's currently-active segment on this node.
     async fn list_offsets(&self, req: RangeOffsetRequest) -> Result<ClientSuccess, ServerError> {
-        let topic = self.raft_sender.get_topic_metadata(req.topic_name).await?;
-        self.authorize_acl_resource(AclResource::TopicData(topic.id))
-            .await?;
+        self.authorize_topic(&req.topic_name, AclResource::TopicData)?;
+        let topic = self.get_topic_metadata(req.topic_name).await?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
@@ -618,7 +630,7 @@ impl ClientController {
     async fn handle_admin(&self, request: AdminRequest) -> Result<ClientSuccess, ServerError> {
         use AdminRequest::*;
 
-        self.authorize_acl_resource(AclResource::Cluster).await?;
+        self.authorize_acl_resource(AclResource::Cluster)?;
 
         match request {
             DescribeCluster => self.describe_cluster().await,
@@ -706,7 +718,7 @@ pub async fn handle_client_stream(
     swim_sender: SwimSender,
     raft_sender: MutlRaftSender,
     data_plane_tx: DataPlaneSender,
-    authorization: AclHandle,
+    authorization: Permissions,
 ) {
     let certificate_principal = stream.peer_principal();
     let (read_half, write_half) = stream.into_split();
@@ -735,17 +747,13 @@ mod tests {
     };
     use crate::control_plane::consensus::actor::MultiRaftActor;
     use crate::control_plane::consensus::messages::MultiRaftActorCommand;
-    use crate::control_plane::consensus::raft::states::security::AclRecord;
-    use crate::control_plane::consensus::transport::RaftTransportActor;
     use crate::control_plane::membership::actor::SwimActor;
-    use crate::control_plane::membership::messages::dissemination_buffer::ShardLeaderInfo;
     use crate::control_plane::membership::{
-        QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand, Topology,
-        TopologyConfig, TopologyReader,
+        QueryCommand, ShardGroup, ShardGroupId, ShardLeaderEntry, SwimActorCommand,
     };
+    use crate::control_plane::metadata::TopicStats as MetadataTopicStats;
     use crate::control_plane::metadata::consumer_group::GenerationId;
     use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
-    use crate::control_plane::metadata::{ConsumerGroupResource, TopicStats as MetadataTopicStats};
     use crate::control_plane::metadata::{RangeId, TopicId, TopicMeta};
     use crate::control_plane::{NodeAddress, NodeId, Replicas, SwimNode, SwimNodeState};
     use crate::data_plane::actor::DataPlaneSender;
@@ -753,12 +761,11 @@ mod tests {
     use crate::data_plane::messages::DataPlaneMessage;
     use crate::data_plane::messages::command::{DataPlaneCommand, ProduceAck};
     use crate::net::TcpListener;
-    use crate::security::{AclActor, NodeTransportSecurity};
+    use crate::security::Permissions;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::Notify;
     use turmoil::Builder;
 
     fn addr(port: u16) -> SocketAddr {
@@ -889,32 +896,13 @@ mod tests {
         DataPlaneSender(tx)
     }
 
-    fn test_topology_reader(nodes: impl IntoIterator<Item = NodeId>) -> TopologyReader {
-        Topology::new(
-            nodes,
-            TopologyConfig {
-                vnodes_per_pnode: 4,
-                replication_factor: 1,
-            },
-        )
-        .channel()
-        .1
-    }
-
     fn trusted_controller(
         node_id: NodeId,
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
         data_plane_tx: DataPlaneSender,
     ) -> ClientController {
-        let topology = test_topology_reader([node_id.clone()]);
-        let authorization = AclActor::spawn(
-            node_id.clone(),
-            swim_sender.clone(),
-            raft_sender.clone(),
-            topology,
-            NodeTransportSecurity::TrustedDevelopment,
-        );
+        let authorization = Permissions::trusted_development();
         ClientController::new(
             None,
             node_id,
@@ -931,49 +919,10 @@ mod tests {
         swim_sender: SwimSender,
         raft_sender: MutlRaftSender,
     ) -> ClientController {
-        let topology = test_topology_reader([node_id.clone()]);
-        authenticated_controller_with_topology(
-            principal,
-            node_id,
-            swim_sender,
-            raft_sender,
-            topology,
-        )
-    }
-
-    fn authenticated_controller_with_topology(
-        principal: &str,
-        node_id: NodeId,
-        swim_sender: SwimSender,
-        raft_sender: MutlRaftSender,
-        topology: TopologyReader,
-    ) -> ClientController {
-        let authorization = AclActor::spawn(
-            node_id.clone(),
-            swim_sender.clone(),
-            raft_sender.clone(),
-            topology,
-            NodeTransportSecurity::TrustedDevelopment,
-        );
         ClientController::new(
-            Some(CertificatePrincipal::new(principal)),
-            node_id,
-            swim_sender,
-            raft_sender,
-            dp_stub(),
-            authorization,
+            Some(CertificatePrincipal::new(principal)), node_id, swim_sender, raft_sender, dp_stub(),
+            Permissions::parse(br#"{"topics":{"t1":1,"orders":7},"grants":{"topic-data/1":["owner","other"],"topic-data/7":["orders-service"]}}"#).unwrap(),
         )
-    }
-
-    fn acl_snapshot(resource: AclResource, principals: &[&str]) -> AclRecord {
-        AclRecord {
-            resource,
-            revision: 1,
-            principals: principals
-                .iter()
-                .map(|principal| (*principal).to_owned())
-                .collect(),
-        }
     }
 
     fn produce_req() -> ClientRequest {
@@ -1003,6 +952,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_grant_allows_discovery_and_redirects_without_delete_permission() {
+        for owner in ["self", "remote"] {
+            let swim = swim_sender_with(move |cmd| match cmd {
+                SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
+                    let _ = reply.send(Some(ShardGroup {
+                        id: ShardGroupId(42),
+                        replicas: Replicas::new(vec![node_id(owner)]),
+                    }));
+                }
+                SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) => {
+                    let _ = reply.send(Some(NodeAddress::test(addr(9000), addr(9001))));
+                }
+                SwimActorCommand::Query(QueryCommand::GetMembers { reply }) => {
+                    let _ = reply.send(Vec::new());
+                }
+                _ => panic!("unexpected routing query"),
+            });
+            let raft = raft_sender_with(|cmd| {
+                if let MultiRaftActorCommand::GetTopicMetadata { reply, .. } = cmd {
+                    let _ = reply.send(Some(topic_meta("self")));
+                } else {
+                    panic!("unexpected metadata command");
+                }
+            });
+            let controller = authenticated_controller("owner", node_id("self"), swim, raft);
+            let result = controller.describe_topic("t1".into()).await;
+            if owner == "self" {
+                assert!(matches!(result, Ok(ClientSuccess::TopicDetail(_))));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ServerError::TopicMetadataRedirect { .. })
+                ));
+            }
+            assert_eq!(
+                controller.delete_topic("t1".into()).await,
+                Err(ServerError::Unauthorized)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthorized_named_requests_never_reach_routing() {
+        let controller = authenticated_controller(
+            "ungranted",
+            node_id("self"),
+            swim_sender_with(|_| panic!("unauthorized request reached routing")),
+            raft_sender_with(|_| panic!("unauthorized request reached metadata")),
+        );
+        assert!(matches!(
+            controller.dispatch(produce_req()).await,
+            ClientResponse::Err(ServerError::Unauthorized)
+        ));
+        assert_eq!(
+            controller.describe_topic("t1".into()).await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(
+            controller.delete_topic("t1".into()).await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(
+            controller
+                .open_producer_session(OpenProducerSessionRequest {
+                    topic_name: "t1".into(),
+                    producer_id: uuid::Uuid::nil(),
+                    session_nonce: uuid::Uuid::nil(),
+                })
+                .await,
+            Err(ServerError::Unauthorized)
+        );
+        assert_eq!(
+            controller
+                .update_consumer_group_member(UpdateConsumerGroupMemberRequest {
+                    topic_name: "t1".into(),
+                    group_id: "billing".into(),
+                    member_id: uuid::Uuid::nil(),
+                    action: ConsumerGroupMemberAction::Heartbeat,
+                })
+                .await,
+            Err(ServerError::Unauthorized)
+        );
+    }
+
+    #[tokio::test]
     async fn certificate_client_requires_exact_topic_acl() {
         let group = ShardGroup {
             id: ShardGroupId(42),
@@ -1013,53 +1047,13 @@ mod tests {
                 let _ = reply.send(Some(group.clone()));
             }
         });
-        let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
-                assert_eq!(query.resource, AclResource::TopicData(TopicId(7)));
-                let _ = query
-                    .reply
-                    .send(Ok(acl_snapshot(query.resource, &["orders-service"])));
-            }
-        });
+        let raft = raft_sender_with(|_| panic!("authorization must be local"));
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
 
         assert_eq!(
-            controller
-                .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
-                .await,
+            controller.authorize_acl_resource(AclResource::TopicData(TopicId(7))),
             Ok(())
         );
-    }
-
-    #[tokio::test]
-    async fn acl_cache_miss_reads_the_local_snapshot_once() {
-        let group = test_shard_group();
-        let swim = swim_sender_with(move |cmd| {
-            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
-                let _ = reply.send(Some(group.clone()));
-            }
-        });
-        let query_count = Arc::new(AtomicUsize::new(0));
-        let observed_query_count = query_count.clone();
-        let raft = raft_sender_with(move |cmd| {
-            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
-                observed_query_count.fetch_add(1, Ordering::Relaxed);
-                let _ = query
-                    .reply
-                    .send(Ok(acl_snapshot(query.resource, &["orders-service"])));
-            }
-        });
-        let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
-
-        for _ in 0..2 {
-            assert_eq!(
-                controller
-                    .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
-                    .await,
-                Ok(())
-            );
-        }
-        assert_eq!(query_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1075,10 +1069,6 @@ mod tests {
         let raft = raft_sender_with(move |cmd| match cmd {
             MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
                 let _ = reply.send(Some(topic_meta("node-1")));
-            }
-            MultiRaftActorCommand::GetAclSnapshot(query) => {
-                assert_eq!(query.resource, AclResource::TopicAdmin(TopicId(1)));
-                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
             }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
@@ -1111,15 +1101,10 @@ mod tests {
         });
         let proposal_count = Arc::new(AtomicUsize::new(0));
         let observed_proposals = proposal_count.clone();
-        let raft = raft_sender_with(move |cmd| match cmd {
-            MultiRaftActorCommand::GetAclSnapshot(query) => {
-                assert_eq!(query.resource, AclResource::Cluster);
-                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
-            }
-            MultiRaftActorCommand::ClientProposal { .. } => {
+        let raft = raft_sender_with(move |cmd| {
+            if let MultiRaftActorCommand::ClientProposal { .. } = cmd {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {}
         });
         let controller = authenticated_controller("orders-service", node_id("node-1"), swim, raft);
 
@@ -1158,18 +1143,7 @@ mod tests {
                 let _ = reply.send(Some(group.clone()));
             }
         });
-        let raft = raft_sender_with(|cmd| {
-            if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
-                assert_eq!(
-                    query.resource,
-                    AclResource::ConsumerGroup(ConsumerGroupResource {
-                        topic_id: TopicId(7),
-                        group_id: "billing".to_string(),
-                    })
-                );
-                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
-            }
-        });
+        let raft = raft_sender_with(|_| panic!("authorization must be local"));
         let controller = authenticated_controller("orders-service", node_id("self"), swim, raft);
 
         let result = controller
@@ -1203,16 +1177,6 @@ mod tests {
             MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
                 let _ = reply.send(Some(topic_meta("self")));
             }
-            MultiRaftActorCommand::GetAclSnapshot(query) => {
-                assert_eq!(
-                    query.resource,
-                    AclResource::ConsumerGroup(ConsumerGroupResource {
-                        topic_id: TopicId(1),
-                        group_id: "billing".to_string(),
-                    })
-                );
-                let _ = query.reply.send(Ok(acl_snapshot(query.resource, &[])));
-            }
             MultiRaftActorCommand::ClientProposal { .. } => {
                 observed_proposals.fetch_add(1, Ordering::Relaxed);
             }
@@ -1231,144 +1195,6 @@ mod tests {
 
         assert_eq!(result, Err(ServerError::Unauthorized));
         assert_eq!(proposal_count.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn certificate_client_fails_closed_when_acl_shard_is_remote() {
-        let group = ShardGroup {
-            id: ShardGroupId(42),
-            replicas: Replicas::new(vec![node_id("other")]),
-        };
-        let swim = swim_sender_with(move |cmd| match cmd {
-            SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) => {
-                let _ = reply.send(Some(group.clone()));
-            }
-            SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) => {
-                let _ = reply.send(None);
-            }
-            _ => {}
-        });
-        let topology = test_topology_reader([node_id("other")]);
-        let controller = authenticated_controller_with_topology(
-            "orders-service",
-            node_id("self"),
-            swim,
-            raft_sender_with(|_| panic!("remote ACL shard must not be queried locally")),
-            topology,
-        );
-
-        assert_eq!(
-            controller
-                .authorize_acl_resource(AclResource::TopicData(TopicId(7)))
-                .await,
-            Err(ServerError::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn certificate_client_refreshes_acl_from_remote_shard_host() -> turmoil::Result {
-        let resource = AclResource::TopicData(TopicId(7));
-        let snapshot = acl_snapshot(resource.clone(), &["orders-service"]);
-        let response_received = Arc::new(Notify::new());
-        let mut topology = Topology::new(
-            [node_id("owner"), node_id("requester")],
-            TopologyConfig {
-                vnodes_per_pnode: 4,
-                replication_factor: 2,
-            },
-        );
-        let remote_group_id = topology
-            .shard_group_for(&resource.routing_key())
-            .expect("two-node test topology must resolve every key")
-            .id;
-        topology.update_shard_leader(&ShardLeaderInfo {
-            shard_group_id: remote_group_id,
-            leader_node_id: node_id("owner"),
-            leader_addr: NodeAddress::test(addr(9000), addr(9001)),
-            term: 1,
-        });
-        let remote_topology = topology.channel().1;
-        let mut sim = Builder::new()
-            .simulation_duration(Duration::from_secs(5))
-            .build();
-
-        let owner_snapshot = snapshot.clone();
-        let owner_resource = resource.clone();
-        let owner_response_received = response_received.clone();
-        let owner_topology = remote_topology.clone();
-        sim.host("owner", move || {
-            let expected_snapshot = owner_snapshot.clone();
-            let expected_resource = owner_resource.clone();
-            let owner_completion = owner_response_received.clone();
-            let owner_topology_reader = owner_topology.clone();
-            async move {
-                let listener = TcpListener::bind("0.0.0.0:9000").await?;
-                let (raft_tx, mut raft_rx) = MultiRaftActor::channel(8);
-                let (_transport_tx, transport_rx) = mpsc::channel(1);
-                let (swim_tx, _swim_rx) = SwimActor::channel(1);
-                let authorization = AclActor::spawn(
-                    node_id("owner"),
-                    swim_tx.clone(),
-                    raft_tx.clone(),
-                    owner_topology_reader,
-                    NodeTransportSecurity::TrustedDevelopment,
-                );
-                tokio::spawn(RaftTransportActor::run(
-                    node_id("owner"),
-                    listener,
-                    raft_tx,
-                    transport_rx,
-                    swim_tx,
-                    NodeTransportSecurity::TrustedDevelopment,
-                    authorization,
-                ));
-
-                let Some(MultiRaftActorCommand::GetAclSnapshot(query)) = raft_rx.recv().await
-                else {
-                    panic!("expected remote ACL snapshot query");
-                };
-                assert_eq!(query.shard_group_id, remote_group_id);
-                assert_eq!(query.resource, expected_resource);
-                let _ = query.reply.send(Ok(expected_snapshot));
-                owner_completion.notified().await;
-                Ok(())
-            }
-        });
-
-        let requester_resource = resource.clone();
-        let requester_topology = remote_topology.clone();
-        sim.host("requester", move || {
-            let requested_resource = requester_resource.clone();
-            let requester_completion = response_received.clone();
-            let requester_topology_reader = requester_topology.clone();
-            async move {
-                let owner_addr = turmoil::lookup("owner");
-                let owner = NodeAddress::test(
-                    SocketAddr::new(owner_addr, 9000),
-                    SocketAddr::new(owner_addr, 9001),
-                );
-                let swim = swim_sender_with(move |cmd| {
-                    if let SwimActorCommand::Query(QueryCommand::ResolveAddress { reply, .. }) = cmd
-                    {
-                        let _ = reply.send(Some(owner));
-                    }
-                });
-                let controller = authenticated_controller_with_topology(
-                    "orders-service",
-                    node_id("requester"),
-                    swim,
-                    raft_sender_with(|_| panic!("remote ACL refresh must not query local Raft")),
-                    requester_topology_reader,
-                );
-
-                let result = controller.authorize_acl_resource(requested_resource).await;
-                requester_completion.notify_one();
-                assert_eq!(result, Ok(()));
-                Ok(())
-            }
-        });
-
-        sim.run()
     }
 
     /// Ring can't map the key yet (topology not converged) → retriable
@@ -1508,10 +1334,6 @@ mod tests {
         let raft = raft_sender_with(move |cmd| {
             if let MultiRaftActorCommand::GetTopicMetadata { reply, .. } = cmd {
                 let _ = reply.send(Some(topic.clone()));
-            } else if let MultiRaftActorCommand::GetAclSnapshot(query) = cmd {
-                let _ = query
-                    .reply
-                    .send(Ok(acl_snapshot(query.resource, &["owner", "other"])));
             }
         });
         for principal in ["owner", "other"] {

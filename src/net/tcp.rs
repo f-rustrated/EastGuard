@@ -114,6 +114,24 @@ impl From<OwnedWriteHalf> for TransportWriteHalf {
 }
 
 impl TransportTcpStream {
+    /// SDK connections verify the destination IP SAN using the supplied standard
+    /// rustls configuration, including after redirects. The server also needs a node URI.
+    pub(crate) async fn connect_client(
+        addr: std::net::SocketAddr,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let Some(config) = tls else {
+            return Ok(Self::TrustedDevelopment(stream));
+        };
+        let stream = TlsConnector::from(config)
+            .connect(ServerName::IpAddress(addr.ip().into()), stream)
+            .await?;
+        AuthenticatedTcpStream::from_tls_stream(stream.into(), node_certificate_principal)
+            .map(Box::new)
+            .map(Self::Secure)
+    }
+
     pub async fn accept(
         stream: TcpStream,
         security: &NodeTransportSecurity,

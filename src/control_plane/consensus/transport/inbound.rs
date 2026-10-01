@@ -3,13 +3,11 @@ use crate::control_plane::consensus::actor::MutlRaftSender;
 use crate::control_plane::consensus::messages::InboundRaftRpc;
 use crate::control_plane::consensus::messages::WireRaftMessage;
 use crate::net::{TcpStream, TransportReadHalf, TransportTcpStream, TransportWriteHalf};
-use crate::security::{AclHandle, NodeTransportSecurity, node_certificate_principal};
+use crate::security::{NodeTransportSecurity, node_certificate_principal};
 use borsh::BorshDeserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
-use super::protocol::{
-    AclSnapshotRequest, AclSnapshotResponse, ClusterRequest, MAX_CLUSTER_FRAME_SIZE, encode_frame,
-};
+use super::protocol::MAX_CLUSTER_FRAME_SIZE;
 
 pub(super) struct ClusterMessageReader {
     read_half: TransportReadHalf,
@@ -84,14 +82,12 @@ pub(super) struct AcceptedRaftConnection {
 
 /// Authenticates a cluster stream and handles its first request.
 ///
-/// ACL reads finish here. Only a verified Raft stream is
-/// returned to the persistent connection dispatcher.
+/// Only a verified Raft stream reaches the persistent connection dispatcher.
 pub(super) async fn accept_cluster_connection(
     stream: TcpStream,
     local_node_id: &NodeId,
     node_transport: &NodeTransportSecurity,
-    acl: &AclHandle,
-) -> anyhow::Result<Option<AcceptedRaftConnection>> {
+) -> anyhow::Result<AcceptedRaftConnection> {
     let mut stream = TransportTcpStream::accept(
         stream,
         node_transport,
@@ -109,42 +105,21 @@ pub(super) async fn accept_cluster_connection(
     } else {
         None
     };
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut reader = ClusterMessageReader::new(read_half);
     let request = reader
-        .read_frame::<ClusterRequest>(MAX_CLUSTER_FRAME_SIZE, "cluster request")
+        .read_frame::<WireRaftMessage>(MAX_CLUSTER_FRAME_SIZE, "cluster request")
         .await?;
 
-    match request {
-        ClusterRequest::Raft(message) => {
-            if let Some(peer) = peer {
-                anyhow::ensure!(
-                    message.peer_id == peer,
-                    "cluster requester differs from authenticated node"
-                );
-            }
-            Ok(Some(AcceptedRaftConnection {
-                initial_message: message,
-                reader,
-                writer: write_half,
-            }))
-        }
-        ClusterRequest::AclSnapshot(request) => {
-            handle_acl_snapshot(request, acl, &mut write_half).await?;
-            Ok(None)
-        }
+    if let Some(peer) = peer {
+        anyhow::ensure!(
+            request.peer_id == peer,
+            "cluster requester differs from authenticated node"
+        );
     }
-}
-
-async fn handle_acl_snapshot(
-    request: AclSnapshotRequest,
-    acl: &AclHandle,
-    write_half: &mut TransportWriteHalf,
-) -> anyhow::Result<()> {
-    let snapshot = acl.read_local_acl(request.resource).await?;
-    write_half
-        .write_all(&encode_frame(&AclSnapshotResponse { snapshot })?)
-        .await?;
-    write_half.flush().await?;
-    Ok(())
+    Ok(AcceptedRaftConnection {
+        initial_message: request,
+        reader,
+        writer: write_half,
+    })
 }

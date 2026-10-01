@@ -13,6 +13,7 @@ pub fn default_env(idx: u32, node_id: String, client_port: u16, cluster_port: u1
         certificate_chain_path: None,
         private_key_path: None,
         trust_root_path: None,
+        permissions_path: None,
         config_dir: std::env::temp_dir()
             .join(format!("eastguard-config-{}-{}", idx, uuid::Uuid::new_v4()))
             .to_string_lossy()

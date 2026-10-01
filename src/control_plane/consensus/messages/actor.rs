@@ -1,12 +1,10 @@
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::connections::protocol::ServerError;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
-use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{AclResource, ConsumerGroupAssignment, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
@@ -54,7 +52,6 @@ pub enum MultiRaftActorCommand {
         topic_name: String,
         reply: oneshot::Sender<Option<TopicMeta>>,
     },
-    GetAclSnapshot(GetAclSnapshot),
     GetConsumerGroupAssignment(GetConsumerGroupAssignment),
     /// Data-plane request forwarded to the metadata coordinator for proposal.
     ProposeSegmentRoll(ProposeSegmentRoll),
@@ -77,17 +74,6 @@ pub struct GetConsumerGroupAssignment {
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
 }
 
-/// Returns committed ACL state after a quorum-backed read barrier on the
-/// shard leader.
-///
-/// The caller has already routed the resource to this shard. A missing ACL is
-/// returned as an empty record so it can be cached as a bounded denial.
-pub struct GetAclSnapshot {
-    pub(crate) shard_group_id: ShardGroupId,
-    pub(crate) resource: AclResource,
-    pub(crate) reply: oneshot::Sender<Result<AclRecord, ServerError>>,
-}
-
 impl From<RaftProtocolMessage> for MultiRaftActorCommand {
     fn from(cmd: RaftProtocolMessage) -> Self {
         MultiRaftActorCommand::ProtocolMessage(cmd)
@@ -108,11 +94,7 @@ impl_from_variant_via!(
     RemoveGroup,
 );
 
-impl_from_variant!(
-    MultiRaftActorCommand,
-    GetAclSnapshot,
-    GetConsumerGroupAssignment,
-);
+impl_from_variant!(MultiRaftActorCommand, GetConsumerGroupAssignment,);
 
 /// A synchronous actor result held until the end-of-batch reply flush.
 pub(crate) struct DeferredResponse<T> {
@@ -132,7 +114,6 @@ pub(crate) enum DeferredReply {
     Propose(DeferredResponse<Result<(), ProposalError>>),
     GetTopics(DeferredResponse<Box<[String]>>),
     GetTopicStats(DeferredResponse<Box<[TopicStats]>>),
-    GetTopicMetadata(DeferredResponse<Option<TopicMeta>>),
-    GetAclSnapshot(DeferredResponse<Result<AclRecord, ServerError>>),
+    GetTopicMetadata(Box<DeferredResponse<Option<TopicMeta>>>),
     GetConsumerGroupAssignment(DeferredResponse<Option<ConsumerGroupAssignment>>),
 }

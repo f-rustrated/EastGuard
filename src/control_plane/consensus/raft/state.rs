@@ -9,7 +9,6 @@ use crate::control_plane::consensus::raft::states::consensus::{
     ConsensusState, PeerState, Role, SNAPSHOT_CHUNK_BYTES, SnapshotInstallOutcome,
 };
 use crate::control_plane::consensus::raft::states::metadata_state::MetadataState;
-use crate::control_plane::consensus::raft::states::security::AclRecord;
 use crate::control_plane::consensus::raft::storage::{
     RaftPersistentState, RaftSnapshot, SnapshotData,
 };
@@ -18,8 +17,8 @@ use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::{DeleteSegments, ExpireProducerSessions};
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
-    AclResource, ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment,
-    RollSegment, SegmentRollIntent, TopicId, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
+    SegmentRollIntent, TopicId, TopicMeta, TopicStats,
 };
 use crate::control_plane::{NodeId, Replicas};
 use crate::data_plane::SegmentKey;
@@ -162,10 +161,6 @@ impl Raft {
 
     pub(crate) fn get_topic_by_name(&self, name: &str) -> Option<&TopicMeta> {
         self.metadata.get_topic_by_name(name)
-    }
-
-    pub(crate) fn acl_snapshot(&self, resource: &AclResource) -> AclRecord {
-        self.metadata.acl_snapshot(resource)
     }
 
     pub(crate) fn get_consumer_group_assignment(
@@ -2485,7 +2480,7 @@ mod tests {
 
     #[test]
     fn lagging_follower_catches_up_in_byte_bounded_batches() {
-        use crate::control_plane::metadata::command::GrantAcl;
+        use crate::control_plane::metadata::command::DeleteTopic;
 
         let mut raft = three_node_raft("node-1");
         raft.handle_timeout(RaftTimeoutCallback::ElectionTimeout {
@@ -2503,14 +2498,10 @@ mod tests {
         );
         drain(&mut raft);
 
-        let principal = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES / 2);
-        for topic_id in [1, 2] {
+        let name = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES / 2);
+        for _ in 0..2 {
             raft.propose(RaftCommand::Metadata(
-                GrantAcl {
-                    resource: AclResource::TopicData(TopicId(topic_id)),
-                    principal: principal.clone(),
-                }
-                .into(),
+                DeleteTopic { name: name.clone() }.into(),
             ))
             .unwrap();
         }
@@ -2570,19 +2561,13 @@ mod tests {
 
     #[test]
     fn proposal_rejects_an_entry_larger_than_a_transport_batch() {
-        use crate::control_plane::metadata::command::GrantAcl;
+        use crate::control_plane::metadata::command::DeleteTopic;
 
         let mut raft = three_node_raft_as_leader("node-1");
         let before = raft.log_last_index();
-        let principal = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES);
+        let name = "x".repeat(MAX_APPEND_ENTRIES_BATCH_BYTES);
 
-        let result = raft.propose(RaftCommand::Metadata(
-            GrantAcl {
-                resource: AclResource::Cluster,
-                principal,
-            }
-            .into(),
-        ));
+        let result = raft.propose(RaftCommand::Metadata(DeleteTopic { name }.into()));
 
         assert_eq!(result, Err(ProposalError::EntryTooLarge));
         assert_eq!(raft.log_last_index(), before);

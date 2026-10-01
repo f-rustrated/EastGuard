@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use borsh::{BorshDeserialize, BorshSerialize};
 use rustls::pki_types::CertificateDer;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -7,7 +6,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::control_plane::NodeId;
 
 /// Certificate identity and its permitted node-ID namespace.
-#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CertificatePrincipal(Box<str>);
 
 impl CertificatePrincipal {

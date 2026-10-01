@@ -15,7 +15,7 @@ use crate::control_plane::membership::{ShardGroup, ShardGroupId};
 use crate::control_plane::{NodeId, Replicas};
 use crate::impls::metadata_storage::MetadataStorage;
 use crate::net::{TcpListener, TcpStream};
-use crate::security::{AclActor, NodeTransportSecurity};
+use crate::security::NodeTransportSecurity;
 
 use crate::schedulers::actor::spawn_scheduling_actor;
 use crate::schedulers::ticker::{PROBE_INTERVAL_TICKS, TICK_PERIOD_100_MS};
@@ -108,13 +108,6 @@ async fn run_raft_node(
         .chain(peer_names.iter().copied())
         .collect();
     let topology_reader = super::stub_topology_reader(&all_nodes);
-    let acl = AclActor::spawn(
-        node_id.clone(),
-        swim_tx.clone(),
-        raft_tx.clone(),
-        topology_reader.clone(),
-        NodeTransportSecurity::TrustedDevelopment,
-    );
     tokio::spawn(RaftTransportActor::run(
         node_id.clone(),
         listener,
@@ -122,7 +115,6 @@ async fn run_raft_node(
         transport_rx,
         swim_tx.clone(),
         NodeTransportSecurity::TrustedDevelopment,
-        acl,
     ));
     let db = MetadataStorage::open(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()));
     let election_jitter_seed = {

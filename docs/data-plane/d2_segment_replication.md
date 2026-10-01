@@ -261,19 +261,19 @@ The data transport follows the same broad shape as the Raft transport (see
 lower-`NodeId`-wins conflict resolution, length-prefixed Borsh frames, live
 address resolution, and cleanup after peer death.
 
-Its secure connection lifecycle is not yet equivalent. Data TLS authenticates
-the reusable node certificate, but the current handshake still trusts a framed
-`NodeId`; it does not prove the current process identity or enforce the
-admission deadline on both connection halves. Secure startup remains gated
-until that gap is closed.
+Both transports use standard mutual TLS, bind the exchanged node identity to
+its certificate principal, and verify the exact destination process identity.
+Operators provision credentials and close existing connections when withdrawing
+access. The remaining secure-startup gates are tracked in the
+[security roadmap](../security/roadmap.md).
 
 **Differences from RaftTransportActor:**
 
 | | RaftTransportActor | DataTransportActor |
 |---|---|---|
 | Port | `raft_port` | `data_port` (2923) |
-| Frame size cap | 4MB | 64MB (record batches up to 10MB per segment) |
-| Process admission | Mutual session-bound proof with an admission deadline | Not implemented; TLS certificate only |
+| Frame size cap | 8 MiB (4 MiB entry batches) | 64 MiB (record batches up to 10 MiB per segment) |
+| Node authentication | Mutual TLS and certificate-bound node identity | Same |
 | Runtime | tokio | tokio |
 
 **Threading note:** `DataTransportActor` runs on tokio (async TCP I/O, no blocking calls). `DataPlaneActor` runs on a dedicated OS thread (blocking WAL fsync) — a pinned thread keeps hot data (write buffers, segment trackers, WAL write buffer) in L1/L2 cache across batches.

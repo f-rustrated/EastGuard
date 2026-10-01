@@ -179,7 +179,7 @@ impl NodeTransportSecurity {
     }
 
     /// Binds an outbound connection to its exact target before application data.
-    /// Shared by Raft, ACL reads, and data replication.
+    /// Shared by Raft and data replication.
     pub(crate) async fn authenticate_outbound(
         &self,
         stream: &mut TransportTcpStream,

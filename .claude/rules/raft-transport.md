@@ -2,7 +2,7 @@
 
 `RaftTransportActor` is the async TCP transport for Raft RPCs. It manages one
 persistent bidirectional connection per peer, owning its reader task and writer
-half together. The cluster listener also serves one-shot ACL snapshot reads.
+half together. The cluster listener serves Raft messages only.
 SWIM remains a separate UDP transport.
 
 ## Architecture
@@ -14,11 +14,10 @@ local certificates and trust roots
        mutual TLS + node IDs
                 |
                 v
-          ClusterRequest
-          |            |
-          v            v
-         Raft          ACL
-   persistent peer     security actor -> quorum read -> reply -> close
+         WireRaftMessage
+                |
+                v
+       persistent Raft peer
 ```
 
 ## Wire Protocol
@@ -31,24 +30,21 @@ Length-prefixed Borsh frames:
    the form `<certificate-principal>::<nonempty-suffix>`. The ID and principal
    must meet `MAX_SECURITY_ID_BYTES`; the frame is bounded before allocation.
 2. The initiator checks the exact expected peer ID before sending application
-   traffic. It then sends one `ClusterRequest`.
-3. For `ClusterRequest::Raft`, the initial message identifies the sender.
-   Later frames are raw `WireRaftMessage` values until close.
-4. For `ClusterRequest::AclSnapshot`, the request carries one ACL resource.
-   The server derives its shard locally and returns one `AclSnapshotResponse`.
-5. Trusted-development mode skips TLS and the mutual identity exchange. Its
-   first frame is directly a `ClusterRequest`.
+   traffic. It then sends a `WireRaftMessage`.
+3. The initial message identifies the sender. All later frames use the same
+   `WireRaftMessage` format until close.
+4. Trusted-development mode skips TLS and the mutual identity exchange.
 
-There is no `ClusterHandshake`, process proof, or admission lookup endpoint.
-These opening frames are incompatible with the previous development protocol.
+There are no admission or ACL lookup endpoints. The obsolete development wire
+wrapper and security metadata formats have been removed; no upgrade compatibility
+is promised before the first deployment.
 
 ## Rules
 
 1. **Certificate authentication does not depend on Raft availability.**
    Certificates and trust roots are loaded locally. Node IDs must belong to
    the certificate's namespace, and outbound connections must match the exact
-   intended process ID. No admission record or security actor query precedes
-   Raft traffic. Two processes holding the same certificate and private key
+   intended process ID. No metadata query precedes Raft traffic. Two processes holding the same certificate and private key
    are equally trusted; the protocol does not fence them from each other.
 
 2. **At most one live connection slot per peer.**
@@ -68,8 +64,7 @@ These opening frames are incompatible with the previous development protocol.
 5. **Handshake and write work are bounded.**
    The listener caps its `JoinSet` before spawning and applies a total deadline.
    The actor collects verified streams directly from that set; completed tasks
-   count toward the cap until collected. Slow TLS, identity exchange, or ACL
-   reads do not block the listener's dispatcher loop.
+   count toward the cap until collected. Slow TLS or identity exchange does not block the listener's dispatcher loop.
    Outbound dial tasks and buffered messages are bounded. Write timeouts drop
    the whole connection because a partial frame cannot be safely reused.
 
@@ -81,19 +76,7 @@ These opening frames are incompatible with the previous development protocol.
    not interpret the RPC. Existing voter, learner, leader, term, and log checks
    remain the Raft state machine's responsibility.
 
-8. **ACL cache expiry does not expire Raft transport.**
-   ACL records still require quorum-backed reads, but broker connections have
-   no admission lease. Certificate expiry is currently checked at handshake
-   only; active-session expiry and revocation remain production gates.
-
-## ACL Snapshot Rule
-
-An ACL snapshot request is not a Raft RPC. In secure mode, certificate
-authentication and node-ID exchange precede it. The receiving broker derives
-the shard locally and requires local Raft leadership and a quorum-backed read.
-It returns the record on the same connection and closes.
-
-An unavailable quorum fails the ACL read; it does not prevent independent Raft
-connections from recovering the quorum. ACL reads cannot proxy client data or
-mutate permissions. A Raft connection accepts only raw Raft frames after its
-initial request.
+8. **Credential lifecycle belongs to the deployment.**
+   Certificate validity is checked at handshake. Credential replacement and
+   access withdrawal require operator procedures that close existing sessions.
+   Static client permissions have no role in broker-to-broker authentication.

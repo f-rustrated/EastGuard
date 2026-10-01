@@ -41,6 +41,10 @@ pub struct Environment {
     #[arg(long, env = "TRUST_ROOT_PATH")]
     pub trust_root_path: Option<PathBuf>,
 
+    /// Bounded JSON permissions policy; identical on every broker. Restart to reload.
+    #[arg(long, env = "PERMISSIONS_PATH")]
+    pub permissions_path: Option<PathBuf>,
+
     #[arg(long, env = "CONFIG_DIR", default_value = "./eastguard/config")]
     pub config_dir: String,
 
@@ -455,6 +459,7 @@ mod tests {
             certificate_chain_path: None,
             private_key_path: None,
             trust_root_path: None,
+            permissions_path: None,
             config_dir: "./eastguard/config".to_string(),
             config_file: None,
             data_dir: "./eastguard/data".to_string(),
