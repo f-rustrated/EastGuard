@@ -375,6 +375,7 @@ impl ClientController {
                     "metadata proposal exceeds the Raft transport limit".into(),
                 ));
             }
+            ProposalError::ApplyRejected(error) => return Err(error.into()),
         };
 
         let leader_addr = self.resolve_id_to_addr(leader).await;
@@ -1474,6 +1475,43 @@ mod tests {
         assert!(
             matches!(resp, ClientResponse::Err(ServerError::Internal(_))),
             "expected InternalError, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_topic_returns_the_apply_rejection() {
+        use crate::control_plane::metadata::error::MetadataError;
+
+        let swim = swim_sender_with(|cmd| {
+            if let SwimActorCommand::Query(QueryCommand::ResolveShardGroup { reply, .. }) = cmd {
+                let _ = reply.send(Some(test_shard_group()));
+            }
+        });
+        let raft = raft_sender_with(|cmd| match cmd {
+            MultiRaftActorCommand::GetTopicMetadata { reply, .. } => {
+                let _ = reply.send(Some(topic_meta("node-1")));
+            }
+            MultiRaftActorCommand::ClientProposal { propose, reply } => {
+                let MetadataCommand::DeleteTopic(command) = propose.command else {
+                    panic!("expected a delete proposal");
+                };
+                let _ = reply.send(Err(ProposalError::ApplyRejected(
+                    MetadataError::TopicNotFound(command.topic_id),
+                )));
+            }
+            command => panic!(
+                "unexpected Raft command: {:?}",
+                std::mem::discriminant(&command)
+            ),
+        });
+        let response = trusted_controller(node_id("node-1"), swim, raft, dp_stub())
+            .dispatch(ClientRequest::ControlPlane(
+                ControlPlaneRequest::DeleteTopic { name: "t1".into() },
+            ))
+            .await;
+        assert!(
+            matches!(response, ClientResponse::Err(ServerError::TopicNotFound)),
+            "{response:?}"
         );
     }
 

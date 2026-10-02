@@ -15,6 +15,7 @@ use crate::control_plane::consensus::raft::storage::{
 use crate::control_plane::consensus::raft::{compute_replacement_replica_set, now_ms};
 use crate::control_plane::membership::{ShardGroupId, TopologyReader};
 use crate::control_plane::metadata::command::{DeleteSegments, ExpireProducerSessions};
+use crate::control_plane::metadata::error::MetadataError;
 use crate::control_plane::metadata::event::MetadataEvent;
 use crate::control_plane::metadata::{
     ConsumerGroupAssignment, ConsumerMemberId, MetadataCommand, ReassignSegment, RollSegment,
@@ -65,6 +66,8 @@ pub struct Raft {
 
     peers: HashSet<NodeId>,
     events: Vec<RaftEvent>,
+    /// Local completion results, drained every flush on leaders and followers.
+    apply_results: Vec<(u64, Result<(), MetadataError>)>,
     timer_seqs: TimerSeqs,
 }
 
@@ -104,6 +107,7 @@ impl Raft {
             consensus: ConsensusState::from_persistent(persistent, election_jitter_seed),
             metadata,
             events: Vec::new(),
+            apply_results: Vec::new(),
             timer_seqs,
         };
         raft.reset_election_timer();
@@ -684,6 +688,10 @@ impl Raft {
 
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    pub(crate) fn take_apply_results(&mut self) -> Vec<(u64, Result<(), MetadataError>)> {
+        std::mem::take(&mut self.apply_results)
     }
 
     fn raise(&mut self, event: impl Into<RaftEvent>) {
@@ -1569,7 +1577,6 @@ impl Raft {
                 break;
             };
 
-            // ? At this point if apply failed when things are already committed, what'd that mean?
             match entry.command {
                 RaftCommand::Noop => {}
                 RaftCommand::Metadata(cmd) => self.apply_metadata_entry(cmd, entry.index),
@@ -1580,15 +1587,15 @@ impl Raft {
     }
 
     fn apply_metadata_entry(&mut self, cmd: MetadataCommand, index: u64) {
-        match self.metadata.apply(cmd) {
-            Ok(()) => {}
-            Err(e) => tracing::error!(
+        let result = self.metadata.apply(cmd).inspect_err(|error| {
+            tracing::warn!(
                 "[{}] Metadata apply error at index {}: {:?}",
                 self.node_id,
                 index,
-                e
-            ),
-        }
+                error
+            );
+        });
+        self.apply_results.push((index, result));
         for event in self.metadata.take_pending_events() {
             tracing::debug!(
                 "[{}] Applied metadata event at index {}: {:?}",

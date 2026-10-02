@@ -743,6 +743,7 @@ impl MultiRaft {
             };
 
             last_indices.insert(*id, raft.log_last_index());
+            let is_leader = raft.is_leader();
             for log in raft.take_log_mutations() {
                 if let LogMutation::TruncateFrom(from_index) = &log {
                     // Rare and destructive: a new leader is overwriting this
@@ -754,6 +755,8 @@ impl MultiRaft {
                         "log truncation: dropping conflicting suffix and its pending seals",
                     );
                     self.pending_rolls.drop_from(*id, *from_index);
+                    // A replacement entry at this index belongs to another proposal.
+                    self.reject_pending_proposes(*id, *from_index);
                 }
                 mutations.push((*id, log));
             }
@@ -761,7 +764,7 @@ impl MultiRaft {
             // drop both here (the reliable step-down checkpoint — the ring-check
             // that would otherwise prune is leader-gated and stops firing). A new
             // leader re-derives: re-proposes the seal / re-polls the survivors.
-            if !raft.is_leader() {
+            if !is_leader {
                 // pending_rolls: its committed roll notification won't come from here.
                 self.pending_rolls.drop_group(*id);
                 // boundary-recovery rounds: we can't propose their recovery roll.
@@ -801,48 +804,35 @@ impl MultiRaft {
 
     fn resolve_pending_proposes(&mut self, dirty: &[ShardGroupId]) {
         for id in dirty {
-            let Some(raft) = self.groups.get(id) else {
+            let Some(raft) = self.groups.get_mut(id) else {
                 continue;
             };
-            let last_applied = raft.last_applied_index();
 
-            // 1. Resolve applied entries
-            loop {
-                // Find the first key in the applied range.
-                let first_key = self
-                    .pending_proposes
-                    .range((*id, 0)..=(*id, last_applied))
-                    .map(|(&k, _)| k)
-                    .next();
-
-                let Some(key) = first_key else {
-                    break; // No more applied entries for this shard
-                };
-
-                if let Some(sender) = self.pending_proposes.remove(&key) {
-                    let _ = sender.send(Ok(()));
+            // Completion requires this entry's actual apply result, even if apply
+            // emitted no metadata event or the log was compacted during this flush.
+            for (index, result) in raft.take_apply_results() {
+                if let Some(sender) = self.pending_proposes.remove(&(*id, index)) {
+                    let _ = sender.send(result.map_err(ProposalError::ApplyRejected));
                 }
             }
 
-            // 2. Reject orphaned entries ONLY if we lost leadership
+            // No remaining proposal can be confirmed here after leadership loss.
+            // A received snapshot may have advanced last_applied without applying it.
             if !raft.is_leader() {
-                loop {
-                    // Find the first key GREATER than last_applied for this shard.
-                    let first_key = self
-                        .pending_proposes
-                        .range((*id, last_applied.saturating_add(1))..)
-                        .take_while(|((shard_id, _), _)| *shard_id == *id)
-                        .map(|(&k, _)| k)
-                        .next();
+                self.reject_pending_proposes(*id, 0);
+            }
+        }
+    }
 
-                    let Some(key) = first_key else {
-                        break; // No more orphaned entries for this shard
-                    };
-
-                    if let Some(sender) = self.pending_proposes.remove(&key) {
-                        let _ = sender.send(Err(ProposalError::NotLeader(None)));
-                    }
-                }
+    fn reject_pending_proposes(&mut self, id: ShardGroupId, from_index: u64) {
+        while let Some(key) = self
+            .pending_proposes
+            .range((id, from_index)..=(id, u64::MAX))
+            .map(|(&key, _)| key)
+            .next()
+        {
+            if let Some(sender) = self.pending_proposes.remove(&key) {
+                let _ = sender.send(Err(ProposalError::NotLeader(None)));
             }
         }
     }
@@ -1464,6 +1454,160 @@ mod tests {
     }
 
     #[test]
+    fn stale_delete_returns_its_apply_rejection_after_compaction() {
+        use crate::connections::protocol::ServerError;
+        use crate::control_plane::metadata::command::{CreateTopic, DeleteTopic};
+        use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
+
+        let (storage, _) = temp_storage();
+        let mut store = new_store(node("n1"), storage);
+        store.snapshot_entry_threshold = 1;
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![node("n1")]));
+        elect_leader(&mut store);
+        store.flush();
+        let create = |name: &str| CreateTopic {
+            name: name.into(),
+            storage_policy: StoragePolicy {
+                retention_ms: None,
+                replication_factor: 1,
+                partition_strategy: PartitionStrategy::Fixed,
+            },
+            replica_set: Replicas::new(vec![node("n1")]),
+            created_at: 1000,
+        };
+        store
+            .propose_internal(MetadataProposal {
+                shard_group_id: TEST_GROUP_ID,
+                command: create("orders").into(),
+            })
+            .unwrap();
+        store.flush();
+        let original = store.get_topic_metadata("orders").unwrap();
+        let delete = DeleteTopic {
+            name: "orders".into(),
+            topic_id: original.id,
+        };
+
+        let mut replies = Vec::new();
+        for command in [
+            delete.clone().into(),
+            create("orders").into(),
+            delete.into(),
+            create("after").into(),
+        ] {
+            let (reply, mut receiver) = oneshot::channel();
+            store.propose(
+                MetadataProposal {
+                    shard_group_id: TEST_GROUP_ID,
+                    command,
+                },
+                reply,
+            );
+            assert_eq!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            );
+            replies.push(receiver);
+        }
+        store.flush();
+        for (mut receiver, expected) in
+            replies
+                .into_iter()
+                .zip([Ok(()), Ok(()), Err(ServerError::TopicNotFound), Ok(())])
+        {
+            assert_eq!(
+                receiver.try_recv().unwrap().map_err(ServerError::from),
+                expected
+            );
+        }
+        let replacement = store.get_topic_metadata("orders").unwrap();
+        assert_ne!(replacement.id, original.id);
+        assert_eq!(
+            replacement.state,
+            crate::control_plane::metadata::TopicState::Active
+        );
+        assert!(store.get_topic_metadata("after").is_some());
+        assert!(store.pending_proposes.is_empty());
+        // The result must survive compaction without consulting or replaying the log.
+        let last_applied = store.groups[&TEST_GROUP_ID].last_applied_index();
+        assert!(read_entry(&store, last_applied).is_none());
+    }
+
+    #[test]
+    fn overwritten_proposal_does_not_receive_the_replacement_result() {
+        use crate::control_plane::consensus::messages::RequestVoteResponse;
+        use crate::control_plane::metadata::command::{DeleteTopic, MetadataCommand};
+
+        let (storage, _) = temp_storage();
+        let mut store = new_store(node("n1"), storage);
+        store.add_group(&shard(TEST_GROUP_ID.0, vec![node("n1"), node("n2")]));
+        elect_leader(&mut store);
+        store.handle_consensus(InboundRaftRpc {
+            shard_group_id: TEST_GROUP_ID,
+            peer_id: node("n2"),
+            rpc: RequestVoteResponse {
+                term: 1,
+                node_id: node("n2"),
+                vote_granted: true,
+            }
+            .into(),
+        });
+        store.flush();
+        assert!(store.groups[&TEST_GROUP_ID].is_leader());
+        let command: MetadataCommand = DeleteTopic {
+            name: "missing".into(),
+            topic_id: TopicId(0),
+        }
+        .into();
+        let (reply, mut receiver) = oneshot::channel();
+        store.propose(
+            MetadataProposal {
+                shard_group_id: TEST_GROUP_ID,
+                command: command.clone(),
+            },
+            reply,
+        );
+        store.flush();
+        assert_eq!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+
+        // Another term replaces index 2 and applies its own (rejected) command.
+        store.handle_consensus(InboundRaftRpc {
+            shard_group_id: TEST_GROUP_ID,
+            peer_id: node("n2"),
+            rpc: AppendEntries {
+                term: 2,
+                leader_id: node("n2"),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Box::new([LogEntry {
+                    term: 2,
+                    index: 2,
+                    command: command.into(),
+                }]),
+                leader_commit: 2,
+            }
+            .into(),
+        });
+        store.flush();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            Err(ProposalError::NotLeader(None))
+        );
+        assert!(store.pending_proposes.is_empty());
+        assert!(
+            store
+                .groups
+                .get_mut(&TEST_GROUP_ID)
+                .unwrap()
+                .take_apply_results()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn stale_metadata_proposal_rejected_gracefully() {
         use crate::control_plane::metadata::command::{CreateTopic, MetadataCommand};
         use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
@@ -1489,19 +1633,25 @@ mod tests {
             })
         };
 
-        // First proposal succeeds
-        let _ = store.propose_internal(MetadataProposal {
-            shard_group_id: TEST_GROUP_ID,
-            command: make_cmd(),
-        });
-        store.flush();
-
-        // Duplicate proposal: must not panic, state machine rejects at apply
-        let _ = store.propose_internal(MetadataProposal {
-            shard_group_id: TEST_GROUP_ID,
-            command: make_cmd(),
-        });
-        store.flush();
+        for expected in [
+            Ok(()),
+            Err(ProposalError::ApplyRejected(
+                crate::control_plane::metadata::error::MetadataError::TopicNameAlreadyExists(
+                    "blue".into(),
+                ),
+            )),
+        ] {
+            let (reply, mut receiver) = oneshot::channel();
+            store.propose(
+                MetadataProposal {
+                    shard_group_id: TEST_GROUP_ID,
+                    command: make_cmd(),
+                },
+                reply,
+            );
+            store.flush();
+            assert_eq!(receiver.try_recv().unwrap(), expected);
+        }
 
         let raft = store.groups.get(&TEST_GROUP_ID).unwrap();
         assert_eq!(

@@ -89,6 +89,7 @@ impl From<ProposalError> for ServerError {
             ProposalError::EntryTooLarge => {
                 Self::Internal("metadata proposal exceeds the Raft transport limit".into())
             }
+            ProposalError::ApplyRejected(error) => error.into(),
         }
     }
 }
