@@ -686,6 +686,55 @@ impl Raft {
         Some(self.metadata.get_segment(key)?.replica_set.clone())
     }
 
+    pub(crate) fn placement_updates(
+        &self,
+        topic_id: TopicId,
+        recipients: &BTreeSet<NodeId>,
+    ) -> Vec<DataTransportCommand> {
+        use crate::control_plane::metadata::{SegmentMetaState, TopicState};
+        use crate::data_plane::placement::CommittedPlacement;
+        let Some(topic) = self
+            .metadata
+            .get_topic(&topic_id)
+            .filter(|_| self.is_leader())
+        else {
+            return vec![];
+        };
+        let mut epochs: Vec<_> = topic
+            .consumer_groups
+            .iter()
+            .map(|(id, group)| (id.clone(), group.generation))
+            .collect();
+        epochs.sort_by(|a, b| a.0.cmp(&b.0));
+        topic
+            .ranges
+            .iter()
+            .flat_map(|(range_id, range)| {
+                range.segments.values().map(|segment| {
+                    let mut segment = segment.clone();
+                    if topic.state == TopicState::Deleted {
+                        segment.state = SegmentMetaState::Deleting;
+                    }
+                    let targets: BTreeSet<_> = recipients
+                        .iter()
+                        .chain(segment.replica_set.iter())
+                        .cloned()
+                        .collect();
+                    DataTransportCommand::send_to_targets(
+                        targets.into_iter().collect::<Box<_>>(),
+                        CommittedPlacement {
+                            segment_key: SegmentKey::new(topic_id, *range_id, segment.segment_id),
+                            term: self.current_term(),
+                            log_index: self.last_applied_index(),
+                            segment,
+                            consumer_epochs: epochs.clone().into_boxed_slice(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn take_events(&mut self) -> Vec<RaftEvent> {
         std::mem::take(&mut self.events)
     }
@@ -1110,8 +1159,23 @@ impl Raft {
     }
 
     pub(crate) fn handle_segment_placed(&mut self, ack: SegmentPlaced) {
+        if !self.is_leader()
+            || ack.shard_group_id != self.shard_group_id
+            || !self
+                .metadata
+                .get_segment(&ack.segment_key)
+                .is_some_and(|segment| {
+                    segment.state == crate::control_plane::metadata::SegmentMetaState::Active
+                        && segment.replica_set.leader() == Some(&ack.from)
+                })
+        {
+            tracing::warn!(segment = ?ack.segment_key, "rejected placement acknowledgement outside committed data placement");
+            return;
+        }
         self.consensus
             .confirm_data_leader(ack.segment_key, ack.from);
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
     }
 
     /// Re-drive the catch-up sweep — the sealed-segment analogue of
@@ -1126,7 +1190,22 @@ impl Raft {
     /// A member confirmed it holds a reassigned sealed segment; routed here from
     /// `MultiRaft`.
     pub(crate) fn handle_catch_up_ack(&mut self, ack: SegmentCaughtUp) {
+        if !self.is_leader()
+            || ack.shard_group_id != self.shard_group_id
+            || !self
+                .metadata
+                .get_segment(&ack.segment_key)
+                .is_some_and(|segment| {
+                    segment.state == crate::control_plane::metadata::SegmentMetaState::Sealed
+                        && segment.replica_set.contains(&ack.from)
+                })
+        {
+            tracing::warn!(segment = ?ack.segment_key, "rejected catch-up acknowledgement outside committed data placement");
+            return;
+        }
         self.consensus.confirm_catch_up(ack);
+        #[cfg(any(test, debug_assertions))]
+        self.assert_invariants();
     }
 
     /// Takeover backstop: re-seed catch-up for every known-end sealed segment this
@@ -4812,6 +4891,45 @@ mod tests {
             assert_eq!(a.sealed_end_entry_id, 100.into());
             assert_eq!(a.replica_set.0, members.clone().into_boxed_slice());
         }
+
+        // Metadata-group membership grants no authority over segment bytes.
+        raft.handle_catch_up_ack(SegmentCaughtUp {
+            segment_key: seg0,
+            shard_group_id: TEST_SHARD,
+            from: node("metadata-only"),
+        });
+        assert_eq!(drain_catch_up_redrives(&mut raft).len(), members.len());
+        raft.handle_catch_up_ack(SegmentCaughtUp {
+            segment_key: seg0,
+            shard_group_id: TEST_SHARD,
+            from: members[0].clone(),
+        });
+        assert_eq!(drain_catch_up_redrives(&mut raft).len(), members.len() - 1);
+    }
+
+    #[test]
+    fn placement_ack_requires_committed_data_leader() {
+        use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+        let mut raft = single_node_raft_as_leader();
+        create_topic_in_raft(&mut raft, "t", vec![node("data-leader"), node("follower")]);
+        let key = SegmentKey::new(TopicId(0), RangeId(0), SegmentId(0));
+        for from in [raft.node_id.clone(), node("follower")] {
+            raft.handle_segment_placed(SegmentPlaced {
+                segment_key: key,
+                shard_group_id: TEST_SHARD,
+                from: from.clone(),
+            });
+            assert!(!raft.consensus.is_data_leader_confirmed(&key, &from));
+        }
+        raft.handle_segment_placed(SegmentPlaced {
+            segment_key: key,
+            shard_group_id: TEST_SHARD,
+            from: node("data-leader"),
+        });
+        assert!(
+            raft.consensus
+                .is_data_leader_confirmed(&key, &node("data-leader"))
+        );
     }
 
     #[test]

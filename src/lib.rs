@@ -71,12 +71,6 @@ impl StartUp {
     pub async fn run(self) -> Result<()> {
         let node_transport = NodeTransportSecurity::load(&self.env)?;
         let permissions = Permissions::load(&self.env)?;
-        if node_transport.is_secure() {
-            anyhow::bail!(
-                "secure startup is unavailable: committed data placement checks and cluster formation/recovery under the protected-network deployment contract remain incomplete"
-            );
-        }
-
         // Bind sockets before spawning — fail fast on port conflicts
         let udp_socket = UdpSocket::bind(self.env.peer_bind_addr()).await?;
         let tcp_listener = TcpListener::bind(self.env.peer_bind_addr()).await?;

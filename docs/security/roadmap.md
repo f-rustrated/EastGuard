@@ -25,17 +25,14 @@ credential replacement, and closing existing sessions when access is withdrawn.
   this project has never been deployed.
 - Bounded record counts, decompression, fetch assembly, and wire frames;
   payload-free error logs, handler limits, and transport timeouts retained.
+- Peer IDs bound to authenticated connections. Replication, acknowledgments,
+  deletion, and catch-up checked against coordinator-published committed data
+  placement. Missing, older, and conflicting placement denied.
+- mTLS cluster formation, partition healing, and restart with persisted metadata
+  and data verified in simulation. Secure startup enabled.
 
-## Remaining before secure startup
-
-1. Enforce committed data placement at receiving boundaries. Raft membership
-   and authenticated identity must not substitute for segment replica authority.
-2. Verify cluster formation, restart, and partition recovery with mTLS and the
-   protected-network contract. Then remove the secure-startup guard.
-
-Secure startup still aborts before listeners open. Trusted development remains
-explicit. Keep production-code and test-code reductions visible when reporting
-changes; simplification must remove the replaced implementation and its tests.
+Trusted development remains explicit. Keep production-code and test-code changes
+visible when reporting; simplification must remove replaced code and tests.
 
 ## Deferred until required
 

@@ -1,7 +1,7 @@
 # Static Security Deployment
 
-**Status:** Policy loading and SDK/CLI mTLS are implemented. Secure startup remains
-disabled until the [remaining placement and recovery work](roadmap.md) is verified.
+**Status:** Native mTLS and static permissions are enabled. Formation, partition
+healing, and restart with persisted storage are covered by cluster simulations.
 
 ## Trust boundary
 
@@ -9,6 +9,12 @@ Operators admit trusted brokers and protect **both TCP and SWIM UDP**. SWIM is
 plaintext: use an authenticated, encrypted private network and restrict its
 membership. A TCP-only mesh is insufficient. Compromised brokers are outside
 this trust model.
+
+Data replicas accept placement only from the authenticated metadata coordinator
+known for the shard and term. Messages must match its committed data replica set
+and segment state; Raft membership alone grants no data authority. Placement is
+rebuilt through coordinator retries after restart. Keep broker identity and
+metadata/data directories stable when restarting a broker.
 
 EastGuard uses rustls for mutual TLS. Operators supply the certificate chain,
 private key, and trust roots. Broker certificates carry one URI SAN,

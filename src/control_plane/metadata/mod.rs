@@ -30,6 +30,12 @@ pub struct TopicId(pub(crate) u64);
 
 impl_new_struct_wrapper!(TopicId, u64);
 
+impl TopicId {
+    pub(crate) fn shard_group_id(self) -> crate::control_plane::membership::ShardGroupId {
+        crate::control_plane::membership::ShardGroupId(self.0 >> 32)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AclResource {
     Cluster,

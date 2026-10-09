@@ -6,11 +6,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::membership::TopologyReader;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{
-    DataPlaneCommand, DataPlanePeerMessage, ReceivePeerMessage,
-};
+use crate::data_plane::messages::command::{DataPlanePeerMessage, ReceivePeerMessage};
 use crate::net::{TransportTcpStream, TransportWriteHalf, before_deadline};
 use crate::security::NodeTransportSecurity;
 
@@ -48,17 +47,23 @@ pub(super) struct TransportState {
     /// 3s TCP timeouts to unreachable peers. Cleared by periodic cleanup (300s).
     connect_backoffs: HashMap<NodeId, Instant>,
     node_transport: NodeTransportSecurity,
+    topology: TopologyReader,
     next_generation: u64,
 }
 
 impl TransportState {
-    pub fn new(node_id: NodeId, node_transport: NodeTransportSecurity) -> Self {
+    pub fn new(
+        node_id: NodeId,
+        node_transport: NodeTransportSecurity,
+        topology: TopologyReader,
+    ) -> Self {
         Self {
             node_id,
             writers: HashMap::new(),
             dead_peers: HashSet::new(),
             connect_backoffs: HashMap::new(),
             node_transport,
+            topology,
             next_generation: 0,
         }
     }
@@ -111,10 +116,13 @@ impl TransportState {
             // to `replica_set[0]`
             if *target == self.node_id {
                 let _ = data_plane_tx
-                    .send_async(DataPlaneCommand::ReceivePeerMessage(ReceivePeerMessage {
-                        from: self.node_id.clone(),
-                        message: Box::new(msg.clone()),
-                    }))
+                    .receive_peer(
+                        ReceivePeerMessage {
+                            from: self.node_id.clone(),
+                            message: Box::new(msg.clone()),
+                        },
+                        &self.topology,
+                    )
                     .await;
                 continue;
             }
@@ -199,6 +207,7 @@ impl TransportState {
                 generation,
             },
             disconnect_tx.clone(),
+            self.topology.clone(),
         ));
         self.dead_peers.remove(&peer);
         self.connect_backoffs.remove(&peer);
@@ -270,7 +279,17 @@ mod tests {
         sim.client("client", async {
             let local = NodeId::new("client");
             let peer = NodeId::new("server");
-            let mut state = TransportState::new(local, NodeTransportSecurity::TrustedDevelopment);
+            let topology = crate::control_plane::membership::Topology::new(
+                [],
+                crate::control_plane::membership::TopologyConfig {
+                    vnodes_per_pnode: 1,
+                    replication_factor: 1,
+                },
+            )
+            .channel()
+            .1;
+            let mut state =
+                TransportState::new(local, NodeTransportSecurity::TrustedDevelopment, topology);
             let (data, _data_rx) = flume::bounded(1);
             let data = DataPlaneSender(data);
             let (closed_tx, _closed_rx) = mpsc::channel(4);

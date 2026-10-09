@@ -356,6 +356,7 @@ impl MetadataState {
 
         // The dispatch announces the desired replica set; receivers reconcile, so
         // we only carry the sealed bounds (the catch-up target) alongside it.
+        let previous_replica_set = segment.replica_set.clone();
         let event = segment
             .reassign(cmd.replica_set.clone())?
             .then_some(SegmentReassigned {
@@ -363,6 +364,7 @@ impl MetadataState {
                 start_entry_id: segment.start_entry_id,
                 sealed_end: segment.end_entry_id,
                 new_replica_set: cmd.replica_set,
+                previous_replica_set,
             });
         if let Some(event) = event {
             self.raise_event(event);
@@ -542,6 +544,10 @@ impl MetadataState {
         let consumer_group_epochs = topic.rebalance_consumer_groups();
 
         self.topic_name_index.remove(&cmd.name);
+
+        self.raise_event(TopicDeleted {
+            topic_id: cmd.topic_id,
+        });
 
         for epoch in consumer_group_epochs {
             self.raise_event(epoch);

@@ -79,6 +79,7 @@ pub struct DataPlane<W: WalStorage> {
     pending_roll_requests: PendingSegmentRollRequests,
     /// In-progress catch-up receives (replacement side), keyed by segment.
     pending_catch_ups: HashMap<SegmentKey, PendingCatchUp>,
+    catch_up_checkpoints: HashMap<SegmentKey, (u64, ReceivePeerMessage)>,
 
     /// Hand-off channel to the cold-read thread pool. A fetch that resolves to a
     /// sealed segment (whose live tracker is gone) is forwarded here; the pool
@@ -95,6 +96,7 @@ pub struct DataPlane<W: WalStorage> {
     pending_boundary_corrections: std::collections::HashSet<SegmentKey>,
     pressure_checkpoints_in_flight: BTreeSet<SegmentKey>,
     auxiliary_state: AuxiliaryStateManager,
+    placements: super::placement::DataPlacements,
 }
 
 impl<W: WalStorage> DataPlane<W> {
@@ -122,6 +124,7 @@ impl<W: WalStorage> DataPlane<W> {
             needs_flush: false,
             replication: ReplicationState::default(),
             pending_catch_ups: HashMap::new(),
+            catch_up_checkpoints: HashMap::new(),
             cold_read_handoff_sender,
             self_tx,
             out,
@@ -130,6 +133,7 @@ impl<W: WalStorage> DataPlane<W> {
             pending_boundary_corrections: std::collections::HashSet::new(),
             pressure_checkpoints_in_flight: BTreeSet::new(),
             auxiliary_state,
+            placements: super::placement::DataPlacements::default(),
         }
     }
 
@@ -143,6 +147,34 @@ impl<W: WalStorage> DataPlane<W> {
     fn handle_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
         let cmd = cmd.into();
         match cmd {
+            DataPlaneCommand::InstallCommittedPlacement(update) => {
+                let key = update.placement.segment_key;
+                let changed = self
+                    .placements
+                    .get(&key)
+                    .is_some_and(|old| old.segment != update.placement.segment);
+                let epochs = if update.placement.segment.replica_set.contains(&self.node_id) {
+                    update.placement.consumer_epochs.clone()
+                } else {
+                    Box::new([])
+                };
+                if self.placements.install(update) {
+                    if changed {
+                        self.pending_catch_ups.remove(&key);
+                    }
+                    // A generation notification can arrive before coordinator
+                    // discovery and be rejected. Committed placement retries
+                    // restore that fence as well as replica membership.
+                    for (group_id, generation) in epochs {
+                        self.handle_consumer_group_epoch_seal(EpochSeal {
+                            key: crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffsetKey {
+                                topic_id: key.topic_id, range_id: key.range_id, group_id,
+                            },
+                            generation,
+                        });
+                    }
+                }
+            }
             DataPlaneCommand::Produce(cmd) => self.handle_produce(cmd),
             DataPlaneCommand::SegmentCheckpointComplete(complete) => {
                 self.handle_checkpoint_complete(complete);
@@ -157,7 +189,18 @@ impl<W: WalStorage> DataPlane<W> {
                 self.receive_peer_message(received);
             }
             DataPlaneCommand::CatchUpReadComplete(cmd) => {
-                self.handle_catch_up_read_complete(cmd);
+                if self
+                    .placements
+                    .can_catch_up(&cmd.segment_key, &cmd.requester, &self.node_id)
+                    && self.placements.get(&cmd.segment_key).is_some_and(|p| {
+                        p.segment.start_entry_id == cmd.start_offset
+                            && p.segment.end_entry_id == Some(cmd.sealed_end)
+                    })
+                {
+                    self.handle_catch_up_read_complete(cmd);
+                } else {
+                    tracing::warn!(key = ?cmd.segment_key, "discarded catch-up read after placement changed");
+                }
             }
             DataPlaneCommand::OrphanGcCheck(check) => self.handle_orphan_gc_check(check),
             DataPlaneCommand::CommitConsumerOffset(cmd) => self.commit_consumer_offset(cmd),
@@ -433,6 +476,14 @@ impl<W: WalStorage> DataPlane<W> {
             );
         }
         self.reclaim_checkpointed_wal();
+        if self
+            .catch_up_checkpoints
+            .get(&complete.segment_key)
+            .is_some_and(|(frontier, _)| complete.new_frontier >= *frontier)
+            && let Some((_, received)) = self.catch_up_checkpoints.remove(&complete.segment_key)
+        {
+            self.receive_peer_message(received);
+        }
     }
 
     fn handle_auxiliary_checkpoint_complete(&mut self, complete: AuxiliaryCheckpointComplete) {
@@ -524,10 +575,79 @@ impl<W: WalStorage> DataPlane<W> {
     }
 
     fn receive_peer_message(&mut self, received: ReceivePeerMessage) {
+        if !self
+            .placements
+            .allows(&received.from, &self.node_id, &received.message)
+        {
+            tracing::warn!(peer = %received.from, local = %self.node_id, kind = ?std::mem::discriminant(&*received.message), "rejected data message: sender or committed placement mismatch");
+            return;
+        }
+        let receive_key = if let DataPlanePeerMessage::CatchUpEntries(c) = &*received.message {
+            Some(c.segment_key)
+        } else if let DataPlanePeerMessage::CatchUpEntriesSent(c) = &*received.message {
+            Some(c.segment_key)
+        } else {
+            None
+        };
+        if let Some(key) = receive_key
+            && !self
+                .pending_catch_ups
+                .get(&key)
+                .is_some_and(|pending| pending.source == received.from)
+        {
+            tracing::warn!(peer = %received.from, ?key, "rejected catch-up from an unrequested source");
+            return;
+        }
+        if let DataPlanePeerMessage::AssignSegmentCatchUp(assignment) = &*received.message {
+            let key = assignment.segment_key;
+            if let Some((_, waiting)) = self.catch_up_checkpoints.get_mut(&key) {
+                *waiting = received;
+                return;
+            }
+            if let Some(tracker) = self.segments.get_mut(&key) {
+                for (_, _, identity) in tracker
+                    .staged_for_replay()
+                    .chain(tracker.uncommitted_entries())
+                {
+                    if let Some(identity) = identity {
+                        self.auxiliary_state
+                            .unstage_producer(&AppendKey::new(key, &identity));
+                    }
+                }
+                // The seal notification may have been lost during a partition.
+                // Publish only the locally durable prefix of the committed seal,
+                // then wait for its checkpoint before appending a catch-up suffix.
+                for entry in tracker.commit_durable_through(assignment.sealed_end_entry_id) {
+                    if let Some(identity) = entry.producer_identity {
+                        self.auxiliary_state.advance_producer(
+                            key,
+                            identity,
+                            entry.entry_id,
+                            entry.lsn,
+                        );
+                    }
+                }
+                let frontier = tracker.cache().load_read_cursor();
+                self.catch_up_checkpoints.insert(key, (frontier, received));
+                self.replication.fail_segment(key);
+                self.pending_roll_requests.remove(&key);
+                self.pending_boundary_corrections.remove(&key);
+                self.dirty_segments.remove(&key);
+                self.retire_old_segment(key);
+                return;
+            }
+        }
+        self.dispatch_peer_message(received);
+    }
+
+    fn dispatch_peer_message(&mut self, received: ReceivePeerMessage) {
         use DataPlanePeerMessage as C;
         let ReceivePeerMessage { from, message } = received;
 
         match *message {
+            C::CommittedPlacement(_) => {
+                tracing::warn!("placement bypassed coordinator authentication; rejected");
+            }
             C::PlaceSegment(cmd) => self.place_segment(cmd),
             C::ReplicateSegmentEntries(cmd) => self.replicate_segment_entries(&from, cmd),
             C::ReplicaEntriesAppended(cmd) => self.handle_replica_ack(cmd),
@@ -662,6 +782,7 @@ impl<W: WalStorage> DataPlane<W> {
             let Some(source) = Self::pick_catch_up_source(&cmd.replica_set, &self.node_id) else {
                 return;
             };
+            pending.source = source.clone();
             self.out
                 .store_transport_cmd(DataTransportCommand::send_to_targets(
                     vec![source],
@@ -709,6 +830,7 @@ impl<W: WalStorage> DataPlane<W> {
         self.pending_catch_ups.insert(
             cmd.segment_key,
             PendingCatchUp {
+                source: source.clone(),
                 appender,
                 shard_group_id: cmd.shard_group_id,
                 start_offset: cmd.start_entry_id,
@@ -802,7 +924,7 @@ impl<W: WalStorage> DataPlane<W> {
             let next = pending
                 .last_written
                 .map_or(pending.start_offset, |w| w + 1u64);
-            if entry.entry_id != next {
+            if entry.entry_id != next || entry.entry_id > pending.sealed_end {
                 continue;
             }
             match pending.appender.append_entry(
@@ -1201,10 +1323,23 @@ impl<W: WalStorage> DataPlane<W> {
             return;
         }
 
+        let Some(placement) = self.placements.get(&cmd.segment_key) else {
+            return;
+        };
+        let start_entry_id = placement.segment.start_entry_id;
+        let shard_group_id = cmd.segment_key.topic_id.shard_group_id();
+        let expected = self
+            .segments
+            .get(&cmd.segment_key)
+            .map_or(start_entry_id, SegmentTracker::next_staged_entry_id);
+        if cmd.entry_id > expected {
+            return; // A gap needs recovery, never a new sender-chosen base offset.
+        }
+
         if matches!(
             self.auxiliary_state.observe_placement(
                 cmd.segment_key,
-                ShardGroupId(0),
+                shard_group_id,
                 &cmd.replicas,
                 &self.node_id
             ),
@@ -1219,11 +1354,11 @@ impl<W: WalStorage> DataPlane<W> {
                 cmd.segment_key,
                 SegmentTracker::new_with_start_entry_id(
                     cmd.segment_key
-                        .file_path(&self.config.data_dir, cmd.entry_id),
+                        .file_path(&self.config.data_dir, start_entry_id),
                     SegmentRole::Follower,
                     cmd.replicas,
-                    ShardGroupId(0),
-                    cmd.entry_id,
+                    shard_group_id,
+                    start_entry_id,
                 ),
             );
         }
@@ -1815,12 +1950,46 @@ mod tests {
     use bytes::Bytes;
 
     impl<T: WalStorage> DataPlane<T> {
+        // Handler tests start after peer admission. Receiver tests below use
+        // `process`, as do the transport/cluster tests, to exercise the boundary.
+        fn handle_admitted_command(&mut self, cmd: impl Into<DataPlaneCommand>) {
+            let cmd = cmd.into();
+            if let DataPlaneCommand::ReceivePeerMessage(received) = cmd {
+                if let DataPlanePeerMessage::ReplicateSegmentEntries(append) = &*received.message
+                    && self.placements.get(&append.segment_key).is_none()
+                {
+                    self.placements
+                        .install(super::super::placement::InstallCommittedPlacement {
+                            coordinator: NodeId::new("test-coordinator"),
+                            placement: super::super::placement::CommittedPlacement {
+                                segment_key: append.segment_key,
+                                term: 1,
+                                log_index: 1,
+                                segment: crate::control_plane::metadata::SegmentMeta::new(
+                                    append.segment_key.segment_id,
+                                    append.replicas.clone(),
+                                    append.entry_id,
+                                    0,
+                                ),
+                                consumer_epochs: Box::new([]),
+                            },
+                        });
+                }
+                self.dispatch_peer_message(received);
+            } else if let DataPlaneCommand::CatchUpReadComplete(cmd) = cmd {
+                self.handle_catch_up_read_complete(cmd);
+            } else {
+                self.handle_command(cmd);
+            }
+            self.assert_invariants();
+        }
+
         fn has_buffered_data(&self) -> bool {
             self.buffer_byte_count > 0
         }
 
         fn process_peer(&mut self, message: impl Into<DataPlanePeerMessage>) {
-            self.handle_command(receive_peer_message(message.into()));
+            self.handle_admitted_command(receive_peer_message(message.into()));
         }
     }
 
@@ -1868,6 +2037,7 @@ mod tests {
             DataPlanePeerMessage::RequestDurableSegmentEnd(request) => request.coordinator.clone(),
             DataPlanePeerMessage::DurableSegmentEndReported(event) => event.from.clone(),
             DataPlanePeerMessage::PlaceSegment(_)
+            | DataPlanePeerMessage::CommittedPlacement(_)
             | DataPlanePeerMessage::AdvanceReplicaCommit(_)
             | DataPlanePeerMessage::SegmentRollCommitted(_)
             | DataPlanePeerMessage::SegmentMetaSealed(_)
@@ -1916,7 +2086,7 @@ mod tests {
     fn consumer_offset_read_waits_for_durable_generation_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.process(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
             generation: 2.into(),
             key: consumer_offset_key(),
@@ -1941,7 +2111,7 @@ mod tests {
     fn future_consumer_offset_waits_for_epoch_seal() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.process(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         let position = ConsumerOffsetPosition {
             entry_id: EntryId(7),
             batch_offset: 2,
@@ -2048,7 +2218,7 @@ mod tests {
     fn stale_consumer_offset_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.process(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         dp.process_peer(DataPlanePeerMessage::ConsumerGroupEpochSealed(EpochSeal {
             generation: 4.into(),
             key: ConsumerOffsetKey {
@@ -2080,7 +2250,7 @@ mod tests {
     fn sealed_range_retains_offset_coordinator() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.process(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         dp.process_peer(DataPlanePeerMessage::SegmentMetaSealed(SegmentMetaSealed {
             segment_key: test_key(),
             committed_entry_id: None,
@@ -2119,7 +2289,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower_1 = NodeId::new("follower-1");
         let follower_2 = NodeId::new("follower-2");
-        dp.process(assign_segment(
+        dp.handle_admitted_command(assign_segment(
             test_key(),
             vec![test_node_id(), follower_1.clone(), follower_2.clone()],
         ));
@@ -2167,6 +2337,7 @@ mod tests {
                 DataTransportCommand::SendToTargets(send) => match &send.message {
                     DataPlanePeerMessage::ReplicateConsumerOffset(commit) => Some(commit.clone()),
                     DataPlanePeerMessage::PlaceSegment(_)
+                    | DataPlanePeerMessage::CommittedPlacement(_)
                     | DataPlanePeerMessage::SegmentPlaced(_)
                     | DataPlanePeerMessage::ReplicateSegmentEntries(_)
                     | DataPlanePeerMessage::ReplicaEntriesAppended(_)
@@ -2442,7 +2613,7 @@ mod tests {
     }
 
     fn process_and_flush(dp: &mut DataPlane<WalWriter>, cmd: DataPlaneCommand) {
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         if dp.should_flush() {
             dp.flush_batch();
         }
@@ -2499,7 +2670,7 @@ mod tests {
     fn has_segment_returns_true_after_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         assert!(dp.segments.contains_key(&test_key()));
     }
 
@@ -2509,7 +2680,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let (cmd, mut rx) = produce(test_key());
 
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         assert!(!dp.has_buffered_data());
         let ack = rx.try_recv().unwrap();
@@ -2521,10 +2692,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -2539,7 +2710,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (tx, _) = oneshot::channel();
         dp.handle_command(Produce {
@@ -2560,7 +2731,7 @@ mod tests {
     fn committed_producer_retry_returns_same_entry_without_appending() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         let producer = ProducerAppendIdentity {
             producer_id: uuid::Uuid::new_v4(),
             incarnation: 0,
@@ -2595,7 +2766,7 @@ mod tests {
     fn committed_retry_survives_segment_removal_but_new_append_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         let producer_id = uuid::Uuid::new_v4();
         let request = ProducerAppendIdentity {
             producer_id,
@@ -2679,7 +2850,7 @@ mod tests {
     fn segment_assignment_creates_tracker() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         assert!(dp.segments.contains_key(&test_key()));
     }
 
@@ -2688,10 +2859,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         assert!(dp.has_buffered_data());
 
@@ -2713,10 +2884,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         assert!(
             dp.out
@@ -2731,10 +2902,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         dp.flush_batch();
 
@@ -2749,10 +2920,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         let (cmd, _) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
@@ -2765,7 +2936,7 @@ mod tests {
     fn volume_trigger_flushes_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2785,7 +2956,7 @@ mod tests {
     fn volume_trigger_flush_leaves_stale_timer_harmless() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2808,7 +2979,7 @@ mod tests {
     fn cache_pressure_checkpoint_disabled_when_budget_zero() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![dp.node_id.clone()]));
 
         dp.handle_command(Produce {
             segment_key: test_key(),
@@ -2837,8 +3008,8 @@ mod tests {
         let large = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
         let replica_set = vec![NodeId::new(dp.node_id.to_string())];
 
-        dp.handle_command(assign_segment(small, replica_set.clone()));
-        dp.handle_command(assign_segment(large, replica_set));
+        dp.handle_admitted_command(assign_segment(small, replica_set.clone()));
+        dp.handle_admitted_command(assign_segment(large, replica_set));
 
         dp.handle_command(Produce {
             segment_key: small,
@@ -2872,7 +3043,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.config.hot_cache_budget_bytes = 10;
         dp.config.hot_cache_pressure_watermark = 0.5;
-        dp.handle_command(assign_segment(
+        dp.handle_admitted_command(assign_segment(
             test_key(),
             vec![test_node_id(), NodeId::new("follower")],
         ));
@@ -2901,7 +3072,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         dp.config.hot_cache_budget_bytes = 10;
         dp.config.hot_cache_pressure_watermark = 0.5;
-        dp.handle_command(assign_segment(
+        dp.handle_admitted_command(assign_segment(
             test_key(),
             vec![NodeId::new(dp.node_id.to_string())],
         ));
@@ -2941,17 +3112,17 @@ mod tests {
     fn seal_carries_unflushed_staged_into_successor() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         // Produce — staged into the active segment, no flush yet.
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         assert!(dp.has_buffered_data());
 
         // Seal arrives before the batch flush. `handle_command` runs
         // `assert_invariants` afterwards — pre-fix this panics on the stranded
         // counter.
-        dp.handle_command(seal_response(
+        dp.handle_admitted_command(seal_response(
             test_key(),
             SegmentId(1),
             vec![test_node_id()],
@@ -2973,21 +3144,21 @@ mod tests {
     fn seal_handoff_carries_into_a_successor_already_created_by_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         // Produce — staged into the active segment, unflushed.
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         assert!(dp.has_buffered_data());
 
         // The successor's PlaceSegment wins the race: seg1 is created empty.
         let successor = test_key().with_segment_id(SegmentId(1));
-        dp.handle_command(assign_segment(successor, vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(successor, vec![test_node_id()]));
 
         // The committed roll handoff arrives second. Pre-fix `insert_active` refuses
         // (seg1 already active) → the staged produce is dropped and `buffer_byte_count`
         // strands, tripping `assert_invariants` after the command.
-        dp.handle_command(seal_response(
+        dp.handle_admitted_command(seal_response(
             test_key(),
             SegmentId(1),
             vec![test_node_id()],
@@ -3005,8 +3176,8 @@ mod tests {
         let key1 = SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0));
         let key2 = SegmentKey::new(TopicId(2), RangeId(0), SegmentId(0));
 
-        dp.handle_command(assign_segment(key1, vec![test_node_id()]));
-        dp.handle_command(assign_segment(key2, vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(key1, vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(key2, vec![test_node_id()]));
 
         let wal_file_count =
             || -> usize { std::fs::read_dir(dir.path().join("wal")).unwrap().count() };
@@ -3037,8 +3208,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         assert_eq!(dp.segments.len(), 1);
     }
@@ -3048,14 +3219,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd1, _rx1) = produce(test_key());
         let (cmd2, _rx2) = produce(test_key());
         let (cmd3, _rx3) = produce(test_key());
-        dp.handle_command(cmd1);
-        dp.handle_command(cmd2);
-        dp.handle_command(cmd3);
+        dp.handle_admitted_command(cmd1);
+        dp.handle_admitted_command(cmd2);
+        dp.handle_admitted_command(cmd3);
 
         assert!(dp.has_buffered_data());
         assert!(!dp.should_flush());
@@ -3082,10 +3253,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         process_and_flush(
             &mut dp,
@@ -3105,10 +3276,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         process_and_flush(
             &mut dp,
@@ -3128,13 +3299,13 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(
+        dp.handle_admitted_command(assign_segment(
             test_key(),
             vec![test_node_id(), follower.clone()],
         ));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         process_and_flush(
             &mut dp,
@@ -3152,10 +3323,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3178,7 +3349,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             ReplicateSegmentEntries {
                 segment_key: test_key(),
                 replicas: Replicas::new(vec![leader, test_node_id()]),
@@ -3192,34 +3363,121 @@ mod tests {
         dp.flush_batch();
 
         let (cmd, rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
 
         let ack = rx.blocking_recv().unwrap();
         assert!(matches!(ack, ProduceAck::Err(_)));
     }
 
     #[test]
-    fn replica_append_self_authorization() {
+    fn replica_append_requires_committed_placement() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
-
-        dp.handle_command(receive_peer_message(
-            ReplicateSegmentEntries {
-                segment_key: test_key(),
-                replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
-                data: b"data".to_vec().into(),
-                record_count: 1,
-                entry_id: EntryId(0),
-                producer_identity: None,
-            }
-            .into(),
+        let replicas = Replicas::new(vec![leader.clone(), test_node_id()]);
+        let append = ReplicateSegmentEntries {
+            segment_key: test_key(),
+            replicas: replicas.clone(),
+            data: b"data".to_vec().into(),
+            record_count: 1,
+            entry_id: EntryId(0),
+            producer_identity: None,
+        };
+        dp.process(receive_peer_message_from(leader.clone(), append.clone()));
+        assert!(
+            !dp.segments.contains_key(&test_key()),
+            "data traffic must not install placement"
+        );
+        let committed = super::super::placement::CommittedPlacement {
+            segment_key: test_key(),
+            term: 1,
+            log_index: 1,
+            segment: crate::control_plane::metadata::SegmentMeta::new(
+                SegmentId(0),
+                replicas,
+                EntryId(0),
+                0,
+            ),
+            consumer_epochs: Box::new([]),
+        };
+        dp.process(DataPlaneCommand::InstallCommittedPlacement(
+            super::super::placement::InstallCommittedPlacement {
+                coordinator: NodeId::new("coordinator"),
+                placement: committed,
+            },
         ));
+        dp.process(receive_peer_message_from(
+            NodeId::new("intruder"),
+            append.clone(),
+        ));
+        assert!(!dp.segments.contains_key(&test_key()));
+        let mut skipped_prefix = append.clone();
+        skipped_prefix.entry_id = EntryId(5);
+        dp.process(receive_peer_message_from(leader.clone(), skipped_prefix));
+        assert!(!dp.segments.contains_key(&test_key()));
+        dp.process(receive_peer_message_from(leader, append));
 
         assert!(dp.segments.contains_key(&test_key()));
         assert_eq!(
             dp.segments.get(&test_key()).unwrap().role(),
             SegmentRole::Follower
+        );
+        // An authenticated coordinator cannot delete an active segment without
+        // the committed deletion; neither can another data replica.
+        for from in [NodeId::new("coordinator"), test_node_id()] {
+            dp.process(receive_peer_message_from(
+                from,
+                DeleteSegments {
+                    segment_keys: Box::new([test_key()]),
+                },
+            ));
+            assert!(dp.segments.contains_key(&test_key()));
+        }
+    }
+
+    #[test]
+    fn placement_retry_restores_a_missed_consumer_epoch() {
+        use crate::data_plane::placement::{CommittedPlacement, InstallCommittedPlacement};
+        let dir = tempfile::tempdir().unwrap();
+        let mut dp = make_data_plane(&dir);
+        let mut placement = CommittedPlacement {
+            segment_key: test_key(),
+            term: 1,
+            log_index: 2,
+            segment: crate::control_plane::metadata::SegmentMeta::new(
+                SegmentId(0),
+                Replicas::new(vec![test_node_id()]),
+                EntryId(0),
+                0,
+            ),
+            consumer_epochs: Box::new([("group".into(), GenerationId(1))]),
+        };
+        dp.process(DataPlaneCommand::InstallCommittedPlacement(
+            InstallCommittedPlacement {
+                coordinator: NodeId::new("coordinator"),
+                placement: placement.clone(),
+            },
+        ));
+        dp.flush_batch();
+        assert_eq!(
+            dp.auxiliary_state
+                .durable_generation(&consumer_offset_key()),
+            GenerationId(1)
+        );
+
+        placement.log_index = 1;
+        placement.consumer_epochs = Box::new([("group".into(), GenerationId(2))]);
+        dp.process(DataPlaneCommand::InstallCommittedPlacement(
+            InstallCommittedPlacement {
+                coordinator: NodeId::new("coordinator"),
+                placement,
+            },
+        ));
+        dp.flush_batch();
+        assert_eq!(
+            dp.auxiliary_state
+                .durable_generation(&consumer_offset_key()),
+            GenerationId(1)
         );
     }
 
@@ -3229,7 +3487,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(receive_peer_message_from(
+        dp.handle_admitted_command(receive_peer_message_from(
             NodeId::new("other-peer"),
             ReplicateSegmentEntries {
                 segment_key: test_key(),
@@ -3250,7 +3508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             ReplicateSegmentEntries {
                 segment_key: test_key(),
                 replicas: Replicas::new(vec![
@@ -3274,7 +3532,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             ReplicateSegmentEntries {
                 segment_key: test_key(),
                 replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
@@ -3287,7 +3545,7 @@ mod tests {
         ));
         dp.flush_batch();
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AdvanceReplicaCommit {
                 segment_key: test_key(),
                 committed_entry_id: EntryId(0),
@@ -3306,10 +3564,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3346,10 +3604,10 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id(), follower]));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3369,13 +3627,13 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let follower = NodeId::new("follower-1");
 
-        dp.handle_command(assign_segment(
+        dp.handle_admitted_command(assign_segment(
             test_key(),
             vec![test_node_id(), follower.clone()],
         ));
 
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3398,7 +3656,7 @@ mod tests {
 
         assert!(!dp.needs_flush);
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             ReplicateSegmentEntries {
                 segment_key: test_key(),
                 replicas: Replicas::new(vec![leader, test_node_id()]),
@@ -3423,7 +3681,7 @@ mod tests {
         process_and_flush(&mut dp, assign_segment(test_key(), rs.clone()));
 
         let (cmd, _) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         dp.handle_command(DataPlaneCommand::DataPlaneTimeoutCallback(
             DataPlaneTimeoutCallback::BatchFlushDeadline,
         ));
@@ -3432,7 +3690,7 @@ mod tests {
             .unwrap()
             .commit_entry(EntryId(0));
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
@@ -3455,7 +3713,7 @@ mod tests {
     fn enqueue_roll_request_sends_to_coordinator() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
 
@@ -3476,7 +3734,7 @@ mod tests {
     fn idle_timeout_requests_idle_maintenance_roll() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         dp.enqueue_roll_for_idle_segments(std::time::Duration::ZERO);
 
@@ -3491,7 +3749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
         dp.config.segment_size_limit = 0;
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         dp.enqueue_roll_for_idle_segments(std::time::Duration::ZERO);
 
@@ -3502,7 +3760,7 @@ mod tests {
     fn enqueue_roll_request_deduplicates() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
         dp.enqueue_roll_request(test_key(), SegmentRollIntent::DataPressure);
@@ -3529,7 +3787,7 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let leader = NodeId::new("leader-node");
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             ReplicateSegmentEntries {
                 segment_key: test_key(),
                 replicas: Replicas::new(vec![leader, test_node_id()]),
@@ -3570,7 +3828,7 @@ mod tests {
     fn segment_assignment_indexes_for_resolver() {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
 
         let resolved = dp
             .segments
@@ -3591,9 +3849,9 @@ mod tests {
         // Single-replica produce auto-commits on flush, so entry 0 is
         // committed at the time we issue the seal. After seal: end=0 on the
         // sealed entry, new segment starts at offset 1.
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3601,7 +3859,7 @@ mod tests {
             ),
         );
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
@@ -3645,9 +3903,9 @@ mod tests {
 
         // Assign with a follower so the produce does NOT auto-commit: entry 0
         // is published (write cursor 1) but uncommitted (read cursor 0).
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id(), follower]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id(), follower]));
         let (cmd, _rx) = produce(test_key());
-        dp.handle_command(cmd);
+        dp.handle_admitted_command(cmd);
         process_and_flush(
             &mut dp,
             DataPlaneCommand::DataPlaneTimeoutCallback(
@@ -3665,7 +3923,7 @@ mod tests {
         );
 
         // Replication-timeout failover seals the never-committed segment.
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             SegmentRollCommitted {
                 old_segment_key: test_key(),
                 new_segment_id: SegmentId(1),
@@ -3739,7 +3997,7 @@ mod tests {
         );
 
         // Assign + produce 3 records (single replica → commit inline on flush).
-        dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+        dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
         let records: [(&[u8], u32); 3] = [(b"alpha", 2), (b"bravo", 5), (b"charlie", 1)];
         for (payload, record_count) in records {
             let (tx, _rx) = oneshot::channel();
@@ -3780,7 +4038,7 @@ mod tests {
             .unwrap();
         sparse.put_batch(index_entries).unwrap();
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             SegmentMetaSealed {
                 segment_key: test_key(),
                 committed_entry_id: None,
@@ -3849,7 +4107,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut dp = make_data_plane(&dir);
-            dp.handle_command(assign_segment(test_key(), vec![test_node_id()]));
+            dp.handle_admitted_command(assign_segment(test_key(), vec![test_node_id()]));
             for _ in 0..count {
                 let (reply, _rx) = oneshot::channel();
                 dp.handle_command(Produce {
@@ -3931,7 +4189,7 @@ mod tests {
         let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
 
         let requester = NodeId::new("replacement");
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             RequestCatchUpEntries {
                 segment_key: test_key(),
                 from: requester.clone(),
@@ -3958,7 +4216,7 @@ mod tests {
         let (mut dp, cold_read_rx) = source_with_sealed_segment(&dir);
 
         let requester = NodeId::new("replacement");
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             RequestCatchUpEntries {
                 segment_key: test_key(),
                 from: requester.clone(),
@@ -4015,7 +4273,7 @@ mod tests {
                 producer_identity: None,
             }),
         ];
-        dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
+        dp.handle_admitted_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
             requester: requester.clone(),
             segment_key: test_key(),
             start_offset: EntryId(0),
@@ -4084,7 +4342,7 @@ mod tests {
         );
         let requester = NodeId::new("replacement");
 
-        dp.handle_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
+        dp.handle_admitted_command(DataPlaneCommand::CatchUpReadComplete(CatchUpReadComplete {
             requester: requester.clone(),
             segment_key: test_key(),
             start_offset: EntryId(0),
@@ -4132,16 +4390,42 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let source = NodeId::new("source");
 
+        let replicas = Replicas::new(vec![
+            test_node_id(),
+            source.clone(),
+            NodeId::new("other-replica"),
+        ]);
+        let mut segment = crate::control_plane::metadata::SegmentMeta::new(
+            SegmentId(0),
+            replicas.clone(),
+            EntryId(0),
+            0,
+        );
+        segment.state = crate::control_plane::metadata::SegmentMetaState::Sealed;
+        segment.end_entry_id = Some(EntryId(2));
+        dp.process(DataPlaneCommand::InstallCommittedPlacement(
+            super::super::placement::InstallCommittedPlacement {
+                coordinator: source.clone(),
+                placement: super::super::placement::CommittedPlacement {
+                    segment_key: test_key(),
+                    term: 1,
+                    log_index: 1,
+                    segment,
+                    consumer_epochs: Box::new([]),
+                },
+            },
+        ));
+
         // Coordinator assigns this node the sealed segment [0, 2].
-        dp.handle_command(receive_peer_message(
+        dp.process(receive_peer_message_from(
+            source.clone(),
             AssignSegmentCatchUp {
                 segment_key: test_key(),
-                shard_group_id: ShardGroupId(1),
+                shard_group_id: ShardGroupId(0),
                 start_entry_id: EntryId(0),
                 sealed_end_entry_id: EntryId(2),
-                replica_set: Replicas::new(vec![test_node_id(), source.clone()]),
-            }
-            .into(),
+                replica_set: replicas,
+            },
         ));
 
         // → a request-all (`local_end: None`) to the source.
@@ -4156,8 +4440,30 @@ mod tests {
                 if r.segment_key == test_key() && r.local_end.is_none()
         ));
 
+        // Another committed replica is still not the source we requested.
+        dp.process(receive_peer_message_from(
+            NodeId::new("other-replica"),
+            CatchUpEntries {
+                segment_key: test_key(),
+                entries: Box::new([CatchUpEntry {
+                    entry_id: EntryId(0),
+                    data: b"forged".to_vec().into(),
+                    record_count: 1,
+                }]),
+            },
+        ));
+        assert!(dp.pending_catch_ups[&test_key()].last_written.is_none());
+        dp.process(receive_peer_message_from(
+            NodeId::new("other-replica"),
+            CatchUpEntriesSent {
+                segment_key: test_key(),
+            },
+        ));
+        assert!(dp.pending_catch_ups.contains_key(&test_key()));
+
         // Source streams the three entries, then signals end of stream.
-        dp.handle_command(receive_peer_message(
+        dp.process(receive_peer_message_from(
+            source.clone(),
             CatchUpEntries {
                 segment_key: test_key(),
                 entries: vec![
@@ -4178,14 +4484,13 @@ mod tests {
                     },
                 ]
                 .into(),
-            }
-            .into(),
+            },
         ));
-        dp.handle_command(receive_peer_message(
+        dp.process(receive_peer_message_from(
+            source.clone(),
             CatchUpEntriesSent {
                 segment_key: test_key(),
-            }
-            .into(),
+            },
         ));
 
         // Registered cold-readable at its sealed bounds...
@@ -4220,7 +4525,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
@@ -4231,7 +4536,7 @@ mod tests {
             .into(),
         ));
         // ...but only 0..=2 arrive.
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             CatchUpEntries {
                 segment_key: test_key(),
                 entries: vec![
@@ -4255,7 +4560,7 @@ mod tests {
             }
             .into(),
         ));
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             CatchUpEntriesSent {
                 segment_key: test_key(),
             }
@@ -4287,7 +4592,7 @@ mod tests {
         // Recovered from disk through entry 5 — past the sealed end of 2.
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 5));
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
@@ -4377,7 +4682,7 @@ mod tests {
         write_seg_file(&path, &[(b"a", 1), (b"b", 1)]);
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
@@ -4428,7 +4733,7 @@ mod tests {
             .insert_sealed_from_catch_up(key, EntryId(0), EntryId(0));
         assert!(dp.segments.sealed_bounds(&key).is_some());
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             DeleteSegments {
                 segment_keys: Box::new([key]),
             }
@@ -4457,7 +4762,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane(&dir);
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             DeleteSegments {
                 segment_keys: Box::new([test_key()]),
             }
@@ -4485,7 +4790,7 @@ mod tests {
         );
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 1));
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
@@ -4516,7 +4821,7 @@ mod tests {
         let leader = NodeId::new("leader");
         let follower = NodeId::new("follower");
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             AssignSegmentCatchUp {
                 segment_key: test_key(),
                 shard_group_id: ShardGroupId(1),
@@ -4577,12 +4882,12 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let source = NodeId::new("source");
 
-        dp.handle_command(catch_up_assignment_to(&source, 5)); // initial request
+        dp.handle_admitted_command(catch_up_assignment_to(&source, 5)); // initial request
         dp.out.transport_cmds.clear();
 
         // Within the grace window the re-drive is silent.
         for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
-            dp.handle_command(catch_up_assignment_to(&source, 5));
+            dp.handle_admitted_command(catch_up_assignment_to(&source, 5));
             assert!(
                 dp.out.transport_cmds.is_empty(),
                 "no re-request within grace"
@@ -4590,7 +4895,7 @@ mod tests {
         }
         // At the budget: a resume request to the source, from local_end = None
         // (nothing written yet).
-        dp.handle_command(catch_up_assignment_to(&source, 5));
+        dp.handle_admitted_command(catch_up_assignment_to(&source, 5));
         assert_eq!(dp.out.transport_cmds.len(), 1, "stalled → resume request");
         let DataTransportCommand::SendToTargets(s) = &dp.out.transport_cmds[0] else {
             panic!("expected SendToTargets");
@@ -4611,17 +4916,17 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let source = NodeId::new("source");
 
-        dp.handle_command(catch_up_assignment_to(&source, 5));
+        dp.handle_admitted_command(catch_up_assignment_to(&source, 5));
         // Bring the counter to the brink...
         for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
-            dp.handle_command(catch_up_assignment_to(&source, 5));
+            dp.handle_admitted_command(catch_up_assignment_to(&source, 5));
         }
         // ...a chunk resets it...
-        dp.handle_command(catch_up_chunk_of(&[0]));
+        dp.handle_admitted_command(catch_up_chunk_of(&[0]));
         dp.out.transport_cmds.clear();
         // ...so the same run of re-drives again still doesn't trip a resume.
         for _ in 0..CATCH_UP_IDLE_REDRIVES - 1 {
-            dp.handle_command(catch_up_assignment_to(&source, 5));
+            dp.handle_admitted_command(catch_up_assignment_to(&source, 5));
         }
         assert!(
             dp.out.transport_cmds.is_empty(),
@@ -4637,11 +4942,11 @@ mod tests {
         let mut dp = make_data_plane(&dir);
         let source = NodeId::new("source");
 
-        dp.handle_command(catch_up_assignment_to(&source, 4));
-        dp.handle_command(catch_up_chunk_of(&[0, 1, 2]));
+        dp.handle_admitted_command(catch_up_assignment_to(&source, 4));
+        dp.handle_admitted_command(catch_up_chunk_of(&[0, 1, 2]));
         // Overlap: 1,2 are duplicates (skipped), 3,4 are new (appended).
-        dp.handle_command(catch_up_chunk_of(&[1, 2, 3, 4]));
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(catch_up_chunk_of(&[1, 2, 3, 4]));
+        dp.handle_admitted_command(receive_peer_message(
             CatchUpEntriesSent {
                 segment_key: test_key(),
             }
@@ -4669,7 +4974,7 @@ mod tests {
         let leader = NodeId::new("leader-node");
 
         for entry_id in 0..3 {
-            dp.handle_command(receive_peer_message(
+            dp.handle_admitted_command(receive_peer_message(
                 ReplicateSegmentEntries {
                     segment_key: test_key(),
                     replicas: Replicas::new(vec![leader.clone(), test_node_id()]),
@@ -4722,7 +5027,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut dp = make_data_plane_with(&dir, inventory_with(test_key(), 4));
 
-        dp.handle_command(receive_peer_message(
+        dp.handle_admitted_command(receive_peer_message(
             RequestDurableSegmentEnd {
                 segment_key: test_key(),
                 coordinator: NodeId::new("coordinator"),

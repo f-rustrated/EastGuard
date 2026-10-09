@@ -444,7 +444,19 @@ impl Swim {
             leader_addr: self.self_addr,
             term,
         };
-        self.apply_shard_leader_update(&info);
+        self.topology.update_shard_leader(&info);
+        // Local periodic announcements must replenish gossip even at the same
+        // term: a restarted peer has lost its leader cache. Remote duplicates
+        // still stop in apply_shard_leader_update, avoiding a gossip loop.
+        if self
+            .topology
+            .shard_leader(shard_group_id)
+            .is_some_and(|known| {
+                known.term == info.term && known.leader.node_id == info.leader_node_id
+            })
+        {
+            self.shard_leader_buffer.enqueue(info, self.members.len());
+        }
         #[cfg(any(test, debug_assertions))]
         self.assert_invariants();
     }
@@ -1732,6 +1744,26 @@ mod tests {
         use crate::control_plane::membership::swim::tests::{add_node_harness, ping};
         use crate::control_plane::membership::topology::ShardGroupId;
         use std::net::SocketAddr;
+
+        #[test]
+        fn local_refresh_replenishes_exhausted_leader_gossip() {
+            let mut h = TestHarness::new("node-local", 8000);
+            h.protocol
+                .announce_shard_leader(ShardGroupId(42), NodeId::new("node-local"), 1);
+            for _ in 0..32 {
+                h.protocol.shard_leader_buffer.collect(4096);
+            }
+            assert!(h.protocol.shard_leader_buffer.collect(4096).is_empty());
+            h.protocol
+                .announce_shard_leader(ShardGroupId(42), NodeId::new("node-local"), 1);
+            assert!(
+                h.protocol
+                    .shard_leader_buffer
+                    .collect(4096)
+                    .iter()
+                    .any(|info| info.shard_group_id == ShardGroupId(42) && info.term == 1)
+            );
+        }
 
         #[test]
         fn announce_leader_appears_in_next_outbound_packet() {

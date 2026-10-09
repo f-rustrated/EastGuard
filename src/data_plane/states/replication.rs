@@ -111,6 +111,22 @@ impl ReplicationState {
         }
     }
 
+    pub(crate) fn fail_segment(&mut self, key: SegmentKey) {
+        self.timer_seqs.remove(&key);
+        let pending = self.pending_replies.remove(&key).into_iter().flatten();
+        let in_flight = self
+            .in_flight
+            .remove(&key)
+            .into_iter()
+            .flatten()
+            .flat_map(|batch| batch.replies);
+        for reply in pending.chain(in_flight) {
+            let _ = reply.send(ProduceAck::Err(ProduceError::NotLeader));
+        }
+        #[cfg(any(test, debug_assertions))]
+        crate::test_traits::TAssertInvariant::assert_invariants(self);
+    }
+
     pub(crate) fn begin_replication(
         &mut self,
         pending_repl: &PendingReplicationBatch,

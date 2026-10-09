@@ -155,6 +155,32 @@ fn run_orphan_gc(internal: Duration, tx: &Sender<DataPlaneMessage>) {
 pub(crate) struct DataPlaneSender(pub flume::Sender<DataPlaneMessage>);
 
 impl DataPlaneSender {
+    pub(crate) async fn receive_peer(
+        &self,
+        received: super::messages::command::ReceivePeerMessage,
+        topology: &crate::control_plane::membership::TopologyReader,
+    ) -> Result<(), ServerError> {
+        use super::messages::command::DataPlanePeerMessage;
+        if let DataPlanePeerMessage::CommittedPlacement(placement) = *received.message {
+            if !placement.is_from_coordinator(&received.from, topology) {
+                tracing::warn!(peer = %received.from, key = ?placement.segment_key,
+                    term = placement.term, known = ?topology.shard_leader(placement.segment_key.topic_id.shard_group_id()),
+                    "rejected placement from an unknown or stale coordinator");
+                return Ok(());
+            }
+            self.send_async(DataPlaneCommand::InstallCommittedPlacement(
+                super::placement::InstallCommittedPlacement {
+                    coordinator: received.from,
+                    placement,
+                },
+            ))
+            .await
+        } else {
+            self.send_async(DataPlaneCommand::ReceivePeerMessage(received))
+                .await
+        }
+    }
+
     pub fn send(&self, msg: impl Into<DataPlaneMessage>) -> Result<(), ServerError> {
         self.0
             .send(msg.into())

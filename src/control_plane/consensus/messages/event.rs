@@ -63,6 +63,7 @@ impl MetadataCommitted {
     pub fn into_data_transport_cmds(self) -> Vec<DataTransportCommand> {
         let sgid = self.shard_group_id;
         match self.event {
+            MetadataEvent::TopicDeleted(_) => vec![],
             MetadataEvent::TopicCreated(tc) => {
                 vec![tc.into_command(sgid)]
             }

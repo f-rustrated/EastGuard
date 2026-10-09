@@ -7,6 +7,7 @@ use crate::data_plane::sparse_index::SparseEntry;
 /// appender, the sealed bounds being filled toward, and the sparse anchors
 /// accumulated as chunks land — flushed to the index once the file verifies.
 pub(crate) struct PendingCatchUp {
+    pub(crate) source: crate::control_plane::NodeId,
     pub(crate) appender: SegmentAppender,
     pub(crate) shard_group_id: ShardGroupId,
     pub(crate) start_offset: EntryId,

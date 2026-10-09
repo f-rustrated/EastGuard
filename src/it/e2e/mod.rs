@@ -2,6 +2,7 @@ mod client_protocol;
 mod client_sdk;
 mod consumer_group_test;
 mod producer_deduplication;
+mod secure_cluster;
 
 use crate::StartUp;
 use crate::config::Environment;

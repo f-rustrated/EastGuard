@@ -1,8 +1,9 @@
 use tokio::sync::mpsc;
 
 use crate::control_plane::NodeId;
+use crate::control_plane::membership::TopologyReader;
 use crate::data_plane::actor::DataPlaneSender;
-use crate::data_plane::messages::command::{DataPlaneCommand, ReceivePeerMessage};
+use crate::data_plane::messages::command::ReceivePeerMessage;
 use crate::net::TransportReadHalf;
 
 use super::connection::{DATA_FRAME_MAX, read_frame};
@@ -31,6 +32,7 @@ impl DataReader {
         data_plane_tx: DataPlaneSender,
         closed: ConnectionClosed,
         disconnect_tx: mpsc::Sender<ConnectionClosed>,
+        topology: TopologyReader,
     ) {
         loop {
             match read_frame::<ReceivePeerMessage>(&mut self.read_half, DATA_FRAME_MAX).await {
@@ -44,7 +46,7 @@ impl DataReader {
                         break;
                     }
                     if data_plane_tx
-                        .send_async(DataPlaneCommand::ReceivePeerMessage(message))
+                        .receive_peer(message, &topology)
                         .await
                         .is_err()
                     {
@@ -105,6 +107,15 @@ mod tests {
                         generation: 7,
                     },
                     closed_tx,
+                    crate::control_plane::membership::Topology::new(
+                        [],
+                        crate::control_plane::membership::TopologyConfig {
+                            vnodes_per_pnode: 1,
+                            replication_factor: 1,
+                        },
+                    )
+                    .channel()
+                    .1,
                 )
                 .await;
             assert!(data_rx.is_empty());

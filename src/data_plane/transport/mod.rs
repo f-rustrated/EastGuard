@@ -34,7 +34,8 @@ impl DataTransportActor {
         topology: TopologyReader,
         node_transport: NodeTransportSecurity,
     ) {
-        let mut state = TransportState::new(node_id.clone(), node_transport.clone());
+        let mut state =
+            TransportState::new(node_id.clone(), node_transport.clone(), topology.clone());
         let mut handshakes = JoinSet::new();
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         cleanup_interval.tick().await;

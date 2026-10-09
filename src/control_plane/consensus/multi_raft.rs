@@ -78,6 +78,41 @@ impl MultiRaft {
         &self.node_id
     }
 
+    pub(crate) fn with_placement_updates(
+        &self,
+        commands: Vec<DataTransportCommand>,
+    ) -> Box<[DataTransportCommand]> {
+        let mut topics: BTreeMap<TopicId, BTreeSet<NodeId>> = BTreeMap::new();
+        for command in &commands {
+            if let DataTransportCommand::SendToTargets(send) = command {
+                for topic in send.message.coordinated_topics() {
+                    topics
+                        .entry(topic)
+                        .or_default()
+                        .extend(send.targets.iter().cloned());
+                }
+            }
+        }
+        let mut updates: Vec<_> = topics
+            .into_iter()
+            .flat_map(|(topic, recipients)| {
+                self.groups
+                    .get(&topic.shard_group_id())
+                    .map(|raft| raft.placement_updates(topic, &recipients))
+                    .unwrap_or_default()
+            })
+            .collect();
+        updates.extend(commands);
+        updates.into_boxed_slice()
+    }
+
+    pub(crate) fn topic_placement_updates(&self, topic: TopicId) -> Vec<DataTransportCommand> {
+        self.groups
+            .get(&topic.shard_group_id())
+            .map(|raft| raft.placement_updates(topic, &BTreeSet::new()))
+            .unwrap_or_default()
+    }
+
     /// This runs a reconciliation process to stabilize the group.
     /// Importantly, takeover does NOT trust its own peer set.
     #[tracing::instrument(level = "debug", skip_all, fields(group = shard_group_id.0))]
@@ -477,6 +512,16 @@ impl MultiRaft {
 
         let live_nodes = self.topology.live_nodes();
 
+        if old_replica_set.leader() != Some(&req.from)
+            || req
+                .failed_nodes
+                .iter()
+                .any(|node| node == &req.from || !old_replica_set.contains(node))
+        {
+            tracing::warn!(segment = ?req.segment_key, "rejected roll request outside committed data placement");
+            return;
+        }
+
         let new_replica_set =
             compute_replacement_replica_set(&old_replica_set, &req.failed_nodes, &live_nodes);
 
@@ -517,6 +562,19 @@ impl MultiRaft {
     /// Feed a survivor's durable extent into the subsystem; if it completes a
     /// round, execute the resulting action.
     fn handle_durable_end_report(&mut self, report: DurableSegmentEndReported) {
+        if !self
+            .groups
+            .get(&report.segment_key.topic_id.shard_group_id())
+            .is_some_and(|raft| {
+                raft.is_leader()
+                    && raft
+                        .get_replica_set(&report.segment_key)
+                        .is_some_and(|replicas| replicas.contains(&report.from))
+            })
+        {
+            tracing::warn!(segment = ?report.segment_key, "rejected durable-end report outside committed data placement");
+            return;
+        }
         match self
             .boundary_recovery
             .record(report.segment_key, report.from, report.durable_end)

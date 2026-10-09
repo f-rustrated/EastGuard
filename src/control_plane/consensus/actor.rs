@@ -123,13 +123,15 @@ impl MultiRaftActor {
                 .push(RaftTransportCommand::Send(packets.1.into_boxed_slice()));
         }
 
+        let data_commands = self
+            .state
+            .with_placement_updates(std::mem::take(&mut self.data_transport_cmds));
         tokio::join!(
             self.transport_tx
                 .send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice()),
             self.scheduler_tx
                 .send_batch(std::mem::take(&mut self.timer_cmds).into_boxed_slice()),
-            self.data_transport_tx
-                .send_batch(std::mem::take(&mut self.data_transport_cmds).into_boxed_slice()),
+            self.data_transport_tx.send_batch(data_commands),
         );
 
         self.state.fire_deferred();
@@ -175,6 +177,12 @@ impl MultiRaftActor {
                     .push(RaftTransportCommand::DisconnectPeer(node_id));
             }
             RaftEvent::MetadataCommitted(committed) => {
+                if let crate::control_plane::metadata::event::MetadataEvent::TopicDeleted(deleted) =
+                    &committed.event
+                {
+                    self.data_transport_cmds
+                        .extend(self.state.topic_placement_updates(deleted.topic_id));
+                }
                 self.data_transport_cmds
                     .extend(committed.into_data_transport_cmds());
             }
