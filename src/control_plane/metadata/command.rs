@@ -4,10 +4,12 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use uuid::Uuid;
 
 use crate::{
-    connections::protocol::ConsumerGroupSyncAction,
+    connections::protocol::ConsumerGroupMemberAction,
     control_plane::{
         Replicas,
-        metadata::{EntryId, RangeId, SegmentId, TopicId, strategy::StoragePolicy},
+        metadata::{
+            EntryId, ProducerSessionOwner, RangeId, SegmentId, TopicId, strategy::StoragePolicy,
+        },
     },
     data_plane::SegmentKey,
     impl_from_variant,
@@ -64,6 +66,7 @@ pub struct MergeRange {
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct DeleteTopic {
     pub name: String,
+    pub topic_id: TopicId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -84,8 +87,9 @@ pub struct DeleteSegments {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct SyncConsumerGroup {
-    pub req: SyncConsumerGroupRequest,
+pub struct UpdateConsumerGroupMember {
+    pub req: UpdateConsumerGroupMemberRequest,
+    pub topic_id: TopicId,
     // TODO consider using logical clock
     pub observed_at: u64,
     pub session_timeout_ms: u64,
@@ -93,9 +97,11 @@ pub struct SyncConsumerGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct OpenProducerSession {
-    pub topic_name: String,
+    pub topic_name: Box<str>,
+    pub topic_id: TopicId,
     pub producer_id: Uuid,
     pub session_nonce: Uuid,
+    pub owner: ProducerSessionOwner,
     pub observed_at: u64,
     pub session_timeout_ms: u64,
 }
@@ -107,27 +113,28 @@ pub struct ExpireProducerSessions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct SyncConsumerGroupRequest {
+pub struct UpdateConsumerGroupMemberRequest {
     pub topic_name: String,
     pub group_id: String,
     pub member_id: Uuid,
-    pub action: ConsumerGroupSyncAction,
+    pub action: ConsumerGroupMemberAction,
 }
 
-impl Deref for SyncConsumerGroup {
-    type Target = SyncConsumerGroupRequest;
+impl Deref for UpdateConsumerGroupMember {
+    type Target = UpdateConsumerGroupMemberRequest;
 
     fn deref(&self) -> &Self::Target {
         &self.req
     }
 }
 
-impl SyncConsumerGroup {
-    pub(crate) fn new(req: SyncConsumerGroupRequest) -> Self {
+impl UpdateConsumerGroupMember {
+    pub(crate) fn new(req: UpdateConsumerGroupMemberRequest, topic_id: TopicId) -> Self {
         const SESSION_TIMEOUT_MS: u64 = 10_000;
         let observed_at = crate::now_ms();
-        SyncConsumerGroup {
+        UpdateConsumerGroupMember {
             req,
+            topic_id,
             observed_at,
             session_timeout_ms: SESSION_TIMEOUT_MS,
         }
@@ -143,7 +150,7 @@ pub enum MetadataCommand {
     DeleteTopic(DeleteTopic),
     ReassignSegment(ReassignSegment),
     DeleteSegments(DeleteSegments),
-    SyncConsumerGroup(SyncConsumerGroup),
+    UpdateConsumerGroupMember(UpdateConsumerGroupMember),
     OpenProducerSession(OpenProducerSession),
     ExpireProducerSessions(ExpireProducerSessions),
 }
@@ -157,7 +164,7 @@ impl_from_variant!(
     DeleteTopic,
     ReassignSegment,
     DeleteSegments,
-    SyncConsumerGroup,
+    UpdateConsumerGroupMember,
     OpenProducerSession,
-    ExpireProducerSessions
+    ExpireProducerSessions,
 );

@@ -11,7 +11,7 @@ use super::sparse_index::SparseIndex;
 use super::states::segment::cache::CachedEntry;
 use super::wal::{WalRecord, WalRecordType};
 use crate::client::ServerError;
-use crate::connections::protocol::RangeProgressSignal;
+use crate::connections::protocol::{EntryPayload, RangeProgressSignal};
 use crate::control_plane::NodeId;
 use crate::control_plane::metadata::EntryId;
 use crate::data_plane::messages::command::CatchUpReadComplete;
@@ -197,6 +197,12 @@ impl ColdReadPool {
         let mut current_entry_id = EntryId(anchor_id);
         let mut next_offset = req.start_entry_offset;
         let mut bytes_read = 0u64;
+        let mut wire_budget = match &req.reply {
+            ColdReadReply::Consumer {
+                progress_signal, ..
+            } => Some(progress_signal.fetch_entries_max_bytes()?),
+            ColdReadReply::CatchUp(_) => None,
+        };
 
         loop {
             let pos_before = reader.stream_position()?;
@@ -238,8 +244,22 @@ impl ColdReadPool {
                     }
 
                     let payload_len = record.payload.len() as u64;
+                    if let Some(budget) = &mut wire_budget {
+                        let wire_len = record.payload.len() + EntryPayload::WIRE_HEADER_SIZE;
+                        if wire_len > *budget {
+                            if entries.is_empty() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Fetch entry exceeds the frame limit",
+                                )
+                                .into());
+                            }
+                            break;
+                        }
+                        *budget -= wire_len;
+                    }
 
-                    // Ensure we always return at least one entry even if it exceeds max_bytes
+                    // The first entry may exceed max_bytes, but not the wire limit.
                     if !entries.is_empty() && bytes_read + payload_len > req.max_bytes {
                         break;
                     }
@@ -429,6 +449,61 @@ mod tests {
         assert_eq!(out.entries.len(), 1, "always include at least one entry");
         assert_eq!(out.entries[0].entry_id, EntryId(0));
         assert_eq!(out.next_offset, EntryId(1));
+    }
+
+    #[test]
+    fn cold_fetch_bounds_assembly_by_wire_size() {
+        use crate::connections::protocol::{ClientResponse, RangeTransition};
+        use crate::connections::{MAX_FRAME_SIZE, REQUEST_ID_SIZE};
+
+        for (payload_len, count, progress_signal, expected_count) in [
+            (2 * 1024 * 1024, 3, RangeProgressSignal::Active, Some(1)),
+            (
+                0,
+                6,
+                RangeProgressSignal::Sealed {
+                    end_entry_id: EntryId(5),
+                    transition: RangeTransition::Split {
+                        left_range_id: RangeId(1),
+                        right_range_id: RangeId(2),
+                        split_point: vec![0; MAX_FRAME_SIZE - 128],
+                    },
+                },
+                Some(4),
+            ),
+            (MAX_FRAME_SIZE, 1, RangeProgressSignal::Active, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("seg.log");
+            let payload = vec![0; payload_len];
+            let entries = vec![(payload.as_slice(), 1); count];
+            let idx = FakeIndex {
+                positions: write_segment(&path, &entries),
+            };
+            let mut req = request(path, 0, count as u64 - 1, u32::MAX as u64);
+            let (reply, _rx) = oneshot::channel();
+            req.reply = ColdReadReply::Consumer {
+                reply,
+                progress_signal: progress_signal.clone(),
+            };
+            let result = ColdReadPool::process_request(&req, &idx);
+            if let Some(expected) = expected_count {
+                let fetched = result.unwrap();
+                assert_eq!(fetched.entries.len(), expected);
+                assert_eq!(fetched.next_offset, EntryId(expected as u64));
+                let response =
+                    ClientResponse::Ok(EntryPayload::from_fetched_record(FetchedRecords {
+                        entries: fetched.entries,
+                        next_entry_id: fetched.next_offset,
+                        progress_signal,
+                    }));
+                assert!(
+                    borsh::object_length(&response).unwrap() + REQUEST_ID_SIZE <= MAX_FRAME_SIZE
+                );
+            } else {
+                assert!(matches!(result, Err(ColdReadError::Io(_))));
+            }
+        }
     }
 
     #[test]

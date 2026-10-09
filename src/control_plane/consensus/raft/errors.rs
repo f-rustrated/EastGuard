@@ -1,8 +1,7 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-
 use crate::control_plane::NodeId;
+use crate::control_plane::metadata::error::MetadataError;
 
-#[derive(Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProposalError {
     #[error("Non-leader cannot make proposal: {0:?}")]
     NotLeader(Option<NodeId>),
@@ -10,6 +9,10 @@ pub enum ProposalError {
     ShardNotFound,
     #[error("Shard group removed")]
     ShardGroupRemoved,
+    #[error("Proposal exceeds the Raft transport entry size limit")]
+    EntryTooLarge,
+    #[error("Metadata command rejected: {0}")]
+    ApplyRejected(MetadataError),
 }
 
 #[derive(Debug)]

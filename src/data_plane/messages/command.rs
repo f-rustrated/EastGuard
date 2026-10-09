@@ -7,6 +7,7 @@ use crate::data_plane::auxiliary_states::consumer_offsets::state::ConsumerOffset
 use crate::data_plane::auxiliary_states::consumer_offsets::state::EpochSeal;
 use crate::data_plane::auxiliary_states::consumer_offsets::state::StaleEpoch;
 use crate::data_plane::auxiliary_states::consumer_offsets::types::ReplicateConsumerOffset;
+use crate::data_plane::placement::{CommittedPlacement, InstallCommittedPlacement};
 use crate::data_plane::timer::{BatchFlushCallback, ReplicationCallback, SegmentIdleCallback};
 use crate::impl_from_variant;
 use crate::impl_from_variant_via;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub enum DataPlaneCommand {
+    InstallCommittedPlacement(InstallCommittedPlacement),
     Produce(Produce),
     SegmentCheckpointComplete(SegmentCheckpointComplete),
     AuxiliaryCheckpointComplete(AuxiliaryCheckpointComplete),
@@ -311,6 +313,7 @@ pub struct DeleteSegments {
 
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub enum DataPlanePeerMessage {
+    CommittedPlacement(CommittedPlacement),
     PlaceSegment(PlaceSegment),
     SegmentPlaced(SegmentPlaced),
     ReplicateSegmentEntries(ReplicateSegmentEntries),
@@ -337,6 +340,7 @@ pub enum DataPlanePeerMessage {
 
 impl_from_variant!(
     DataPlanePeerMessage,
+    CommittedPlacement,
     PlaceSegment,
     SegmentPlaced,
     ReplicateSegmentEntries,
@@ -393,6 +397,7 @@ pub struct CatchUpReadComplete {
 
 impl_from_variant!(
     DataPlaneCommand,
+    InstallCommittedPlacement,
     Produce,
     SegmentCheckpointComplete,
     AuxiliaryCheckpointComplete,

@@ -198,11 +198,26 @@ impl LogState {
             .get((index - self.last_included_index() - 1) as usize)
     }
 
-    pub(crate) fn entries_from(&self, start_index: u64) -> Box<[LogEntry]> {
+    pub(crate) fn entries_from(
+        &self,
+        start_index: u64,
+        max_serialized_bytes: usize,
+    ) -> Box<[LogEntry]> {
         if start_index <= self.last_included_index() || start_index > self.last_index() {
             return Box::new([]);
         }
-        self.entries[(start_index - self.last_included_index() - 1) as usize..].into()
+        let entries = &self.entries[(start_index - self.last_included_index() - 1) as usize..];
+        let mut serialized_bytes = std::mem::size_of::<u32>();
+        let mut count = 0;
+        for entry in entries {
+            let entry_bytes = borsh::object_length(entry).unwrap_or(usize::MAX);
+            if serialized_bytes.saturating_add(entry_bytes) > max_serialized_bytes {
+                break;
+            }
+            serialized_bytes = serialized_bytes.saturating_add(entry_bytes);
+            count += 1;
+        }
+        entries[..count].into()
     }
 
     pub(crate) fn append(&mut self, entry: LogEntry) {
@@ -269,6 +284,21 @@ mod tests {
                 LogMutation::TruncateFrom(1)
             ] if appended == &entry
         ));
+    }
+
+    #[test]
+    fn bounded_entries_do_not_exceed_the_limit() {
+        let mut state = LogState::from_persistent(RaftPersistentState::default());
+        for index in 1..=2 {
+            state.append(LogEntry {
+                term: 1,
+                index,
+                command: RaftCommand::Noop,
+            });
+        }
+
+        let entries = state.entries_from(1, 0);
+        assert!(entries.is_empty());
     }
 
     #[test]

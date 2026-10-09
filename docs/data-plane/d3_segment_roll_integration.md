@@ -193,7 +193,7 @@ Both the write-path timeout (D2) and SWIM node death may fire for the same failu
 
 ## Lifecycle Event Propagation
 
-After Raft commits a metadata command that creates new segments, the coordinator sends a segment assignment to each new segment's primary. Followers self-authorize from the primary's first replication append (D2).
+After Raft commits a metadata command that creates new segments, the coordinator publishes committed placement to every data replica, then assigns each new segment's primary. Followers validate the primary's replication against that committed placement (D2).
 
 | Metadata Event | Segments Created | Assignment Target |
 |---|---|---|
@@ -343,4 +343,4 @@ Broker D (segment leader)       Coordinator A        Raft [A,B,C]
 
 8. **Size- and inactivity-based seals reuse the failure path.** Same flow, with no failed nodes and the replica set preserved.
 
-9. **Followers need no segment assignment.** They self-authorize from the leader's first replication append (D2).
+9. **Follower admission requires committed placement (protocol rule).** The explicit write-leader assignment goes to the primary; all replicas receive committed placement before accepting replication (D2).

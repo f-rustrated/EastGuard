@@ -10,6 +10,7 @@ pub(crate) mod auxiliary_states;
 pub(crate) mod checkpoint;
 pub(crate) mod cold_read;
 pub(crate) mod messages;
+pub(crate) mod placement;
 pub(crate) mod recovery;
 pub(crate) mod segment_writer;
 pub(crate) mod sparse_index;

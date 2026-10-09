@@ -90,27 +90,27 @@ impl CheckpointWorker {
         data_plane_tx: &DataPlaneSender,
     ) -> std::io::Result<()> {
         let checkpoint = job.cache.drain_for_checkpoint();
-        if checkpoint.is_empty() {
-            return Ok(());
-        }
-
-        let mut appender = SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
-        let mut index_entries = Vec::with_capacity(checkpoint.entries.len());
-        for entry in &checkpoint.entries {
-            if let Some(anchor) = appender.append_entry(
-                entry.entry_id,
-                WalRecord::data((*entry.data).clone(), entry.record_count),
-            )? {
-                index_entries.push(anchor);
+        if !checkpoint.is_empty() {
+            let mut appender =
+                SegmentAppender::open_append(job.segment_key, &job.segment_file_path)?;
+            let mut index_entries = Vec::with_capacity(checkpoint.entries.len());
+            for entry in &checkpoint.entries {
+                if let Some(anchor) = appender.append_entry(
+                    entry.entry_id,
+                    WalRecord::data((*entry.data).clone(), entry.record_count),
+                )? {
+                    index_entries.push(anchor);
+                }
             }
+            appender.flush_sync_and_release()?;
+            sparse_index.put_batch(index_entries)?;
         }
-        appender.flush_sync_and_release()?;
-
-        sparse_index.put_batch(index_entries)?;
         // We do NOT advance the eviction frontier here. We defer it to the DataPlane thread
         // via CheckpointComplete to prevent an invariant race condition where the frontier
         // advances before checkpoint_lsn is updated.
 
+        // Even an empty checkpoint completes the handoff from a live tracker
+        // to catch-up; the receiver must know no checkpoint write remains.
         let completion: DataPlaneCommand = SegmentCheckpointComplete {
             segment_key: job.segment_key,
             checkpointed_lsn: checkpoint.last_lsn(),
@@ -149,4 +149,31 @@ pub struct AuxiliaryCheckpointJob {
     pub snapshot: AuxiliarySnapshot,
     pub data_dir: PathBuf,
     pub checkpointed_lsn: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::metadata::{RangeId, SegmentId, TopicId};
+
+    #[test]
+    fn empty_checkpoint_completes_catch_up_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = rocksdb::DB::open_default(directory.path().join("index")).unwrap();
+        let (tx, rx) = flume::unbounded();
+        let job = CheckpointJob {
+            segment_key: SegmentKey::new(TopicId(1), RangeId(0), SegmentId(0)),
+            cache: Arc::new(SegmentRingBuffer::new()),
+            segment_file_path: directory.path().join("empty.seg"),
+        };
+        CheckpointWorker::process_job(&index, &job, &DataPlaneSender(tx)).unwrap();
+        let DataPlaneMessage::Command(DataPlaneCommand::SegmentCheckpointComplete(done)) =
+            rx.try_recv().unwrap()
+        else {
+            panic!("checkpoint must complete even with no entries");
+        };
+        assert_eq!(done.segment_key, job.segment_key);
+        assert_eq!(done.new_frontier, 0);
+        assert!(!job.segment_file_path.exists());
+    }
 }

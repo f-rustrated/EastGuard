@@ -12,7 +12,7 @@ use crate::control_plane::consensus::raft::storage::RaftStorage;
 use crate::control_plane::membership::actor::SwimSender;
 use crate::control_plane::membership::{ShardGroupId, SwimCommand, TopologyReader};
 use crate::control_plane::metadata::{
-    ConsumerGroupAssignment, MetadataCommand, TopicMeta, TopicStats,
+    ConsumerGroupAssignment, MetadataCommand, TopicId, TopicMeta, TopicStats,
 };
 use crate::data_plane::transport::command::DataTransportCommand;
 use crate::schedulers::ticker_message::{SchedulerSender, TickerCommand};
@@ -123,13 +123,15 @@ impl MultiRaftActor {
                 .push(RaftTransportCommand::Send(packets.1.into_boxed_slice()));
         }
 
+        let data_commands = self
+            .state
+            .with_placement_updates(std::mem::take(&mut self.data_transport_cmds));
         tokio::join!(
             self.transport_tx
                 .send_batch(std::mem::take(&mut self.transport_cmds).into_boxed_slice()),
             self.scheduler_tx
                 .send_batch(std::mem::take(&mut self.timer_cmds).into_boxed_slice()),
-            self.data_transport_tx
-                .send_batch(std::mem::take(&mut self.data_transport_cmds).into_boxed_slice()),
+            self.data_transport_tx.send_batch(data_commands),
         );
 
         self.state.fire_deferred();
@@ -175,6 +177,12 @@ impl MultiRaftActor {
                     .push(RaftTransportCommand::DisconnectPeer(node_id));
             }
             RaftEvent::MetadataCommitted(committed) => {
+                if let crate::control_plane::metadata::event::MetadataEvent::TopicDeleted(deleted) =
+                    &committed.event
+                {
+                    self.data_transport_cmds
+                        .extend(self.state.topic_placement_updates(deleted.topic_id));
+                }
                 self.data_transport_cmds
                     .extend(committed.into_data_transport_cmds());
             }
@@ -200,10 +208,10 @@ impl MutlRaftSender {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(MultiRaftActorCommand::ClientProposal {
-                propose: MetadataProposal {
+                propose: Box::new(MetadataProposal {
                     shard_group_id,
                     command,
-                },
+                }),
                 reply,
             })
             .await;
@@ -262,14 +270,14 @@ impl MutlRaftSender {
 
     pub(crate) async fn get_consumer_group_assignment(
         &self,
-        topic_name: String,
+        topic_id: TopicId,
         group_id: String,
         member_id: Uuid,
     ) -> Option<ConsumerGroupAssignment> {
         let (reply, recv) = tokio::sync::oneshot::channel();
         let _ = self
             .send(GetConsumerGroupAssignment {
-                topic_name,
+                topic_id,
                 group_id,
                 member_id,
                 reply,

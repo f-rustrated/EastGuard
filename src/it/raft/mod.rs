@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 
 use crate::control_plane::membership::{
-    QueryCommand, SwimActorCommand, Topology, TopologyConfig, TopologyReader, topology_channel,
+    QueryCommand, SwimActorCommand, Topology, TopologyConfig, TopologyReader,
 };
 use crate::control_plane::{NodeAddress, NodeId};
 
@@ -54,7 +54,7 @@ pub(super) fn stub_topology_channel(
             replication_factor: 3,
         },
     );
-    topology_channel(topology)
+    topology.channel()
 }
 
 mod election;

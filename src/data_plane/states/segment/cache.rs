@@ -224,7 +224,7 @@ impl SegmentRingBuffer {
 
     fn fetch_sub_saturating(counter: &AtomicU64, amount: u64) {
         // why not fetch_sub? because such a raw atomic subtraction may underflow for u64.
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
     }

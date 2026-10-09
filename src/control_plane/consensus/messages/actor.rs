@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::raft::errors::ProposalError;
 use crate::control_plane::membership::ShardGroupId;
-use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicMeta, TopicStats};
+use crate::control_plane::metadata::{ConsumerGroupAssignment, TopicId, TopicMeta, TopicStats};
 use crate::data_plane::messages::command::{
     DurableSegmentEndReported, SegmentCaughtUp, SegmentPlaced,
 };
@@ -32,7 +32,7 @@ pub enum MultiRaftActorCommand {
     },
     /// Propose a command to a shard group's Raft log. Leader-only.
     ClientProposal {
-        propose: MetadataProposal,
+        propose: Box<MetadataProposal>,
         reply: oneshot::Sender<Result<(), ProposalError>>,
     },
     /// Query all topic names from all shard groups on this node.
@@ -68,7 +68,7 @@ pub enum MultiRaftActorCommand {
 }
 
 pub struct GetConsumerGroupAssignment {
-    pub(crate) topic_name: String,
+    pub(crate) topic_id: TopicId,
     pub(crate) group_id: String,
     pub(crate) member_id: Uuid,
     pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
@@ -94,22 +94,26 @@ impl_from_variant_via!(
     RemoveGroup,
 );
 
-impl_from_variant!(MultiRaftActorCommand, GetConsumerGroupAssignment);
+impl_from_variant!(MultiRaftActorCommand, GetConsumerGroupAssignment,);
 
-pub(crate) struct DeferredConsumerGroupAssignment {
-    pub(crate) reply: oneshot::Sender<Option<ConsumerGroupAssignment>>,
-    pub(crate) value: Option<ConsumerGroupAssignment>,
+/// A synchronous actor result held until the end-of-batch reply flush.
+pub(crate) struct DeferredResponse<T> {
+    pub(crate) reply: oneshot::Sender<T>,
+    pub(crate) value: T,
+}
+
+impl<T> DeferredResponse<T> {
+    pub(crate) fn send(self) {
+        let _ = self.reply.send(self.value);
+    }
 }
 
 pub(crate) enum DeferredReply {
-    GetLeader(oneshot::Sender<Option<NodeId>>, Option<NodeId>),
-    GetPeers(oneshot::Sender<Box<[NodeId]>>, Box<[NodeId]>),
-    Propose(
-        oneshot::Sender<Result<(), ProposalError>>,
-        Result<(), ProposalError>,
-    ),
-    GetTopics(oneshot::Sender<Box<[String]>>, Box<[String]>),
-    GetTopicStats(oneshot::Sender<Box<[TopicStats]>>, Box<[TopicStats]>),
-    GetTopicMetadata(oneshot::Sender<Option<TopicMeta>>, Box<Option<TopicMeta>>),
-    GetConsumerGroupAssignment(DeferredConsumerGroupAssignment),
+    GetLeader(DeferredResponse<Option<NodeId>>),
+    GetPeers(DeferredResponse<Box<[NodeId]>>),
+    Propose(DeferredResponse<Result<(), ProposalError>>),
+    GetTopics(DeferredResponse<Box<[String]>>),
+    GetTopicStats(DeferredResponse<Box<[TopicStats]>>),
+    GetTopicMetadata(Box<DeferredResponse<Option<TopicMeta>>>),
+    GetConsumerGroupAssignment(DeferredResponse<Option<ConsumerGroupAssignment>>),
 }

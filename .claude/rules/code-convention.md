@@ -6,7 +6,7 @@ Functions taking `&self`, `&mut self`, or a reference to a struct as their first
 
 ## Enum struct pattern
 
-Enum variants that carry data must use the tuple-variant + named-struct pattern. Never use inline fields on enum variants. See `/.claude/skills/enum-struct-pattern/SKILL.md` for the full pattern including `impl_from_variant!` usage.
+Enum variants that carry data must use the tuple-variant + named-struct pattern. Prefer not using inline fields on enum variants. See `/.claude/skills/enum-struct-pattern/SKILL.md` for the full pattern including `impl_from_variant!` usage. 
 
 ## Result over Option for observability
 

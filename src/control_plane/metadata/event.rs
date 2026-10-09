@@ -1,5 +1,5 @@
 use crate::control_plane::Replicas;
-use crate::control_plane::consensus::multi_raft::RollRequestContext;
+use crate::control_plane::consensus::pending_rolls::RollRequestContext;
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 use crate::control_plane::metadata::{EntryId, RangeId, SegmentId, TopicId};
@@ -78,6 +78,7 @@ pub struct SegmentReassigned {
     /// dispatch just emits nothing.
     pub sealed_end: Option<EntryId>,
     pub new_replica_set: Replicas,
+    pub previous_replica_set: Replicas,
 }
 
 impl SegmentReassigned {
@@ -85,7 +86,13 @@ impl SegmentReassigned {
         let Some(sealed_end) = self.sealed_end else {
             return vec![];
         };
-        self.new_replica_set
+        let targets: std::collections::BTreeSet<_> = self
+            .new_replica_set
+            .iter()
+            .chain(self.previous_replica_set.iter())
+            .cloned()
+            .collect();
+        targets
             .iter()
             .map(|member| {
                 DataTransportCommand::send_to_targets(
@@ -251,7 +258,13 @@ impl SegmentBoundaryCorrected {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicDeleted {
+    pub topic_id: TopicId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEvent {
+    TopicDeleted(TopicDeleted),
     TopicCreated(TopicCreated),
     SegmentRolled(SegmentRolled),
     RangeSplit(RangeSplit),
@@ -265,6 +278,7 @@ pub enum MetadataEvent {
 
 impl_from_variant!(
     MetadataEvent,
+    TopicDeleted,
     TopicCreated,
     SegmentRolled,
     RangeSplit,

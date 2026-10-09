@@ -1,7 +1,7 @@
 use crate::control_plane::NodeId;
 use crate::control_plane::consensus::messages::rpc::OutboundRaftPacket;
 use crate::control_plane::consensus::messages::timer::RaftTimer;
-use crate::control_plane::consensus::multi_raft::RollRequestContext;
+use crate::control_plane::consensus::pending_rolls::RollRequestContext;
 use crate::control_plane::consensus::raft::{log::LogEntry, storage::RaftSnapshot};
 use crate::control_plane::membership::ShardGroupId;
 use crate::control_plane::metadata::event::MetadataEvent;
@@ -63,6 +63,7 @@ impl MetadataCommitted {
     pub fn into_data_transport_cmds(self) -> Vec<DataTransportCommand> {
         let sgid = self.shard_group_id;
         match self.event {
+            MetadataEvent::TopicDeleted(_) => vec![],
             MetadataEvent::TopicCreated(tc) => {
                 vec![tc.into_command(sgid)]
             }

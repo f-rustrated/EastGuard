@@ -36,7 +36,7 @@ use crate::control_plane::NodeAddressInfo;
 use crate::control_plane::metadata::consumer_group::GenerationId;
 pub use crate::control_plane::metadata::strategy::{PartitionStrategy, StoragePolicy};
 pub use crate::control_plane::metadata::{EntryId, RangeId};
-use crate::control_plane::metadata::{SyncConsumerGroupRequest, TopicId};
+use crate::control_plane::metadata::{TopicId, UpdateConsumerGroupMemberRequest};
 use crate::data_plane::auxiliary_states::consumer_offsets::state::{
     ConsumerOffsetKey, ConsumerOffsetPosition,
 };
@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 use crate::connections::protocol::{
     ClientDataPlaneRequest, ClientRequest, ClientResponse, CommitConsumerOffsetRequest,
-    ConsumerGroupAssignmentResponse, ConsumerGroupSyncAction, ControlPlaneRequest,
+    ConsumerGroupAssignmentResponse, ConsumerGroupMemberAction, ControlPlaneRequest,
     FetchConsumerOffsetRequest, OpenProducerSessionRequest, ProduceRequest, ProducerSessionOpened,
     RangeOffsetRequest,
 };
@@ -79,6 +79,21 @@ pub struct Client {
 }
 
 impl Client {
+    /// Connect using standard rustls mutual TLS. Configure trusted roots and a
+    /// client certificate with `urn:eastguard:client:<principal>` as its sole URI SAN.
+    /// Broker certificates must cover their advertised IPs and carry a node URI SAN.
+    /// Every seed, redirect, and reconnection uses this configuration; TLS failures
+    /// never fall back to plaintext. Replace the client to rotate credentials.
+    pub fn connect_secure(
+        seeds: impl Into<Vec<SocketAddr>>,
+        retry: RetryPolicy,
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, ClientError> {
+        let mut client = Self::connect_with(seeds, retry)?;
+        client.pool.tls = Some(tls);
+        Ok(client)
+    }
+
     /// Build a client from one or more seed addresses with the default [`RetryPolicy`].
     /// Seeds are the fallback the redirect loop re-resolves against; they need not be leaders or even alive.
     pub fn connect(seeds: impl Into<Vec<SocketAddr>>) -> Result<Self, ClientError> {
@@ -504,8 +519,11 @@ impl Client {
                     Redirect::Follow(owner.client_addr())
                 }
                 ServerError::TopicNotFound => Redirect::NotFound,
-                ServerError::SegmentNotLocal | ServerError::Internal(_) => Redirect::Reresolve,
+                ServerError::SegmentNotLocal | ServerError::Internal(_) | ServerError::Busy => {
+                    Redirect::Reresolve
+                }
                 ServerError::AlreadyExists
+                | ServerError::Unauthorized
                 | ServerError::StaleRange
                 | ServerError::ProduceRejected(_)
                 | ServerError::EntryIdOutOfRange

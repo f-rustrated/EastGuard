@@ -44,7 +44,8 @@ The leader map is a cache, not a correctness dependency. If a one-shot leader an
 
 ## Completion is tied to apply
 
-Once a leader accepts a command, the consensus actor records its log position and the waiting reply. Apply reaching that position completes the request:
+Once a leader accepts a command, the consensus actor records its log position and
+the waiting reply. The result of applying that entry completes the request:
 
 ```
 client       node         leader Raft       followers
@@ -55,12 +56,20 @@ client       node         leader Raft       followers
   │            │               │◄──── acks ─────┤
   │            │               │ commit + apply │
   │            │◄──────────────┤ complete       │
-  │◄───────────┤ success       │                │
+  │◄───────────┤ apply result  │                │
 ```
 
 Tracking by log position avoids coupling completion to a particular command type. It also correctly handles multiple identical commands: each accepted proposal has its own place in the history.
 
-If leadership is lost before completion, outstanding replies fail with a not-leader result. The caller retries through current routing instead of waiting forever for an old leader that can no longer commit its suffix.
+Commit alone does not mean the mutation succeeded. A topic may have been deleted
+and recreated while a command was queued; apply rejects its stale topic ID and
+the caller receives that rejection. Results remain available until the reply is
+resolved, including when the log is compacted during the same flush.
+
+If leadership is lost before completion, outstanding replies fail with a
+not-leader result. An overwritten proposal cannot receive its replacement's
+result. The caller retries through current routing instead of waiting forever
+for an old leader that can no longer commit its suffix.
 
 ---
 
@@ -80,6 +89,7 @@ Some local inventory reads intentionally report only the groups hosted on the co
 | Member is not leader | Redirect with leader hint when available | Retry once at the hinted node. |
 | Leader hint is stale | Target rejects based on Raft role | Resolve and retry; no stale write occurs. |
 | Leader steps down after append | Pending reply fails | New leader decides the surviving log suffix. |
+| Apply rejects a stale or conflicting command | Caller receives the rejection | Refresh state before deciding whether to retry. |
 | Leader announcement is missing | Member fallback | Contact group members; only leader accepts. |
 
 ---
@@ -87,7 +97,7 @@ Some local inventory reads intentionally report only the groups hosted on the co
 ## Design rules
 
 1. **The hash ring chooses the shard; Raft chooses the writer.** Conflating them makes topology gossip an accidental consensus mechanism.
-2. **Success means committed and applied.** Append acceptance alone is not a durable client outcome.
+2. **Success means committed and successfully applied.** Apply rejection is returned to the caller; advancing the log position alone cannot establish success.
 3. **Leader hints are advisory.** Every target validates its current role before accepting a proposal.
 4. **Forwarding is bounded.** A stale route may add one correction hop but cannot create a loop.
 5. **Stepdown resolves every pending caller.** No request remains attached to leadership that no longer exists.

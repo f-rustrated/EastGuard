@@ -63,8 +63,12 @@ impl ConsensusState {
     pub(crate) fn log_entry(&self, index: u64) -> Option<&LogEntry> {
         self.log.get(index)
     }
-    pub(crate) fn log_entries_from(&self, index: u64) -> Box<[LogEntry]> {
-        self.log.entries_from(index)
+    pub(crate) fn log_entries_from(
+        &self,
+        index: u64,
+        max_serialized_bytes: usize,
+    ) -> Box<[LogEntry]> {
+        self.log.entries_from(index, max_serialized_bytes)
     }
     pub(crate) fn append_log(&mut self, entry: LogEntry) {
         self.log.append(entry);

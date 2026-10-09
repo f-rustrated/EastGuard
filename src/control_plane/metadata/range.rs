@@ -307,7 +307,15 @@ impl RangeMeta {
     /// (`sealed_at + retention_ms < now`), as an oldest-first prefix by segment_id.
     /// Take-while semantics — stops at the first non-expired sealed segment (or the
     /// active head) so the result is always a contiguous prefix, never a hole.
-    pub(crate) fn expired_sealed_prefix(&self, now: u64, retention_ms: u64) -> Vec<SegmentId> {
+    pub(crate) fn expired_sealed_prefix(
+        &self,
+        now: u64,
+        retention_ms: u64,
+        max_segments: usize,
+    ) -> Vec<SegmentId> {
+        if max_segments == 0 {
+            return Vec::new();
+        }
         let mut segs: Vec<&SegmentMeta> = self.segments.values().collect();
         segs.sort_by_key(|s| s.segment_id.0);
         let mut out = Vec::new();
@@ -317,7 +325,10 @@ impl RangeMeta {
                 SegmentMetaState::Deleting => continue,
                 SegmentMetaState::Sealed => match seg.sealed_at {
                     Some(sealed_at) if sealed_at.saturating_add(retention_ms) < now => {
-                        out.push(seg.segment_id)
+                        out.push(seg.segment_id);
+                        if out.len() == max_segments {
+                            break;
+                        }
                     }
                     // First non-expired (or unknown sealed_at) → stop: prefix only.
                     _ => break,

@@ -30,7 +30,7 @@ pub use error::*;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::{
-    control_plane::metadata::{EntryId, SyncConsumerGroupRequest},
+    control_plane::metadata::{EntryId, UpdateConsumerGroupMemberRequest},
     data_plane::{
         auxiliary_states::consumer_offsets::state::ConsumerOffsetPosition,
         messages::query::RangeOffsets,
@@ -45,6 +45,35 @@ pub enum ClientRequest {
     ControlPlane(ControlPlaneRequest),
     DataPlane(ClientDataPlaneRequest),
     Admin(AdminRequest),
+}
+
+impl ClientRequest {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::ControlPlane(request) => match request {
+                ControlPlaneRequest::CreateTopic { .. } => "CreateTopic",
+                ControlPlaneRequest::DeleteTopic { .. } => "DeleteTopic",
+                ControlPlaneRequest::ListHostedTopics => "ListHostedTopics",
+                ControlPlaneRequest::DescribeTopic { .. } => "DescribeTopic",
+                ControlPlaneRequest::SyncConsumerGroup(_) => "SyncConsumerGroup",
+                ControlPlaneRequest::OpenProducerSession(_) => "OpenProducerSession",
+            },
+            Self::DataPlane(request) => match request {
+                ClientDataPlaneRequest::Produce(_) => "Produce",
+                ClientDataPlaneRequest::Fetch(_) => "Fetch",
+                ClientDataPlaneRequest::FetchById(_) => "FetchById",
+                ClientDataPlaneRequest::ListOffsets(_) => "ListOffsets",
+                ClientDataPlaneRequest::CommitConsumerOffset(_) => "CommitConsumerOffset",
+                ClientDataPlaneRequest::FetchConsumerOffset(_) => "FetchConsumerOffset",
+            },
+            Self::Admin(request) => match request {
+                AdminRequest::DescribeCluster => "DescribeCluster",
+                AdminRequest::ListHostedTopicsWithStats => "ListHostedTopicsWithStats",
+                AdminRequest::GetShardInfo { .. } => "GetShardInfo",
+                AdminRequest::GetShardLeader { .. } => "GetShardLeader",
+            },
+        }
+    }
 }
 
 #[derive(Debug, BorshSerialize, BorshDeserialize)]
@@ -126,4 +155,8 @@ impl_from_variant_via!(
     FetchConsumerOffsetRequest
 );
 
-impl_from_variant_via!(ClientRequest, ControlPlaneRequest, SyncConsumerGroupRequest);
+impl_from_variant_via!(
+    ClientRequest,
+    ControlPlaneRequest,
+    UpdateConsumerGroupMemberRequest
+);

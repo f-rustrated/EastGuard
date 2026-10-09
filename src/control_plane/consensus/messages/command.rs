@@ -8,7 +8,7 @@ use crate::{impl_from_variant, impl_new_struct_wrapper};
 
 pub struct InboundRaftRpc {
     pub shard_group_id: ShardGroupId,
-    pub from: NodeId,
+    pub peer_id: NodeId,
     pub rpc: RaftRpc,
 }
 

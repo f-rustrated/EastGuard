@@ -1,10 +1,7 @@
-use crate::control_plane::membership::{OutboundPacket, SwimCommand, actor::SwimSender};
-
-// ==========================================
-// TRANSPORT LAYER (Presentation)
-// ==========================================
-use crate::net::UdpSocket;
 use tokio::sync::mpsc;
+
+use crate::control_plane::membership::{OutboundPacket, SwimCommand, actor::SwimSender};
+use crate::net::UdpSocket;
 
 pub struct SwimTransportActor;
 
@@ -15,7 +12,7 @@ impl SwimTransportActor {
         mut from_actor: mpsc::Receiver<Box<[OutboundPacket]>>,
     ) {
         tracing::info!(
-            "Transport Layer listening on {}",
+            "SWIM trusted-development transport listening on {}",
             socket.local_addr().unwrap()
         );
 

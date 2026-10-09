@@ -225,6 +225,21 @@ impl SegmentTracker {
         self.last_activity_at = tokio::time::Instant::now();
     }
 
+    /// A committed seal can publish only the prefix present in our durable cache.
+    pub(crate) fn commit_durable_through(&mut self, end: EntryId) -> Box<[Arc<CachedEntry>]> {
+        let mut committed = Vec::new();
+        while let Some(entry) = self.cache.load_published(self.cache.load_read_cursor()) {
+            if entry.entry_id > end {
+                break;
+            }
+            self.commit_entry(entry.entry_id);
+            committed.push(entry);
+        }
+        #[cfg(any(test, debug_assertions))]
+        crate::test_traits::TAssertInvariant::assert_invariants(self);
+        committed.into_boxed_slice()
+    }
+
     pub(crate) fn advance_checkpoint(
         &mut self,
         checkpointed_lsn: u64,

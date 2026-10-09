@@ -125,6 +125,7 @@ mod tests {
     }
     fn reassigned(members: &[&str], sealed_end: Option<u64>) -> SegmentReassigned {
         SegmentReassigned {
+            previous_replica_set: Replicas::new(members.iter().map(|n| node(n)).collect()),
             segment_key: seg(),
             start_entry_id: 0.into(),
             sealed_end: sealed_end.map(EntryId),

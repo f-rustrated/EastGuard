@@ -5,7 +5,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 use crate::client::RangeId;
 use crate::control_plane::metadata::consumer_group::GenerationId;
-use crate::control_plane::metadata::{EntryId, TopicId};
+use crate::control_plane::metadata::{AclResource, ConsumerGroupResource, EntryId, TopicId};
 use crate::data_plane::SegmentKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
@@ -18,6 +18,12 @@ pub(crate) struct ConsumerOffsetKey {
 impl ConsumerOffsetKey {
     pub(crate) fn placement_key(&self) -> (TopicId, RangeId) {
         (self.topic_id, self.range_id)
+    }
+    pub(crate) fn acl(&self) -> AclResource {
+        AclResource::ConsumerGroup(ConsumerGroupResource {
+            topic_id: self.topic_id,
+            group_id: self.group_id.clone(),
+        })
     }
 }
 

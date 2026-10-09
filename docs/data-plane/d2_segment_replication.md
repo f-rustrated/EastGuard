@@ -68,7 +68,7 @@ WAL fsync is the sole disk write on the leader's critical path, same as D1. The 
 ```
 ReplicaAppend arrives (one entry: EntryPayload + entry_id)
     │
-    ├── segment unknown? validate & create SegmentTracker (see self-authorization)
+    ├── validate committed placement, then create a follower if needed
     │
     ▼
 tracker.stage_entry_from_replica(data, record_count, entry_id)
@@ -101,14 +101,23 @@ Flush fires when either a leader flush trigger trips (10ms / 10MB) OR the actor 
 
 Follower-to-leader promotion (F2) requires no buffer migration: the new segment's `SegmentTracker` is created with `role = Leader` and an empty `staged_entries`. `flush_batch()` handles it like any other leader segment.
 
-### Replica Self-Authorization
+### Committed Data Placement
 
-The first `ReplicaAppend` for an unknown segment is self-authorizing — no prior `SegmentAssignment` notification needed for followers. `ReplicaAppend` carries `replica_set` and batch data. Follower validates:
-1. Am I in `replica_set`? → if not, reject
-2. Is sender `replica_set[0]` (segment leader)? → if not, reject
-3. Valid → create `SegmentTracker` with `SegmentRole::Follower`, create segment file, accept
+Before dispatching data work, the metadata coordinator publishes the segment's
+committed placement and log position to its data replicas. Receivers accept it
+only from the authenticated coordinator known for that shard and term. Missing,
+older, or conflicting placement is rejected; an append cannot install authority.
 
-Only the segment leader requires explicit `SegmentAssignment` from the coordinator (D3). Followers learn about new segments from the leader's first `ReplicaAppend` — no gossip or coordinator notification required on the follower data path.
+Replication must come from the committed data leader to a current follower and
+match the stored replica set. Acknowledgments, deletion, and catch-up have their
+own role and segment-state checks. Embedded sender IDs must match the connection;
+catch-up chunks must also come from the requested source. Raft membership grants
+no authority over segment bytes.
+
+The placement view is volatile. After restart, coordinator retries restore it
+before peer traffic can create or modify segment state. When catch-up overtakes a
+lost seal notification, the replica checkpoints its durable prefix before opening
+the file for the missing suffix.
 
 ### Commit Notification
 
@@ -149,7 +158,7 @@ SegmentTracker (D1 fields unchanged)
 ### DataPlane State Machine
 
 **New fields:**
-- `node_id: NodeId` — role determination and self-authorization
+- `node_id: NodeId` — role determination against committed placement
 - `needs_flush: bool` — set by `process_replica_append()` and `handle_seal_response()`, checked by actor after mailbox drain, reset by `flush_batch()`
 - `buffer_byte_count: usize` — payload bytes across all leader staged entries, drives 10MB flush threshold
 - `dirty_segments: Vec<SegmentKey>` — tracks segments with non-empty `staged_entries`; `flush_batch()` only visits these
@@ -159,13 +168,13 @@ SegmentTracker (D1 fields unchanged)
 
 | Method | Role | Effect |
 |---|---|---|
-| `process_replica_append()` | Follower | Validate sender (self-authorization), stage entry via `stage_entry_from_replica()`, set `needs_flush` |
+| `process_replica_append()` | Follower | Validate sender against committed placement, stage entry via `stage_entry_from_replica()`, set `needs_flush` |
 | `commit_segment(key, entry_id)` | Both | `tracker.commit_entry(entry_id)`, send `CommitAdvance` to followers via `InterNodeCommandQueued` |
 | `handle_seal_response(...)` | Leader | Create new tracker (`start_entry_id = old.committed_entry_id + 1`), replay uncommitted tail via `uncommitted_entries()`, call `replication.segment_handoff()`, send `SegmentSealed` to old followers via `InterNodeCommandQueued` |
 
 **`flush_batch()` changes (D1 → D2):** Three phases: (1) `stage_to_wal(wal.buf())` for each dirty segment — encodes each staged entry into WAL with routing header, (2) `wal.flush_batch()` — single write+fsync, returns LSN, (3) `publish_staged(lsn)` for each dirty segment — drains `staged_entries`, assigns `entry_id` to each, publishes to ring buffer. Per entry per segment, `tracker.role` determines event: Leader with followers → `BatchPublished`, Leader without followers → immediate `commit_entry` (no-follower fast path), Follower → `ReplicaAck` via `InterNodeCommandQueued`. Triggers: `BatchFlushDeadline` timer (10ms) OR byte threshold (10MB) OR `needs_flush` after mailbox drain.
 
-**Other changes:** `handle_segment_assignment()` stores `replica_set`, sets role (leader-only in D2 — followers self-authorize). Followers reject `Produce` with error.
+**Other changes:** `handle_segment_assignment()` stores `replica_set`, sets the leader role; followers also require committed placement before accepting replication. Followers reject `Produce` with error.
 
 ### DataPlaneActor
 
@@ -256,14 +265,24 @@ D2 uses two separate timer types, each implementing `TTimer`. No single `DataPla
 
 ## DataTransportActor
 
-Same architectural pattern as `RaftTransportActor` (see `raft-transport.md`) — `HashMap<NodeId, OwnedWriteHalf>`, lower-`NodeId`-wins conflict resolution, length-prefixed bincode frames, identical connection lifecycle (outbound resolve, inbound accept, disconnect on SWIM death, 300s cleanup).
+The data transport follows the same broad shape as the Raft transport (see
+`raft-transport.md`): a separate TCP listener, per-peer writers,
+lower-`NodeId`-wins conflict resolution, length-prefixed Borsh frames, live
+address resolution, and cleanup after peer death.
+
+Both transports use standard mutual TLS, bind the exchanged node identity to
+its certificate principal, and verify the exact destination process identity.
+Operators provision credentials and close existing connections when withdrawing
+access. The remaining secure-startup gates are tracked in the
+[security roadmap](../security/roadmap.md).
 
 **Differences from RaftTransportActor:**
 
 | | RaftTransportActor | DataTransportActor |
 |---|---|---|
 | Port | `raft_port` | `data_port` (2923) |
-| Frame size cap | 4MB | 64MB (record batches up to 10MB per segment) |
+| Frame size cap | 8 MiB (4 MiB entry batches) | 64 MiB (record batches up to 10 MiB per segment) |
+| Node authentication | Mutual TLS and certificate-bound node identity | Same |
 | Runtime | tokio | tokio |
 
 **Threading note:** `DataTransportActor` runs on tokio (async TCP I/O, no blocking calls). `DataPlaneActor` runs on a dedicated OS thread (blocking WAL fsync) — a pinned thread keeps hot data (write buffers, segment trackers, WAL write buffer) in L1/L2 cache across batches.
@@ -414,7 +433,7 @@ Broker D              Broker E              Broker G              Broker F (dead
    │ flush_batch() (replayed + any new records)│
    │──ReplicaAppend(seg 8)──►E ✓               │
    │──ReplicaAppend(seg 8)────────────────────►│
-   │                     │          validate replica_set (self-auth)
+   │                     │          validate committed placement
    │                     │          create tracker (Follower)
    │                     │                     │
    │ all acks → commit → ACK original producers (Ok)
@@ -442,8 +461,8 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 - **Segment leader D** already stopped writing to segment 7 (D initiated the seal). No new data enters segment 7.
 - **Follower E** learns via `SegmentSealed` from D over `data_port`. Not waiting for gossip.
-- **New replica G** learns from D's first `ReplicaAppend` for segment 8 (self-authorizing).
-- **Failed node F** is unreachable. On recovery with new NodeId, it queries the coordinator.
+- **New replica G** receives committed placement from the coordinator before accepting segment 8 replication.
+- **Failed node F** is unreachable. On recovery, coordinator retries restore its committed placement and assigned data.
 - **No legitimate produce traffic** targets segment 7 — the active segment is now 8.
 - **Consumer reads** of segment 7 are fine — sealed segments are immutable.
 
@@ -463,7 +482,7 @@ Between Raft commit (step 3) and `data_port` notifications reaching participants
 
 6. **Replication is per-segment.** Each segment has its own `replica_set` and independent `VecDeque<PendingBatch>`. One WAL flush can produce batches for multiple segments; each is replicated independently. Commit and producer ACK happen per-segment. No cross-segment dependency.
 
-7. **Self-authorization is sufficient for follower onboarding.** No prior `SegmentAssignment` required for followers — see "Replica Self-Authorization" above.
+7. **Follower admission checks committed placement (protocol rule).** The coordinator's committed data replica set must arrive before replication can create a follower — see "Committed Data Placement" above.
 
 8. **ReplicationTimeout triggers seal, not retry.** A slow or failed replica is treated the same — seal the segment, replace the replica. No retry, no ISR shrink/expand.
 
